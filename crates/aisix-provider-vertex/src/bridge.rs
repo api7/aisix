@@ -1207,6 +1207,7 @@ impl VertexBridge {
             }
             outbound_bytes(&body_value)?
         };
+        let include_usage = req.include_usage();
         // The owned request is not needed past its wire bytes.
         drop(req);
 
@@ -1244,6 +1245,7 @@ impl VertexBridge {
         let stream = async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
             let mut state = StreamState::default();
+            let mut usage = aisix_gateway::IncludeUsage::new(include_usage);
             let mut byte_stream = Box::pin(byte_stream);
 
             loop {
@@ -1272,16 +1274,22 @@ impl VertexBridge {
                         Err(aisix_provider_anthropic::wire::stream_error_into_bridge_error(error))?;
                     }
                     state.update(&parsed);
-                    if let Some(chunk) = state.to_chunk(&parsed) {
+                    if let Some(chunk) = state.to_chunk(&parsed).map(|c| usage.pass(c)) {
                         yield chunk;
                     }
                     if StreamState::is_terminal(&parsed) {
+                        if let Some(u) = usage.finish() {
+                            yield u;
+                        }
                         return;
                     }
                 }
                 if eof {
                     break;
                 }
+            }
+            if let Some(u) = usage.finish() {
+                yield u;
             }
         };
 
@@ -1794,6 +1802,7 @@ impl VertexBridge {
             apply_body_overrides(&mut body, ctx);
             outbound_bytes(&body)?
         };
+        let include_usage = req.include_usage();
         // The owned request is not needed past its wire bytes.
         drop(req);
         // Resolve bearer (pre-minted OR minted-from-SA) BEFORE
@@ -1835,6 +1844,7 @@ impl VertexBridge {
                 service_tier: header_tier,
                 ..Default::default()
             };
+            let mut usage = aisix_gateway::IncludeUsage::new(include_usage);
             let mut byte_stream = Box::pin(byte_stream);
 
             while let Some(item) = byte_stream.next().await {
@@ -1847,6 +1857,8 @@ impl VertexBridge {
                         )?;
                         for chunk in
                             gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut state)
+                                .into_iter()
+                                .map(|c| usage.pass(c))
                         {
                             yield chunk;
                         }
@@ -1871,9 +1883,14 @@ impl VertexBridge {
                 )?;
                 for chunk in
                     gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut state)
+                        .into_iter()
+                        .map(|c| usage.pass(c))
                 {
                     yield chunk;
                 }
+            }
+            if let Some(u) = usage.finish() {
+                yield u;
             }
         };
 
@@ -1971,6 +1988,7 @@ fn gemini_chunk_into_chat_chunks(
             finish_reason: None,
             usage: None,
             service_tier: state.service_tier.clone(),
+            accounting_usage: None,
         });
     }
 
@@ -1998,6 +2016,7 @@ fn gemini_chunk_into_chat_chunks(
             finish_reason,
             usage,
             service_tier: state.service_tier.clone(),
+            accounting_usage: None,
         });
     }
 

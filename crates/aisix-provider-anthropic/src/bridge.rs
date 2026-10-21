@@ -484,6 +484,7 @@ impl Bridge for AnthropicBridge {
             apply_auto_prompt_caching(&mut body, &ctx.model);
             outbound_bytes(&body)?
         };
+        let include_usage = req.include_usage();
         // The owned request is not needed past its wire bytes.
         drop(req);
         let url = cached_endpoint_url(
@@ -520,13 +521,14 @@ impl Bridge for AnthropicBridge {
         }
 
         let byte_stream = resp.bytes_stream();
-        let stream = build_chunk_stream(byte_stream);
+        let stream = build_chunk_stream(byte_stream, include_usage);
         Ok(Box::pin(stream))
     }
 }
 
 fn build_chunk_stream<S>(
     byte_stream: S,
+    include_usage: bool,
 ) -> impl futures::Stream<Item = Result<ChatChunk, BridgeError>> + Send
 where
     S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
@@ -535,6 +537,7 @@ where
         let mut decoder = SseDecoder::new();
         let mut stream = Box::pin(byte_stream);
         let mut state = StreamState::default();
+        let mut usage = aisix_gateway::IncludeUsage::new(include_usage);
 
         loop {
             // At EOF, `finish` flushes a last frame the upstream never
@@ -558,16 +561,22 @@ where
                     Err(crate::wire::stream_error_into_bridge_error(error))?;
                 }
                 state.update(&parsed);
-                if let Some(c) = state.to_chunk(&parsed) {
+                if let Some(c) = state.to_chunk(&parsed).map(|c| usage.pass(c)) {
                     yield c;
                 }
                 if StreamState::is_terminal(&parsed) {
+                    if let Some(u) = usage.finish() {
+                        yield u;
+                    }
                     return;
                 }
             }
             if eof {
                 break;
             }
+        }
+        if let Some(u) = usage.finish() {
+            yield u;
         }
     }
 }
@@ -587,7 +596,7 @@ mod tests {
                 .into_iter()
                 .map(|c| Ok::<_, reqwest::Error>(bytes::Bytes::from(c))),
         );
-        build_chunk_stream(bytes).collect().await
+        build_chunk_stream(bytes, false).collect().await
     }
 
     fn sse(event: &str, data: serde_json::Value) -> String {

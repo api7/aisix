@@ -3103,6 +3103,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         }
     }
 
@@ -3147,6 +3148,7 @@ mod tests {
                 finish_reason: None,
                 usage: None,
                 service_tier: None,
+                accounting_usage: None,
             },
             ChatChunk {
                 id: "c".into(),
@@ -3161,6 +3163,7 @@ mod tests {
                 finish_reason: None,
                 usage: None,
                 service_tier: None,
+                accounting_usage: None,
             },
         ];
         let counts = redact_chat_chunks(chain.as_ref(), &mut chunks);

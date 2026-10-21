@@ -1278,8 +1278,13 @@ fn shape_invoke_body(
     upstream_id: &str,
     header_betas: Vec<String>,
 ) {
-    if let Some(stops) = crate::converse_req::stop_sequences(req, upstream_id) {
-        obj.insert("stop_sequences".into(), stops.into());
+    // A `stop_sequences` the caller sent natively wins, as on the other
+    // Claude paths; otherwise `stop` is re-derived without empty strings.
+    if !req.extra.contains_key("stop_sequences") {
+        obj.remove("stop_sequences");
+        if let Some(stops) = crate::converse_req::stop_sequences(req, upstream_id) {
+            obj.insert("stop_sequences".into(), stops.into());
+        }
     }
     obj.remove("stop");
     // Already carried as `max_tokens` (see `chat_anthropic`).
@@ -2671,6 +2676,7 @@ fn emit_converse_chunk(
                     finish_reason: None,
                     usage: None,
                     service_tier: None,
+                    accounting_usage: None,
                 });
             }
         }
@@ -2705,6 +2711,7 @@ fn emit_converse_chunk(
                         finish_reason: None,
                         usage: None,
                         service_tier: None,
+                        accounting_usage: None,
                     });
                 }
                 // #560: a tool-use `arguments` fragment. Correlate to the
@@ -2741,6 +2748,7 @@ fn emit_converse_chunk(
                         finish_reason: None,
                         usage: None,
                         service_tier: None,
+                        accounting_usage: None,
                     });
                 }
                 _ => {}
@@ -2754,6 +2762,7 @@ fn emit_converse_chunk(
                 finish_reason: Some(map_stop_reason(&m.stop_reason)),
                 usage: None,
                 service_tier: None,
+                accounting_usage: None,
             });
         }
         ConverseStreamOutput::Metadata(m) => {
@@ -2783,6 +2792,7 @@ fn emit_converse_chunk(
                         ..Default::default()
                     }),
                     service_tier,
+                    accounting_usage: None,
                 });
             }
         }
@@ -2838,6 +2848,7 @@ fn tool_call_chunk(
         finish_reason: None,
         usage: None,
         service_tier: None,
+        accounting_usage: None,
     }
 }
 
@@ -4084,6 +4095,64 @@ mod tests {
             messages[0].get("role").and_then(|v| v.as_str()),
             Some("user")
         );
+    }
+
+    #[tokio::test]
+    async fn chat_anthropic_maps_max_completion_tokens_and_stop() {
+        let send = |extra: serde_json::Value, max_tokens: Option<u32>| async move {
+            let server = MockServer::builder().start().await;
+            let responder = CapturingResponder::default();
+            Mock::given(method("POST"))
+                .and(path_regex(r"^/model/.+/invoke$"))
+                .respond_with(responder.clone())
+                .expect(1)
+                .mount(&server)
+                .await;
+            let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+            let ctx = BridgeContext::new(
+                "req-1",
+                sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+                sample_pk_with_secret(valid_secret_json()),
+            );
+            let req = ChatFormat {
+                max_tokens,
+                extra: extra.as_object().unwrap().clone(),
+                ..ChatFormat::new("my-claude", vec![ChatMessage::user("hi")])
+            };
+            bridge.chat(&req, &ctx).await.unwrap();
+            let body = responder.captured_body.lock().unwrap().clone().unwrap();
+            body
+        };
+
+        // `max_completion_tokens` outranks `max_tokens`, as on Converse.
+        let body = send(
+            serde_json::json!({"max_completion_tokens": 77, "stop": ["", "END"]}),
+            Some(33),
+        )
+        .await;
+        assert_eq!(body["max_tokens"], 77, "body={body}");
+        assert_eq!(
+            body["stop_sequences"],
+            serde_json::json!(["END"]),
+            "body={body}"
+        );
+        assert!(body.get("stop").is_none() && body.get("max_completion_tokens").is_none());
+
+        // A native `stop_sequences` wins over `stop`.
+        let body = send(
+            serde_json::json!({"stop": ["a"], "stop_sequences": ["b"]}),
+            None,
+        )
+        .await;
+        assert_eq!(
+            body["stop_sequences"],
+            serde_json::json!(["b"]),
+            "body={body}"
+        );
+
+        // Only empty strings: nothing is sent.
+        let body = send(serde_json::json!({"stop": ""}), None).await;
+        assert!(body.get("stop_sequences").is_none(), "body={body}");
     }
 
     #[tokio::test]

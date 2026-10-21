@@ -57,7 +57,7 @@ pub use bridge::{
 pub use chat::{
     CacheCreationTtl, ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject,
     EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingUsageSource, EmbeddingVector,
-    FinishReason, ModalityTokens, OpenAiUsageDetails, Role, ServiceTier, UsageStats,
+    FinishReason, IncludeUsage, ModalityTokens, OpenAiUsageDetails, Role, ServiceTier, UsageStats,
 };
 pub use credential::credential_fingerprint;
 pub use hub::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};

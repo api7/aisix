@@ -688,6 +688,27 @@ pub fn build_request<'a>(
     // no tool survives translation: upstream rejects the field without
     // an accompanying `tools` list (AISIX-Cloud#1614).
     let mut extras = req.extra.clone();
+    // `stream_options` is read by the gateway, which renders the usage
+    // chunk itself; the Messages API has no such parameter and rejects it.
+    extras.remove("stream_options");
+    // OpenAI's newer name for the output cap; it outranks `max_tokens` when
+    // both are sent. A value that is not a token count is left for the
+    // upstream to reject.
+    let max_tokens = match extras.get("max_completion_tokens") {
+        Some(serde_json::Value::Null) => {
+            extras.remove("max_completion_tokens");
+            req.max_tokens
+        }
+        Some(v) => match v.as_u64() {
+            Some(n) => {
+                extras.remove("max_completion_tokens");
+                Some(n.min(u32::MAX as u64) as u32)
+            }
+            None => req.max_tokens,
+        },
+        None => req.max_tokens,
+    };
+    translate_stop_to_anthropic(&mut extras);
     let mut tools = extras
         .remove("tools")
         .and_then(translate_openai_tools_to_anthropic);
@@ -726,7 +747,7 @@ pub fn build_request<'a>(
         }
     }
     let thinking_max_tokens =
-        translate_reasoning_effort_to_anthropic(&mut extras, upstream_model, req.max_tokens);
+        translate_reasoning_effort_to_anthropic(&mut extras, upstream_model, max_tokens);
     // `response_format` is the OpenAI spelling of structured outputs. It
     // has no top-level Anthropic counterpart, so it is always consumed
     // here — riding `extra` onto the body would be rejected as an unknown
@@ -783,8 +804,7 @@ pub fn build_request<'a>(
     AnthropicRequest {
         model: upstream_model,
         messages,
-        max_tokens: req
-            .max_tokens
+        max_tokens: max_tokens
             .or(thinking_max_tokens)
             .unwrap_or(DEFAULT_MAX_TOKENS),
         system,
@@ -795,6 +815,26 @@ pub fn build_request<'a>(
         tool_choice,
         extra: extras,
     }
+}
+
+/// OpenAI's `stop` (a string or an array of strings) as Anthropic's
+/// `stop_sequences`, which takes an array only. A `stop_sequences` the
+/// caller sent natively wins. `null` and an empty array set nothing; any
+/// other shape stays as sent, for the upstream to reject.
+fn translate_stop_to_anthropic(extras: &mut serde_json::Map<String, serde_json::Value>) {
+    let sequences = match extras.remove("stop") {
+        None | Some(serde_json::Value::Null) => return,
+        Some(serde_json::Value::String(s)) => serde_json::Value::Array(vec![s.into()]),
+        Some(serde_json::Value::Array(items)) if items.is_empty() => return,
+        Some(v @ serde_json::Value::Array(_)) => v,
+        Some(other) => {
+            extras.insert("stop".to_string(), other);
+            return;
+        }
+    };
+    extras
+        .entry("stop_sequences".to_string())
+        .or_insert(sequences);
 }
 
 /// Whether the client stated a `tool_choice` of their own, which the
@@ -2262,6 +2302,7 @@ impl StreamState {
             finish_reason: None,
             usage: None,
             service_tier: self.service_tier.clone(),
+            accounting_usage: None,
         }
     }
 
@@ -2307,6 +2348,7 @@ impl StreamState {
                 finish_reason: None,
                 usage: None,
                 service_tier: self.service_tier.clone(),
+                accounting_usage: None,
             }),
             AnthropicStreamEvent::ContentBlockDelta {
                 delta: AnthropicStreamDelta::ThinkingDelta { thinking },
@@ -2328,6 +2370,7 @@ impl StreamState {
                 finish_reason: None,
                 usage: None,
                 service_tier: self.service_tier.clone(),
+                accounting_usage: None,
             }),
             AnthropicStreamEvent::MessageDelta { delta, usage } => {
                 let finish = delta
@@ -2355,6 +2398,7 @@ impl StreamState {
                     finish_reason: finish,
                     usage,
                     service_tier: self.service_tier.clone(),
+                    accounting_usage: None,
                 })
             }
             _ => None,
@@ -5226,6 +5270,60 @@ mod tests {
     }
 
     #[test]
+    fn build_request_translates_max_completion_tokens_and_stop() {
+        let build_with = |extra: serde_json::Value, max_tokens: Option<u32>| {
+            let req = ChatFormat {
+                max_tokens,
+                extra: extra.as_object().unwrap().clone(),
+                ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+            };
+            let (_system, messages) = split_system(&req).unwrap();
+            serde_json::to_value(build_request(
+                &req,
+                "claude-sonnet-4-5",
+                None,
+                messages,
+                false,
+            ))
+            .unwrap()
+        };
+        let body = build_with(
+            serde_json::json!({"max_completion_tokens": 77, "stop": "END"}),
+            Some(33),
+        );
+        assert_eq!(body["max_tokens"], 77);
+        assert_eq!(body["stop_sequences"], serde_json::json!(["END"]));
+        assert!(body.get("max_completion_tokens").is_none() && body.get("stop").is_none());
+
+        // A native `stop_sequences` is the more specific statement and wins.
+        let body = build_with(
+            serde_json::json!({"stop": ["a"], "stop_sequences": ["b"], "max_completion_tokens": null}),
+            None,
+        );
+        assert_eq!(body["stop_sequences"], serde_json::json!(["b"]));
+        assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
+        assert!(body.get("max_completion_tokens").is_none() && body.get("stop").is_none());
+
+        // Shapes that are neither OpenAI's nor Anthropic's stay as sent.
+        let body = build_with(
+            serde_json::json!({"stop": 5, "max_completion_tokens": "x"}),
+            None,
+        );
+        assert_eq!(body["stop"], 5);
+        assert_eq!(body["max_completion_tokens"], "x");
+        assert!(body.get("stop_sequences").is_none());
+
+        // The thinking budget is sized against the caller's cap, whichever
+        // name it came under.
+        let body = build_with(
+            serde_json::json!({"max_completion_tokens": 8000, "reasoning_effort": "low"}),
+            None,
+        );
+        assert_eq!(body["max_tokens"], 8000);
+        assert!(body["thinking"]["budget_tokens"].as_u64().unwrap() < 8000);
+    }
+
+    #[test]
     fn build_request_strips_tool_choice_from_extra() {
         // Even when the value is unrecognised, tool_choice MUST NOT
         // leak into `extra` — forwarding the OpenAI shape would 400
@@ -6718,6 +6816,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         }
     }
 
@@ -6729,6 +6828,7 @@ mod tests {
             finish_reason: Some(FinishReason::Stop),
             usage: Some(UsageStats::new(0, out_tokens)),
             service_tier: None,
+            accounting_usage: None,
         }
     }
 
@@ -6796,6 +6896,7 @@ mod tests {
             finish_reason: Some(FinishReason::Stop),
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         };
         let events = enc.next_events(&stop_no_usage);
         let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
@@ -6811,6 +6912,7 @@ mod tests {
             finish_reason: None,
             usage: Some(UsageStats::new(17, 23)),
             service_tier: None,
+            accounting_usage: None,
         };
         let events = enc.next_events(&usage_only);
         let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
@@ -6899,6 +7001,7 @@ mod tests {
             finish_reason: Some(FinishReason::Stop),
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         };
         let _ = enc.next_events(&stop_no_usage);
 
@@ -6915,6 +7018,7 @@ mod tests {
                 ..UsageStats::default()
             }),
             service_tier: None,
+            accounting_usage: None,
         };
         let events = enc.next_events(&usage_only);
         let usage = &events[0].data["usage"];
@@ -6935,6 +7039,7 @@ mod tests {
             finish_reason: Some(FinishReason::Stop),
             usage: Some(UsageStats::with_cache(10, 4, 200, 800)),
             service_tier: None,
+            accounting_usage: None,
         };
         let events = enc.next_events(&stop_with_usage);
         let delta = events
@@ -6957,6 +7062,7 @@ mod tests {
             finish_reason: Some(FinishReason::Stop),
             usage: Some(UsageStats::new(17, 23)),
             service_tier: None,
+            accounting_usage: None,
         });
         let delta = events
             .iter()
@@ -6983,6 +7089,7 @@ mod tests {
             finish_reason: Some(FinishReason::ToolCalls),
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         };
         let _ = enc.next_events(&stop_no_usage);
         assert!(!enc.is_finished());
@@ -7074,6 +7181,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         }
     }
 
@@ -7085,6 +7193,7 @@ mod tests {
             finish_reason: Some(FinishReason::ToolCalls),
             usage: Some(UsageStats::new(10, 5)),
             service_tier: None,
+            accounting_usage: None,
         }
     }
 
@@ -7192,6 +7301,7 @@ mod tests {
             finish_reason: None,
             usage: None,
             service_tier: None,
+            accounting_usage: None,
         }
     }
 
