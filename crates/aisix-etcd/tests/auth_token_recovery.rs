@@ -48,10 +48,8 @@ use etcd_client::ConnectOptions;
 
 /// Two tests here change the cluster's auth store, which stales every
 /// token every other test in this file is holding, so they take turns.
-/// Under nextest each test is a process of its own and this lock cannot
-/// reach across them; there the `etcd-auth-ttl` group in
-/// `.config/nextest.toml` serialises this whole file together with the one
-/// test outside it that uses this cluster.
+/// Test binaries are run one at a time, so nothing outside this file is
+/// talking to it.
 static ETCD: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 struct AuthEtcd {
@@ -89,7 +87,7 @@ fn unique_suffix() -> u128 {
 }
 
 fn unique_prefix() -> String {
-    format!("/aisix-token-it-{}-{}", unique_suffix(), std::process::id())
+    format!("/aisix-token-it-{}", unique_suffix())
 }
 
 impl AuthEtcd {

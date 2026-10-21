@@ -290,21 +290,15 @@ async fn env_namespace_isolates_identical_fingerprints() {
 }
 
 /// Cheap unique-ish suffix to keep tests from clobbering each other.
-/// We don't need cryptographic uniqueness — nanos + pid + thread-id give
-/// plenty of spread whether tests run as threads (`cargo test`) or as
-/// parallel processes (nextest), where thread ids repeat.
+/// We don't need cryptographic uniqueness — `cargo test` runs each test
+/// file in a single process, so nanos + thread-id give plenty of spread.
 fn uuid_like() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    format!(
-        "{nanos:x}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    )
-    .replace(['(', ')', ' '], "")
+    format!("{nanos:x}-{:?}", std::thread::current().id()).replace(['(', ')', ' '], "")
 }
 
 /// A TCP relay in front of Redis that a test can black-hole: the socket

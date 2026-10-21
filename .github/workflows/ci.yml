@@ -211,10 +211,8 @@ jobs:
           components: llvm-tools-preview
       - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
-      - name: install cargo-llvm-cov + cargo-nextest
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-llvm-cov,cargo-nextest
+      - name: install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
       - name: Start the authenticated etcds
         # Not service containers: a user has to be created and
         # `auth enable` called after the server is up, which service
@@ -325,10 +323,7 @@ jobs:
           docker exec redis-auth redis-cli -p 6390 -a aisix-ci-redis ping | grep -q PONG \
             || { echo "::error::Authenticated Redis 6390 did not come up"; exit 1; }
       - name: unit tests with coverage
-        # nextest runs every test in its own process, test binaries in
-        # parallel. Tests that share external state across binaries are
-        # serialised by the test groups in .config/nextest.toml.
-        run: cargo llvm-cov nextest --no-fail-fast --workspace --all-features --lcov --output-path lcov-unit.info
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov-unit.info
       - uses: actions/upload-artifact@v7
         with:
           name: coverage-unit
@@ -344,6 +339,8 @@ jobs:
     name: build aisix (instrumented)
     runs-on: ubuntu-latest
     env:
+      RUSTFLAGS: "-C instrument-coverage"
+      LLVM_PROFILE_FILE: "coverage/aisix-%p-%m.profraw"
       AISIX_BUILD_VERSION: 0.0.0-ci
     steps:
       - uses: actions/checkout@v6
