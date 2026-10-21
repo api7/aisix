@@ -10,6 +10,7 @@ import { WebSocket as WsClient, WebSocketServer } from "ws";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   waitConfigPropagation,
@@ -226,10 +227,6 @@ describe("realtime upstream WebSocket follows the proxy environment", () => {
       extra: { upstream: { tls: { verify: false } } },
     });
     const seed = new SeedClient(etcd, app.etcdPrefix);
-    await seed.createApiKey({
-      key_hash: createHash("sha256").update(CALLER).digest("hex"),
-      allowed_models: ["*"],
-    });
     if (tlsUpstream) {
       const pk = await seed.createProviderKey({
         display_name: "rt-proxy-tls-pk",
@@ -254,14 +251,13 @@ describe("realtime upstream WebSocket follows the proxy environment", () => {
       model_name: "gpt-realtime-mock",
       provider_key_id: directPk.id,
     });
-    await waitConfigPropagation(async () => {
-      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
-        headers: { authorization: `Bearer ${CALLER}` },
-      });
-      if (res.status !== 200) return false;
-      const body = (await res.json()) as { data?: Array<{ id?: string }> };
-      return (body.data ?? []).some((m) => m.id === "rt-direct");
+    // Seeded last: once it authenticates, every resource above is live.
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update(CALLER).digest("hex"),
+      allowed_models: ["*"],
     });
+    const client = new ProxyClient(app.proxyUrl, CALLER);
+    await waitConfigPropagation(async () => (await client.listModels()).status === 200);
   });
 
   afterAll(async () => {
@@ -329,10 +325,6 @@ describe("realtime upstream WebSocket through an https:// proxy, and a SOCKS one
       extra: { upstream: { tls: { verify: false } } },
     });
     const seed = new SeedClient(etcd, app.etcdPrefix);
-    await seed.createApiKey({
-      key_hash: createHash("sha256").update(CALLER).digest("hex"),
-      allowed_models: ["*"],
-    });
     const tlsPk = await seed.createProviderKey({
       display_name: "rt-https-proxy-pk",
       secret: "sk-upstream-realtime",
@@ -356,14 +348,13 @@ describe("realtime upstream WebSocket through an https:// proxy, and a SOCKS one
       model_name: "gpt-realtime-mock",
       provider_key_id: socksPk.id,
     });
-    await waitConfigPropagation(async () => {
-      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
-        headers: { authorization: `Bearer ${CALLER}` },
-      });
-      if (res.status !== 200) return false;
-      const body = (await res.json()) as { data?: Array<{ id?: string }> };
-      return (body.data ?? []).some((m) => m.id === "rt-via-socks");
+    // Seeded last: once it authenticates, every resource above is live.
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update(CALLER).digest("hex"),
+      allowed_models: ["*"],
     });
+    const client = new ProxyClient(app.proxyUrl, CALLER);
+    await waitConfigPropagation(async () => (await client.listModels()).status === 200);
   });
 
   afterAll(async () => {
