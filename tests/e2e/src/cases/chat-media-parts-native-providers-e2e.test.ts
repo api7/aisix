@@ -109,6 +109,10 @@ async function startMediaServer(): Promise<MediaServer> {
         res.statusCode = 302;
         res.setHeader("location", `http://localhost:${port}/cat.png`);
         return res.end();
+      case "/to-gone.png":
+        res.statusCode = 302;
+        res.setHeader("location", `http://localhost:${port}/gone.png`);
+        return res.end();
       default:
         return send(404, "text/plain", "not found");
     }
@@ -615,13 +619,17 @@ describe("chat media content parts → native provider media shapes", () => {
       expect(message).toMatch(/^messages\[0\]\.content\[1\]: /);
       expect(message).toContain("outbound.ssrf_protection.allowed_hosts");
       expect(message).toContain("outbound.ssrf_protection.enabled");
+      expect(message).toContain("adds 127.0.0.1 to");
     }
     // Refused before any request left the gateway.
     expect(hits("/cat.png")).toBe(before);
 
-    expect(await refused("media-nova", user(allowed("/to-private.png")))).toContain(
-      "outbound.ssrf_protection.allowed_hosts",
-    );
+    // Refused on the second hop: the error names that hop and its host,
+    // since allow-listing the first one would change nothing.
+    const redirected = await refused("media-nova", user(allowed("/to-private.png")));
+    expect(redirected).toContain("outbound.ssrf_protection.allowed_hosts");
+    expect(redirected).toContain(`redirected to ${JSON.stringify(unlisted("/cat.png"))}`);
+    expect(redirected).toContain("adds 127.0.0.1 to");
     const followed = await chat("media-nova", [text("hi"), image(allowed("/to-allowed.png"))]);
     expect(followed.messages[0].content).toContainEqual({
       image: { format: "png", source: { bytes: PNG_B64 } },
@@ -640,6 +648,10 @@ describe("chat media content parts → native provider media shapes", () => {
     expect(missing).not.toContain("sekrit");
     // An answer, not a transport failure: asked once.
     expect(hits("/gone.png") - before).toBe(1);
+    // A later hop's answer names that hop.
+    expect(await refused("media-nova", user(allowed("/to-gone.png")))).toContain(
+      `from ${JSON.stringify(allowed("/gone.png"))}`,
+    );
 
     expect(await refused("media-nova", user("ftp://files.example/cat.png"))).toContain(
       "does not read media from a URL",

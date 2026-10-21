@@ -87,12 +87,7 @@ impl SsrfProtection {
     /// How a request to `url` is sent, or why it may not be. Async because
     /// a URL an environment proxy takes is resolved and checked here.
     pub async fn route(&self, url: &Url) -> Result<Route, Refusal> {
-        let (host, ip) = match url.host() {
-            Some(url::Host::Domain(d)) => (d.trim_end_matches('.').to_ascii_lowercase(), None),
-            Some(url::Host::Ipv4(a)) => (a.to_string(), Some(IpAddr::V4(a))),
-            Some(url::Host::Ipv6(a)) => (a.to_string(), Some(IpAddr::V6(a))),
-            None => return Err(Refusal::BadUrl),
-        };
+        let (host, ip) = host_of(url).ok_or(Refusal::BadUrl)?;
         let port = url.port_or_known_default().ok_or(Refusal::BadUrl)?;
         let proxied = self.proxied(url);
         let unchecked = if proxied {
@@ -119,6 +114,16 @@ impl SsrfProtection {
     }
 }
 
+/// `url`'s host as an `allowed_hosts` entry spells it, and the address
+/// when the host is an address literal.
+fn host_of(url: &Url) -> Option<(String, Option<IpAddr>)> {
+    Some(match url.host()? {
+        url::Host::Domain(d) => (d.trim_end_matches('.').to_ascii_lowercase(), None),
+        url::Host::Ipv4(a) => (a.to_string(), Some(IpAddr::V4(a))),
+        url::Host::Ipv6(a) => (a.to_string(), Some(IpAddr::V6(a))),
+    })
+}
+
 /// The client a permitted request goes out on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
@@ -140,11 +145,17 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    /// The error a caller gets for a blocked host, naming the settings an
-    /// operator would change.
-    pub fn blocked_hint() -> &'static str {
-        "To allow it, an operator adds the host to outbound.ssrf_protection.allowed_hosts, \
-         or turns the check off with outbound.ssrf_protection.enabled: false"
+    /// The error a caller gets for `url`'s blocked host, naming the host
+    /// and the settings an operator would change. Never the address the
+    /// host resolved to.
+    pub fn blocked_hint(url: Option<&Url>) -> String {
+        let host = url
+            .and_then(host_of)
+            .map_or_else(|| "the host".to_string(), |(host, _)| host);
+        format!(
+            "To allow it, an operator adds {host} to outbound.ssrf_protection.allowed_hosts, \
+             or turns the check off with outbound.ssrf_protection.enabled: false"
+        )
     }
 
     /// The refusal a resolver error carries, if any.
