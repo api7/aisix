@@ -487,7 +487,10 @@ pub struct OpenAiStreamChunk {
     pub id: String,
     #[serde(default)]
     pub model: String,
-    pub choices: Vec<OpenAiStreamChoice>,
+    /// `None` when the key is absent: OpenAI sends such a chunk on
+    /// audio-output streams, between the finish and the usage chunk.
+    #[serde(default)]
+    pub choices: Option<Vec<OpenAiStreamChoice>>,
     #[serde(default)]
     pub usage: Option<OpenAiUsage>,
     /// See [`OpenAiResponse::service_tier`].
@@ -527,6 +530,10 @@ pub struct OpenAiStreamDelta {
     /// omit the field) parse unaffected.
     #[serde(default)]
     pub reasoning: Option<String>,
+    /// Audio output models stream `delta.audio` (`id`, `transcript`,
+    /// `data`, and a final `expires_at`); relayed as sent.
+    #[serde(default)]
+    pub audio: Option<serde_json::Value>,
 }
 
 /// Supplies the `index` a streamed tool-call delta omits.
@@ -580,11 +587,16 @@ impl ToolCallIndexer {
     }
 }
 
+/// `None` for a chunk with no `choices` key and no usage, which carries
+/// nothing to relay.
 pub fn stream_chunk_into_chat_chunk(
     mut raw: OpenAiStreamChunk,
     tool_call_indexer: &mut ToolCallIndexer,
-) -> ChatChunk {
-    let first = raw.choices.drain(..).next();
+) -> Option<ChatChunk> {
+    if raw.choices.is_none() && raw.usage.is_none() {
+        return None;
+    }
+    let first = raw.choices.take().unwrap_or_default().into_iter().next();
     let (delta, finish) = match first {
         Some(c) => (
             ChatDelta {
@@ -603,6 +615,7 @@ pub fn stream_chunk_into_chat_chunk(
                     .reasoning_content
                     .filter(|s| !s.is_empty())
                     .or(c.delta.reasoning.filter(|s| !s.is_empty())),
+                audio: c.delta.audio.filter(|a| !a.is_null()),
             },
             c.finish_reason
                 .as_deref()
@@ -610,14 +623,14 @@ pub fn stream_chunk_into_chat_chunk(
         ),
         None => (ChatDelta::default(), None),
     };
-    ChatChunk {
+    Some(ChatChunk {
         id: raw.id,
         model: raw.model,
         delta,
         finish_reason: finish,
         usage: raw.usage.map(into_usage),
         service_tier: service_tier_of(raw.service_tier.as_ref()),
-    }
+    })
 }
 
 // ─── Embeddings wire types ────────────────────────────────────────────────────
@@ -1378,9 +1391,37 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         assert_eq!(chunk.delta.content.as_deref(), Some("hel"));
         assert!(chunk.finish_reason.is_none());
+    }
+
+    /// Audio-output streams carry `delta.audio`, and OpenAI sends one
+    /// chunk with no `choices` key between the finish and the usage chunk.
+    #[test]
+    fn stream_chunk_relays_audio_and_tolerates_a_chunk_without_choices() {
+        let body = r#"{"id": "c", "choices": [{"index": 0,
+            "delta": {"audio": {"id": "audio_1", "transcript": "Hel"}}}]}"#;
+        let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
+        assert_eq!(
+            chunk.delta.audio,
+            Some(serde_json::json!({"id": "audio_1", "transcript": "Hel"}))
+        );
+
+        let body = r#"{"id": "c", "object": "chat.completion.chunk", "usage": null,
+            "obfuscation": "x"}"#;
+        let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
+        assert!(stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).is_none());
+
+        // The usage chunk has an empty `choices` and is kept.
+        let body = r#"{"id": "c", "choices": [], "usage": {"prompt_tokens": 1,
+            "completion_tokens": 2, "total_tokens": 3}}"#;
+        let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
+        assert!(
+            stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default())
+                .is_some_and(|c| c.usage.is_some())
+        );
     }
 
     #[test]
@@ -1395,7 +1436,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         assert_eq!(chunk.finish_reason, Some(FinishReason::Stop));
     }
 
@@ -1418,7 +1459,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         let tc = chunk.delta.tool_calls.expect("tool_calls in delta");
         assert_eq!(tc.len(), 1);
         assert_eq!(tc[0]["id"], "call_abc");
@@ -1437,7 +1478,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         assert_eq!(
             chunk.delta.reasoning_content.as_deref(),
             Some("thinking...")
@@ -1459,7 +1500,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         assert_eq!(
             chunk.delta.reasoning_content.as_deref(),
             Some("let me reason about this")
@@ -1478,7 +1519,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         assert_eq!(chunk.delta.reasoning_content.as_deref(), Some("canonical"));
     }
 
@@ -1494,7 +1535,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         assert_eq!(chunk.delta.reasoning_content.as_deref(), Some("fallback"));
     }
 
@@ -1510,7 +1551,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default());
+        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         assert!(chunk.delta.reasoning_content.is_none());
     }
 
@@ -1701,12 +1742,16 @@ mod tests {
             "id": "x", "choices": [], "service_tier": "flex"
         }));
         assert_eq!(
-            stream_chunk_into_chat_chunk(chunk, &mut ToolCallIndexer::default()).service_tier,
+            stream_chunk_into_chat_chunk(chunk, &mut ToolCallIndexer::default())
+                .unwrap()
+                .service_tier,
             Some(ServiceTier::OpenAi("flex".into()))
         );
         let chunk = stream_chunk(serde_json::json!({"id": "x", "choices": []}));
         assert_eq!(
-            stream_chunk_into_chat_chunk(chunk, &mut ToolCallIndexer::default()).service_tier,
+            stream_chunk_into_chat_chunk(chunk, &mut ToolCallIndexer::default())
+                .unwrap()
+                .service_tier,
             None
         );
     }
@@ -1718,7 +1763,9 @@ mod tests {
             "tool_calls": [{"id": "a", "function": {"name": "f", "arguments": "{}"}}]
         }}]}));
         assert_eq!(
-            stream_chunk_into_chat_chunk(call, &mut indexer).finish_reason,
+            stream_chunk_into_chat_chunk(call, &mut indexer)
+                .unwrap()
+                .finish_reason,
             None
         );
         let end = |reason: &str| {
@@ -1727,15 +1774,20 @@ mod tests {
             ]}))
         };
         assert_eq!(
-            stream_chunk_into_chat_chunk(end("stop"), &mut indexer).finish_reason,
+            stream_chunk_into_chat_chunk(end("stop"), &mut indexer)
+                .unwrap()
+                .finish_reason,
             Some(FinishReason::ToolCalls)
         );
         assert_eq!(
-            stream_chunk_into_chat_chunk(end("length"), &mut indexer).finish_reason,
+            stream_chunk_into_chat_chunk(end("length"), &mut indexer)
+                .unwrap()
+                .finish_reason,
             Some(FinishReason::Length)
         );
         assert_eq!(
             stream_chunk_into_chat_chunk(end("stop"), &mut ToolCallIndexer::default())
+                .unwrap()
                 .finish_reason,
             Some(FinishReason::Stop)
         );

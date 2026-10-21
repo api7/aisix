@@ -1193,6 +1193,11 @@ pub struct ChatDelta {
     /// emitter is a passthrough.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// OpenAI's streamed audio output (`delta.audio`: `id`, `transcript`,
+    /// `data`, `expires_at`), relayed as the upstream sent it — the
+    /// streaming counterpart of the non-stream `message.audio`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<serde_json::Value>,
 }
 
 // ─── Embeddings ──────────────────────────────────────────────────────────────
@@ -2067,6 +2072,7 @@ mod tests {
                 content: Some("hello".into()),
                 tool_calls: None,
                 reasoning_content: None,
+                audio: None,
             },
             finish_reason: None,
             usage: None,

@@ -844,8 +844,9 @@ where
                     }
                     SseEvent::Data(payload) => {
                         let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                        yield stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer)
-                    .with_fallback_service_tier(&header_tier);
+                        if let Some(chunk) = stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                    yield chunk.with_fallback_service_tier(&header_tier);
+                }
                     }
                 }
             }
@@ -863,8 +864,9 @@ where
             }
             Some(SseEvent::Data(payload)) => {
                 let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                yield stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer)
-                    .with_fallback_service_tier(&header_tier);
+                if let Some(chunk) = stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                    yield chunk.with_fallback_service_tier(&header_tier);
+                }
             }
             None => {}
         }

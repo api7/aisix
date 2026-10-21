@@ -231,6 +231,9 @@ pub struct RenderedDelta {
     /// — issue #302 §5.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// OpenAI's `delta.audio`, as the upstream streamed it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<serde_json::Value>,
 }
 
 pub fn render_response(
@@ -283,6 +286,7 @@ pub fn render_chunk(
                 content: chunk.delta.content,
                 tool_calls: chunk.delta.tool_calls,
                 reasoning_content: chunk.delta.reasoning_content,
+                audio: chunk.delta.audio,
             },
             finish_reason: chunk
                 .finish_reason
@@ -588,6 +592,7 @@ mod tests {
                 content: None,
                 tool_calls: None,
                 reasoning_content: None,
+                audio: None,
             },
             finish_reason: Some(FinishReason::Stop),
             usage: Some(usage),
@@ -633,6 +638,7 @@ mod tests {
                 content: Some("hi".into()),
                 tool_calls: None,
                 reasoning_content: None,
+                audio: None,
             },
             finish_reason: None,
             usage: None,
@@ -659,6 +665,7 @@ mod tests {
                 content: Some("hi".into()),
                 tool_calls: None,
                 reasoning_content: None,
+                audio: None,
             },
             finish_reason: None,
             usage: None,
