@@ -1,5 +1,11 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, request as httpRequest, type IncomingMessage, type Server } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
+import { connect as netConnect } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { EtcdClient, SeedClient, spawnApp, waitConfigPropagation, type SpawnedApp } from "../harness/index.js";
 
@@ -23,9 +29,36 @@ const MODEL = "meta.llama3-3-70b-instruct-v1:0";
 
 type Reply = { status?: number; headers?: Record<string, string>; body: string };
 
-async function listen(handler: (path: string, raw: string) => Reply) {
+/** A throwaway CA and a `localhost` leaf it signs, or `undefined` without
+ * openssl. The AWS SDK stack cannot skip verification, so the gateway is
+ * handed the CA through `upstream.tls.ca_file`. */
+function makePki(): { caPath: string; key: Buffer; cert: Buffer } | undefined {
+  try {
+    execFileSync("openssl", ["version"], { stdio: "ignore" });
+  } catch {
+    return undefined;
+  }
+  const dir = mkdtempSync(join(tmpdir(), "aisix-bedrock-proxy-tls-"));
+  const p = (name: string) => join(dir, name);
+  const openssl = (args: string[]) => execFileSync("openssl", args, { stdio: "ignore" });
+  openssl(["genrsa", "-out", p("ca.key"), "2048"]);
+  openssl(["req", "-x509", "-new", "-key", p("ca.key"), "-out", p("ca.crt"), "-days", "1", "-sha256", "-subj", "/CN=aisix-e2e-proxy-ca"]);
+  openssl(["genrsa", "-out", p("server.key"), "2048"]);
+  openssl(["req", "-new", "-key", p("server.key"), "-out", p("server.csr"), "-subj", "/CN=localhost"]);
+  writeFileSync(p("ext.cnf"), "subjectAltName=DNS:localhost\n", "utf8");
+  openssl([
+    "x509", "-req", "-in", p("server.csr"), "-CA", p("ca.crt"), "-CAkey", p("ca.key"),
+    "-CAcreateserial", "-out", p("server.crt"), "-days", "1", "-sha256", "-extfile", p("ext.cnf"),
+  ]);
+  return { caPath: p("ca.crt"), key: readFileSync(p("server.key")), cert: readFileSync(p("server.crt")) };
+}
+
+async function listen(
+  handler: (path: string, raw: string) => Reply,
+  tls?: { key: Buffer; cert: Buffer },
+) {
   const paths: string[] = [];
-  const server: Server = createServer((req: IncomingMessage, res) => {
+  const onRequest = (req: IncomingMessage, res: import("node:http").ServerResponse) => {
     let raw = "";
     req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
     req.on("end", () => {
@@ -35,14 +68,16 @@ async function listen(handler: (path: string, raw: string) => Reply) {
       res.writeHead(reply.status ?? 200, { "content-type": "application/json", ...(reply.headers ?? {}) });
       res.end(reply.body);
     });
-  });
+  };
+  const server: Server = tls ? createHttpsServer(tls, onRequest) : createServer(onRequest);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const addr = server.address();
   if (addr === null || typeof addr === "string") throw new Error("no port");
   return { server, port: addr.port, paths };
 }
 
-/** Relays absolute-form `http://` requests and records each request line. */
+/** Relays absolute-form `http://` requests, tunnels `CONNECT`, and records
+ * each request line. */
 async function startForwardProxy() {
   const seen: string[] = [];
   const server: Server = createServer((req, res) => {
@@ -63,6 +98,18 @@ async function startForwardProxy() {
     );
     out.on("error", () => res.destroy());
     req.pipe(out);
+  });
+  server.on("connect", (req, client, head) => {
+    seen.push(`CONNECT ${req.url}`);
+    const [host, port] = (req.url ?? "").split(":");
+    const up = netConnect(Number(port), host, () => {
+      client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      up.write(head);
+      up.pipe(client);
+      client.pipe(up);
+    });
+    up.on("error", () => client.destroy());
+    client.on("error", () => up.destroy());
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const addr = server.address();
@@ -97,6 +144,7 @@ describe("Bedrock clients honour the proxy environment", () => {
   let bedrock: Awaited<ReturnType<typeof listen>> | undefined;
   let stsMock: Awaited<ReturnType<typeof listen>> | undefined;
   let guardrail: Awaited<ReturnType<typeof listen>> | undefined;
+  let tlsBedrock: Awaited<ReturnType<typeof listen>> | undefined;
   let proxy: Awaited<ReturnType<typeof startForwardProxy>> | undefined;
   let etcdReachable = false;
 
@@ -108,6 +156,8 @@ describe("Bedrock clients honour the proxy environment", () => {
     stsMock = await listen(sts);
     guardrail = await listen(() => ({ body: JSON.stringify({ action: "NONE", outputs: [] }) }));
     proxy = await startForwardProxy();
+    const pki = makePki();
+    if (pki) tlsBedrock = await listen(converse, pki);
 
     app = await spawnApp({
       extraEnv: {
@@ -124,7 +174,10 @@ describe("Bedrock clients honour the proxy environment", () => {
         AWS_CONFIG_FILE: "/nonexistent/aisix-e2e-aws-config",
         AWS_SHARED_CREDENTIALS_FILE: "/nonexistent/aisix-e2e-aws-credentials",
       },
-      extra: { bedrock_endpoint_url: `http://localhost:${guardrail.port}` },
+      extra: {
+        bedrock_endpoint_url: `http://localhost:${guardrail.port}`,
+        ...(pki ? { upstream: { tls: { ca_file: pki.caPath } } } : {}),
+      },
     });
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const keys: Array<[string, string, Record<string, unknown>]> = [
@@ -144,6 +197,13 @@ describe("Bedrock clients honour the proxy environment", () => {
         { auth_type: "default_chain", role_arn: `arn:aws:iam::${ACCOUNT}:role/Proxied`, region: "us-east-1" },
       ],
     ];
+    if (tlsBedrock) {
+      keys.push([
+        "tunnel",
+        `https://localhost:${tlsBedrock.port}`,
+        { access_key_id: "AKIDTUNNEL0000000001", secret_access_key: "s", region: "us-east-1" },
+      ]);
+    }
     for (const [name, apiBase, secret] of keys) {
       const pk = await seed.createProviderKey({
         display_name: `envproxy-${name}`,
@@ -159,6 +219,20 @@ describe("Bedrock clients honour the proxy environment", () => {
         provider_key_id: pk.id,
       });
     }
+    // Fail-closed, so a guardrail call the proxy could not carry fails the
+    // request. Seeded before the caller key, which the readiness gate waits on.
+    await seed.createGuardrail({
+      name: "envproxy-guardrail",
+      enabled: true,
+      hook_point: "input",
+      fail_open: false,
+      kind: "bedrock",
+      guardrail_id: "envproxygr01",
+      guardrail_version: "DRAFT",
+      region: "us-east-1",
+      aws_credentials: { kind: "static", access_key_id: "AKIDGUARDPROXY000001", secret_access_key: "s" },
+      latency_mode: { kind: "serial" },
+    });
     await seed.createApiKey({
       key_hash: CALLER_HASH,
       allowed_models: keys.map(([name]) => `envproxy-${name}`),
@@ -172,7 +246,8 @@ describe("Bedrock clients honour the proxy environment", () => {
 
   afterAll(async () => {
     await app?.exit();
-    for (const s of [bedrock?.server, stsMock?.server, guardrail?.server, proxy?.server]) {
+    proxy?.server.closeAllConnections();
+    for (const s of [bedrock?.server, stsMock?.server, guardrail?.server, tlsBedrock?.server, proxy?.server]) {
       if (s) await new Promise<void>((resolve) => s.close(() => resolve()));
     }
   });
@@ -202,6 +277,17 @@ describe("Bedrock clients honour the proxy environment", () => {
     expect(proxy!.seen.some((l) => l.startsWith(`POST http://localhost:${bedrock!.port}/model/`))).toBe(true);
   });
 
+  test("an https Bedrock endpoint is tunnelled through the proxy", async (ctx) => {
+    if (skip(ctx)) return;
+    if (!tlsBedrock) return ctx.skip();
+    const res = await chat("envproxy-tunnel");
+    expect(res.status, res.text).toBe(200);
+    expect(proxy!.seen).toContain(`CONNECT localhost:${tlsBedrock.port}`);
+    // The SDK's HTTP/1 client sends the absolute-form target inside the
+    // tunnel too; servers must accept it (RFC 9112 §3.2.2), and Bedrock does.
+    expect(tlsBedrock.paths.some((p) => p.includes(`localhost:${tlsBedrock!.port}/model/`) || p.startsWith("/model/"))).toBe(true);
+  });
+
   test("a host NO_PROXY covers is reached directly", async (ctx) => {
     if (skip(ctx)) return;
     const before = proxy!.seen.length;
@@ -220,24 +306,10 @@ describe("Bedrock clients honour the proxy environment", () => {
 
   test("the Bedrock guardrail call goes through the proxy", async (ctx) => {
     if (skip(ctx)) return;
-    const etcd = new EtcdClient();
-    const seed = new SeedClient(etcd, app!.etcdPrefix);
-    await seed.createGuardrail({
-      name: "envproxy-guardrail",
-      enabled: true,
-      hook_point: "input",
-      fail_open: false,
-      kind: "bedrock",
-      guardrail_id: "envproxygr01",
-      guardrail_version: "DRAFT",
-      region: "us-east-1",
-      aws_credentials: { kind: "static", access_key_id: "AKIDGUARDPROXY000001", secret_access_key: "s" },
-      latency_mode: { kind: "serial" },
-    });
-    await waitConfigPropagation(async () => {
-      const res = await chat("envproxy-direct");
-      return res.status === 200 && guardrail!.paths.length > 0;
-    });
+    const before = guardrail!.paths.length;
+    const res = await chat("envproxy-direct");
+    expect(res.status, res.text).toBe(200);
+    expect(guardrail!.paths.length).toBeGreaterThan(before);
     expect(proxy!.seen.some((l) => l.startsWith(`POST http://localhost:${guardrail!.port}/guardrail/`))).toBe(true);
   });
 });
