@@ -164,7 +164,8 @@ describe("/v1/realtime close handshake", () => {
     (s.ws as unknown as { _socket: NodeJS.WritableStream })._socket.write(
       Buffer.concat([Buffer.from([0x88, 0x80 | payload.length, 0, 0, 0, 0]), payload]),
     );
-    await s.closed;
+    // The client's own close is still answered rather than reset.
+    expect((await s.closed).code).not.toBe(1006);
     await expect.poll(() => upstream!.closesSeen.length).toBe(before + 1);
     expect(upstream!.closesSeen[before]).toBe(1011);
   });

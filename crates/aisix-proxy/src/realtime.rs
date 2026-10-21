@@ -1011,9 +1011,10 @@ async fn run_session(
                     }
                 }
                 Some(Ok(AxMessage::Close(frame))) => {
-                    // The transport has already queued the reply echoing
-                    // the client's code; it goes out on the flush, and
-                    // without one the client sees 1006.
+                    // The transport has already queued its reply (the
+                    // client's code, or the library's 1002 for one that may
+                    // not be sent); it goes out on the flush, and without
+                    // one the client sees 1006.
                     let _ = client_tx.close().await;
                     // A client code that may not be sent arrives as the
                     // library's substitute; the upstream gets 1011, not a
@@ -1500,25 +1501,30 @@ mod tests {
     async fn library_rejected_close_matches_what_tungstenite_substitutes() {
         use futures::StreamExt;
         use tokio::io::AsyncWriteExt;
-        let (local, mut remote) = tokio::io::duplex(64);
-        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
-            local,
-            tokio_tungstenite::tungstenite::protocol::Role::Client,
-            None,
-        )
-        .await;
-        // Unmasked server Close carrying 1004, a code that may not be sent.
-        remote
-            .write_all(&[0x88, 0x04, 0x03, 0xEC, b'r', b'1'])
-            .await
-            .unwrap();
-        let Some(Ok(TgMessage::Close(Some(frame)))) = ws.next().await else {
-            panic!("expected a Close frame");
-        };
-        assert_eq!(
-            (u16::from(frame.code), frame.reason.as_ref()),
-            super::LIBRARY_REJECTED_CLOSE
-        );
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        // A Close carrying 1004, a code that may not be sent: unmasked as
+        // the upstream sends it to the gateway's client role, and masked
+        // (all-zero key) as a client sends it to axum's server role.
+        for (role, frame) in [
+            (Role::Client, &[0x88, 0x04, 0x03, 0xEC, b'r', b'1'][..]),
+            (
+                Role::Server,
+                &[0x88, 0x84, 0, 0, 0, 0, 0x03, 0xEC, b'r', b'1'][..],
+            ),
+        ] {
+            let (local, mut remote) = tokio::io::duplex(64);
+            let mut ws =
+                tokio_tungstenite::WebSocketStream::from_raw_socket(local, role, None).await;
+            remote.write_all(frame).await.unwrap();
+            let Some(Ok(TgMessage::Close(Some(close)))) = ws.next().await else {
+                panic!("expected a Close frame ({role:?})");
+            };
+            assert_eq!(
+                (u16::from(close.code), close.reason.as_ref()),
+                super::LIBRARY_REJECTED_CLOSE,
+                "{role:?}"
+            );
+        }
     }
 
     /// JSON lets both a key and a string value be spelled with escapes, and
