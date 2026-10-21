@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_config::provider_config::ProviderConfig;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_credential_types::provider::{
     error::CredentialsError, future, ProvideCredentials, SharedCredentialsProvider,
@@ -224,9 +226,31 @@ impl RefreshingCredentials {
                     Some(d) => timeouts = timeouts.connect_timeout(d),
                     None => timeouts = timeouts.disable_connect_timeout(),
                 }
+                let region = Region::new(self.spec.region.clone());
+                // The chain's instance-metadata calls never go through the
+                // proxy environment, wherever aws-config resolves the
+                // endpoint (the default, the IPv6 endpoint mode, or a
+                // configured endpoint); everything else on the chain —
+                // its STS calls included — uses the shared client.
+                let imds = aws_config::imds::Client::builder()
+                    .configure(&ProviderConfig::default().with_http_client(
+                        crate::upstream_tls::aws_credential_endpoint_http_client(),
+                    ))
+                    .build();
+                let chain = DefaultCredentialsChain::builder()
+                    .configure(
+                        ProviderConfig::default()
+                            .with_http_client(crate::upstream_tls::aws_http_client())
+                            .with_region(Some(region.clone())),
+                    )
+                    .region(region.clone())
+                    .imds_client(imds)
+                    .build()
+                    .await;
                 aws_config::defaults(BehaviorVersion::latest())
-                    .region(Region::new(self.spec.region.clone()))
+                    .region(region)
                     .http_client(crate::upstream_tls::aws_http_client())
+                    .credentials_provider(chain)
                     .timeout_config(timeouts.build())
                     .load()
                     .await

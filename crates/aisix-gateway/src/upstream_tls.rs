@@ -573,21 +573,36 @@ fn aws_pooled_builder(
         .proxy_config(proxy)
 }
 
-/// The link-local credential endpoints of the AWS default credential
-/// chain — EC2 instance metadata (IPv4 and IPv6), ECS task credentials,
-/// and EKS Pod Identity — which [`aws_http_client`] always reaches
-/// directly, whatever the proxy environment says. They are only
-/// reachable from the host itself, so an egress proxy can never serve
-/// them; before the AWS client honoured the proxy environment they were
-/// always reached directly, and a deployment's `NO_PROXY` was never
-/// written with them in mind.
+/// The fixed addresses of the AWS default credential chain's endpoints —
+/// EC2 instance metadata (IPv4 and IPv6), ECS task credentials, and EKS
+/// Pod Identity (IPv4 and IPv6) — which [`aws_http_client`] always reaches
+/// directly, whatever the proxy environment says. They are only reachable
+/// from the host itself, so an egress proxy can never serve them; before
+/// the AWS client honoured the proxy environment they were always reached
+/// directly, and a deployment's `NO_PROXY` was never written with them in
+/// mind. Loopback hosts and a configured container-credentials URI go
+/// direct too, and the instance-metadata client is direct whatever
+/// endpoint it resolves — see [`aws_http_client`].
 #[cfg(feature = "aws")]
-pub const AWS_CREDENTIAL_ENDPOINT_HOSTS: [&str; 4] = [
+pub const AWS_CREDENTIAL_ENDPOINT_HOSTS: [&str; 5] = [
     "169.254.169.254",
     "[fd00:ec2::254]",
     "169.254.170.2",
     "169.254.170.23",
+    "[fd00:ec2::23]",
 ];
+
+#[cfg(feature = "aws")]
+struct AwsClients {
+    routed: aws_smithy_runtime_api::client::http::SharedHttpClient,
+    direct: aws_smithy_runtime_api::client::http::SharedHttpClient,
+}
+
+#[cfg(feature = "aws")]
+fn aws_clients() -> &'static AwsClients {
+    static CLIENTS: OnceLock<AwsClients> = OnceLock::new();
+    CLIENTS.get_or_init(build_aws_clients)
+}
 
 /// The HTTP client every Bedrock SDK client is built on, carrying the
 /// deployment's extra trust roots, `upstream.pool_idle_timeout`, and the
@@ -598,10 +613,17 @@ pub const AWS_CREDENTIAL_ENDPOINT_HOSTS: [&str; 4] = [
 ///
 /// The proxy is `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`,
 /// read through the same matcher reqwest uses for every other upstream
-/// client, so a host is proxied or not the same way on both stacks —
-/// except [`AWS_CREDENTIAL_ENDPOINT_HOSTS`], which are always direct. The
-/// Bedrock runtime, the Bedrock guardrail and every STS call go through
-/// the proxy like any other upstream.
+/// client, so a host is proxied or not the same way on both stacks. The
+/// Bedrock runtime, the Bedrock guardrail and every STS call — including
+/// the ones the default credential chain makes for web identity, SSO or a
+/// profile role — go through the proxy like any other upstream. What the
+/// chain sends to its own credential endpoints does not: a request for
+/// one of [`AWS_CREDENTIAL_ENDPOINT_HOSTS`], for a loopback host (a local
+/// credential agent), or for the host of
+/// `AWS_CONTAINER_CREDENTIALS_FULL_URI` is sent by a never-proxied client
+/// instead, and the instance-metadata client is built on
+/// [`aws_credential_endpoint_http_client`] outright, so a custom IMDS
+/// endpoint is direct however aws-config resolved it.
 ///
 /// Two of the four `upstream.tls` knobs stop here, because the SDK's
 /// HTTP stack exposes trust roots and nothing else on its stable
@@ -613,9 +635,16 @@ pub const AWS_CREDENTIAL_ENDPOINT_HOSTS: [&str; 4] = [
 /// — is fully served by `ca_file`.
 #[cfg(feature = "aws")]
 pub fn aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
-    static CLIENT: OnceLock<aws_smithy_runtime_api::client::http::SharedHttpClient> =
-        OnceLock::new();
-    CLIENT.get_or_init(build_aws_http_client).clone()
+    aws_clients().routed.clone()
+}
+
+/// The never-proxied side of [`aws_http_client`], with the same trust
+/// roots and connection pool: the HTTP client for the default credential
+/// chain's instance-metadata calls.
+#[cfg(feature = "aws")]
+pub fn aws_credential_endpoint_http_client(
+) -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    aws_clients().direct.clone()
 }
 
 /// The same client, built fresh and therefore carrying its own
@@ -632,17 +661,11 @@ pub fn aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClie
 /// "runtime dropped the dispatch task" instead of reaching the server.
 #[cfg(feature = "aws")]
 pub fn build_aws_http_client() -> aws_smithy_runtime_api::client::http::SharedHttpClient {
-    build_aws_http_client_direct_to(&AWS_CREDENTIAL_ENDPOINT_HOSTS)
+    build_aws_clients().routed
 }
 
-/// [`build_aws_http_client`] with the always-direct hosts given, so a
-/// test can name a loopback host in place of the link-local endpoints it
-/// cannot bind. Hosts are compared as a URL spells them: an IPv6 address
-/// in brackets, no port.
 #[cfg(feature = "aws")]
-pub fn build_aws_http_client_direct_to(
-    direct_hosts: &[&str],
-) -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+fn build_aws_clients() -> AwsClients {
     use aws_smithy_http_client::proxy::ProxyConfig;
     use aws_smithy_http_client::tls;
     let tls_cfg = &crate::upstream_http::config().tls;
@@ -680,15 +703,31 @@ pub fn build_aws_http_client_direct_to(
     };
     // Two clients because the smithy proxy setting cannot add hosts to
     // the environment's `NO_PROXY`: the environment one, and one that is
-    // never proxied for the hosts that must stay direct.
-    aws_smithy_runtime_api::client::http::SharedHttpClient::new(aws_split::DirectForHosts {
-        proxied: client(ProxyConfig::from_env()),
-        direct: client(ProxyConfig::disabled()),
-        hosts: direct_hosts
-            .iter()
-            .map(|h| h.to_ascii_lowercase())
-            .collect(),
-    })
+    // never proxied for the credential endpoints.
+    let direct = client(ProxyConfig::disabled());
+    let mut hosts: Vec<String> = AWS_CREDENTIAL_ENDPOINT_HOSTS
+        .iter()
+        .map(|h| h.to_string())
+        .collect();
+    // The container-credentials provider reads the same variable; an
+    // `https` URI there may name any host.
+    if let Some(host) = std::env::var("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+        .ok()
+        .and_then(|uri| uri.parse::<http::Uri>().ok())
+        .and_then(|uri| uri.host().map(str::to_owned))
+    {
+        hosts.push(host);
+    }
+    AwsClients {
+        routed: aws_smithy_runtime_api::client::http::SharedHttpClient::new(
+            aws_split::DirectForHosts {
+                proxied: client(ProxyConfig::from_env()),
+                direct: direct.clone(),
+                hosts: hosts.into(),
+            },
+        ),
+        direct,
+    }
 }
 
 #[cfg(feature = "aws")]
@@ -757,6 +796,22 @@ mod aws_split {
         }
     }
 
+    /// Whether a request for `host` (as a URI spells it: an IPv6 address
+    /// in brackets) bypasses the proxy: one of `hosts`, or loopback.
+    pub(super) fn goes_direct(host: &str, hosts: &[String]) -> bool {
+        if host.eq_ignore_ascii_case("localhost")
+            || hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
+        {
+            return true;
+        }
+        let bare = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        bare.parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+    }
+
     #[derive(Debug)]
     struct Split {
         proxied: SharedHttpConnector,
@@ -766,10 +821,11 @@ mod aws_split {
 
     impl HttpConnector for Split {
         fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-            let direct = url::Url::parse(request.uri())
+            let direct = request
+                .uri()
+                .parse::<http::Uri>()
                 .ok()
-                .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
-                .is_some_and(|host| self.hosts.contains(&host));
+                .is_some_and(|u| u.host().is_some_and(|host| goes_direct(host, &self.hosts)));
             if direct {
                 self.direct.call(request)
             } else {
@@ -905,7 +961,7 @@ mod tests {
         // function body: this test's own text mentions the helper too.
         let src = include_str!("upstream_tls.rs");
         let body = src
-            .split_once("pub fn build_aws_http_client_direct_to(")
+            .split_once("fn build_aws_clients(")
             .expect("build_aws_http_client is defined in this file")
             .1
             .split_once("\n}\n")
@@ -919,8 +975,8 @@ mod tests {
 
     /// The credential endpoints the AWS client never proxies: EC2
     /// instance metadata over IPv4 and IPv6, ECS task credentials, and
-    /// EKS Pod Identity — and nothing else, since every other AWS call
-    /// must follow the proxy environment.
+    /// EKS Pod Identity over IPv4 and IPv6 — and nothing else, since every
+    /// other AWS call must follow the proxy environment.
     #[cfg(feature = "aws")]
     #[test]
     fn the_aws_client_bypasses_exactly_the_credential_endpoints() {
@@ -931,12 +987,38 @@ mod tests {
                 "[fd00:ec2::254]",
                 "169.254.170.2",
                 "169.254.170.23",
+                "[fd00:ec2::23]",
             ]
         );
-        // Spelled as a parsed URL reports the host, or the match never hits.
+        let hosts: Vec<String> = AWS_CREDENTIAL_ENDPOINT_HOSTS
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
+        let direct = |uri: &str| {
+            let parsed: http::Uri = uri.parse().unwrap();
+            aws_split::goes_direct(parsed.host().unwrap(), &hosts)
+        };
         for host in AWS_CREDENTIAL_ENDPOINT_HOSTS {
-            let parsed = url::Url::parse(&format!("http://{host}/latest/api/token")).unwrap();
-            assert_eq!(parsed.host_str(), Some(host));
+            assert!(direct(&format!("http://{host}/latest/api/token")), "{host}");
+        }
+        // A loopback credential agent, however it is spelled.
+        for uri in [
+            "http://127.0.0.1:51679/creds",
+            "http://127.12.0.3/creds",
+            "http://[::1]:8080/creds",
+            "http://LocalHost/creds",
+        ] {
+            assert!(direct(uri), "{uri}");
+        }
+        // Everything else follows the proxy environment.
+        for uri in [
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/x/converse",
+            "https://sts.amazonaws.com/",
+            "http://169.254.170.3/",
+            "http://[fd00:ec2::2]/",
+            "http://10.0.0.1/",
+        ] {
+            assert!(!direct(uri), "{uri}");
         }
     }
 
