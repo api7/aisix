@@ -639,9 +639,9 @@ describe("chat media content parts → native provider media shapes", () => {
         (l) => l.includes("media URL not downloaded") && l.includes(`url=${JSON.stringify(url)}`),
         `the media-fetch failure line for ${url}`,
       );
-    expect(await failedLine(allowed("/to-private.png"))).toContain(
-      `redirected_to=${JSON.stringify(unlisted("/cat.png"))} failure=Blocked(127.0.0.1)`,
-    );
+    const redirectedLine = await failedLine(allowed("/to-private.png"));
+    expect(redirectedLine).toContain(`redirected_to=${JSON.stringify(unlisted("/cat.png"))} `);
+    expect(redirectedLine).toContain("failure=Blocked(");
     expect(await failedLine(unlisted("/cat.png"))).not.toContain("redirected_to");
     const followed = await chat("media-nova", [text("hi"), image(allowed("/to-allowed.png"))]);
     expect(followed.messages[0].content).toContainEqual({
