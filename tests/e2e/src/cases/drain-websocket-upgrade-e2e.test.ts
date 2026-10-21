@@ -129,7 +129,8 @@ describe("drain: a WebSocket upgrade", () => {
       const head = await handshake(socket);
       socket.destroy();
       expect(summarise(head), head).toEqual({ status: "101", connection: "upgrade" });
-      // An upgraded session does not hold the drain, so nothing is left to.
+      // An upgraded session does not hold the drain, so nothing holds the
+      // gateway once the handshake is answered.
       await app.waitForExit(20_000);
     },
     60_000,
