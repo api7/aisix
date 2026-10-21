@@ -221,7 +221,6 @@ aws-smithy-http-client = { version = "1", default-features = false, features = [
 
 # Test-only
 wiremock = "0.6"
-testcontainers = "0.28"
 tempfile = "3.13"
 
 # Full DWARF is the largest single thing in `target/` here: it is 83% of
