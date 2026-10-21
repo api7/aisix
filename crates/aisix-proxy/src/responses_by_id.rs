@@ -175,8 +175,8 @@ async fn forward(
     .await;
 
     // No usage row, whatever the outcome: these calls act on a response its
-    // creation already metered.
-    crate::attribution::note_unmetered_route();
+    // creation already metered (`operation::surface_for_endpoint` gives
+    // their label no surface, so a cancelled one files none either).
     let path = format!("/v1/responses/{id}{suffix}");
     let elapsed = started.elapsed();
     let (target, status, error) = match &result {
