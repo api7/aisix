@@ -214,6 +214,9 @@ pub async fn responses(
             );
         }
     };
+    // Before anything reads the body: no gateway context tag may reach a
+    // guardrail, a log, or an upstream.
+    let affinity = crate::responses_affinity::ContextAffinity::unwrap_request(&mut body);
     let request_id = client.request_id.clone();
     crate::span_facts::note_request(
         &client,
@@ -252,6 +255,7 @@ pub async fn responses(
         &snapshot,
         &auth,
         &mut body,
+        &affinity,
         &request_id,
         started,
         &client,
@@ -611,6 +615,8 @@ async fn dispatch(
     // `&mut` so mask-action PII guardrails (#932) can rewrite the request
     // text in place before it reaches the upstream.
     body: &mut Value,
+    // The context tags `responses` removed from `body`.
+    affinity: &crate::responses_affinity::ContextAffinity,
     request_id: &str,
     // Request-scoped clock + downstream client attribution, threaded so the
     // streaming path's Drop guard can stamp latency + client IP/UA on the
@@ -757,6 +763,7 @@ async fn dispatch(
             headers: Some(&client.headers),
             api_key_id: auth.entry.id.as_str(),
             source_ip: &client.source_ip,
+            context_origin: affinity.origin(),
         },
     )?;
     let retry_on_429 = model_entry
@@ -882,6 +889,20 @@ async fn dispatch(
                     continue 'targets;
                 }
             };
+            // A group target that cannot read some tagged ciphertext gets
+            // the request without it, rather than a certain 400.
+            let stripped_body = is_routing_request
+                .then(|| {
+                    affinity.body_for_target(
+                        snapshot,
+                        body,
+                        &target.id,
+                        target.model.provider_key_id.as_deref(),
+                    )
+                })
+                .flatten();
+            let attempt_body = stripped_body.as_ref().unwrap_or(body);
+            let mark = affinity.response_mark(is_routing_request.then_some(target.id.as_str()));
             let result = if crate::dispatch::serves_natively(
                 snapshot,
                 &target.model,
@@ -890,7 +911,8 @@ async fn dispatch(
                 responses_to_target(
                     state,
                     snapshot,
-                    body,
+                    attempt_body,
+                    mark,
                     &target.model,
                     &target.id,
                     timeouts,
@@ -912,7 +934,8 @@ async fn dispatch(
                 responses_cross_provider_to_target(
                     state,
                     snapshot,
-                    body,
+                    attempt_body,
+                    mark,
                     &target.model,
                     &target.id,
                     timeouts,
@@ -1225,6 +1248,8 @@ async fn responses_to_target(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     body: &Value,
+    // The context tags this attempt's response carries back.
+    mark: crate::responses_affinity::ResponseMark,
     model: &aisix_core::Model,
     model_id: &str,
     // Deadlines resolved by the caller across target → group → deployment
@@ -1883,6 +1908,9 @@ async fn responses_to_target(
                 ),
                 _ => None,
             };
+            // After every telemetry read above, which records the
+            // upstream's own ids.
+            let buf = mark.apply_to_sse_buffer(buf);
             let mut response = axum::response::Response::new(axum::body::Body::from(buf));
             apply_passthrough_headers(&mut response, &headers, request_id);
             return Ok(ResponseDispatchSuccess {
@@ -2029,6 +2057,7 @@ async fn responses_to_target(
             content_cap,
             eos_scan,
             requested_model.to_string(),
+            mark,
             move |mut usage, out_text, output_hits| {
                 // Streams that reach here are committed 200s — the
                 // `!status.is_success()` guard above returned early on errors.
@@ -2332,6 +2361,8 @@ async fn responses_to_target(
             _ => None,
         };
 
+        // Last, after every telemetry read of the body.
+        mark.apply_to_body(&mut json_body);
         Ok(ResponseDispatchSuccess {
             response: Json(json_body).into_response(),
             provider: provider_label,
@@ -2361,6 +2392,8 @@ async fn responses_cross_provider_to_target(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     body: &Value,
+    // The context tags this attempt's response carries back.
+    mark: crate::responses_affinity::ResponseMark,
     model: &aisix_core::Model,
     model_id: &str,
     // Deadlines resolved by the caller across target → group → deployment
@@ -2428,7 +2461,10 @@ async fn responses_cross_provider_to_target(
     // function tools, so only the request's own tool list can tell the
     // reply translators which item each of the model's calls goes back as;
     // the request also supplies the settings every Response object echoes.
-    let reply = crate::responses_bridge::ResponsesReplyContext::from_request(body);
+    let mut reply = crate::responses_bridge::ResponsesReplyContext::from_request(body);
+    if let Some(sent) = mark.previous_response_id_sent() {
+        reply.echo_previous_response_id(sent);
+    }
 
     let is_stream = chat.is_streaming();
     let mut ctx = crate::dispatch::bridge_ctx(
@@ -2518,7 +2554,7 @@ async fn responses_cross_provider_to_target(
         state.health.record_success(&model.display_name);
         state.runtime_status.mark_healthy(model_id);
 
-        let response_id = format!("resp_{}", Uuid::new_v4().simple());
+        let response_id = mark.response_id(format!("resp_{}", Uuid::new_v4().simple()));
         let created_at = chrono::Utc::now().timestamp();
         let encoder = crate::responses_bridge::ResponsesSseEncoder::new(
             response_id,
@@ -2913,7 +2949,7 @@ async fn responses_cross_provider_to_target(
     crate::redact::merge_counts(&mut output_redactions, output_seg_counts);
 
     let created_at = chrono::Utc::now().timestamp();
-    let json_body = crate::responses_bridge::chat_response_to_responses_json(
+    let mut json_body = crate::responses_bridge::chat_response_to_responses_json(
         &resp,
         requested_model,
         created_at,
@@ -2934,6 +2970,7 @@ async fn responses_cross_provider_to_target(
         ),
         _ => None,
     };
+    mark.apply_to_body(&mut json_body);
     let mut response = Json(json_body).into_response();
     if let Ok(hv) = HeaderValue::from_str(request_id) {
         response
@@ -3204,6 +3241,7 @@ fn responses_sse_provider_request_id(bytes: &[u8]) -> String {
 /// `response.completed` last). A frame is the SSE protocol's atomic unit, so
 /// holding a partial one back is not observable to a conforming client;
 /// `buf` retains only that partial tail.
+#[allow(clippy::too_many_arguments)]
 fn drain_responses_sse_frames(
     buf: &mut Vec<u8>,
     acc: &mut Option<ResponseUsage>,
@@ -3211,17 +3249,20 @@ fn drain_responses_sse_frames(
     attempt_started: Instant,
     first_frame_seen: &mut bool,
     client_facing_model: &str,
+    mark: &crate::responses_affinity::ResponseMark,
     out: &mut Vec<u8>,
 ) {
     while let Some(end) = aisix_gateway::sse::find_frame_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
-        match crate::model_echo::restamp_sse_frame(
+        let restamped = crate::model_echo::restamp_sse_frame(
             &frame,
             client_facing_model,
             crate::model_echo::responses_snapshot_model,
-        ) {
-            Some(rewritten) => out.extend_from_slice(&rewritten),
-            None => out.extend_from_slice(&frame),
+        );
+        let forwarded = restamped.as_deref().unwrap_or(&frame);
+        match mark.apply_to_sse_frame(forwarded) {
+            Some(tagged) => out.extend_from_slice(&tagged),
+            None => out.extend_from_slice(forwarded),
         }
         // Whole payload, not the first `data:` line (#1100): a frame whose
         // JSON is written over several `data:` lines parses only once they
@@ -3500,6 +3541,9 @@ fn build_responses_passthrough_stream<S, F>(
     // The model name the caller addressed, restamped onto the snapshot
     // frames so a streamed response echoes the alias like a buffered one.
     client_facing_model: String,
+    // Context tags applied to the forwarded frames only; the usage and
+    // capture parsers read each frame as the upstream sent it.
+    mark: crate::responses_affinity::ResponseMark,
     on_complete: F,
 ) -> impl futures::Stream<Item = reqwest::Result<bytes::Bytes>>
 where
@@ -3557,6 +3601,7 @@ where
                     attempt_started,
                     &mut first_frame_seen,
                     &client_facing_model,
+                    &mark,
                     &mut forward,
                 );
                 // Bound the frame buffer: the happy path drains complete frames
@@ -3652,6 +3697,7 @@ where
                 attempt_started,
                 &mut first_frame_seen,
                 &client_facing_model,
+                &mark,
                 &mut drained,
             );
             let tail = match drained.len().checked_sub(pad.len()) {
@@ -7594,6 +7640,7 @@ data: [DONE]\n\n";
             std::time::Instant::now(),
             &mut first,
             "client-facing",
+            &Default::default(),
             &mut out,
         );
         let usage = acc.expect("the terminal frame must be parsed");
@@ -7621,6 +7668,7 @@ data: [DONE]\n\n";
             std::time::Instant::now(),
             &mut first,
             "client-facing",
+            &Default::default(),
             &mut out,
         );
         let usage = acc.expect("a CRLF terminal frame must be parsed");

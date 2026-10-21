@@ -605,6 +605,7 @@ where
             headers: Some(&client.headers),
             api_key_id: auth.entry.id.as_str(),
             source_ip: &client.source_ip,
+            context_origin: None,
         },
     )?;
     let routing = entry.value.routing.as_ref();
@@ -1415,6 +1416,11 @@ pub(crate) struct RoutingRequest<'a> {
     pub headers: Option<&'a HeaderMap>,
     pub api_key_id: &'a str,
     pub source_ip: &'a str,
+    /// Model id of the target that produced the context a `/v1/responses`
+    /// follow-up carries ([`crate::responses_affinity`]). When set, that
+    /// target and its provider-key peers are attempted first, ahead of the
+    /// strategy's order. `None` everywhere else.
+    pub context_origin: Option<&'a str>,
 }
 
 /// Drop the targets whose own `allowed_cidrs` excludes `source_ip`.
@@ -1584,8 +1590,17 @@ pub(crate) fn resolve_attempt_models(
             pricing,
         );
         resolved.sort_by_key(|a| std::cmp::Reverse(a.priority));
-        resolved.truncate(routing.max_fallbacks_or_default() + 1);
     }
+    if let Some(origin) = req.context_origin {
+        resolved = pin_context_origin(snapshot, routing, resolved, origin);
+        tracing::debug!(
+            virtual_model = %virtual_name,
+            origin,
+            first = resolved.first().map(|a| a.model.display_name.as_str()),
+            "responses context affinity reordered routing candidates",
+        );
+    }
+    resolved.truncate(routing.max_fallbacks_or_default() + 1);
     match filter_attempt_models(
         runtime_status,
         resolved,
@@ -1608,6 +1623,46 @@ pub(crate) fn resolve_attempt_models(
             Err(ProxyError::AllCandidatesUnavailable { retry_after_secs })
         }
     }
+}
+
+/// Put the targets that can read a conversation's context first: the origin
+/// target, then the other targets on its provider key, then the rest in the
+/// strategy's order. A boundary member the strategy left out of `resolved`
+/// (its `max_fallbacks` cut) is brought back, since the cut is applied again
+/// after this. Only targets that survived the tag and client-IP filters are
+/// considered — `routing.targets` is already that set; health and cooldown
+/// are still judged by [`filter_attempt_models`] afterwards.
+fn pin_context_origin(
+    snapshot: &AisixSnapshot,
+    routing: &Routing,
+    resolved: Vec<AttemptModel>,
+    origin: &str,
+) -> Vec<AttemptModel> {
+    let boundary = crate::responses_affinity::Boundary::of(snapshot, origin);
+    let mut candidates = resolved;
+    for t in &routing.targets {
+        let Some(entry) = snapshot.models.get_by_name(&t.model) else {
+            continue;
+        };
+        if candidates.iter().any(|a| a.id == entry.id)
+            || !boundary.contains(&entry.id, entry.value.provider_key_id.as_deref())
+        {
+            continue;
+        }
+        candidates.push(AttemptModel {
+            id: entry.id.clone(),
+            model: entry.value.clone(),
+            priority: t.priority_or_default(),
+            weight: t.weight_or_default(),
+        });
+    }
+    let (mut inside, outside): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|a| boundary.contains(&a.id, a.model.provider_key_id.as_deref()));
+    // Stable, so the peers keep the strategy's order behind the origin.
+    inside.sort_by_key(|a| !boundary.is_origin(&a.id));
+    inside.extend(outside);
+    inside
 }
 
 /// Name every target the health/cooldown filter dropped, and how many

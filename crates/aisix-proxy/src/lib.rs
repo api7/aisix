@@ -81,6 +81,7 @@ mod request_id;
 mod request_metrics;
 mod rerank;
 mod responses;
+mod responses_affinity;
 mod responses_bridge;
 mod rewrite;
 mod routing;

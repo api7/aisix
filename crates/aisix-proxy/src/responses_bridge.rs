@@ -902,6 +902,13 @@ impl ResponsesReplyContext {
         }
     }
 
+    /// Echo `id` as the Response object's `previous_response_id` instead of
+    /// the one the request carried.
+    pub fn echo_previous_response_id(&mut self, id: &str) {
+        self.echo
+            .insert("previous_response_id".into(), Value::String(id.to_string()));
+    }
+
     fn tool_call<'a>(&'a self, chat_name: &'a str) -> ReplyToolCall<'a> {
         if self.custom_tools.contains(chat_name) {
             return ReplyToolCall::Custom;
