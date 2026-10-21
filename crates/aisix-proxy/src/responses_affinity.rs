@@ -337,6 +337,25 @@ impl ResponseMark {
         }
     }
 
+    /// Tag the ciphertext of a listed item page (`input_items`): the items
+    /// reached this target with their tags removed, so they are its own to
+    /// read.
+    pub(crate) fn apply_to_item_list(&self, body: &mut Value) {
+        let Some(items) = body.get_mut("data").and_then(Value::as_array_mut) else {
+            return;
+        };
+        for item in items {
+            if let Some(v) = item.get_mut("encrypted_content") {
+                if let Some(new) = v
+                    .as_str()
+                    .and_then(|s| self.rewrite(Slot::EncryptedContent, s))
+                {
+                    *v = Value::String(new);
+                }
+            }
+        }
+    }
+
     /// Tag one Responses SSE event payload, byte-preserving: the Response
     /// object of the snapshot events (`response.created` / `.in_progress` /
     /// `.queued` / `.completed` / `.incomplete` / `.failed`) and the item of

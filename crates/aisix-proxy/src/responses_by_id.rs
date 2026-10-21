@@ -137,18 +137,45 @@ async fn forward(
         if !query.is_empty() {
             url = format!("{url}?{query}");
         }
-        let streamed = params.get("stream").is_some_and(|v| v == "true");
-        let upstream = crate::jobs::send_upstream_head(
-            &state,
-            &target,
-            method.clone(),
-            &url,
-            UpstreamBody::Empty,
-            &request_id,
-            !streamed,
-        )
-        .await?;
-        let resp = relay(&state, &target, upstream, mark).await?;
+        let resp = if params.get("stream").is_some_and(|v| v == "true") {
+            let upstream = crate::jobs::send_upstream_head(
+                &state,
+                &target,
+                method.clone(),
+                &url,
+                UpstreamBody::Empty,
+                &request_id,
+                false,
+            )
+            .await?;
+            relay_stream(&state, &target, upstream, mark)
+        } else {
+            let (status, resp_headers, bytes) = crate::jobs::send_upstream(
+                &state,
+                &target,
+                method.clone(),
+                &url,
+                UpstreamBody::Empty,
+                &request_id,
+            )
+            .await?;
+            let body = match serde_json::from_slice::<Value>(&bytes) {
+                Ok(mut v) if status.is_success() => {
+                    mark.apply_to_body(&mut v);
+                    if suffix == "/input_items" {
+                        mark.apply_to_item_list(&mut v);
+                    }
+                    Bytes::from(serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec()))
+                }
+                _ => bytes,
+            };
+            with_content_type(
+                Response::builder().status(status),
+                resp_headers.get(header::CONTENT_TYPE),
+            )
+            .body(Body::from(body))
+            .unwrap()
+        };
         Ok((resp, target))
     }
     .await;
@@ -185,7 +212,7 @@ fn resolve(
     let (entry, raw, mark) = match crate::responses_affinity::decode_response_id(id) {
         Some((origin, raw)) => {
             let entry = snapshot.models.get_by_id(&origin).ok_or_else(not_found)?;
-            if !reachable(snapshot, auth, &entry.value) {
+            if !reachable(snapshot, auth, &entry.value, &client.source_ip) {
                 return Err(not_found());
             }
             let mark = ResponseMark::for_target(&entry.id);
@@ -199,17 +226,8 @@ fn resolve(
                         .into(),
                 )
             })?;
-            let entry = crate::model_resolve::resolve_model(snapshot, &name)
-                .ok_or_else(|| ProxyError::ModelNotFound(name.clone()))?;
-            if !auth.key().can_access(snapshot, &name) {
-                return Err(ProxyError::ModelForbidden(name));
-            }
-            let m = &entry.value;
-            if m.is_routing() || m.is_ensemble() || m.is_semantic() {
-                return Err(ProxyError::InvalidRequest(format!(
-                    "model {name:?} is a virtual model; name the model that served the response"
-                )));
-            }
+            let entry =
+                crate::jobs::resolve_named_direct(snapshot, auth, &name, "stored-response")?;
             (entry, id.to_string(), ResponseMark::default())
         }
     };
@@ -219,12 +237,14 @@ fn resolve(
     Ok((target, raw, mark))
 }
 
-/// Whether the caller may address `target` itself or a Model Group that
-/// routes to it.
+/// Whether the caller may address `target` itself, or a Model Group that
+/// routes to it and admits the client IP — the group's own `allowed_cidrs`
+/// gate its targets just as they gate a request naming the group.
 fn reachable(
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     target: &Model,
+    source_ip: &str,
 ) -> bool {
     let key = auth.key();
     key.can_access(snapshot, &target.display_name)
@@ -234,6 +254,7 @@ fn reachable(
                     .iter()
                     .any(|t| t.model_ref(snapshot) == target.display_name)
             }) && key.can_access(snapshot, &group.value.display_name)
+                && group.value.ip_allowed(source_ip)
         })
 }
 
@@ -258,80 +279,85 @@ fn native_target(
     Some(JobTarget::new(entry, pk, secret, Adapter::Openai, client))
 }
 
-/// The upstream reply with the target's tags applied: per frame for an
-/// event stream, whole-body for JSON, verbatim otherwise.
-async fn relay(
+fn with_content_type(
+    builder: axum::http::response::Builder,
+    content_type: Option<&HeaderValue>,
+) -> axum::http::response::Builder {
+    builder.header(
+        header::CONTENT_TYPE,
+        content_type
+            .cloned()
+            .unwrap_or_else(|| HeaderValue::from_static("application/json")),
+    )
+}
+
+/// A streamed retrieve relayed frame by frame with the target's tags, under
+/// the model's streaming budget between chunks.
+fn relay_stream(
     state: &ProxyState,
     target: &JobTarget,
     upstream: reqwest::Response,
     mark: ResponseMark,
-) -> Result<Response, ProxyError> {
+) -> Response {
+    crate::attribution::note_upstream_wait_end(true);
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
-    let is_sse = content_type
-        .as_ref()
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("text/event-stream"));
-    let builder = Response::builder().status(status);
-    let builder = match content_type {
-        Some(ct) => builder.header(header::CONTENT_TYPE, ct),
-        None => builder.header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        ),
-    };
-    if is_sse {
-        crate::attribution::note_upstream_wait_end(true);
+    let builder = with_content_type(
+        Response::builder().status(status),
+        upstream.headers().get(header::CONTENT_TYPE),
+    );
+    let idle =
+        crate::routing::effective_timeouts(&target.model_entry.value, None, state.default_timeouts)
+            .stream;
+    let runtime_status = state.runtime_status.clone();
+    let model_id = target.model_entry.id.clone();
+    let cooldown = target.model_entry.value.cooldown.clone();
+    let mut upstream = upstream.bytes_stream();
+    let tagged = async_stream::stream! {
         let mut buf: Vec<u8> = Vec::new();
-        let mut upstream = upstream.bytes_stream();
-        let tagged = async_stream::stream! {
-            while let Some(chunk) = upstream.next().await {
-                match chunk {
-                    Ok(chunk) => {
-                        buf.extend_from_slice(&chunk);
-                        let mut out = Vec::new();
-                        while let Some(end) = aisix_gateway::sse::find_frame_end(&buf) {
-                            let frame: Vec<u8> = buf.drain(..end).collect();
-                            match mark.apply_to_sse_frame(&frame) {
-                                Some(t) => out.extend_from_slice(&t),
-                                None => out.extend_from_slice(&frame),
-                            }
-                        }
-                        if !out.is_empty() {
-                            yield Ok::<_, std::io::Error>(Bytes::from(out));
-                        }
-                    }
-                    Err(e) => {
-                        yield Err(std::io::Error::other(e));
-                        return;
-                    }
+        loop {
+            let next: Result<Option<Bytes>, String> = match idle {
+                Some(d) => match tokio::time::timeout(d, upstream.next()).await {
+                    Ok(next) => next.transpose().map_err(|e| aisix_gateway::transport_error_message(&e)),
+                    Err(_) => Err("stream idle timeout".to_string()),
+                },
+                None => upstream
+                    .next()
+                    .await
+                    .transpose()
+                    .map_err(|e| aisix_gateway::transport_error_message(&e)),
+            };
+            let chunk = match next {
+                Ok(None) => break,
+                Ok(Some(chunk)) => chunk,
+                Err(reason) => {
+                    tracing::warn!(model_id = %model_id, %reason, "stored-response stream ended early");
+                    let _ = crate::cooldown::note_failure(
+                        &runtime_status,
+                        &model_id,
+                        cooldown.as_ref(),
+                        aisix_gateway::BridgeError::Transport(reason.clone()),
+                    );
+                    yield Err(std::io::Error::other(reason));
+                    return;
+                }
+            };
+            buf.extend_from_slice(&chunk);
+            let mut out = Vec::new();
+            while let Some(end) = aisix_gateway::sse::find_frame_end(&buf) {
+                let frame: Vec<u8> = buf.drain(..end).collect();
+                match mark.apply_to_sse_frame(&frame) {
+                    Some(t) => out.extend_from_slice(&t),
+                    None => out.extend_from_slice(&frame),
                 }
             }
-            if !buf.is_empty() {
-                yield Ok(Bytes::from(std::mem::take(&mut buf)));
+            if !out.is_empty() {
+                yield Ok::<_, std::io::Error>(Bytes::from(out));
             }
-        };
-        return Ok(builder.body(Body::from_stream(tagged)).unwrap());
-    }
-    let bytes = upstream.bytes().await;
-    crate::attribution::note_upstream_wait_end(bytes.is_ok());
-    let bytes = bytes
-        .map_err(|e| {
-            crate::cooldown::note_failure(
-                &state.runtime_status,
-                &target.model_entry.id,
-                target.model_entry.value.cooldown.as_ref(),
-                aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
-            )
-        })
-        .map_err(ProxyError::Bridge)?;
-    let body = match serde_json::from_slice::<Value>(&bytes) {
-        Ok(mut v) if status.is_success() => {
-            mark.apply_to_body(&mut v);
-            Bytes::from(serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec()))
         }
-        _ => bytes,
+        if !buf.is_empty() {
+            yield Ok(Bytes::from(buf));
+        }
     };
-    Ok(builder.body(Body::from(body)).unwrap())
+    builder.body(Body::from_stream(tagged)).unwrap()
 }

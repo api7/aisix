@@ -190,6 +190,29 @@ pub(crate) fn explicit_model(
         .map(str::to_string)
 }
 
+/// The direct model a caller named by `?model=` / `x-aisix-model`, after the
+/// key's model ACL. A virtual model is refused: an id-addressed call needs
+/// the upstream that holds the resource.
+pub(crate) fn resolve_named_direct(
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    name: &str,
+    surface: &str,
+) -> Result<Arc<ResourceEntry<Model>>, ProxyError> {
+    let entry = crate::model_resolve::resolve_model(snapshot, name)
+        .ok_or_else(|| ProxyError::ModelNotFound(name.to_string()))?;
+    if !auth.key().can_access(snapshot, name) {
+        return Err(ProxyError::ModelForbidden(name.to_string()));
+    }
+    let m = &entry.value;
+    if m.is_routing() || m.is_ensemble() || m.is_semantic() {
+        return Err(ProxyError::InvalidRequest(format!(
+            "model {name:?} is a virtual router; {surface} requests must route to a direct model"
+        )));
+    }
+    Ok(entry)
+}
+
 /// Resolve the routing target for a jobs request.
 ///
 /// `wanted = None` falls back to the first non-routing Model the key can
@@ -203,21 +226,7 @@ pub(crate) fn resolve_target(
     client_ctx: &ClientContext,
 ) -> Result<JobTarget, ProxyError> {
     let model_entry = match wanted {
-        Some(name) => {
-            let entry = crate::model_resolve::resolve_model(snapshot, name)
-                .ok_or_else(|| ProxyError::ModelNotFound(name.to_string()))?;
-            if !auth.key().can_access(snapshot, name) {
-                return Err(ProxyError::ModelForbidden(name.to_string()));
-            }
-            let m = &entry.value;
-            if m.is_routing() || m.is_ensemble() || m.is_semantic() {
-                return Err(ProxyError::InvalidRequest(format!(
-                    "model {name:?} is a virtual router; files/batches/fine-tuning \
-                     requests must route to a direct model"
-                )));
-            }
-            entry
-        }
+        Some(name) => resolve_named_direct(snapshot, auth, name, "files/batches/fine-tuning")?,
         None => snapshot
             .models
             .entries()

@@ -272,15 +272,23 @@ describe("/v1/responses/{id} retrieve, delete, input_items and cancel", () => {
     await model("byid-bridge", pkBridge, { provider: "deepseek" });
     await group("byid-group", ["byid-a", "byid-b"]);
     await group("byid-bridged", ["byid-bridge"]);
+    await model("byid-fenced-target", await pk("acct-fenced"));
+    // The group admits no loopback client; its target has no fence of its own.
+    const fenced = await seed.createModel({
+      display_name: "byid-fenced",
+      allowed_cidrs: ["10.0.0.0/8"],
+      routing: { strategy: "round_robin", targets: [{ model: "byid-fenced-target" }], max_fallbacks: 0 },
+    });
+    ids["byid-fenced"] = fenced.id;
 
     // The caller reaches the group's targets only through the group.
     await seed.createApiKey({
       key_hash: hash(OTHER),
-      allowed_models: ["byid-hidden"],
+      allowed_models: ["byid-hidden", "byid-fenced-target"],
     });
     await seed.createApiKey({
       key_hash: hash(CALLER),
-      allowed_models: ["byid-group", "byid-solo", "byid-bridged"],
+      allowed_models: ["byid-group", "byid-solo", "byid-bridged", "byid-fenced"],
     });
     await waitConfigPropagation(async () => {
       const res = await fetch(`${app!.proxyUrl}/v1/models`, {
@@ -448,6 +456,33 @@ describe("/v1/responses/{id} retrieve, delete, input_items and cancel", () => {
     // The response is still there for the key that can reach it.
     const owner = await call("GET", `/v1/responses/${stored.id}?model=byid-hidden`, { key: OTHER });
     expect(owner.status, owner.text).toBe(200);
+  });
+
+  test("a group's client-IP fence also fences the ids its targets produced", async (ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    // The caller's only way to the target is the fenced group, which does not
+    // admit this client; a request naming the group is refused.
+    const viaGroup = await call("POST", "/v1/responses", { body: { model: "byid-fenced", input: "hi" } });
+    expect(viaGroup.status, viaGroup.text).toBe(403);
+    const stored = await create("byid-fenced-target", OTHER);
+    const before = upstream!.forAccount("acct-fenced").length;
+    const r = await call("GET", `/v1/responses/${forgeResponseId(ids["byid-fenced-target"], stored.id)}`);
+    expect(r.status, r.text).toBe(404);
+    expect(upstream!.forAccount("acct-fenced").length).toBe(before);
+  });
+
+  test("listed input items carry ciphertext the caller can send back through the group", async (ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    const first = await create("byid-group");
+    const reasoning = first.output.find((i: any) => i.type === "reasoning");
+    const followUp = await create("byid-group", CALLER, {
+      input: [reasoning, { type: "message", role: "user", content: "and then?" }],
+    });
+    expect(decodeResponseId(followUp.id)!.target).toBe(decodeResponseId(first.id)!.target);
+    const items = await call("GET", `/v1/responses/${followUp.id}/input_items`);
+    expect(items.status, items.text).toBe(200);
+    const listed = items.json.data.find((i: any) => i.type === "reasoning");
+    expect(listed.encrypted_content).toBe(reasoning.encrypted_content);
   });
 
   test("a bridged target's id has nothing stored upstream: 404", async (ctx) => {
