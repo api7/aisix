@@ -34,6 +34,30 @@ const FAILURES: Record<string, { status: number; type: string }> = {
   brokengr0001: { status: 500, type: "InternalServerException" },
 };
 
+/** A guardrail whose role the mock STS refuses to let the gateway assume:
+ * the call is never signed, so ApplyGuardrail is never reached. */
+const DENIED_ROLE_GUARDRAIL = "deniedrole01";
+
+async function startDenyingSts(): Promise<{ url: string; server: Server; calls: () => number }> {
+  let calls = 0;
+  const server = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      calls += 1;
+      res.writeHead(403, { "content-type": "text/xml" });
+      res.end(
+        '<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/"><Error><Type>Sender</Type>' +
+          "<Code>AccessDenied</Code><Message>refused by the mock</Message></Error>" +
+          "<RequestId>req-sts</RequestId></ErrorResponse>",
+      );
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  if (addr === null || typeof addr === "string") throw new Error("no port");
+  return { url: `http://127.0.0.1:${addr.port}`, server, calls: () => calls };
+}
+
 async function startFailingBedrock(): Promise<{ url: string; server: Server }> {
   const server = createServer((req, res) => {
     req.resume();
@@ -57,6 +81,7 @@ describe("Bedrock guardrail failure tags", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let bedrock: Awaited<ReturnType<typeof startFailingBedrock>> | undefined;
+  let sts: Awaited<ReturnType<typeof startDenyingSts>> | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -73,7 +98,16 @@ describe("Bedrock guardrail failure tags", () => {
       },
     });
     bedrock = await startFailingBedrock();
-    app = await spawnApp({ extra: { bedrock_endpoint_url: bedrock.url } });
+    sts = await startDenyingSts();
+    app = await spawnApp({
+      extraEnv: {
+        AWS_ENDPOINT_URL_STS: sts.url,
+        AWS_EC2_METADATA_DISABLED: "true",
+        AWS_CONFIG_FILE: "/nonexistent/aisix-e2e-aws-config",
+        AWS_SHARED_CREDENTIALS_FILE: "/nonexistent/aisix-e2e-aws-credentials",
+      },
+      extra: { bedrock_endpoint_url: bedrock.url },
+    });
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "bft-pk",
@@ -81,7 +115,7 @@ describe("Bedrock guardrail failure tags", () => {
       api_base: `${upstream.baseUrl}/v1`,
     });
     const models: string[] = [];
-    for (const id of Object.keys(FAILURES)) {
+    for (const id of [...Object.keys(FAILURES), DENIED_ROLE_GUARDRAIL]) {
       const model = await seed.createModel({
         display_name: `bft-${id}`,
         provider: "openai",
@@ -98,7 +132,12 @@ describe("Bedrock guardrail failure tags", () => {
           guardrail_id: id,
           guardrail_version: "DRAFT",
           region: "us-east-1",
-          aws_credentials: { kind: "static", access_key_id: "AKIDFAILURETAG000001", secret_access_key: "s" },
+          aws_credentials: {
+            kind: "static",
+            access_key_id: "AKIDFAILURETAG000001",
+            secret_access_key: "s",
+            ...(id === DENIED_ROLE_GUARDRAIL ? { role_arn: "arn:aws:iam::111122223333:role/Denied" } : {}),
+          },
           latency_mode: { kind: "serial" },
         },
         { attach: false },
@@ -117,7 +156,9 @@ describe("Bedrock guardrail failure tags", () => {
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
-    if (bedrock) await new Promise<void>((resolve) => bedrock!.server.close(() => resolve()));
+    for (const s of [bedrock?.server, sts?.server]) {
+      if (s) await new Promise<void>((resolve) => s.close(() => resolve()));
+    }
   });
 
   async function bypassReasonOf(id: string): Promise<Record<string, number>> {
@@ -147,4 +188,12 @@ describe("Bedrock guardrail failure tags", () => {
       });
     });
   }
+
+  test("credentials STS refuses to issue fail open as bedrock_config_error", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const before = sts!.calls();
+    const deltas = await bypassReasonOf(DENIED_ROLE_GUARDRAIL);
+    expect(sts!.calls()).toBeGreaterThan(before);
+    expect(deltas).toEqual({ bedrock_config_error: 1, bedrock_5xx: 0 });
+  });
 });
