@@ -12,6 +12,7 @@ import {
   SeedClient,
   spawnApp,
   waitConfigPropagation,
+  waitForLogLine,
   type SpawnedApp,
 } from "../harness/index.js";
 
@@ -630,6 +631,18 @@ describe("chat media content parts → native provider media shapes", () => {
     expect(redirected).toContain("outbound.ssrf_protection.allowed_hosts");
     expect(redirected).toContain(`redirected to ${JSON.stringify(unlisted("/cat.png"))}`);
     expect(redirected).toContain("adds 127.0.0.1 to");
+    // The WARN line quotes the hop it failed at the same way as the URL the
+    // request named, and has no redirected_to when there was no redirect.
+    const failedLine = (url: string) =>
+      waitForLogLine(
+        app!,
+        (l) => l.includes("media URL not downloaded") && l.includes(`url=${JSON.stringify(url)}`),
+        `the media-fetch failure line for ${url}`,
+      );
+    expect(await failedLine(allowed("/to-private.png"))).toContain(
+      `redirected_to=${JSON.stringify(unlisted("/cat.png"))} failure=Blocked(127.0.0.1)`,
+    );
+    expect(await failedLine(unlisted("/cat.png"))).not.toContain("redirected_to");
     const followed = await chat("media-nova", [text("hi"), image(allowed("/to-allowed.png"))]);
     expect(followed.messages[0].content).toContainEqual({
       image: { format: "png", source: { bytes: PNG_B64 } },
