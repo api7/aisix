@@ -173,9 +173,15 @@ describe("drain: a WebSocket upgrade", () => {
       await waitForLogLine(app, (l) => l.includes("drain complete"), "the drain to end", 10_000);
 
       const head = await handshake(socket);
-      socket.destroy();
       expect(summarise(head), head).toEqual({ status: "101", connection: "upgrade" });
-      // The session ended with the socket, so nothing holds the gateway.
+      // The session that handshake opened is in flight, so the gateway
+      // stays up for it although the drain has already ended.
+      const exitedEarly = await app.waitForExit(3_000).then(
+        () => true,
+        () => false,
+      );
+      expect(exitedEarly, "the gateway exited under an open session").toBe(false);
+      socket.destroy();
       await app.waitForExit(20_000);
     },
     60_000,
@@ -219,7 +225,12 @@ describe("drain: a WebSocket upgrade", () => {
       const deadline = Date.now() + 2_000;
       while (Date.now() < deadline) {
         const after = await scrapeMetrics(app.metricsUrl);
-        recorded = metricDelta(before, after, "aisix_llm_input_tokens_total");
+        recorded = metricDelta(
+          before,
+          after,
+          "aisix_llm_input_tokens_total",
+          (labels) => !Object.values(labels).includes("/v1/chat/completions"),
+        );
         if (recorded > 0) break;
         await new Promise((r) => setTimeout(r, 50));
       }

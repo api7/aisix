@@ -3054,6 +3054,17 @@ async fn accept_loop(
     // TLS handshake that stalls is not bounded by it either).
     drop(alive);
     let _ = all_connections_ended.recv().await;
+    // A connection that upgraded ends its task at the 101, but its session
+    // is still in flight (a Realtime WebSocket holds a drain guard until
+    // it closes). The drain's own wait is over by now, so this one is what
+    // keeps the listener — and in thread-per-core mode the worker runtime
+    // the session runs on — up until such a session opened after the
+    // drain ended has finished.
+    if let Some(drain) = drain {
+        while drain.in_flight() > 0 {
+            tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+        }
+    }
     Ok(())
 }
 
