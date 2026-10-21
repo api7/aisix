@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
+  ProxyClient,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -89,11 +90,9 @@ describe("chat completion usage details reach the caller as the upstream reporte
       }
     }
     await seed.createApiKey({ key_hash: hash(CALLER), allowed_models: models });
-    await waitConfigPropagation(async () => {
-      const r = await fetch(`${app!.proxyUrl}/v1/models`, { headers: { authorization: `Bearer ${CALLER}` } });
-      const body = await r.text();
-      return r.status === 200 && models.every((m) => body.includes(m));
-    });
+    // The caller key is seeded last, so its authenticating implies every model is loaded.
+    const probe = new ProxyClient(app.proxyUrl, CALLER);
+    await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
   });
 
   afterAll(async () => {
