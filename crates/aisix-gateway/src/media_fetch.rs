@@ -396,7 +396,10 @@ async fn fetch_wanted(
                 tracing::warn!(
                     request_id = %ctx.request_id,
                     url = %display_uri(&w.uri),
-                    redirected_to = failure.redirected_to.as_ref().map(|u| display_uri(u.as_str())),
+                    redirected_to = failure
+                        .redirected_to
+                        .as_ref()
+                        .map(|u| tracing::field::display(display_uri(u.as_str()))),
                     failure = ?failure.failure,
                     "media URL not downloaded"
                 );
