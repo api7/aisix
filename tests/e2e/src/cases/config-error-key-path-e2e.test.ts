@@ -45,6 +45,9 @@ async function boot(
       return { code: 0, logs: `${ok.stdout}${ok.stderr}` };
     } catch (e) {
       const err = e as Error & { code?: number | string; stdout?: string; stderr?: string };
+      if (err.code === "ENOENT") {
+        throw new Error(`aisix binary not found at ${BIN_PATH}; set AISIX_BIN or build it`);
+      }
       return {
         code: typeof err.code === "number" ? err.code : null,
         logs: `${err.stdout ?? ""}${err.stderr ?? ""}`,
