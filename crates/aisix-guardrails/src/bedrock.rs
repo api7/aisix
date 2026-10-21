@@ -799,11 +799,15 @@ fn assessment_has_hard_block(a: &GuardrailAssessment) -> bool {
 }
 
 /// Failure cause buckets that map onto `guardrail_bypassed_reason`
-/// telemetry tags. `Other` collapses every long-tail SDK error onto
-/// `bedrock_5xx` so an unrecognised AWS error doesn't leak its
-/// internal shape into our wire schema — but it carries the original
-/// SDK error detail for the failure log line so operators can tell a
-/// network blip from an auth/validation error (#106).
+/// telemetry tags. `ConfigError` is every non-`429` `4xx` AWS answered
+/// with (`AccessDeniedException`, `ValidationException`,
+/// `ResourceNotFoundException`, …) — a credential, guardrail id or
+/// region the operator has to fix, tagged `bedrock_config_error` like
+/// the other kinds' `_config_error`. `Other` collapses the rest — 5xx,
+/// transport, a response the SDK could not read — onto `bedrock_5xx` so
+/// an unrecognised AWS error doesn't leak its internal shape into our
+/// wire schema. Both carry the original SDK error detail for the failure
+/// log line (#106).
 #[derive(Debug)]
 enum BedrockFailure {
     Timeout,
@@ -815,6 +819,10 @@ enum BedrockFailure {
     /// simply failing (AISIX-Cloud#1386).
     TooLarge {
         detail: String,
+    },
+    ConfigError {
+        detail: String,
+        source: Option<String>,
     },
     Other {
         /// Human-readable detail for logs: the modeled service error
@@ -842,13 +850,15 @@ impl BedrockFailure {
             if crate::too_large::body_says_too_large(&detail) {
                 return Self::TooLarge { detail };
             }
-            if matches!(svc.err(), ApplyGuardrailError::ThrottlingException(_)) {
+            let status = svc.raw().status().as_u16();
+            if matches!(svc.err(), ApplyGuardrailError::ThrottlingException(_)) || status == 429 {
                 return Self::Throttled;
             }
-            return Self::Other {
-                detail,
-                source: std::error::Error::source(&err).map(|s| s.to_string()),
-            };
+            let source = std::error::Error::source(&err).map(|s| s.to_string());
+            if (400..500).contains(&status) {
+                return Self::ConfigError { detail, source };
+            }
+            return Self::Other { detail, source };
         }
         // Dispatch / response / construction / timeout: the SdkError
         // Display names the variant; source() reaches the underlying
@@ -864,15 +874,17 @@ impl BedrockFailure {
             Self::Timeout => "bedrock_timeout",
             Self::Throttled => "bedrock_throttled",
             Self::TooLarge { .. } => "bedrock_too_large",
+            Self::ConfigError { .. } => "bedrock_config_error",
             Self::Other { .. } => "bedrock_5xx",
         }
     }
 
     /// Fields for the failure log line: the wire-stable tag plus, for
-    /// `Other`, the captured SDK error detail and underlying source.
+    /// `ConfigError` and `Other`, the captured SDK error detail and
+    /// underlying source.
     fn log_fields(&self) -> (&'static str, Option<&str>, Option<&str>) {
         match self {
-            Self::Other { detail, source } => {
+            Self::ConfigError { detail, source } | Self::Other { detail, source } => {
                 (self.bypass_tag(), Some(detail.as_str()), source.as_deref())
             }
             Self::TooLarge { detail } => (self.bypass_tag(), Some(detail.as_str()), None),
@@ -1233,6 +1245,14 @@ mod tests {
             .bypass_tag(),
             "bedrock_5xx",
         );
+        assert_eq!(
+            BedrockFailure::ConfigError {
+                detail: "x".into(),
+                source: None,
+            }
+            .bypass_tag(),
+            "bedrock_config_error",
+        );
     }
 
     /// #106: the `Other` bucket keeps the wire-stable `bedrock_5xx`
@@ -1242,12 +1262,12 @@ mod tests {
     #[test]
     fn other_failure_log_fields_carry_detail_and_source() {
         let f = BedrockFailure::Other {
-            detail: "AccessDeniedException(...)".into(),
+            detail: "InternalServerException(...)".into(),
             source: Some("dispatch failure: connection refused".into()),
         };
         let (tag, detail, source) = f.log_fields();
         assert_eq!(tag, "bedrock_5xx");
-        assert_eq!(detail, Some("AccessDeniedException(...)"));
+        assert_eq!(detail, Some("InternalServerException(...)"));
         assert_eq!(source, Some("dispatch failure: connection refused"));
 
         let (tag, detail, source) = BedrockFailure::Timeout.log_fields();
@@ -1293,7 +1313,7 @@ mod tests {
         let g = build_test(true);
         let v = g.handle_failure(
             BedrockFailure::Other {
-                detail: "AccessDeniedException(...)".into(),
+                detail: "InternalServerException(...)".into(),
                 source: None,
             },
             g.fail_open,
