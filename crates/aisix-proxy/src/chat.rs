@@ -2307,12 +2307,7 @@ async fn dispatch(
         // terminal usage-only chunk that produces is for the gateway's own
         // telemetry. It reaches the client only when the client itself
         // asked for usage.
-        let client_requested_usage = req
-            .extra
-            .get("stream_options")
-            .and_then(|so| so.get("include_usage"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let client_requested_usage = req.include_usage();
         // Token-estimation fallback context (AISIX-Cloud#1074): the
         // request is cloned here because the stream owns it until an
         // end-of-stream Drop — where the borrow is long gone. Tokenized
@@ -4163,12 +4158,7 @@ async fn dispatch_ensemble(
         // #790: the client only receives the terminal usage-only chunk when it
         // asked for `stream_options.include_usage`. Computed exactly as the
         // single-upstream path does.
-        let client_requested_usage = req
-            .extra
-            .get("stream_options")
-            .and_then(|so| so.get("include_usage"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let client_requested_usage = req.include_usage();
         // Content-capturing exporters: the ensemble streams the JUDGE answer,
         // so content capture would mirror the single-upstream path. v1 keeps
         // the ensemble content-free (matching the non-streaming ensemble path,

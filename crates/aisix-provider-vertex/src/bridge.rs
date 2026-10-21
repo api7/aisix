@@ -1207,6 +1207,7 @@ impl VertexBridge {
             }
             outbound_bytes(&body_value)?
         };
+        let include_usage = req.include_usage();
         // The owned request is not needed past its wire bytes.
         drop(req);
 
@@ -1273,7 +1274,9 @@ impl VertexBridge {
                     }
                     state.update(&parsed);
                     if let Some(chunk) = state.to_chunk(&parsed) {
-                        yield chunk;
+                        for chunk in chunk.into_frames(include_usage) {
+                            yield chunk;
+                        }
                     }
                     if StreamState::is_terminal(&parsed) {
                         return;
@@ -1794,6 +1797,7 @@ impl VertexBridge {
             apply_body_overrides(&mut body, ctx);
             outbound_bytes(&body)?
         };
+        let include_usage = req.include_usage();
         // The owned request is not needed past its wire bytes.
         drop(req);
         // Resolve bearer (pre-minted OR minted-from-SA) BEFORE
@@ -1847,6 +1851,8 @@ impl VertexBridge {
                         )?;
                         for chunk in
                             gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut state)
+                                .into_iter()
+                                .flat_map(|c| c.into_frames(include_usage))
                         {
                             yield chunk;
                         }
@@ -1871,6 +1877,8 @@ impl VertexBridge {
                 )?;
                 for chunk in
                     gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut state)
+                        .into_iter()
+                        .flat_map(|c| c.into_frames(include_usage))
                 {
                     yield chunk;
                 }

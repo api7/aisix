@@ -688,6 +688,9 @@ pub fn build_request<'a>(
     // no tool survives translation: upstream rejects the field without
     // an accompanying `tools` list (AISIX-Cloud#1614).
     let mut extras = req.extra.clone();
+    // `stream_options` is read by the gateway, which renders the usage
+    // chunk itself; the Messages API has no such parameter and rejects it.
+    extras.remove("stream_options");
     let mut tools = extras
         .remove("tools")
         .and_then(translate_openai_tools_to_anthropic);

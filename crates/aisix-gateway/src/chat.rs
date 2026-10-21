@@ -376,6 +376,17 @@ impl ChatFormat {
     pub fn is_streaming(&self) -> bool {
         self.stream.unwrap_or(false)
     }
+
+    /// The caller asked for `stream_options.include_usage`: a streamed
+    /// response ends with one extra chunk carrying the usage, with an
+    /// empty `choices` array, and no other chunk carries usage.
+    pub fn include_usage(&self) -> bool {
+        self.extra
+            .get("stream_options")
+            .and_then(|so| so.get("include_usage"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
 }
 
 /// Why a completion finished. Unknown upstream reasons collapse to
@@ -1258,6 +1269,24 @@ impl ChatChunk {
     /// The `include_usage` terminal frame: usage and nothing else.
     pub fn is_usage_only(&self) -> bool {
         self.usage.is_some() && self.finish_reason.is_none() && self.has_no_payload()
+    }
+
+    /// The chunks this one is sent to the caller as. Under
+    /// `include_usage`, usage carried beside a finish reason or a delta
+    /// moves onto a usage-only chunk that follows it: a bridge whose
+    /// upstream reports usage on the event that ends the message must
+    /// still send it on a chunk of its own, as OpenAI does.
+    pub fn into_frames(mut self, include_usage: bool) -> impl Iterator<Item = ChatChunk> {
+        let split = include_usage && self.usage.is_some() && !self.is_usage_only();
+        let usage_only = split.then(|| ChatChunk {
+            id: self.id.clone(),
+            model: self.model.clone(),
+            delta: ChatDelta::default(),
+            finish_reason: None,
+            usage: self.usage.take(),
+            service_tier: self.service_tier.clone(),
+        });
+        std::iter::once(self).chain(usage_only)
     }
 }
 

@@ -484,6 +484,7 @@ impl Bridge for AnthropicBridge {
             apply_auto_prompt_caching(&mut body, &ctx.model);
             outbound_bytes(&body)?
         };
+        let include_usage = req.include_usage();
         // The owned request is not needed past its wire bytes.
         drop(req);
         let url = cached_endpoint_url(
@@ -520,13 +521,14 @@ impl Bridge for AnthropicBridge {
         }
 
         let byte_stream = resp.bytes_stream();
-        let stream = build_chunk_stream(byte_stream);
+        let stream = build_chunk_stream(byte_stream, include_usage);
         Ok(Box::pin(stream))
     }
 }
 
 fn build_chunk_stream<S>(
     byte_stream: S,
+    include_usage: bool,
 ) -> impl futures::Stream<Item = Result<ChatChunk, BridgeError>> + Send
 where
     S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
@@ -559,7 +561,9 @@ where
                 }
                 state.update(&parsed);
                 if let Some(c) = state.to_chunk(&parsed) {
-                    yield c;
+                    for c in c.into_frames(include_usage) {
+                        yield c;
+                    }
                 }
                 if StreamState::is_terminal(&parsed) {
                     return;
@@ -587,7 +591,7 @@ mod tests {
                 .into_iter()
                 .map(|c| Ok::<_, reqwest::Error>(bytes::Bytes::from(c))),
         );
-        build_chunk_stream(bytes).collect().await
+        build_chunk_stream(bytes, false).collect().await
     }
 
     fn sse(event: &str, data: serde_json::Value) -> String {
