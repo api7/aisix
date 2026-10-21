@@ -584,8 +584,7 @@ impl BedrockSecret {
             );
             match e {
                 // Missing or refused credentials: the configuration's to fix.
-                CredentialsError::CredentialsNotLoaded(_)
-                | CredentialsError::InvalidConfiguration(_) => {
+                e if aisix_gateway::aws_auth::credentials_refused(&e) => {
                     BridgeError::InvalidUpstreamCredentials(msg)
                 }
                 CredentialsError::ProviderTimedOut(_) => timed_out("obtaining AWS credentials"),

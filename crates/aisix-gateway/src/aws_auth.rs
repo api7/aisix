@@ -105,6 +105,18 @@ pub enum AwsAuth {
     SigV4(SharedCredentialsProvider),
 }
 
+/// Whether a credential provider's error says the configured credentials
+/// are missing or refused — the configuration's to fix — rather than that
+/// a credential service failed and may answer the next attempt. Every
+/// Bedrock consumer classifies a credential failure through this, so they
+/// cannot drift.
+pub fn credentials_refused(err: &CredentialsError) -> bool {
+    matches!(
+        err,
+        CredentialsError::CredentialsNotLoaded(_) | CredentialsError::InvalidConfiguration(_)
+    )
+}
+
 /// The authentication for `spec`. Credentials that are fetched rather than
 /// configured come from one provider per distinct `spec`, shared by every
 /// caller, so a refresh is paid once per configuration rather than once per

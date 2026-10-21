@@ -845,11 +845,7 @@ fn credentials_refused(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut cur = Some(err);
     while let Some(e) = cur {
         if let Some(c) = e.downcast_ref::<CredentialsError>() {
-            return matches!(
-                c,
-                CredentialsError::CredentialsNotLoaded(_)
-                    | CredentialsError::InvalidConfiguration(_)
-            );
+            return aisix_gateway::aws_auth::credentials_refused(c);
         }
         cur = e.source();
     }
