@@ -211,7 +211,8 @@ pub fn spawn(
 /// before the drain ended is still served after it, and that request's
 /// UsageEvent is owed like any other. Stopping only once the proxy has
 /// stopped serving is what keeps those events from landing in a queue
-/// nobody reads.
+/// nobody reads. An upgraded (WebSocket) session is not part of serving
+/// once its 101 is out, so its event is not covered by this.
 pub async fn stop_after<T>(
     serving: impl std::future::Future<Output = T>,
     stop: &watch::Sender<bool>,

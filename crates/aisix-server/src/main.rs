@@ -3050,7 +3050,8 @@ async fn accept_loop(
     // what is left here is idle pooled connections, which end as soon as
     // `serve_connection` hands them the cancel signal, and connections that
     // have not sent a request yet, which are served first and so are held
-    // for up to `downstream.idle_timeout_secs` (unbounded when it is 0).
+    // for up to `downstream.idle_timeout_secs` (unbounded when it is 0; a
+    // TLS handshake that stalls is not bounded by it either).
     drop(alive);
     let _ = all_connections_ended.recv().await;
     Ok(())
@@ -3112,27 +3113,30 @@ async fn serve_connection<I, S>(
             // a plaintext one whose request is still arriving — nothing
             // has been read at the moment the drain ends. That client is
             // owed an answer like any other (AISIX-Cloud#1394), so a
-            // connection is retired only once it has answered a request:
-            // the one that arrives is served with `Connection: close`, and
-            // a connection that never sends one is bounded by
-            // `downstream.idle_timeout_secs` exactly as the version sniff
-            // bounds a plaintext one. A pooled connection that has served
-            // a request is retired when the drain ends, as before.
+            // connection is retired only between requests, once it has
+            // answered one: the request that arrives is served with
+            // `Connection: close`, and a connection that never sends one
+            // is bounded by `downstream.idle_timeout_secs` exactly as the
+            // version sniff bounds a plaintext one. A pooled connection
+            // idle when the drain ends is retired then, as before.
             //
-            // A 101 does not count: the connection stops being HTTP once
-            // it is upgraded, and retiring it first would make hyper stamp
-            // `Connection: close` over the 101's `Connection: upgrade`,
-            // which a WebSocket client rejects (RFC 6455 §4.1).
-            let (dispatched_tx, mut dispatched) = watch::channel(false);
-            let dispatched_tx = std::sync::Arc::new(dispatched_tx);
+            // Waiting for the answer is also what keeps an upgrade intact:
+            // retiring a connection while its upgrade handler runs makes
+            // hyper stamp `Connection: close` over the 101's `Connection:
+            // upgrade`, which a WebSocket client rejects (RFC 6455 §4.1).
+            // A 101 does not make the connection retirable — it is no
+            // longer HTTP once upgraded.
+            let (retirable_tx, mut retirable) = watch::channel(false);
+            let retirable_tx = std::sync::Arc::new(retirable_tx);
             let service = hyper::service::service_fn(move |req| {
+                retirable_tx.send_if_modified(|r| std::mem::replace(r, false));
                 let call = hyper::service::Service::call(&service, req);
-                let dispatched_tx = dispatched_tx.clone();
+                let retirable_tx = retirable_tx.clone();
                 async move {
                     let response = call.await;
                     if let Ok(response) = &response {
                         if response.status() != axum::http::StatusCode::SWITCHING_PROTOCOLS {
-                            dispatched_tx.send_if_modified(|d| !std::mem::replace(d, true));
+                            retirable_tx.send_if_modified(|r| !std::mem::replace(r, true));
                         }
                     }
                     response
@@ -3149,7 +3153,7 @@ async fn serve_connection<I, S>(
                     served = conn.as_mut() => break served.map_err(|e| e.to_string()),
                     _ = async {
                         shutdown.cancelled().await;
-                        let _ = dispatched.wait_for(|d| *d).await;
+                        let _ = retirable.wait_for(|r| *r).await;
                     }, if !retired => {
                         conn.as_mut().graceful_shutdown();
                         retired = true;
@@ -4674,6 +4678,57 @@ managed:
             head.extend_from_slice(&buf[..n]);
         }
         let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 101"), "{head}");
+        assert!(head.contains("\r\nconnection: upgrade\r\n"), "{head}");
+        drop(tcp);
+        harness.serving.await.expect("join").expect("serve");
+    }
+
+    /// The same, on a pooled connection that has already served a request
+    /// and asks to upgrade while the drain ends: it is not idle, so it is
+    /// not retired under the running upgrade handler.
+    #[tokio::test]
+    async fn an_upgrade_on_a_pooled_connection_keeps_connection_upgrade_when_the_drain_ends() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn read_head(tcp: &mut tokio::net::TcpStream) -> String {
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                let n = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut byte))
+                    .await
+                    .expect("response head in time")
+                    .expect("read");
+                assert!(n > 0, "closed before a response head: {head:?}");
+                head.push(byte[0]);
+            }
+            String::from_utf8_lossy(&head).to_ascii_lowercase()
+        }
+
+        let harness = drain_harness().await;
+        let mut tcp = tokio::net::TcpStream::connect(harness.addr)
+            .await
+            .expect("connect");
+        tcp.write_all(b"GET / HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("write");
+        let first = read_head(&mut tcp).await;
+        assert!(first.starts_with("http/1.1 200"), "{first}");
+        let mut body = [0u8; 2];
+        tcp.read_exact(&mut body).await.expect("body");
+
+        tcp.write_all(
+            b"GET /upgrade-slow HTTP/1.1\r\nhost: 127.0.0.1\r\n\
+              connection: upgrade\r\nupgrade: websocket\r\n\r\n",
+        )
+        .await
+        .expect("write");
+        // The handler is now running; the drain ends under it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        harness.retire.send(true).expect("retire");
+        harness.cancel.send(true).expect("cancel");
+
+        let head = read_head(&mut tcp).await;
         assert!(head.starts_with("http/1.1 101"), "{head}");
         assert!(head.contains("\r\nconnection: upgrade\r\n"), "{head}");
         drop(tcp);
