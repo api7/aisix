@@ -25,7 +25,8 @@ interface CloseUpstream {
 }
 
 /** Mock Realtime upstream: greets with `session.created`, then obeys
- * `test.close` / `test.close-empty` / `test.drop` control events. */
+ * `test.close` / `test.close-empty` / `test.close-raw` / `test.drop`
+ * control events. */
 async function startUpstream(): Promise<CloseUpstream> {
   const closesSeen: number[] = [];
   const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
@@ -38,6 +39,21 @@ async function startUpstream(): Promise<CloseUpstream> {
       // A Close frame with no status code: reads as 1005, which is reserved.
       if (ev.type === "test.close-empty") socket.close();
       if (ev.type === "test.drop") socket.terminate();
+      // A Close frame written byte by byte, for what `ws` refuses to send:
+      // a code that may not be sent, or a control frame over 125 bytes.
+      if (ev.type === "test.close-raw") {
+        const payload = Buffer.concat([
+          Buffer.from([ev.code! >> 8, ev.code! & 0xff]),
+          Buffer.from(ev.reason ?? ""),
+        ]);
+        const header =
+          payload.length < 126
+            ? Buffer.from([0x88, payload.length])
+            : Buffer.from([0x88, 126, payload.length >> 8, payload.length & 0xff]);
+        (socket as unknown as { _socket: NodeJS.WritableStream })._socket.write(
+          Buffer.concat([header, payload]),
+        );
+      }
     });
   });
   await new Promise<void>((resolve) => wss.on("listening", resolve));
@@ -162,19 +178,70 @@ describe("/v1/realtime close handshake", () => {
     expect(errors[0].error?.message).toContain("quota exhausted");
   });
 
-  test("a close without a status code becomes 1011", async (ctx) => {
-    if (!ready(ctx)) return;
+  /** Trigger an upstream end and return the close and the one error event's message. */
+  async function upstreamEnds(control: object) {
     const s = await openSession(app!);
-    s.ws.send(JSON.stringify({ type: "test.close-empty" }));
-    expect((await s.closed).code).toBe(1011);
-    expect(s.events.filter((e) => e.type === "error")).toHaveLength(1);
+    s.ws.send(JSON.stringify(control));
+    const closed = await s.closed;
+    const errors = s.events.filter((e) => e.type === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0].error?.type).toBe("server_error");
+    return { closed, message: errors[0].error?.message ?? "" };
+  }
+
+  test("a close without a status code becomes 1011, without claiming a code", async (ctx) => {
+    if (!ready(ctx)) return;
+    const { closed, message } = await upstreamEnds({ type: "test.close-empty" });
+    expect(closed).toEqual({ code: 1011, reason: "" });
+    expect(message).toBe("upstream websocket closed without a status code");
   });
 
-  test("an upstream that drops the connection becomes 1011", async (ctx) => {
+  test("an upstream that drops the connection becomes 1011, without claiming a code", async (ctx) => {
     if (!ready(ctx)) return;
-    const s = await openSession(app!);
-    s.ws.send(JSON.stringify({ type: "test.drop" }));
-    expect((await s.closed).code).toBe(1011);
-    expect(s.events.filter((e) => e.type === "error")).toHaveLength(1);
+    const { closed, message } = await upstreamEnds({ type: "test.drop" });
+    expect(closed).toEqual({ code: 1011, reason: "upstream error" });
+    expect(message).toMatch(/^upstream websocket connection failed: /);
+    expect(message).not.toMatch(/code \d/);
+  });
+
+  // The gateway's WebSocket library replaces such a Close with its own
+  // 1002 "Protocol violation" and drops the upstream's code.
+  test.for([1004, 2999])(
+    "an upstream close with code %i, which may not be sent, becomes 1011",
+    async (code, ctx) => {
+      if (!ready(ctx)) return;
+      const { closed, message } = await upstreamEnds({
+        type: "test.close-raw",
+        code,
+        reason: `r${code}`,
+      });
+      expect(closed).toEqual({ code: 1011, reason: "" });
+      expect(message).toBe(
+        'upstream websocket sent a close frame the gateway cannot relay: an invalid close code, or 1002 "Protocol violation"',
+      );
+    },
+  );
+
+  test("an upstream 1002 with its own reason is relayed as received", async (ctx) => {
+    if (!ready(ctx)) return;
+    const { closed, message } = await upstreamEnds({
+      type: "test.close",
+      code: 1002,
+      reason: "bad frame",
+    });
+    expect(closed).toEqual({ code: 1002, reason: "bad frame" });
+    expect(message).toBe("upstream websocket closed with code 1002: bad frame");
+  });
+
+  test("an oversized Close frame is a protocol error: 1011, naming the failure", async (ctx) => {
+    if (!ready(ctx)) return;
+    const { closed, message } = await upstreamEnds({
+      type: "test.close-raw",
+      code: 4003,
+      reason: "x".repeat(140),
+    });
+    expect(closed).toEqual({ code: 1011, reason: "upstream error" });
+    expect(message).toMatch(/^upstream websocket connection failed: /);
+    expect(message).not.toMatch(/code \d/);
   });
 });
