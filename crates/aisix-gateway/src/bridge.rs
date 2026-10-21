@@ -423,9 +423,17 @@ pub enum BridgeError {
     /// The request outgrew `proxy.request_body_limit_bytes` once the media
     /// the gateway downloaded for it is counted with its inbound body.
     /// The same 413 an over-limit inbound body gets; never retried, and
-    /// raised before the upstream is contacted.
-    #[error("request body exceeds {limit_bytes}-byte limit")]
-    RequestTooLarge { limit_bytes: usize },
+    /// raised before the upstream is contacted. The message counts both
+    /// parts, since the inbound body alone is under the limit.
+    #[error(
+        "the request body ({inbound_bytes} bytes) plus downloaded media ({downloaded_bytes} \
+         bytes) exceeds the {limit_bytes}-byte request_body_limit_bytes limit"
+    )]
+    RequestTooLarge {
+        limit_bytes: usize,
+        inbound_bytes: usize,
+        downloaded_bytes: u64,
+    },
     /// Customer-fixable upstream *credential* problem — the admin's
     /// ProviderKey secret/credential is missing, empty, or malformed
     /// (empty secret, api key with invalid HTTP-header bytes, unparseable

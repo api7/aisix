@@ -74,6 +74,7 @@ pub fn init(cfg: &aisix_core::config::MediaFetchConfig, request_body_limit_bytes
 /// What one request may still hold: its inbound body plus every byte
 /// downloaded for it, against `proxy.request_body_limit_bytes`.
 struct RequestBudget {
+    inbound: usize,
     used: AtomicUsize,
     limit: usize,
 }
@@ -81,6 +82,7 @@ struct RequestBudget {
 impl RequestBudget {
     fn new(inbound: usize, limit: usize) -> Self {
         Self {
+            inbound,
             used: AtomicUsize::new(inbound),
             limit,
         }
@@ -91,16 +93,27 @@ impl RequestBudget {
         Self::new(0, 0)
     }
 
-    fn would_exceed(&self, more: u64) -> bool {
-        self.limit > 0 && self.used.load(Ordering::Relaxed) as u64 + more > self.limit as u64
+    /// Refuses a body of `more` bytes the request cannot hold.
+    fn check(&self, more: u64) -> Result<(), Failure> {
+        let total = self.used.load(Ordering::Relaxed) as u64 + more;
+        if self.limit > 0 && total > self.limit as u64 {
+            return Err(self.over(total));
+        }
+        Ok(())
     }
 
     fn claim(&self, n: usize) -> Result<(), Failure> {
         let used = self.used.fetch_add(n, Ordering::Relaxed) + n;
         if self.limit > 0 && used > self.limit {
-            return Err(Failure::OverRequestLimit);
+            return Err(self.over(used as u64));
         }
         Ok(())
+    }
+
+    fn over(&self, total: u64) -> Failure {
+        Failure::OverRequestLimit {
+            downloaded: total.saturating_sub(self.inbound as u64),
+        }
     }
 
     fn release(&self, n: usize) {
@@ -370,11 +383,13 @@ async fn fetch_wanted(
                 slots.insert(w.uri, (media, w.uses));
             }
             Err(Failed {
-                failure: Failure::OverRequestLimit,
+                failure: Failure::OverRequestLimit { downloaded },
                 ..
             }) => {
                 return Err(BridgeError::RequestTooLarge {
                     limit_bytes: settings.request_body_limit_bytes,
+                    inbound_bytes: ctx.inbound_body_bytes,
+                    downloaded_bytes: downloaded,
                 });
             }
             Err(failure) => {
@@ -520,8 +535,8 @@ async fn read_capped(
     if declared.is_some_and(|len| len > max) {
         return Err(Failure::TooLarge);
     }
-    if declared.is_some_and(|len| held.would_exceed(len)) {
-        return Err(Failure::OverRequestLimit);
+    if let Some(len) = declared {
+        held.check(len)?;
     }
     let mut body = Vec::with_capacity(declared.unwrap_or(0) as usize);
     let mut claimed = 0;
@@ -586,8 +601,11 @@ enum Failure {
     Status(u16),
     TooLarge,
     /// The request's inbound body plus its downloads passed
-    /// `proxy.request_body_limit_bytes`.
-    OverRequestLimit,
+    /// `proxy.request_body_limit_bytes`; `downloaded` is what the downloads
+    /// had reached when they did.
+    OverRequestLimit {
+        downloaded: u64,
+    },
     TooManyRedirects,
     BadRedirect,
     UnknownType,
@@ -667,7 +685,7 @@ impl Failure {
                 settings.max_bytes
             ),
             // Answered as a 413 before it is described.
-            Self::OverRequestLimit => format!(
+            Self::OverRequestLimit { .. } => format!(
                 "the request would exceed its {}-byte limit",
                 settings.request_body_limit_bytes
             ),
@@ -764,7 +782,7 @@ mod tests {
         let got = download(&url, &settings, &held).await;
         assert_eq!(
             got.map(|_| ()).map_err(|f| f.failure),
-            Err(Failure::OverRequestLimit)
+            Err(Failure::OverRequestLimit { downloaded: 10 })
         );
         assert_eq!(
             held.used.load(Ordering::Relaxed),

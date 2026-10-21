@@ -632,7 +632,11 @@ mod tests {
             BridgeError::UnsupportedCapability(BridgeCapability::Embeddings),
             BridgeError::InvalidUpstreamConfig("model.model_name missing".into()),
             BridgeError::InvalidRequest("`functions` is not supported for this model".into()),
-            BridgeError::RequestTooLarge { limit_bytes: 1024 },
+            BridgeError::RequestTooLarge {
+                limit_bytes: 1024,
+                inbound_bytes: 1000,
+                downloaded_bytes: 100,
+            },
             BridgeError::InvalidUpstreamCredentials("provider_key.api_key is empty".into()),
         ]
     }

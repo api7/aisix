@@ -811,6 +811,20 @@ describe("chat media downloads count against proxy.request_body_limit_bytes", ()
 
   const url = (path: string) => `http://localhost:${media!.port}${path}`;
 
+  /** The inbound body alone is under the limit, so the 413 has to say the
+   * downloads are what took it over, with both counts. */
+  function expectCountsTheDownload(message: string, body: unknown) {
+    const inbound = Buffer.byteLength(JSON.stringify(body));
+    expect(inbound).toBeLessThan(LIMIT);
+    const m = message.match(
+      /request body \((\d+) bytes\) plus downloaded media \((\d+) bytes\) exceeds the (\d+)-byte/,
+    );
+    expect(m, message).not.toBeNull();
+    expect(Number(m![1])).toBe(inbound);
+    expect(Number(m![1]) + Number(m![2])).toBeGreaterThan(LIMIT);
+    expect(Number(m![3])).toBe(LIMIT);
+  }
+
   test("under the limit the request goes through; past it, the same 413 an oversized body gets", async (ctx) => {
     if (!etcdReachable || !app || !upstream || !media) return ctx.skip();
     const one = await send("/v1/chat/completions", {
@@ -820,19 +834,21 @@ describe("chat media downloads count against proxy.request_body_limit_bytes", ()
     expect(one.status, one.text).toBe(200);
 
     const before = upstream.received.length;
-    const two = await send("/v1/chat/completions", {
+    const twoBody = {
       model: "media-total-nova",
       messages: [
         { role: "user", content: [text("hi"), image(url("/pad-a.png")), image(url("/pad-b.png"))] },
       ],
-    });
+    };
+    const two = await send("/v1/chat/completions", twoBody);
     expect(two.status, two.text).toBe(413);
     const error = JSON.parse(two.text).error;
     expect(error.type).toBe("invalid_request_error");
-    expect(error.message).toContain(`${LIMIT}-byte limit`);
+    expect(error.message).toContain(`${LIMIT}-byte`);
+    expectCountsTheDownload(error.message, twoBody);
     expect(upstream.received.length).toBe(before);
 
-    const viaMessages = await send("/v1/messages", {
+    const messagesBody = {
       model: "media-total-nova",
       max_tokens: 16,
       messages: [
@@ -845,9 +861,11 @@ describe("chat media downloads count against proxy.request_body_limit_bytes", ()
           ],
         },
       ],
-    });
+    };
+    const viaMessages = await send("/v1/messages", messagesBody);
     expect(viaMessages.status, viaMessages.text).toBe(413);
     expect(JSON.parse(viaMessages.text).error.type).toBe("request_too_large");
+    expectCountsTheDownload(JSON.parse(viaMessages.text).error.message, messagesBody);
   });
 });
 
