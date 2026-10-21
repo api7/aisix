@@ -486,6 +486,11 @@ pub struct UsageStats {
     /// `modality`.
     #[serde(skip)]
     pub cache_creation_ttl: CacheCreationTtl,
+    /// The OpenAI-shape `*_tokens_details` counters an upstream reported,
+    /// for the client-facing OpenAI projection only. Not serialized, for
+    /// the same reason as `modality`.
+    #[serde(skip)]
+    pub openai_details: OpenAiUsageDetails,
 }
 
 /// Prompt-cache writes by cache lifetime, as the upstream reported them:
@@ -732,6 +737,70 @@ impl ModalityTokens {
     }
 }
 
+/// The OpenAI `prompt_tokens_details` / `completion_tokens_details`
+/// counters the gateway has no accounting slot for, plus whether the cache
+/// and reasoning counters were reported at all. Each count is `None` when
+/// the upstream did not report it — distinct from a reported `0` — so the
+/// client sees what the upstream sent and nothing it did not. The values
+/// that do have a slot (`cached_prompt_tokens`, `reasoning_tokens`,
+/// `modality`) stay there; the two `*_reported` flags only mark presence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OpenAiUsageDetails {
+    pub cached_tokens_reported: bool,
+    pub reasoning_tokens_reported: bool,
+    pub prompt_text_tokens: Option<u32>,
+    pub completion_text_tokens: Option<u32>,
+    pub accepted_prediction_tokens: Option<u32>,
+    pub rejected_prediction_tokens: Option<u32>,
+}
+
+impl OpenAiUsageDetails {
+    /// Field-wise sum, `None` only where neither side reported.
+    pub fn saturating_add(&self, other: &Self) -> Self {
+        fn add(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+            match (a, b) {
+                (None, None) => None,
+                _ => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+            }
+        }
+        Self {
+            cached_tokens_reported: self.cached_tokens_reported || other.cached_tokens_reported,
+            reasoning_tokens_reported: self.reasoning_tokens_reported
+                || other.reasoning_tokens_reported,
+            prompt_text_tokens: add(self.prompt_text_tokens, other.prompt_text_tokens),
+            completion_text_tokens: add(self.completion_text_tokens, other.completion_text_tokens),
+            accepted_prediction_tokens: add(
+                self.accepted_prediction_tokens,
+                other.accepted_prediction_tokens,
+            ),
+            rejected_prediction_tokens: add(
+                self.rejected_prediction_tokens,
+                other.rejected_prediction_tokens,
+            ),
+        }
+    }
+
+    /// Field-wise maximum, for a stream that reports usage on more than
+    /// one frame.
+    pub fn max_fieldwise(&self, other: &Self) -> Self {
+        Self {
+            cached_tokens_reported: self.cached_tokens_reported || other.cached_tokens_reported,
+            reasoning_tokens_reported: self.reasoning_tokens_reported
+                || other.reasoning_tokens_reported,
+            prompt_text_tokens: self.prompt_text_tokens.max(other.prompt_text_tokens),
+            completion_text_tokens: self
+                .completion_text_tokens
+                .max(other.completion_text_tokens),
+            accepted_prediction_tokens: self
+                .accepted_prediction_tokens
+                .max(other.accepted_prediction_tokens),
+            rejected_prediction_tokens: self
+                .rejected_prediction_tokens
+                .max(other.rejected_prediction_tokens),
+        }
+    }
+}
+
 fn is_zero(n: &u32) -> bool {
     *n == 0
 }
@@ -879,6 +948,7 @@ impl UsageStats {
             cache_creation_ttl: self
                 .cache_creation_ttl
                 .saturating_add(&other.cache_creation_ttl),
+            openai_details: self.openai_details.saturating_add(&other.openai_details),
         }
     }
 
@@ -918,6 +988,7 @@ impl UsageStats {
             cache_creation_ttl: self
                 .cache_creation_ttl
                 .max_fieldwise(&other.cache_creation_ttl),
+            openai_details: self.openai_details.max_fieldwise(&other.openai_details),
         }
     }
 
@@ -1171,6 +1242,22 @@ impl ChatChunk {
             self.service_tier.clone_from(fallback);
         }
         self
+    }
+
+    /// Carries nothing for the caller but a finish reason or usage: no
+    /// delta payload of any kind.
+    pub fn has_no_payload(&self) -> bool {
+        let d = &self.delta;
+        d.role.is_none()
+            && d.content.is_none()
+            && d.tool_calls.is_none()
+            && d.reasoning_content.is_none()
+            && d.audio.is_none()
+    }
+
+    /// The `include_usage` terminal frame: usage and nothing else.
+    pub fn is_usage_only(&self) -> bool {
+        self.usage.is_some() && self.finish_reason.is_none() && self.has_no_payload()
     }
 }
 
@@ -1821,6 +1908,11 @@ mod tests {
                 cache_creation_5m_tokens: Some(0),
                 cache_creation_1h_tokens: Some(1),
             },
+            openai_details: OpenAiUsageDetails {
+                accepted_prediction_tokens: Some(2),
+                rejected_prediction_tokens: Some(0),
+                ..OpenAiUsageDetails::default()
+            },
         };
         let b = UsageStats {
             prompt_tokens: 20,
@@ -1841,8 +1933,22 @@ mod tests {
                 ..ModalityTokens::NONE
             },
             cache_creation_ttl: CacheCreationTtl::NONE,
+            openai_details: OpenAiUsageDetails {
+                accepted_prediction_tokens: Some(5),
+                prompt_text_tokens: Some(7),
+                ..OpenAiUsageDetails::default()
+            },
         };
         let sum = a.saturating_add(&b);
+        assert_eq!(
+            sum.openai_details,
+            OpenAiUsageDetails {
+                accepted_prediction_tokens: Some(7),
+                rejected_prediction_tokens: Some(0),
+                prompt_text_tokens: Some(7),
+                ..OpenAiUsageDetails::default()
+            }
+        );
         assert_eq!(sum.cache_creation_ttl, a.cache_creation_ttl);
         assert_eq!(
             sum.modality,

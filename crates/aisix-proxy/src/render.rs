@@ -79,19 +79,18 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
-    /// OpenAI-canonical prompt-token breakdown. Emitted whenever the
-    /// gateway has a non-zero cache-hit count (#542) — for OpenAI it
-    /// comes from the upstream's `prompt_tokens_details.cached_tokens`,
-    /// for DeepSeek from the normalized native `prompt_cache_hit_tokens`
-    /// — or the upstream reported a prompt audio count.
-    /// Skipped (not `{}`) when there's nothing to report, so callers
-    /// that branch on the field's presence behave like they do against
-    /// api.openai.com.
+    /// OpenAI-canonical prompt-token breakdown. Each counter is emitted
+    /// when the upstream reported it — a reported `0` included, so an
+    /// OpenAI-shape upstream's details reach the caller as it sent them —
+    /// and the whole object is omitted when nothing was reported, so
+    /// callers that branch on the field's presence behave like they do
+    /// against api.openai.com. Bridged upstreams fill it through their
+    /// existing mappings (`cached_tokens` from an Anthropic / Bedrock
+    /// cache read or DeepSeek's native hit count, `cache_creation_tokens`
+    /// from a cache write); nothing is invented for one that reports none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
-    /// OpenAI-canonical completion-token breakdown. Emitted when the
-    /// upstream reported reasoning tokens (o1/o3/DeepSeek-R1) (#542/#466)
-    /// or a completion audio count.
+    /// OpenAI-canonical completion-token breakdown, under the same rule.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
     /// DeepSeek-native cache-hit counter, passed through verbatim
@@ -108,13 +107,14 @@ pub struct Usage {
 
 #[derive(Debug, Serialize, Default)]
 pub struct PromptTokensDetails {
-    /// Prompt tokens served from the provider's prompt cache. Always
-    /// present on the object, as on api.openai.com, so a client that reads
-    /// it once the object exists never finds it missing.
-    pub cached_tokens: u32,
-    /// Audio input tokens, when the upstream reported a non-zero count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_tokens: Option<u32>,
     /// Raw OpenAI cache-write counter, kept separate from additive cache creation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u32>,
@@ -125,12 +125,41 @@ pub struct PromptTokensDetails {
 
 #[derive(Debug, Serialize, Default)]
 pub struct CompletionTokensDetails {
-    /// o1 / o3 / DeepSeek-R1 reasoning tokens (subset of completion).
-    /// Always present on the object, like `cached_tokens`.
-    pub reasoning_tokens: u32,
-    /// Audio output tokens, when the upstream reported a non-zero count.
+    /// Reasoning tokens (subset of completion).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_prediction_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected_prediction_tokens: Option<u32>,
+}
+
+impl PromptTokensDetails {
+    fn is_empty(&self) -> bool {
+        self.cached_tokens.is_none()
+            && self.audio_tokens.is_none()
+            && self.text_tokens.is_none()
+            && self.image_tokens.is_none()
+            && self.cache_write_tokens.is_none()
+            && self.cache_creation_tokens.is_none()
+    }
+}
+
+impl CompletionTokensDetails {
+    fn is_empty(&self) -> bool {
+        self.reasoning_tokens.is_none()
+            && self.audio_tokens.is_none()
+            && self.text_tokens.is_none()
+            && self.image_tokens.is_none()
+            && self.accepted_prediction_tokens.is_none()
+            && self.rejected_prediction_tokens.is_none()
+    }
 }
 
 impl Usage {
@@ -145,50 +174,49 @@ impl Usage {
     ///   and copying them through handed an OpenAI client a
     ///   `prompt_tokens` short of the input it paid for, with
     ///   `total_tokens != prompt + completion` (AISIX-Cloud#1447)
-    /// - `cached_tokens > 0` → emit OpenAI-shape
-    ///   `prompt_tokens_details.cached_tokens` (works for OpenAI's
-    ///   nested field, DeepSeek's normalized native one, AND an
-    ///   Anthropic/Bedrock upstream's `cache_read_input_tokens`)
+    /// - each `*_tokens_details` counter the upstream reported is emitted,
+    ///   a reported `0` included; one it did not report is omitted, and a
+    ///   details object with nothing in it is omitted entirely
+    /// - `cached_tokens` is the projected hit (OpenAI's nested field,
+    ///   DeepSeek's normalized native one, or an Anthropic / Bedrock
+    ///   `cache_read_input_tokens`), emitted beside any cache write too
     /// - a cache WRITE is billed input, so it lands in `prompt_tokens`
     ///   and is named beside the hit rather than left as an unexplained
     ///   increase the caller cannot price
-    /// - `reasoning_tokens > 0` → emit
-    ///   `completion_tokens_details.reasoning_tokens`
-    /// - a non-zero audio count the upstream reported → emit it as
-    ///   `*_tokens_details.audio_tokens`, OpenAI's own names
     /// - DeepSeek-native `prompt_cache_hit_tokens` /
     ///   `prompt_cache_miss_tokens` passed through verbatim when the
     ///   upstream sent them (Some), omitted otherwise
     fn from_stats(u: &aisix_gateway::UsageStats) -> Self {
+        let reported = &u.openai_details;
         let cached_tokens = u.openai_cached_tokens();
         let cache_creation_tokens = u.anthropic_cache_creation_input_tokens();
-        let cache_detail =
-            cached_tokens > 0 || cache_creation_tokens > 0 || u.cache_write_tokens.is_some();
-        // Non-zero only, like the cache and reasoning counters: an OpenAI
-        // upstream reports `audio_tokens: 0` on every text request, and
-        // echoing it would add a details object to responses that have
-        // never carried one.
-        let prompt_audio_tokens = u.modality.prompt_audio_tokens.filter(|&n| n > 0);
-        let completion_audio_tokens = u.modality.completion_audio_tokens.filter(|&n| n > 0);
+        let cache_detail = cached_tokens > 0
+            || reported.cached_tokens_reported
+            || cache_creation_tokens > 0
+            || u.cache_write_tokens.is_some();
+        let prompt = PromptTokensDetails {
+            cached_tokens: cache_detail.then_some(cached_tokens),
+            audio_tokens: u.modality.prompt_audio_tokens,
+            text_tokens: reported.prompt_text_tokens,
+            image_tokens: u.modality.prompt_image_tokens,
+            cache_write_tokens: u.cache_write_tokens,
+            cache_creation_tokens: (cache_creation_tokens > 0).then_some(cache_creation_tokens),
+        };
+        let completion = CompletionTokensDetails {
+            reasoning_tokens: (u.reasoning_tokens > 0 || reported.reasoning_tokens_reported)
+                .then_some(u.reasoning_tokens),
+            audio_tokens: u.modality.completion_audio_tokens,
+            text_tokens: reported.completion_text_tokens,
+            image_tokens: u.modality.completion_image_tokens,
+            accepted_prediction_tokens: reported.accepted_prediction_tokens,
+            rejected_prediction_tokens: reported.rejected_prediction_tokens,
+        };
         Usage {
             prompt_tokens: u.openai_prompt_tokens(),
             completion_tokens: u.completion_tokens,
             total_tokens: u.openai_total_tokens(),
-            prompt_tokens_details: (cache_detail || prompt_audio_tokens.is_some()).then_some(
-                PromptTokensDetails {
-                    cached_tokens,
-                    audio_tokens: prompt_audio_tokens,
-                    cache_write_tokens: u.cache_write_tokens,
-                    cache_creation_tokens: (cache_creation_tokens > 0)
-                        .then_some(cache_creation_tokens),
-                },
-            ),
-            completion_tokens_details: (u.reasoning_tokens > 0
-                || completion_audio_tokens.is_some())
-            .then_some(CompletionTokensDetails {
-                reasoning_tokens: u.reasoning_tokens,
-                audio_tokens: completion_audio_tokens,
-            }),
+            prompt_tokens_details: (!prompt.is_empty()).then_some(prompt),
+            completion_tokens_details: (!completion.is_empty()).then_some(completion),
             prompt_cache_hit_tokens: u.prompt_cache_hit_tokens,
             prompt_cache_miss_tokens: u.prompt_cache_miss_tokens,
         }
@@ -270,16 +298,13 @@ pub fn render_chunk(
     chunk: ChatChunk,
     client_facing_model: &str,
 ) -> ChatCompletionChunk {
-    // Same contract as `render_response`: every chunk's `model` field
-    // carries the customer's requested name, not the upstream's raw id.
-    // Re-stamping has to happen per-chunk; missing one chunk leaks the
-    // upstream id mid-stream.
-    ChatCompletionChunk {
-        id: chunk.id,
-        object: "chat.completion.chunk",
-        created: created_unix_ts,
-        model: client_facing_model.to_string(),
-        choices: vec![StreamChoice {
+    // A frame that carries only usage is the `include_usage` terminal
+    // frame, which OpenAI sends with an empty `choices` array.
+    let usage_only = chunk.is_usage_only();
+    let choices = if usage_only {
+        Vec::new()
+    } else {
+        vec![StreamChoice {
             index: 0,
             delta: RenderedDelta {
                 role: chunk.delta.role.map(role_to_str),
@@ -292,7 +317,18 @@ pub fn render_chunk(
                 .finish_reason
                 .as_ref()
                 .map(|f| finish_to_str(f).to_string()),
-        }],
+        }]
+    };
+    // Same contract as `render_response`: every chunk's `model` field
+    // carries the customer's requested name, not the upstream's raw id.
+    // Re-stamping has to happen per-chunk; missing one chunk leaks the
+    // upstream id mid-stream.
+    ChatCompletionChunk {
+        id: chunk.id,
+        object: "chat.completion.chunk",
+        created: created_unix_ts,
+        model: client_facing_model.to_string(),
+        choices,
         usage: chunk.usage.as_ref().map(Usage::from_stats),
         service_tier: openai_service_tier(chunk.service_tier.as_ref()),
     }

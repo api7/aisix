@@ -195,7 +195,7 @@ describe("streaming ensemble folds the panel usage once with a multi-usage-frame
     expect(terminal.usage).toMatchObject({ prompt_tokens: 40, completion_tokens: 29, total_tokens: 69 });
     expect(terminal.id).toBe("chatcmpl-judge");
     expect(terminal.model).toBe(ENSEMBLE);
-    expect(terminal.choices).toEqual([{ index: 0, delta: {} }]);
+    expect(terminal.choices).toEqual([]);
     // The stripped usage-only trailer is dropped, not forwarded empty: the
     // terminal frame is the only chunk with nothing but an empty delta.
     const emptyFrames = frames.filter((f) => {

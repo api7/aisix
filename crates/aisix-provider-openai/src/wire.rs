@@ -277,7 +277,7 @@ pub struct OpenAiUsage {
 pub struct OpenAiPromptDetails {
     /// Tokens served from the prompt cache (50% of prompt rate).
     #[serde(default)]
-    pub cached_tokens: u32,
+    pub cached_tokens: Option<u32>,
     #[serde(default)]
     pub cache_write_tokens: Option<u32>,
     /// Audio / image input tokens, as reported (audio-input models).
@@ -285,6 +285,8 @@ pub struct OpenAiPromptDetails {
     pub audio_tokens: Option<u32>,
     #[serde(default)]
     pub image_tokens: Option<u32>,
+    #[serde(default)]
+    pub text_tokens: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -293,12 +295,20 @@ pub struct OpenAiCompletionDetails {
     /// surfaced separately so admins can see "of which N were
     /// reasoning" on the dashboard.
     #[serde(default)]
-    pub reasoning_tokens: u32,
+    pub reasoning_tokens: Option<u32>,
     /// Audio / image output tokens, as reported (audio-output models).
     #[serde(default)]
     pub audio_tokens: Option<u32>,
     #[serde(default)]
     pub image_tokens: Option<u32>,
+    #[serde(default)]
+    pub text_tokens: Option<u32>,
+    /// Predicted Outputs: prediction tokens that did / did not appear in
+    /// the completion.
+    #[serde(default)]
+    pub accepted_prediction_tokens: Option<u32>,
+    #[serde(default)]
+    pub rejected_prediction_tokens: Option<u32>,
 }
 
 pub fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
@@ -385,6 +395,8 @@ pub fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
 }
 
 pub fn into_usage(u: OpenAiUsage) -> UsageStats {
+    let prompt = u.prompt_tokens_details.as_ref();
+    let completion = u.completion_tokens_details.as_ref();
     UsageStats {
         prompt_tokens: u.prompt_tokens,
         completion_tokens: u.completion_tokens,
@@ -396,10 +408,8 @@ pub fn into_usage(u: OpenAiUsage) -> UsageStats {
         // nested form when present, else fall back to DeepSeek's native
         // field. This is what surfaces as `prompt_tokens_details.cached_tokens`
         // on the client response regardless of upstream.
-        cached_prompt_tokens: u
-            .prompt_tokens_details
-            .as_ref()
-            .map(|d| d.cached_tokens)
+        cached_prompt_tokens: prompt
+            .and_then(|d| d.cached_tokens)
             // A *zeroed* nested detail must not mask a real native
             // count (PR #442 audit MEDIUM-1): a hybrid OpenAI-compat
             // proxy could send `prompt_tokens_details:{cached_tokens:0}`
@@ -409,15 +419,8 @@ pub fn into_usage(u: OpenAiUsage) -> UsageStats {
             .filter(|&n| n > 0)
             .or(u.prompt_cache_hit_tokens)
             .unwrap_or(0),
-        cache_write_tokens: u
-            .prompt_tokens_details
-            .as_ref()
-            .and_then(|d| d.cache_write_tokens),
-        reasoning_tokens: u
-            .completion_tokens_details
-            .as_ref()
-            .map(|d| d.reasoning_tokens)
-            .unwrap_or(0),
+        cache_write_tokens: prompt.and_then(|d| d.cache_write_tokens),
+        reasoning_tokens: completion.and_then(|d| d.reasoning_tokens).unwrap_or(0),
         // OpenAI doesn't currently expose Anthropic-style cache
         // creation/read counters; leave at 0 (cp-api falls back to
         // prompt rate for unset cache counters).
@@ -431,22 +434,18 @@ pub fn into_usage(u: OpenAiUsage) -> UsageStats {
         prompt_cache_hit_tokens: u.prompt_cache_hit_tokens,
         prompt_cache_miss_tokens: u.prompt_cache_miss_tokens,
         modality: aisix_gateway::ModalityTokens {
-            prompt_audio_tokens: u
-                .prompt_tokens_details
-                .as_ref()
-                .and_then(|d| d.audio_tokens),
-            prompt_image_tokens: u
-                .prompt_tokens_details
-                .as_ref()
-                .and_then(|d| d.image_tokens),
-            completion_audio_tokens: u
-                .completion_tokens_details
-                .as_ref()
-                .and_then(|d| d.audio_tokens),
-            completion_image_tokens: u
-                .completion_tokens_details
-                .as_ref()
-                .and_then(|d| d.image_tokens),
+            prompt_audio_tokens: prompt.and_then(|d| d.audio_tokens),
+            prompt_image_tokens: prompt.and_then(|d| d.image_tokens),
+            completion_audio_tokens: completion.and_then(|d| d.audio_tokens),
+            completion_image_tokens: completion.and_then(|d| d.image_tokens),
+        },
+        openai_details: aisix_gateway::OpenAiUsageDetails {
+            cached_tokens_reported: prompt.is_some_and(|d| d.cached_tokens.is_some()),
+            reasoning_tokens_reported: completion.is_some_and(|d| d.reasoning_tokens.is_some()),
+            prompt_text_tokens: prompt.and_then(|d| d.text_tokens),
+            completion_text_tokens: completion.and_then(|d| d.text_tokens),
+            accepted_prediction_tokens: completion.and_then(|d| d.accepted_prediction_tokens),
+            rejected_prediction_tokens: completion.and_then(|d| d.rejected_prediction_tokens),
         },
         // `total_tokens` decodes to 0 when the upstream omits it, which is
         // exactly "not reported".
@@ -823,6 +822,24 @@ pub fn embed_usage_into(usage: Option<OpenAiEmbedUsage>) -> EmbeddingUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_details_keep_reported_zeros_apart_from_absent_and_null() {
+        let usage: OpenAiUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 4,
+            "total_tokens": 14,
+            "prompt_tokens_details": {"cached_tokens": null, "text_tokens": 0},
+            "completion_tokens_details": {"reasoning_tokens": null, "rejected_prediction_tokens": 0}
+        }))
+        .expect("a null detail counter decodes as unreported");
+        let u = into_usage(usage);
+        assert!(!u.openai_details.cached_tokens_reported);
+        assert!(!u.openai_details.reasoning_tokens_reported);
+        assert_eq!(u.openai_details.prompt_text_tokens, Some(0));
+        assert_eq!(u.openai_details.rejected_prediction_tokens, Some(0));
+        assert_eq!(u.openai_details.accepted_prediction_tokens, None);
+    }
 
     #[test]
     fn messages_from_preserves_developer_role() {

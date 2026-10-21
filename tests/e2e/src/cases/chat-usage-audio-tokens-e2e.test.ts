@@ -168,12 +168,12 @@ describe("chat completion usage carries the upstream's audio tokens", () => {
       expect(usage.completion_tokens_details).toEqual({ reasoning_tokens: 0, audio_tokens: 64 });
     });
 
-    test(`${mode}: an all-zero breakdown adds no details objects`, async (ctx) => {
+    test(`${mode}: an all-zero breakdown reaches the caller as reported`, async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
       const usage = await usageOf(modelName("zero", stream), stream);
       expect(usage.prompt_tokens).toBe(7);
-      expect(usage.prompt_tokens_details).toBeUndefined();
-      expect(usage.completion_tokens_details).toBeUndefined();
+      expect(usage.prompt_tokens_details).toEqual(ZERO_USAGE.prompt_tokens_details);
+      expect(usage.completion_tokens_details).toEqual(ZERO_USAGE.completion_tokens_details);
     });
 
     test(`${mode}: no audio count is invented when the upstream reported none`, async (ctx) => {
