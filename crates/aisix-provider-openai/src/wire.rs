@@ -824,6 +824,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn usage_details_keep_reported_zeros_apart_from_absent_and_null() {
+        let usage: OpenAiUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 4,
+            "total_tokens": 14,
+            "prompt_tokens_details": {"cached_tokens": null, "text_tokens": 0},
+            "completion_tokens_details": {"reasoning_tokens": null, "rejected_prediction_tokens": 0}
+        }))
+        .expect("a null detail counter decodes as unreported");
+        let u = into_usage(usage);
+        assert!(!u.openai_details.cached_tokens_reported);
+        assert!(!u.openai_details.reasoning_tokens_reported);
+        assert_eq!(u.openai_details.prompt_text_tokens, Some(0));
+        assert_eq!(u.openai_details.rejected_prediction_tokens, Some(0));
+        assert_eq!(u.openai_details.accepted_prediction_tokens, None);
+    }
+
+    #[test]
     fn messages_from_preserves_developer_role() {
         let req = ChatFormat::new(
             "gpt-4o",
