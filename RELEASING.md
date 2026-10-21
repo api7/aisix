@@ -49,7 +49,7 @@ docker run --rm --entrypoint cat ghcr.io/api7/aisix:X.Y.Z \
   /usr/local/share/aisix/pgo-verified.json
 ```
 
-**`-rc.N`, `:dev` and PR images are NOT PGO'd** — PGO cost ~20 min on every
+**`-rc.N` and `:dev` images are NOT PGO'd** — PGO cost ~20 min on every
 one of the ~40 main pushes per cycle and none of those images are what a
 customer runs. Two things follow, and both belong to the release flow:
 
@@ -88,11 +88,6 @@ gh run list --workflow=docker-image.yml --limit 1 --json databaseId,headSha --jq
 # when you come to tag — a lookup, not a wait
 gh run view <run-id> --json conclusion --jq .conclusion
 ```
-
-A PR that touches `Dockerfile`, `Cargo.toml`, `Cargo.lock`,
-`rust-toolchain.toml`, `bench/pgo-training/**` or the workflow itself still
-flips to PGO=on automatically — that is the one pre-tag exercise of the
-pipeline that needs no one to remember it.
 
 Local note: each retrained profile is content-addressed, so repeated local
 PGO builds accumulate build artifacts in the persistent BuildKit cache

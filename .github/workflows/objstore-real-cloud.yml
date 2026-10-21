@@ -67,7 +67,7 @@ jobs:
     # The explicit same-repo check is defense-in-depth: plain `pull_request`
     # withholds secrets from fork PRs by GitHub default today, but this gate
     # keeps the credentials off fork-controlled code even if that default is
-    # ever flipped (mirrors docker-image.yml's `!= 'pull_request'` guard).
+    # ever flipped.
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.head.repo.full_name == github.repository &&
