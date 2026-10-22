@@ -270,7 +270,8 @@ stopped=""
 while IFS=$'\t' read -r unit size kind image id digest created tags; do
   if [ "$unit" != "$cur" ]; then
     cur=$unit
-    if [ $((executed + size)) -gt "$MAX_DELETES" ]; then
+    # A unit larger than the cap still runs alone, or it would block every run.
+    if [ "$MAX_DELETES" -eq 0 ] || { [ "$executed" -gt 0 ] && [ $((executed + size)) -gt "$MAX_DELETES" ]; }; then
       stopped="reached the cap of $MAX_DELETES DELETEs"
       break
     fi

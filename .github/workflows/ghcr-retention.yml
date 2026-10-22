@@ -50,7 +50,7 @@ jobs:
       - name: List versions past retention
         env:
           GH_TOKEN: ${{ github.token }}
-          MAX_DELETES: ${{ inputs.max_deletes || 300 }}
+          MAX_DELETES: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.max_deletes) || '' }}
         run: scripts/ghcr-retention.sh --dry-run
 
   cleanup:
@@ -66,5 +66,5 @@ jobs:
       - name: Delete versions past retention
         env:
           GH_TOKEN: ${{ github.token }}
-          MAX_DELETES: ${{ inputs.max_deletes || 300 }}
+          MAX_DELETES: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.max_deletes) || '' }}
         run: scripts/ghcr-retention.sh
