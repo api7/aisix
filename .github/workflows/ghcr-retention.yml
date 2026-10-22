@@ -1,0 +1,62 @@
+name: ghcr retention
+
+# Retention for the images docker-image.yml pushes to ghcr.io/api7/aisix and
+# for their cosign signatures in the shared ghcr.io/api7/notary package: keep
+# the three newest main builds (versions tagged only sha-* / dev), delete
+# ci-test-* images after three days, their untagged children with them, and
+# untagged versions nothing references once a day old. Release and candidate
+# tags are never touched. The selection rules live in scripts/ghcr-retention.sh.
+# A pull request that edits this cleanup runs it as a dry run, so listing both
+# packages is proven before merge.
+
+on:
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only print what would be deleted"
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - .github/workflows/ghcr-retention.yml
+      - scripts/ghcr-retention.sh
+
+# Read-only by default: the pull_request dry run runs the PR's own copy of
+# the script, so only the scheduled/dispatched job may delete.
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ghcr-retention-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
+
+jobs:
+  dry-run:
+    name: list versions that would be deleted
+    if: github.event_name == 'pull_request' || inputs.dry_run
+    runs-on: ubuntu-latest
+    # Paging the shared notary package alone takes several minutes.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - name: List versions past retention
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ghcr-retention.sh --dry-run
+
+  cleanup:
+    name: delete versions past retention
+    if: github.event_name != 'pull_request' && !inputs.dry_run
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Delete versions past retention
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ghcr-retention.sh
