@@ -4,8 +4,9 @@
 #
 # Per image package:
 #   main-built  versions whose tags are all `sha-*` / `dev`: the MAIN_KEEP
-#               newest by creation time are kept, the rest deleted. Any other
-#               tag (X.Y.Z, X.Y.Z-rc.N, latest, ...) protects the whole version.
+#               newest by creation time and the one carrying `dev` are kept,
+#               the rest deleted. Any other tag (X.Y.Z, X.Y.Z-rc.N, latest,
+#               ...) protects the whole version.
 #   ci-test     versions whose tags are all `ci-test-*`, deleted once older
 #               than CI_TEST_MAX_AGE_DAYS.
 #   children    untagged manifests a deleted index lists, unless a surviving
@@ -15,12 +16,18 @@
 #               their index, so a young one may still be claimed).
 #
 # notary is shared with other products (API7 EE signs into it too), so a
-# signature is deleted only when its cosign payload names this image and the
-# digest this run deleted, and that digest is no longer in the package. Any
-# signature that cannot be attributed that way is left alone.
+# signature is deleted only when every cosign payload in it names this image
+# at a digest this run deletes. Anything else in notary is left alone.
 #
-# GitHub refuses to delete a package's last version, so a plan that would empty
-# a package is refused. The first failed DELETE stops the run.
+# Deletion runs oldest first, one unit at a time: an index's signatures, its
+# children's signatures, its children, then the index (an orphan: its
+# signature, then itself). A run that stops anywhere leaks nothing: a signature
+# whose image is still listed is not needed, and the image is found again by
+# the next run. At most MAX_DELETES DELETEs per run, DELETE_INTERVAL seconds
+# apart, so the backlog drains over several runs instead of tripping GitHub's
+# rate limits; a rate-limited DELETE ends the run cleanly, any other failed
+# DELETE fails it. A plan that would empty a package is refused (GitHub will
+# not delete a package's last version).
 #
 # Usage: GH_TOKEN=... scripts/ghcr-retention.sh [--dry-run]
 set -euo pipefail
@@ -31,6 +38,8 @@ NOTARY_IMAGE="${NOTARY_IMAGE:-api7/notary}"
 MAIN_KEEP="${MAIN_KEEP:-3}"
 CI_TEST_MAX_AGE_DAYS="${CI_TEST_MAX_AGE_DAYS:-3}"
 ORPHAN_MIN_AGE_DAYS="${ORPHAN_MIN_AGE_DAYS:-1}"
+MAX_DELETES="${MAX_DELETES:-300}"
+DELETE_INTERVAL="${DELETE_INTERVAL:-1}"
 dry_run=false
 case "${1:-}" in
   "") ;;
@@ -76,9 +85,15 @@ children_of() {
   manifest "$1" | jq -r '.manifests[]?.digest'
 }
 
+# "<index>\t<child>" for every manifest the index lists.
+index_children() {
+  set -o pipefail
+  children_of "$1" | awk -v i="$1" '{ print i "\t" $0 }'
+}
+
 # Prints the signature row back when every layer of the cosign signature
-# manifest is a simple-signing payload naming ghcr.io/<image> at the
-# image digest the signature tag carries; prints nothing otherwise.
+# manifest is a simple-signing payload naming ghcr.io/<image> at the image
+# digest the signature tag carries; prints nothing otherwise.
 attribute_signature() {
   set -o pipefail
   local id=$1 digest=$2 created=$3 tag=$4 image=$5 image_digest=$6 m layer ok=0
@@ -96,11 +111,24 @@ attribute_signature() {
   [ "$ok" = 1 ] && printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$digest" "$created" "$tag" "$image" "$image_digest"
   return 0
 }
-export -f manifest children_of attribute_signature
+export -f manifest children_of index_children attribute_signature
 
+# Returns 2 when GitHub rate-limited the DELETE; exits on any other failure.
 delete_version() {
-  local image=$1 kind=$2 id=$3 digest=$4 created=$5 tags=$6
-  $dry_run || gh api -X DELETE "$(package_of "$image")/versions/$id" > /dev/null
+  local image=$1 kind=$2 id=$3 digest=$4 created=$5 tags=$6 out status
+  if ! $dry_run; then
+    sleep "$DELETE_INTERVAL"
+    if ! out=$(gh api -i -X DELETE "$(package_of "$image")/versions/$id" 2>&1); then
+      status=$(sed -n '1s|^HTTP/[0-9.]* \([0-9]*\).*|\1|p' <<<"$out")
+      if [ "$status" = 429 ] || { [ "$status" = 403 ] && grep -qiE '^x-ratelimit-remaining: 0|rate limit' <<<"$out"; }; then
+        echo "::warning::rate limited (HTTP $status) deleting $kind $id from ghcr.io/$image; stopping here, the next run continues"
+        return 2
+      fi
+      echo "::error::DELETE of $kind $id from ghcr.io/$image failed (HTTP ${status:-unknown})"
+      printf '%s\n' "$out" >&2
+      exit 1
+    fi
+  fi
   echo "$verb $kind $id $digest (created $created${tags:+, tags $tags})"
 }
 
@@ -118,8 +146,10 @@ for image in $IMAGES; do
   # Versions whose tags all match the pattern.
   only_tags() { awk -F'\t' -v re="$1" '{ n = split($4, t, ","); ok = 1; for (i = 1; i <= n; i++) if (t[i] !~ re) ok = 0; if (ok) print }' "$dir/tagged.tsv"; }
   only_tags '^(sha-.*|dev)$' | sort -t$'\t' -k3,3r -k1,1nr > "$dir/main.tsv"
-  head -n "$MAIN_KEEP" "$dir/main.tsv" > "$dir/main_kept.tsv"
-  tail -n +"$((MAIN_KEEP + 1))" "$dir/main.tsv" > "$dir/main_del.tsv"
+  # `dev` is a consumer pointer (other repositories' CI pulls it), so its
+  # version stays even when newer sha-only builds push it out of the newest few.
+  awk -F'\t' -v keep="$MAIN_KEEP" 'NR <= keep || $4 ~ /(^|,)dev(,|$)/' "$dir/main.tsv" > "$dir/main_kept.tsv"
+  awk -F'\t' -v keep="$MAIN_KEEP" 'NR > keep && $4 !~ /(^|,)dev(,|$)/' "$dir/main.tsv" > "$dir/main_del.tsv"
   only_tags '^ci-test-' > "$dir/ci_all.tsv"
   awk -F'\t' -v c="$ci_cutoff" '$3 < c' "$dir/ci_all.tsv" > "$dir/ci_del.tsv"
   cat "$dir/main_del.tsv" "$dir/ci_del.tsv" > "$dir/indexes.tsv"
@@ -129,8 +159,9 @@ for image in $IMAGES; do
   registry_token=$(registry_token "$image")
   export IMAGE registry_token
 
-  cut -f2 "$dir/indexes.tsv" | xargs -r -P 16 -I{} bash -c 'children_of "$1"' _ {} \
-    | sort -u > "$dir/candidate_children"
+  cut -f2 "$dir/indexes.tsv" | xargs -r -P 16 -I{} bash -c 'index_children "$1"' _ {} \
+    | sort -u > "$dir/index_children"
+  cut -f2 "$dir/index_children" | sort -u > "$dir/candidate_children"
   # Untagged versions this run may delete: children of a deleted index, and
   # anything past the orphan grace period.
   awk -F'\t' -v c="$orphan_cutoff" 'FILENAME == ARGV[1] { cc[$1]; next } ($2 in cc) || $3 < c' \
@@ -163,38 +194,26 @@ for image in $IMAGES; do
     FILENAME == ARGV[1] { k[$1]; next } FILENAME == ARGV[2] { cc[$1]; next }
     !($2 in k) { print > (($2 in cc) ? ch : orf) }' \
     "$dir/kept" "$dir/candidate_children" "$dir/untagged_candidates.tsv"
-  # Oldest first: within an orphaned build the children predate their index.
-  sort -t$'\t' -k3,3 -o "$dir/orphans.tsv" "$dir/orphans.tsv"
 
   plan=$(cat "$dir/indexes.tsv" "$dir/children.tsv" "$dir/orphans.tsv" | wc -l)
   if [ "$plan" -ge "$total" ]; then
     echo "refusing: the plan would delete all $total versions of ghcr.io/$image" >&2
     exit 1
   fi
-
-  {
-    echo "ghcr.io/$image ($total versions):"
-    echo "  main-built: $(wc -l < "$dir/main.tsv"), kept $(wc -l < "$dir/main_kept.tsv"), $verb $(wc -l < "$dir/main_del.tsv")"
-    awk -F'\t' '{ print "    kept " $4 " (created " $3 ")" }' "$dir/main_kept.tsv"
-    echo "  ci-test: $(wc -l < "$dir/ci_all.tsv"), $verb $(wc -l < "$dir/ci_del.tsv") older than ${CI_TEST_MAX_AGE_DAYS} days"
-    echo "  children of deleted indexes: $verb $(wc -l < "$dir/children.tsv")"
-    echo "  orphans (untagged, unreferenced, older than ${ORPHAN_MIN_AGE_DAYS} day): $verb $(wc -l < "$dir/orphans.tsv")"
-  } >> "$work/report"
   cat "$dir/children.tsv" "$dir/indexes.tsv" "$dir/orphans.tsv" \
     | awk -F'\t' -v img="$image" '{ print $2 "\t" img }' >> "$work/deleted_digests"
 done
 
-# Plan the notary sweep before deleting anything, so a failed fetch aborts
-# with nothing deleted. Signatures pushed while the list is paged belong to
-# new images, which this run does not delete.
+# Attribute notary signatures before deleting anything, so a failed fetch
+# aborts with nothing deleted.
 : > "$work/signatures.tsv"
 : > "$work/notary_matched.tsv"
 if [ -s "$work/deleted_digests" ]; then
   list_versions "$NOTARY_IMAGE" > "$work/notary.tsv"
+  notary_total=$(wc -l < "$work/notary.tsv")
   IMAGE="$NOTARY_IMAGE"
   registry_token=$(registry_token "$NOTARY_IMAGE")
   export IMAGE registry_token
-  notary_total=$(wc -l < "$work/notary.tsv")
   # cosign tags a signature sha256-<hex>.sig after the signed digest.
   awk -F'\t' 'FILENAME == ARGV[1] { d = $1; sub(/^sha256:/, "sha256-", d); want[d ".sig"] = $1 "\t" $2; next }
     ($4 in want) { print $1 "\t" $2 "\t" $3 "\t" $4 "\t" want[$4] }' \
@@ -208,32 +227,85 @@ if [ -s "$work/deleted_digests" ]; then
   fi
 fi
 
+# The deletion plan, one line per DELETE:
+#   unit, unit size, kind, package image, id, digest, created, tags
+# Units run oldest first; within a unit, signatures, then children, then the
+# index or orphan itself. A child two deleted indexes list goes with the older.
+: > "$work/plan.tsv"
 for image in $IMAGES; do
   dir="$work/${image//\//_}"
-  # Children first: if a run aborts midway, the index survives and the next
-  # run finds the remaining children through it again.
-  while IFS=$'\t' read -r id digest created tags; do delete_version "$image" child "$id" "$digest" "$created" "$tags"; done < "$dir/children.tsv"
-  while IFS=$'\t' read -r id digest created tags; do delete_version "$image" index "$id" "$digest" "$created" "$tags"; done < "$dir/indexes.tsv"
-  while IFS=$'\t' read -r id digest created tags; do delete_version "$image" orphan "$id" "$digest" "$created" "$tags"; done < "$dir/orphans.tsv"
+  {
+    awk -F'\t' '{ print $3 "\tmain\t" $1 "\t" $2 "\t" $4 }' "$dir/main_del.tsv"
+    awk -F'\t' '{ print $3 "\tci-test\t" $1 "\t" $2 "\t" $4 }' "$dir/ci_del.tsv"
+    awk -F'\t' '{ print $3 "\torphan\t" $1 "\t" $2 "\t" $4 }' "$dir/orphans.tsv"
+  } | sort -t$'\t' -k1,1 -k3,3n > "$dir/units.tsv"
+  awk -F'\t' -v img="$image" -v NOTARY="$NOTARY_IMAGE" '
+    FILENAME == ARGV[1] { if ($5 == img) sig[$6] = sig[$6] "\n" $1 "\t" $2 "\t" $3 "\t" $4; next }
+    FILENAME == ARGV[2] { kids[$1] = kids[$1] " " $2; next }
+    FILENAME == ARGV[3] { child[$2] = $1 "\t" $2 "\t" $3 "\t" $4; next }
+    function sigs(d,   n, i, rows) {
+      n = split(substr(sig[d], 2), rows, "\n")
+      for (i = 1; i <= n; i++) if (rows[i] != "") out[++m] = "signature\t" NOTARY "\t" rows[i]
+    }
+    {
+      m = 0; delete out
+      sigs($4)
+      nk = 0; delete mine
+      if ($2 != "orphan") {
+        nc = split(kids[$4], cs, " ")
+        for (i = 1; i <= nc; i++) if ((cs[i] in child) && !(cs[i] in taken)) { taken[cs[i]]; mine[++nk] = cs[i]; sigs(cs[i]) }
+      }
+      for (i = 1; i <= nk; i++) out[++m] = "child\t" img "\t" child[mine[i]]
+      out[++m] = $2 "\t" img "\t" $3 "\t" $4 "\t" $1 "\t" $5
+      unit++
+      for (i = 1; i <= m; i++) print img ":" unit "\t" m "\t" out[i]
+    }' "$work/signatures.tsv" "$dir/index_children" "$dir/children.tsv" "$dir/units.tsv" >> "$work/plan.tsv"
 done
+backlog=$(wc -l < "$work/plan.tsv")
 
-# A signature goes only once its digest is gone from the package.
-: > "$work/present"
-if ! $dry_run; then
-  for image in $IMAGES; do list_versions "$image" | awk -F'\t' -v img="$image" '{ print img "\t" $2 }'; done \
-    | sort -u > "$work/present"
-fi
-awk -F'\t' 'FILENAME == ARGV[1] { p[$1 "\t" $2]; next } !(($5 "\t" $6) in p)' "$work/present" "$work/signatures.tsv" \
-  > "$work/notary_del.tsv"
-while IFS=$'\t' read -r id digest created tag image image_digest; do
-  delete_version "$NOTARY_IMAGE" signature "$id" "$digest" "$created" "$tag"
-done < "$work/notary_del.tsv"
+cur=""
+executed=0
+stopped=""
+: > "$work/executed"
+while IFS=$'\t' read -r unit size kind image id digest created tags; do
+  if [ "$unit" != "$cur" ]; then
+    cur=$unit
+    if [ $((executed + size)) -gt "$MAX_DELETES" ]; then
+      stopped="reached the cap of $MAX_DELETES DELETEs"
+      break
+    fi
+  fi
+  rc=0
+  delete_version "$image" "$kind" "$id" "$digest" "$created" "$tags" || rc=$?
+  if [ "$rc" = 2 ]; then
+    stopped="rate limited"
+    break
+  fi
+  executed=$((executed + 1))
+  echo "$kind" >> "$work/executed"
+done < "$work/plan.tsv"
 
+done_of() { grep -cx "$1" "$work/executed" || true; }
+for image in $IMAGES; do
+  dir="$work/${image//\//_}"
+  {
+    echo "ghcr.io/$image ($(wc -l < "$dir/versions.tsv") versions):"
+    echo "  main-built: $(wc -l < "$dir/main.tsv"), kept $(wc -l < "$dir/main_kept.tsv"), past retention $(wc -l < "$dir/main_del.tsv")"
+    awk -F'\t' '{ print "    kept " $4 " (created " $3 ")" }' "$dir/main_kept.tsv"
+    echo "  ci-test: $(wc -l < "$dir/ci_all.tsv"), past retention $(wc -l < "$dir/ci_del.tsv") (older than ${CI_TEST_MAX_AGE_DAYS} days)"
+    echo "  children of those indexes: $(wc -l < "$dir/children.tsv")"
+    echo "  orphans (untagged, unreferenced, older than ${ORPHAN_MIN_AGE_DAYS} day): $(wc -l < "$dir/orphans.tsv")"
+  } >> "$work/report"
+done
+remaining=$((backlog - executed))
 {
   echo "ghcr.io/$NOTARY_IMAGE:"
-  echo "  signatures tagged after a deleted digest: $(wc -l < "$work/notary_matched.tsv")"
-  echo "  attributed to ${IMAGES// /, } by the cosign payload: $(wc -l < "$work/signatures.tsv"), $verb $(wc -l < "$work/notary_del.tsv")"
-  awk -F'\t' '{ n[$5]++ } END { for (i in n) print "    " i ": " n[i] }' "$work/notary_del.tsv" | sort
+  echo "  signatures tagged after a digest past retention: $(wc -l < "$work/notary_matched.tsv")"
+  echo "  attributed by the cosign payload: $(wc -l < "$work/signatures.tsv")"
+  awk -F'\t' '{ n[$5]++ } END { for (i in n) print "    " i ": " n[i] }' "$work/signatures.tsv" | sort
+  echo "this run ($verb, cap $MAX_DELETES): main $(done_of main), ci-test $(done_of ci-test), children $(done_of child), orphans $(done_of orphan), signatures $(done_of signature); $executed of $backlog DELETEs${stopped:+, stopped: $stopped}"
+  [ "$remaining" -gt 0 ] && echo "left for later runs: $remaining DELETEs, about $(( (remaining + MAX_DELETES - 1) / MAX_DELETES )) more daily runs at this cap"
+  true
 } >> "$work/report"
 echo
 cat "$work/report"
