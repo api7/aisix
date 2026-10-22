@@ -88,7 +88,8 @@ if [ -s "$work/candidates.tsv" ]; then
     xargs -P 16 -I{} bash -c 'children_of "$1"' _ {} < "$work/surviving_tagged"
   } | sort -u > "$work/kept"
 fi
-awk -F'\t' 'NR == FNR { kept[$1]; next } !($2 in kept)' "$work/kept" "$work/candidates.tsv" \
+# FILENAME, not NR == FNR: kept is empty when no tagged version is recent enough.
+awk -F'\t' 'FILENAME == ARGV[1] { kept[$1]; next } !($2 in kept)' "$work/kept" "$work/candidates.tsv" \
   > "$work/children.tsv"
 
 plan=$(( $(wc -l < "$work/indexes.tsv") + $(wc -l < "$work/children.tsv") ))
