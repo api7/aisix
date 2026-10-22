@@ -1270,9 +1270,10 @@ struct CohereBilledUnits {
 /// Fit the Anthropic Messages body InvokeModel sends to what Bedrock's
 /// Claude takes: the Bedrock-native blocks come off the body (they travel
 /// as request headers), and the caller's `additionalModelRequestFields`
-/// join it, as Converse does for Claude. `stop` and
-/// `max_completion_tokens` are left as the shared Anthropic builder mapped
-/// them, so a value it cannot map reaches the upstream as sent.
+/// join it, as Converse does for Claude. `stop`, `stop_sequences` and
+/// `max_completion_tokens` are not touched here: the body keeps what the
+/// shared Anthropic builder (and any body override) put there, so a value
+/// the builder cannot map reaches the upstream as sent.
 fn shape_invoke_body(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     req: &ChatFormat,
