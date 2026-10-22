@@ -880,6 +880,47 @@ impl Intercept for DefaultHeadersInterceptor {
     }
 }
 
+/// Re-serializes the Converse body with sorted keys before signing. Smithy
+/// `Document` objects are `HashMap`s, so tool schemas, `toolUse.input` and
+/// `additionalModelRequestFields` otherwise change key order per request and
+/// Bedrock prompt caching (exact prefix match, tools first) never hits.
+///
+/// Reference: <https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html>
+#[derive(Debug)]
+struct StableJsonBodyInterceptor;
+
+impl Intercept for StableJsonBodyInterceptor {
+    fn name(&self) -> &'static str {
+        "AisixBedrockStableJsonBody"
+    }
+
+    fn modify_before_signing(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let request = context.request_mut();
+        let Some(body) = request.body().bytes().and_then(stable_json) else {
+            return Ok(());
+        };
+        request
+            .headers_mut()
+            .insert("content-length", body.len().to_string());
+        *request.body_mut() = aws_smithy_types::body::SdkBody::from(body);
+        Ok(())
+    }
+}
+
+/// `body` with every object's keys sorted, or `None` when it is not JSON.
+/// Sorting comes from `serde_json::Map` being a `BTreeMap` (the workspace
+/// does not enable `preserve_order`); `stable_json_sorts_nested_keys` fails
+/// if that ever changes.
+fn stable_json(body: &[u8]) -> Option<Vec<u8>> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    serde_json::to_vec(&value).ok()
+}
+
 /// Hands each response head to [`aisix_gateway::note_upstream_response`],
 /// which the SDK's typed outputs would otherwise hide.
 #[derive(Debug)]
@@ -1570,6 +1611,8 @@ impl BedrockBridge {
         // The owned request is not needed past its wire bytes.
         drop(req);
         let resp = call
+            .customize()
+            .interceptor(StableJsonBodyInterceptor)
             .send()
             .await
             .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
@@ -1660,6 +1703,8 @@ impl BedrockBridge {
         // The owned request is not needed past its wire bytes.
         drop(req);
         let mut resp = call
+            .customize()
+            .interceptor(StableJsonBodyInterceptor)
             .send()
             .await
             .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
@@ -3268,6 +3313,15 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use std::time::Duration;
+
+    #[test]
+    fn stable_json_sorts_nested_keys() {
+        let a = br#"{"toolConfig":{"tools":[{"toolSpec":{"inputSchema":{"json":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"}}}}}}]},"modelId":"m"}"#;
+        assert_eq!(
+            String::from_utf8(stable_json(a).unwrap()).unwrap(),
+            r#"{"modelId":"m","toolConfig":{"tools":[{"toolSpec":{"inputSchema":{"json":{"properties":{"include":{"type":"string"},"path":{"type":"string"},"pattern":{"type":"string"}},"type":"object"}}}}]}}"#
+        );
+    }
 
     async fn consume_invalid_mock_stream(result: Result<ChatChunkStream, BridgeError>) {
         match result {
