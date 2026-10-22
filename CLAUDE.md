@@ -56,6 +56,7 @@ Behavioral guidelines to reduce common LLM coding mistakes. Bias toward caution 
 - E2E tests must be **source-blind**: design assertions from scenario reasonableness alone, never by reading product source to pick expected values. The test verifies the observable contract, not the implementation.
 - **If an E2E test fails, the default conclusion is a bug in the code, not the test.** Fix the product; don't weaken the assertion, relax the expected value, change the scenario, or read the source to explain it away. Only change a failing test if a human confirms the scenario is invalid.
 - If a test case itself looks wrong, flag it and ask a human — don't silently delete or rewrite it.
+- To acceptance-test a branch as a container image, build it with `scripts/build-local-image.sh` (→ `aisix:local-<sha7>`): the same thin Dockerfile CI publishes through, with the binary compiled in this worktree's own `target/`.
 
 ## 6. Research Discipline
 

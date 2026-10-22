@@ -43,3 +43,7 @@ coverage/
 
 # Local benchmark results collected by bench/onthebench/bench.sh
 /bench-results/
+
+# Binaries staged for the container image (scripts/build-image-binary.sh)
+/bin
+/target-pgo-data

@@ -1,13 +1,13 @@
 //! Build-time version identity.
 //!
 //! The version comes only from two compile-time stamps, and an empty stamp
-//! counts as unset (the Dockerfile always exports both, possibly empty):
+//! counts as unset (scripts/build-image-binary.sh always exports both, possibly empty):
 //!
 //! - `AISIX_BUILD_VERSION` — set by the `docker-image` workflow on release
 //!   tags only (`v1.4.0` → `1.4.0`). Reported unchanged.
 //! - `AISIX_BUILD_SHA` — the short commit sha every CI image build passes.
 //!   Without a release version the binary reports `dev+sha-<sha>`.
-//! - Neither → `dev` (plain `cargo build`, `docker build` without args).
+//! - Neither → `dev` (plain `cargo build`).
 //!
 //! The workspace crate version is a placeholder and is never reported.
 //! [`BUILD_VERSION`] is what `aisix --version`, the `Server` header and the
@@ -84,7 +84,7 @@ mod tests {
             heartbeat_version(Some(""), Some("103d3ec")),
             "dev+sha-103d3ec"
         );
-        // `docker build` without args exports both, empty.
+        // The image build script with neither stamp set exports both, empty.
         assert_eq!(resolve_version(Some(""), Some("")), "dev");
         assert_eq!(heartbeat_version(Some(""), Some("")), "dev");
         assert_eq!(resolve_version(Some("1.4.0"), Some("")), "1.4.0");

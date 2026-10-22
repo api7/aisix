@@ -275,6 +275,14 @@ lto = "fat"
 codegen-units = 1
 strip = "debuginfo"
 
+# main/:dev and local acceptance images (scripts/build-image-binary.sh thin).
+# Release-candidate and stable tags keep [profile.release]; this trades
+# the fat-LTO per-request win for a link several times faster.
+[profile.release-thin]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+
 [profile.coverage]
 inherits = "dev"
 opt-level = 0

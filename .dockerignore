@@ -1,11 +1,7 @@
-.git
-.github
-target
-target-pgo-gen
-target-pgo
-bench/pgo-training/trainer/target
-
-docs
-tests/fixtures/tmp
-**/.DS_Store
-**/*.log
+# The image packages a binary built outside Docker (scripts/build-image-binary.sh),
+# so the build context carries only what the Dockerfile copies.
+*
+!bin/aisix-*
+!bin/pgo-verified-*.json
+!config.managed.yaml
+!docker/entrypoint.sh

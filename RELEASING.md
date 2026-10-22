@@ -30,8 +30,9 @@ Pushing the tag triggers two workflows:
 
 ### PGO applies to the stable release tag only — and it is fail-closed there
 
-The `vX.Y.Z` image is profile-guided-optimized (#967): the Docker build
-compiles an instrumented gateway, drives the committed training matrix
+The `vX.Y.Z` image is profile-guided-optimized (#967): the image build
+(`scripts/build-image-binary.sh pgo`, run natively on each architecture's
+runner) compiles an instrumented gateway, drives the committed training matrix
 (`bench/pgo-training/`) against it, and rebuilds with the merged profile.
 Any phase failing — instrumented build, training, profile merge, optimized
 build — fails the image build; there is no fallback to a plain build. After
@@ -51,7 +52,9 @@ docker run --rm --entrypoint cat ghcr.io/api7/aisix:X.Y.Z \
 
 **`-rc.N` and `:dev` images are NOT PGO'd** — PGO cost ~20 min on every
 one of the ~40 main pushes per cycle and none of those images are what a
-customer runs. Two things follow, and both belong to the release flow:
+customer runs. `-rc.N` builds the same `release` profile (fat LTO) as the
+stable tag; `:dev` builds the `release-thin` profile (thin LTO). Two things
+follow, and both belong to the release flow:
 
 - **The QA'd candidate is not bit-identical to the shipped image.** PGO
   changes code layout, inlining and block ordering — never semantics; the
@@ -59,7 +62,8 @@ customer runs. Two things follow, and both belong to the release flow:
   different inlining decision to expose. The functional QA result therefore
   still describes the shipped build. What it does *not* describe is the
   released image's performance: any perf number must come from a `vX.Y.Z`
-  image or a local `--build-arg PGO=on` build, never from `:dev` or an rc.
+  image or a local `scripts/build-image-binary.sh pgo` build, never from
+  `:dev` or an rc.
 - **The release tag is the first build to run the PGO pipeline on that
   commit**, so a training-shape regression surfaces *after* QA has passed —
   the most expensive moment to find it, since the fix moves the commit and
@@ -68,7 +72,7 @@ customer runs. Two things follow, and both belong to the release flow:
   candidate's commit, which `vX.Y.Z-rc.N` already fixes, so fire it as soon
   as the candidate is cut and read the verdict when you come to tag. It
   builds the exact three-phase path and asserts the proof marker, publishing
-  only a `:sha-<short>` tag that moves no pointer — and it finishes well
+  only a scratch `:ci-test-<short>` tag that moves no pointer — and it finishes well
   inside the QA window, so it costs no extra wall clock. Blocking on it at
   tag time would put ~30 minutes on the critical path of every release for a
   result that was already knowable hours earlier.
@@ -78,7 +82,8 @@ the release line's branch — at this point its HEAD *is* the candidate commit.
 Do NOT dispatch on the `vX.Y.Z-rc.N` tag: a tag ref makes metadata-action
 re-emit the candidate's own image tags, republishing the very artifact QA is
 testing as a PGO'd build QA never saw. A branch ref publishes one GHCR
-`:sha-<short>` and nothing else.
+`:ci-test-<short>` and nothing else (never `:sha-*`, which the resident
+environments' image updaters follow).
 
 ```bash
 # when the candidate is cut — fire and carry on
@@ -90,8 +95,8 @@ gh run view <run-id> --json conclusion --jq .conclusion
 ```
 
 Local note: each retrained profile is content-addressed, so repeated local
-PGO builds accumulate build artifacts in the persistent BuildKit cache
-mounts; reclaim with `docker builder prune`.
+PGO builds accumulate artifacts in `target-pgo-gen/` and `target-pgo/`;
+delete them to reclaim.
 
 ## 2. Polish the release notes
 
