@@ -323,7 +323,7 @@ pub fn build_object_store(
             if let Some(ep) = endpoint {
                 b = b.with_endpoint(ep);
                 // S3-compatible servers (MinIO / emulators) are path-style and
-                // commonly plaintext inside a private network.
+                // often served over plain http.
                 b = b.with_virtual_hosted_style_request(false);
                 if ep.starts_with("http://") {
                     b = b.with_allow_http(true);

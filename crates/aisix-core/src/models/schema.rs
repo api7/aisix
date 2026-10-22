@@ -4648,11 +4648,11 @@ mod tests {
     }
 
     #[test]
-    fn exporter_otlp_http_rejects_plain_http_endpoint() {
+    fn exporter_otlp_http_rejects_an_endpoint_without_http_scheme() {
         let v = json!({
             "name": "x",
             "kind": "otlp_http",
-            "endpoint": "http://api.honeycomb.io/v1/traces"
+            "endpoint": "grpc://api.honeycomb.io:4317"
         });
         assert!(validate_observability_exporter(&v).is_err());
     }
