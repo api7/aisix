@@ -314,17 +314,15 @@ pub(crate) fn top_k_field(req: &ChatFormat, model_id: &str) -> Option<(&'static 
 /// `stop` as Converse `stopSequences`. An empty string is skipped, as
 /// Converse rejects it. Grok and GPT 5.6 and newer refuse stop sequences on
 /// every route, so they get none. A Claude caller's native `stop_sequences`,
-/// top-level or inside its own `additionalModelRequestFields`, wins: it
-/// reaches the model as sent there, and Converse rejects a request that also
-/// sets `stopSequences`.
+/// top-level or inside its own `additionalModelRequestFields`, wins even
+/// when `null`, as on the Anthropic route: it reaches the model as sent
+/// there, and Converse rejects a request that also sets `stopSequences`.
 pub(crate) fn stop_sequences(req: &ChatFormat, model_id: &str) -> Option<Vec<String>> {
     if chat_completions_family(capability_id(model_id)) {
         return None;
     }
     if base_id(model_id).starts_with("anthropic.")
-        && caller_additional_fields(req)
-            .get("stop_sequences")
-            .is_some_and(|v| !v.is_null())
+        && caller_additional_fields(req).contains_key("stop_sequences")
     {
         return None;
     }
@@ -526,14 +524,17 @@ mod tests {
             "additionalModelRequestFields": {"stop_sequences": ["beta"]},
         }));
         assert_eq!(stop_sequences(&nested, claude), None);
-        // Other publishers and a null native field keep `stop` as before.
+        // A null native field is still the caller's statement, as on the
+        // Anthropic route.
+        let null_native = req(serde_json::json!({"stop": ["delta"], "stop_sequences": null}));
+        assert_eq!(stop_sequences(&null_native, claude), None);
+        assert_eq!(
+            caller_additional_fields(&null_native).get("stop_sequences"),
+            Some(&serde_json::Value::Null)
+        );
+        // Other publishers keep `stop` as before.
         assert_eq!(
             stop_sequences(&both, "us.amazon.nova-lite-v1:0"),
-            Some(vec!["delta".into()])
-        );
-        let null_native = req(serde_json::json!({"stop": ["delta"], "stop_sequences": null}));
-        assert_eq!(
-            stop_sequences(&null_native, claude),
             Some(vec!["delta".into()])
         );
     }
