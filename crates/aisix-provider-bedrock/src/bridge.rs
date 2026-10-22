@@ -1268,27 +1268,16 @@ struct CohereBilledUnits {
 }
 
 /// Fit the Anthropic Messages body InvokeModel sends to what Bedrock's
-/// Claude takes: OpenAI's `stop` as `stop_sequences` and
-/// `max_completion_tokens` as `max_tokens`; the Bedrock-native blocks come
-/// off the body (they travel as request headers), and the caller's
-/// `additionalModelRequestFields` join it, as Converse does for Claude.
+/// Claude takes: the Bedrock-native blocks come off the body (they travel
+/// as request headers), and the caller's `additionalModelRequestFields`
+/// join it, as Converse does for Claude. `stop` and
+/// `max_completion_tokens` are left as the shared Anthropic builder mapped
+/// them, so a value it cannot map reaches the upstream as sent.
 fn shape_invoke_body(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     req: &ChatFormat,
-    upstream_id: &str,
     header_betas: Vec<String>,
 ) {
-    // A `stop_sequences` the caller sent natively wins, as on the other
-    // Claude paths; otherwise `stop` is re-derived without empty strings.
-    if !req.extra.contains_key("stop_sequences") {
-        obj.remove("stop_sequences");
-        if let Some(stops) = crate::converse_req::stop_sequences(req, upstream_id) {
-            obj.insert("stop_sequences".into(), stops.into());
-        }
-    }
-    obj.remove("stop");
-    // Already carried as `max_tokens` (see `chat_anthropic`).
-    obj.remove("max_completion_tokens");
     for key in [
         "guardrailConfig",
         "performanceConfig",
@@ -1374,7 +1363,7 @@ impl BedrockBridge {
             // URL-borne `model` into the /invoke body.
             apply_body_overrides(&mut body_value, ctx);
             if let Some(obj) = body_value.as_object_mut() {
-                shape_invoke_body(obj, &req, upstream_id, header_betas(ctx));
+                shape_invoke_body(obj, &req, header_betas(ctx));
                 obj.remove("model");
                 obj.remove("stream");
                 obj.insert(
@@ -4124,7 +4113,8 @@ mod tests {
             body
         };
 
-        // `max_completion_tokens` outranks `max_tokens`, as on Converse.
+        // `max_completion_tokens` outranks `max_tokens`, as on Converse;
+        // an empty stop sequence is forwarded, for the upstream to judge.
         let body = send(
             serde_json::json!({"max_completion_tokens": 77, "stop": ["", "END"]}),
             Some(33),
@@ -4133,7 +4123,7 @@ mod tests {
         assert_eq!(body["max_tokens"], 77, "body={body}");
         assert_eq!(
             body["stop_sequences"],
-            serde_json::json!(["END"]),
+            serde_json::json!(["", "END"]),
             "body={body}"
         );
         assert!(body.get("stop").is_none() && body.get("max_completion_tokens").is_none());
@@ -4149,10 +4139,35 @@ mod tests {
             serde_json::json!(["b"]),
             "body={body}"
         );
+        assert!(body.get("stop").is_none(), "body={body}");
 
-        // Only empty strings: nothing is sent.
+        // A string becomes a one-element array, the empty one included.
         let body = send(serde_json::json!({"stop": ""}), None).await;
+        assert_eq!(
+            body["stop_sequences"],
+            serde_json::json!([""]),
+            "body={body}"
+        );
+        assert!(body.get("stop").is_none(), "body={body}");
+
+        // `null` and an empty array set nothing.
+        for stop in [serde_json::Value::Null, serde_json::json!([])] {
+            let body = send(serde_json::json!({ "stop": stop }), None).await;
+            assert!(
+                body.get("stop").is_none() && body.get("stop_sequences").is_none(),
+                "body={body}"
+            );
+        }
+
+        // Values that cannot be mapped reach the upstream as sent.
+        let body = send(
+            serde_json::json!({"stop": 5, "max_completion_tokens": "many"}),
+            None,
+        )
+        .await;
+        assert_eq!(body["stop"], 5, "body={body}");
         assert!(body.get("stop_sequences").is_none(), "body={body}");
+        assert_eq!(body["max_completion_tokens"], "many", "body={body}");
     }
 
     #[tokio::test]
