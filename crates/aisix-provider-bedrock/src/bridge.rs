@@ -54,6 +54,7 @@ use aisix_gateway::media_fetch::{
     fetch_media_urls, fetch_media_urls_including_tool_results, Encoding, FetchedMedia,
 };
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use std::time::Instant;
 
 use aisix_provider_anthropic::wire::{
@@ -880,6 +881,86 @@ impl Intercept for DefaultHeadersInterceptor {
     }
 }
 
+/// Re-serializes the Converse body with sorted keys before signing. Smithy
+/// `Document` objects (and `requestMetadata`) are `HashMap`s, so tool
+/// schemas, `toolUse.input` and `additionalModelRequestFields` otherwise
+/// change key order per request and Bedrock prompt caching (exact prefix
+/// match, tools first) never hits.
+///
+/// Runs once before the retry loop, not per attempt: the SDK checkpoints
+/// the request right after this hook, so every attempt signs and sends the
+/// rewritten bytes and the original body is not kept alongside them.
+///
+/// Reference: <https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html>
+#[derive(Debug)]
+struct StableJsonBodyInterceptor;
+
+impl Intercept for StableJsonBodyInterceptor {
+    fn name(&self) -> &'static str {
+        "AisixBedrockStableJsonBody"
+    }
+
+    fn modify_before_retry_loop(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let request = context.request_mut();
+        let Some(body) = request.body().bytes().and_then(stable_json) else {
+            return Ok(());
+        };
+        request
+            .headers_mut()
+            .insert("content-length", body.len().to_string());
+        *request.body_mut() = aws_smithy_types::body::SdkBody::from(body);
+        Ok(())
+    }
+}
+
+/// `body` with every object's keys sorted, or `None` when it is not JSON.
+/// Only keys are re-encoded; every scalar is copied as its original bytes, so
+/// numbers keep their exact digits and large inline media strings are never
+/// materialized, and the output is the input's length.
+fn stable_json(body: &[u8]) -> Option<Vec<u8>> {
+    let root: &RawValue = serde_json::from_slice(body).ok()?;
+    let mut out = Vec::with_capacity(body.len());
+    write_sorted(root, &mut out).ok()?;
+    Some(out)
+}
+
+fn write_sorted(value: &RawValue, out: &mut Vec<u8>) -> serde_json::Result<()> {
+    let raw = value.get();
+    match raw.as_bytes().first() {
+        Some(b'{') => {
+            let map: std::collections::BTreeMap<String, &RawValue> = serde_json::from_str(raw)?;
+            out.push(b'{');
+            for (i, (k, v)) in map.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                serde_json::to_writer(&mut *out, &k)?;
+                out.push(b':');
+                write_sorted(v, out)?;
+            }
+            out.push(b'}');
+        }
+        Some(b'[') => {
+            let items: Vec<&RawValue> = serde_json::from_str(raw)?;
+            out.push(b'[');
+            for (i, v) in items.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                write_sorted(v, out)?;
+            }
+            out.push(b']');
+        }
+        _ => out.extend_from_slice(raw.as_bytes()),
+    }
+    Ok(())
+}
+
 /// Hands each response head to [`aisix_gateway::note_upstream_response`],
 /// which the SDK's typed outputs would otherwise hide.
 #[derive(Debug)]
@@ -1570,6 +1651,8 @@ impl BedrockBridge {
         // The owned request is not needed past its wire bytes.
         drop(req);
         let resp = call
+            .customize()
+            .interceptor(StableJsonBodyInterceptor)
             .send()
             .await
             .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
@@ -1660,6 +1743,8 @@ impl BedrockBridge {
         // The owned request is not needed past its wire bytes.
         drop(req);
         let mut resp = call
+            .customize()
+            .interceptor(StableJsonBodyInterceptor)
             .send()
             .await
             .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
@@ -3268,6 +3353,25 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use std::time::Duration;
+
+    #[test]
+    fn stable_json_sorts_nested_keys() {
+        let a = br#"{"toolConfig":{"tools":[{"toolSpec":{"inputSchema":{"json":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"}}}}}}]},"modelId":"m"}"#;
+        assert_eq!(
+            String::from_utf8(stable_json(a).unwrap()).unwrap(),
+            r#"{"modelId":"m","toolConfig":{"tools":[{"toolSpec":{"inputSchema":{"json":{"properties":{"include":{"type":"string"},"path":{"type":"string"},"pattern":{"type":"string"}},"type":"object"}}}}]}}"#
+        );
+    }
+
+    #[test]
+    fn stable_json_keeps_scalar_bytes() {
+        let a = br#"{"z":{"x":380693.66128071636,"e":1.603964615428183e143,"s":"q\"\u00e9\/","n":-5,"t":null},"a":[{"b":1,"a":2},3]}"#;
+        assert_eq!(
+            String::from_utf8(stable_json(a).unwrap()).unwrap(),
+            r#"{"a":[{"a":2,"b":1},3],"z":{"e":1.603964615428183e143,"n":-5,"s":"q\"\u00e9\/","t":null,"x":380693.66128071636}}"#
+        );
+        assert_eq!(stable_json(b"not json"), None);
+    }
 
     async fn consume_invalid_mock_stream(result: Result<ChatChunkStream, BridgeError>) {
         match result {
