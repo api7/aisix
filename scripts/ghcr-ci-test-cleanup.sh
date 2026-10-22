@@ -66,21 +66,30 @@ while IFS=$'\t' read -r _ digest _ _; do
   children_of "$digest"
 done < "$work/indexes.tsv" | sort -u > "$work/candidate_children"
 
-# Everything a surviving tagged version is or references stays.
-awk -F'\t' '$4 != ""' "$work/versions.tsv" | cut -f2 | sort -u \
-  | comm -23 - "$work/deleted_digests" > "$work/surviving_tagged"
-{
-  cat "$work/surviving_tagged"
-  # One registry fetch per tagged version; any failed fetch aborts the run.
-  export -f children_of
-  export registry_token IMAGE
-  xargs -P 16 -I{} bash -c 'children_of "$1"' _ {} < "$work/surviving_tagged"
-} | sort -u > "$work/kept"
-
 # Children are deleted only as untagged package versions.
 awk -F'\t' '$4 == ""' "$work/versions.tsv" | sort -t$'\t' -k2,2 > "$work/untagged.tsv"
-comm -23 "$work/candidate_children" "$work/kept" \
-  | join -t$'\t' -1 1 -2 2 -o 2.1,2.2,2.3,2.4 - "$work/untagged.tsv" > "$work/children.tsv"
+join -t$'\t' -1 1 -2 2 -o 2.1,2.2,2.3,2.4 "$work/candidate_children" "$work/untagged.tsv" \
+  > "$work/candidates.tsv"
+
+# A surviving tagged version keeps every child it is or references. An index
+# can only reference manifests pushed before it, so tagged versions created
+# before the oldest candidate child cannot reference one and are not fetched.
+: > "$work/kept"
+if [ -s "$work/candidates.tsv" ]; then
+  earliest=$(cut -f3 "$work/candidates.tsv" | sort | head -n 1)
+  awk -F'\t' -v since="$earliest" '$4 != "" && $3 >= since' "$work/versions.tsv" | cut -f2 | sort -u \
+    | comm -23 - "$work/deleted_digests" > "$work/surviving_tagged"
+  echo "checking $(wc -l < "$work/surviving_tagged") tagged versions created since $earliest for references"
+  {
+    cat "$work/surviving_tagged"
+    # Any failed fetch aborts the run rather than risk deleting a referenced child.
+    export -f children_of
+    export registry_token IMAGE
+    xargs -P 16 -I{} bash -c 'children_of "$1"' _ {} < "$work/surviving_tagged"
+  } | sort -u > "$work/kept"
+fi
+awk -F'\t' 'NR == FNR { kept[$1]; next } !($2 in kept)' "$work/kept" "$work/candidates.tsv" \
+  > "$work/children.tsv"
 
 plan=$(( $(wc -l < "$work/indexes.tsv") + $(wc -l < "$work/children.tsv") ))
 if [ "$plan" -ge "$total" ]; then
@@ -88,15 +97,8 @@ if [ "$plan" -ge "$total" ]; then
   exit 1
 fi
 
-# Indexes first, so no surviving tag ever points at a deleted child.
-while IFS=$'\t' read -r id digest created tags; do
-  if $dry_run; then
-    echo "would delete index $id $digest (created $created, tags $tags)"
-  else
-    gh api -X DELETE "$PACKAGE/versions/$id"
-    echo "deleted index $id $digest (created $created, tags $tags)"
-  fi
-done < "$work/indexes.tsv"
+# Children first: if a run aborts midway, the index survives and the next
+# run finds the remaining children through it again.
 while IFS=$'\t' read -r id digest created _; do
   if $dry_run; then
     echo "would delete child $id $digest (created $created)"
@@ -105,4 +107,12 @@ while IFS=$'\t' read -r id digest created _; do
     echo "deleted child $id $digest (created $created)"
   fi
 done < "$work/children.tsv"
+while IFS=$'\t' read -r id digest created tags; do
+  if $dry_run; then
+    echo "would delete index $id $digest (created $created, tags $tags)"
+  else
+    gh api -X DELETE "$PACKAGE/versions/$id"
+    echo "deleted index $id $digest (created $created, tags $tags)"
+  fi
+done < "$work/indexes.tsv"
 echo "$($dry_run && echo 'would delete' || echo 'deleted') $(wc -l < "$work/indexes.tsv") ci-test indexes and $(wc -l < "$work/children.tsv") children"
