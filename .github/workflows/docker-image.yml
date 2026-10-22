@@ -174,7 +174,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: docker-image-${{ matrix.arch }}-${{ steps.pgomode.outputs.profile }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/runner-built-image' }}
 
       # Same short sha the `type=sha,prefix=sha-` tag uses, stamped into
       # the binary so a DP reports `<version>+sha-<short>` (release) or
