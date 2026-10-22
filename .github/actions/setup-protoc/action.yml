@@ -16,7 +16,12 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        url="https://github.com/protocolbuffers/protobuf/releases/download/v${{ inputs.version }}/protoc-${{ inputs.version }}-linux-x86_64.zip"
+        case "$(uname -m)" in
+          x86_64) asset=linux-x86_64 ;;
+          aarch64) asset=linux-aarch_64 ;;
+          *) echo "::error::no protoc release asset for $(uname -m)"; exit 1 ;;
+        esac
+        url="https://github.com/protocolbuffers/protobuf/releases/download/v${{ inputs.version }}/protoc-${{ inputs.version }}-${asset}.zip"
         # curl's own --retry plus an outer loop: the release CDN 504s are
         # intermittent, so retry hard (up to 5 outer x 5 inner) before failing.
         for attempt in 1 2 3 4 5; do
