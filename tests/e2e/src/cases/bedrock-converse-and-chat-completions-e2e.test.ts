@@ -478,6 +478,26 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
     expect(sent[0].body.inferenceConfig).toEqual({ maxTokens: 50, stopSequences: ["END"] });
   });
 
+  // Values Claude's Messages API refuses are the upstream's to refuse, as on
+  // the Anthropic route: nothing is dropped or filtered on the way.
+  test("a non-streamed Claude request forwards stop and max_completion_tokens as sent", async (ctx) => {
+    if (skip(ctx)) return;
+    const cases: Array<[Record<string, unknown>, Record<string, unknown>]> = [
+      [{ stop: "" }, { stop_sequences: [""] }],
+      [{ stop: ["", "gamma"] }, { stop_sequences: ["", "gamma"] }],
+      [{ stop: 5 }, { stop: 5 }],
+      [{ max_completion_tokens: "many" }, { max_completion_tokens: "many" }],
+    ];
+    for (const [extra, expected] of cases) {
+      const { result, sent } = await capture(() =>
+        chat({ model: "cc-claude", messages: [{ role: "user", content: "hi" }], ...extra }),
+      );
+      expect(result.status, result.text).toBe(200);
+      expect(sent[0].path).toMatch(/\/invoke$/);
+      expect(sent[0].body, JSON.stringify(extra)).toMatchObject(expected);
+    }
+  });
+
   test("an OpenAI GPT model on Converse gets reasoning.effort, no stop sequences, and a cap of at least 16", async (ctx) => {
     if (skip(ctx)) return;
     const { result, sent } = await capture(() =>
