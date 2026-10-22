@@ -95,7 +95,8 @@ gh run view <run-id> --json conclusion --jq .conclusion
 ```
 
 Local note: each retrained profile is content-addressed, so repeated local
-PGO builds accumulate artifacts in `target-pgo/`; delete it to reclaim.
+PGO builds accumulate artifacts in `target-pgo-gen/` and `target-pgo/`;
+delete them to reclaim.
 
 ## 2. Polish the release notes
 

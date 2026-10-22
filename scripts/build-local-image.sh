@@ -9,7 +9,7 @@
 # Usage: scripts/build-local-image.sh [image-tag]
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null && pwd)"
 SHA7="$(git -C "$ROOT" rev-parse --short=7 HEAD)"
 TAG="${1:-aisix:local-$SHA7}"
 

@@ -133,8 +133,11 @@ jobs:
               esac
               ;;
           esac
-          case "${PROFILE_INPUT:-auto}" in
-            thin | release) profile="$PROFILE_INPUT" ;;
+          # The profile input never applies on a tag ref, where the build
+          # republishes that tag's own image.
+          case "$GITHUB_REF:${PROFILE_INPUT:-auto}" in
+            refs/tags/*) ;;
+            *:thin | *:release) profile="$PROFILE_INPUT" ;;
           esac
           if [ "${PGO_INPUT:-}" = "true" ]; then
             mode=on
@@ -170,7 +173,9 @@ jobs:
       # Only main saves: a cache written by a tag run is visible to that tag
       # alone (GitHub scopes caches to the ref that wrote them, plus the
       # default branch), so saving there would only spend the repository's
-      # 10 GB quota on entries nothing can read.
+      # 10 GB quota on entries nothing can read. main builds only `thin`, so
+      # in practice main/:dev builds warm and `-rc.N` / stable tags compile
+      # their dependencies cold (the profiles' artifacts are not shared).
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: docker-image-${{ matrix.arch }}-${{ steps.pgomode.outputs.profile }}

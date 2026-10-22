@@ -18,11 +18,11 @@
 #
 # pgo runs the three phases, FAIL-CLOSED — any phase failing fails the script
 # and no binary is staged:
-#   A. instrumented build (-Cprofile-generate) in target/;
+#   A. instrumented build (-Cprofile-generate) in target-pgo-gen/;
 #   B. train.sh drives the committed shape matrix through it and merges the
 #      .profraw files with the pinned toolchain's own llvm-profdata;
 #   C. optimized build (-Cprofile-use) in target-pgo/, so profile builds never
-#      share cargo fingerprints with the instrumented one. The merged profile
+#      share cargo fingerprints with each other or with plain builds. The merged profile
 #      is content-addressed (merged-<sha>.profdata) because cargo fingerprints
 #      the -Cprofile-use PATH, not the file content.
 # The proof marker is written only after phase C succeeds; the docker-image
@@ -31,12 +31,15 @@
 set -euo pipefail
 
 MODE="${1:?usage: build-image-binary.sh <thin|release|pgo>}"
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." >/dev/null && pwd)"
 cd "$ROOT"
 
+# The image is Linux, and the binary links this host's glibc, which must not
+# be newer than the runtime image's (the Dockerfile's install step runs it).
+[ "$(uname -s)" = Linux ] || { echo "build-image-binary.sh must run on a Linux host" >&2; exit 2; }
 case "$(uname -m)" in
     x86_64) ARCH=amd64 ;;
-    aarch64 | arm64) ARCH=arm64 ;;
+    aarch64) ARCH=arm64 ;;
     *) echo "unsupported host architecture: $(uname -m)" >&2; exit 2 ;;
 esac
 
@@ -48,7 +51,10 @@ if [ "$ARCH" = arm64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi
 export AISIX_BUILD_SHA="${AISIX_BUILD_SHA:-}"
 export AISIX_BUILD_VERSION="${AISIX_BUILD_VERSION:-}"
 export CARGO_TARGET_DIR="$ROOT/target"
-unset RUSTFLAGS CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+# Set-but-empty, so a developer's cargo config `build.rustflags` (say
+# -Ctarget-cpu=native) cannot reach an image; the PGO phases set their own.
+export RUSTFLAGS=""
+unset CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
 
 OUT="$ROOT/bin"
 mkdir -p "$OUT"
@@ -66,10 +72,11 @@ case "$MODE" in
         ;;
     pgo)
         PGO_DIR="$ROOT/target-pgo-data"
-        RUSTFLAGS="-Cprofile-generate=$PGO_DIR" cargo build --locked --release --bin aisix
+        RUSTFLAGS="-Cprofile-generate=$PGO_DIR" CARGO_TARGET_DIR="$ROOT/target-pgo-gen" \
+            cargo build --locked --release --bin aisix
         CARGO_TARGET_DIR="$ROOT/bench/pgo-training/trainer/target" cargo build --locked --release \
             --manifest-path bench/pgo-training/trainer/Cargo.toml
-        bash bench/pgo-training/train.sh "$ROOT/target/release/aisix" "$PGO_DIR"
+        bash bench/pgo-training/train.sh "$ROOT/target-pgo-gen/release/aisix" "$PGO_DIR"
         PROFDATA="$(ls "$PGO_DIR"/merged-*.profdata)"
         RUSTFLAGS="-Cprofile-use=$PROFDATA" CARGO_TARGET_DIR="$ROOT/target-pgo" \
             cargo build --locked --release --bin aisix
