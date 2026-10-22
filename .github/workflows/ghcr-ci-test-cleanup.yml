@@ -1,0 +1,47 @@
+name: ghcr ci-test cleanup
+
+# Deletes the scratch images docker-image.yml pushes to ghcr.io/api7/aisix
+# for a workflow_dispatch on a non-main branch (tag `ci-test-<sha7>`) once
+# they are older than three days, with their untagged per-platform children.
+# sha-*, dev and every other tag are never touched; the selection rules live
+# in scripts/ghcr-ci-test-cleanup.sh. A pull request that edits this cleanup
+# runs it as a dry run, so the listing permission is proven before merge.
+
+on:
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only print what would be deleted"
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - .github/workflows/ghcr-ci-test-cleanup.yml
+      - scripts/ghcr-ci-test-cleanup.sh
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ghcr-ci-test-cleanup-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
+
+jobs:
+  cleanup:
+    name: delete ci-test images older than three days
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Delete expired ci-test images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ github.event_name == 'pull_request' || inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            scripts/ghcr-ci-test-cleanup.sh --dry-run
+          else
+            scripts/ghcr-ci-test-cleanup.sh
+          fi
