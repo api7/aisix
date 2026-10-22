@@ -32,7 +32,11 @@ MAIN_KEEP="${MAIN_KEEP:-3}"
 CI_TEST_MAX_AGE_DAYS="${CI_TEST_MAX_AGE_DAYS:-3}"
 ORPHAN_MIN_AGE_DAYS="${ORPHAN_MIN_AGE_DAYS:-1}"
 dry_run=false
-[ "${1:-}" = "--dry-run" ] && dry_run=true
+case "${1:-}" in
+  "") ;;
+  --dry-run) dry_run=true ;;
+  *) echo "usage: $0 [--dry-run]" >&2; exit 2 ;;
+esac
 verb=$($dry_run && echo 'would delete' || echo 'deleted')
 
 ci_cutoff=$(date -u -d "${CI_TEST_MAX_AGE_DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)
