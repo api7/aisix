@@ -17,7 +17,9 @@ import {
 //
 // The request carries a tool with several parameters and a replayed tool call
 // with several arguments: the two places a JSON object travels inside the
-// Converse body.
+// Converse body. Every client endpoint that can reach Converse is driven, and
+// `/v1/messages` to Claude, which Bedrock answers through InvokeModel, is held
+// to the same standard.
 
 const CALLER_PLAINTEXT = "sk-bedrock-converse-stable-body";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -37,53 +39,89 @@ const CONVERSE_STREAM = eventStream([
   ["metadata", { usage: { inputTokens: 20, outputTokens: 3, totalTokens: 23 }, metrics: { latencyMs: 5 } }],
 ]);
 
-const TOOLS = [
-  {
-    type: "function",
-    function: {
-      name: "grep",
-      description: "Search file contents",
-      parameters: {
-        type: "object",
-        properties: {
-          pattern: { type: "string" },
-          path: { type: "string" },
-          include: { type: "string" },
-          context: { type: "integer" },
-          ignore_case: { type: "boolean" },
-          max_results: { type: "integer" },
-        },
-        required: ["pattern"],
-      },
-    },
+const INVOKE_REPLY = {
+  id: "msg_stable_body",
+  type: "message",
+  role: "assistant",
+  model: "claude-haiku-4-5-20251001",
+  content: [{ type: "text", text: "Found it." }],
+  stop_reason: "end_turn",
+  usage: { input_tokens: 20, output_tokens: 3 },
+};
+
+const SYSTEM = "You are a coding assistant.";
+const QUESTION = "Find TODO in src.";
+const TOOL_OUTPUT = "src/main.rs:3: // TODO";
+const PARAMETERS = {
+  type: "object",
+  properties: {
+    pattern: { type: "string" },
+    path: { type: "string" },
+    include: { type: "string" },
+    context: { type: "integer" },
+    ignore_case: { type: "boolean" },
+    max_results: { type: "integer" },
   },
-];
-const MESSAGES = [
-  { role: "system", content: "You are a coding assistant." },
-  { role: "user", content: "Find TODO in src." },
-  {
-    role: "assistant",
-    content: null,
-    tool_calls: [
-      {
-        id: "tooluse_1",
-        type: "function",
-        function: {
-          name: "grep",
-          arguments: JSON.stringify({
-            pattern: "TODO",
-            path: "src",
-            include: "*.rs",
-            context: 2,
-            ignore_case: true,
-            max_results: 50,
-          }),
-        },
-      },
-    ],
-  },
-  { role: "tool", tool_call_id: "tooluse_1", content: "src/main.rs:3: // TODO" },
-];
+  required: ["pattern"],
+};
+const ARGUMENTS = {
+  pattern: "TODO",
+  path: "src",
+  include: "*.rs",
+  context: 2,
+  ignore_case: true,
+  max_results: 50,
+};
+
+type Endpoint = "/v1/chat/completions" | "/v1/messages" | "/v1/responses";
+
+function requestBody(endpoint: Endpoint, model: string, stream: boolean): unknown {
+  switch (endpoint) {
+    case "/v1/chat/completions":
+      return {
+        model,
+        stream,
+        tools: [{ type: "function", function: { name: "grep", description: "Search file contents", parameters: PARAMETERS } }],
+        messages: [
+          { role: "system", content: SYSTEM },
+          { role: "user", content: QUESTION },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              { id: "tooluse_1", type: "function", function: { name: "grep", arguments: JSON.stringify(ARGUMENTS) } },
+            ],
+          },
+          { role: "tool", tool_call_id: "tooluse_1", content: TOOL_OUTPUT },
+        ],
+      };
+    case "/v1/messages":
+      return {
+        model,
+        stream,
+        max_tokens: 256,
+        system: SYSTEM,
+        tools: [{ name: "grep", description: "Search file contents", input_schema: PARAMETERS }],
+        messages: [
+          { role: "user", content: QUESTION },
+          { role: "assistant", content: [{ type: "tool_use", id: "tooluse_1", name: "grep", input: ARGUMENTS }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "tooluse_1", content: TOOL_OUTPUT }] },
+        ],
+      };
+    case "/v1/responses":
+      return {
+        model,
+        stream,
+        instructions: SYSTEM,
+        tools: [{ type: "function", name: "grep", description: "Search file contents", parameters: PARAMETERS }],
+        input: [
+          { role: "user", content: QUESTION },
+          { type: "function_call", call_id: "tooluse_1", name: "grep", arguments: JSON.stringify(ARGUMENTS) },
+          { type: "function_call_output", call_id: "tooluse_1", output: TOOL_OUTPUT },
+        ],
+      };
+  }
+}
 
 describe("Bedrock Converse: identical requests send identical bodies", () => {
   let app: SpawnedApp | undefined;
@@ -104,6 +142,9 @@ describe("Bedrock Converse: identical requests send identical bodies", () => {
         if (req.url?.endsWith("/converse-stream")) {
           res.writeHead(200, { "content-type": "application/vnd.amazon.eventstream" });
           res.end(CONVERSE_STREAM);
+        } else if (req.url?.endsWith("/invoke")) {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(INVOKE_REPLY));
         } else {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify(CONVERSE_REPLY));
@@ -155,21 +196,27 @@ describe("Bedrock Converse: identical requests send identical bodies", () => {
     await new Promise<void>((resolve) => (upstream ? upstream.close(() => resolve()) : resolve()));
   });
 
-  test.for<[string, boolean]>([
-    ["stable-body-nova", false],
-    ["stable-body-nova", true],
-    ["stable-body-claude", true],
-  ])("%s stream=%s", async ([model, stream], ctx) => {
+  test.for<[Endpoint, string, boolean, string]>([
+    ["/v1/chat/completions", "stable-body-nova", false, "/converse"],
+    ["/v1/chat/completions", "stable-body-nova", true, "/converse-stream"],
+    ["/v1/chat/completions", "stable-body-claude", true, "/converse-stream"],
+    ["/v1/messages", "stable-body-nova", false, "/converse"],
+    ["/v1/messages", "stable-body-nova", true, "/converse-stream"],
+    ["/v1/messages", "stable-body-claude", false, "/invoke"],
+    ["/v1/responses", "stable-body-nova", false, "/converse"],
+    ["/v1/responses", "stable-body-nova", true, "/converse-stream"],
+    ["/v1/responses", "stable-body-claude", true, "/converse-stream"],
+  ])("%s %s stream=%s", async ([endpoint, model, stream, upstreamPath], ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const before = received.length;
     for (let i = 0; i < REPEATS; i++) {
-      const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      const res = await fetch(`${app.proxyUrl}${endpoint}`, {
         method: "POST",
         headers: {
           authorization: `Bearer ${CALLER_PLAINTEXT}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify({ model, stream, tools: TOOLS, messages: MESSAGES }),
+        body: JSON.stringify(requestBody(endpoint, model, stream)),
       });
       const text = await res.text();
       expect(res.status, text).toBe(200);
@@ -178,7 +225,7 @@ describe("Bedrock Converse: identical requests send identical bodies", () => {
     const sent = received.slice(before);
     expect(sent).toHaveLength(REPEATS);
     for (const s of sent) {
-      expect(s.path).toMatch(stream ? /\/converse-stream$/ : /\/converse$/);
+      expect(s.path.endsWith(upstreamPath), s.path).toBe(true);
     }
     // The schema and the replayed arguments both reached Bedrock.
     expect(sent[0].raw).toContain("max_results");

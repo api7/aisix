@@ -881,9 +881,14 @@ impl Intercept for DefaultHeadersInterceptor {
 }
 
 /// Re-serializes the Converse body with sorted keys before signing. Smithy
-/// `Document` objects are `HashMap`s, so tool schemas, `toolUse.input` and
-/// `additionalModelRequestFields` otherwise change key order per request and
-/// Bedrock prompt caching (exact prefix match, tools first) never hits.
+/// `Document` objects (and `requestMetadata`) are `HashMap`s, so tool
+/// schemas, `toolUse.input` and `additionalModelRequestFields` otherwise
+/// change key order per request and Bedrock prompt caching (exact prefix
+/// match, tools first) never hits.
+///
+/// Runs once before the retry loop, not per attempt: the SDK checkpoints
+/// the request right after this hook, so every attempt signs and sends the
+/// rewritten bytes and the original body is not kept alongside them.
 ///
 /// Reference: <https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html>
 #[derive(Debug)]
@@ -894,7 +899,7 @@ impl Intercept for StableJsonBodyInterceptor {
         "AisixBedrockStableJsonBody"
     }
 
-    fn modify_before_signing(
+    fn modify_before_retry_loop(
         &self,
         context: &mut BeforeTransmitInterceptorContextMut<'_>,
         _runtime_components: &RuntimeComponents,
@@ -913,12 +918,17 @@ impl Intercept for StableJsonBodyInterceptor {
 }
 
 /// `body` with every object's keys sorted, or `None` when it is not JSON.
-/// Sorting comes from `serde_json::Map` being a `BTreeMap` (the workspace
-/// does not enable `preserve_order`); `stable_json_sorts_nested_keys` fails
-/// if that ever changes.
+/// The output buffer is sized to the input, so a body carrying large inline
+/// media costs the parsed tree and one output copy while this runs, never a
+/// growth-doubled buffer that would then be held for the whole call.
 fn stable_json(body: &[u8]) -> Option<Vec<u8>> {
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    serde_json::to_vec(&value).ok()
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value.sort_all_objects();
+    let mut out = Vec::with_capacity(body.len());
+    serde_json::to_writer(&mut out, &value).ok()?;
+    drop(value);
+    out.shrink_to_fit();
+    Some(out)
 }
 
 /// Hands each response head to [`aisix_gateway::note_upstream_response`],
@@ -3321,6 +3331,17 @@ mod tests {
             String::from_utf8(stable_json(a).unwrap()).unwrap(),
             r#"{"modelId":"m","toolConfig":{"tools":[{"toolSpec":{"inputSchema":{"json":{"properties":{"include":{"type":"string"},"path":{"type":"string"},"pattern":{"type":"string"}},"type":"object"}}}}]}}"#
         );
+    }
+
+    #[test]
+    fn stable_json_keeps_scalars() {
+        let a = br#"{"z":{"s":"q\"b\\\n\u00e9\u2028","f":0.1,"e":1e300,"u":18446744073709551615,"n":-5,"t":true,"x":null},"a":[3,{"b":1,"a":2}]}"#;
+        let out = stable_json(a).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&out).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(a).unwrap()
+        );
+        assert_eq!(stable_json(b"not json"), None);
     }
 
     async fn consume_invalid_mock_stream(result: Result<ChatChunkStream, BridgeError>) {
