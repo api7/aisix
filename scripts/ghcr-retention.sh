@@ -46,6 +46,7 @@ case "${1:-}" in
   --dry-run) dry_run=true ;;
   *) echo "usage: $0 [--dry-run]" >&2; exit 2 ;;
 esac
+[[ $MAX_DELETES =~ ^[0-9]+$ ]] || { echo "MAX_DELETES must be a whole number, got '$MAX_DELETES'" >&2; exit 2; }
 verb=$($dry_run && echo 'would delete' || echo 'deleted')
 
 ci_cutoff=$(date -u -d "${CI_TEST_MAX_AGE_DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)
@@ -261,6 +262,12 @@ for image in $IMAGES; do
       for (i = 1; i <= m; i++) print img ":" unit "\t" m "\t" out[i]
     }' "$work/signatures.tsv" "$dir/index_children" "$dir/children.tsv" "$dir/units.tsv" >> "$work/plan.tsv"
 done
+# The oldest unit that deletes a signature goes first, so a token that cannot
+# delete in notary stops the run before any image is touched.
+first_signed=$(awk -F'\t' '$3 == "signature" { print $1; exit }' "$work/plan.tsv")
+awk -F'\t' -v u="$first_signed" '$1 == u' "$work/plan.tsv" > "$work/plan.ordered"
+awk -F'\t' -v u="$first_signed" '$1 != u' "$work/plan.tsv" >> "$work/plan.ordered"
+mv "$work/plan.ordered" "$work/plan.tsv"
 backlog=$(wc -l < "$work/plan.tsv")
 
 cur=""
@@ -305,7 +312,7 @@ remaining=$((backlog - executed))
   echo "  attributed by the cosign payload: $(wc -l < "$work/signatures.tsv")"
   awk -F'\t' '{ n[$5]++ } END { for (i in n) print "    " i ": " n[i] }' "$work/signatures.tsv" | sort
   echo "this run ($verb, cap $MAX_DELETES): main $(done_of main), ci-test $(done_of ci-test), children $(done_of child), orphans $(done_of orphan), signatures $(done_of signature); $executed of $backlog DELETEs${stopped:+, stopped: $stopped}"
-  [ "$remaining" -gt 0 ] && echo "left for later runs: $remaining DELETEs, about $(( (remaining + MAX_DELETES - 1) / MAX_DELETES )) more daily runs at this cap"
+  [ "$remaining" -gt 0 ] && [ "$MAX_DELETES" -gt 0 ] && echo "left for later runs: $remaining DELETEs, about $(( (remaining + MAX_DELETES - 1) / MAX_DELETES )) more daily runs at this cap"
   true
 } >> "$work/report"
 echo
