@@ -41,6 +41,9 @@ jobs:
       - name: List expired ci-test images
         env:
           GH_TOKEN: ${{ github.token }}
+          # On a pull request, treat every ci-test image as expired so the
+          # whole selection path runs against the real package.
+          MAX_AGE_DAYS: ${{ github.event_name == 'pull_request' && '0' || '3' }}
         run: scripts/ghcr-ci-test-cleanup.sh --dry-run
 
   cleanup:
