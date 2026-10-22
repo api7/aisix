@@ -110,7 +110,7 @@ for image in $IMAGES; do
   echo "== ghcr.io/$image: $total versions"
 
   awk -F'\t' '$4 != ""' "$dir/versions.tsv" > "$dir/tagged.tsv"
-  awk -F'\t' '$4 == ""' "$dir/versions.tsv" | sort -t$'\t' -k2,2 > "$dir/untagged.tsv"
+  awk -F'\t' '$4 == ""' "$dir/versions.tsv" > "$dir/untagged.tsv"
   # Versions whose tags all match the pattern.
   only_tags() { awk -F'\t' -v re="$1" '{ n = split($4, t, ","); ok = 1; for (i = 1; i <= n; i++) if (t[i] !~ re) ok = 0; if (ok) print }' "$dir/tagged.tsv"; }
   only_tags '^(sha-.*|dev)$' | sort -t$'\t' -k3,3r -k1,1nr > "$dir/main.tsv"
@@ -139,7 +139,7 @@ for image in $IMAGES; do
   # protects its children.
   : > "$dir/kept"
   if [ -s "$dir/untagged_candidates.tsv" ]; then
-    earliest=$(cut -f3 "$dir/untagged_candidates.tsv" | sort | head -n 1)
+    earliest=$(cut -f3 "$dir/untagged_candidates.tsv" | sort | sed -n 1p)
     awk -F'\t' -v since="$earliest" -v c="$orphan_cutoff" '
       FILENAME == ARGV[1] { gone[$1]; next }
       FILENAME == ARGV[2] { gone[$1]; next }
@@ -183,13 +183,13 @@ done
 # Plan the notary sweep before deleting anything, so a failed fetch aborts
 # with nothing deleted. Signatures pushed while the list is paged belong to
 # new images, which this run does not delete.
-IMAGE="$NOTARY_IMAGE"
-registry_token=$(registry_token "$NOTARY_IMAGE")
-export IMAGE registry_token
 : > "$work/signatures.tsv"
 : > "$work/notary_matched.tsv"
 if [ -s "$work/deleted_digests" ]; then
   list_versions "$NOTARY_IMAGE" > "$work/notary.tsv"
+  IMAGE="$NOTARY_IMAGE"
+  registry_token=$(registry_token "$NOTARY_IMAGE")
+  export IMAGE registry_token
   notary_total=$(wc -l < "$work/notary.tsv")
   # cosign tags a signature sha256-<hex>.sig after the signed digest.
   awk -F'\t' 'FILENAME == ARGV[1] { d = $1; sub(/^sha256:/, "sha256-", d); want[d ".sig"] = $1 "\t" $2; next }
