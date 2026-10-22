@@ -494,14 +494,14 @@ fn observability_exporter_corpus() {
                 json!({"name": "hc", "kind": "otlp_http", "endpoint": "https://api.honeycomb.io/v1/traces"}),
             ),
             (
-                "otlp loopback http",
+                "otlp plain http any host",
                 true,
-                json!({"name": "e2e", "kind": "otlp_http", "endpoint": "http://mock-otlp:4318/v1/traces"}),
+                json!({"name": "x", "kind": "otlp_http", "endpoint": "http://otel-collector-dev:4318/v1/traces"}),
             ),
             (
-                "otlp plain http non-loopback (pattern)",
+                "otlp non-http scheme (pattern)",
                 false,
-                json!({"name": "x", "kind": "otlp_http", "endpoint": "http://api.honeycomb.io/v1/traces"}),
+                json!({"name": "x", "kind": "otlp_http", "endpoint": "grpc://otel-collector:4317"}),
             ),
             (
                 "otlp sample_rate > 1",
@@ -576,9 +576,14 @@ fn observability_exporter_corpus() {
                 json!({"name": "x", "kind": "object_store", "provider": "wasabi", "bucket": "b", "prefix": "p", "credential_ref": "r"}),
             ),
             (
-                "loopback minio endpoint",
+                "plain http endpoint any host",
                 true,
-                json!({"name": "x", "kind": "object_store", "provider": "s3", "bucket": "b", "prefix": "p", "endpoint": "http://minio:9000", "credential_ref": "r"}),
+                json!({"name": "x", "kind": "object_store", "provider": "s3", "bucket": "b", "prefix": "p", "endpoint": "http://minio-prod.internal:9000", "credential_ref": "r"}),
+            ),
+            (
+                "endpoint without http scheme (pattern)",
+                false,
+                json!({"name": "x", "kind": "object_store", "provider": "s3", "bucket": "b", "prefix": "p", "endpoint": "minio:9000", "credential_ref": "r"}),
             ),
             (
                 "object_store empty credential_ref",

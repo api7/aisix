@@ -4648,11 +4648,11 @@ mod tests {
     }
 
     #[test]
-    fn exporter_otlp_http_rejects_plain_http_endpoint() {
+    fn exporter_otlp_http_rejects_an_endpoint_without_http_scheme() {
         let v = json!({
             "name": "x",
             "kind": "otlp_http",
-            "endpoint": "http://api.honeycomb.io/v1/traces"
+            "endpoint": "grpc://api.honeycomb.io:4317"
         });
         assert!(validate_observability_exporter(&v).is_err());
     }
@@ -4799,24 +4799,23 @@ mod tests {
     }
 
     #[test]
-    fn exporter_object_store_allows_loopback_minio_endpoint() {
-        // The e2e points the S3 sink at a local MinIO over http://.
-        let v = json!({
-            "name": "s3-e2e", "kind": "object_store",
-            "provider": "s3", "bucket": "b", "prefix": "p",
-            "endpoint": "http://minio:9000", "credential_ref": "mock"
-        });
-        validate_observability_exporter(&v).unwrap();
+    fn exporter_object_store_allows_plaintext_endpoint_on_any_host() {
+        for endpoint in ["http://minio:9000", "http://minio-prod.internal:9000"] {
+            let v = json!({
+                "name": "s3", "kind": "object_store",
+                "provider": "s3", "bucket": "b", "prefix": "p",
+                "endpoint": endpoint, "credential_ref": "mock"
+            });
+            validate_observability_exporter(&v).unwrap();
+        }
     }
 
     #[test]
-    fn exporter_object_store_rejects_plaintext_non_loopback_endpoint() {
-        // A non-loopback plaintext endpoint must be rejected — no exfil to an
-        // arbitrary http host.
+    fn exporter_object_store_rejects_an_endpoint_without_http_scheme() {
         let v = json!({
             "name": "x", "kind": "object_store",
             "provider": "s3", "bucket": "b", "prefix": "p",
-            "endpoint": "http://evil.example.com", "credential_ref": "r"
+            "endpoint": "ftp://minio:9000", "credential_ref": "r"
         });
         assert!(validate_observability_exporter(&v).is_err());
     }

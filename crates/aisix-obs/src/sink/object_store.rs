@@ -291,7 +291,7 @@ fn client_options_for(
 /// exporter. **This is the only provider-specific code** — each arm picks the
 /// matching `object_store` builder, which owns that cloud's signing. An
 /// `endpoint` (S3-compatible MinIO / R2, or an emulator) is honored and HTTP
-/// is allowed only for explicit `http://` endpoints (loopback emulators).
+/// is allowed only for explicit `http://` endpoints.
 pub fn build_object_store(
     provider: ObjectStoreProvider,
     bucket: &str,
@@ -323,7 +323,7 @@ pub fn build_object_store(
             if let Some(ep) = endpoint {
                 b = b.with_endpoint(ep);
                 // S3-compatible servers (MinIO / emulators) are path-style and
-                // commonly plaintext on loopback.
+                // often served over plain http.
                 b = b.with_virtual_hosted_style_request(false);
                 if ep.starts_with("http://") {
                     b = b.with_allow_http(true);
@@ -350,7 +350,7 @@ pub fn build_object_store(
             // JSON. object_store uploads through the XML API, which the stock
             // fake-gcs-server image does not implement (fsouza/fake-gcs-server#331):
             // it rejects every upload, encoded object name or not. GCS's builder has no `with_allow_http`,
-            // so plaintext loopback is enabled through its client config.
+            // so plaintext http is enabled through its client config.
             if let Some(ep) = endpoint {
                 b = b.with_base_url(ep);
                 if ep.starts_with("http://") {

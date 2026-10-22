@@ -51,6 +51,8 @@ export interface MockOtlpOptions {
    * can wait out.
    */
   failStatus?: number;
+  /** Loopback address to listen on; `127.0.0.1` by default. */
+  host?: string;
 }
 
 export interface MockOtlp {
@@ -171,13 +173,14 @@ export async function startMockOtlp(
       res.end("{}");
     });
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const host = options.host ?? "127.0.0.1";
+  await new Promise<void>((resolve) => server.listen(0, host, resolve));
   const address = server.address();
   if (address === null || typeof address === "string") {
     throw new Error("otlp mock: no listen address");
   }
   return {
-    url: `http://127.0.0.1:${address.port}/v1/traces`,
+    url: `http://${host}:${address.port}/v1/traces`,
     spans,
     get posts() {
       return state.posts;
