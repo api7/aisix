@@ -478,6 +478,25 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
     expect(sent[0].body.inferenceConfig).toEqual({ maxTokens: 50, stopSequences: ["END"] });
   });
 
+  // Converse refuses `stopSequences` beside an additional `stop_sequences`.
+  test("ConverseStream to Claude lets a native stop_sequences win over stop", async (ctx) => {
+    if (skip(ctx)) return;
+    const { result, sent } = await capture(() =>
+      chat({
+        model: "cc-claude",
+        stream: true,
+        max_tokens: 60,
+        stop: ["delta"],
+        stop_sequences: ["beta"],
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    );
+    expect(result.status, result.text).toBe(200);
+    expect(sent[0].path).toMatch(/\/converse-stream$/);
+    expect(sent[0].body.inferenceConfig).toEqual({ maxTokens: 60 });
+    expect(sent[0].body.additionalModelRequestFields).toEqual({ stop_sequences: ["beta"] });
+  });
+
   // Values Claude's Messages API refuses are the upstream's to refuse, as on
   // the Anthropic route: nothing is dropped or filtered on the way.
   test("a non-streamed Claude request forwards stop and max_completion_tokens as sent", async (ctx) => {

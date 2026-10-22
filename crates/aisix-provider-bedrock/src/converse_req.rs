@@ -313,9 +313,19 @@ pub(crate) fn top_k_field(req: &ChatFormat, model_id: &str) -> Option<(&'static 
 
 /// `stop` as Converse `stopSequences`. An empty string is skipped, as
 /// Converse rejects it. Grok and GPT 5.6 and newer refuse stop sequences on
-/// every route, so they get none.
+/// every route, so they get none. A Claude caller's native `stop_sequences`
+/// wins: it reaches the model as sent through `additionalModelRequestFields`,
+/// and Converse rejects a request that also sets `stopSequences`.
 pub(crate) fn stop_sequences(req: &ChatFormat, model_id: &str) -> Option<Vec<String>> {
     if chat_completions_family(capability_id(model_id)) {
+        return None;
+    }
+    if base_id(model_id).starts_with("anthropic.")
+        && req
+            .extra
+            .get("stop_sequences")
+            .is_some_and(|v| !v.is_null())
+    {
         return None;
     }
     match req.extra.get("stop")? {
@@ -500,6 +510,27 @@ mod tests {
         );
         let bad = req(serde_json::json!({"reasoning_effort": "xhigh"}));
         assert!(reasoning_field(&bad, "amazon.nova-2-lite-v1:0").is_err());
+    }
+
+    #[test]
+    fn a_claude_callers_native_stop_sequences_wins_over_stop() {
+        let claude = "us.anthropic.claude-haiku-4-5-20251001-v1:0";
+        let both = req(serde_json::json!({"stop": ["delta"], "stop_sequences": ["beta"]}));
+        assert_eq!(stop_sequences(&both, claude), None);
+        assert_eq!(
+            caller_additional_fields(&both).get("stop_sequences"),
+            Some(&serde_json::json!(["beta"]))
+        );
+        // Other publishers and a null native field keep `stop` as before.
+        assert_eq!(
+            stop_sequences(&both, "us.amazon.nova-lite-v1:0"),
+            Some(vec!["delta".into()])
+        );
+        let null_native = req(serde_json::json!({"stop": ["delta"], "stop_sequences": null}));
+        assert_eq!(
+            stop_sequences(&null_native, claude),
+            Some(vec!["delta".into()])
+        );
     }
 
     #[test]
