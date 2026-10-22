@@ -126,7 +126,7 @@ function requestBody(endpoint: Endpoint, model: string, stream: boolean): unknow
 describe("Bedrock Converse: identical requests send identical bodies", () => {
   let app: SpawnedApp | undefined;
   let upstream: Server | undefined;
-  const received: Array<{ path: string; raw: string }> = [];
+  const received: Array<{ path: string; raw: string; contentLength: string | undefined }> = [];
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -138,7 +138,7 @@ describe("Bedrock Converse: identical requests send identical bodies", () => {
       let raw = "";
       req.on("data", (c) => (raw += c));
       req.on("end", () => {
-        received.push({ path: req.url ?? "", raw });
+        received.push({ path: req.url ?? "", raw, contentLength: req.headers["content-length"] });
         if (req.url?.endsWith("/converse-stream")) {
           res.writeHead(200, { "content-type": "application/vnd.amazon.eventstream" });
           res.end(CONVERSE_STREAM);
@@ -226,6 +226,8 @@ describe("Bedrock Converse: identical requests send identical bodies", () => {
     expect(sent).toHaveLength(REPEATS);
     for (const s of sent) {
       expect(s.path.endsWith(upstreamPath), s.path).toBe(true);
+      expect(Number(s.contentLength)).toBe(Buffer.byteLength(s.raw));
+      expect(() => JSON.parse(s.raw)).not.toThrow();
     }
     // The schema and the replayed arguments both reached Bedrock.
     expect(sent[0].raw).toContain("max_results");
