@@ -54,11 +54,9 @@ pub enum ExporterKind {
 /// OTLP/HTTP trace exporter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct OtlpHttpConfig {
-    /// Full URL of the OTLP/HTTP traces endpoint. Include the receiver's
+    /// Full `http://` or `https://` URL of the OTLP/HTTP traces endpoint. Include the receiver's
     /// expected path, such as `/v1/traces`.
-    #[schemars(regex(
-        pattern = r"^https://.+|^http://([^/?#\\]*@)?(mock-otlp|otel-collector|127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$"
-    ))]
+    #[schemars(regex(pattern = r"^https?://.+"))]
     pub endpoint: String,
 
     /// Static headers attached to every export request, such as authorization or vendor-specific API-key headers.
@@ -199,11 +197,9 @@ pub struct ObjectStoreConfig {
     #[schemars(length(min = 1))]
     pub region: Option<String>,
 
-    /// Backend endpoint override: an S3-compatible host such as MinIO, Aliyun OSS, or Cloudflare R2, a Cloud Storage XML API base URL such as a private endpoint, or an Azure Blob endpoint. A `gcs` endpoint must implement the Cloud Storage XML API and accept the percent-encoded object names the gateway sends; the stock fake-gcs-server image does not, so it cannot receive objects. When omitted, the provider's native endpoint is used.
+    /// Backend endpoint override, an `http://` or `https://` URL: an S3-compatible host such as MinIO, Aliyun OSS, or Cloudflare R2, a Cloud Storage XML API base URL such as a private endpoint, or an Azure Blob endpoint. A `gcs` endpoint must implement the Cloud Storage XML API and accept the percent-encoded object names the gateway sends; the stock fake-gcs-server image does not, so it cannot receive objects. When omitted, the provider's native endpoint is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(regex(
-        pattern = r"^https://.+|^http://([^/?#\\]*@)?(minio|azurite|fake-gcs-server|fake-gcs|127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$"
-    ))]
+    #[schemars(regex(pattern = r"^https?://.+"))]
     pub endpoint: Option<String>,
 
     /// Compression applied to each NDJSON file before upload.
@@ -430,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn a_loopback_http_endpoint_may_carry_userinfo_but_not_hide_its_host() {
+    fn an_endpoint_is_any_http_or_https_url_on_both_paths() {
         let otlp = |endpoint: &str| serde_json::json!({"name": "x", "kind": "otlp_http", "endpoint": endpoint});
         let object_store = |endpoint: &str| {
             serde_json::json!({
@@ -445,21 +441,21 @@ mod tests {
             )
         };
         for (doc, accepted) in [
-            (otlp("http://user:pw@localhost:4318/v1/traces"), true),
-            (otlp("http://user@mock-otlp/v1/traces"), true),
-            (otlp("http://localhost@evil.example/x"), false),
-            (otlp("http://a@localhost@evil.example"), false),
-            // `\` ends the authority for the URL parser, so this is host
-            // `evil.example` with a path, not userinfo in front of localhost.
+            (otlp("http://otel-collector-dev:4318/v1/traces"), true),
+            (otlp("http://10.0.3.7:4318/v1/traces"), true),
             (
-                otlp(r"http://evil.example\@localhost:4318/v1/traces"),
-                false,
+                otlp("http://user:pw@collector.svc.cluster.local/v1/traces"),
+                true,
             ),
-            (otlp("http://user:pw@evil.example/v1/traces"), false),
-            (object_store("http://ak:sk@minio:9000"), true),
-            (object_store("http://localhost@evil.example/x"), false),
-            (object_store("http://a@localhost@evil.example"), false),
-            (object_store(r"http://evil.example\@minio:9000"), false),
+            (otlp("https://api.honeycomb.io/v1/traces"), true),
+            (otlp("grpc://otel-collector:4317"), false),
+            (otlp("otel-collector:4318/v1/traces"), false),
+            (otlp("http://"), false),
+            (object_store("http://minio-prod.internal:9000"), true),
+            (object_store("http://ak:sk@10.0.3.8:9000"), true),
+            (object_store("https://oss-cn-hangzhou.aliyuncs.com"), true),
+            (object_store("s3://bucket"), false),
+            (object_store("minio:9000"), false),
         ] {
             assert_eq!(both(&doc), (accepted, accepted), "{doc}");
         }

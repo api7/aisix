@@ -13,12 +13,10 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: an exporter endpoint URL may carry userinfo, loopback `http://`
+// E2E: an exporter endpoint URL may carry userinfo, plain `http://`
 // included. It is an opaque URL: the OTLP exporter reaches a receiver that
-// requires the Basic credential written there, an object_store exporter
-// uploads with its provider's own signature, and a host that is not on the
-// loopback allow-list stays refused however the userinfo in front of it is
-// written.
+// requires the Basic credential written there, and an object_store exporter
+// uploads with its provider's own signature.
 
 const CALLER = "sk-exporter-endpoint-userinfo";
 const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
@@ -92,7 +90,6 @@ describe("exporter endpoint URLs may carry userinfo", () => {
   let upstream: OpenAiUpstream | undefined;
   let otlp: Receiver | undefined;
   let s3: Receiver | undefined;
-  let refusedId = "";
   let etcdReachable = false;
 
   const basic = `Basic ${Buffer.from(`${OTLP_USER}:${OTLP_PASS}`).toString("base64")}`;
@@ -132,16 +129,6 @@ describe("exporter endpoint URLs may carry userinfo", () => {
       compression: "none",
       credential_ref: CREDENTIAL_REF,
     });
-    // Not on the loopback allow-list: the userinfo in front of the host
-    // must not smuggle it past the pattern.
-    const refused = await seed.createObservabilityExporter({
-      name: "otlp-not-allow-listed",
-      enabled: true,
-      kind: "otlp_http",
-      endpoint: "http://localhost@evil.example/v1/traces",
-    });
-    refusedId = refused.id;
-
     const pk = await seed.createProviderKey({
       display_name: "endpoint-userinfo-pk",
       secret: "sk-mock",
@@ -165,7 +152,7 @@ describe("exporter endpoint URLs may carry userinfo", () => {
     await s3?.close();
   });
 
-  test("both exporters load and deliver; the non-allow-listed host is rejected", async (ctx) => {
+  test("both exporters load and deliver", async (ctx) => {
     if (!etcdReachable || !app || !otlp || !s3) return ctx.skip();
 
     const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
@@ -193,13 +180,5 @@ describe("exporter endpoint URLs may carry userinfo", () => {
     );
     expect(upload.path.startsWith(`/${BUCKET}/p/`)).toBe(true);
     expect(upload.authorization.some((a) => a.startsWith("AWS4-HMAC-SHA256 "))).toBe(true);
-
-    const status = await fetch(`${app.metricsUrl}/status/config`);
-    const cfg = (await status.json()) as {
-      rejected: Array<{ resource_id: string; resource_kind: string; last_error_kind: string }>;
-    };
-    const rejection = cfg.rejected.find((r) => r.resource_id === refusedId);
-    expect(rejection, JSON.stringify(cfg.rejected)).toBeDefined();
-    expect(rejection!.last_error_kind).toBe("schema_failed");
   });
 });
