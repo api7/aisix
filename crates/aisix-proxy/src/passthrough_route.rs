@@ -5654,9 +5654,8 @@ fn frame_parts_and_tier(
 ) {
     let mut tier = None;
     let mut labelled = None;
-    let raw = matches!(protocol, PassthroughProtocol::Raw);
-    let frame_labelled = is_usage_labelled_frame(frame);
-    let usage_labelled = raw && frame_labelled;
+    let usage_labelled =
+        matches!(protocol, PassthroughProtocol::Raw) && is_usage_labelled_frame(frame);
     let mut parts = crate::held_content::Parts::default();
     let mut usage: Option<PassthroughUsage> = None;
     let mut merge = |found: PassthroughUsage| {
@@ -5744,7 +5743,7 @@ fn frame_parts_and_tier(
             Metering::Responses => crate::responses::terminal_response_service_tier(&v),
             _ => None,
         };
-        if frame_labelled {
+        if is_usage_labelled_frame(frame) {
             labelled = agent_token_usage(&v);
         }
         let report = match metering {

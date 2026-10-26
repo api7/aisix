@@ -321,11 +321,28 @@ pub(crate) fn top_k_field(req: &ChatFormat, model_id: &str) -> Option<(&'static 
 ///
 /// Converse is built from typed fields, so a `stop` it cannot carry cannot
 /// be forwarded for the upstream to reject: anything else that is not a
-/// non-empty string or an array of them is refused here.
+/// non-empty string or an array of them is refused here, on every model.
 pub(crate) fn stop_sequences(
     req: &ChatFormat,
     model_id: &str,
 ) -> Result<Option<Vec<String>>, BridgeError> {
+    const WANT: &str = "must be a non-empty string or an array of non-empty strings";
+    let stops = match req.extra.get("stop") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s.is_empty() => None,
+        Some(Value::String(s)) => Some(vec![s.clone()]),
+        Some(Value::Array(items)) => {
+            let seqs = items
+                .iter()
+                .map(|v| v.as_str().filter(|s| !s.is_empty()).map(str::to_string))
+                .collect::<Option<Vec<String>>>()
+                .ok_or_else(|| invalid("stop", WANT))?;
+            (!seqs.is_empty()).then_some(seqs)
+        }
+        Some(_) => return Err(invalid("stop", WANT)),
+    };
+    // Checked first, so the same `stop` is refused whichever model a
+    // routing group picks.
     let id = capability_id(model_id);
     if chat_completions_family(id) || base_id(model_id).contains("gpt-oss") {
         return Ok(None);
@@ -335,21 +352,7 @@ pub(crate) fn stop_sequences(
     {
         return Ok(None);
     }
-    const WANT: &str = "must be a non-empty string or an array of non-empty strings";
-    match req.extra.get("stop") {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(s)) if s.is_empty() => Ok(None),
-        Some(Value::String(s)) => Ok(Some(vec![s.clone()])),
-        Some(Value::Array(items)) => {
-            let seqs = items
-                .iter()
-                .map(|v| v.as_str().filter(|s| !s.is_empty()).map(str::to_string))
-                .collect::<Option<Vec<String>>>()
-                .ok_or_else(|| invalid("stop", WANT))?;
-            Ok((!seqs.is_empty()).then_some(seqs))
-        }
-        Some(_) => Err(invalid("stop", WANT)),
-    }
+    Ok(stops)
 }
 
 /// Refuse a `max_completion_tokens` Converse cannot carry: anything but a
@@ -580,6 +583,18 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn an_invalid_stop_is_refused_on_models_that_get_none() {
+        let r = req(serde_json::json!({"stop": 5}));
+        for id in [
+            "openai.gpt-oss-20b-1:0",
+            "us.openai.gpt-6-luna",
+            "us.xai.grok-4.6",
+        ] {
+            assert!(stop_sequences(&r, id).is_err(), "{id}");
+        }
     }
 
     #[test]

@@ -464,13 +464,18 @@ impl VertexSecret {
                 )));
             }
         }
+        let has_sa = fields
+            .get("service_account_json")
+            .is_some_and(serde_json::Value::is_object);
         let parsed: VertexSecret = serde_json::from_value(value).map_err(|_e| {
-            BridgeError::InvalidUpstreamCredentials(
+            BridgeError::InvalidUpstreamCredentials(if has_sa {
                 "vertex provider_key.api_key.service_account_json must be a \
                  service-account key object with string fields type, private_key, \
                  client_email and token_uri"
-                    .into(),
-            )
+                    .into()
+            } else {
+                format!("vertex provider_key.api_key must be {SHAPE}")
+            })
         })?;
         // Enforce mutual exclusion. Both-set is suspect (which one
         // wins?); neither-set is unusable. Empty-string token is a

@@ -508,6 +508,8 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
     const routes: Array<Record<string, unknown>> = [
       { model: "cc-llama" },
       { model: "cc-llama", stream: true },
+      // Refused even where no stop sequences are sent at all.
+      { model: "cc-gptoss" },
       { model: "cc-claude", stream: true },
       { model: "cc-claude", requestMetadata: { team: "a" } },
     ];
