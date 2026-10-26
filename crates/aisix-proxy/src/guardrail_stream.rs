@@ -24,6 +24,8 @@ use aisix_gateway::{ChatMessage, ChatResponse, FinishReason, UsageStats};
 /// placeholders and never reach the client.
 pub(crate) fn synth_chat_response(model: &str, text: String) -> ChatResponse {
     ChatResponse {
+        logprobs: None,
+        more_choices: Vec::new(),
         id: String::new(),
         model: model.to_string(),
         message: ChatMessage::assistant(text),

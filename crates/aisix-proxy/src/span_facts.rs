@@ -180,14 +180,11 @@ pub(crate) fn chat_params(req: &aisix_gateway::ChatFormat) -> aisix_obs::GenAiRe
             serde_json::json!({ "type": kind }),
         );
     }
-    // Through the shortest decimal form, so `0.2` is reported as `0.2`
-    // rather than the f32's widened `0.20000000298…`.
-    let widen = |v: f32| v.to_string().parse::<f64>().map(Value::from).ok();
-    if let Some(v) = req.temperature.and_then(widen) {
-        body.insert("temperature".into(), v);
+    if let Some(v) = req.temperature {
+        body.insert("temperature".into(), Value::from(v));
     }
-    if let Some(v) = req.top_p.and_then(widen) {
-        body.insert("top_p".into(), v);
+    if let Some(v) = req.top_p {
+        body.insert("top_p".into(), Value::from(v));
     }
     if let Some(v) = req.max_tokens {
         body.insert("max_tokens".into(), Value::from(v));

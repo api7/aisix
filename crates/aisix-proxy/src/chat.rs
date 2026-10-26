@@ -1183,29 +1183,31 @@ async fn resolve_cache_hit(
 /// `est_output_text` accumulation: message content + reasoning +
 /// tool-call name/argument text. Only built when estimation runs.
 pub(crate) fn estimation_output_text(resp: &aisix_gateway::ChatResponse) -> String {
-    let mut out = resp.message.content.clone().unwrap_or_default();
-    if let Some(s) = resp
-        .message
-        .extra
-        .get("reasoning_content")
-        .and_then(|v| v.as_str())
-    {
-        out.push_str(s);
-    }
-    if let Some(tcs) = resp
-        .message
-        .extra
-        .get("tool_calls")
-        .and_then(|v| v.as_array())
-    {
-        for tc in tcs {
-            if let Some(f) = tc.get("function") {
-                if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
-                    out.push_str(n);
-                }
-                if let Some(a) = f.get("arguments").and_then(|v| v.as_str()) {
-                    out.push_str(a);
-                }
+    let mut out = String::new();
+    // Every choice was generated, and is billed.
+    for message in resp.messages() {
+        out.push_str(&message.content_str());
+        if let Some(s) = message
+            .extra
+            .get("reasoning_content")
+            .and_then(|v| v.as_str())
+        {
+            out.push_str(s);
+        }
+        let calls = message
+            .extra
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|tc| tc.get("function"))
+            .chain(message.extra.get("function_call"));
+        for f in calls {
+            if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
+                out.push_str(n);
+            }
+            if let Some(a) = f.get("arguments").and_then(|v| v.as_str()) {
+                out.push_str(a);
             }
         }
     }
@@ -6279,7 +6281,10 @@ where
                     // guardrail. Window mode keeps only the current window
                     // (bounded memory); other modes accumulate the whole
                     // response in content_buffer. No-op without a guardrail.
-                    if let Some(text) = chunk.delta.content.as_deref() {
+                    // A streamed `refusal` reaches the caller beside the
+                    // content, so it is scanned with it.
+                    let refusal = chunk.delta.extra.get("refusal").and_then(|r| r.as_str());
+                    if let Some(text) = chunk.delta.content.as_deref().or(refusal) {
                         if matches!(
                             stream_policy,
                             aisix_guardrails::StreamOutputPolicy::Window { .. }
@@ -6310,9 +6315,17 @@ where
                         if let Some(text) = chunk.delta.reasoning_content.as_deref() {
                             push_capped(&mut comp.est_output_text, text);
                         }
-                        if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
-                            for tc in tcs {
-                                if let Some(f) = tc.get("function") {
+                        let legacy_call = chunk.delta.extra.get("function_call");
+                        if chunk.delta.tool_calls.is_some() || legacy_call.is_some() {
+                            let functions = chunk
+                                .delta
+                                .tool_calls
+                                .iter()
+                                .flatten()
+                                .filter_map(|tc| tc.get("function"))
+                                .chain(legacy_call);
+                            for f in functions {
+                                {
                                     if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
                                         push_capped(&mut comp.est_output_text, n);
                                     }
@@ -6329,13 +6342,27 @@ where
                     // for the output guardrail. `delta.tool_calls` streams as
                     // partial JSON objects; concatenate their text WITHOUT a
                     // separator so a literal split across deltas reassembles.
-                    if let (Some(tcs), Some(buf), false, false) = (
-                        chunk.delta.tool_calls.as_ref(),
+                    // A legacy `delta.function_call` is one more call, in
+                    // the shape of a tool-call delta.
+                    let legacy_call = chunk
+                        .delta
+                        .extra
+                        .get("function_call")
+                        .map(|f| serde_json::json!({"function": f}));
+                    let calls: Vec<&serde_json::Value> = chunk
+                        .delta
+                        .tool_calls
+                        .iter()
+                        .flatten()
+                        .chain(legacy_call.as_ref())
+                        .collect();
+                    if let (false, Some(buf), false, false) = (
+                        calls.is_empty(),
                         tool_calls_buf.as_mut(),
                         cap_released,
                         tool_calls_overflowed,
                     ) {
-                        for tc in tcs {
+                        for tc in calls {
                             let function = tc.get("function");
                             let name = function
                                 .and_then(|f| f.get("name"))
@@ -6485,7 +6512,7 @@ where
                             if let Some(ctx) = output_guardrail.as_ref() {
                                 let synthesized = {
                                     let comp = guard.comp();
-                                    aisix_gateway::ChatResponse {
+                                    aisix_gateway::ChatResponse { logprobs: None, more_choices: Vec::new(),
                                         id: comp.provider_request_id.clone(),
                                         model: comp.provider_model_version.clone(),
                                         // Fold tool-call text into the window
@@ -6658,7 +6685,7 @@ where
         }
         .filter(|_| client_requested_usage);
         if let (Some(final_usage), false) = (final_usage, errored) {
-            let chunk = aisix_gateway::ChatChunk {
+            let chunk = aisix_gateway::ChatChunk { choice_index: 0, logprobs: None,
                 id: std::mem::take(&mut last_chunk_id),
                 model: std::mem::take(&mut last_chunk_model),
                 delta: Default::default(),
@@ -6717,7 +6744,7 @@ where
                     } else {
                         let synthesized = {
                             let comp = guard.comp();
-                            aisix_gateway::ChatResponse {
+                            aisix_gateway::ChatResponse { logprobs: None, more_choices: Vec::new(),
                                 id: comp.provider_request_id.clone(),
                                 model: comp.provider_model_version.clone(),
                                 message: aisix_gateway::ChatMessage::assistant(final_text),
@@ -6845,7 +6872,7 @@ where
                 } else {
                     format!("{content}\n{tc_part}")
                 };
-                let synthesized = aisix_gateway::ChatResponse {
+                let synthesized = aisix_gateway::ChatResponse { logprobs: None, more_choices: Vec::new(),
                     id: guard.comp().provider_request_id.clone(),
                     model: guard.comp().provider_model_version.clone(),
                     message: aisix_gateway::ChatMessage::assistant(scan_text),
@@ -6869,7 +6896,7 @@ where
                 } else {
                     // Deltas past their bound: judge the tool-call text whole.
                     let tool_calls_whole = eos_tool_calls.is_full();
-                    let mut chunks = vec![aisix_gateway::ChatChunk {
+                    let mut chunks = vec![aisix_gateway::ChatChunk { choice_index: 0, logprobs: None,
                         id: String::new(),
                         model: String::new(),
                         delta: aisix_gateway::ChatDelta {
@@ -7154,7 +7181,7 @@ mod cooldown_tests {
             &BridgeError::UpstreamDecode("bad json".into()),
             Some(&enabled())
         )
-        .is_some());
+        .is_none());
     }
 
     #[test]
@@ -7521,6 +7548,8 @@ mod complete_on_drop_tests {
         usage: UsageStats,
     ) -> aisix_gateway::chat::ChatResponse {
         aisix_gateway::chat::ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "id".into(),
             model: "relay-model".into(),
             message: aisix_gateway::chat::ChatMessage {

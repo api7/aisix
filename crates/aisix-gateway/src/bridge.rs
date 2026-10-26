@@ -1029,6 +1029,8 @@ mod tests {
             _ctx: &BridgeContext,
         ) -> Result<ChatResponse, BridgeError> {
             Ok(ChatResponse {
+                logprobs: None,
+                more_choices: Vec::new(),
                 id: String::new(),
                 model: String::new(),
                 message: ChatMessage::assistant(String::new()),
@@ -1070,6 +1072,8 @@ mod tests {
             ),
         );
         let embed_req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "m".into(),
             input: vec!["hello".into()],
             input_was_single: true,

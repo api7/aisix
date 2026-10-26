@@ -307,6 +307,7 @@ fn role_label(role: &aisix_gateway::chat::Role) -> &'static str {
         aisix_gateway::chat::Role::User => "user",
         aisix_gateway::chat::Role::Assistant => "assistant",
         aisix_gateway::chat::Role::Tool => "tool",
+        aisix_gateway::chat::Role::Function => "function",
     }
 }
 

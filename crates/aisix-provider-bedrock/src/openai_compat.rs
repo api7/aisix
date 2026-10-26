@@ -20,7 +20,7 @@ use aisix_gateway::{
     SseDecoder, SseEvent,
 };
 use aisix_provider_openai::wire::{
-    build_request, messages_from, response_into_chat_response, stream_chunk_into_chat_chunk,
+    build_request, messages_from, response_into_chat_response, stream_chunk_into_chat_chunks,
     DeveloperRoleMode, OpenAiResponse, OpenAiStreamChunk, ToolCallIndexer,
 };
 use futures::StreamExt;
@@ -468,8 +468,10 @@ pub(crate) async fn chat(
     if chat.id.is_empty() {
         chat.id = request_id;
     }
-    if let Some(Value::Array(calls)) = chat.message.extra.get_mut("tool_calls") {
-        mint_positional_ids(calls, &mut Vec::new(), true);
+    for message in chat.messages_mut() {
+        if let Some(Value::Array(calls)) = message.extra.get_mut("tool_calls") {
+            mint_positional_ids(calls, &mut Vec::new(), true);
+        }
     }
     Ok(chat)
 }
@@ -494,7 +496,7 @@ pub(crate) async fn chat_stream(
                 match event {
                     SseEvent::Done => break 'outer,
                     SseEvent::Data(payload) => {
-                        if let Some(chunk) = chunk_from(&payload, &mut indexer, &mut minted, &request_id)? {
+                        for chunk in chunk_from(&payload, &mut indexer, &mut minted, &request_id)? {
                             yield chunk;
                         }
                     }
@@ -502,7 +504,7 @@ pub(crate) async fn chat_stream(
             }
         }
         if let Some(SseEvent::Data(payload)) = decoder.finish().map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
-            if let Some(chunk) = chunk_from(&payload, &mut indexer, &mut minted, &request_id)? {
+            for chunk in chunk_from(&payload, &mut indexer, &mut minted, &request_id)? {
                 yield chunk;
             }
         }
@@ -515,21 +517,21 @@ fn chunk_from(
     indexer: &mut ToolCallIndexer,
     minted: &mut Vec<(u64, String)>,
     request_id: &str,
-) -> Result<Option<ChatChunk>, BridgeError> {
+) -> Result<Vec<ChatChunk>, BridgeError> {
     let parsed: OpenAiStreamChunk = serde_json::from_str(payload).map_err(|e| {
         aisix_gateway::capture_in_band_error(payload, aisix_gateway::UpstreamWire::OpenAI)
             .unwrap_or(BridgeError::UpstreamDecode(e.to_string()))
     })?;
-    let Some(mut chunk) = stream_chunk_into_chat_chunk(parsed, indexer) else {
-        return Ok(None);
-    };
-    if chunk.id.is_empty() {
-        chunk.id = request_id.to_string();
+    let mut chunks = stream_chunk_into_chat_chunks(parsed, indexer);
+    for chunk in &mut chunks {
+        if chunk.id.is_empty() {
+            chunk.id = request_id.to_string();
+        }
+        if let Some(calls) = chunk.delta.tool_calls.as_mut() {
+            mint_positional_ids(calls, minted, false);
+        }
     }
-    if let Some(calls) = chunk.delta.tool_calls.as_mut() {
-        mint_positional_ids(calls, minted, false);
-    }
-    Ok(Some(chunk))
+    Ok(chunks)
 }
 
 #[cfg(test)]

@@ -251,6 +251,8 @@ mod tests {
 
     fn resp(text: &str) -> ChatResponse {
         ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "cmpl-1".into(),
             model: "m".into(),
             message: ChatMessage::assistant(text),

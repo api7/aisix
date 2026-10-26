@@ -2029,6 +2029,8 @@ mod tests {
         assert_eq!(v, GuardrailVerdict::Allow);
         // Output hook is monitored the same way.
         let resp = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "r".into(),
             model: "m".into(),
             message: ChatMessage::assistant("leaking AKIAEXAMPLE"),
@@ -4454,6 +4456,8 @@ mod tests {
         // ...but output check is a noop on this rule.
         use aisix_gateway::{ChatResponse, FinishReason, UsageStats};
         let resp = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "r".into(),
             model: "m".into(),
             message: ChatMessage::assistant("secret"),

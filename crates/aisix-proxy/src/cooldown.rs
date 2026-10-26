@@ -123,9 +123,9 @@ pub fn decide_cooldown(
         {
             Some((default_ttl, "transport_error"))
         }
-        BridgeError::UpstreamDecode(_) if cfg.trigger_on_transport_or_default() => {
-            Some((default_ttl, "upstream_decode_error"))
-        }
+        // A 2xx whose body the gateway could not read says nothing about
+        // the upstream's health.
+        BridgeError::UpstreamDecode(_) => None,
         // Config errors mean WE are misconfigured (missing provider, bad
         // bridge registration). Cooling down doesn't help; let it
         // surface and operator fixes the snapshot.
@@ -268,12 +268,12 @@ mod tests {
     }
 
     #[test]
-    fn note_failure_marks_cooldown_for_decode_errors() {
+    fn note_failure_leaves_a_decode_error_out_of_cooldown() {
         let tracker = ModelRuntimeStatusTracker::new();
         let err = BridgeError::UpstreamDecode("bad json".into());
         let cfg = enabled();
         let _ = note_failure(&tracker, "m-1", Some(&cfg), err);
-        assert_eq!(
+        assert_ne!(
             tracker.status("m-1").status,
             crate::health::RuntimeStatus::Cooldown
         );

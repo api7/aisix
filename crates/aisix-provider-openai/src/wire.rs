@@ -39,9 +39,9 @@ pub struct OpenAiRequest<'a> {
     pub model: &'a str,
     pub messages: &'a [OpenAiMessage<'a>],
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
+    pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
+    pub top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     pub stream: bool,
@@ -65,8 +65,9 @@ pub struct OpenAiMessage<'a> {
     /// vision spec; we forward whichever the caller sent. The
     /// `untagged` enum makes `OpenAiContent::Blocks([...])`
     /// serialise as a bare array and `OpenAiContent::Text("...")`
-    /// as a bare string — matching the OpenAI wire shape.
-    pub content: OpenAiContent<'a>,
+    /// as a bare string — matching the OpenAI wire shape. `None` is the
+    /// JSON `null` an assistant turn with only tool calls carries.
+    pub content: Option<OpenAiContent<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -139,10 +140,13 @@ pub fn messages_from(
             // DeepSeek-OpenAI-compat upstreams). When present forward
             // the raw blocks verbatim; otherwise forward the bare
             // string. See `ChatMessage::content_blocks` doc.
-            content: match m.content_blocks.as_deref() {
-                Some(blocks) => OpenAiContent::Blocks(blocks),
+            content: match (m.content_blocks.as_deref(), m.content.as_deref()) {
+                (Some(blocks), _) => Some(OpenAiContent::Blocks(blocks)),
                 // No blocks: the text is the stored string.
-                None => OpenAiContent::Text(m.content.as_deref().unwrap_or("")),
+                (None, Some(text)) => Some(OpenAiContent::Text(text)),
+                // An assistant's `content: null` goes out as `null`.
+                (None, None) if m.role == Role::Assistant => None,
+                (None, None) => Some(OpenAiContent::Text("")),
             },
             name: m.name.as_deref(),
             tool_call_id: m.tool_call_id.as_deref(),
@@ -159,6 +163,7 @@ fn role_str(role: Role, developer_role_mode: DeveloperRoleMode) -> &'static str 
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
+        Role::Function => "function",
     }
 }
 
@@ -196,16 +201,30 @@ pub fn service_tier_of(raw: Option<&serde_json::Value>) -> Option<aisix_gateway:
 
 #[derive(Debug, Deserialize)]
 pub struct OpenAiChoice {
+    #[serde(default)]
+    pub index: Option<u32>,
     pub message: OpenAiResponseMessage,
     #[serde(default)]
     pub finish_reason: Option<String>,
+    #[serde(default)]
+    pub logprobs: Option<serde_json::Value>,
+}
+
+/// A message `content`: OpenAI's string, or the array of content parts
+/// some compatible servers answer with.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum OpenAiResponseContent {
+    Text(String),
+    Parts(Vec<serde_json::Value>),
 }
 
 #[derive(Debug, Deserialize)]
 pub struct OpenAiResponseMessage {
+    #[serde(default)]
     pub role: String,
     #[serde(default)]
-    pub content: Option<String>,
+    pub content: Option<OpenAiResponseContent>,
     #[serde(default)]
     pub tool_calls: Option<Vec<serde_json::Value>>,
     /// DeepSeek-reasoner (and other reasoning models) return the
@@ -240,6 +259,10 @@ pub struct OpenAiResponseMessage {
     /// omit the field) parse unaffected.
     #[serde(default)]
     pub audio: Option<serde_json::Value>,
+    /// Every other message field (`refusal`, `annotations`, the legacy
+    /// `function_call`, …), relayed to the caller as sent.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 // `#[serde(default)]` at the container level so an upstream that omits
@@ -311,76 +334,26 @@ pub struct OpenAiCompletionDetails {
     pub rejected_prediction_tokens: Option<u32>,
 }
 
-pub fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
-    let first = raw.choices.drain(..).next();
-    let (message, finish) = match first {
-        Some(c) => {
-            let mut extra = serde_json::Map::new();
-            let has_tool_calls = c.message.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
-            if let Some(tool_calls) = c.message.tool_calls {
-                if !tool_calls.is_empty() {
-                    extra.insert(
-                        "tool_calls".to_string(),
-                        serde_json::Value::Array(tool_calls),
-                    );
-                }
-            }
-            // #466: surface DeepSeek-reasoner's reasoning_content on the
-            // non-streaming path. Stashed in `extra` so render.rs's
-            // RenderedMessage (which flattens `extra`) emits it as
-            // `message.reasoning_content` on the wire — matching the
-            // streaming path's `delta.reasoning_content`. Skip empty
-            // strings so a model that returns `""` doesn't add a noise
-            // field.
-            //
-            // #648: normalise OpenRouter's `message.reasoning` into the same
-            // canonical `reasoning_content` slot. The DeepSeek-canonical
-            // `reasoning_content` takes precedence when present; otherwise we
-            // fall back to OpenRouter's `reasoning`. Without this an
-            // OpenRouter reasoning model that emits its whole answer as
-            // reasoning (empty `content`) reaches the customer with BOTH
-            // fields empty.
-            let reasoning_text = c
-                .message
-                .reasoning_content
-                .filter(|s| !s.is_empty())
-                .or(c.message.reasoning.filter(|s| !s.is_empty()));
-            if let Some(reasoning) = reasoning_text {
-                extra.insert(
-                    "reasoning_content".to_string(),
-                    serde_json::Value::String(reasoning),
-                );
-            }
-            // #684: surface gpt-4o-audio's generated audio. The audio chat
-            // models return `message.audio` (`{ id, data, transcript,
-            // expires_at }`) when the audio output modality is requested
-            // (the request-side `modalities`/`audio` params already pass
-            // through via `extra`). Stash it in `extra` so RenderedMessage
-            // (which flattens `extra`) emits it as `message.audio` on the
-            // wire. A null/absent audio adds no field.
-            if let Some(audio) = c.message.audio {
-                if !audio.is_null() {
-                    extra.insert("audio".to_string(), audio);
-                }
-            }
-            (
-                ChatMessage {
-                    role: role_from_str(&c.message.role),
-                    // #395: carry the upstream `string | null` through
-                    // verbatim. A tool_calls response returns
-                    // `content: null`; collapsing it to `""` here is the
-                    // divergence we're fixing.
-                    content: c.message.content,
-                    content_blocks: None,
-                    name: None,
-                    tool_call_id: None,
-                    extra,
-                },
-                turn_finish_reason(c.finish_reason.as_deref(), has_tool_calls),
-            )
-        }
-        None => (ChatMessage::assistant(""), FinishReason::Stop),
+pub fn response_into_chat_response(raw: OpenAiResponse) -> ChatResponse {
+    let mut choices = raw
+        .choices
+        .into_iter()
+        .enumerate()
+        .map(|(position, c)| choice_into_parts(position, c));
+    let (message, finish, logprobs) = match choices.next() {
+        Some((_, message, finish, logprobs)) => (message, finish, logprobs),
+        None => (ChatMessage::assistant(""), FinishReason::Stop, None),
     };
+    let more_choices = choices
+        .map(
+            |(index, message, finish_reason, logprobs)| aisix_gateway::chat::ChatChoice {
+                index,
+                message,
+                finish_reason,
+                logprobs,
+            },
+        )
+        .collect();
 
     let usage = raw.usage.map(into_usage).unwrap_or_default();
 
@@ -389,9 +362,79 @@ pub fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
         model: raw.model,
         message,
         finish_reason: finish,
+        logprobs,
+        more_choices,
         usage,
         service_tier: service_tier_of(raw.service_tier.as_ref()),
     }
+}
+
+fn choice_into_parts(
+    position: usize,
+    c: OpenAiChoice,
+) -> (u32, ChatMessage, FinishReason, Option<serde_json::Value>) {
+    let mut extra = c.message.extra;
+    let has_tool_calls = c.message.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
+    if let Some(tool_calls) = c.message.tool_calls {
+        if !tool_calls.is_empty() {
+            extra.insert(
+                "tool_calls".to_string(),
+                serde_json::Value::Array(tool_calls),
+            );
+        }
+    }
+    // #466: surface DeepSeek-reasoner's reasoning_content on the
+    // non-streaming path. Stashed in `extra` so render.rs's
+    // RenderedMessage (which flattens `extra`) emits it as
+    // `message.reasoning_content` on the wire — matching the
+    // streaming path's `delta.reasoning_content`. Skip empty
+    // strings so a model that returns `""` doesn't add a noise
+    // field.
+    //
+    // #648: normalise OpenRouter's `message.reasoning` into the same
+    // canonical `reasoning_content` slot. The DeepSeek-canonical
+    // `reasoning_content` takes precedence when present; otherwise we
+    // fall back to OpenRouter's `reasoning`.
+    let reasoning_text = c
+        .message
+        .reasoning_content
+        .filter(|s| !s.is_empty())
+        .or(c.message.reasoning.filter(|s| !s.is_empty()));
+    if let Some(reasoning) = reasoning_text {
+        extra.insert(
+            "reasoning_content".to_string(),
+            serde_json::Value::String(reasoning),
+        );
+    }
+    // #684: surface gpt-4o-audio's generated audio. A null/absent audio
+    // adds no field.
+    if let Some(audio) = c.message.audio {
+        if !audio.is_null() {
+            extra.insert("audio".to_string(), audio);
+        }
+    }
+    // #395: carry the upstream `string | null` through verbatim. A
+    // tool_calls response returns `content: null`; collapsing it to `""`
+    // is a divergence. An array of content parts is kept as the parts.
+    let (content, content_blocks) = match c.message.content {
+        Some(OpenAiResponseContent::Text(text)) => (Some(text), None),
+        Some(OpenAiResponseContent::Parts(parts)) => (None, Some(parts)),
+        None => (None, None),
+    };
+    let message = ChatMessage {
+        role: role_from_str(&c.message.role),
+        content,
+        content_blocks,
+        name: None,
+        tool_call_id: None,
+        extra,
+    };
+    (
+        c.index.unwrap_or(position as u32),
+        message,
+        turn_finish_reason(c.finish_reason.as_deref(), has_tool_calls),
+        c.logprobs.filter(|l| !l.is_null()),
+    )
 }
 
 pub fn into_usage(u: OpenAiUsage) -> UsageStats {
@@ -531,17 +574,24 @@ impl TryFrom<RawStreamChunk> for OpenAiStreamChunk {
 
 #[derive(Debug, Deserialize)]
 pub struct OpenAiStreamChoice {
+    #[serde(default)]
+    pub index: Option<u32>,
+    #[serde(default)]
     pub delta: OpenAiStreamDelta,
     #[serde(default)]
     pub finish_reason: Option<String>,
+    #[serde(default)]
+    pub logprobs: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct OpenAiStreamDelta {
     #[serde(default)]
     pub role: Option<String>,
+    /// A string, or (from some compatible servers) an array of content
+    /// parts, whose text is relayed.
     #[serde(default)]
-    pub content: Option<String>,
+    pub content: Option<OpenAiResponseContent>,
     #[serde(default)]
     pub tool_calls: Option<Vec<serde_json::Value>>,
     /// Canonical reasoning slot — DeepSeek emits this directly; for
@@ -556,7 +606,7 @@ pub struct OpenAiStreamDelta {
     /// chain-of-thought at `delta.reasoning` — NOT the DeepSeek-canonical
     /// `delta.reasoning_content` (#502, streaming parity with the
     /// non-stream #648 fix). Normalised into the canonical
-    /// `reasoning_content` slot in [`stream_chunk_into_chat_chunk`] with no
+    /// `reasoning_content` slot in [`stream_chunk_into_chat_chunks`] with no
     /// per-key config required. Default so non-OpenRouter upstreams (which
     /// omit the field) parse unaffected.
     #[serde(default)]
@@ -565,6 +615,10 @@ pub struct OpenAiStreamDelta {
     /// `data`, and a final `expires_at`); relayed as sent.
     #[serde(default)]
     pub audio: Option<serde_json::Value>,
+    /// Every other delta field (`refusal`, the legacy `function_call`,
+    /// `annotations`, …), relayed as sent.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Supplies the `index` a streamed tool-call delta omits.
@@ -576,13 +630,26 @@ pub struct OpenAiStreamDelta {
 /// delta without `index` that names a new call `id` opens the next slot; one
 /// without an `id`, or repeating the current one, continues the current slot.
 /// One indexer lives for exactly one upstream stream.
+///
+/// Each choice of a multi-choice stream numbers its calls on its own.
 #[derive(Debug, Default)]
 pub struct ToolCallIndexer {
+    choices: std::collections::BTreeMap<u32, ChoiceToolCallIndexer>,
+}
+
+impl ToolCallIndexer {
+    fn choice(&mut self, index: u32) -> &mut ChoiceToolCallIndexer {
+        self.choices.entry(index).or_default()
+    }
+}
+
+#[derive(Debug, Default)]
+struct ChoiceToolCallIndexer {
     next: u64,
     current: Option<(u64, Option<String>)>,
 }
 
-impl ToolCallIndexer {
+impl ChoiceToolCallIndexer {
     fn saw_tool_call(&self) -> bool {
         self.current.is_some()
     }
@@ -618,23 +685,36 @@ impl ToolCallIndexer {
     }
 }
 
-/// `None` for a chunk with no `choices` key and no usage, which carries
-/// nothing to relay.
-pub fn stream_chunk_into_chat_chunk(
+/// One gateway chunk per choice the frame carries, each keyed by its
+/// choice index; the frame's usage rides the last of them. A frame with
+/// no choice is one chunk with an empty delta. Empty for a frame with no
+/// `choices` key and no usage, which carries nothing to relay.
+pub fn stream_chunk_into_chat_chunks(
     mut raw: OpenAiStreamChunk,
     tool_call_indexer: &mut ToolCallIndexer,
-) -> Option<ChatChunk> {
+) -> Vec<ChatChunk> {
     if raw.choices.is_none() && raw.usage.is_none() {
-        return None;
+        return Vec::new();
     }
-    let first = raw.choices.take().unwrap_or_default().into_iter().next();
-    let (delta, finish) = match first {
-        Some(c) => (
-            ChatDelta {
+    let service_tier = service_tier_of(raw.service_tier.as_ref());
+    let mut chunks: Vec<ChatChunk> = raw
+        .choices
+        .take()
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(position, c)| {
+            let choice_index = c.index.unwrap_or(position as u32);
+            let indexer = tool_call_indexer.choice(choice_index);
+            let content = c.delta.content.map(|content| match content {
+                OpenAiResponseContent::Text(text) => text,
+                OpenAiResponseContent::Parts(parts) => aisix_gateway::chat::blocks_text(&parts),
+            });
+            let delta = ChatDelta {
                 role: c.delta.role.as_deref().map(role_from_str),
-                content: c.delta.content,
+                content,
                 tool_calls: c.delta.tool_calls.map(|mut calls| {
-                    tool_call_indexer.fill(&mut calls);
+                    indexer.fill(&mut calls);
                     calls
                 }),
                 // #648 canonical precedence, mirrored on the streaming path
@@ -647,22 +727,44 @@ pub fn stream_chunk_into_chat_chunk(
                     .filter(|s| !s.is_empty())
                     .or(c.delta.reasoning.filter(|s| !s.is_empty())),
                 audio: c.delta.audio.filter(|a| !a.is_null()),
-            },
-            c.finish_reason
+                extra: c.delta.extra,
+            };
+            let finish_reason = c
+                .finish_reason
                 .as_deref()
-                .map(|r| turn_finish_reason(Some(r), tool_call_indexer.saw_tool_call())),
-        ),
-        None => (ChatDelta::default(), None),
-    };
-    Some(ChatChunk {
-        id: raw.id,
-        model: raw.model,
-        delta,
-        finish_reason: finish,
-        usage: raw.usage.map(into_usage),
-        service_tier: service_tier_of(raw.service_tier.as_ref()),
-        accounting_usage: None,
-    })
+                .map(|r| turn_finish_reason(Some(r), indexer.saw_tool_call()));
+            ChatChunk {
+                id: raw.id.clone(),
+                model: raw.model.clone(),
+                choice_index,
+                delta,
+                finish_reason,
+                logprobs: c.logprobs.filter(|l| !l.is_null()),
+                usage: None,
+                service_tier: service_tier.clone(),
+                accounting_usage: None,
+            }
+        })
+        .collect();
+    // A frame with no choice (an empty `choices`, or usage alone) is still
+    // relayed as one chunk.
+    if chunks.is_empty() {
+        chunks.push(ChatChunk {
+            id: raw.id,
+            model: raw.model,
+            choice_index: 0,
+            delta: ChatDelta::default(),
+            finish_reason: None,
+            logprobs: None,
+            usage: None,
+            service_tier,
+            accounting_usage: None,
+        });
+    }
+    if let Some(last) = chunks.last_mut() {
+        last.usage = raw.usage.map(into_usage);
+    }
+    chunks
 }
 
 // ─── Embeddings wire types ────────────────────────────────────────────────────
@@ -683,6 +785,8 @@ pub(crate) enum OpenAiEmbedInput<'a> {
     /// `input: ["...", ...]` (array) OR when the `input_was_single`
     /// signal is missing (round-tripped requests).
     Multi(&'a [String]),
+    /// Token ids, as the caller sent them.
+    Tokens(&'a serde_json::Value),
 }
 
 /// Request body forwarded to OpenAI `/v1/embeddings`.
@@ -694,6 +798,9 @@ pub(crate) struct OpenAiEmbedRequest<'a> {
     pub encoding_format: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dimensions: Option<u32>,
+    /// The caller's other fields (`user`, …).
+    #[serde(flatten)]
+    pub extra: &'a serde_json::Map<String, serde_json::Value>,
 }
 
 /// One embedding object from OpenAI's response.
@@ -759,7 +866,9 @@ pub(crate) fn embed_request_body<'a>(
     // Defensive fallback: if `input_was_single` is true but the vec
     // is empty or has more than one element, drop back to array
     // form (the single-string shape is undefined for those cases).
-    let input = if req.input_was_single && req.input.len() == 1 {
+    let input = if let Some(tokens) = &req.token_input {
+        OpenAiEmbedInput::Tokens(tokens)
+    } else if req.input_was_single && req.input.len() == 1 {
         OpenAiEmbedInput::Single(&req.input[0])
     } else {
         OpenAiEmbedInput::Multi(&req.input)
@@ -769,6 +878,7 @@ pub(crate) fn embed_request_body<'a>(
         input,
         encoding_format: req.encoding_format.as_deref(),
         dimensions: req.dimensions,
+        extra: &req.extra,
     }
 }
 
@@ -822,6 +932,12 @@ pub fn embed_usage_into(usage: Option<OpenAiEmbedUsage>) -> EmbeddingUsage {
 
 #[cfg(test)]
 mod tests {
+    fn first_chunk(raw: OpenAiStreamChunk, indexer: &mut ToolCallIndexer) -> Option<ChatChunk> {
+        stream_chunk_into_chat_chunks(raw, indexer)
+            .into_iter()
+            .next()
+    }
+
     use super::*;
 
     #[test]
@@ -856,7 +972,7 @@ mod tests {
         assert_eq!(messages[0].role, "developer");
         assert!(matches!(
             messages[0].content,
-            OpenAiContent::Text("Follow application instructions")
+            Some(OpenAiContent::Text("Follow application instructions"))
         ));
         assert_eq!(messages[1].role, "user");
     }
@@ -875,7 +991,7 @@ mod tests {
         assert_eq!(messages[0].role, "system");
         assert!(matches!(
             messages[0].content,
-            OpenAiContent::Text("Follow application instructions")
+            Some(OpenAiContent::Text("Follow application instructions"))
         ));
         assert_eq!(messages[1].role, "user");
     }
@@ -1442,7 +1558,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
+        let chunk = first_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         assert_eq!(chunk.delta.content.as_deref(), Some("hel"));
         assert!(chunk.finish_reason.is_none());
     }
@@ -1454,7 +1570,7 @@ mod tests {
         let body = r#"{"id": "c", "choices": [{"index": 0,
             "delta": {"audio": {"id": "audio_1", "transcript": "Hel"}}}]}"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
+        let chunk = first_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         assert_eq!(
             chunk.delta.audio,
             Some(serde_json::json!({"id": "audio_1", "transcript": "Hel"}))
@@ -1463,15 +1579,14 @@ mod tests {
         let body = r#"{"id": "c", "object": "chat.completion.chunk", "usage": null,
             "obfuscation": "x"}"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        assert!(stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).is_none());
+        assert!(first_chunk(raw, &mut ToolCallIndexer::default()).is_none());
 
         // The usage chunk has an empty `choices` and is kept.
         let body = r#"{"id": "c", "choices": [], "usage": {"prompt_tokens": 1,
             "completion_tokens": 2, "total_tokens": 3}}"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
         assert!(
-            stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default())
-                .is_some_and(|c| c.usage.is_some())
+            first_chunk(raw, &mut ToolCallIndexer::default()).is_some_and(|c| c.usage.is_some())
         );
     }
 
@@ -1487,7 +1602,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
+        let chunk = first_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         assert_eq!(chunk.finish_reason, Some(FinishReason::Stop));
     }
 
@@ -1510,7 +1625,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
+        let chunk = first_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         let tc = chunk.delta.tool_calls.expect("tool_calls in delta");
         assert_eq!(tc.len(), 1);
         assert_eq!(tc[0]["id"], "call_abc");
@@ -1529,7 +1644,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
+        let chunk = first_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         assert_eq!(
             chunk.delta.reasoning_content.as_deref(),
             Some("thinking...")
@@ -1551,7 +1666,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
+        let chunk = first_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         assert_eq!(
             chunk.delta.reasoning_content.as_deref(),
             Some("let me reason about this")
@@ -1570,7 +1685,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
+        let chunk = first_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         assert_eq!(chunk.delta.reasoning_content.as_deref(), Some("canonical"));
     }
 
@@ -1586,7 +1701,7 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
+        let chunk = first_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         assert_eq!(chunk.delta.reasoning_content.as_deref(), Some("fallback"));
     }
 
@@ -1602,13 +1717,14 @@ mod tests {
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
-        let chunk = stream_chunk_into_chat_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
+        let chunk = first_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         assert!(chunk.delta.reasoning_content.is_none());
     }
 
     #[test]
     fn build_request_sets_stream_flag_and_propagates_params() {
         let req = ChatFormat {
+            gateway_strict_schema: false,
             model: "my-model".into(),
             messages: vec![ChatMessage::user("hi")],
             temperature: Some(0.4),
@@ -1638,6 +1754,7 @@ mod tests {
     #[test]
     fn build_request_injects_include_usage_on_streaming() {
         let req = ChatFormat {
+            gateway_strict_schema: false,
             model: "m".into(),
             messages: vec![ChatMessage::user("hi")],
             temperature: None,
@@ -1664,6 +1781,7 @@ mod tests {
             serde_json::json!({"include_usage": false}),
         );
         let req = ChatFormat {
+            gateway_strict_schema: false,
             model: "m".into(),
             messages: vec![],
             temperature: None,
@@ -1689,6 +1807,7 @@ mod tests {
     #[test]
     fn build_request_omits_stream_options_when_not_streaming() {
         let req = ChatFormat {
+            gateway_strict_schema: false,
             model: "m".into(),
             messages: vec![],
             temperature: None,
@@ -1708,6 +1827,7 @@ mod tests {
         extra.insert("seed".into(), serde_json::json!(42));
         extra.insert("presence_penalty".into(), serde_json::json!(0.1));
         let req = ChatFormat {
+            gateway_strict_schema: false,
             model: "m".into(),
             messages: vec![],
             temperature: None,
@@ -1740,6 +1860,7 @@ mod tests {
         ]"#;
         let messages: Vec<ChatMessage> = serde_json::from_str(history_json).unwrap();
         let req = ChatFormat {
+            gateway_strict_schema: false,
             model: "my-model".into(),
             messages,
             temperature: None,
@@ -1793,14 +1914,14 @@ mod tests {
             "id": "x", "choices": [], "service_tier": "flex"
         }));
         assert_eq!(
-            stream_chunk_into_chat_chunk(chunk, &mut ToolCallIndexer::default())
+            first_chunk(chunk, &mut ToolCallIndexer::default())
                 .unwrap()
                 .service_tier,
             Some(ServiceTier::OpenAi("flex".into()))
         );
         let chunk = stream_chunk(serde_json::json!({"id": "x", "choices": []}));
         assert_eq!(
-            stream_chunk_into_chat_chunk(chunk, &mut ToolCallIndexer::default())
+            first_chunk(chunk, &mut ToolCallIndexer::default())
                 .unwrap()
                 .service_tier,
             None
@@ -1813,31 +1934,26 @@ mod tests {
         let call = stream_chunk(serde_json::json!({"id": "x", "choices": [{"delta": {
             "tool_calls": [{"id": "a", "function": {"name": "f", "arguments": "{}"}}]
         }}]}));
-        assert_eq!(
-            stream_chunk_into_chat_chunk(call, &mut indexer)
-                .unwrap()
-                .finish_reason,
-            None
-        );
+        assert_eq!(first_chunk(call, &mut indexer).unwrap().finish_reason, None);
         let end = |reason: &str| {
             stream_chunk(serde_json::json!({"id": "x", "choices": [
                 {"delta": {}, "finish_reason": reason}
             ]}))
         };
         assert_eq!(
-            stream_chunk_into_chat_chunk(end("stop"), &mut indexer)
+            first_chunk(end("stop"), &mut indexer)
                 .unwrap()
                 .finish_reason,
             Some(FinishReason::ToolCalls)
         );
         assert_eq!(
-            stream_chunk_into_chat_chunk(end("length"), &mut indexer)
+            first_chunk(end("length"), &mut indexer)
                 .unwrap()
                 .finish_reason,
             Some(FinishReason::Length)
         );
         assert_eq!(
-            stream_chunk_into_chat_chunk(end("stop"), &mut ToolCallIndexer::default())
+            first_chunk(end("stop"), &mut ToolCallIndexer::default())
                 .unwrap()
                 .finish_reason,
             Some(FinishReason::Stop)
@@ -1867,7 +1983,7 @@ mod tests {
         let mut indexer = ToolCallIndexer::default();
         let mut indices = |calls: serde_json::Value| {
             let mut calls = calls.as_array().unwrap().clone();
-            indexer.fill(&mut calls);
+            indexer.choice(0).fill(&mut calls);
             calls
                 .iter()
                 .map(|c| c["index"].as_u64().unwrap())

@@ -1022,6 +1022,17 @@ pub(crate) fn proxy_error_from_json_rejection(
         JsonRejection::BytesRejection(_) => {
             ProxyError::InvalidRequest("failed to read request body".into())
         }
+        // Valid JSON whose value does not fit the request type: name the
+        // field it failed at (`messages[0].content: ...`, `max_tokens:
+        // invalid value: integer `-1`, expected u32`) rather than leave the
+        // caller to guess.
+        JsonRejection::JsonDataError(e) => {
+            let text = e.body_text();
+            let detail = text
+                .strip_prefix("Failed to deserialize the JSON body into the target type: ")
+                .unwrap_or(&text);
+            ProxyError::InvalidRequest(format!("invalid request body: {detail}"))
+        }
         _ => ProxyError::InvalidRequest("invalid JSON request body".into()),
     }
 }

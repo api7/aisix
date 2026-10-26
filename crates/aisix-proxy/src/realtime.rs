@@ -1406,6 +1406,8 @@ async fn guardrail_block_event(
         aisix_guardrails::Guardrail::check_input_unmaskable_observed(chain, &chat).await
     } else {
         let synth = aisix_gateway::ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: String::new(),
             model: model_name.to_string(),
             message: aisix_gateway::ChatMessage::assistant(text.to_string()),

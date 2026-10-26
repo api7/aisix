@@ -42,6 +42,8 @@ async fn connect_ns(url: &str, ns: &str) -> RedisSemanticCache {
 
 fn resp(content: &str) -> ChatResponse {
     ChatResponse {
+        logprobs: None,
+        more_choices: Vec::new(),
         id: "cmpl-sem-1".into(),
         model: "openai/gpt-4o".into(),
         message: ChatMessage::assistant(content),

@@ -1123,7 +1123,7 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
                 messages.push(match responses_item_role(item) {
                     Role::Assistant => ChatMessage::assistant(text),
                     Role::System | Role::Developer => ChatMessage::system(text),
-                    Role::Tool => ChatMessage::tool(text),
+                    Role::Tool | Role::Function => ChatMessage::tool(text),
                     Role::User => ChatMessage::user(text),
                 });
             }

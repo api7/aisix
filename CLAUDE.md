@@ -119,6 +119,26 @@ This covers a validation that got stricter (an existing resource that no longer 
 - **Never gate the guardrail chain on having found text to scan.** "Nothing to scan" is not "nothing to decide": a `kind: custom` row's verdict can be independent of the text, so a call site that skips the chain when its collect walk came back empty converts an operator's block rule into a silent allow. The call site always consults the chain; only a guardrail kind may decide it needs text, and every remote kind already self-guards, so consulting costs no provider round-trip. `crates/aisix-proxy/src/guardrail_coverage.rs` enforces this: it parses the routing table out of `build_router`'s own source, so a new route fails the census until it declares a posture, and every surface declared `Enforced` is driven against an unconditional-block guardrail.
 - Prefer hoisting the shared logic into one chokepoint (e.g. `resolve_attempt_models`) so the family can't drift again.
 
+## A Request Field Is Handled by the Target Platform's Contract
+
+**Every time the gateway builds an upstream request — same protocol or translated — it handles each client field by what the target platform's documented contract defines for it:**
+
+1. **The target defines the field and the value fits its slot.** Write it as the client sent it, or map it into the same-meaning slot when the target names or places it differently. Never drop it, rewrite it, or pre-validate it on the upstream's behalf; the upstream's error reaches the client with its status and message.
+2. **The target cannot represent the field or value.** Drop it silently — no log, header or metric.
+3. **The value is illegal in the client's own protocol and the path cannot forward it as is.** Return a 400 that names the field.
+4. **Whatever is forwarded comes back in full** — every choice, `logprobs`, `refusal`, `annotations`, the legacy `function_call`. Never billed-and-lost, and never re-dispatched after the upstream already answered (an undecodable 2xx is not retried, failed over, or counted toward cooldown).
+
+Per-model or per-family knowledge may decide **where** a value is written (slot, route, field name); it may never decide **whether** a value is dropped, refused or changed. Per-platform contract knowledge — which fields and betas a platform takes — is allowed.
+
+Deliberate exceptions, each for its own reason:
+
+- The Claude Code billing-header line is stripped from `system`: it is client billing metadata no model reads, and left in it costs the upstream's prompt cache.
+- An ensemble judge's sampling parameters are the gateway's own, not the caller's.
+- A single empty-string `stop` is skipped on Converse, which rejects it.
+- The Responses → Chat Completions bridge carries the fields Codex sends; the rest of the Responses API is out of its scope.
+
+Two shared mechanics carry the rule across bridges. A bridge whose upstream takes tools but not the legacy `functions` / `function_call` runs the request through `aisix_gateway::tool_calls::legacy_functions_as_tools` and renders the answer back with the `LegacyFunctionCalling` it returns. A multi-choice answer is `ChatResponse::message` plus `more_choices`, and a stream keys each chunk by `ChatChunk::choice_index`; a renderer whose protocol holds one answer reads a chunk through `ChatChunk::first_choice_only`.
+
 ## Usage Converts at the Client Boundary, Never at the Telemetry One
 
 **`UsageStats` carries two *disjoint* cache representations with opposite arithmetic, and a cross-protocol handler must convert one for the client while leaving the UsageEvent in the upstream's own shape.**

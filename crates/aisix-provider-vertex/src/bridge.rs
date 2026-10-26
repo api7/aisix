@@ -48,7 +48,6 @@ use aisix_gateway::content_part::{
     check_tool_result_parts, display_uri, translate_user_parts, Media, MediaSource,
 };
 use aisix_gateway::media_fetch::{fetch_media_urls, Encoding, FetchedMedia};
-use aisix_gateway::tool_calls::reject_legacy_function_calling;
 
 use crate::gemini_tools::{
     function_call_parts, function_response_part, gemini_tool_config, gemini_tools,
@@ -80,7 +79,7 @@ use aisix_provider_anthropic::wire::{
 use aisix_provider_openai::wire::{
     build_request as build_openai_request, messages_from as openai_messages_from,
     response_into_chat_response as openai_response_into_chat_response,
-    stream_chunk_into_chat_chunk as openai_stream_chunk_into_chat_chunk, DeveloperRoleMode,
+    stream_chunk_into_chat_chunks as openai_stream_chunk_into_chat_chunks, DeveloperRoleMode,
     OpenAiResponse, OpenAiStreamChunk, ToolCallIndexer,
 };
 
@@ -740,8 +739,16 @@ impl Bridge for VertexBridge {
         };
 
         match publisher {
-            VertexPublisher::Google => self.chat_gemini(req, ctx, upstream_id).await,
-            VertexPublisher::Anthropic => self.chat_anthropic(req, ctx, upstream_id).await,
+            VertexPublisher::Google | VertexPublisher::Anthropic => {
+                // Gemini and Claude take tools, not the legacy fields.
+                let (req, legacy) = aisix_gateway::tool_calls::legacy_functions_as_tools(req)?;
+                let resp = if publisher == VertexPublisher::Google {
+                    self.chat_gemini(req, ctx, upstream_id).await
+                } else {
+                    self.chat_anthropic(req, ctx, upstream_id).await
+                };
+                resp.map(|resp| legacy.reply(resp))
+            }
             VertexPublisher::OpenAiCompat => self.chat_openai_shim(req, ctx, upstream_id).await,
             VertexPublisher::Mistral | VertexPublisher::Ai21 => {
                 self.chat_mistral_ai21(req, ctx, upstream_id, publisher)
@@ -777,6 +784,13 @@ impl Bridge for VertexBridge {
             VertexPublisher::Google => req,
             _ => aisix_gateway::tool_calls::chat_without_thought_signatures(req),
         };
+        // Gemini and Claude take tools, not the legacy fields.
+        let (req, legacy) = match publisher {
+            VertexPublisher::Google | VertexPublisher::Anthropic => {
+                aisix_gateway::tool_calls::legacy_functions_as_tools(req)?
+            }
+            _ => (req, Default::default()),
+        };
         // The Claude tool route's JSON only exists once the synthetic
         // tool call has been assembled, so it cannot be streamed as it
         // arrives. Run the request non-streaming and fake-stream the
@@ -797,9 +811,11 @@ impl Bridge for VertexBridge {
             let chunks = response_into_fake_stream_chunks(
                 self.chat_cow(req, &ctx.non_streaming_ctx()).await?,
             );
-            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+            return Ok(
+                legacy.reply_stream(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            );
         }
-        match publisher {
+        let stream = match publisher {
             VertexPublisher::Google => self.chat_gemini_stream(req, ctx, upstream_id).await,
             VertexPublisher::OpenAiCompat => {
                 self.chat_openai_shim_stream(req, ctx, upstream_id).await
@@ -809,7 +825,8 @@ impl Bridge for VertexBridge {
                 self.chat_mistral_ai21_stream(req, ctx, upstream_id, publisher)
                     .await
             }
-        }
+        };
+        stream.map(|stream| legacy.reply_stream(stream))
     }
 
     /// Native Vertex embeddings (#723): google-publisher `:predict`
@@ -823,6 +840,7 @@ impl Bridge for VertexBridge {
         req: &EmbeddingRequest,
         ctx: &BridgeContext,
     ) -> Result<EmbeddingResponse, BridgeError> {
+        req.require_text_input()?;
         let upstream_id = upstream_model(ctx)?;
         let creds = VertexSecret::parse(&ctx.provider_key.api_key)?;
         validate_url_token("project", &creds.project)?;
@@ -1517,7 +1535,7 @@ impl VertexBridge {
                                 &data,
                                 "vertex openai-shim stream chunk parse",
                             )?;
-                            if let Some(chunk) = openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                            for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
                                 yield chunk.with_fallback_service_tier(&header_tier);
                             }
                         }
@@ -1537,7 +1555,7 @@ impl VertexBridge {
                     &data,
                     "vertex openai-shim stream tail parse",
                 )?;
-                if let Some(chunk) = openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
                     yield chunk.with_fallback_service_tier(&header_tier);
                 }
             }
@@ -1760,7 +1778,7 @@ impl VertexBridge {
                                 &data,
                                 "vertex partner :streamRawPredict chunk parse",
                             )?;
-                            if let Some(chunk) = openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                            for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
                                 yield chunk.with_fallback_service_tier(&header_tier);
                             }
                         }
@@ -1778,7 +1796,7 @@ impl VertexBridge {
                     &data,
                     "vertex partner :streamRawPredict tail parse",
                 )?;
-                if let Some(chunk) = openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
                     yield chunk.with_fallback_service_tier(&header_tier);
                 }
             }
@@ -2018,6 +2036,8 @@ fn gemini_chunk_into_chat_chunks(
     if !state.emitted_role && (!text.is_empty() || !tool_calls.is_empty()) {
         state.emitted_role = true;
         chunks.push(ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: String::new(),
             model: upstream_id.to_string(),
             delta: ChatDelta {
@@ -2045,6 +2065,8 @@ fn gemini_chunk_into_chat_chunks(
     // when its content is empty.
     if !text.is_empty() || !tool_calls.is_empty() || finish_reason.is_some() || usage.is_some() {
         chunks.push(ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: String::new(),
             model: upstream_id.to_string(),
             delta: ChatDelta {
@@ -2220,9 +2242,9 @@ impl GeminiPart {
 #[derive(Debug, Serialize, Default)]
 struct GeminiGenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "topP")]
-    top_p: Option<f32>,
+    top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "maxOutputTokens")]
     max_output_tokens: Option<u32>,
     /// Gemini's constrained-decoding switch. `"application/json"` is the
@@ -2480,7 +2502,9 @@ fn build_gemini_request(
 ///   `functionResponse` parts, as Gemini pairs a turn's calls with the
 ///   next turn's responses — see [`crate::gemini_tools`]
 /// - `tools` → `tools[].functionDeclarations`, `tool_choice` →
-///   `toolConfig.functionCallingConfig`
+///   `toolConfig.functionCallingConfig` (the legacy `functions` /
+///   `function_call` arrive here already rewritten as tools, by
+///   [`aisix_gateway::tool_calls::legacy_functions_as_tools`])
 /// - `temperature`, `top_p`, `max_tokens` → `generationConfig.*`
 /// - `response_format` → `generationConfig.responseMimeType` plus the
 ///   schema field this model's generation reads — see
@@ -2489,8 +2513,7 @@ fn build_gemini_request(
 ///   knob can never ride onto the wire and 400.
 ///
 /// Fails (400) on what this translation cannot express rather than
-/// dropping it: the legacy `functions` / `function_call` fields, a
-/// non-function tool, an unsupported `tool_choice`, a tool result with no
+/// dropping it: a non-function tool, an unsupported `tool_choice`, a tool result with no
 /// call to answer, or call arguments that are not JSON.
 ///
 /// `fetched` holds the media URLs the gateway downloaded for Gemini.
@@ -2499,7 +2522,6 @@ fn build_gemini_request_with(
     upstream_model: &str,
     fetched: &FetchedMedia,
 ) -> Result<GeminiGenerateContentRequest, BridgeError> {
-    reject_legacy_function_calling(req)?;
     let mut system_parts: Vec<String> = Vec::new();
     let mut contents: Vec<GeminiContent> = Vec::new();
     let mut tool_responses: Vec<GeminiPart> = Vec::new();
@@ -2522,7 +2544,7 @@ fn build_gemini_request_with(
                 role: "user",
                 parts: gemini_user_parts(m, index, fetched)?,
             }),
-            Role::Tool => {
+            Role::Tool | Role::Function => {
                 check_tool_result_parts(m, index).map_err(BridgeError::InvalidRequest)?;
                 tool_responses.push(GeminiPart::Raw(function_response_part(
                     m,
@@ -2841,6 +2863,8 @@ fn gemini_response_into_chat_response(
         .map(GeminiUsageMetadata::into_usage_stats)
         .unwrap_or_default();
     ChatResponse {
+        logprobs: None,
+        more_choices: Vec::new(),
         id: String::new(), // Gemini doesn't return a request id in the body
         model: upstream_id.to_string(),
         message,
@@ -6674,6 +6698,8 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["hello".into(), "world".into()],
             input_was_single: false,
@@ -6742,6 +6768,8 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["hello".into()],
             input_was_single: true,
@@ -6780,6 +6808,8 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["hello".into()],
             input_was_single: true,
@@ -6948,21 +6978,6 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             chunks.last().unwrap().finish_reason,
             Some(FinishReason::ToolCalls)
         );
-    }
-
-    #[test]
-    fn legacy_function_fields_are_refused_not_dropped() {
-        for field in ["functions", "function_call"] {
-            let mut req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
-            req.extra.insert(field.into(), serde_json::json!([]));
-            assert!(
-                matches!(
-                    build_gemini_request(&req, "gemini-2.5-flash"),
-                    Err(BridgeError::InvalidRequest(_))
-                ),
-                "{field}"
-            );
-        }
     }
 
     #[test]

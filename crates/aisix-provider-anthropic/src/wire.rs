@@ -93,9 +93,9 @@ pub struct AnthropicRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<AnthropicSystem>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
+    pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
+    pub top_p: Option<f64>,
     pub stream: bool,
     /// Tools spec translated from the caller's OpenAI-shape `tools`
     /// (when present in `extra`). The gateway emits Anthropic's
@@ -549,7 +549,7 @@ pub fn split_system_with<'a>(
                     m,
                 ));
             }
-            Role::Tool => {
+            Role::Tool | Role::Function => {
                 seen_non_system = true;
                 let tool_use_id = m
                     .tool_call_id
@@ -1495,10 +1495,13 @@ pub fn translate_anthropic_tool_choice_to_openai(
 /// `mapped_effort` reports what the target model's effort mapping did to
 /// the request before it got here, so a mapping that removed the effort
 /// is not undone by resolving `thinking` into one.
+///
+/// Returns whether it set a strict `response_format` schema of its own —
+/// see [`aisix_gateway::ChatFormat::gateway_strict_schema`].
 pub fn translate_extras_to_openai_shape(
     extra: &mut serde_json::Map<String, serde_json::Value>,
     mapped_effort: MappedEffort,
-) {
+) -> bool {
     translate_extras_to_openai_shape_with(extra, mapped_effort, CacheMarkers::Drop)
 }
 
@@ -1509,7 +1512,7 @@ pub fn translate_extras_to_openai_shape_with(
     extra: &mut serde_json::Map<String, serde_json::Value>,
     mapped_effort: MappedEffort,
     markers: CacheMarkers,
-) {
+) -> bool {
     let anthropic = std::mem::take(extra);
     let mut thinking = None;
     let mut output_config = None;
@@ -1584,9 +1587,11 @@ pub fn translate_extras_to_openai_shape_with(
     let format = output_format
         .or_else(|| output_config.and_then(|c| c.get("format").cloned()))
         .and_then(anthropic_output_format_to_response_format);
+    let strict_schema = format.is_some();
     if let Some(response_format) = format {
         extra.insert("response_format".to_string(), response_format);
     }
+    strict_schema
 }
 
 /// Resolve the OpenAI `reasoning_effort` a request's Anthropic thinking
@@ -1899,6 +1904,8 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
         .unwrap_or_default();
 
     ChatResponse {
+        logprobs: None,
+        more_choices: Vec::new(),
         id: raw.id,
         model: raw.model,
         message: ChatMessage {
@@ -2305,6 +2312,8 @@ impl StreamState {
 
     fn tool_call_chunk(&self, call: serde_json::Value) -> ChatChunk {
         ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: self.id.clone(),
             model: self.model.clone(),
             delta: ChatDelta {
@@ -2365,9 +2374,12 @@ impl StreamState {
                 delta: AnthropicStreamDelta::TextDelta { text },
                 ..
             } => Some(ChatChunk {
+                choice_index: 0,
+                logprobs: None,
                 id: self.id.clone(),
                 model: self.model.clone(),
                 delta: ChatDelta {
+                    extra: Default::default(),
                     role: None,
                     content: Some(text.clone()),
                     tool_calls: None,
@@ -2383,9 +2395,12 @@ impl StreamState {
                 delta: AnthropicStreamDelta::ThinkingDelta { thinking },
                 ..
             } if !thinking.is_empty() => Some(ChatChunk {
+                choice_index: 0,
+                logprobs: None,
                 id: self.id.clone(),
                 model: self.model.clone(),
                 delta: ChatDelta {
+                    extra: Default::default(),
                     role: None,
                     content: None,
                     tool_calls: None,
@@ -2421,6 +2436,8 @@ impl StreamState {
                     return None;
                 }
                 Some(ChatChunk {
+                    choice_index: 0,
+                    logprobs: None,
                     id: self.id.clone(),
                     model: self.model.clone(),
                     delta: ChatDelta::default(),
@@ -2841,10 +2858,10 @@ fn parse_inbound(
     let mut chat = ChatFormat::new(model, messages);
 
     if let Some(t) = obj.get("temperature").and_then(Value::as_f64) {
-        chat.temperature = Some(t as f32);
+        chat.temperature = Some(t);
     }
     if let Some(t) = obj.get("top_p").and_then(Value::as_f64) {
-        chat.top_p = Some(t as f32);
+        chat.top_p = Some(t);
     }
     if let Some(t) = obj.get("max_tokens").and_then(Value::as_u64) {
         chat.max_tokens = Some(t as u32);
@@ -3471,6 +3488,8 @@ impl AnthropicSseEncoder {
         if self.finished {
             return Vec::new();
         }
+        // A Messages response is one answer.
+        let chunk = &*chunk.first_choice_only();
 
         if let Some(u) = chunk.usage.as_ref() {
             self.usage_seen = true;
@@ -6658,6 +6677,8 @@ mod tests {
     #[test]
     fn render_anthropic_response_basic_shape() {
         let resp = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "cmpl-1".into(),
             model: "gpt-4o".into(), // upstream — should NOT leak into output
             message: ChatMessage::assistant("hello"),
@@ -6682,6 +6703,8 @@ mod tests {
     fn render_anthropic_response_finish_reason_mappings() {
         let mk = |fr: FinishReason| {
             let resp = ChatResponse {
+                logprobs: None,
+                more_choices: Vec::new(),
                 id: "x".into(),
                 model: "u".into(),
                 message: ChatMessage::assistant(""),
@@ -6710,6 +6733,8 @@ mod tests {
         // `cache_read_input_tokens` — pre-fix it vanished entirely and
         // an Anthropic client billed the whole prompt at full rate.
         let resp = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "chatcmpl-cache-test".into(),
             model: "MiniMax-M3".into(),
             message: ChatMessage::assistant("ok"),
@@ -6746,6 +6771,8 @@ mod tests {
         // reports `prompt_tokens` EXCLUDING cache, so the counters ride
         // on top and nothing is subtracted.
         let resp = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "x".into(),
             model: "u".into(),
             message: ChatMessage::assistant("ok"),
@@ -6762,6 +6789,8 @@ mod tests {
     #[test]
     fn render_anthropic_response_omits_cache_fields_when_upstream_reports_none() {
         let resp = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "x".into(),
             model: "u".into(),
             message: ChatMessage::assistant("ok"),
@@ -6778,6 +6807,8 @@ mod tests {
     #[test]
     fn render_anthropic_response_fully_cached_prompt_reports_zero_input() {
         let resp = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "x".into(),
             model: "u".into(),
             message: ChatMessage::assistant("ok"),
@@ -6813,6 +6844,8 @@ mod tests {
             }]),
         );
         let resp = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "cmpl-tc".into(),
             model: "gpt-4o".into(),
             message: msg,
@@ -6833,9 +6866,12 @@ mod tests {
 
     fn delta_chunk(text: &str) -> ChatChunk {
         ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "cmpl-1".into(),
             model: "u".into(),
             delta: ChatDelta {
+                extra: Default::default(),
                 role: None,
                 content: Some(text.into()),
                 tool_calls: None,
@@ -6851,6 +6887,8 @@ mod tests {
 
     fn finish_chunk(out_tokens: u32) -> ChatChunk {
         ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "cmpl-1".into(),
             model: "u".into(),
             delta: ChatDelta::default(),
@@ -6919,6 +6957,8 @@ mod tests {
 
         // Stop chunk with NO usage — only the content block closes.
         let stop_no_usage = ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "cmpl-1".into(),
             model: "u".into(),
             delta: ChatDelta::default(),
@@ -6935,6 +6975,8 @@ mod tests {
         // The trailing usage-only frame releases the closing pair,
         // carrying both input and output tokens.
         let usage_only = ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "cmpl-1".into(),
             model: "u".into(),
             delta: ChatDelta::default(),
@@ -7024,6 +7066,8 @@ mod tests {
         let mut enc = AnthropicSseEncoder::new("msg_01", "tencent-minimax-m3", 0);
         let _ = enc.next_events(&delta_chunk("ok"));
         let stop_no_usage = ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "chatcmpl-cache-test".into(),
             model: "MiniMax-M3".into(),
             delta: ChatDelta::default(),
@@ -7035,6 +7079,8 @@ mod tests {
         let _ = enc.next_events(&stop_no_usage);
 
         let usage_only = ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "chatcmpl-cache-test".into(),
             model: "MiniMax-M3".into(),
             delta: ChatDelta::default(),
@@ -7062,6 +7108,8 @@ mod tests {
         let mut enc = AnthropicSseEncoder::new("msg_01", "m", 0);
         let _ = enc.next_events(&delta_chunk("ok"));
         let stop_with_usage = ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "u".into(),
             delta: ChatDelta::default(),
@@ -7085,6 +7133,8 @@ mod tests {
         let mut enc = AnthropicSseEncoder::new("msg_01", "m", 0);
         let _ = enc.next_events(&delta_chunk("ok"));
         let events = enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "u".into(),
             delta: ChatDelta::default(),
@@ -7112,6 +7162,8 @@ mod tests {
         let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
         let _ = enc.next_events(&delta_chunk("hi"));
         let stop_no_usage = ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "cmpl-1".into(),
             model: "u".into(),
             delta: ChatDelta::default(),
@@ -7198,9 +7250,12 @@ mod tests {
             tc["function"] = serde_json::Value::Object(func);
         }
         ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "cmpl-1".into(),
             model: "u".into(),
             delta: ChatDelta {
+                extra: Default::default(),
                 role: None,
                 content: None,
                 tool_calls: Some(vec![tc]),
@@ -7216,6 +7271,8 @@ mod tests {
 
     fn tool_finish_chunk() -> ChatChunk {
         ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "cmpl-1".into(),
             model: "u".into(),
             delta: ChatDelta::default(),
@@ -7321,6 +7378,8 @@ mod tests {
 
     fn reasoning_chunk(text: &str) -> ChatChunk {
         ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "cmpl-1".into(),
             model: "u".into(),
             delta: ChatDelta {
@@ -7362,6 +7421,8 @@ mod tests {
                 "function": {"name": "f", "arguments": "{}"}}]),
         );
         let resp = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "cmpl".into(),
             model: "u".into(),
             message: msg,
@@ -7388,6 +7449,8 @@ mod tests {
         let mut msg = ChatMessage::assistant("hi");
         msg.extra.insert("reasoning_content".into(), "".into());
         let resp = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "cmpl".into(),
             model: "u".into(),
             message: msg,

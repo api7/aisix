@@ -1073,8 +1073,6 @@ impl Bridge for BedrockBridge {
         req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
-        // Converse has no slot for the legacy fields and would drop them.
-        aisix_gateway::tool_calls::reject_legacy_function_calling(&req)?;
         let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let upstream_id = upstream_model(ctx)?;
         validate_model_id_chars(upstream_id)?;
@@ -1084,6 +1082,8 @@ impl Bridge for BedrockBridge {
             let endpoint = self.chat_completions_endpoint(ctx)?;
             return crate::openai_compat::chat(endpoint, req, ctx, upstream_id).await;
         }
+        // InvokeModel and Converse take tools, not the legacy fields.
+        let (req, legacy) = aisix_gateway::tool_calls::legacy_functions_as_tools(req)?;
         // Claude answers a non-streamed request through InvokeModel, in
         // Anthropic Messages shape; every other publisher, and every
         // streamed request, through Converse.
@@ -1099,6 +1099,7 @@ impl Bridge for BedrockBridge {
             }
             _ => self.chat_converse(req, ctx, upstream_id).await,
         }
+        .map(|resp| legacy.reply(resp))
     }
 
     async fn chat_stream(
@@ -1115,8 +1116,6 @@ impl Bridge for BedrockBridge {
         req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
-        // Converse has no slot for the legacy fields and would drop them.
-        aisix_gateway::tool_calls::reject_legacy_function_calling(&req)?;
         let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let upstream_id = upstream_model(ctx)?;
         validate_model_id_chars(upstream_id)?;
@@ -1126,6 +1125,8 @@ impl Bridge for BedrockBridge {
             let endpoint = self.chat_completions_endpoint(ctx)?;
             return crate::openai_compat::chat_stream(endpoint, req, ctx, upstream_id).await;
         }
+        // InvokeModel and Converse take tools, not the legacy fields.
+        let (req, legacy) = aisix_gateway::tool_calls::legacy_functions_as_tools(req)?;
         // The tool route's JSON only exists once the synthetic tool call
         // has been assembled, so it cannot be streamed as it arrives.
         // Run the request non-streaming — through `chat`, so each
@@ -1143,13 +1144,15 @@ impl Bridge for BedrockBridge {
             let chunks = response_into_fake_stream_chunks(
                 self.chat_cow(req, &ctx.non_streaming_ctx()).await?,
             );
-            return Ok(Box::pin(async_stream::stream! {
+            return Ok(legacy.reply_stream(Box::pin(async_stream::stream! {
                 for chunk in chunks {
                     yield Ok(chunk);
                 }
-            }));
+            })));
         }
-        self.chat_converse_stream(req, ctx, upstream_id).await
+        self.chat_converse_stream(req, ctx, upstream_id)
+            .await
+            .map(|stream| legacy.reply_stream(stream))
     }
 
     /// Native Bedrock embeddings (#723), LiteLLM `litellm/llms/bedrock/embed/`
@@ -1162,6 +1165,7 @@ impl Bridge for BedrockBridge {
         req: &EmbeddingRequest,
         ctx: &BridgeContext,
     ) -> Result<EmbeddingResponse, BridgeError> {
+        req.require_text_input()?;
         let upstream_id = upstream_model(ctx)?;
         validate_model_id_chars(upstream_id)?;
         let client = self.build_client_from_ctx(ctx).await?;
@@ -1913,7 +1917,7 @@ fn build_converse_inputs(
                 mark_end_of_turn(&mut blocks, cache, msg);
                 messages.push(build_message(ConversationRole::Assistant, blocks)?);
             }
-            Role::Tool => {
+            Role::Tool | Role::Function => {
                 // #560: `role:"tool"` → Converse `toolResult` block. The
                 // correlation id rides `tool_call_id`, the result rides
                 // `content`. A result that names no call still goes
@@ -2620,6 +2624,8 @@ fn converse_output_into_chat_response(
         })
         .unwrap_or_default();
     ChatResponse {
+        logprobs: None,
+        more_choices: Vec::new(),
         id: String::new(),
         model: upstream_id.to_string(),
         message,
@@ -2742,6 +2748,8 @@ fn emit_converse_chunk(
             if !state.emitted_role {
                 state.emitted_role = true;
                 out.push(ChatChunk {
+                    choice_index: 0,
+                    logprobs: None,
                     id: String::new(),
                     model: upstream_id.to_string(),
                     delta: ChatDelta {
@@ -2777,6 +2785,8 @@ fn emit_converse_chunk(
             match d.delta {
                 Some(ContentBlockDelta::Text(text)) => {
                     out.push(ChatChunk {
+                        choice_index: 0,
+                        logprobs: None,
                         id: String::new(),
                         model: upstream_id.to_string(),
                         delta: ChatDelta {
@@ -2810,6 +2820,8 @@ fn emit_converse_chunk(
                         .is_some_and(|last| last != block_index);
                     state.reasoning_block = Some(block_index);
                     out.push(ChatChunk {
+                        choice_index: 0,
+                        logprobs: None,
                         id: String::new(),
                         model: upstream_id.to_string(),
                         delta: ChatDelta {
@@ -2831,6 +2843,8 @@ fn emit_converse_chunk(
         }
         ConverseStreamOutput::MessageStop(m) => {
             out.push(ChatChunk {
+                choice_index: 0,
+                logprobs: None,
                 id: String::new(),
                 model: upstream_id.to_string(),
                 delta: ChatDelta::default(),
@@ -2846,6 +2860,8 @@ fn emit_converse_chunk(
             let service_tier = converse_service_tier(m.service_tier());
             if let Some(u) = m.usage {
                 out.push(ChatChunk {
+                    choice_index: 0,
+                    logprobs: None,
                     id: String::new(),
                     model: upstream_id.to_string(),
                     delta: ChatDelta::default(),
@@ -2914,6 +2930,8 @@ fn tool_call_chunk(
     }
     call.insert("function".to_string(), serde_json::Value::Object(function));
     ChatChunk {
+        choice_index: 0,
+        logprobs: None,
         id: String::new(),
         model: upstream_id.to_string(),
         delta: ChatDelta {
@@ -3015,17 +3033,18 @@ fn build_inference_config(
             // an f64 bound not representable in f32 still clamps at the
             // right boundary. Max-then-min order matches the /invoke path.
             if let Some(max) = c.temperature_max {
-                if f64::from(next) > max {
-                    next = max as f32;
+                if next > max {
+                    next = max;
                 }
             }
             if let Some(min) = c.temperature_min {
-                if f64::from(next) < min {
-                    next = min as f32;
+                if next < min {
+                    next = min;
                 }
             }
         }
-        b = b.temperature(next);
+        // The SDK's inference config is `f32`.
+        b = b.temperature(next as f32);
     }
     if let Some(m) = max_tokens {
         // Bedrock's API uses i32; ChatFormat's u32 is always non-negative.
@@ -3033,7 +3052,7 @@ fn build_inference_config(
         b = b.max_tokens(clamped);
     }
     if let Some(p) = req.top_p {
-        b = b.top_p(p);
+        b = b.top_p(p as f32);
     }
     if let Some(stops) = stop_sequences {
         b = b.set_stop_sequences(Some(stops));
@@ -7158,6 +7177,8 @@ mod tests {
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["a".into(), "b".into()],
             input_was_single: false,
@@ -7208,6 +7229,8 @@ mod tests {
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["a".into()],
             input_was_single: true,
@@ -7244,6 +7267,8 @@ mod tests {
 
         let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["a".into()],
             input_was_single: true,
@@ -7297,6 +7322,8 @@ mod tests {
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["a".into(), "b".into()],
             input_was_single: false,
@@ -7327,6 +7354,8 @@ mod tests {
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["a".into()],
             input_was_single: true,

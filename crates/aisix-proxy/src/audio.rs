@@ -1860,6 +1860,8 @@ async fn multipart_dispatch(
         }
         if refusal.is_none() && !scan.text.is_empty() {
             let synth = ChatResponse {
+                logprobs: None,
+                more_choices: Vec::new(),
                 id: String::new(),
                 model: model_name.clone(),
                 message: ChatMessage::assistant(scan.text),

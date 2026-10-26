@@ -57,8 +57,9 @@ const FALLBACK_ALL_UNHEALTHY_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// Whether a Bridge error is retryable at all, optionally treating 429
 /// as retryable. Non-429 4xx is the caller's mistake — retrying won't
-/// help and may amplify damage. Everything else (5xx, timeout,
-/// transport, decode, config, stream abort) gets the retry/failover path.
+/// help and may amplify damage. An undecodable 2xx body was already
+/// served. Everything else (5xx, timeout, transport, config, stream
+/// abort) gets the retry/failover path.
 ///
 /// `fallback_on_statuses` (AISIX-Cloud#1012) is the routing model's
 /// explicit opt-in list for providers that use 4xx codes for transient
@@ -112,9 +113,12 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
         // it rather than failing over (`dispatch_with_failover`), the same
         // as on any other non-retryable refusal.
         BridgeError::UnsupportedCapability(_) => false,
+        // The upstream answered 2xx and the gateway could not read the
+        // body: the call was served — and billed — already, so another
+        // attempt would run (and charge for) the same request again.
+        BridgeError::UpstreamDecode(_) => false,
         BridgeError::Timeout { .. }
         | BridgeError::Transport(_)
-        | BridgeError::UpstreamDecode(_)
         | BridgeError::Config(_)
         | BridgeError::StreamAborted => true,
     }
@@ -2517,7 +2521,7 @@ mod tests {
             false,
             &[]
         ));
-        assert!(is_retryable(
+        assert!(!is_retryable(
             &BridgeError::UpstreamDecode("x".into()),
             false,
             &[]

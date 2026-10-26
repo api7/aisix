@@ -1926,6 +1926,8 @@ async fn anthropic_passthrough_dispatch(
                 out_text.push_str(&aisix_gateway::tool_calls::blocks_scan_text(scannable));
 
                 let synth = aisix_gateway::ChatResponse {
+                    logprobs: None,
+                    more_choices: Vec::new(),
                     id: String::new(),
                     model: model_name.to_string(),
                     message: aisix_gateway::ChatMessage::assistant(out_text),
@@ -2392,7 +2394,8 @@ async fn cross_provider_dispatch(
     // fields (context_management, top_k, mcp_servers, …) are dropped —
     // flattened onto an OpenAI-compatible upstream they 400 as unknown
     // parameters (AISIX-Cloud#953).
-    translate_extras_to_openai_shape_with(&mut chat.extra, mapped_effort, markers);
+    chat.gateway_strict_schema =
+        translate_extras_to_openai_shape_with(&mut chat.extra, mapped_effort, markers);
     let provider_label = provider.to_ascii_lowercase();
     let provider_key_id = model.provider_key_id.as_deref().unwrap_or("unknown");
     let upstream_model = model.upstream_model().unwrap_or("unknown").to_string();
@@ -3092,7 +3095,7 @@ fn build_anthropic_sse_stream(
                         serde_json::Value::Array(std::mem::take(&mut tool_call_fragments)),
                     );
                 }
-                let synth = aisix_gateway::ChatResponse {
+                let synth = aisix_gateway::ChatResponse { logprobs: None, more_choices: Vec::new(),
                     id: String::new(),
                     model: model_label.clone(),
                     message,
@@ -4613,7 +4616,7 @@ where
                 text.push_str(payload);
             }
             if !text.is_empty() {
-                let synth = aisix_gateway::ChatResponse {
+                let synth = aisix_gateway::ChatResponse { logprobs: None, more_choices: Vec::new(),
                     id: String::new(),
                     model: model_label.clone(),
                     message: aisix_gateway::ChatMessage::assistant(text),

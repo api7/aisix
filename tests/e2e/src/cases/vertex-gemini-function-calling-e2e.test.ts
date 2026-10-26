@@ -582,8 +582,6 @@ describe("function calling on Vertex's native Gemini wire", () => {
   });
 
   test.for<[string, Record<string, unknown>]>([
-    ["legacy functions", { functions: [WEATHER_TOOL.function] }],
-    ["legacy function_call", { tools: [WEATHER_TOOL], function_call: "auto" }],
     ["a hosted tool", { tools: [{ type: "web_search_preview" }] }],
     [
       "an unnamed tool_choice object",

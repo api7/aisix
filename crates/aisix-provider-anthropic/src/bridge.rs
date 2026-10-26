@@ -368,6 +368,7 @@ impl Bridge for AnthropicBridge {
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
         let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
+        let (req, legacy) = aisix_gateway::tool_calls::legacy_functions_as_tools(req)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -430,7 +431,7 @@ impl Bridge for AnthropicBridge {
             if synthetic_json_tool {
                 unwrap_json_tool_call(&mut chat);
             }
-            Ok(chat)
+            Ok(legacy.reply(chat))
         })
         .await
     }
@@ -450,6 +451,7 @@ impl Bridge for AnthropicBridge {
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
         let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
+        let (req, legacy) = aisix_gateway::tool_calls::legacy_functions_as_tools(req)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -468,7 +470,9 @@ impl Bridge for AnthropicBridge {
             let chunks = response_into_fake_stream_chunks(
                 self.chat_cow(req, &ctx.non_streaming_ctx()).await?,
             );
-            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+            return Ok(
+                legacy.reply_stream(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            );
         }
 
         let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, |m| {
@@ -521,7 +525,7 @@ impl Bridge for AnthropicBridge {
 
         let byte_stream = resp.bytes_stream();
         let stream = build_chunk_stream(byte_stream);
-        Ok(Box::pin(stream))
+        Ok(legacy.reply_stream(Box::pin(stream)))
     }
 }
 
