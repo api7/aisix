@@ -1187,12 +1187,8 @@ pub(crate) fn estimation_output_text(resp: &aisix_gateway::ChatResponse) -> Stri
     // Every choice was generated, and is billed.
     for message in resp.messages() {
         out.push_str(&message.content_str());
-        if let Some(s) = message
-            .extra
-            .get("reasoning_content")
-            .and_then(|v| v.as_str())
-        {
-            out.push_str(s);
+        if let Some(s) = message.reasoning_text() {
+            out.push_str(&s);
         }
         let calls = message
             .extra
@@ -2972,7 +2968,7 @@ async fn dispatch(
                 let captured_content = content_cap.map(|cap| {
                     CapturedContent::new(
                         &serde_json::to_string(req).unwrap_or_default(),
-                        cached.message.content.as_deref().unwrap_or(""),
+                        &cached.message.content_str(),
                         cap as usize,
                     )
                     .with_output(chat_message_output(&cached.message, cap))
@@ -3648,7 +3644,7 @@ async fn dispatch(
     let captured_content = content_cap.map(|cap| {
         CapturedContent::new(
             &serde_json::to_string(req).unwrap_or_default(),
-            upstream.message.content.as_deref().unwrap_or(""),
+            &upstream.message.content_str(),
             cap as usize,
         )
         .with_output(chat_message_output(&upstream.message, cap))
@@ -5014,6 +5010,15 @@ pub(crate) fn chat_message_output(
     message: &aisix_gateway::ChatMessage,
     cap: u32,
 ) -> Option<aisix_obs::OutputCapture> {
+    let reasoning = message.reasoning_text();
+    let mut message = serde_json::to_value(message).unwrap_or_default();
+    // Reasoning the upstream answered as content parts is captured as
+    // reasoning, as it is from `reasoning_content`.
+    if let (Some(reasoning), Some(fields)) = (reasoning, message.as_object_mut()) {
+        fields
+            .entry("reasoning_content")
+            .or_insert_with(|| reasoning.into_owned().into());
+    }
     let body = serde_json::json!({"choices": [{"index": 0, "message": message}]});
     Some(aisix_obs::OutputCollector::from_body(
         aisix_obs::OutputWire::OpenAiChat,

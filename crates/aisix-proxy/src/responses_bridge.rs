@@ -1042,8 +1042,8 @@ pub fn chat_response_to_responses_json(
 ) -> Value {
     let (status, incomplete_reason) = responses_status(&resp.finish_reason);
     let output = build_output_items(
-        message_reasoning_text(&resp.message),
-        resp.message.content.as_deref(),
+        resp.message.reasoning_text().as_deref(),
+        resp.message.text().as_deref(),
         resp.message
             .extra
             .get("tool_calls")
@@ -1290,21 +1290,6 @@ fn reasoning_item_json(item_id: &str, text: &str) -> Value {
         "status": "completed",
         "summary": [{"type": "summary_text", "text": text}],
     })
-}
-
-/// The upstream's chain-of-thought on a bridged non-streaming response.
-///
-/// The OpenAI-compatible response parser already normalises both spellings
-/// the ecosystem uses — `message.reasoning_content` (DeepSeek / GLM / Qwen /
-/// vLLM / SGLang) and `message.reasoning` (aggregators) — into this one
-/// canonical slot on the way into [`ChatMessage`], so the bridge reads the
-/// slot rather than re-deriving the spellings here.
-fn message_reasoning_text(message: &ChatMessage) -> Option<&str> {
-    message
-        .extra
-        .get("reasoning_content")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
 }
 
 /// Assemble the `output` array: a `reasoning` item carrying the upstream's
