@@ -175,13 +175,6 @@ describe("a refused request shape is described as a request error", () => {
   const ORPHAN_TOOL_RESULT = { role: "tool", tool_call_id: "call_unknown", content: "sunny" };
 
   test.for<[string, string, Record<string, unknown>, RegExp]>([
-    ["gemini: legacy functions", "refusal-gemini", { functions: [WEATHER_FUNCTION] }, /^`functions` is not supported/],
-    [
-      "gemini: legacy function_call",
-      "refusal-gemini",
-      { tools: [{ type: "function", function: WEATHER_FUNCTION }], function_call: "auto" },
-      /^`function_call` is not supported/,
-    ],
     ["gemini: a non-function tool", "refusal-gemini", { tools: [{ type: "web_search" }] }, /^tool type "web_search" is not supported/],
     [
       "gemini: an orphan tool result",
@@ -189,7 +182,6 @@ describe("a refused request shape is described as a request error", () => {
       { messages: [USER, ORPHAN_TOOL_RESULT] },
       /^tool message has no corresponding tool call/,
     ],
-    ["bedrock: legacy functions", "refusal-nova", { functions: [WEATHER_FUNCTION] }, /^`functions` is not supported/],
   ])("chat: %s", async ([, model, extra, mentions], ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     for (const stream of [false, true]) {

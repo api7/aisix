@@ -373,6 +373,20 @@ pub struct ChatFormat {
     /// written.
     #[serde(skip)]
     pub gateway_strict_schema: bool,
+    /// `top_k` from a `/v1/messages` caller. The OpenAI wire has no such
+    /// parameter, so it never rides `extra`; a bridge whose target takes a
+    /// top-k slot writes it there (Claude `top_k`, Converse Claude / Nova,
+    /// Gemini `topK`) and every other bridge leaves it unsent.
+    #[serde(skip)]
+    pub top_k: Option<u64>,
+    /// The exact `thinking.budget_tokens` of a `/v1/messages` caller whose
+    /// thinking is `enabled`. `extra.reasoning_effort` still carries the
+    /// tier bucketed from it, for targets that take only a tier; a target
+    /// with a token-budget slot (Claude `thinking.budget_tokens`, Gemini 2.5
+    /// `thinkingBudget`) writes this exact budget instead of mapping the
+    /// tier back to one.
+    #[serde(skip)]
+    pub thinking_budget_tokens: Option<u64>,
 }
 
 impl ChatFormat {
@@ -386,6 +400,8 @@ impl ChatFormat {
             stream: None,
             extra: serde_json::Map::new(),
             gateway_strict_schema: false,
+            top_k: None,
+            thinking_budget_tokens: None,
         }
     }
 
@@ -1547,6 +1563,8 @@ mod tests {
     fn chat_format_round_trips_through_json() {
         let f = ChatFormat {
             gateway_strict_schema: false,
+            top_k: None,
+            thinking_budget_tokens: None,
             model: "my-gpt4".into(),
             messages: vec![
                 ChatMessage::system("you are helpful"),

@@ -798,23 +798,20 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
     expect(noUsage.body.error.message).toContain("`usage`");
   });
 
-  test("a model group fails over an incomplete answer and cools its target down", async (ctx) => {
+  // The upstream already answered — and billed — the request, so an
+  // incomplete answer is neither re-dispatched to another target nor
+  // counted toward cooldown.
+  test("a model group neither fails over an incomplete answer nor cools its target down", async (ctx) => {
     if (!ready(ctx)) return;
     const badFrom = noConfidence!.receivedRequests.length;
     const okFrom = typesafe!.receivedRequests.length;
-    const res = await post("/v1/decisions", decisionsBody("dec-incomplete-group"));
-
-    expect(res.status).toBe(200);
-    expect(noConfidence!.receivedRequests.length).toBe(badFrom + 1);
-    expect(typesafe!.receivedRequests.length).toBe(okFrom + 1);
-    expect(res.body.model).toBe("dec-incomplete-group");
-    expect(res.body.answers[1]).toMatchObject({ type: "choice", choice: "engineering", confidence: 1 });
-
-    // Cooled down: the next request goes straight to the healthy target.
-    const again = await post("/v1/decisions", decisionsBody("dec-incomplete-group"));
-    expect(again.status).toBe(200);
-    expect(noConfidence!.receivedRequests.length).toBe(badFrom + 1);
-    expect(typesafe!.receivedRequests.length).toBe(okFrom + 2);
+    for (const attempt of [1, 2]) {
+      const res = await post("/v1/decisions", decisionsBody("dec-incomplete-group"));
+      expect(res.status, `attempt ${attempt}`).toBe(502);
+      expect(res.body.error.message).toContain("unexpected decision response");
+      expect(noConfidence!.receivedRequests.length).toBe(badFrom + attempt);
+    }
+    expect(typesafe!.receivedRequests.length).toBe(okFrom);
   });
 
   test("an absent answer and one of another question type are still refusals", async (ctx) => {

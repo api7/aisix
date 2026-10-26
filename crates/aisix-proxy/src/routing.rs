@@ -118,6 +118,7 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
         // attempt would run (and charge for) the same request again.
         BridgeError::UpstreamDecode(_) => false,
         BridgeError::Timeout { .. }
+        | BridgeError::TokenExchangeDecode(_)
         | BridgeError::Transport(_)
         | BridgeError::Config(_)
         | BridgeError::StreamAborted => true,
@@ -2523,6 +2524,12 @@ mod tests {
         ));
         assert!(!is_retryable(
             &BridgeError::UpstreamDecode("x".into()),
+            false,
+            &[]
+        ));
+        // A credential exchange answered unreadably: nothing was served.
+        assert!(is_retryable(
+            &BridgeError::TokenExchangeDecode("x".into()),
             false,
             &[]
         ));

@@ -902,6 +902,7 @@ async fn count_tokens_to_target(
             client,
         ),
     );
+    crate::messages::forward_client_anthropic_beta(&mut headers, client);
 
     let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
     let mut req = url.post_on(&client).headers(headers).body(body);
@@ -927,15 +928,7 @@ async fn count_tokens_to_target(
     let status = upstream_resp.status();
 
     if !status.is_success() {
-        let status_u16 = status.as_u16();
-        let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
-        let message = upstream_resp.text().await.unwrap_or_default();
-        let truncated = crate::util::truncate_on_char_boundary(&message, 1024);
-        let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
-            status_u16,
-            truncated,
-            retry_after,
-        );
+        let err = aisix_provider_anthropic::map_http_error(status, upstream_resp).await;
         if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
         {
             state.runtime_status.mark_cooldown(model_id, ttl, reason);

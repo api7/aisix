@@ -268,10 +268,9 @@ impl TokenMinter {
                 BridgeError::Config(msg)
             });
         }
-        let parsed: TokenResponse = resp
-            .json()
-            .await
-            .map_err(|e| BridgeError::UpstreamDecode(format!("vertex token mint response: {e}")))?;
+        let parsed: TokenResponse = resp.json().await.map_err(|e| {
+            BridgeError::TokenExchangeDecode(format!("vertex token mint response: {e}"))
+        })?;
         Ok((parsed.access_token, parsed.expires_in))
     }
 

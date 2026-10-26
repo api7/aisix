@@ -540,6 +540,9 @@ pub fn split_system_with<'a>(
                     .get("tool_calls")
                     .and_then(|v| v.as_array())
                     .map(Vec::as_slice);
+                if let Some(calls) = tool_calls {
+                    check_history_tool_calls(calls, index)?;
+                }
                 messages.push(marked_turn(
                     AnthropicMessage::assistant(
                         &m.content_str(),
@@ -572,6 +575,32 @@ pub fn split_system_with<'a>(
         build_system(&system_msgs),
         merge_consecutive_roles(messages),
     ))
+}
+
+/// A replayed assistant `tool_calls[]` entry needs the `id` its tool
+/// result answers and the function `name` Claude's `tool_use` block
+/// requires; without either the turn cannot be written.
+fn check_history_tool_calls(
+    calls: &[serde_json::Value],
+    index: usize,
+) -> Result<(), TranslateError> {
+    for (i, call) in calls.iter().enumerate() {
+        let present = |v: Option<&serde_json::Value>| {
+            v.and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        };
+        if !present(call.get("id")) {
+            return Err(TranslateError::InvalidContent(format!(
+                "messages[{index}].tool_calls[{i}].id is required"
+            )));
+        }
+        if !present(call.get("function").and_then(|f| f.get("name"))) {
+            return Err(TranslateError::InvalidContent(format!(
+                "messages[{index}].tool_calls[{i}].function.name is required"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A message-level `cache_control` marker — written beside a message's
@@ -678,7 +707,7 @@ pub fn build_request<'a>(
     system: Option<AnthropicSystem>,
     messages: Vec<AnthropicMessage<'a>>,
     stream: bool,
-) -> AnthropicRequest<'a> {
+) -> Result<AnthropicRequest<'a>, BridgeError> {
     // Pull `tools` and `tool_choice` out of the caller's extras and
     // translate to Anthropic shape; everything else passes through
     // verbatim. Forwarding the OpenAI tool_choice shape would 400
@@ -694,21 +723,26 @@ pub fn build_request<'a>(
     // OpenAI's newer name for the output cap; it outranks `max_tokens` when
     // both are sent. A value that is not a token count is left for the
     // upstream to reject.
-    let max_tokens = match extras.get("max_completion_tokens") {
-        Some(serde_json::Value::Null) => {
-            extras.remove("max_completion_tokens");
-            req.max_tokens
-        }
-        Some(v) => match v.as_u64() {
-            Some(n) => {
-                extras.remove("max_completion_tokens");
-                Some(n.min(u32::MAX as u64) as u32)
-            }
-            None => req.max_tokens,
-        },
-        None => req.max_tokens,
+    let max_tokens = match extras.remove("max_completion_tokens") {
+        None | Some(serde_json::Value::Null) => req.max_tokens,
+        Some(v) => Some(
+            v.as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| {
+                    BridgeError::InvalidRequest(
+                        "max_completion_tokens must be a non-negative integer no larger than \
+                         4294967295"
+                            .into(),
+                    )
+                })?,
+        ),
     };
-    translate_stop_to_anthropic(&mut extras);
+    translate_stop_to_anthropic(&mut extras)?;
+    translate_openai_only_fields(&mut extras);
+    if let Some(top_k) = req.top_k {
+        extras.entry("top_k").or_insert(top_k.into());
+    }
+    let budget_max_tokens = write_thinking_budget(req, &mut extras);
     let mut tools = extras
         .remove("tools")
         .and_then(translate_openai_tools_to_anthropic);
@@ -726,10 +760,11 @@ pub fn build_request<'a>(
         .and_then(serde_json::Value::as_bool)
         == Some(false);
     let client_set_tool_choice = tool_choice_states_a_preference(requested_tool_choice.as_ref());
-    let mut tool_choice = tools
-        .as_ref()
-        .and(requested_tool_choice)
-        .and_then(translate_openai_tool_choice_to_anthropic);
+    let translated_tool_choice = match requested_tool_choice {
+        Some(choice) => translate_openai_tool_choice_to_anthropic(choice)?,
+        None => None,
+    };
+    let mut tool_choice = tools.as_ref().and(translated_tool_choice);
     if serial_tool_calls && tools.is_some() {
         // The flag is a member of `tool_choice`, so with no translated
         // choice to carry it — the caller sent none, or sent one this
@@ -747,7 +782,8 @@ pub fn build_request<'a>(
         }
     }
     let thinking_max_tokens =
-        translate_reasoning_effort_to_anthropic(&mut extras, upstream_model, max_tokens);
+        translate_reasoning_effort_to_anthropic(&mut extras, upstream_model, max_tokens)?
+            .or(budget_max_tokens);
     // `response_format` is the OpenAI spelling of structured outputs. It
     // has no top-level Anthropic counterpart, so it is always consumed
     // here — riding `extra` onto the body would be rejected as an unknown
@@ -801,7 +837,7 @@ pub fn build_request<'a>(
             }
         }
     }
-    AnthropicRequest {
+    Ok(AnthropicRequest {
         model: upstream_model,
         messages,
         max_tokens: max_tokens
@@ -814,6 +850,82 @@ pub fn build_request<'a>(
         tools,
         tool_choice,
         extra: extras,
+    })
+}
+
+/// Write the exact [`ChatFormat::thinking_budget_tokens`] a `/v1/messages`
+/// caller sent as Claude's `thinking` block, in place of the
+/// `reasoning_effort` tier bucketed from it, which would only approximate
+/// it. A `thinking` the caller sent in the chat body wins. Returns the
+/// `max_tokens` such a request needs when the caller sent none: Anthropic
+/// requires it above the budget.
+pub fn write_thinking_budget(
+    req: &ChatFormat,
+    extras: &mut serde_json::Map<String, serde_json::Value>,
+) -> Option<u32> {
+    let budget = req.thinking_budget_tokens?;
+    if extras.contains_key("thinking") {
+        return None;
+    }
+    extras.remove("reasoning_effort");
+    extras.insert(
+        "thinking".into(),
+        serde_json::json!({"type": "enabled", "budget_tokens": budget}),
+    );
+    Some(
+        u32::try_from(budget)
+            .unwrap_or(u32::MAX)
+            .saturating_add(DEFAULT_MAX_TOKENS),
+    )
+}
+
+/// OpenAI Chat Completions request fields with no Anthropic Messages slot.
+/// Each is dropped on the way to Claude; a field this list does not name
+/// is either translated by [`build_request`] or not an OpenAI field at all
+/// — an Anthropic-native field a caller put in a chat body on purpose —
+/// and is forwarded as sent.
+const OPENAI_ONLY_FIELDS: &[&str] = &[
+    "audio",
+    "frequency_penalty",
+    "logit_bias",
+    "logprobs",
+    "modalities",
+    "n",
+    "prediction",
+    "presence_penalty",
+    "prompt_cache_key",
+    "prompt_cache_retention",
+    "seed",
+    "store",
+    "top_logprobs",
+    "verbosity",
+    "web_search_options",
+];
+
+/// Drop the OpenAI-only fields and write the OpenAI fields Anthropic names
+/// differently into their Anthropic slots:
+///
+/// - `user` / `safety_identifier` → `metadata.user_id`, the identifier
+///   Anthropic uses for the same abuse attribution. A caller that sent
+///   both keeps them as sent.
+/// - `metadata` keeps only `user_id`, its one Anthropic member; OpenAI's
+///   stored-completion tags have nowhere to go.
+fn translate_openai_only_fields(extras: &mut serde_json::Map<String, serde_json::Value>) {
+    for key in OPENAI_ONLY_FIELDS {
+        extras.remove(*key);
+    }
+    let mut user_id = None;
+    if let Some(metadata) = extras.remove("metadata") {
+        user_id = metadata.get("user_id").filter(|v| !v.is_null()).cloned();
+    }
+    let identifier = match (extras.get("user"), extras.get("safety_identifier")) {
+        (Some(_), Some(_)) => None,
+        (Some(_), None) => extras.remove("user"),
+        (None, Some(_)) => extras.remove("safety_identifier"),
+        (None, None) => None,
+    };
+    if let Some(user_id) = user_id.or(identifier.filter(|v| !v.is_null())) {
+        extras.insert("metadata".into(), serde_json::json!({ "user_id": user_id }));
     }
 }
 
@@ -821,20 +933,26 @@ pub fn build_request<'a>(
 /// `stop_sequences`, which takes an array only. A `stop_sequences` the
 /// caller sent natively wins. `null` and an empty array set nothing; any
 /// other shape stays as sent, for the upstream to reject.
-fn translate_stop_to_anthropic(extras: &mut serde_json::Map<String, serde_json::Value>) {
+fn translate_stop_to_anthropic(
+    extras: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), BridgeError> {
     let sequences = match extras.remove("stop") {
-        None | Some(serde_json::Value::Null) => return,
+        None | Some(serde_json::Value::Null) => return Ok(()),
         Some(serde_json::Value::String(s)) => serde_json::Value::Array(vec![s.into()]),
-        Some(serde_json::Value::Array(items)) if items.is_empty() => return,
-        Some(v @ serde_json::Value::Array(_)) => v,
-        Some(other) => {
-            extras.insert("stop".to_string(), other);
-            return;
+        Some(serde_json::Value::Array(items)) if items.is_empty() => return Ok(()),
+        Some(serde_json::Value::Array(items)) if items.iter().all(|i| i.is_string()) => {
+            serde_json::Value::Array(items)
+        }
+        Some(_) => {
+            return Err(BridgeError::InvalidRequest(
+                "stop must be a string or an array of strings".into(),
+            ))
         }
     };
     extras
         .entry("stop_sequences".to_string())
         .or_insert(sequences);
+    Ok(())
 }
 
 /// Whether the client stated a `tool_choice` of their own, which the
@@ -1004,9 +1122,30 @@ pub fn translate_reasoning_effort_to_anthropic(
     extras: &mut serde_json::Map<String, serde_json::Value>,
     model: &str,
     max_tokens: Option<u32>,
+) -> Result<Option<u32>, BridgeError> {
+    let Some(effort) = extras.remove("reasoning_effort") else {
+        return Ok(None);
+    };
+    let effort = match &effort {
+        serde_json::Value::String(s) => s.as_str(),
+        serde_json::Value::Null => return Ok(None),
+        _ => {
+            return Err(BridgeError::InvalidRequest(
+                "reasoning_effort must be a string".into(),
+            ))
+        }
+    };
+    Ok(reasoning_effort_into_anthropic(
+        extras, effort, model, max_tokens,
+    ))
+}
+
+fn reasoning_effort_into_anthropic(
+    extras: &mut serde_json::Map<String, serde_json::Value>,
+    effort: &str,
+    model: &str,
+    max_tokens: Option<u32>,
 ) -> Option<u32> {
-    let effort = extras.remove("reasoning_effort")?;
-    let effort = effort.as_str()?;
     // A caller who natively turned thinking off has already stated the
     // depth, so the alias adds nothing — and pairing a tier with it
     // would build a request Anthropic rejects above `high`, naming an
@@ -1331,6 +1470,9 @@ pub fn translate_openai_tools_to_anthropic(
             if let Some(desc) = function.get("description") {
                 anthropic_tool.insert("description".into(), desc.clone());
             }
+            if let Some(strict) = function.get("strict").filter(|v| !v.is_null()) {
+                anthropic_tool.insert("strict".into(), strict.clone());
+            }
             // OpenAI's `parameters` (JSON Schema) maps to Anthropic's
             // `input_schema` verbatim — both are JSON Schema.
             if let Some(params) = function.get("parameters") {
@@ -1369,29 +1511,43 @@ pub fn translate_openai_tools_to_anthropic(
 ///   {type:"function",                   {"type":"tool",
 ///    function:{name:"X"}}           →    "name":"X"}
 ///
-/// Returns None for unrecognised shapes — caller's value is discarded
-/// rather than forwarded verbatim, since the OpenAI shape would 400
-/// the Anthropic upstream.
+/// `null` and the shapes naming something Claude cannot be offered — an
+/// `allowed_tools` subset, a `custom` tool — set no choice. Any other
+/// shape is not a valid OpenAI `tool_choice` and is refused, naming the
+/// field.
 pub fn translate_openai_tool_choice_to_anthropic(
     v: serde_json::Value,
-) -> Option<serde_json::Value> {
+) -> Result<Option<serde_json::Value>, BridgeError> {
+    let invalid = || {
+        BridgeError::InvalidRequest(
+            "tool_choice must be \"none\", \"auto\", \"required\" or a \
+             {\"type\": \"function\", \"function\": {\"name\": …}} object"
+                .into(),
+        )
+    };
     match v {
+        serde_json::Value::Null => Ok(None),
         serde_json::Value::String(s) => match s.as_str() {
-            "auto" | "none" => Some(serde_json::json!({"type": s})),
-            "required" => Some(serde_json::json!({"type": "any"})),
-            _ => None,
+            "auto" | "none" => Ok(Some(serde_json::json!({"type": s}))),
+            "required" => Ok(Some(serde_json::json!({"type": "any"}))),
+            _ => Err(invalid()),
         },
-        serde_json::Value::Object(o) => {
-            if o.get("type").and_then(|t| t.as_str()) != Some("function") {
-                return None;
+        serde_json::Value::Object(o) => match o.get("type").and_then(|t| t.as_str()) {
+            Some("function") => {
+                let name = o
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .filter(|n| !n.is_empty())
+                    .ok_or_else(|| {
+                        BridgeError::InvalidRequest("tool_choice.function.name is required".into())
+                    })?;
+                Ok(Some(serde_json::json!({"type": "tool", "name": name})))
             }
-            let name = o
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())?;
-            Some(serde_json::json!({"type": "tool", "name": name}))
-        }
-        _ => None,
+            Some("allowed_tools" | "custom") => Ok(None),
+            _ => Err(invalid()),
+        },
+        _ => Err(invalid()),
     }
 }
 
@@ -1416,6 +1572,12 @@ fn anthropic_tools_to_openai(
     let translated: Vec<serde_json::Value> = arr
         .iter()
         .filter_map(|t| {
+            if t.get("type")
+                .and_then(|v| v.as_str())
+                .is_some_and(is_anthropic_server_tool)
+            {
+                return None;
+            }
             let name = t.get("name")?.as_str()?;
             let mut function = serde_json::Map::new();
             function.insert("name".into(), name.into());
@@ -1424,6 +1586,9 @@ fn anthropic_tools_to_openai(
             }
             if let Some(schema) = t.get("input_schema") {
                 function.insert("parameters".into(), schema.clone());
+            }
+            if let Some(strict) = t.get("strict").filter(|v| !v.is_null()) {
+                function.insert("strict".into(), strict.clone());
             }
             Some(with_marker_of(
                 serde_json::json!({
@@ -1440,6 +1605,23 @@ fn anthropic_tools_to_openai(
     } else {
         Some(serde_json::Value::Array(translated))
     }
+}
+
+/// An Anthropic server tool: Anthropic runs it itself, so no other upstream
+/// can — offering one there as a function the model may call would invent
+/// a tool nobody executes. Anthropic's client tools (`bash_*`,
+/// `text_editor_*`, `computer_*`, `memory_*`) are executed by the caller
+/// and are not in this list.
+fn is_anthropic_server_tool(tool_type: &str) -> bool {
+    const SERVER_TOOL_PREFIXES: &[&str] = &[
+        "web_search_",
+        "web_fetch_",
+        "code_execution_",
+        "tool_search_tool_",
+    ];
+    SERVER_TOOL_PREFIXES
+        .iter()
+        .any(|prefix| tool_type.starts_with(prefix))
 }
 
 /// Translate Anthropic-shape `tool_choice` to OpenAI's.
@@ -1922,12 +2104,31 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
     }
 }
 
+/// Claude's `stop_reason` in OpenAI's `finish_reason` vocabulary, which
+/// has no slot for a raw Anthropic value. `pause_turn` (a server tool
+/// paused a long turn for the client to continue) ends this response
+/// normally; `model_context_window_exceeded` is the context-window form of
+/// running out of tokens.
 fn map_stop_reason(raw: Option<&str>) -> FinishReason {
     match raw {
-        Some("end_turn") | Some("stop_sequence") | None => FinishReason::Stop,
-        Some("max_tokens") => FinishReason::Length,
+        Some("end_turn") | Some("stop_sequence") | Some("pause_turn") | None => FinishReason::Stop,
+        Some("max_tokens") | Some("model_context_window_exceeded") => FinishReason::Length,
         Some("tool_use") => FinishReason::ToolCalls,
+        Some("refusal") => FinishReason::ContentFilter,
         Some(other) => FinishReason::Other(other.to_string()),
+    }
+}
+
+/// The Messages `stop_reason` a chat answer ends with. A content filter is
+/// Claude's `refusal`, and so is an answer the upstream marked as a
+/// refusal, unless it ran out of tokens first.
+fn anthropic_stop_reason(reason: &FinishReason, refused: bool) -> &'static str {
+    match reason {
+        FinishReason::Length => "max_tokens",
+        FinishReason::ContentFilter => "refusal",
+        _ if refused => "refusal",
+        FinishReason::ToolCalls => "tool_use",
+        FinishReason::Stop | FinishReason::Other(_) => "end_turn",
     }
 }
 
@@ -2496,6 +2697,11 @@ pub enum AnthropicInboundError {
     UnsupportedContent { idx: usize },
     #[error("`system` field must be a string or an array of text blocks")]
     UnsupportedSystem,
+    #[error("`{field}` must be {expected}")]
+    InvalidField {
+        field: &'static str,
+        expected: &'static str,
+    },
 }
 
 /// What a parsed body is going to be used for.
@@ -2857,17 +3063,56 @@ fn parse_inbound(
 
     let mut chat = ChatFormat::new(model, messages);
 
-    if let Some(t) = obj.get("temperature").and_then(Value::as_f64) {
-        chat.temperature = Some(t);
-    }
-    if let Some(t) = obj.get("top_p").and_then(Value::as_f64) {
-        chat.top_p = Some(t);
-    }
-    if let Some(t) = obj.get("max_tokens").and_then(Value::as_u64) {
-        chat.max_tokens = Some(t as u32);
-    }
-    if let Some(s) = obj.get("stream").and_then(Value::as_bool) {
-        chat.stream = Some(s);
+    if purpose == InboundUse::Dispatch {
+        // Translated, the body can no longer reach Anthropic to be judged
+        // there, so a value of the wrong type is refused here, naming the
+        // field. The scan parse leaves the judgement to the passthrough's
+        // upstream.
+        let invalid = |field, expected| AnthropicInboundError::InvalidField { field, expected };
+        let present = |key| obj.get(key).filter(|v| !v.is_null());
+        if let Some(v) = present("temperature") {
+            chat.temperature = Some(v.as_f64().ok_or(invalid("temperature", "a number"))?);
+        }
+        if let Some(v) = present("top_p") {
+            chat.top_p = Some(v.as_f64().ok_or(invalid("top_p", "a number"))?);
+        }
+        if let Some(v) = present("max_tokens") {
+            chat.max_tokens = Some(v.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or(
+                invalid(
+                    "max_tokens",
+                    "a non-negative integer no larger than 4294967295",
+                ),
+            )?);
+        }
+        if let Some(v) = present("stream") {
+            chat.stream = Some(v.as_bool().ok_or(invalid("stream", "a boolean"))?);
+        }
+        if let Some(v) = present("top_k") {
+            chat.top_k = Some(
+                v.as_u64()
+                    .ok_or(invalid("top_k", "a non-negative integer"))?,
+            );
+        }
+        let thinking = present("thinking");
+        if thinking.and_then(|t| t.get("type")).and_then(Value::as_str) == Some("enabled") {
+            if let Some(v) = thinking
+                .and_then(|t| t.get("budget_tokens"))
+                .filter(|v| !v.is_null())
+            {
+                chat.thinking_budget_tokens = Some(
+                    v.as_u64()
+                        .ok_or(invalid("thinking.budget_tokens", "a non-negative integer"))?,
+                );
+            }
+        }
+    } else {
+        chat.temperature = obj.get("temperature").and_then(Value::as_f64);
+        chat.top_p = obj.get("top_p").and_then(Value::as_f64);
+        chat.max_tokens = obj
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok());
+        chat.stream = obj.get("stream").and_then(Value::as_bool);
     }
 
     // Pass remaining keys through `extra` so future bridges can use
@@ -3299,13 +3544,13 @@ pub fn chat_response_into_anthropic_json(
     resp: &ChatResponse,
     model_display_name: &str,
 ) -> serde_json::Value {
-    let stop_reason = match &resp.finish_reason {
-        FinishReason::Stop => "end_turn",
-        FinishReason::Length => "max_tokens",
-        FinishReason::ContentFilter => "stop_sequence",
-        FinishReason::ToolCalls => "tool_use",
-        FinishReason::Other(_) => "end_turn",
-    };
+    let refusal = resp
+        .message
+        .extra
+        .get("refusal")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let stop_reason = anthropic_stop_reason(&resp.finish_reason, refusal.is_some());
 
     let mut content: Vec<serde_json::Value> = Vec::new();
 
@@ -3329,6 +3574,11 @@ pub fn chat_response_into_anthropic_json(
 
     if let Some(text) = resp.message.content.as_deref().filter(|s| !s.is_empty()) {
         content.push(serde_json::json!({"type": "text", "text": text}));
+    }
+    // A refusal is the model's answer in its own field; Claude writes its
+    // refusal as text.
+    if let Some(refusal) = refusal {
+        content.push(serde_json::json!({"type": "text", "text": refusal}));
     }
 
     // Translate OpenAI-shape tool_calls from message.extra into
@@ -3430,6 +3680,11 @@ pub struct AnthropicSseEncoder {
     next_block_index: usize,
     /// Per-OpenAI-delta-index tool call state.
     tool_calls: std::collections::BTreeMap<u64, ToolCallState>,
+    /// Reasoning that arrived while a tool_use block was open, written as
+    /// its own thinking block once the tool_use blocks close.
+    held_reasoning: String,
+    /// The upstream streamed a `refusal`, so the answer ends as one.
+    refused: bool,
     /// Stop reason captured at the `finish_reason` chunk while the
     /// closing `message_delta`/`message_stop` pair is withheld. With
     /// `stream_options.include_usage` (AISIX-Cloud#790) an OpenAI
@@ -3472,6 +3727,8 @@ impl AnthropicSseEncoder {
             finished: false,
             next_block_index: 0,
             tool_calls: std::collections::BTreeMap::new(),
+            held_reasoning: String::new(),
+            refused: false,
             pending_stop_reason: None,
             seen_input_tokens: 0,
             seen_output_tokens: 0,
@@ -3521,11 +3778,27 @@ impl AnthropicSseEncoder {
             .reasoning_content
             .as_deref()
             .is_some_and(|s| !s.is_empty());
-        let has_content = chunk
+        // A refusal streams in its own delta field; Claude writes it as
+        // text.
+        let refusal = chunk
             .delta
-            .content
-            .as_deref()
-            .is_some_and(|s| !s.is_empty());
+            .extra
+            .get("refusal")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        if refusal.is_some() {
+            self.refused = true;
+        }
+        let text: Option<String> = match (
+            chunk.delta.content.as_deref().filter(|s| !s.is_empty()),
+            refusal,
+        ) {
+            (Some(c), Some(r)) => Some(format!("{c}{r}")),
+            (Some(c), None) => Some(c.to_string()),
+            (None, Some(r)) => Some(r.to_string()),
+            (None, None) => None,
+        };
+        let has_content = text.is_some();
         let has_tool_calls = chunk
             .delta
             .tool_calls
@@ -3541,12 +3814,15 @@ impl AnthropicSseEncoder {
         }
 
         // ── Thinking content block ──
-        // Reasoning that arrives while a tool_use block is open is dropped:
+        // Reasoning that arrives while a tool_use block is open is held:
         // opening a thinking block would close the tool_use block, and the
         // call's remaining argument fragments would then have nowhere to go.
+        // It is written as its own thinking block once the tool_use blocks
+        // close.
         let tool_block_open = self.tool_calls.values().any(|t| t.started);
         if has_reasoning && tool_block_open {
-            tracing::debug!("dropping reasoning that arrived inside an open tool_use block");
+            self.held_reasoning
+                .push_str(chunk.delta.reasoning_content.as_deref().unwrap_or_default());
         }
         if has_reasoning && !tool_block_open {
             if self.thinking_block_index.is_none() {
@@ -3596,7 +3872,7 @@ impl AnthropicSseEncoder {
                     "index": idx,
                     "delta": {
                         "type": "text_delta",
-                        "text": chunk.delta.content.clone().unwrap_or_default(),
+                        "text": text.unwrap_or_default(),
                     },
                 }),
             });
@@ -3678,13 +3954,7 @@ impl AnthropicSseEncoder {
         if let Some(fr) = &chunk.finish_reason {
             self.close_open_blocks(&mut events);
 
-            let stop_reason = match fr {
-                FinishReason::Stop => "end_turn",
-                FinishReason::Length => "max_tokens",
-                FinishReason::ContentFilter => "stop_sequence",
-                FinishReason::ToolCalls => "tool_use",
-                FinishReason::Other(_) => "end_turn",
-            };
+            let stop_reason = anthropic_stop_reason(fr, self.refused);
             if self.usage_seen {
                 // Usage already known (provider attached it to the stop
                 // chunk or earlier) — close out immediately.
@@ -3804,7 +4074,9 @@ impl AnthropicSseEncoder {
         }
     }
 
-    /// Close every open content block, in index order.
+    /// Close every open content block, in index order, then write the
+    /// reasoning held while a tool_use block was open as a thinking block
+    /// of its own.
     fn close_open_blocks(&mut self, events: &mut Vec<AnthropicSseEvent>) {
         let mut open: Vec<usize> = Vec::new();
         open.extend(self.thinking_block_index.take());
@@ -3817,6 +4089,30 @@ impl AnthropicSseEncoder {
         );
         open.sort_unstable();
         events.extend(open.into_iter().map(content_block_stop_event));
+        if !self.held_reasoning.is_empty() {
+            let idx = self.next_block_index;
+            self.next_block_index += 1;
+            events.push(AnthropicSseEvent {
+                event: "content_block_start",
+                data: serde_json::json!({
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+                }),
+            });
+            events.push(AnthropicSseEvent {
+                event: "content_block_delta",
+                data: serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {
+                        "type": "thinking_delta",
+                        "thinking": std::mem::take(&mut self.held_reasoning),
+                    },
+                }),
+            });
+            events.push(content_block_stop_event(idx));
+        }
     }
 
     fn message_start_event(&self) -> AnthropicSseEvent {
@@ -4466,7 +4762,7 @@ mod tests {
     /// Anthropic upstream actually sees.
     fn wire_system(req: &ChatFormat) -> serde_json::Value {
         let (system, messages) = split_system(req).unwrap();
-        let built = build_request(req, "claude-sonnet-4-5", system, messages, false);
+        let built = build_request(req, "claude-sonnet-4-5", system, messages, false).unwrap();
         serde_json::to_value(&built).unwrap()["system"].clone()
     }
 
@@ -4794,7 +5090,7 @@ mod tests {
     /// the serialized wire body — what the upstream actually receives.
     fn injected_wire(req: &ChatFormat, ttl: &str) -> serde_json::Value {
         let (system, messages) = split_system(req).unwrap();
-        let mut built = build_request(req, "claude-sonnet-4-5", system, messages, false);
+        let mut built = build_request(req, "claude-sonnet-4-5", system, messages, false).unwrap();
         inject_cache_breakpoints(&mut built, ttl);
         serde_json::to_value(&built).unwrap()
     }
@@ -5007,7 +5303,7 @@ mod tests {
     fn build_request_applies_default_max_tokens_when_unset() {
         let req = ChatFormat::new("claude", vec![ChatMessage::user("hi")]);
         let (_system, messages) = split_system(&req).unwrap();
-        let built = build_request(&req, "claude-sonnet-4-5", None, messages, false);
+        let built = build_request(&req, "claude-sonnet-4-5", None, messages, false).unwrap();
         assert_eq!(built.max_tokens, DEFAULT_MAX_TOKENS);
 
         let req = ChatFormat {
@@ -5015,7 +5311,7 @@ mod tests {
             ..ChatFormat::new("claude", vec![ChatMessage::user("hi")])
         };
         let (_system, messages) = split_system(&req).unwrap();
-        let built = build_request(&req, "claude-sonnet-4-5", None, messages, false);
+        let built = build_request(&req, "claude-sonnet-4-5", None, messages, false).unwrap();
         assert_eq!(built.max_tokens, 256);
     }
 
@@ -5179,16 +5475,16 @@ mod tests {
         // OpenAI: "auto" | "none" | "required"
         // Anthropic: {"type":"auto"} | {"type":"none"} | {"type":"any"}
         assert_eq!(
-            translate_openai_tool_choice_to_anthropic(serde_json::json!("auto")),
+            translate_openai_tool_choice_to_anthropic(serde_json::json!("auto")).unwrap(),
             Some(serde_json::json!({"type": "auto"})),
         );
         assert_eq!(
-            translate_openai_tool_choice_to_anthropic(serde_json::json!("none")),
+            translate_openai_tool_choice_to_anthropic(serde_json::json!("none")).unwrap(),
             Some(serde_json::json!({"type": "none"})),
         );
         // "required" → "any" (Anthropic's name for "must call something")
         assert_eq!(
-            translate_openai_tool_choice_to_anthropic(serde_json::json!("required")),
+            translate_openai_tool_choice_to_anthropic(serde_json::json!("required")).unwrap(),
             Some(serde_json::json!({"type": "any"})),
         );
     }
@@ -5202,22 +5498,213 @@ mod tests {
             "function": {"name": "get_weather"}
         });
         assert_eq!(
-            translate_openai_tool_choice_to_anthropic(openai),
+            translate_openai_tool_choice_to_anthropic(openai).unwrap(),
             Some(serde_json::json!({"type": "tool", "name": "get_weather"})),
         );
     }
 
     #[test]
-    fn tool_choice_unrecognised_shape_drops_to_none() {
-        // Strip the field rather than forwarding an OpenAI shape
-        // Anthropic doesn't recognise.
+    fn tool_choice_outside_openais_contract_is_refused() {
+        for choice in [serde_json::json!("invalid_form"), serde_json::json!(42)] {
+            assert!(translate_openai_tool_choice_to_anthropic(choice).is_err());
+        }
         assert_eq!(
-            translate_openai_tool_choice_to_anthropic(serde_json::json!("invalid_form")),
-            None,
+            translate_openai_tool_choice_to_anthropic(serde_json::json!(null)).unwrap(),
+            None
         );
+    }
+
+    /// OpenAI-only fields have no Anthropic slot and are dropped; the ones
+    /// with a same-meaning slot are written there; a field OpenAI does not
+    /// define is the caller's Anthropic-native field and goes through.
+    #[test]
+    fn openai_only_fields_are_dropped_and_mapped_ones_written_in_their_slot() {
+        let build = |extra: serde_json::Value| {
+            let req = ChatFormat {
+                extra: extra.as_object().unwrap().clone(),
+                ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+            };
+            let (_system, messages) = split_system(&req).unwrap();
+            serde_json::to_value(
+                build_request(&req, "claude-sonnet-4-5", None, messages, false).unwrap(),
+            )
+            .unwrap()
+        };
+        let body = build(serde_json::json!({
+            "seed": 1, "n": 2, "logprobs": true, "top_logprobs": 2, "logit_bias": {"1": 1},
+            "presence_penalty": 0.1, "frequency_penalty": 0.1, "store": true,
+            "prompt_cache_key": "k", "verbosity": "low", "modalities": ["text"],
+            "user": "end-user-1", "top_k": 7, "service_tier": "auto",
+        }));
+        for dropped in [
+            "seed",
+            "n",
+            "logprobs",
+            "top_logprobs",
+            "logit_bias",
+            "presence_penalty",
+            "frequency_penalty",
+            "store",
+            "prompt_cache_key",
+            "verbosity",
+            "modalities",
+            "user",
+        ] {
+            assert!(body.get(dropped).is_none(), "{dropped} reached Claude");
+        }
         assert_eq!(
-            translate_openai_tool_choice_to_anthropic(serde_json::json!(42)),
-            None,
+            body["metadata"],
+            serde_json::json!({"user_id": "end-user-1"})
+        );
+        assert_eq!(body["top_k"], 7);
+        assert_eq!(body["service_tier"], "auto");
+
+        let body = build(serde_json::json!({"safety_identifier": "sid", "metadata": {"tag": "x"}}));
+        assert_eq!(body["metadata"], serde_json::json!({"user_id": "sid"}));
+        let body = build(serde_json::json!({"metadata": {"tag": "x"}}));
+        assert!(body.get("metadata").is_none());
+        // Both identifiers: kept as sent.
+        let body = build(serde_json::json!({"user": "u", "safety_identifier": "s"}));
+        assert_eq!(
+            (body["user"].clone(), body["safety_identifier"].clone()),
+            ("u".into(), "s".into())
+        );
+    }
+
+    #[test]
+    fn a_function_tools_strict_reaches_the_claude_tool() {
+        let tools = translate_openai_tools_to_anthropic(serde_json::json!([{
+            "type": "function",
+            "function": {"name": "f", "strict": true, "parameters": {"type": "object"}},
+        }]))
+        .unwrap();
+        assert_eq!(tools[0]["strict"], true);
+    }
+
+    #[test]
+    fn a_replayed_tool_call_without_id_or_name_is_refused() {
+        for call in [
+            serde_json::json!({"type": "function", "function": {"name": "f", "arguments": "{}"}}),
+            serde_json::json!({"id": "c1", "type": "function", "function": {"arguments": "{}"}}),
+        ] {
+            let mut assistant = ChatMessage::assistant("");
+            assistant
+                .extra
+                .insert("tool_calls".into(), serde_json::json!([call]));
+            let req = ChatFormat::new("c", vec![ChatMessage::user("hi"), assistant]);
+            let err = split_system(&req).unwrap_err().to_string();
+            assert!(err.starts_with("messages[1].tool_calls[0]."), "{err}");
+        }
+    }
+
+    /// The IR's exact budget becomes Claude's thinking block in place of
+    /// the tier bucketed from it, and `top_k` reaches its slot.
+    #[test]
+    fn the_messages_budget_and_top_k_reach_claude_exactly() {
+        let mut req = ChatFormat::new("c", vec![ChatMessage::user("hi")]);
+        req.thinking_budget_tokens = Some(3000);
+        req.top_k = Some(9);
+        req.extra
+            .insert("reasoning_effort".into(), serde_json::json!("medium"));
+        let (_system, messages) = split_system(&req).unwrap();
+        let body = serde_json::to_value(
+            build_request(&req, "claude-sonnet-4-5", None, messages, false).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({"type": "enabled", "budget_tokens": 3000})
+        );
+        assert!(body.get("output_config").is_none());
+        assert_eq!(body["top_k"], 9);
+        assert_eq!(body["max_tokens"], 3000 + DEFAULT_MAX_TOKENS);
+    }
+
+    #[test]
+    fn a_messages_body_carries_top_k_and_the_exact_budget_and_refuses_wrong_types() {
+        let chat = parse_inbound_request(&serde_json::json!({
+            "model": "m", "max_tokens": 100, "top_k": 4,
+            "thinking": {"type": "enabled", "budget_tokens": 3000},
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap();
+        assert_eq!(chat.top_k, Some(4));
+        assert_eq!(chat.thinking_budget_tokens, Some(3000));
+        for (field, value) in [
+            ("temperature", serde_json::json!("hot")),
+            ("top_p", serde_json::json!(true)),
+            ("max_tokens", serde_json::json!(-1)),
+            ("max_tokens", serde_json::json!(5_000_000_000u64)),
+            ("stream", serde_json::json!("yes")),
+            ("top_k", serde_json::json!(1.5)),
+        ] {
+            let mut body =
+                serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+            body[field] = value.clone();
+            let err = parse_inbound_request(&body).unwrap_err().to_string();
+            assert!(
+                err.starts_with(&format!("`{field}` must be")),
+                "{value}: {err}"
+            );
+            // The scan parse leaves the judgement to the passthrough's upstream.
+            assert!(parse_inbound_request_for_scan(&body).is_ok());
+        }
+    }
+
+    #[test]
+    fn server_tools_are_dropped_and_strict_is_carried() {
+        let tools = translate_anthropic_tools_to_openai(serde_json::json!([
+            {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
+            {"type": "code_execution_20250825", "name": "code_execution"},
+            {"type": "web_fetch_20250910", "name": "web_fetch"},
+            {"type": "bash_20250124", "name": "bash"},
+            {"name": "f", "strict": true, "input_schema": {"type": "object"}},
+        ]))
+        .unwrap();
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["bash", "f"]);
+        assert_eq!(tools[1]["function"]["strict"], true);
+    }
+
+    #[test]
+    fn claudes_stop_reasons_take_openais_names() {
+        for (raw, want) in [
+            ("refusal", FinishReason::ContentFilter),
+            ("model_context_window_exceeded", FinishReason::Length),
+            ("pause_turn", FinishReason::Stop),
+        ] {
+            assert_eq!(map_stop_reason(Some(raw)), want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn an_openai_refusal_renders_as_a_claude_refusal() {
+        let mut message = ChatMessage::assistant("");
+        message.content = None;
+        message.extra.insert(
+            "refusal".into(),
+            serde_json::json!("I can't help with that."),
+        );
+        let resp = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
+            id: "x".into(),
+            model: "u".into(),
+            message,
+            finish_reason: FinishReason::Stop,
+            usage: UsageStats::new(0, 0),
+            service_tier: None,
+        };
+        let body = chat_response_into_anthropic_json(&resp, "m");
+        assert_eq!(body["stop_reason"], "refusal");
+        assert_eq!(
+            body["content"],
+            serde_json::json!([{"type": "text", "text": "I can't help with that."}])
         );
     }
 
@@ -5326,13 +5813,9 @@ mod tests {
                 ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
             };
             let (_system, messages) = split_system(&req).unwrap();
-            serde_json::to_value(build_request(
-                &req,
-                "claude-sonnet-4-5",
-                None,
-                messages,
-                false,
-            ))
+            serde_json::to_value(
+                build_request(&req, "claude-sonnet-4-5", None, messages, false).unwrap(),
+            )
             .unwrap()
         };
         let body = build_with(
@@ -5352,14 +5835,31 @@ mod tests {
         assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
         assert!(body.get("max_completion_tokens").is_none() && body.get("stop").is_none());
 
-        // Shapes that are neither OpenAI's nor Anthropic's stay as sent.
-        let body = build_with(
-            serde_json::json!({"stop": 5, "max_completion_tokens": "x"}),
-            None,
-        );
-        assert_eq!(body["stop"], 5);
-        assert_eq!(body["max_completion_tokens"], "x");
-        assert!(body.get("stop_sequences").is_none());
+        // A value OpenAI's contract does not allow cannot be written into
+        // Anthropic's slot, and is refused naming the field.
+        for (extra, field) in [
+            (serde_json::json!({"stop": 5}), "stop"),
+            (serde_json::json!({"stop": ["a", 1]}), "stop"),
+            (
+                serde_json::json!({"max_completion_tokens": "x"}),
+                "max_completion_tokens",
+            ),
+            (
+                serde_json::json!({"max_completion_tokens": 5_000_000_000u64}),
+                "max_completion_tokens",
+            ),
+        ] {
+            let req = ChatFormat {
+                extra: extra.as_object().unwrap().clone(),
+                ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+            };
+            let (_system, messages) = split_system(&req).unwrap();
+            let err = build_request(&req, "claude-sonnet-4-5", None, messages, false).unwrap_err();
+            assert!(
+                matches!(&err, BridgeError::InvalidRequest(m) if m.starts_with(field)),
+                "{extra}: {err:?}"
+            );
+        }
 
         // The thinking budget is sized against the caller's cap, whichever
         // name it came under.
@@ -5393,7 +5893,7 @@ mod tests {
             ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
         };
         let (_system, messages) = split_system(&req).unwrap();
-        let built = build_request(&req, "c-name", None, messages, false);
+        let built = build_request(&req, "c-name", None, messages, false).unwrap();
         // tool_choice translated and on the typed field.
         assert_eq!(built.tool_choice, Some(serde_json::json!({"type": "auto"})));
         // tool_choice removed from `extra`; other fields preserved.
@@ -5403,22 +5903,40 @@ mod tests {
             Some(&serde_json::json!("kept"))
         );
 
-        // The unrecognised half of the invariant, alongside a tool list
-        // that does survive: the typed field stays empty and the value
-        // still must not fall back into `extra`.
-        let req = ChatFormat {
-            extra: {
-                let mut m = req.extra.clone();
-                m.insert("tool_choice".to_string(), serde_json::json!("bogus"));
-                m
-            },
-            ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
-        };
-        let (_system, messages) = split_system(&req).unwrap();
-        let built = build_request(&req, "c-name", None, messages, false);
-        assert!(built.tools.is_some());
-        assert!(built.tool_choice.is_none());
-        assert!(!built.extra.contains_key("tool_choice"));
+        // A choice naming nothing Claude can be offered sets no choice and
+        // still must not fall back into `extra`; one that is not an OpenAI
+        // `tool_choice` at all is refused.
+        for (choice, refused) in [
+            (
+                serde_json::json!({"type": "allowed_tools", "allowed_tools": {"mode": "auto", "tools": []}}),
+                false,
+            ),
+            (serde_json::json!("bogus"), true),
+            (serde_json::json!({"type": "function"}), true),
+            (serde_json::json!(7), true),
+        ] {
+            let req = ChatFormat {
+                extra: {
+                    let mut m = req.extra.clone();
+                    m.insert("tool_choice".to_string(), choice.clone());
+                    m
+                },
+                ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+            };
+            let (_system, messages) = split_system(&req).unwrap();
+            match build_request(&req, "c-name", None, messages, false) {
+                Ok(built) => {
+                    assert!(!refused, "{choice} was accepted");
+                    assert!(built.tools.is_some());
+                    assert!(built.tool_choice.is_none());
+                    assert!(!built.extra.contains_key("tool_choice"));
+                }
+                Err(err) => {
+                    assert!(refused, "{choice}: {err:?}");
+                    assert!(err.to_string().starts_with("tool_choice"), "{err}");
+                }
+            }
+        }
     }
 
     /// A chat request carrying one function tool plus whatever `extra`
@@ -5450,7 +5968,7 @@ mod tests {
         // re-expressed as `tool_choice.disable_parallel_tool_use`.
         let req = chat_with_tool(&[("parallel_tool_calls", serde_json::json!(false))]);
         let (_system, messages) = split_system(&req).unwrap();
-        let built = build_request(&req, "c-name", None, messages, false);
+        let built = build_request(&req, "c-name", None, messages, false).unwrap();
         assert!(!built.extra.contains_key("parallel_tool_calls"));
         assert_eq!(
             built.tool_choice,
@@ -5467,7 +5985,7 @@ mod tests {
             ),
         ]);
         let (_system, messages) = split_system(&req).unwrap();
-        let built = build_request(&req, "c-name", None, messages, false);
+        let built = build_request(&req, "c-name", None, messages, false).unwrap();
         assert_eq!(
             built.tool_choice,
             Some(serde_json::json!({
@@ -5484,7 +6002,7 @@ mod tests {
         // but nothing is attached.
         let req = chat_with_tool(&[("parallel_tool_calls", serde_json::json!(true))]);
         let (_system, messages) = split_system(&req).unwrap();
-        let built = build_request(&req, "c-name", None, messages, false);
+        let built = build_request(&req, "c-name", None, messages, false).unwrap();
         assert!(!built.extra.contains_key("parallel_tool_calls"));
         assert!(built.tool_choice.is_none());
 
@@ -5495,7 +6013,7 @@ mod tests {
             ("tool_choice", serde_json::json!("none")),
         ]);
         let (_system, messages) = split_system(&req).unwrap();
-        let built = build_request(&req, "c-name", None, messages, false);
+        let built = build_request(&req, "c-name", None, messages, false).unwrap();
         assert_eq!(built.tool_choice, Some(serde_json::json!({"type": "none"})));
     }
 
@@ -5518,7 +6036,7 @@ mod tests {
             ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
         };
         let (_system, messages) = split_system(&req).unwrap();
-        let built = build_request(&req, "c-name", None, messages, false);
+        let built = build_request(&req, "c-name", None, messages, false).unwrap();
         assert!(!built.extra.contains_key("response_format"));
         assert_eq!(
             built.extra.get("custom_field"),
@@ -5555,7 +6073,7 @@ mod tests {
             ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
         };
         let (_system, messages) = split_system(&req).unwrap();
-        let built = build_request(&req, "c-name", None, messages, false);
+        let built = build_request(&req, "c-name", None, messages, false).unwrap();
         assert!(built.tools.is_none());
         assert!(built.tool_choice.is_none());
         assert!(!built.extra.contains_key("parallel_tool_calls"));
@@ -5632,7 +6150,7 @@ mod tests {
                 ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
             };
             let (_system, messages) = split_system(&req).unwrap();
-            let built = build_request(&req, "c-name", None, messages, false);
+            let built = build_request(&req, "c-name", None, messages, false).unwrap();
             assert!(built.tools.is_none(), "tools for {tools}");
             assert!(built.tool_choice.is_none(), "tool_choice for {tools}");
             assert!(!built.extra.contains_key("tools"));
@@ -6451,7 +6969,7 @@ mod tests {
                 ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
             };
             let (_system, messages) = split_system(&req).unwrap();
-            let built = build_request(&req, "c-name", None, messages, false);
+            let built = build_request(&req, "c-name", None, messages, false).unwrap();
             assert_eq!(
                 built.extra.get("output_config"),
                 Some(&serde_json::json!({"effort": tier})),
@@ -6476,7 +6994,7 @@ mod tests {
             ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
         };
         let (_system, messages) = split_system(&req).unwrap();
-        let built = build_request(&req, "c-name", None, messages, false);
+        let built = build_request(&req, "c-name", None, messages, false).unwrap();
         assert_eq!(
             built.extra.get("thinking"),
             Some(&serde_json::json!({"type": "disabled"}))
@@ -6500,7 +7018,7 @@ mod tests {
             ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
         };
         let (_system, messages) = split_system(&req).unwrap();
-        let built = build_request(&req, "c-name", None, messages, false);
+        let built = build_request(&req, "c-name", None, messages, false).unwrap();
         assert_eq!(
             built.extra.get("output_config"),
             Some(&serde_json::json!({"effort": "max"}))
@@ -6528,7 +7046,7 @@ mod tests {
             ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
         };
         let (_system, messages) = split_system(&req).unwrap();
-        let built = build_request(&req, "c-name", None, messages, false);
+        let built = build_request(&req, "c-name", None, messages, false).unwrap();
         assert_eq!(
             built.extra.get("output_config"),
             Some(&serde_json::json!({
@@ -6551,7 +7069,7 @@ mod tests {
             ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
         };
         let (_system, messages) = split_system(&req).unwrap();
-        let built = build_request(&req, "c-name", None, messages, false);
+        let built = build_request(&req, "c-name", None, messages, false).unwrap();
         assert_eq!(
             built.extra.get("output_config"),
             Some(&serde_json::json!("nonsense"))
@@ -6578,7 +7096,7 @@ mod tests {
             ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
         };
         let (_system, messages) = split_system(&req).unwrap();
-        let built = build_request(&req, "c-name", None, messages, false);
+        let built = build_request(&req, "c-name", None, messages, false).unwrap();
         assert_eq!(
             built.extra.get("output_config"),
             Some(&serde_json::json!({"effort": "max"}))
@@ -6605,7 +7123,7 @@ mod tests {
             ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
         };
         let (_system, messages) = split_system(&req).unwrap();
-        let built = build_request(&req, "c-name", None, messages, false);
+        let built = build_request(&req, "c-name", None, messages, false).unwrap();
         assert_eq!(
             built.extra.get("thinking"),
             Some(&serde_json::json!({"type": "adaptive", "display": "summarized"}))
@@ -6636,7 +7154,7 @@ mod tests {
                 ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
             };
             let (_system, messages) = split_system(&req).unwrap();
-            let built = build_request(&req, "c-name", None, messages, false);
+            let built = build_request(&req, "c-name", None, messages, false).unwrap();
             assert_eq!(
                 built.extra.get("thinking"),
                 Some(&serde_json::json!({"type": "disabled"})),
@@ -6652,24 +7170,33 @@ mod tests {
 
     #[test]
     fn build_request_drops_unrecognised_reasoning_effort() {
-        for value in [serde_json::json!("turbo"), serde_json::json!(5)] {
-            let req = ChatFormat {
-                extra: {
-                    let mut m = serde_json::Map::new();
-                    m.insert("reasoning_effort".to_string(), value.clone());
-                    m
-                },
-                ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
-            };
-            let (_system, messages) = split_system(&req).unwrap();
-            let built = build_request(&req, "c-name", None, messages, false);
-            assert!(
-                !built.extra.contains_key("reasoning_effort"),
-                "reasoning_effort = {value} leaked upstream"
-            );
-            assert!(!built.extra.contains_key("output_config"));
-            assert!(!built.extra.contains_key("thinking"));
-        }
+        let req = ChatFormat {
+            extra: serde_json::json!({"reasoning_effort": 5})
+                .as_object()
+                .unwrap()
+                .clone(),
+            ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+        };
+        let (_system, messages) = split_system(&req).unwrap();
+        let err = build_request(&req, "c-name", None, messages, false).unwrap_err();
+        assert_eq!(err.to_string(), "reasoning_effort must be a string");
+        let value = serde_json::json!("turbo");
+        let req = ChatFormat {
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert("reasoning_effort".to_string(), value.clone());
+                m
+            },
+            ..ChatFormat::new("c", vec![ChatMessage::user("hi")])
+        };
+        let (_system, messages) = split_system(&req).unwrap();
+        let built = build_request(&req, "c-name", None, messages, false).unwrap();
+        assert!(
+            !built.extra.contains_key("reasoning_effort"),
+            "reasoning_effort = {value} leaked upstream"
+        );
+        assert!(!built.extra.contains_key("output_config"));
+        assert!(!built.extra.contains_key("thinking"));
     }
 
     // ─── chat_response_into_anthropic_json ────────────────────────
@@ -6719,7 +7246,7 @@ mod tests {
         };
         assert_eq!(mk(FinishReason::Stop), "end_turn");
         assert_eq!(mk(FinishReason::Length), "max_tokens");
-        assert_eq!(mk(FinishReason::ContentFilter), "stop_sequence");
+        assert_eq!(mk(FinishReason::ContentFilter), "refusal");
         assert_eq!(mk(FinishReason::ToolCalls), "tool_use");
         assert_eq!(mk(FinishReason::Other("vendor".into())), "end_turn");
     }
@@ -7532,6 +8059,8 @@ mod tests {
         events.extend(enc.next_events(&reasoning_chunk("hmm")));
         events.extend(enc.next_events(&tool_call_chunk(0, "", "", "\"UTC\"}")));
         events.extend(enc.next_events(&tool_finish_chunk()));
+        // The reasoning is held until the tool_use block closes, then
+        // written as a thinking block of its own rather than lost.
         assert_eq!(
             event_summary(&events),
             [
@@ -7540,10 +8069,18 @@ mod tests {
                 "delta 0 \"input_json_delta\"",
                 "delta 0 \"input_json_delta\"",
                 "stop 0",
+                "start 1 \"thinking\"",
+                "delta 1 \"thinking_delta\"",
+                "stop 1",
                 "message_delta",
                 "message_stop",
             ]
         );
+        let thinking: String = events
+            .iter()
+            .filter_map(|e| e.data["delta"]["thinking"].as_str())
+            .collect();
+        assert_eq!(thinking, "hmm");
         let args: String = events
             .iter()
             .filter_map(|e| e.data["delta"]["partial_json"].as_str())
@@ -7966,7 +8503,8 @@ mod tests {
         );
         let (system, messages) = split_system(&chat).unwrap();
         let wire =
-            serde_json::to_value(build_request(&chat, "claude", system, messages, false)).unwrap();
+            serde_json::to_value(build_request(&chat, "claude", system, messages, false).unwrap())
+                .unwrap();
         let ec = serde_json::json!({"type": "ephemeral"});
         assert_eq!(
             wire["system"],
@@ -8256,7 +8794,7 @@ mod tests {
 
     fn build<'a>(req: &'a ChatFormat, upstream_model: &'a str) -> AnthropicRequest<'a> {
         let (system, messages) = split_system(req).unwrap();
-        build_request(req, upstream_model, system, messages, false)
+        build_request(req, upstream_model, system, messages, false).unwrap()
     }
 
     #[test]

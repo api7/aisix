@@ -62,7 +62,8 @@ use aisix_provider_anthropic::wire::{
     claude_media_kind, message_cache_control, response_into_chat_response,
     retain_cache_control_fields, split_system_with, structured_output_for,
     tool_choice_states_a_preference, tool_message_cache_control,
-    translate_reasoning_effort_to_anthropic, AnthropicResponse, MediaUrls, StructuredOutput,
+    translate_reasoning_effort_to_anthropic, write_thinking_budget, AnthropicResponse, MediaUrls,
+    StructuredOutput,
 };
 
 // Per-`ProviderKey` request override pipeline (#302 §5 / #340). The JSON-body
@@ -1435,7 +1436,7 @@ impl BedrockBridge {
         let body_bytes = {
             let (system, messages) = split_system_with(&req, urls, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
-            let mut anthropic_req = build_request(&req, anthropic_model, system, messages, false);
+            let mut anthropic_req = build_request(&req, anthropic_model, system, messages, false)?;
             apply_auto_prompt_caching(&mut anthropic_req, &ctx.model);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
@@ -3081,11 +3082,13 @@ fn build_converse_additional_model_request_fields(
     let claude = BedrockPublisher::from_model_id(upstream_id) == Some(BedrockPublisher::Anthropic);
     if claude {
         let mut extras = req.extra.clone();
+        let budget_max_tokens = write_thinking_budget(req, &mut extras);
         thinking_max_tokens = translate_reasoning_effort_to_anthropic(
             &mut extras,
             bedrock_claude_model_name(upstream_id).unwrap_or(upstream_id),
             crate::converse_req::max_tokens(req, upstream_id),
-        );
+        )?
+        .or(budget_max_tokens);
         for name in ["thinking", "output_config", "anthropic_beta"] {
             if let Some(value) = extras.remove(name) {
                 fields.insert(name.to_string(), value);
@@ -4284,15 +4287,31 @@ mod tests {
             );
         }
 
-        // Values that cannot be mapped reach the upstream as sent.
-        let body = send(
-            serde_json::json!({"stop": 5, "max_completion_tokens": "many"}),
-            None,
-        )
-        .await;
-        assert_eq!(body["stop"], 5, "body={body}");
-        assert!(body.get("stop_sequences").is_none(), "body={body}");
-        assert_eq!(body["max_completion_tokens"], "many", "body={body}");
+        // A value OpenAI's contract does not allow is refused, naming the
+        // field, before the upstream is called.
+        for (extra, field) in [
+            (serde_json::json!({"stop": 5}), "stop"),
+            (
+                serde_json::json!({"max_completion_tokens": "many"}),
+                "max_completion_tokens",
+            ),
+        ] {
+            let bridge = BedrockBridge::new().with_endpoint_override("http://127.0.0.1:9");
+            let ctx = BridgeContext::new(
+                "req-1",
+                sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+                sample_pk_with_secret(valid_secret_json()),
+            );
+            let req = ChatFormat {
+                extra: extra.as_object().unwrap().clone(),
+                ..ChatFormat::new("my-claude", vec![ChatMessage::user("hi")])
+            };
+            let err = bridge.chat(&req, &ctx).await.unwrap_err();
+            assert!(
+                matches!(&err, BridgeError::InvalidRequest(m) if m.starts_with(field)),
+                "{err:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -360,8 +360,17 @@ pub enum BridgeError {
         wire: UpstreamWire,
         retry_after: Option<Duration>,
     },
+    /// A 2xx model answer the gateway could not read. Never retried,
+    /// failed over or counted toward cooldown: the upstream already served
+    /// — and billed — the call.
     #[error("upstream returned an unparseable body: {0}")]
     UpstreamDecode(String),
+    /// A 2xx from a credential token exchange (Azure AAD, Vertex service
+    /// account) the gateway could not read. Nothing was served or billed,
+    /// so unlike [`UpstreamDecode`](Self::UpstreamDecode) it is retried and
+    /// counts toward cooldown like a transport fault.
+    #[error("upstream returned an unparseable body: {0}")]
+    TokenExchangeDecode(String),
     /// A provider-reported error carried *inside* a 2xx streaming
     /// response body — an OpenAI-family `data: {"error":{...}}` frame,
     /// an Anthropic `event: error` frame, a Gemini in-stream error
@@ -749,7 +758,7 @@ impl BridgeError {
                     502
                 }
             }
-            BridgeError::UpstreamDecode(_) => 502,
+            BridgeError::UpstreamDecode(_) | BridgeError::TokenExchangeDecode(_) => 502,
             // Same forwarding rule as UpstreamStatus: an embedded 4xx is
             // the provider's judgment of the request and passes through;
             // 5xx / unknown collapse to 502.
@@ -796,6 +805,7 @@ impl BridgeError {
             BridgeError::Timeout { .. }
             | BridgeError::UpstreamStatus { .. }
             | BridgeError::UpstreamDecode(_)
+            | BridgeError::TokenExchangeDecode(_)
             | BridgeError::UpstreamInBand { .. }
             | BridgeError::Transport(_)
             | BridgeError::StreamAborted => true,
@@ -813,7 +823,9 @@ impl BridgeError {
         match self {
             BridgeError::Timeout { .. } => "timeout",
             BridgeError::UpstreamStatus { .. } => "upstream_error",
-            BridgeError::UpstreamDecode(_) => "upstream_decode_error",
+            BridgeError::UpstreamDecode(_) | BridgeError::TokenExchangeDecode(_) => {
+                "upstream_decode_error"
+            }
             BridgeError::UpstreamInBand { .. } => "upstream_in_band_error",
             BridgeError::Config(_) | BridgeError::UnsupportedCapability(_) => "config_error",
             BridgeError::InvalidUpstreamConfig(_)

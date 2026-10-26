@@ -300,7 +300,10 @@ pub(crate) fn reasoning_field(
 /// additional field, Nova inside its own `inferenceConfig`. Dropped
 /// elsewhere.
 pub(crate) fn top_k_field(req: &ChatFormat, model_id: &str) -> Option<(&'static str, Value)> {
-    let top_k = req.extra.get("top_k").filter(|v| !v.is_null())?.clone();
+    let top_k = match req.extra.get("top_k").filter(|v| !v.is_null()) {
+        Some(v) => v.clone(),
+        None => req.top_k?.into(),
+    };
     let id = base_id(model_id);
     if id.starts_with("anthropic.") {
         Some(("top_k", top_k))

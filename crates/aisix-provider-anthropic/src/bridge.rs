@@ -220,7 +220,11 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
         .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
 }
 
-async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
+/// A non-2xx answer from an Anthropic-wire endpoint as a [`BridgeError`]
+/// carrying the upstream's own `error.type` and `error.message`, never the
+/// raw body as the message. Shared with the proxy's `/v1/messages` and
+/// `count_tokens` passthroughs.
+pub async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     aisix_gateway::capture_upstream_error_http(
         status,
         resp,
@@ -381,7 +385,7 @@ impl Bridge for AnthropicBridge {
         let body = {
             let (system, messages) = split_system_with(&req, MediaUrls::Accepted, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
-            let mut body = build_request(&req, upstream, system, messages, false);
+            let mut body = build_request(&req, upstream, system, messages, false)?;
             apply_auto_prompt_caching(&mut body, &ctx.model);
             outbound_bytes(&body)?
         };
@@ -484,7 +488,7 @@ impl Bridge for AnthropicBridge {
         let body = {
             let (system, messages) = split_system_with(&req, MediaUrls::Accepted, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
-            let mut body = build_request(&req, upstream, system, messages, true);
+            let mut body = build_request(&req, upstream, system, messages, true)?;
             apply_auto_prompt_caching(&mut body, &ctx.model);
             outbound_bytes(&body)?
         };

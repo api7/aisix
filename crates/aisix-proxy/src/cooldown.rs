@@ -126,6 +126,10 @@ pub fn decide_cooldown(
         // A 2xx whose body the gateway could not read says nothing about
         // the upstream's health.
         BridgeError::UpstreamDecode(_) => None,
+        // A credential exchange that answered unreadably served nothing.
+        BridgeError::TokenExchangeDecode(_) if cfg.trigger_on_transport_or_default() => {
+            Some((default_ttl, "upstream_decode_error"))
+        }
         // Config errors mean WE are misconfigured (missing provider, bad
         // bridge registration). Cooling down doesn't help; let it
         // surface and operator fixes the snapshot.
@@ -276,6 +280,21 @@ mod tests {
         assert_ne!(
             tracker.status("m-1").status,
             crate::health::RuntimeStatus::Cooldown
+        );
+    }
+
+    #[test]
+    fn note_failure_cools_down_on_an_unreadable_token_exchange() {
+        let tracker = ModelRuntimeStatusTracker::new();
+        let err = BridgeError::TokenExchangeDecode("bad token json".into());
+        let _ = note_failure(&tracker, "m-1", Some(&enabled()), err);
+        assert_eq!(
+            tracker.status("m-1").status,
+            crate::health::RuntimeStatus::Cooldown
+        );
+        assert_eq!(
+            tracker.status("m-1").status_reason.as_deref(),
+            Some("upstream_decode_error")
         );
     }
 

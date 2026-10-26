@@ -1725,6 +1725,8 @@ mod tests {
     fn build_request_sets_stream_flag_and_propagates_params() {
         let req = ChatFormat {
             gateway_strict_schema: false,
+            top_k: None,
+            thinking_budget_tokens: None,
             model: "my-model".into(),
             messages: vec![ChatMessage::user("hi")],
             temperature: Some(0.4),
@@ -1755,6 +1757,8 @@ mod tests {
     fn build_request_injects_include_usage_on_streaming() {
         let req = ChatFormat {
             gateway_strict_schema: false,
+            top_k: None,
+            thinking_budget_tokens: None,
             model: "m".into(),
             messages: vec![ChatMessage::user("hi")],
             temperature: None,
@@ -1782,6 +1786,8 @@ mod tests {
         );
         let req = ChatFormat {
             gateway_strict_schema: false,
+            top_k: None,
+            thinking_budget_tokens: None,
             model: "m".into(),
             messages: vec![],
             temperature: None,
@@ -1808,6 +1814,8 @@ mod tests {
     fn build_request_omits_stream_options_when_not_streaming() {
         let req = ChatFormat {
             gateway_strict_schema: false,
+            top_k: None,
+            thinking_budget_tokens: None,
             model: "m".into(),
             messages: vec![],
             temperature: None,
@@ -1828,6 +1836,8 @@ mod tests {
         extra.insert("presence_penalty".into(), serde_json::json!(0.1));
         let req = ChatFormat {
             gateway_strict_schema: false,
+            top_k: None,
+            thinking_budget_tokens: None,
             model: "m".into(),
             messages: vec![],
             temperature: None,
@@ -1861,6 +1871,8 @@ mod tests {
         let messages: Vec<ChatMessage> = serde_json::from_str(history_json).unwrap();
         let req = ChatFormat {
             gateway_strict_schema: false,
+            top_k: None,
+            thinking_budget_tokens: None,
             model: "my-model".into(),
             messages,
             temperature: None,

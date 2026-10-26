@@ -1137,12 +1137,7 @@ async fn dispatch_to_target(
     //
     // Claude on Bedrock or Vertex AI is both: it is not Anthropic's API, and
     // it verifies thinking signatures exactly as Anthropic's API does.
-    //
-    // A structured-output request to a Claude family without native
-    // structured output keeps the chat translation, whose synthetic-tool
-    // route is what makes it work there.
-    let platform = crate::dispatch::anthropic_platform_bridge(&state.hub, snapshot, model)
-        .filter(|_| !needs_synthetic_structured_output(body, model));
+    let platform = crate::dispatch::anthropic_platform_bridge(&state.hub, snapshot, model);
     let body = if crate::dispatch::is_first_party_anthropic(snapshot, model) {
         aisix_provider_anthropic::strip_unsigned_thinking_blocks(body)
     } else if platform.is_some() {
@@ -1274,8 +1269,16 @@ async fn anthropic_passthrough_dispatch(
     // body the handler keeps for fail-over, so an owned `Value` copy alive
     // across the await would be a third copy of the whole request. Later
     // readers (content capture, token estimation) work from the bytes.
+    // A structured-output request to a Claude family without native
+    // structured output, on a platform's own route: the schema rides the
+    // synthetic JSON tool in the native body, and the answer is only
+    // complete once that call is, so the upstream leg does not stream.
+    let synthetic_json = platform.is_some() && needs_synthetic_structured_output(&body, model);
     let (body_bytes, is_stream, platform_body) = {
         let mut body = body.into_owned();
+        if synthetic_json {
+            aisix_provider_anthropic::json_tool::inject(&mut body);
+        }
 
         // Rewrite the `model` field to the upstream value.
         if let Some(m) = body.get_mut("model") {
@@ -1312,11 +1315,15 @@ async fn anthropic_passthrough_dispatch(
             .get("stream")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        if synthetic_json && is_stream {
+            body["stream"] = Value::Bool(false);
+        }
         let bytes = crate::util::outbound_json(&body)?;
         // A platform bridge adapts the body itself, so it takes the value
         // rather than parsing the bytes back.
         (bytes, is_stream, platform.is_some().then_some(body))
     };
+    let upstream_streams = is_stream && !synthetic_json;
 
     let wire_protocol = match &platform {
         Some(bridge) => bridge.wire_protocol(),
@@ -1393,6 +1400,7 @@ async fn anthropic_passthrough_dispatch(
                 &mut headers,
                 &crate::dispatch::upstream_header_ctx(pk_value, pk_id, model, model_id, client_ctx),
             );
+            forward_client_anthropic_beta(&mut headers, client_ctx);
 
             let client = crate::http_client::client_for(pk_value.upstream_connection().as_ref());
             let mut req_builder = url
@@ -1427,15 +1435,7 @@ async fn anthropic_passthrough_dispatch(
             let status = upstream_resp.status();
 
             if !status.is_success() {
-                let status_u16 = status.as_u16();
-                let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
-                let message = upstream_resp.text().await.unwrap_or_default();
-                let truncated = crate::util::truncate_on_char_boundary(&message, 1024);
-                let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
-                    status_u16,
-                    truncated,
-                    retry_after,
-                );
+                let err = aisix_provider_anthropic::map_http_error(status, upstream_resp).await;
                 // Apply the cross-request cooldown contract to the
                 // Anthropic-passthrough path too — without this, a 401 / 429 /
                 // 5xx via /v1/messages would never mark the direct model and
@@ -1459,7 +1459,7 @@ async fn anthropic_passthrough_dispatch(
                 std::sync::Arc::new(pk_value.clone()),
                 Some(client_ctx),
             );
-            if let Some(d) = if is_stream {
+            if let Some(d) = if upstream_streams {
                 timeouts.stream
             } else {
                 timeouts.request
@@ -1468,7 +1468,7 @@ async fn anthropic_passthrough_dispatch(
             }
             // Media downloads are bounded by the end-to-end budget, not the
             // chunk gap a streaming deadline is.
-            if is_stream {
+            if upstream_streams {
                 ctx = ctx.with_non_streaming_deadline(timeouts.request);
             }
             let native = bridge
@@ -1483,7 +1483,20 @@ async fn anthropic_passthrough_dispatch(
                     )
                 })
                 .map_err(ProxyError::Bridge)?;
-            Upstream::Native(native)
+            match native {
+                aisix_gateway::NativeMessages::Json(mut message) if synthetic_json => {
+                    aisix_provider_anthropic::json_tool::unwrap(&mut message);
+                    if is_stream {
+                        let frames = aisix_provider_anthropic::json_tool::into_sse_frames(&message);
+                        Upstream::Native(aisix_gateway::NativeMessages::Stream(Box::pin(
+                            futures::stream::iter(frames.into_iter().map(Ok)),
+                        )))
+                    } else {
+                        Upstream::Native(aisix_gateway::NativeMessages::Json(message))
+                    }
+                }
+                native => Upstream::Native(native),
+            }
         }
     };
 
@@ -2028,6 +2041,25 @@ async fn anthropic_passthrough_dispatch(
     }
 }
 
+/// The caller's `anthropic-beta` reaches an Anthropic-wire upstream as sent:
+/// it is part of the Messages contract, naming the beta features the body
+/// relies on. A value the operator configured on the ProviderKey
+/// (`default_headers`, `forward_client_headers`) was applied first and
+/// stands. `anthropic-version` is not forwarded; the gateway speaks one
+/// version of the wire.
+pub(crate) fn forward_client_anthropic_beta(
+    headers: &mut axum::http::HeaderMap,
+    client: &ClientContext,
+) {
+    const ANTHROPIC_BETA: &str = "anthropic-beta";
+    if headers.contains_key(ANTHROPIC_BETA) {
+        return;
+    }
+    for value in client.headers.get_all(ANTHROPIC_BETA) {
+        headers.append(HeaderName::from_static(ANTHROPIC_BETA), value.clone());
+    }
+}
+
 fn needs_synthetic_structured_output(body: &Value, model: &aisix_core::Model) -> bool {
     let asks = body.get("output_format").is_some_and(|v| !v.is_null())
         || body
@@ -2396,6 +2428,11 @@ async fn cross_provider_dispatch(
     // parameters (AISIX-Cloud#953).
     chat.gateway_strict_schema =
         translate_extras_to_openai_shape_with(&mut chat.extra, mapped_effort, markers);
+    // An effort mapping that removed the request's effort removes the
+    // budget it would otherwise have carried too.
+    if mapped_effort == aisix_core::MappedEffort::Removed {
+        chat.thinking_budget_tokens = None;
+    }
     let provider_label = provider.to_ascii_lowercase();
     let provider_key_id = model.provider_key_id.as_deref().unwrap_or("unknown");
     let upstream_model = model.upstream_model().unwrap_or("unknown").to_string();
