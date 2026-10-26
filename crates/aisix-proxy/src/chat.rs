@@ -6074,7 +6074,13 @@ impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
 /// into another's: a literal split across one choice's deltas reassembles,
 /// and none forms across two. A scan reads one channel per line.
 #[derive(Default)]
-struct ChoiceTexts(std::collections::BTreeMap<(u32, u64), String>);
+struct ChoiceTexts {
+    texts: std::collections::BTreeMap<(u32, u64), String>,
+    /// Chars pushed since the last [`Self::keep_tails`].
+    fresh: usize,
+    /// The overlap the last [`Self::keep_tails`] kept as context.
+    kept: usize,
+}
 
 impl ChoiceTexts {
     const CONTENT: u64 = 0;
@@ -6082,12 +6088,16 @@ impl ChoiceTexts {
 
     fn push(&mut self, choice: u32, channel: u64, text: &str) {
         if !text.is_empty() {
-            self.0.entry((choice, channel)).or_default().push_str(text);
+            self.fresh += text.chars().count();
+            self.texts
+                .entry((choice, channel))
+                .or_default()
+                .push_str(text);
         }
     }
 
     fn joined(&self) -> String {
-        self.0
+        self.texts
             .values()
             .map(String::as_str)
             .collect::<Vec<_>>()
@@ -6095,22 +6105,30 @@ impl ChoiceTexts {
     }
 
     fn len(&self) -> usize {
-        self.0.values().map(String::len).sum()
+        self.texts.values().map(String::len).sum()
     }
 
-    fn chars(&self) -> usize {
-        self.0.values().map(|t| t.chars().count()).sum()
+    /// Whether a window of `window` chars is due: as much new text as the
+    /// window holds beyond the context kept from the last one.
+    fn window_full(&self, window: usize) -> bool {
+        self.fresh >= window.saturating_sub(self.kept)
     }
 
-    /// Keep each channel's trailing `overlap` chars (at most all but one)
-    /// as context for the next window.
-    fn keep_tails(&mut self, overlap: usize) {
-        self.0.retain(|_, text| {
+    /// After a window scan, keep each channel's trailing `overlap` chars —
+    /// short of a whole window, so the held text stays bounded — as context
+    /// for the next one. A channel shorter than that is kept whole: its
+    /// text may be the start of a literal the next window completes.
+    fn keep_tails(&mut self, overlap: usize, window: usize) {
+        let keep = overlap.min(window.saturating_sub(1));
+        let mut kept = 0;
+        self.texts.retain(|_, text| {
             let cc = text.chars().count();
-            let keep = overlap.min(cc.saturating_sub(1));
-            *text = text.chars().skip(cc - keep).collect();
+            *text = text.chars().skip(cc.saturating_sub(keep)).collect();
+            kept = kept.max(cc.min(keep));
             !text.is_empty()
         });
+        self.fresh = 0;
+        self.kept = kept;
     }
 }
 
@@ -6569,7 +6587,7 @@ where
                         overlap_chars,
                         ..
                     } => {
-                        if window_buf.chars() >= *size_chars {
+                        if window_buf.window_full(*size_chars) {
                             if let Some(ctx) = output_guardrail.as_ref() {
                                 let synthesized = {
                                     let comp = guard.comp();
@@ -6656,7 +6674,7 @@ where
                                 // misconfigured overlap >= window can't keep
                                 // the whole buffer and re-scan every
                                 // subsequent token (cost/latency guard).
-                                window_buf.keep_tails(*overlap_chars);
+                                window_buf.keep_tails(*overlap_chars, *size_chars);
                             }
                         }
                     }
@@ -7115,6 +7133,35 @@ fn error_frame_payload(error_type: &str, message: &str) -> String {
     .unwrap_or_else(|_| {
         r#"{"error":{"message":"error","type":"internal_error"}}"#.into()
     })
+}
+
+#[cfg(test)]
+mod choice_texts_tests {
+    use super::ChoiceTexts;
+
+    #[test]
+    fn a_short_channel_keeps_its_text_across_a_window_another_filled() {
+        let mut w = ChoiceTexts::default();
+        w.push(0, ChoiceTexts::CONTENT, "b");
+        w.push(1, ChoiceTexts::CONTENT, &"x".repeat(10));
+        assert!(w.window_full(10));
+        w.keep_tails(4, 10);
+        w.push(0, ChoiceTexts::CONTENT, "omb");
+        assert!(w.joined().contains("bomb"), "{}", w.joined());
+    }
+
+    #[test]
+    fn one_channel_scans_every_window_less_its_overlap() {
+        let mut w = ChoiceTexts::default();
+        w.push(0, ChoiceTexts::CONTENT, &"a".repeat(10));
+        assert!(w.window_full(10));
+        w.keep_tails(4, 10);
+        assert_eq!(w.joined(), "aaaa");
+        w.push(0, ChoiceTexts::CONTENT, &"b".repeat(5));
+        assert!(!w.window_full(10));
+        w.push(0, ChoiceTexts::CONTENT, "b");
+        assert!(w.window_full(10));
+    }
 }
 
 #[cfg(test)]

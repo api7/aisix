@@ -689,7 +689,7 @@ describe("output guardrails cover every choice and the refusal", () => {
     // Seeded last: the key authenticating implies the whole seed set is live.
     await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
     await waitConfigPropagation(async () => {
-      const res = await post(app!, "/v1/chat/completions", { model: "pg-refusal", messages: [{ role: "user", content: "hi" }] });
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, { headers: HEADERS });
       await res.arrayBuffer();
       return res.status === 200;
     });
