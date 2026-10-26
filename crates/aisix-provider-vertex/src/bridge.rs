@@ -359,6 +359,17 @@ impl VertexPublisher {
     }
 }
 
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
 /// `ProviderKey.api_key` schema for a Vertex provider key.
 ///
 /// Convention: GCP credentials are JSON-encoded into the `secret`
@@ -413,10 +424,51 @@ impl VertexSecret {
                     .into(),
             ));
         }
-        let parsed: VertexSecret = serde_json::from_str(secret).map_err(|_e| {
+        const SHAPE: &str = "{project, region, and either access_token or service_account_json}";
+        let value: serde_json::Value = serde_json::from_str(secret).map_err(|_e| {
+            BridgeError::InvalidUpstreamCredentials(format!(
+                "vertex provider_key.api_key must be valid JSON: {SHAPE}"
+            ))
+        })?;
+        let Some(fields) = value.as_object() else {
+            return Err(BridgeError::InvalidUpstreamCredentials(format!(
+                "vertex provider_key.api_key must be a JSON object: {SHAPE}"
+            )));
+        };
+        // Name the offending field: a type error from serde would either be
+        // too generic or quote the value, which may be secret material.
+        for (field, required) in [("project", true), ("region", true), ("access_token", false)] {
+            match fields.get(field) {
+                None if required => {
+                    return Err(BridgeError::InvalidUpstreamCredentials(format!(
+                        "vertex provider_key.api_key.{field} is missing: {SHAPE}"
+                    )));
+                }
+                None | Some(serde_json::Value::String(_)) => {}
+                Some(serde_json::Value::Null) if !required => {}
+                Some(other) => {
+                    return Err(BridgeError::InvalidUpstreamCredentials(format!(
+                        "vertex provider_key.api_key.{field} must be a string, got {}",
+                        json_type_name(other)
+                    )));
+                }
+            }
+        }
+        match fields.get("service_account_json") {
+            None | Some(serde_json::Value::Null | serde_json::Value::Object(_)) => {}
+            Some(other) => {
+                return Err(BridgeError::InvalidUpstreamCredentials(format!(
+                    "vertex provider_key.api_key.service_account_json must be a JSON \
+                     object (the contents of the service-account key file), got {}",
+                    json_type_name(other)
+                )));
+            }
+        }
+        let parsed: VertexSecret = serde_json::from_value(value).map_err(|_e| {
             BridgeError::InvalidUpstreamCredentials(
-                "vertex provider_key.api_key must be valid JSON: \
-                 {project, region, and either access_token or service_account_json}"
+                "vertex provider_key.api_key.service_account_json must be a \
+                 service-account key object with string fields type, private_key, \
+                 client_email and token_uri"
                     .into(),
             )
         })?;
@@ -3186,6 +3238,34 @@ mod tests {
                 assert!(msg.contains("api_key is empty"));
             }
             other => panic!("expected InvalidUpstreamCredentials, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vertex_secret_names_a_mistyped_field() {
+        let cases = [
+            (
+                r#"{"project":"p","region":"r","service_account_json":"{\"type\":\"service_account\"}"}"#,
+                "service_account_json must be a JSON object",
+            ),
+            (
+                r#"{"project":7,"region":"r","access_token":"t"}"#,
+                "project must be a string",
+            ),
+            (r#"{"project":"p","access_token":"t"}"#, "region is missing"),
+            (
+                r#"{"project":"p","region":"r","service_account_json":{"type":"service_account"}}"#,
+                "service_account_json must be a service-account key object",
+            ),
+        ];
+        for (secret, want) in cases {
+            match VertexSecret::parse(secret).unwrap_err() {
+                BridgeError::InvalidUpstreamCredentials(msg) => {
+                    assert!(msg.contains(want), "{secret}: {msg}");
+                    assert!(!msg.contains("must be valid JSON"), "{secret}: {msg}");
+                }
+                other => panic!("expected InvalidUpstreamCredentials, got {other:?}"),
+            }
         }
     }
 
