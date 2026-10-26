@@ -135,18 +135,38 @@ pub struct LegacyFunctionCalling {
 pub fn legacy_functions_as_tools(
     req: Cow<'_, ChatFormat>,
 ) -> Result<(Cow<'_, ChatFormat>, LegacyFunctionCalling), BridgeError> {
-    let declares = ["functions", "function_call"]
-        .iter()
-        .any(|k| req.extra.contains_key(*k));
+    // A legacy field set to `null` is absent: an SDK replaying a turn it
+    // dumped writes `function_call: null` beside its content.
+    const LEGACY: [&str; 2] = ["functions", "function_call"];
+    let set = |v: Option<&Value>| v.is_some_and(|v| !v.is_null());
+    let declares = LEGACY.iter().any(|k| set(req.extra.get(*k)));
     let replays = req
         .messages
         .iter()
-        .any(|m| m.role == Role::Function || m.extra.contains_key("function_call"));
-    if !declares && !replays {
+        .any(|m| m.role == Role::Function || set(m.extra.get("function_call")));
+    let nulls = LEGACY
+        .iter()
+        .any(|k| req.extra.get(*k).is_some_and(Value::is_null))
+        || req
+            .messages
+            .iter()
+            .any(|m| m.extra.get("function_call").is_some_and(Value::is_null));
+    if !declares && !replays && !nulls {
         return Ok((req, LegacyFunctionCalling::default()));
     }
     let mut req = req.into_owned();
-    let legacy_reply = req.extra.contains_key("functions") && !req.extra.contains_key("tools");
+    req.extra
+        .retain(|k, v| !(v.is_null() && LEGACY.contains(&k.as_str())));
+    for message in &mut req.messages {
+        if message
+            .extra
+            .get("function_call")
+            .is_some_and(Value::is_null)
+        {
+            message.extra.remove("function_call");
+        }
+    }
+    let legacy_reply = req.extra.contains_key("functions") && !set(req.extra.get("tools"));
 
     if let Some(functions) = req.extra.remove("functions") {
         let Value::Array(functions) = functions else {
@@ -422,6 +442,28 @@ mod tests {
             resp.finish_reason,
             FinishReason::Other("function_call".into())
         );
+    }
+
+    #[test]
+    fn null_legacy_fields_are_absent() {
+        let req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello", "function_call": null, "tool_calls": null},
+                {"role": "user", "content": "again"}
+            ],
+            "functions": null,
+            "function_call": null
+        }))
+        .unwrap();
+        let (mapped, legacy) = legacy_functions_as_tools(Cow::Borrowed(&req)).unwrap();
+        assert!(!mapped.extra.contains_key("functions"));
+        assert!(!mapped.extra.contains_key("function_call"));
+        assert!(!mapped.extra.contains_key("tools"));
+        assert!(!mapped.extra.contains_key("tool_choice"));
+        assert!(!mapped.messages[1].extra.contains_key("function_call"));
+        assert!(!legacy.legacy_reply);
     }
 
     #[test]

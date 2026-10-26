@@ -234,6 +234,9 @@ describe("request parameters follow the target platform's contract", () => {
       errorBody: { error: { message: UPSTREAM_ERROR_MESSAGE, type: "invalid_request_error", code: 404, param: null } },
     });
     up.embed = await startOpenAiUpstream({ nonStreamBody: EMBEDDING_REPLY });
+    up.embedNoUsage = await startOpenAiUpstream({
+      nonStreamBody: { object: "list", model: "text-embedding-3-small", data: EMBEDDING_REPLY.data },
+    });
     up.claude = await startOpenAiUpstream({ nonStreamBody: ANTHROPIC_TOOL_USE_REPLY });
     up.claudeStream = await startOpenAiUpstream({ rawStreamFrames: ANTHROPIC_TOOL_USE_STREAM });
     up.gemini = await startOpenAiUpstream({ nonStreamBody: GEMINI_CALL_REPLY });
@@ -255,6 +258,7 @@ describe("request parameters follow the target platform's contract", () => {
     await openaiModel("pc-array", up.array);
     await openaiModel("pc-error", up.error);
     await openaiModel("pc-embed", up.embed, "text-embedding-3-small");
+    await openaiModel("pc-embed-no-usage", up.embedNoUsage, "text-embedding-3-small");
     await seed.createModel({
       display_name: "pc-group",
       routing: { strategy: "failover", targets: [{ model: "pc-garbage" }, { model: "pc-backup" }] },
@@ -452,6 +456,22 @@ describe("request parameters follow the target platform's contract", () => {
     expect(sent.x_trace).toBe("t-1");
   });
 
+  test("token-id input with no upstream usage counts its token ids", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const inputTokens = async () => {
+      const scrape = await fetch(`${app!.metricsUrl}/metrics`).then((r) => r.text());
+      return scrape
+        .split("\n")
+        .filter((l) => l.startsWith("aisix_llm_input_tokens_total{") && l.includes('model="pc-embed-no-usage"'))
+        .reduce((sum, l) => sum + Number.parseFloat(l.split("}").at(-1)!.trim()), 0);
+    };
+    const before = await inputTokens();
+    const res = await post(app, "/v1/embeddings", { model: "pc-embed-no-usage", input: [[101, 2023, 102], [7, 8]] });
+    const text = await res.text();
+    expect(res.status, text).toBe(200);
+    await expect.poll(inputTokens, { timeout: 5_000 }).toBe(before + 5);
+  });
+
   // ── legacy function calling ────────────────────────────────────────
 
   test("an OpenAI-wire target receives functions, function_call and the function turn as sent", async (ctx) => {
@@ -487,6 +507,26 @@ describe("request parameters follow the target platform's contract", () => {
     expect(body.choices[0].message.function_call).toEqual({ name: "get_weather", arguments: "{\"city\":\"Rome\"}" });
     expect(body.choices[0].message.tool_calls).toBeUndefined();
     expect(body.choices[0].finish_reason).toBe("function_call");
+  });
+
+  test("a replayed turn with null legacy fields reaches Claude as plain history", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const baseline = up.claude.receivedRequests.length;
+    const res = await post(app, "/v1/chat/completions", {
+      model: "pc-claude",
+      messages: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "hello", function_call: null, tool_calls: null },
+        { role: "user", content: "again" },
+      ],
+      functions: null,
+      function_call: null,
+    });
+    const body = (await res.json()) as any;
+    expect(res.status, JSON.stringify(body)).toBe(200);
+    const sent = lastBody(up.claude, baseline).json;
+    expect(sent.tools).toBeUndefined();
+    expect(sent.messages[1].content).toEqual([{ type: "text", text: "hello" }]);
   });
 
   test("Claude streams a legacy function call back as delta.function_call", async (ctx) => {

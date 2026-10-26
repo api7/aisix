@@ -93,6 +93,16 @@ fn captured_embeddings_prompt(req: &EmbeddingRequest) -> String {
     .unwrap_or_default()
 }
 
+/// The token ids in a token-id `input`, nested arrays included.
+fn token_id_count(tokens: &serde_json::Value) -> u32 {
+    match tokens {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .fold(0u32, |acc, item| acc.saturating_add(token_id_count(item))),
+        _ => 1,
+    }
+}
+
 /// Deserialises every form of the OpenAI embeddings `input` field: a
 /// string, an array of strings, an array of token ids, or an array of
 /// token-id arrays.
@@ -670,9 +680,12 @@ async fn dispatch(
                     (reported, false)
                 } else {
                     let upstream_model = model.upstream_model().unwrap_or("unknown");
-                    let estimated = req.input.iter().fold(0u32, |acc, s| {
-                        acc.saturating_add(crate::token_estimate::count_text(upstream_model, s))
-                    });
+                    let estimated = match &req.token_input {
+                        Some(tokens) => token_id_count(tokens),
+                        None => req.input.iter().fold(0u32, |acc, s| {
+                            acc.saturating_add(crate::token_estimate::count_text(upstream_model, s))
+                        }),
+                    };
                     (estimated, estimated > 0)
                 };
             // Commit the reservation — release the concurrency permit
