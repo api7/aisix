@@ -6069,6 +6069,51 @@ impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
     }
 }
 
+/// Output-guardrail scan text kept per choice and channel, so a
+/// multi-choice stream's interleaved deltas never splice one choice's text
+/// into another's: a literal split across one choice's deltas reassembles,
+/// and none forms across two. A scan reads one channel per line.
+#[derive(Default)]
+struct ChoiceTexts(std::collections::BTreeMap<(u32, u64), String>);
+
+impl ChoiceTexts {
+    const CONTENT: u64 = 0;
+    const REFUSAL: u64 = 1;
+
+    fn push(&mut self, choice: u32, channel: u64, text: &str) {
+        if !text.is_empty() {
+            self.0.entry((choice, channel)).or_default().push_str(text);
+        }
+    }
+
+    fn joined(&self) -> String {
+        self.0
+            .values()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn len(&self) -> usize {
+        self.0.values().map(String::len).sum()
+    }
+
+    fn chars(&self) -> usize {
+        self.0.values().map(|t| t.chars().count()).sum()
+    }
+
+    /// Keep each channel's trailing `overlap` chars (at most all but one)
+    /// as context for the next window.
+    fn keep_tails(&mut self, overlap: usize) {
+        self.0.retain(|_, text| {
+            let cc = text.chars().count();
+            let keep = overlap.min(cc.saturating_sub(1));
+            *text = text.chars().skip(cc - keep).collect();
+            !text.is_empty()
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_sse_stream<F>(
     upstream: aisix_gateway::ChatChunkStream,
@@ -6132,7 +6177,7 @@ where
         // requests without an output guardrail this is a no-op
         // borrow of the empty string.
         let mut content_buffer = if output_guardrail.is_some() {
-            Some(String::new())
+            Some(ChoiceTexts::default())
         } else {
             None
         };
@@ -6149,7 +6194,7 @@ where
         // path holds nothing back, so it collects all of it, like the content
         // buffer above. Allocated only with a guardrail.
         let mut tool_calls_buf = if output_guardrail.is_some() {
-            Some(String::new())
+            Some(ChoiceTexts::default())
         } else {
             None
         };
@@ -6187,7 +6232,7 @@ where
         let mut pending_bytes = crate::held_content::HeldBytes::default();
         // Content accumulated since the last window flush (Window mode);
         // bounded to ~window_size, unlike content_buffer (whole response).
-        let mut window_buf = String::new();
+        let mut window_buf = ChoiceTexts::default();
         // Set when a BufferFull cap is exceeded with fail-open: stop
         // holding and forward the remainder live.
         let mut cap_released = false;
@@ -6284,14 +6329,19 @@ where
                     // A streamed `refusal` reaches the caller beside the
                     // content, so it is scanned with it.
                     let refusal = chunk.delta.extra.get("refusal").and_then(|r| r.as_str());
-                    if let Some(text) = chunk.delta.content.as_deref().or(refusal) {
+                    let channels = [
+                        (ChoiceTexts::CONTENT, chunk.delta.content.as_deref()),
+                        (ChoiceTexts::REFUSAL, refusal),
+                    ];
+                    for (channel, text) in channels {
+                        let Some(text) = text else { continue };
                         if matches!(
                             stream_policy,
                             aisix_guardrails::StreamOutputPolicy::Window { .. }
                         ) {
-                            window_buf.push_str(text);
+                            window_buf.push(chunk.choice_index, channel, text);
                         } else if let Some(buf) = content_buffer.as_mut() {
-                            buf.push_str(text);
+                            buf.push(chunk.choice_index, channel, text);
                         }
                         // Content capture: assemble the response for the
                         // observability fan-out, bounded to the cap so a long
@@ -6343,18 +6393,20 @@ where
                     // partial JSON objects; concatenate their text WITHOUT a
                     // separator so a literal split across deltas reassembles.
                     // A legacy `delta.function_call` is one more call, in
-                    // the shape of a tool-call delta.
+                    // the shape of a tool-call delta. Each call is its own
+                    // channel of its choice.
                     let legacy_call = chunk
                         .delta
                         .extra
                         .get("function_call")
                         .map(|f| serde_json::json!({"function": f}));
-                    let calls: Vec<&serde_json::Value> = chunk
+                    let calls: Vec<(u64, &serde_json::Value)> = chunk
                         .delta
                         .tool_calls
                         .iter()
                         .flatten()
-                        .chain(legacy_call.as_ref())
+                        .map(|tc| (tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0), tc))
+                        .chain(legacy_call.as_ref().map(|tc| (u64::MAX, tc)))
                         .collect();
                     if let (false, Some(buf), false, false) = (
                         calls.is_empty(),
@@ -6362,7 +6414,7 @@ where
                         cap_released,
                         tool_calls_overflowed,
                     ) {
-                        for tc in calls {
+                        for (channel, tc) in calls {
                             let function = tc.get("function");
                             let name = function
                                 .and_then(|f| f.get("name"))
@@ -6381,15 +6433,24 @@ where
                             if !hold_back {
                                 // Serialized deltas carry their envelope, so
                                 // they get the raw guard's headroom over the
-                                // default text cap.
+                                // default text cap. Re-indexed by channel so
+                                // the check below rebuilds each choice's calls
+                                // apart.
+                                let mut keyed = tc.clone();
+                                if let Some(obj) = keyed.as_object_mut() {
+                                    obj.insert(
+                                        "index".into(),
+                                        ((u64::from(chunk.choice_index) << 32) | (channel & 0xFFFF_FFFF)).into(),
+                                    );
+                                }
                                 eos_tool_calls.push(
-                                    tc,
+                                    &keyed,
                                     aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES
                                         .saturating_mul(crate::held_content::RAW_HOLD_FACTOR),
                                 );
                             }
-                            buf.push_str(name);
-                            buf.push_str(args);
+                            buf.push(chunk.choice_index, channel, name);
+                            buf.push(chunk.choice_index, channel, args);
                         }
                     }
                     if let Some(u) = chunk.usage.as_ref().or(chunk.accounting_usage.as_ref()) {
@@ -6508,7 +6569,7 @@ where
                         overlap_chars,
                         ..
                     } => {
-                        if window_buf.chars().count() >= *size_chars {
+                        if window_buf.chars() >= *size_chars {
                             if let Some(ctx) = output_guardrail.as_ref() {
                                 let synthesized = {
                                     let comp = guard.comp();
@@ -6524,8 +6585,9 @@ where
                                         // tool-call args ahead of the
                                         // end-of-stream check.
                                         message: aisix_gateway::ChatMessage::assistant({
-                                            let w = window_buf.clone();
-                                            match tool_calls_buf.as_deref() {
+                                            let w = window_buf.joined();
+                                            let tc = tool_calls_buf.as_ref().map(ChoiceTexts::joined);
+                                            match tc.as_deref() {
                                                 Some(tc) if !tc.is_empty() && !w.is_empty() => {
                                                     format!("{w}\n{tc}")
                                                 }
@@ -6594,13 +6656,7 @@ where
                                 // misconfigured overlap >= window can't keep
                                 // the whole buffer and re-scan every
                                 // subsequent token (cost/latency guard).
-                                let cc = window_buf.chars().count();
-                                let keep = (*overlap_chars).min(cc.saturating_sub(1));
-                                window_buf = if keep > 0 {
-                                    window_buf.chars().skip(cc - keep).collect()
-                                } else {
-                                    String::new()
-                                };
+                                window_buf.keep_tails(*overlap_chars);
                             }
                         }
                     }
@@ -6725,13 +6781,13 @@ where
                 // the held events if it scans clean.
                 if let Some(ctx) = output_guardrail.as_ref() {
                     let content_part = match &stream_policy {
-                        aisix_guardrails::StreamOutputPolicy::Window { .. } => window_buf.clone(),
-                        _ => content_buffer.clone().unwrap_or_default(),
+                        aisix_guardrails::StreamOutputPolicy::Window { .. } => window_buf.joined(),
+                        _ => content_buffer.as_ref().map(ChoiceTexts::joined).unwrap_or_default(),
                     };
                     // Scan content + tool-call text together (#448 streaming
                     // parity) so blocked content in tool-call arguments can't
                     // leak. Joined with a newline; either part may be empty.
-                    let tc_part = tool_calls_buf.as_deref().unwrap_or("");
+                    let tc_part = tool_calls_buf.as_ref().map(ChoiceTexts::joined).unwrap_or_default();
                     let final_text = if tc_part.is_empty() {
                         content_part
                     } else if content_part.is_empty() {
@@ -6864,7 +6920,8 @@ where
                 (content_buffer.as_ref(), output_guardrail.as_ref())
             {
                 // EndOfStreamCheck: scan content + tool-call text (#448 parity).
-                let tc_part = tool_calls_buf.as_deref().unwrap_or("");
+                let content = content.joined();
+                let tc_part = tool_calls_buf.as_ref().map(ChoiceTexts::joined).unwrap_or_default();
                 let scan_text = if tc_part.is_empty() {
                     content.clone()
                 } else if content.is_empty() {

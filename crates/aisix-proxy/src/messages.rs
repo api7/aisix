@@ -1272,12 +1272,13 @@ async fn anthropic_passthrough_dispatch(
     // A structured-output request to a Claude family without native
     // structured output, on a platform's own route: the schema rides the
     // synthetic JSON tool in the native body, and the answer is only
-    // complete once that call is, so the upstream leg does not stream.
-    let synthetic_json = platform.is_some() && needs_synthetic_structured_output(&body, model);
+    // complete once that call is, so the upstream leg does not stream. A
+    // format with no object schema injects nothing and goes out as sent.
+    let mut synthetic_json = false;
     let (body_bytes, is_stream, platform_body) = {
         let mut body = body.into_owned();
-        if synthetic_json {
-            aisix_provider_anthropic::json_tool::inject(&mut body);
+        if platform.is_some() && needs_synthetic_structured_output(&body, model) {
+            synthetic_json = aisix_provider_anthropic::json_tool::inject(&mut body);
         }
 
         // Rewrite the `model` field to the upstream value.

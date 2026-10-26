@@ -267,12 +267,13 @@ fn mint_tool_call_id() -> String {
     format!("call_{}", uuid::Uuid::new_v4().simple())
 }
 
-/// A streamed delta names its call by `index`, so one call keeps one minted
-/// id across its deltas; a whole response's calls carry no `index` and are
-/// told apart by position.
+/// A streamed delta names its call by its choice and `index`, so one call
+/// keeps one minted id across its deltas; a whole response's calls carry no
+/// `index` and are told apart by position.
 fn mint_positional_ids(
     tool_calls: &mut [Value],
-    minted: &mut Vec<(u64, String)>,
+    choice: u32,
+    minted: &mut Vec<((u32, u64), String)>,
     by_position: bool,
 ) {
     for (position, call) in tool_calls.iter_mut().enumerate() {
@@ -290,11 +291,12 @@ fn mint_positional_ids(
         } else {
             obj.get("index").and_then(Value::as_u64).unwrap_or(0)
         };
-        let id = match minted.iter().find(|(i, _)| *i == index) {
+        let key = (choice, index);
+        let id = match minted.iter().find(|(k, _)| *k == key) {
             Some((_, id)) => id.clone(),
             None => {
                 let id = mint_tool_call_id();
-                minted.push((index, id.clone()));
+                minted.push((key, id.clone()));
                 id
             }
         };
@@ -466,7 +468,7 @@ pub(crate) async fn chat(
     }
     for message in chat.messages_mut() {
         if let Some(Value::Array(calls)) = message.extra.get_mut("tool_calls") {
-            mint_positional_ids(calls, &mut Vec::new(), true);
+            mint_positional_ids(calls, 0, &mut Vec::new(), true);
         }
     }
     Ok(chat)
@@ -484,7 +486,7 @@ pub(crate) async fn chat_stream(
     let stream = async_stream::try_stream! {
         let mut decoder = SseDecoder::new();
         let mut indexer = ToolCallIndexer::default();
-        let mut minted: Vec<(u64, String)> = Vec::new();
+        let mut minted: Vec<((u32, u64), String)> = Vec::new();
         let mut byte_stream = Box::pin(byte_stream);
         'outer: while let Some(next) = byte_stream.next().await {
             let bytes = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
@@ -511,7 +513,7 @@ pub(crate) async fn chat_stream(
 fn chunk_from(
     payload: &str,
     indexer: &mut ToolCallIndexer,
-    minted: &mut Vec<(u64, String)>,
+    minted: &mut Vec<((u32, u64), String)>,
     request_id: &str,
 ) -> Result<Vec<ChatChunk>, BridgeError> {
     let parsed: OpenAiStreamChunk = serde_json::from_str(payload).map_err(|e| {
@@ -524,7 +526,7 @@ fn chunk_from(
             chunk.id = request_id.to_string();
         }
         if let Some(calls) = chunk.delta.tool_calls.as_mut() {
-            mint_positional_ids(calls, minted, false);
+            mint_positional_ids(calls, chunk.choice_index, minted, false);
         }
     }
     Ok(chunks)
@@ -533,6 +535,37 @@ fn chunk_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_positional_ids_are_minted_per_choice() {
+        let mut indexer = ToolCallIndexer::default();
+        let mut minted = Vec::new();
+        let delta = |choice: u32, args: &str| {
+            serde_json::json!({
+                "id": "r",
+                "object": "chat.completion.chunk",
+                "model": "m",
+                "choices": [{"index": choice, "delta": {"tool_calls": [{
+                    "index": 0, "id": "call_0", "type": "function",
+                    "function": {"name": "f", "arguments": args}
+                }]}}]
+            })
+            .to_string()
+        };
+        let mut id_of = |payload: String| {
+            let chunks = chunk_from(&payload, &mut indexer, &mut minted, "r").unwrap();
+            chunks[0].delta.tool_calls.as_ref().unwrap()[0]["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let c0_first = id_of(delta(0, "{"));
+        let c1 = id_of(delta(1, "{"));
+        let c0_again = id_of(delta(0, "}"));
+        assert_ne!(c0_first, c1);
+        assert_eq!(c0_first, c0_again);
+        assert_ne!(c0_first, "call_0");
+    }
 
     #[test]
     fn default_route_needs_the_family_and_a_cross_region_prefix() {

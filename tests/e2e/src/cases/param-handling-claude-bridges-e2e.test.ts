@@ -103,6 +103,21 @@ async function startUpstream() {
         if (lastText.includes("FILTER")) return json(200, openAiReply({ content: "partial" }, "content_filter"));
         return json(200, openAiReply({ content: "ok" }, "stop"));
       }
+      if (path.endsWith(":streamRawPredict")) {
+        const sse = (event: Record<string, unknown>) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(
+          [
+            sse({ type: "message_start", message: { id: "msg_vs", type: "message", role: "assistant", model: VERTEX_OLD_CLAUDE, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 7, output_tokens: 0 } } }),
+            sse({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+            sse({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "streamed" } }),
+            sse({ type: "content_block_stop", index: 0 }),
+            sse({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 1 } }),
+            sse({ type: "message_stop" }),
+          ].join(""),
+        );
+        return;
+      }
       if (path.endsWith(":rawPredict")) {
         return json(200, {
           id: "msg_vertex",
@@ -453,5 +468,25 @@ describe("Claude bridges handle each field by the target's contract", () => {
       .join("");
     expect(text).toBe("{\"city\":\"Paris\"}");
     expect(events.find((e) => e.type === "message_delta")?.delta.stop_reason).toBe("end_turn");
+  });
+
+  test("a structured-output request with no object schema keeps streaming upstream", async (ctx) => {
+    if (!ready(ctx)) return;
+    const res = await post("/v1/messages", {
+      model: "pcb-vertex-old-claude",
+      max_tokens: 64,
+      stream: true,
+      messages: [{ role: "user", content: "weather?" }],
+      output_format: { type: "json_schema" },
+    });
+    expect(res.status, res.text).toBe(200);
+    const sent = res.sent.at(-1)!;
+    expect(sent.path).toMatch(/:streamRawPredict$/);
+    expect(sent.body).not.toHaveProperty("tools");
+    const text = frames(res.text)
+      .filter((e) => e.type === "content_block_delta" && e.delta.type === "text_delta")
+      .map((e) => e.delta.text)
+      .join("");
+    expect(text).toBe("streamed");
   });
 });

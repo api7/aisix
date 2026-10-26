@@ -1323,6 +1323,9 @@ pub fn redact_chat_response(chain: &dyn Guardrail, resp: &mut ChatResponse) -> R
                 }
             }
         }
+        if let Some(refusal) = message.extra.get_mut("refusal") {
+            apply_to_value_string(chain, Direction::Output, refusal, &mut counts);
+        }
         if let Some(tool_calls) = message.extra.get_mut("tool_calls") {
             redact_tool_call_arguments(chain, Direction::Output, tool_calls, &mut counts);
         }
@@ -1379,6 +1382,41 @@ pub fn redact_chat_chunks(chain: &dyn Guardrail, chunks: &mut [ChatChunk]) -> Re
                 } else {
                     String::new()
                 });
+            }
+            merge_counts(&mut counts, r.counts);
+        }
+    }
+
+    // Refusal channels: a choice streams its refusal text beside its content.
+    let mut refusal_channels: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (i, c) in chunks.iter().enumerate() {
+        if c.delta
+            .extra
+            .get("refusal")
+            .and_then(Value::as_str)
+            .is_some_and(|t| !t.is_empty())
+        {
+            refusal_channels.entry(c.choice_index).or_default().push(i);
+        }
+    }
+    for refusal_sites in refusal_channels.values() {
+        let joined: String = refusal_sites
+            .iter()
+            .filter_map(|&i| chunks[i].delta.extra.get("refusal").and_then(Value::as_str))
+            .collect();
+        if let Some(r) = chain.redact_output_text(&joined) {
+            let mut first = true;
+            for &i in refusal_sites {
+                let text = if first {
+                    first = false;
+                    r.text.clone()
+                } else {
+                    String::new()
+                };
+                chunks[i]
+                    .delta
+                    .extra
+                    .insert("refusal".into(), Value::String(text));
             }
             merge_counts(&mut counts, r.counts);
         }

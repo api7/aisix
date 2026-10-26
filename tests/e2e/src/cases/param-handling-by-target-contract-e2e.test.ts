@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -538,5 +539,166 @@ describe("request parameters follow the target platform's contract", () => {
     expect(res.status, JSON.stringify(body)).toBe(400);
     expect(body.error.type).toBe("invalid_request_error");
     expect(body.error.message).toContain(c.field);
+  });
+});
+
+/** An OpenAI moderation endpoint that flags any input containing "bomb". */
+async function startModeration(): Promise<{ baseUrl: string; close: () => Promise<void> }> {
+  const server: Server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
+    req.on("end", () => {
+      const input = String(JSON.parse(raw || "{}").input ?? "");
+      const flagged = input.includes("bomb");
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          id: "modr",
+          model: "omni-moderation-latest",
+          results: [{ flagged, categories: { violence: flagged }, category_scores: { violence: flagged ? 0.99 : 0.01 } }],
+        }),
+      );
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  if (addr === null || typeof addr === "string") throw new Error("no port");
+  return {
+    baseUrl: `http://127.0.0.1:${addr.port}`,
+    close: () => new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))),
+  };
+}
+
+// Output guardrails over the answer as relayed: each choice is scanned on
+// its own, and the refusal text is masked like the content.
+describe("output guardrails cover every choice and the refusal", () => {
+  let app: SpawnedApp | undefined;
+  let etcdReachable = false;
+  const up: Record<string, OpenAiUpstream> = {};
+  const EMAIL = "jane@corp.example";
+  let moderationServer: { baseUrl: string; close: () => Promise<void> };
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+
+    // "bomb" split across choice 0's deltas, with choice 1's between them.
+    up.interleaved = await startOpenAiUpstream({
+      streamEvents: [
+        chunk([{ index: 0, delta: { role: "assistant", content: "bo" }, finish_reason: null }]),
+        chunk([{ index: 1, delta: { role: "assistant", content: "xx" }, finish_reason: null }]),
+        chunk([{ index: 0, delta: { content: "mb" }, finish_reason: null }]),
+        chunk([
+          { index: 0, delta: {}, finish_reason: "stop" },
+          { index: 1, delta: {}, finish_reason: "stop" },
+        ]),
+        "[DONE]",
+      ],
+    });
+    up.refusal = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "chatcmpl-r",
+        object: "chat.completion",
+        created: 1_700_000_000,
+        model: "gpt-4o",
+        choices: [{ index: 0, message: { role: "assistant", content: null, refusal: `I can't email ${EMAIL}` }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
+      },
+    });
+    up.refusalStream = await startOpenAiUpstream({
+      streamEvents: [
+        chunk([{ index: 0, delta: { role: "assistant", refusal: "I can't email jane@" }, finish_reason: null }]),
+        chunk([{ index: 0, delta: { refusal: "corp.example" }, finish_reason: null }]),
+        chunk([{ index: 0, delta: {}, finish_reason: "stop" }]),
+        "[DONE]",
+      ],
+    });
+
+    moderationServer = await startModeration();
+
+    app = await spawnApp();
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    const model = async (name: string, upstream: OpenAiUpstream) => {
+      const pk = await seed.createProviderKey({ display_name: `${name}-pk`, secret: "sk-mock", api_base: `${upstream.baseUrl}/v1` });
+      return seed.createModel({ display_name: name, provider: "openai", model_name: "gpt-4o", provider_key_id: pk.id });
+    };
+    const interleaved = await model("pg-interleaved", up.interleaved);
+    const refusal = await model("pg-refusal", up.refusal);
+    const refusalStream = await model("pg-refusal-stream", up.refusalStream);
+    // A remote moderation guardrail judges the text it is sent.
+    const moderation = await seed.createGuardrail(
+      {
+        name: "pg-moderation",
+        enabled: true,
+        kind: "openai_moderation",
+        hook_point: "output",
+        api_key: "sk-moderation",
+        endpoint: moderationServer.baseUrl,
+      },
+      { attach: false },
+    );
+    await seed.attachGuardrailToModel(moderation.id, interleaved.id);
+    const pii = await seed.createGuardrail(
+      { name: "pg-pii", enabled: true, hook_point: "output", kind: "pii", detectors: [{ type: "email", action: "mask" }] },
+      { attach: false },
+    );
+    await seed.attachGuardrailToModel(pii.id, refusal.id);
+    await seed.attachGuardrailToModel(pii.id, refusalStream.id);
+
+    // Seeded last: the key authenticating implies the whole seed set is live.
+    await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
+    await waitConfigPropagation(async () => {
+      const res = await post(app!, "/v1/chat/completions", { model: "pg-refusal", messages: [{ role: "user", content: "hi" }] });
+      await res.arrayBuffer();
+      return res.status === 200;
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await Promise.all(Object.values(up).map((u) => u.close()));
+    await moderationServer?.close();
+  });
+
+  test("a blocked literal split across one choice's deltas is caught between another choice's", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const res = await post(app, "/v1/chat/completions", {
+      model: "pg-interleaved",
+      n: 2,
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const text = await res.text();
+    const content = sseData(text)
+      .flatMap((c: any) => c.choices ?? [])
+      .filter((c: any) => c.index === 0)
+      .map((c: any) => c.delta?.content ?? "")
+      .join("");
+    expect(content).not.toContain("bomb");
+    expect(text).toContain("event: error");
+  });
+
+  test("the refusal text is masked, streamed or not", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const plain = await post(app, "/v1/chat/completions", { model: "pg-refusal", messages: [{ role: "user", content: "hi" }] });
+    const body = (await plain.json()) as any;
+    expect(plain.status, JSON.stringify(body)).toBe(200);
+    expect(body.choices[0].message.refusal).toContain("I can't email");
+    expect(body.choices[0].message.refusal).not.toContain(EMAIL);
+
+    const streamed = await post(app, "/v1/chat/completions", {
+      model: "pg-refusal-stream",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const text = await streamed.text();
+    expect(streamed.status, text).toBe(200);
+    const refusal = sseData(text)
+      .flatMap((c: any) => c.choices ?? [])
+      .map((c: any) => c.delta?.refusal ?? "")
+      .join("");
+    expect(refusal).toContain("I can't email");
+    expect(refusal).not.toContain(EMAIL);
   });
 });
