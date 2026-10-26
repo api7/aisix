@@ -301,6 +301,41 @@ impl ChatMessage {
         self.text().unwrap_or(std::borrow::Cow::Borrowed(""))
     }
 
+    /// The upstream's chain-of-thought: the `reasoning_content` slot, else
+    /// the reasoning parts of an array `content` — Mistral's
+    /// `{type: "thinking", thinking: [{type: "text", text}]}` and
+    /// Databricks' `{type: "reasoning", summary: [{type: "summary_text",
+    /// text}]}`. Every reader of an answer's reasoning goes through this.
+    pub fn reasoning_text(&self) -> Option<std::borrow::Cow<'_, str>> {
+        if let Some(text) = self
+            .extra
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(std::borrow::Cow::Borrowed(text));
+        }
+        let text: String = self
+            .content_blocks
+            .iter()
+            .flatten()
+            .flat_map(|b| match b.get("type").and_then(Value::as_str) {
+                Some("thinking") => b.get("thinking").and_then(Value::as_array),
+                Some("reasoning") => b.get("summary").and_then(Value::as_array),
+                _ => None,
+            })
+            .flatten()
+            .filter(|c| {
+                matches!(
+                    c.get("type").and_then(Value::as_str),
+                    Some("text" | "summary_text")
+                )
+            })
+            .filter_map(|c| c.get("text").and_then(Value::as_str))
+            .collect();
+        (!text.is_empty()).then_some(std::borrow::Cow::Owned(text))
+    }
+
     /// Stop storing `content` when it is exactly the text the content
     /// blocks derive, so the text is held once. A `content` that says
     /// something else is kept as it is.

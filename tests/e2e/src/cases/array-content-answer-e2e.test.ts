@@ -52,14 +52,44 @@ const arrayReply = (text: string) => ({
   usage: { prompt_tokens: 7, completion_tokens: 8, total_tokens: 15 },
 });
 
+// Reasoning answered as content parts, in the two documented shapes:
+// Mistral's thinking chunk (a list of text chunks) and Databricks' reasoning
+// block (a list of summary_text entries).
+const THINKING = "The user asks for the capital of France, which is Paris.";
+const REASONING_PARTS = {
+  mistral: { type: "thinking", thinking: [{ type: "text", text: THINKING }] },
+  databricks: { type: "reasoning", summary: [{ type: "summary_text", text: THINKING, signature: "sig" }] },
+} as const;
+
+const reasoningReply = (part: unknown, withUsage = true) => ({
+  id: "chatcmpl-reasoning",
+  object: "chat.completion",
+  created: 1_700_000_000,
+  model: "magistral-medium",
+  choices: [
+    {
+      index: 0,
+      message: { role: "assistant", content: [part, { type: "text", text: ANSWER }] },
+      finish_reason: "stop",
+    },
+  ],
+  ...(withUsage ? { usage: { prompt_tokens: 7, completion_tokens: 30, total_tokens: 37 } } : {}),
+});
+
+// Long enough that its tokens dominate the estimate of an answer that
+// reports no usage.
+const LONG_THINKING = "Considering every European capital in turn before settling on one. ".repeat(20);
+
 interface OtlpReceiver {
   url: string;
   spanAttrs: Array<Record<string, string>>;
+  errors: string[];
   close(): Promise<void>;
 }
 
 async function startOtlpReceiver(): Promise<OtlpReceiver> {
   const spanAttrs: Array<Record<string, string>> = [];
+  const errors: string[] = [];
   const server: Server = createServer((req, res) => {
     let raw = "";
     req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
@@ -78,8 +108,11 @@ async function startOtlpReceiver(): Promise<OtlpReceiver> {
             }
           }
         }
-      } catch {
-        // a malformed body fails the assertions on missing spans
+      } catch (err) {
+        errors.push(String(err));
+        res.statusCode = 400;
+        res.end("{}");
+        return;
       }
       res.statusCode = 200;
       res.end("{}");
@@ -90,6 +123,7 @@ async function startOtlpReceiver(): Promise<OtlpReceiver> {
   return {
     url: `http://127.0.0.1:${port}/v1/traces`,
     spanAttrs,
+    errors,
     close: () => new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve()))),
   };
 }
@@ -105,7 +139,10 @@ async function waitForSpans(
     const hits = recv.spanAttrs.filter(predicate);
     if (hits.length >= count) return hits;
     if (Date.now() > deadline) {
-      throw new Error(`${hits.length}/${count} matching spans within timeout; ${recv.spanAttrs.length} spans seen`);
+      throw new Error(
+        `${hits.length}/${count} matching spans within timeout; ${recv.spanAttrs.length} spans seen; ` +
+          `malformed payloads: ${JSON.stringify(recv.errors)}`,
+      );
     }
     await new Promise((r) => setTimeout(r, 50));
   }
@@ -120,6 +157,7 @@ async function post(app: SpawnedApp, path: string, body: unknown) {
 describe("an answer whose content is an array of parts", () => {
   let app: SpawnedApp | undefined;
   let otlp: OtlpReceiver | undefined;
+  let otlpWide: OtlpReceiver | undefined;
   let etcdReachable = false;
   const up: Record<string, OpenAiUpstream> = {};
 
@@ -131,7 +169,13 @@ describe("an answer whose content is an array of parts", () => {
     up.short = await startOpenAiUpstream({ nonStreamBody: arrayReply(ANSWER) });
     up.long = await startOpenAiUpstream({ nonStreamBody: arrayReply(LONG_ANSWER) });
     up.cached = await startOpenAiUpstream({ nonStreamBody: arrayReply(LONG_ANSWER) });
+    up.mistral = await startOpenAiUpstream({ nonStreamBody: reasoningReply(REASONING_PARTS.mistral) });
+    up.databricks = await startOpenAiUpstream({ nonStreamBody: reasoningReply(REASONING_PARTS.databricks) });
+    up.noUsage = await startOpenAiUpstream({
+      nonStreamBody: reasoningReply({ type: "thinking", thinking: [{ type: "text", text: LONG_THINKING }] }, false),
+    });
     otlp = await startOtlpReceiver();
+    otlpWide = await startOtlpReceiver();
 
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -152,6 +196,9 @@ describe("an answer whose content is an array of parts", () => {
     await model("ac-short", up.short);
     await model("ac-long", up.long);
     await model("ac-cached", up.cached);
+    await model("ac-mistral", up.mistral);
+    await model("ac-databricks", up.databricks);
+    await model("ac-no-usage", up.noUsage);
     await seed.createCachePolicy({ name: "ac-cache", enabled: true, applies_to: "model:ac-cached" });
     await seed.createObservabilityExporter({
       name: "ac-otlp",
@@ -160,6 +207,15 @@ describe("an answer whose content is an array of parts", () => {
       endpoint: otlp.url,
       content_mode: "full",
       content_max_bytes: CONTENT_MAX_BYTES,
+    });
+    // A cap the structured answer fits under, so it is reported as messages.
+    await seed.createObservabilityExporter({
+      name: "ac-otlp-wide",
+      enabled: true,
+      kind: "otlp_http",
+      endpoint: otlpWide.url,
+      content_mode: "full",
+      content_max_bytes: 8192,
     });
     // Seeded last: the key authenticating implies the whole seed set is live.
     await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
@@ -173,6 +229,7 @@ describe("an answer whose content is an array of parts", () => {
   afterAll(async () => {
     await app?.exit();
     await otlp?.close();
+    await otlpWide?.close();
     await Promise.all(Object.values(up).map((u) => u.close()));
   });
 
@@ -234,5 +291,66 @@ describe("an answer whose content is an array of parts", () => {
       expect(span["aisix.content.response"]).toBeDefined();
       expect(span["aisix.content.response"].startsWith("array-answer-array-answer-")).toBe(true);
     }
+  });
+
+  test.for(["mistral", "databricks"] as const)(
+    "reasoning parts (%s) reach a /v1/messages caller as a thinking block ahead of the text",
+    async (shape, ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const res = await post(app, "/v1/messages", {
+        model: `ac-${shape}`,
+        max_tokens: 64,
+        messages: [{ role: "user", content: "What is the capital of France?" }],
+      });
+      const body = (await res.json()) as any;
+      expect(res.status, JSON.stringify(body)).toBe(200);
+      expect(body.content).toEqual([
+        { type: "thinking", thinking: THINKING, signature: "" },
+        { type: "text", text: ANSWER },
+      ]);
+    },
+  );
+
+  test.for(["mistral", "databricks"] as const)(
+    "reasoning parts (%s) reach a /v1/responses caller as a reasoning item ahead of the message",
+    async (shape, ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const res = await post(app, "/v1/responses", { model: `ac-${shape}`, input: "What is the capital of France?" });
+      const body = (await res.json()) as any;
+      expect(res.status, JSON.stringify(body)).toBe(200);
+      expect(body.output.map((item: any) => item.type)).toEqual(["reasoning", "message"]);
+      expect(body.output[0].summary).toEqual([{ type: "summary_text", text: THINKING }]);
+      expect(body.output[1].content).toMatchObject([{ type: "output_text", text: ANSWER }]);
+    },
+  );
+
+  test("reasoning parts count toward the completion tokens estimated for an answer without usage", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const res = await post(app, "/v1/chat/completions", {
+      model: "ac-no-usage",
+      messages: [{ role: "user", content: "What is the capital of France?" }],
+    });
+    const body = (await res.json()) as any;
+    expect(res.status, JSON.stringify(body)).toBe(200);
+    // The answer text alone is under ten tokens; the reasoning is hundreds.
+    expect(body.usage.completion_tokens, JSON.stringify(body.usage)).toBeGreaterThan(100);
+  });
+
+  test("reasoning parts reach the content exporter as a reasoning part", async (ctx) => {
+    if (!etcdReachable || !app || !otlpWide) return ctx.skip();
+    const probe = "reasoning-capture-probe";
+    const res = await post(app, "/v1/chat/completions", {
+      model: "ac-mistral",
+      messages: [{ role: "user", content: probe }],
+    });
+    expect(res.status, await res.text()).toBe(200);
+    const [span] = await waitForSpans(otlpWide, (a) => promptOf(a).includes(probe), 1);
+    const output = JSON.parse(span["gen_ai.output.messages"] ?? "null");
+    expect(output?.[0]?.parts, span["gen_ai.output.messages"]).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "reasoning", content: THINKING }),
+        expect.objectContaining({ type: "text", content: ANSWER }),
+      ]),
+    );
   });
 });

@@ -3562,13 +3562,7 @@ pub fn chat_response_into_anthropic_json(
     // ahead of the text and tool_use it produced. It carries no signature
     // — the upstream issued none — so `signature` is the empty string the
     // block shape still requires.
-    if let Some(reasoning) = resp
-        .message
-        .extra
-        .get("reasoning_content")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(reasoning) = resp.message.reasoning_text() {
         content.push(serde_json::json!({
             "type": "thinking",
             "thinking": reasoning,
