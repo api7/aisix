@@ -195,6 +195,7 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
       ["cc-gpt", "global.openai.gpt-6.1-sol"],
       ["cc-gpt-bare", "openai.gpt-6-sol"],
       ["cc-grok", "us.xai.grok-4.6"],
+      ["cc-grok-bare", "xai.grok-4.6"],
       ["cc-llama", "meta.llama3-3-70b-instruct-v1:0"],
       ["cc-gptoss", "openai.gpt-oss-120b-1:0"],
       ["cc-nova2", "us.amazon.nova-2-lite-v1:0"],
@@ -290,8 +291,8 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
     expect(sent[0].body.model).toBe("global.openai.gpt-6.1-sol");
     expect(sent[0].body.max_completion_tokens).toBe(64);
     expect(sent[0].body.max_tokens).toBeUndefined();
-    expect(sent[0].body.stop).toBeUndefined();
-    expect(sent[0].body.n).toBeUndefined();
+    expect(sent[0].body.stop).toEqual(["END"]);
+    expect(sent[0].body.n).toBe(1);
     expect(sent[0].body.tools).toHaveLength(1);
     // The positional `call_0` / `call_1` are replaced by unique ids, one per call.
     const body = JSON.parse(result.text);
@@ -320,15 +321,42 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
     expect(body.error.code).toBe("context_length_exceeded");
   });
 
-  test("a GPT model while it reasons drops the sampling parameters AWS refuses", async (ctx) => {
+  // AWS's refusal of a parameter for a model is answered with its own 400,
+  // which the caller receives; nothing the caller sent is dropped first.
+  const CHAT_COMPLETIONS_REFUSAL = "Unsupported parameter: 'temperature' is not supported with this model.";
+  const refuseChatCompletions: Responder = (r) =>
+    r.path.endsWith("/openai/v1/chat/completions")
+      ? {
+          status: 400,
+          body: { error: { message: CHAT_COMPLETIONS_REFUSAL, type: "invalid_request_error", param: null, code: null } },
+        }
+      : defaultReply(r);
+
+  test("a GPT model while it reasons gets its sampling and logprob parameters as sent", async (ctx) => {
     if (skip(ctx)) return;
+    // Binary fractions, so the values survive the f32 sampling fields exactly.
+    const params = {
+      temperature: 0.5,
+      top_p: 0.75,
+      frequency_penalty: 0.5,
+      presence_penalty: 0.25,
+      logprobs: true,
+      top_logprobs: 2,
+      n: 2,
+      stop: "END",
+    };
     const { result, sent } = await capture(() =>
-      chat({ model: "cc-gpt", messages: [{ role: "user", content: "hi" }], temperature: 0.2, top_p: 0.9 }),
+      chat({ model: "cc-gpt", messages: [{ role: "user", content: "hi" }], ...params }),
     );
     expect(result.status, result.text).toBe(200);
+    expect(sent).toHaveLength(1);
     expect(sent[0].path).toBe("/openai/v1/chat/completions");
-    expect(sent[0].body.temperature).toBeUndefined();
-    expect(sent[0].body.top_p).toBeUndefined();
+    expect(sent[0].body).toMatchObject(params);
+
+    respond = refuseChatCompletions;
+    const refused = await chat({ model: "cc-gpt", messages: [{ role: "user", content: "hi" }], ...params });
+    expect(refused.status, refused.text).toBe(400);
+    expect(JSON.parse(refused.text).error.message).toBe(CHAT_COMPLETIONS_REFUSAL);
   });
 
   test("Chat Completions streams through the same endpoint", async (ctx) => {
@@ -381,24 +409,40 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
     expect(sent[0].body.additionalModelRequestFields).toBeUndefined();
   });
 
-  test("Grok keeps tools on Chat Completions and drops the penalties AWS refuses", async (ctx) => {
+  test("Grok keeps tools on Chat Completions and gets its penalties, stop, n and effort as sent", async (ctx) => {
     if (skip(ctx)) return;
+    const params = {
+      frequency_penalty: 0.5,
+      presence_penalty: 0.5,
+      reasoning_effort: "none",
+      stop: ["END", "STOP"],
+      n: 2,
+    };
     const { result, sent } = await capture(() =>
-      chat({
-        model: "cc-grok",
-        messages: [{ role: "user", content: "weather?" }],
-        tools: TOOLS,
-        frequency_penalty: 0.5,
-        presence_penalty: 0.5,
-        reasoning_effort: "none",
-      }),
+      chat({ model: "cc-grok", messages: [{ role: "user", content: "weather?" }], tools: TOOLS, ...params }),
     );
     expect(result.status, result.text).toBe(200);
     expect(sent[0].path).toBe("/openai/v1/chat/completions");
     expect(sent[0].body.model).toBe("us.xai.grok-4.6");
-    expect(sent[0].body.frequency_penalty).toBeUndefined();
-    expect(sent[0].body.presence_penalty).toBeUndefined();
-    expect(sent[0].body.reasoning_effort).toBeUndefined();
+    expect(sent[0].body).toMatchObject(params);
+    expect(sent[0].body.tools).toHaveLength(1);
+
+    respond = refuseChatCompletions;
+    const refused = await chat({ model: "cc-grok", messages: [{ role: "user", content: "hi" }], ...params });
+    expect(refused.status, refused.text).toBe(400);
+    expect(JSON.parse(refused.text).error.message).toBe(CHAT_COMPLETIONS_REFUSAL);
+  });
+
+  test("a non-string reasoning_effort reaches Chat Completions as sent", async (ctx) => {
+    if (skip(ctx)) return;
+    for (const model of ["cc-grok", "cc-gpt"]) {
+      const { result, sent } = await capture(() =>
+        chat({ model, messages: [{ role: "user", content: "hi" }], reasoning_effort: { level: "high" } }),
+      );
+      expect(result.status, result.text).toBe(200);
+      expect(sent[0].path, model).toBe("/openai/v1/chat/completions");
+      expect(sent[0].body.reasoning_effort, model).toEqual({ level: "high" });
+    }
   });
 
   test("an in-region GPT id stays on Converse", async (ctx) => {
@@ -478,17 +522,31 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
     expect(sent[0].body.inferenceConfig).toEqual({ maxTokens: 50, stopSequences: ["END"] });
   });
 
-  // AWS answers gpt-oss with "This model doesn't support the stopSequences
-  // field", streamed or not.
-  test("gpt-oss gets no stop sequences, streamed or not", async (ctx) => {
+  // Models AWS refuses stop sequences for still get them, and the caller
+  // receives AWS's refusal.
+  test("gpt-oss, Grok and GPT get stop sequences on Converse, streamed or not", async (ctx) => {
     if (skip(ctx)) return;
-    for (const stream of [false, true]) {
-      const { result, sent } = await capture(() =>
-        chat({ model: "cc-gptoss", stream, messages: [{ role: "user", content: "hi" }], stop: ["END"], max_tokens: 50 }),
-      );
-      expect(result.status, result.text).toBe(200);
-      expect(sent[0].path).toMatch(stream ? /\/converse-stream$/ : /\/converse$/);
-      expect(sent[0].body.inferenceConfig, `stream=${stream}`).toEqual({ maxTokens: 50 });
+    const refusal = "This model doesn't support the stopSequences field. Remove stopSequences and try again.";
+    for (const model of ["cc-gptoss", "cc-grok-bare", "cc-gpt-bare"]) {
+      for (const stream of [false, true]) {
+        const what = `${model} stream=${stream}`;
+        respond = defaultReply;
+        const { result, sent } = await capture(() =>
+          chat({ model, stream, messages: [{ role: "user", content: "hi" }], stop: ["END"], max_tokens: 50 }),
+        );
+        expect(result.status, `${what}: ${result.text}`).toBe(200);
+        expect(sent[0].path, what).toMatch(stream ? /\/converse-stream$/ : /\/converse$/);
+        expect(sent[0].body.inferenceConfig, what).toEqual({ maxTokens: 50, stopSequences: ["END"] });
+
+        respond = () => ({
+          status: 400,
+          headers: { "x-amzn-errortype": "ValidationException:http://internal.amazon.com/coral/com.amazon.bedrock/" },
+          body: { message: refusal },
+        });
+        const refused = await chat({ model, stream, messages: [{ role: "user", content: "hi" }], stop: ["END"] });
+        expect(refused.status, `${what}: ${refused.text}`).toBe(400);
+        expect(JSON.parse(refused.text).error.message, what).toBe(refusal);
+      }
     }
   });
 
@@ -508,7 +566,6 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
     const routes: Array<Record<string, unknown>> = [
       { model: "cc-llama" },
       { model: "cc-llama", stream: true },
-      // Refused even where no stop sequences are sent at all.
       { model: "cc-gptoss" },
       { model: "cc-claude", stream: true },
       { model: "cc-claude", requestMetadata: { team: "a" } },
@@ -574,7 +631,7 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
     }
   });
 
-  test("an OpenAI GPT model on Converse gets reasoning.effort, no stop sequences, and a cap of at least 16", async (ctx) => {
+  test("an OpenAI GPT model on Converse gets reasoning.effort, its stop sequences, and a cap of at least 16", async (ctx) => {
     if (skip(ctx)) return;
     const { result, sent } = await capture(() =>
       chat({
@@ -587,7 +644,7 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
     );
     expect(result.status, result.text).toBe(200);
     expect(sent[0].body.additionalModelRequestFields).toEqual({ reasoning: { effort: "high" } });
-    expect(sent[0].body.inferenceConfig).toEqual({ maxTokens: 16 });
+    expect(sent[0].body.inferenceConfig).toEqual({ maxTokens: 16, stopSequences: ["END"] });
   });
 
   test("Nova 2 takes reasoning_effort as reasoningConfig", async (ctx) => {
