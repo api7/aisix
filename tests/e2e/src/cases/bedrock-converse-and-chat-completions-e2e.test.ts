@@ -478,6 +478,63 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
     expect(sent[0].body.inferenceConfig).toEqual({ maxTokens: 50, stopSequences: ["END"] });
   });
 
+  // AWS answers gpt-oss with "This model doesn't support the stopSequences
+  // field", streamed or not.
+  test("gpt-oss gets no stop sequences, streamed or not", async (ctx) => {
+    if (skip(ctx)) return;
+    for (const stream of [false, true]) {
+      const { result, sent } = await capture(() =>
+        chat({ model: "cc-gptoss", stream, messages: [{ role: "user", content: "hi" }], stop: ["END"], max_tokens: 50 }),
+      );
+      expect(result.status, result.text).toBe(200);
+      expect(sent[0].path).toMatch(stream ? /\/converse-stream$/ : /\/converse$/);
+      expect(sent[0].body.inferenceConfig, `stream=${stream}`).toEqual({ maxTokens: 50 });
+    }
+  });
+
+  // Converse is built from typed fields, so a value it cannot carry cannot be
+  // forwarded for Bedrock to refuse: the gateway refuses it, naming the field.
+  test("Converse refuses a stop or max_completion_tokens it cannot carry", async (ctx) => {
+    if (skip(ctx)) return;
+    const invalid: Array<[string, Record<string, unknown>]> = [
+      ["stop", { stop: 5 }],
+      ["stop", { stop: { a: 1 } }],
+      ["stop", { stop: ["END", 1] }],
+      ["stop", { stop: ["END", ""] }],
+      ["max_completion_tokens", { max_completion_tokens: -1 }],
+      ["max_completion_tokens", { max_completion_tokens: 1.5 }],
+      ["max_completion_tokens", { max_completion_tokens: "many" }],
+    ];
+    const routes: Array<Record<string, unknown>> = [
+      { model: "cc-llama" },
+      { model: "cc-llama", stream: true },
+      // Refused even where no stop sequences are sent at all.
+      { model: "cc-gptoss" },
+      { model: "cc-claude", stream: true },
+      { model: "cc-claude", requestMetadata: { team: "a" } },
+    ];
+    for (const route of routes) {
+      for (const [field, extra] of invalid) {
+        const what = JSON.stringify({ ...route, ...extra });
+        const { result, sent } = await capture(() =>
+          chat({ ...route, messages: [{ role: "user", content: "hi" }], ...extra }),
+        );
+        expect(result.status, `${what}: ${result.text}`).toBe(400);
+        const err = JSON.parse(result.text).error;
+        expect(err.type, what).toBe("invalid_request_error");
+        expect(err.message, what).toContain(field);
+        expect(sent, what).toHaveLength(0);
+      }
+    }
+    // A lone empty string is still skipped: Converse rejects it, and it asks
+    // for nothing.
+    const { result, sent } = await capture(() =>
+      chat({ model: "cc-llama", messages: [{ role: "user", content: "hi" }], stop: "", max_completion_tokens: 50 }),
+    );
+    expect(result.status, result.text).toBe(200);
+    expect(sent[0].body.inferenceConfig).toEqual({ maxTokens: 50 });
+  });
+
   // Converse refuses `stopSequences` beside an additional `stop_sequences`.
   test("ConverseStream to Claude lets a native stop_sequences win over stop", async (ctx) => {
     if (skip(ctx)) return;

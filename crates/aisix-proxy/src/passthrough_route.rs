@@ -1038,6 +1038,7 @@ async fn dispatch(
         attempt_started,
         status: status.as_u16(),
         usage: None,
+        labelled_usage: None,
         service_tier: None,
         requested_model,
         metering,
@@ -5628,7 +5629,7 @@ fn frame_parts(
     metering: Metering,
     frame: &[u8],
 ) -> (crate::held_content::Parts, Option<PassthroughUsage>) {
-    let (parts, usage, _) = frame_parts_and_tier(protocol, metering, frame);
+    let (parts, usage, _, _) = frame_parts_and_tier(protocol, metering, frame);
     (parts, usage)
 }
 
@@ -5636,6 +5637,11 @@ fn frame_parts(
 /// same protocol's rule as the typed streaming endpoint: an OpenAI chunk's
 /// top-level `service_tier`, an Anthropic `message_start` / `message_delta`
 /// usage, a terminal Responses snapshot.
+///
+/// The fourth value is, on a DETECTED protocol, the flat token object of a
+/// frame the server labelled a usage report: what the stream is metered
+/// with only if the typed parser read no usage on any of its frames, never
+/// added to usage it did read ([`RouteTelemetry::labelled_usage`]).
 fn frame_parts_and_tier(
     protocol: PassthroughProtocol,
     metering: Metering,
@@ -5644,8 +5650,10 @@ fn frame_parts_and_tier(
     crate::held_content::Parts,
     Option<PassthroughUsage>,
     Option<String>,
+    Option<PassthroughUsage>,
 ) {
     let mut tier = None;
+    let mut labelled = None;
     let usage_labelled =
         matches!(protocol, PassthroughProtocol::Raw) && is_usage_labelled_frame(frame);
     let mut parts = crate::held_content::Parts::default();
@@ -5735,6 +5743,9 @@ fn frame_parts_and_tier(
             Metering::Responses => crate::responses::terminal_response_service_tier(&v),
             _ => None,
         };
+        if is_usage_labelled_frame(frame) {
+            labelled = agent_token_usage(&v);
+        }
         let report = match metering {
             Metering::Chat | Metering::Anthropic => {
                 match crate::messages::anthropic_stream_usage_stats(&v) {
@@ -5774,7 +5785,7 @@ fn frame_parts_and_tier(
             PassthroughProtocol::OpenaiResponses => crate::held_content::responses_event_parts(&v),
         };
     }
-    (parts, usage, tier)
+    (parts, usage, tier, labelled)
 }
 
 /// The text persisted for a streamed response. Raw passthrough capture keeps
@@ -6107,8 +6118,11 @@ fn stream_response(
                 if let Some(err) = frame_in_band_error(protocol, &frame) {
                     telemetry.record_failure(&err);
                 }
-                let (parts, usage, tier) =
+                let (parts, usage, tier, labelled) =
                     frame_parts_and_tier(protocol, telemetry.metering, &frame);
+                if let Some(u) = labelled {
+                    merge_usage(&mut telemetry.labelled_usage, u);
+                }
                 if tier.is_some() {
                     telemetry.service_tier = tier;
                 }
@@ -6472,8 +6486,11 @@ fn stream_response(
                 if anthropic.is_none() && is_messages_family(protocol) {
                     anthropic = anthropic_stream_frame(&rest);
                 }
-                let (parts, usage, tier) =
+                let (parts, usage, tier, labelled) =
                     frame_parts_and_tier(protocol, telemetry.metering, &rest);
+                if let Some(u) = labelled {
+                    merge_usage(&mut telemetry.labelled_usage, u);
+                }
                 if tier.is_some() {
                     telemetry.service_tier = tier;
                 }
@@ -6868,6 +6885,10 @@ struct RouteTelemetry {
     /// Every token dimension the exchange reported, accumulated field-wise
     /// across the response (buffered) or its frames (streamed).
     usage: Option<PassthroughUsage>,
+    /// What server-labelled usage frames (`event: token_usage`) reported on
+    /// a stream whose protocol was detected. The stream is metered with it
+    /// only when the protocol's own parser read no usage at all.
+    labelled_usage: Option<PassthroughUsage>,
     /// The tier the upstream reported serving on, by the metered protocol's
     /// rule; the last one reported on a stream.
     service_tier: Option<String>,
@@ -7014,7 +7035,7 @@ impl RouteTelemetry {
         );
         let elapsed = self.started.elapsed();
         let snapshot = self.state.snapshot.load();
-        let usage = self.usage.unwrap_or_default();
+        let usage = self.usage.or(self.labelled_usage).unwrap_or_default();
 
         emit_access_log(
             &self.method,

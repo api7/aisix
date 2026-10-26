@@ -2941,7 +2941,7 @@ fn build_anthropic_sse_stream(
                     if let Some(fr) = chunk.finish_reason.as_ref() {
                         comp.finish_reason = finish_reason_label(fr);
                     }
-                    if let Some(u) = chunk.usage.as_ref() {
+                    if let Some(u) = chunk.usage.as_ref().or(chunk.accounting_usage.as_ref()) {
                         comp.prompt_tokens = comp.prompt_tokens.max(u.prompt_tokens);
                         comp.completion_tokens = comp.completion_tokens.max(u.completion_tokens);
                         comp.cache_write_tokens = comp.cache_write_tokens.max(u.cache_write_tokens);

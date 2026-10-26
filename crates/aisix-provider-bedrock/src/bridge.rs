@@ -1816,7 +1816,7 @@ impl ConverseParts {
             upstream_id,
             thinking_max_tokens,
             pk_param_constraints(ctx),
-        );
+        )?;
         Ok(Self {
             systems,
             messages,
@@ -2996,15 +2996,16 @@ fn build_inference_config(
     upstream_id: &str,
     thinking_max_tokens: Option<u32>,
     constraints: Option<&ParamConstraints>,
-) -> Option<InferenceConfiguration> {
+) -> Result<Option<InferenceConfiguration>, BridgeError> {
+    crate::converse_req::check_max_completion_tokens(req)?;
     let max_tokens = crate::converse_req::max_tokens(req, upstream_id).or(thinking_max_tokens);
-    let stop_sequences = crate::converse_req::stop_sequences(req, upstream_id);
+    let stop_sequences = crate::converse_req::stop_sequences(req, upstream_id)?;
     if req.temperature.is_none()
         && max_tokens.is_none()
         && req.top_p.is_none()
         && stop_sequences.is_none()
     {
-        return None;
+        return Ok(None);
     }
     let mut b = InferenceConfiguration::builder();
     if let Some(t) = req.temperature {
@@ -3037,7 +3038,7 @@ fn build_inference_config(
     if let Some(stops) = stop_sequences {
         b = b.set_stop_sequences(Some(stops));
     }
-    Some(b.build())
+    Ok(Some(b.build()))
 }
 
 /// `additionalModelRequestFields` for a Converse request: the caller's own

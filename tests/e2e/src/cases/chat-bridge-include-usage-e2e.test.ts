@@ -6,7 +6,10 @@ import {
   ProxyClient,
   SeedClient,
   spawnApp,
+  startMockSls,
   waitConfigPropagation,
+  waitForSlsLog,
+  type MockSls,
   type SpawnedApp,
 } from "../harness/index.js";
 
@@ -25,16 +28,25 @@ import {
 // has to arrive on a chunk of its own all the same — and once, even when
 // the upstream reports running counts on earlier frames too.
 //
+// Without `include_usage` no chunk carries usage at all, whichever upstream
+// served the stream — including an OpenAI-compatible one that reports usage on
+// its finish chunk — while the usage event still records what was reported.
+//
 // The mock upstream accepts only the top-level fields the Messages API
 // documents and rejects anything else the way Anthropic does.
 
 const CALLER = "sk-chat-bridge-include-usage";
 const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
+const CREDENTIAL_REF = "e2e";
+const LOGSTORE = "chat-bridge-include-usage-store";
 
 const MODELS = {
   anthropic: "include-usage-anthropic",
   vertexClaude: "include-usage-vertex-claude",
   vertexGemini: "include-usage-vertex-gemini",
+  // An OpenAI-compatible upstream (Mistral, vLLM, …) that puts the usage on
+  // its finish chunk rather than on a chunk of its own.
+  openaiCompat: "include-usage-openai-compat",
 } as const;
 
 const ANTHROPIC_FIELDS = new Set([
@@ -105,6 +117,22 @@ function geminiStream(): string {
     .join("");
 }
 
+// Usage on the finish chunk, and no usage-only chunk, even when asked.
+function openAiCompatStream(): string {
+  return [
+    { id: "cmpl-compat", object: "chat.completion.chunk", model: "mistral-small", choices: [{ index: 0, delta: { role: "assistant", content: "Paris." }, finish_reason: null }] },
+    {
+      id: "cmpl-compat",
+      object: "chat.completion.chunk",
+      model: "mistral-small",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      usage: { prompt_tokens: 21, completion_tokens: 5, total_tokens: 26 },
+    },
+  ]
+    .map((f) => `data: ${JSON.stringify(f)}\n\n`)
+    .join("") + "data: [DONE]\n\n";
+}
+
 interface Received {
   path: string;
   body: Record<string, unknown>;
@@ -118,6 +146,11 @@ function startUpstream(received: Received[]): Server {
       const path = req.url ?? "";
       const body = JSON.parse(raw || "{}") as Record<string, unknown>;
       received.push({ path, body });
+      if (path.startsWith("/oai/")) {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(openAiCompatStream());
+        return;
+      }
       if (path.includes(":streamGenerateContent")) {
         res.writeHead(200, { "content-type": "text/event-stream" });
         res.end(geminiStream());
@@ -151,6 +184,7 @@ function parseChatSse(raw: string): Array<Record<string, any>> {
 describe("chat streaming with stream_options.include_usage on bridged upstreams", () => {
   let app: SpawnedApp | undefined;
   let upstream: Server | undefined;
+  let sls: MockSls | undefined;
   const received: Received[] = [];
   let etcdReachable = false;
 
@@ -165,8 +199,23 @@ describe("chat streaming with stream_options.include_usage on bridged upstreams"
     if (addr === null || typeof addr === "string") throw new Error("no port");
     const baseUrl = `http://127.0.0.1:${addr.port}`;
 
-    app = await spawnApp();
+    sls = await startMockSls();
+    app = await spawnApp({
+      extraEnv: {
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-ak-id",
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-ak-secret",
+      },
+    });
     const seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createObservabilityExporter({
+      name: "chat-bridge-include-usage-sls",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: "chat-bridge-include-usage-proj",
+      logstore: LOGSTORE,
+      credential_ref: CREDENTIAL_REF,
+    });
     const anthropicPk = await seed.createProviderKey({
       display_name: `${MODELS.anthropic}-pk`,
       provider: "anthropic",
@@ -199,6 +248,17 @@ describe("chat streaming with stream_options.include_usage on bridged upstreams"
       model_name: "gemini-2.5-flash",
       provider_key_id: vertexPk.id,
     });
+    const compatPk = await seed.createProviderKey({
+      display_name: "include-usage-openai-compat-pk",
+      secret: "sk-compat-mock",
+      api_base: `${baseUrl}/oai`,
+    });
+    await seed.createModel({
+      display_name: MODELS.openaiCompat,
+      provider: "openai",
+      model_name: "mistral-small",
+      provider_key_id: compatPk.id,
+    });
     // Seeded last: this key authenticating implies the whole seed set landed.
     await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: Object.values(MODELS) });
     const probe = new ProxyClient(app.proxyUrl, CALLER);
@@ -207,6 +267,7 @@ describe("chat streaming with stream_options.include_usage on bridged upstreams"
 
   afterAll(async () => {
     await app?.exit();
+    await sls?.close();
     await new Promise<void>((resolve) => (upstream ? upstream.close(() => resolve()) : resolve()));
   });
 
@@ -222,7 +283,8 @@ describe("chat streaming with stream_options.include_usage on bridged upstreams"
       }),
     });
     const raw = await res.text();
-    return { status: res.status, raw, chunks: res.status === 200 ? parseChatSse(raw) : [] };
+    const requestId = res.headers.get("x-aisix-request-id") ?? "";
+    return { status: res.status, raw, requestId, chunks: res.status === 200 ? parseChatSse(raw) : [] };
   }
 
   for (const [label, model] of Object.entries(MODELS)) {
@@ -232,10 +294,15 @@ describe("chat streaming with stream_options.include_usage on bridged upstreams"
       const out = await streamChat(model, { stream_options: { include_usage: true } });
       expect(out.status, out.raw).toBe(200);
 
-      // The upstream never saw the OpenAI parameter.
       const sent = received.slice(before);
       expect(sent).toHaveLength(1);
-      expect(sent[0]!.body).not.toHaveProperty("stream_options");
+      if (label === "openaiCompat") {
+        // Its own parameter: forwarded as the caller sent it.
+        expect(sent[0]!.body.stream_options).toEqual({ include_usage: true });
+      } else {
+        // The upstream never saw the OpenAI parameter.
+        expect(sent[0]!.body).not.toHaveProperty("stream_options");
+      }
 
       const content = out.chunks.map((c) => c.choices?.[0]?.delta?.content ?? "").join("");
       expect(content).toBe("Paris.");
@@ -253,7 +320,7 @@ describe("chat streaming with stream_options.include_usage on bridged upstreams"
       expect(out.chunks.indexOf(finishes[0]!)).toBe(out.chunks.length - 2);
     });
 
-    if (label !== "vertexGemini") {
+    if (label === "anthropic" || label === "vertexClaude") {
       // OpenAI's `max_completion_tokens` and `stop` are Anthropic's `max_tokens`
       // and `stop_sequences`; sent under their OpenAI names they are refused.
       test(`${label}: max_completion_tokens and stop reach Claude under the Messages API names`, async (ctx) => {
@@ -277,16 +344,27 @@ describe("chat streaming with stream_options.include_usage on bridged upstreams"
       });
     }
 
-    test(`${label}: without include_usage no usage-only chunk is sent`, async (ctx) => {
+    test(`${label}: without include_usage no chunk carries usage, and the usage event still has it`, async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
       for (const extra of [{}, { stream_options: { include_usage: false } }]) {
         const out = await streamChat(model, extra);
         expect(out.status, out.raw).toBe(200);
         expect(out.chunks.every((c) => (c.choices ?? []).length === 1), out.raw).toBe(true);
+        const content = out.chunks.map((c) => c.choices[0].delta?.content ?? "").join("");
+        expect(content).toBe("Paris.");
         const finish = out.chunks.find((c) => c.choices[0].finish_reason != null)!;
         expect(finish.choices[0].finish_reason).toBe("stop");
-        // Unchanged: these bridges report usage on the finish chunk.
-        expect(finish.usage).toMatchObject({ prompt_tokens: 21, completion_tokens: 5 });
+        expect(out.raw, out.raw).not.toContain('"usage"');
+
+        const row = await waitForSlsLog(
+          sls!,
+          LOGSTORE,
+          (l) => l.get("request_id") === out.requestId,
+          `usage row for ${out.requestId}`,
+          15_000,
+        );
+        expect(row.get("prompt_tokens"), JSON.stringify([...row])).toBe("21");
+        expect(row.get("completion_tokens"), JSON.stringify([...row])).toBe("5");
       }
     });
   }

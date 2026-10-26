@@ -638,6 +638,9 @@ fn panel_request(req: &ChatFormat, member: &PanelMember) -> ChatFormat {
             .insert("seed".to_string(), serde_json::Value::from(seed));
     }
     out.stream = Some(false);
+    // A streaming caller's `stream_options` would reach a non-streaming
+    // upstream call, which OpenAI-protocol upstreams refuse.
+    out.extra.remove("stream_options");
     out
 }
 

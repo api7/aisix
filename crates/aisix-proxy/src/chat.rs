@@ -6206,6 +6206,7 @@ where
         let mut errored = false;
         let mut first_chunk_seen = false;
         let mut stream_usage: Option<aisix_gateway::chat::UsageStats> = None;
+        let mut last_usage: Option<aisix_gateway::chat::UsageStats> = None;
         let fold_base = base_usage != aisix_gateway::chat::UsageStats::default();
         let mut last_chunk_id = String::new();
         let mut last_chunk_model = String::new();
@@ -6386,40 +6387,29 @@ where
                         comp.reasoning_folded_into_completion = u.reasoning_folded_into_completion;
                         stream_usage = Some(acc);
                     }
-                    // #790: a usage-only terminal chunk (no delta payload, no
-                    // finish_reason) exists because the gateway injected
-                    // `include_usage` on the upstream leg. Its counts are
-                    // already folded into `comp` above — forward it only when
-                    // the client itself asked for usage.
-                    if !client_requested_usage && chunk.is_usage_only() {
-                        continue;
-                    }
-                    // Usage held back for `include_usage`, already folded
-                    // above, on a chunk with nothing else for the caller.
-                    if chunk.accounting_usage.is_some()
-                        && chunk.usage.is_none()
-                        && chunk.finish_reason.is_none()
-                        && chunk.has_no_payload()
-                    {
-                        continue;
-                    }
-                    // #614/#617: an ensemble reports usage on ONE synthesized
-                    // terminal frame (judge + panel, emitted at EOF). A judge
-                    // may stamp usage on every chunk (Gemini/Vertex), so the
-                    // judge's own usage is stripped from each forwarded chunk
-                    // — forwarded immediately, no hold — and a chunk left with
-                    // nothing to carry is dropped. Single-upstream callers
-                    // (`base_usage` zero) are untouched.
-                    if fold_base && chunk.usage.is_some() {
-                        let mut chunk = chunk;
-                        chunk.usage = None;
-                        if chunk.finish_reason.is_none() && chunk.has_no_payload() {
-                            continue;
+                    // What a caller sees of usage on a chat stream is the
+                    // same whichever bridge served it: with `include_usage`,
+                    // one usage-only chunk after every other chunk (emitted
+                    // at EOF below); without it, none. So every report is
+                    // taken off the chunk here — already folded into `comp`
+                    // above — and a chunk left with nothing for the caller
+                    // is dropped. A bridge may report on the finish chunk,
+                    // on several chunks (Gemini's running counts), or on a
+                    // usage-only chunk the gateway asked the upstream for
+                    // (#790); the client sees the last report.
+                    let mut chunk = chunk;
+                    let reported = chunk.accounting_usage.take().is_some();
+                    let reported = match chunk.usage.take() {
+                        Some(u) => {
+                            last_usage = Some(u);
+                            true
                         }
-                        Some(chunk)
-                    } else {
-                        Some(chunk)
+                        None => reported,
+                    };
+                    if reported && chunk.finish_reason.is_none() && chunk.has_no_payload() {
+                        continue;
                     }
+                    Some(chunk)
                 }
                 Err(err) => {
                     errored = true;
@@ -6658,18 +6648,22 @@ where
         // body only when the consumer pulls again. Same placement as the
         // sibling streams in messages.rs and responses_bridge.rs.
         guard.comp().reached_end = true;
-        // #617: the ensemble's single usage frame — the judge's field-wise
-        // max plus the panel sum — stamped like the judge's last chunk.
-        let judge_usage = stream_usage
-            .as_ref()
-            .filter(|_| fold_base && client_requested_usage);
-        if let (Some(judge_usage), false) = (judge_usage, errored) {
+        // The `include_usage` chunk. An ensemble's (#617) is the judge's
+        // field-wise max plus the panel sum; a single upstream's is the last
+        // report. Stamped like the last chunk.
+        let final_usage = if fold_base {
+            stream_usage.map(|u| u.saturating_add(&base_usage))
+        } else {
+            last_usage
+        }
+        .filter(|_| client_requested_usage);
+        if let (Some(final_usage), false) = (final_usage, errored) {
             let chunk = aisix_gateway::ChatChunk {
                 id: std::mem::take(&mut last_chunk_id),
                 model: std::mem::take(&mut last_chunk_model),
                 delta: Default::default(),
                 finish_reason: None,
-                usage: Some(judge_usage.saturating_add(&base_usage)),
+                usage: Some(final_usage),
                 service_tier: last_chunk_tier.take(), accounting_usage: None, };
             if !hold_back || cap_released {
                 let ev = chunk_event!(chunk);

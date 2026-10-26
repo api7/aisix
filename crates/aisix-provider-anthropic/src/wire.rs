@@ -2176,6 +2176,9 @@ pub struct StreamState {
     open_tool: Option<usize>,
     /// The tool call the event last passed to [`Self::update`] emits for.
     event_tool: Option<usize>,
+    /// The input and cache counts `message_start` reported, until a chunk
+    /// carries them to the accounting (see [`Self::next_chunk`]).
+    start_usage: Option<UsageStats>,
 }
 
 impl StreamState {
@@ -2217,6 +2220,15 @@ impl StreamState {
                 {
                     self.service_tier = Some(tier);
                 }
+                self.start_usage = message.usage.as_ref().map(|_| UsageStats {
+                    cache_creation_ttl: self.cache_creation_ttl,
+                    ..UsageStats::with_cache(
+                        self.input_tokens,
+                        0,
+                        self.cache_creation_tokens,
+                        self.cache_read_tokens,
+                    )
+                });
             }
             AnthropicStreamEvent::ContentBlockDelta {
                 index,
@@ -2304,6 +2316,23 @@ impl StreamState {
             service_tier: self.service_tier.clone(),
             accounting_usage: None,
         }
+    }
+
+    /// [`Self::update`] then [`Self::to_chunk`] for one event, with the
+    /// counts `message_start` reported attached to the first chunk after it
+    /// as [`ChatChunk::accounting_usage`]. The client sees them only on the
+    /// terminal `message_delta` usage, but a stream that stops before that
+    /// event is still accounted with the input and cache counts the
+    /// upstream reported, rather than an estimate.
+    pub fn next_chunk(&mut self, event: &AnthropicStreamEvent) -> Option<ChatChunk> {
+        self.update(event);
+        let mut chunk = self.to_chunk(event)?;
+        if let Some(start) = self.start_usage.take() {
+            if chunk.usage.is_none() {
+                chunk.accounting_usage = Some(start);
+            }
+        }
+        Some(chunk)
     }
 
     /// Translate one event into an optional chunk to yield upstream.
