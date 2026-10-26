@@ -1043,7 +1043,7 @@ pub fn chat_response_to_responses_json(
     let (status, incomplete_reason) = responses_status(&resp.finish_reason);
     let output = build_output_items(
         message_reasoning_text(&resp.message),
-        resp.message.content.as_deref(),
+        resp.message.text().as_deref(),
         resp.message
             .extra
             .get("tool_calls")

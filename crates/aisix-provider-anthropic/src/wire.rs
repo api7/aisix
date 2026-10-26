@@ -3576,7 +3576,7 @@ pub fn chat_response_into_anthropic_json(
         }));
     }
 
-    if let Some(text) = resp.message.content.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(text) = resp.message.text().filter(|s| !s.is_empty()) {
         content.push(serde_json::json!({"type": "text", "text": text}));
     }
     // A refusal is the model's answer in its own field; Claude writes its

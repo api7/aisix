@@ -2972,7 +2972,7 @@ async fn dispatch(
                 let captured_content = content_cap.map(|cap| {
                     CapturedContent::new(
                         &serde_json::to_string(req).unwrap_or_default(),
-                        cached.message.content.as_deref().unwrap_or(""),
+                        &cached.message.content_str(),
                         cap as usize,
                     )
                     .with_output(chat_message_output(&cached.message, cap))
@@ -3648,7 +3648,7 @@ async fn dispatch(
     let captured_content = content_cap.map(|cap| {
         CapturedContent::new(
             &serde_json::to_string(req).unwrap_or_default(),
-            upstream.message.content.as_deref().unwrap_or(""),
+            &upstream.message.content_str(),
             cap as usize,
         )
         .with_output(chat_message_output(&upstream.message, cap))

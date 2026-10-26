@@ -2854,7 +2854,7 @@ async fn cross_provider_dispatch(
     .map(|cap| {
         CapturedContent::new(
             &serde_json::to_string(body).unwrap_or_default(),
-            resp.message.content.as_deref().unwrap_or(""),
+            &resp.message.content_str(),
             cap as usize,
         )
         .with_output(Some(aisix_obs::OutputCollector::from_body(
