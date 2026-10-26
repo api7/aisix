@@ -474,13 +474,9 @@ fn count_part(bpe: &CoreBPE, part: &Value) -> u32 {
             text_field("text")
         }
         Some("refusal") => text_field("refusal"),
-        // Mistral's array form; an Anthropic block's `thinking` is a string.
-        Some("thinking") if aisix_gateway::chat::is_reasoning_part(part) => {
-            aisix_gateway::chat::reasoning_part_slots(part)
-                .into_iter()
-                .fold(0u32, |n, slot| n.saturating_add(enc(bpe, slot.text)))
-        }
-        Some("thinking") => text_field("thinking"),
+        Some("thinking") => aisix_gateway::chat::reasoning_part_slots(part)
+            .into_iter()
+            .fold(0u32, |n, slot| n.saturating_add(enc(bpe, slot.text))),
         Some("image_url") => {
             let image = part.get("image_url");
             let detail = image.and_then(|i| i.get("detail")).and_then(|d| d.as_str());
@@ -1057,6 +1053,10 @@ mod tests {
         assert_eq!(
             as_parts(json!([{"type": "thinking", "signature": "sig",
                 "thinking": [{"type": "text", "text": text}]}])),
+            want,
+        );
+        assert_eq!(
+            as_parts(json!([{"type": "thinking", "thinking": text, "signature": "sig"}])),
             want,
         );
         assert_eq!(

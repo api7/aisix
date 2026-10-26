@@ -1446,6 +1446,7 @@ mod tests {
             "reasoning_content": "benign slot",
             "content": [
                 {"type": "thinking", "thinking": [{"type": "text", "text": "mistral payload"}]},
+                {"type": "thinking", "thinking": "anthropic payload", "signature": "sig"},
                 {"type": "reasoning", "summary": [
                     {"type": "summary_text", "text": "databricks payload", "signature": "sig"}
                 ]},

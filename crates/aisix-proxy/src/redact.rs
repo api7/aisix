@@ -2737,6 +2737,8 @@ mod tests {
                     "content": [
                         {"type": "thinking", "thinking": [{"type": "text", "text": "mistral a@x.com"}]},
                         {"type": "thinking", "signature": "sig", "thinking": [{"type": "text", "text": "signed b@x.com"}]},
+                        {"type": "thinking", "thinking": "anthropic e@x.com"},
+                        {"type": "thinking", "thinking": "signed f@x.com", "signature": "sig"},
                         {"type": "reasoning", "summary": [
                             {"type": "summary_text", "text": "unsigned c@x.com", "signature": ""},
                             {"type": "summary_text", "text": "signed d@x.com", "signature": "sig"}
@@ -2752,6 +2754,7 @@ mod tests {
             chat_signed_reasoning_texts(&req),
             vec![
                 ("signed b@x.com".to_string(), false),
+                ("signed f@x.com".to_string(), false),
                 ("signed d@x.com".to_string(), false)
             ],
         );
@@ -2760,8 +2763,10 @@ mod tests {
         let blocks = req.messages[1].content_blocks.as_ref().unwrap();
         assert_eq!(blocks[0]["thinking"][0]["text"], "mistral [EMAIL_REDACTED]");
         assert_eq!(blocks[1]["thinking"][0]["text"], "signed b@x.com");
-        assert_eq!(blocks[2]["summary"][0]["text"], "unsigned [EMAIL_REDACTED]");
-        assert_eq!(blocks[2]["summary"][1]["text"], "signed d@x.com");
+        assert_eq!(blocks[2]["thinking"], "anthropic [EMAIL_REDACTED]");
+        assert_eq!(blocks[3]["thinking"], "signed f@x.com");
+        assert_eq!(blocks[4]["summary"][0]["text"], "unsigned [EMAIL_REDACTED]");
+        assert_eq!(blocks[4]["summary"][1]["text"], "signed d@x.com");
     }
 
     /// C1: the `/v1/responses` scan reads a `reasoning` item's

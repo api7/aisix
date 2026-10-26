@@ -13,9 +13,10 @@ import {
 
 // E2E: an assistant turn's replayed reasoning can arrive as a content part
 // instead of the `reasoning_content` field — Mistral's
-// `{type:"thinking", thinking:[{type:"text", text}], signature?}` and
+// `{type:"thinking", thinking:[{type:"text", text}], signature?}`,
 // Databricks' `{type:"reasoning", summary:[{type:"summary_text", text,
-// signature?}]}`. Input guardrails must treat it exactly as they treat
+// signature?}]}`, and the Anthropic-shaped `{type:"thinking",
+// thinking:"<text>", signature?}`. Input guardrails must treat it exactly as they treat
 // `reasoning_content`:
 //
 //   - a block rule fires on text in either part, signed or not;
@@ -35,6 +36,12 @@ const MASKED = "[EMAIL_REDACTED]";
 const mistralPart = (text: string, signature?: string) => ({
   type: "thinking",
   thinking: [{ type: "text", text }],
+  ...(signature === undefined ? {} : { signature }),
+});
+
+const anthropicPart = (thinking: string, signature?: string) => ({
+  type: "thinking",
+  thinking,
   ...(signature === undefined ? {} : { signature }),
 });
 
@@ -147,6 +154,23 @@ describe("input guardrails read replayed reasoning content parts", () => {
   test("a block rule fires on a Mistral thinking part", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     await expectBlocked([mistralPart(`maybe ${BLOCKWORD} helps`)]);
+  });
+
+  test("a block rule fires on an Anthropic-shaped thinking part, signed or not", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    await expectBlocked([anthropicPart(`maybe ${BLOCKWORD} helps`)]);
+    await expectBlocked([anthropicPart(`maybe ${BLOCKWORD} helps`, "sig-anthropic")]);
+  });
+
+  test("a mask rule rewrites an unsigned Anthropic-shaped thinking part and forwards a signed one unchanged", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const signed = anthropicPart(`signed note for ${EMAIL}`, "sig-anthropic");
+    const content = await dispatchedAssistantContent([
+      anthropicPart(`email ${EMAIL} later`),
+      signed,
+    ]);
+    expect(content[0]).toEqual(anthropicPart(`email ${MASKED} later`));
+    expect(content[1]).toEqual(signed);
   });
 
   test("a block rule fires on a signed Databricks reasoning part", async (ctx) => {

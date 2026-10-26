@@ -6418,6 +6418,7 @@ mod tests {
     fn build_converse_inputs_skips_a_reasoning_parts_only_assistant_turn() {
         for parts in [
             serde_json::json!([{"type": "thinking", "thinking": [{"type": "text", "text": "t"}]}]),
+            serde_json::json!([{"type": "thinking", "thinking": "t", "signature": "s"}]),
             serde_json::json!([{"type": "reasoning",
                 "summary": [{"type": "summary_text", "text": "t", "signature": "s"}]}]),
         ] {

@@ -946,6 +946,7 @@ mod tests {
             "role": "assistant",
             "content": [
                 {"type": "thinking", "signature": "sig", "thinking": [{"type": "text", "text": "mistral"}]},
+                {"type": "thinking", "thinking": "anthropic"},
                 {"type": "reasoning", "summary": [{"type": "summary_text", "text": "databricks", "signature": "sig"}]},
                 {"type": "text", "text": "answer"}
             ]
@@ -956,6 +957,7 @@ mod tests {
             input[0]["parts"],
             json!([
                 {"type": "reasoning", "content": "mistral"},
+                {"type": "reasoning", "content": "anthropic"},
                 {"type": "reasoning", "content": "databricks"},
                 {"type": "text", "content": "answer"}
             ])
