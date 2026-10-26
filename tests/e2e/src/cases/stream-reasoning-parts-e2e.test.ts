@@ -247,6 +247,16 @@ describe("streamed reasoning content parts", () => {
   test("keep their place between the text parts of one delta on /v1/messages", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const raw = await stream(app, "/v1/messages", messagesBody("srp-interleaved"));
+    expect(
+      namedEvents(raw)
+        .filter(({ event }) => event === "content_block_start")
+        .map(({ data }) => [data.index, data.content_block.type]),
+      raw,
+    ).toEqual([
+      [0, "text"],
+      [1, "thinking"],
+      [2, "text"],
+    ]);
     expect(messagesBlocks(raw), raw).toEqual([
       { type: "text", text: "Let me check. " },
       { type: "thinking", thinking: "Checking the atlas.", signature: "" },
@@ -260,13 +270,19 @@ describe("streamed reasoning content parts", () => {
     const events = namedEvents(raw);
     // Each item is finished before the next one is added.
     const open = new Set<number>();
+    const added: number[] = [];
     for (const { event, data } of events) {
       if (event === "response.output_item.added") {
         expect(open.size, `item ${data.output_index} added while ${[...open]} open\n${raw}`).toBe(0);
+        added.push(data.output_index);
         open.add(data.output_index);
       }
-      if (event === "response.output_item.done") open.delete(data.output_index);
+      if (event === "response.output_item.done") {
+        expect(open.delete(data.output_index), `item ${data.output_index} done without being open\n${raw}`).toBe(true);
+      }
     }
+    expect(added, raw).toEqual([0, 1, 2]);
+    expect([...open], raw).toEqual([]);
     const completed = events.find((e) => e.event === "response.completed");
     expect(completed, raw).toBeDefined();
     const output = completed!.data.response.output;
