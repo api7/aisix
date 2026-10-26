@@ -1292,6 +1292,17 @@ fn reasoning_item_json(item_id: &str, text: &str) -> Value {
     })
 }
 
+/// A completed assistant `message` item carrying `text`.
+fn message_item_json(item_id: &str, text: &str) -> Value {
+    json!({
+        "type": "message",
+        "id": item_id,
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text, "annotations": []}],
+    })
+}
+
 /// Assemble the `output` array: a `reasoning` item carrying the upstream's
 /// chain-of-thought (when any), then a `message` item carrying the assistant
 /// text (when any), followed by one tool-call item per tool call —
@@ -1554,6 +1565,9 @@ pub struct ResponsesSseEncoder {
     text_item_id: Option<String>,
     text_output_index: u32,
     text_accum: String,
+    /// Message items already closed by reasoning that followed their text,
+    /// as `(item_id, output_index, text)`.
+    text_done: Vec<(String, u32, String)>,
     /// Set once the per-item `*.done` events have been emitted, so
     /// `close_items` is idempotent across the finish chunk + `force_finish`.
     items_closed: bool,
@@ -1607,6 +1621,7 @@ impl ResponsesSseEncoder {
             text_item_id: None,
             text_output_index: 0,
             text_accum: String::new(),
+            text_done: Vec::new(),
             items_closed: false,
             reasoning_open: None,
             reasoning_done: Vec::new(),
@@ -1748,10 +1763,13 @@ impl ResponsesSseEncoder {
             })
             .collect();
         tool_calls.sort_by_key(|(idx, _)| *idx);
-        (
-            self.text_accum.clone(),
-            tool_calls.into_iter().map(|(_, v)| v).collect(),
-        )
+        let text = self
+            .text_done
+            .iter()
+            .map(|(_, _, text)| text.as_str())
+            .chain([self.text_accum.as_str()])
+            .collect();
+        (text, tool_calls.into_iter().map(|(_, v)| v).collect())
     }
 
     /// The Response object embedded in a lifecycle event. `output` and
@@ -1795,17 +1813,17 @@ impl ResponsesSseEncoder {
         for r in self.reasoning_done.iter().chain(self.reasoning_open.iter()) {
             items.push((r.output_index, reasoning_item_json(&r.item_id, &r.text)));
         }
-        if let Some(id) = self.text_item_id.as_ref() {
-            items.push((
-                self.text_output_index,
-                json!({
-                    "type": "message",
-                    "id": id,
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": self.text_accum, "annotations": []}],
-                }),
-            ));
+        let open_text = self
+            .text_item_id
+            .as_ref()
+            .map(|id| (id, self.text_output_index, &self.text_accum));
+        for (id, output_index, text) in self
+            .text_done
+            .iter()
+            .map(|(id, index, text)| (id, *index, text))
+            .chain(open_text)
+        {
+            items.push((output_index, message_item_json(id, text)));
         }
         for tc in self.tool_calls.values() {
             items.push((tc.output_index, tc.done_item()));
@@ -1869,6 +1887,10 @@ impl ResponsesSseEncoder {
         if has_reasoning {
             let delta = chunk.delta.reasoning_content.clone().unwrap_or_default();
             if self.reasoning_open.is_none() {
+                // Reasoning that follows text ends its message item, so the
+                // text after it opens a new one and the items keep the
+                // order the model produced them in.
+                events.extend(self.close_text());
                 let item_id = format!("rs_{}", Uuid::new_v4().simple());
                 let output_index = self.next_output_index;
                 self.next_output_index += 1;
@@ -2110,6 +2132,42 @@ impl ResponsesSseEncoder {
         ]
     }
 
+    /// Close the open message item, if any: its text, then its part, then
+    /// the item. Empty when no message item is open.
+    fn close_text(&mut self) -> Vec<ResponsesSseEvent> {
+        let Some(item_id) = self.text_item_id.take() else {
+            return Vec::new();
+        };
+        let output_index = self.text_output_index;
+        let text = std::mem::take(&mut self.text_accum);
+        let events = vec![
+            self.event(
+                "response.output_text.done",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "text": text,
+                }),
+            ),
+            self.event(
+                "response.content_part.done",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": text, "annotations": []},
+                }),
+            ),
+            self.event(
+                "response.output_item.done",
+                json!({"output_index": output_index, "item": message_item_json(&item_id, &text)}),
+            ),
+        ];
+        self.text_done.push((item_id, output_index, text));
+        events
+    }
+
     /// Emit the per-item `*.done` closing events for the open text + tool
     /// items. Idempotent: a no-op after the first call, so the finish chunk
     /// and a later `force_finish` (when the completed event was withheld for
@@ -2122,36 +2180,7 @@ impl ResponsesSseEncoder {
         // A stream that ended inside its reasoning run (nothing but thinking,
         // or a truncation) still owes the item's closing events.
         let mut events = self.close_reasoning();
-        if self.text_item_id.is_some() {
-            let item_id = self.text_item_id.clone().unwrap_or_default();
-            let output_index = self.text_output_index;
-            let text = self.text_accum.clone();
-            events.push(self.event(
-                "response.output_text.done",
-                json!({
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "text": text,
-                }),
-            ));
-            events.push(self.event(
-                "response.content_part.done",
-                json!({
-                    "item_id": item_id,
-                    "output_index": output_index,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": text, "annotations": []},
-                }),
-            ));
-            events.push(self.event(
-                "response.output_item.done",
-                json!({
-                    "output_index": output_index,
-                    "item": {"type": "message", "id": item_id, "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text, "annotations": []}]},
-                }),
-            ));
-        }
+        events.extend(self.close_text());
         let pending: Vec<u64> = self
             .tool_calls
             .iter()
