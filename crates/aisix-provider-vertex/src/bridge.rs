@@ -3784,6 +3784,35 @@ mod tests {
             .all(|c| !c.parts[0].as_text().is_empty()));
     }
 
+    /// The same skip for a turn whose only payload is reasoning content
+    /// parts (Mistral `thinking`, Databricks `reasoning`).
+    #[test]
+    fn build_gemini_request_skips_a_reasoning_parts_only_assistant_turn() {
+        for parts in [
+            serde_json::json!([{"type": "thinking", "thinking": [{"type": "text", "text": "t"}]}]),
+            serde_json::json!([{"type": "thinking", "thinking": "t", "signature": "s"}]),
+            serde_json::json!([{"type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "t", "signature": "s"}]}]),
+        ] {
+            let reasoning_only: ChatMessage = serde_json::from_value(serde_json::json!({
+                "role": "assistant", "content": parts,
+            }))
+            .unwrap();
+            let req = ChatFormat::new(
+                "my-gemini",
+                vec![
+                    ChatMessage::user("q1"),
+                    reasoning_only,
+                    ChatMessage::user("q2"),
+                    ChatMessage::assistant("a"),
+                ],
+            );
+            let body = build_gemini_request(&req, "gemini-2.0-flash").unwrap();
+            let roles: Vec<&str> = body.contents.iter().map(|c| c.role).collect();
+            assert_eq!(roles, ["user", "user", "model"], "{parts}");
+        }
+    }
+
     #[test]
     fn build_gemini_request_lifts_system_to_top_level() {
         let req = ChatFormat::new(

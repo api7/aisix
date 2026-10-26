@@ -474,7 +474,9 @@ fn count_part(bpe: &CoreBPE, part: &Value) -> u32 {
             text_field("text")
         }
         Some("refusal") => text_field("refusal"),
-        Some("thinking") => text_field("thinking"),
+        Some("thinking") => aisix_gateway::chat::reasoning_part_slots(part)
+            .into_iter()
+            .fold(0u32, |n, slot| n.saturating_add(enc(bpe, slot.text))),
         Some("image_url") => {
             let image = part.get("image_url");
             let detail = image.and_then(|i| i.get("detail")).and_then(|d| d.as_str());
@@ -1031,6 +1033,37 @@ mod tests {
         // + 3 (reply priming) = 8.
         let req = ChatFormat::new("gpt-4", vec![msg(Role::User, "Hello")]);
         assert_eq!(chat_est("gpt-4", req).count_prompt(), 8);
+    }
+
+    /// Replayed reasoning parts count like `reasoning_content` does:
+    /// Mistral's `thinking` array and Databricks' `reasoning` summary are
+    /// text, their signatures are not.
+    #[test]
+    fn chat_prompt_counts_reasoning_parts() {
+        let text = "the user wants the weather in Paris";
+        let as_parts = |content: serde_json::Value| -> u32 {
+            let m: ChatMessage =
+                serde_json::from_value(json!({"role": "assistant", "content": content})).unwrap();
+            chat_est("gpt-4", ChatFormat::new("gpt-4", vec![m])).count_prompt()
+        };
+        let mut slot = msg(Role::Assistant, "");
+        slot.content = None;
+        slot.extra.insert("reasoning_content".into(), json!(text));
+        let want = chat_est("gpt-4", ChatFormat::new("gpt-4", vec![slot])).count_prompt();
+        assert_eq!(
+            as_parts(json!([{"type": "thinking", "signature": "sig",
+                "thinking": [{"type": "text", "text": text}]}])),
+            want,
+        );
+        assert_eq!(
+            as_parts(json!([{"type": "thinking", "thinking": text, "signature": "sig"}])),
+            want,
+        );
+        assert_eq!(
+            as_parts(json!([{"type": "reasoning",
+                "summary": [{"type": "summary_text", "text": text, "signature": "sig"}]}])),
+            want,
+        );
     }
 
     #[test]

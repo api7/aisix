@@ -571,6 +571,12 @@ fn openai_content_parts(content: Option<&Value>) -> Option<Vec<Value>> {
                     }
                     Some(part)
                 }
+                // Replayed reasoning written as a content part is recorded
+                // as the `reasoning_content` slot is.
+                Some("thinking" | "reasoning") if aisix_gateway::chat::is_reasoning_part(p) => {
+                    let text = aisix_gateway::chat::reasoning_part_text(p).unwrap_or_default();
+                    Some(json!({"type": "reasoning", "content": text}))
+                }
                 _ => generic_part(p),
             })
             .collect(),
@@ -932,6 +938,30 @@ mod tests {
         assert_eq!(c.stop_sequences, vec!["\n", "END"]);
         assert_eq!(c.choice_count, Some(3));
         assert!(!c.stream);
+    }
+
+    #[test]
+    fn chat_content_records_reasoning_parts_as_reasoning() {
+        let body = json!({"messages": [{
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "signature": "sig", "thinking": [{"type": "text", "text": "mistral"}]},
+                {"type": "thinking", "thinking": "anthropic"},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "databricks", "signature": "sig"}]},
+                {"type": "text", "text": "answer"}
+            ]
+        }]});
+        let c = structured_content(PromptWire::OpenAiChat, &body.to_string(), "", None, "");
+        let input: Value = serde_json::from_str(c.input_messages.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            input[0]["parts"],
+            json!([
+                {"type": "reasoning", "content": "mistral"},
+                {"type": "reasoning", "content": "anthropic"},
+                {"type": "reasoning", "content": "databricks"},
+                {"type": "text", "content": "answer"}
+            ])
+        );
     }
 
     #[test]

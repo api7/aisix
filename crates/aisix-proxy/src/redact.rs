@@ -357,7 +357,8 @@ pub async fn moderate_body(
 /// screening call (an operator's block rule must still fire on it) and must
 /// come back byte-identical (#1104). `scan_only` is appended after the
 /// collected slots and truncated off the masked reply before the apply
-/// walk, so those texts are judged and never rewritten.
+/// walk, so those texts are judged and never rewritten. Each text carries
+/// whether it sits in the latest-turn window.
 ///
 /// Without it the segment kinds — `bedrock`, `presidio`, `lakera`,
 /// `aliyun_ai_guardrail`, `custom` — never saw thinking content at all on
@@ -372,7 +373,7 @@ pub async fn moderate_body_scanning(
     non_segment_verdict: aisix_guardrails::GuardrailVerdict,
     counts_out: &mut RedactionCounts,
     monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
-    scan_only: Vec<String>,
+    scan_only: Vec<(String, bool)>,
     walk: impl FnMut(&dyn Guardrail) -> RedactionCounts,
 ) -> aisix_guardrails::GuardrailVerdict {
     moderate_body_inner(
@@ -466,7 +467,7 @@ async fn moderate_body_inner(
     non_segment_verdict: aisix_guardrails::GuardrailVerdict,
     counts_out: &mut RedactionCounts,
     monitor_hits_out: &mut Vec<aisix_core::models::GuardrailMonitorHit>,
-    scan_only: Vec<String>,
+    scan_only: Vec<(String, bool)>,
     local: LocalSegments,
     mut walk: impl FnMut(&dyn Guardrail) -> RedactionCounts,
 ) -> aisix_guardrails::GuardrailVerdict {
@@ -494,13 +495,10 @@ async fn moderate_body_inner(
             LocalSegments::Given(segments) => segments,
             LocalSegments::Walk(extra) => {
                 let mut segments = collected.clone();
-                // The scan-only tail is Anthropic signed reasoning —
-                // assistant content, and so outside every latest-turn
-                // window by construction.
-                segments.extend(scan_only.iter().map(|text| ScanSegment {
+                segments.extend(scan_only.iter().map(|(text, in_latest_turn)| ScanSegment {
                     text: text.clone(),
                     role: SegmentRole::ScanOnly,
-                    in_latest_turn: false,
+                    in_latest_turn: *in_latest_turn,
                 }));
                 segments.extend(extra);
                 segments
@@ -524,8 +522,10 @@ async fn moderate_body_inner(
     // Everything past here is judged but unwritable; the apply walk only
     // ever offers the first `writable` slots back.
     let writable = texts.len();
-    texts.extend(scan_only);
-    in_latest_turn.resize(texts.len(), false);
+    for (text, in_turn) in scan_only {
+        texts.push(text);
+        in_latest_turn.push(in_turn);
+    }
     let mut outcome = match dir {
         Direction::Input | Direction::InputHistory => {
             chain
@@ -676,8 +676,10 @@ pub fn redact_json_encoded(
 /// the flat `content` string and the `text` field of typed content
 /// blocks — the same surface `check_input` scans (`message_scan_text`).
 /// Tool-call arguments and replayed `reasoning_content` are covered too
-/// (both reach the upstream verbatim through `extra`). Returns the merged
-/// counts (empty = untouched).
+/// (both reach the upstream verbatim through `extra`), and so are
+/// unsigned reasoning content parts (a signed one is judged through
+/// [`chat_signed_reasoning_texts`] instead and forwarded unchanged).
+/// Returns the merged counts (empty = untouched).
 ///
 /// This list and `message_scan_text`'s must stay equal: a slot the scan
 /// reads but this does not is a Mask rule that reports a hit and then
@@ -698,6 +700,17 @@ pub fn redact_chat_format(chain: &dyn Guardrail, req: &mut ChatFormat) -> Redact
                 if block.get("type").and_then(Value::as_str) == Some("text") {
                     if let Some(text) = block.get_mut("text") {
                         apply_to_value_string(chain, dir, text, &mut counts);
+                    }
+                }
+                // Replayed reasoning written as a content part is masked
+                // like `reasoning_content` below — unless a signature
+                // covers it: that slot must reach the upstream
+                // byte-identical, as a signed Anthropic `thinking` block
+                // does (#1104), so it is judged through
+                // `chat_signed_reasoning_texts` and never offered here.
+                for slot in aisix_gateway::chat::reasoning_part_slots_mut(block) {
+                    if !slot.signed {
+                        apply_to_value_string(chain, dir, slot.text, &mut counts);
                     }
                 }
             }
@@ -865,6 +878,30 @@ fn redact_anthropic_content(
     }
 }
 
+/// The text of every signed reasoning content part in a chat request, for
+/// SCAN-ONLY submission to the segment pass ([`moderate_body_scanning`]) —
+/// the chat-wire counterpart of [`anthropic_signed_reasoning_texts`], and
+/// the slots [`redact_chat_format`] leaves unoffered.
+///
+/// Each text carries whether its message sits in the latest-turn window,
+/// judged as [`redact_chat_format`] judges the slots it does offer.
+pub fn chat_signed_reasoning_texts(req: &ChatFormat) -> Vec<(String, bool)> {
+    let window_from = chat_latest_turn_start(&req.messages);
+    req.messages
+        .iter()
+        .enumerate()
+        .flat_map(|(i, m)| {
+            let in_turn = i >= window_from && !m.role.is_instruction();
+            m.content_blocks
+                .iter()
+                .flatten()
+                .flat_map(aisix_gateway::chat::reasoning_part_slots)
+                .filter(|slot| slot.signed && !slot.text.is_empty())
+                .map(move |slot| (slot.text.to_owned(), in_turn))
+        })
+        .collect()
+}
+
 /// The plaintext of every signed reasoning block in an Anthropic request,
 /// for SCAN-ONLY submission to the segment pass
 /// ([`moderate_body_scanning`]).
@@ -878,7 +915,10 @@ fn redact_anthropic_content(
 ///
 /// `redacted_thinking` carries only provider ciphertext under `data`, so
 /// there is no plaintext in it to screen.
-pub fn anthropic_signed_reasoning_texts(body: &Value) -> Vec<String> {
+///
+/// Every text is marked outside the latest-turn window, as it always has
+/// been on this route.
+pub fn anthropic_signed_reasoning_texts(body: &Value) -> Vec<(String, bool)> {
     body.get("messages")
         .and_then(Value::as_array)
         .map(|msgs| {
@@ -888,7 +928,7 @@ pub fn anthropic_signed_reasoning_texts(body: &Value) -> Vec<String> {
                 .filter(|b| b.get("type").and_then(Value::as_str) == Some("thinking"))
                 .filter_map(|b| b.get("thinking").and_then(Value::as_str))
                 .filter(|t| !t.is_empty())
-                .map(str::to_owned)
+                .map(|t| (t.to_owned(), false))
                 .collect()
         })
         .unwrap_or_default()
@@ -2680,6 +2720,53 @@ mod tests {
             Some("the user meant [EMAIL_REDACTED] I think"),
         );
         assert!(!counts.is_empty());
+    }
+
+    /// Reasoning content parts are masked like `reasoning_content` when
+    /// unsigned, and left byte-identical (but handed to the scan-only
+    /// tail) when a signature covers them.
+    #[test]
+    fn chat_format_masks_unsigned_reasoning_parts_only() {
+        let chain = both();
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "who?"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": [{"type": "text", "text": "mistral a@x.com"}]},
+                        {"type": "thinking", "signature": "sig", "thinking": [{"type": "text", "text": "signed b@x.com"}]},
+                        {"type": "thinking", "thinking": "anthropic e@x.com"},
+                        {"type": "thinking", "thinking": "signed f@x.com", "signature": "sig"},
+                        {"type": "reasoning", "summary": [
+                            {"type": "summary_text", "text": "unsigned c@x.com", "signature": ""},
+                            {"type": "summary_text", "text": "signed d@x.com", "signature": "sig"}
+                        ]},
+                        {"type": "text", "text": "answer"}
+                    ]
+                },
+                {"role": "user", "content": "go on"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            chat_signed_reasoning_texts(&req),
+            vec![
+                ("signed b@x.com".to_string(), false),
+                ("signed f@x.com".to_string(), false),
+                ("signed d@x.com".to_string(), false)
+            ],
+        );
+        let counts = redact_chat_format(chain.as_ref(), &mut req);
+        assert!(!counts.is_empty());
+        let blocks = req.messages[1].content_blocks.as_ref().unwrap();
+        assert_eq!(blocks[0]["thinking"][0]["text"], "mistral [EMAIL_REDACTED]");
+        assert_eq!(blocks[1]["thinking"][0]["text"], "signed b@x.com");
+        assert_eq!(blocks[2]["thinking"], "anthropic [EMAIL_REDACTED]");
+        assert_eq!(blocks[3]["thinking"], "signed f@x.com");
+        assert_eq!(blocks[4]["summary"][0]["text"], "unsigned [EMAIL_REDACTED]");
+        assert_eq!(blocks[4]["summary"][1]["text"], "signed d@x.com");
     }
 
     /// C1: the `/v1/responses` scan reads a `reasoning` item's

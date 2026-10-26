@@ -201,6 +201,125 @@ pub fn blocks_text(blocks: &[Value]) -> String {
         .collect()
 }
 
+/// One text slot of a reasoning content part, and whether a non-empty
+/// `signature` covers it. A signed slot must reach the upstream
+/// byte-identical, so it may be judged but never rewritten.
+pub struct ReasoningSlot<T> {
+    pub text: T,
+    pub signed: bool,
+}
+
+fn is_signed(v: &Value) -> bool {
+    v.get("signature")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty())
+}
+
+/// Where a reasoning content part keeps its text, by shape:
+/// Mistral's `{type: "thinking", thinking: [{type: "text", text}],
+/// signature?}` and Databricks' `{type: "reasoning", summary:
+/// [{type: "summary_text", text, signature?}]}` hold entries; an
+/// Anthropic-shaped `{type: "thinking", thinking: "<text>", signature?}`
+/// holds the text itself.
+enum ReasoningShape {
+    Entries(&'static str),
+    Text,
+}
+
+fn reasoning_shape(part: &Value) -> Option<ReasoningShape> {
+    let key = match part.get("type").and_then(Value::as_str)? {
+        "thinking" => "thinking",
+        "reasoning" => "summary",
+        _ => return None,
+    };
+    match part.get(key)? {
+        Value::Array(_) => Some(ReasoningShape::Entries(key)),
+        Value::String(_) if key == "thinking" => Some(ReasoningShape::Text),
+        _ => None,
+    }
+}
+
+/// Any entry with a string `text`, whatever its `type`: the whole part is
+/// forwarded verbatim, so an entry type this list did not name would
+/// otherwise carry text past the scan.
+fn is_reasoning_entry(entry: &Value) -> bool {
+    entry.get("text").is_some_and(Value::is_string)
+}
+
+/// Whether `part` is a reasoning content part (see [`reasoning_part_slots`]).
+pub fn is_reasoning_part(part: &Value) -> bool {
+    reasoning_shape(part).is_some()
+}
+
+/// The text slots of one reasoning content part, empty for any other
+/// part. The single parser of these shapes: every reader of replayed or
+/// generated reasoning parts goes through this or its `_mut` twin.
+pub fn reasoning_part_slots(part: &Value) -> Vec<ReasoningSlot<&str>> {
+    let part_signed = is_signed(part);
+    match reasoning_shape(part) {
+        None => Vec::new(),
+        Some(ReasoningShape::Text) => part["thinking"]
+            .as_str()
+            .map(|text| ReasoningSlot {
+                text,
+                signed: part_signed,
+            })
+            .into_iter()
+            .collect(),
+        Some(ReasoningShape::Entries(key)) => part[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| is_reasoning_entry(e))
+            .filter_map(|e| {
+                Some(ReasoningSlot {
+                    text: e.get("text")?.as_str()?,
+                    signed: part_signed || is_signed(e),
+                })
+            })
+            .collect(),
+    }
+}
+
+/// [`reasoning_part_slots`] with each `text` value borrowed mutably.
+pub fn reasoning_part_slots_mut(part: &mut Value) -> Vec<ReasoningSlot<&mut Value>> {
+    let part_signed = is_signed(part);
+    match reasoning_shape(part) {
+        None => Vec::new(),
+        Some(ReasoningShape::Text) => part
+            .get_mut("thinking")
+            .map(|text| ReasoningSlot {
+                text,
+                signed: part_signed,
+            })
+            .into_iter()
+            .collect(),
+        Some(ReasoningShape::Entries(key)) => part[key]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+            .filter(|e| is_reasoning_entry(e))
+            .filter_map(|e| {
+                let signed = part_signed || is_signed(e);
+                Some(ReasoningSlot {
+                    text: e.get_mut("text")?,
+                    signed,
+                })
+            })
+            .collect(),
+    }
+}
+
+/// The concatenated text of one reasoning content part, `None` when it is
+/// not one or carries no text.
+pub fn reasoning_part_text(part: &Value) -> Option<String> {
+    let text: String = reasoning_part_slots(part)
+        .into_iter()
+        .map(|s| s.text)
+        .collect();
+    (!text.is_empty()).then_some(text)
+}
+
 /// Split a wire-form `content` value into the gateway's
 /// `(extracted_text, raw_blocks)` representation:
 ///   * String → (Some(string), None)
@@ -302,10 +421,8 @@ impl ChatMessage {
     }
 
     /// The upstream's chain-of-thought: the `reasoning_content` slot, else
-    /// the reasoning parts of an array `content` — Mistral's
-    /// `{type: "thinking", thinking: [{type: "text", text}]}` and
-    /// Databricks' `{type: "reasoning", summary: [{type: "summary_text",
-    /// text}]}`. Every reader of an answer's reasoning goes through this.
+    /// the reasoning parts of an array `content` (see
+    /// [`reasoning_part_slots`]). Every reader of an answer's reasoning goes through this.
     pub fn reasoning_text(&self) -> Option<std::borrow::Cow<'_, str>> {
         if let Some(text) = self
             .extra
@@ -319,19 +436,7 @@ impl ChatMessage {
             .content_blocks
             .iter()
             .flatten()
-            .flat_map(|b| match b.get("type").and_then(Value::as_str) {
-                Some("thinking") => b.get("thinking").and_then(Value::as_array),
-                Some("reasoning") => b.get("summary").and_then(Value::as_array),
-                _ => None,
-            })
-            .flatten()
-            .filter(|c| {
-                matches!(
-                    c.get("type").and_then(Value::as_str),
-                    Some("text" | "summary_text")
-                )
-            })
-            .filter_map(|c| c.get("text").and_then(Value::as_str))
+            .filter_map(reasoning_part_text)
             .collect();
         (!text.is_empty()).then_some(std::borrow::Cow::Owned(text))
     }
@@ -347,27 +452,24 @@ impl ChatMessage {
         }
     }
 
-    /// An assistant turn whose only payload is `reasoning_content`: no
-    /// text, no content blocks, no tool calls. A client replaying a
-    /// model's earlier chain-of-thought that no answer followed sends one
-    /// (the `/v1/responses` bridge builds it from such a `reasoning`
-    /// item). A bridge whose wire has no slot for replayed reasoning must
-    /// skip it rather than render an empty assistant turn, which those
-    /// upstreams reject.
+    /// An assistant turn whose only payload is reasoning — the
+    /// `reasoning_content` slot or reasoning content parts (see
+    /// [`Self::reasoning_text`]): no text, no other content blocks, no
+    /// tool calls. A client replaying a model's earlier chain-of-thought
+    /// that no answer followed sends one (the `/v1/responses` bridge
+    /// builds it from such a `reasoning` item). A bridge whose wire has no
+    /// slot for replayed reasoning must skip it rather than render an
+    /// empty assistant turn, which those upstreams reject.
     pub fn is_reasoning_only(&self) -> bool {
         matches!(self.role, Role::Assistant)
             && self.text().is_none_or(|t| t.is_empty())
-            && self.content_blocks.as_ref().is_none_or(Vec::is_empty)
+            && self.content_blocks.iter().flatten().all(is_reasoning_part)
             && self
                 .extra
                 .get("tool_calls")
                 .and_then(Value::as_array)
                 .is_none_or(Vec::is_empty)
-            && self
-                .extra
-                .get("reasoning_content")
-                .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty())
+            && self.reasoning_text().is_some()
     }
 }
 
@@ -1593,6 +1695,73 @@ pub struct EmbeddingUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_part_slots_read_text_and_signature() {
+        let mistral = serde_json::json!({"type": "thinking", "signature": "s",
+            "thinking": [{"type": "text", "text": "a"}, {"type": "image", "url": "x"}]});
+        let slots = reasoning_part_slots(&mistral);
+        assert_eq!(slots.len(), 1);
+        assert_eq!((slots[0].text, slots[0].signed), ("a", true));
+
+        let databricks = serde_json::json!({"type": "reasoning", "summary": [
+            {"type": "summary_text", "text": "b", "signature": ""},
+            {"type": "summary_text", "text": "c", "signature": "s"}
+        ]});
+        let slots: Vec<(&str, bool)> = reasoning_part_slots(&databricks)
+            .into_iter()
+            .map(|s| (s.text, s.signed))
+            .collect();
+        assert_eq!(slots, [("b", false), ("c", true)]);
+
+        // Anthropic's shape holds the text itself.
+        let anthropic = serde_json::json!({"type": "thinking", "thinking": "a", "signature": "s"});
+        let slots: Vec<(&str, bool)> = reasoning_part_slots(&anthropic)
+            .into_iter()
+            .map(|s| (s.text, s.signed))
+            .collect();
+        assert_eq!(slots, [("a", true)]);
+        let unsigned = serde_json::json!({"type": "thinking", "thinking": "a", "signature": ""});
+        assert!(!reasoning_part_slots(&unsigned)[0].signed);
+        // A `summary` string is not a reasoning part.
+        assert!(!is_reasoning_part(
+            &serde_json::json!({"type": "reasoning", "summary": "a"})
+        ));
+    }
+
+    #[test]
+    fn a_turn_of_reasoning_parts_alone_is_reasoning_only() {
+        let msg = |v: serde_json::Value| -> ChatMessage { serde_json::from_value(v).unwrap() };
+        let thinking = serde_json::json!({"type": "thinking",
+            "thinking": [{"type": "text", "text": "t"}]});
+        assert!(
+            msg(serde_json::json!({"role": "assistant", "content": [thinking.clone()]}))
+                .is_reasoning_only()
+        );
+        assert!(msg(serde_json::json!({"role": "assistant",
+            "content": [{"type": "thinking", "thinking": "t", "signature": "s"}]}))
+        .is_reasoning_only());
+        assert!(msg(
+            serde_json::json!({"role": "assistant", "content": [{"type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "t", "signature": "s"}]}]})
+        )
+        .is_reasoning_only());
+        // Beside text, a tool call, or with no text in it, it is not.
+        assert!(!msg(serde_json::json!({"role": "assistant",
+            "content": [thinking.clone(), {"type": "text", "text": "a"}]}))
+        .is_reasoning_only());
+        assert!(!msg(
+            serde_json::json!({"role": "assistant", "content": [thinking],
+            "tool_calls": [{"id": "c", "type": "function",
+                "function": {"name": "f", "arguments": "{}"}}]})
+        )
+        .is_reasoning_only());
+        assert!(!msg(
+            serde_json::json!({"role": "assistant", "content": [{"type": "thinking",
+            "thinking": [{"type": "text", "text": ""}]}]})
+        )
+        .is_reasoning_only());
+    }
 
     #[test]
     fn chat_format_round_trips_through_json() {

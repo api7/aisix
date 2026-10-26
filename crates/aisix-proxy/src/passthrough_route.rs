@@ -1418,6 +1418,9 @@ fn request_content_text(v: &serde_json::Value) -> String {
         .filter_map(|b| match b.get("type").and_then(|t| t.as_str()) {
             Some("tool_result") => b.get("content").map(request_content_text),
             Some("tool_use") => b.get("input").map(|i| i.to_string()),
+            Some("thinking" | "reasoning") if aisix_gateway::chat::is_reasoning_part(b) => {
+                aisix_gateway::chat::reasoning_part_text(b)
+            }
             Some("thinking") => b
                 .get("thinking")
                 .and_then(|t| t.as_str())
@@ -2697,7 +2700,11 @@ fn append_chat_request_content_strings(
                         }
                     }
                     Some("thinking") => {
-                        append_typed_top_level_strings(out, block_body, "thinking", scan_error)?
+                        append_reasoning_part_strings(out, block_body, "thinking", scan_error)?
+                    }
+                    Some("reasoning") => {
+                        append_reasoning_part_strings(out, block_body, "summary", scan_error)?;
+                        append_raw_top_level_strings(out, block_body, "text")?
                     }
                     Some("text") => {
                         append_typed_top_level_strings(out, block_body, "text", scan_error)?
@@ -2706,6 +2713,69 @@ fn append_chat_request_content_strings(
                 }
             }
         }
+    }
+    Some(())
+}
+
+/// Request text of a replayed reasoning part's `key`: an Anthropic
+/// `thinking` string, or the entry array of Mistral's `thinking` and
+/// Databricks' `reasoning.summary` — each entry's `text`, every duplicate
+/// included, the same text the typed chat route reads through
+/// `aisix_gateway::chat::reasoning_part_slots`. A signed entry is scanned
+/// too; nothing on this route is rewritten. Opaque members beside the text
+/// (`signature`, `encrypted_content`) are never scan text. A carrier of
+/// another shape is read the same way rather than refused: an object for
+/// its `text`, a bare string as text, anything else as nothing.
+fn append_reasoning_part_strings(
+    out: &mut String,
+    block_body: &[u8],
+    key: &str,
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> Option<()> {
+    let Some(values) = raw_top_level_values(block_body, key) else {
+        mark_unevaluable(scan_error);
+        return None;
+    };
+    for value in values {
+        match raw_array_item_refs(&value) {
+            Some(entries) => {
+                for entry in entries {
+                    append_reasoning_entry_strings(out, &entry, scan_error)?;
+                }
+            }
+            None if value.get().trim_start().starts_with('[') => {
+                mark_unevaluable(scan_error);
+                return None;
+            }
+            None => append_reasoning_entry_strings(out, &value, scan_error)?,
+        }
+    }
+    Some(())
+}
+
+fn append_reasoning_entry_strings(
+    out: &mut String,
+    entry: &RawJson<'_>,
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> Option<()> {
+    let source = entry.get().trim_start();
+    if raw_is_object(entry) {
+        let Some(texts) = raw_top_level_values(entry.get().as_bytes(), "text") else {
+            mark_unevaluable(scan_error);
+            return None;
+        };
+        for text in texts {
+            append_scan_text(
+                out,
+                &decoded_json_string_values_including_empty(text.get().as_bytes(), scan_error)?,
+            )?;
+        }
+    } else if source.starts_with('"') {
+        let Ok(decoded) = serde_json::from_str::<String>(source) else {
+            mark_unevaluable(scan_error);
+            return None;
+        };
+        append_scan_text(out, &decoded)?;
     }
     Some(())
 }
@@ -9034,6 +9104,49 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
                 !scanned.contains("routing-only"),
                 "{protocol:?}: {scanned:?}"
             );
+        }
+    }
+
+    /// Replayed reasoning parts are request text: Mistral's `thinking`
+    /// entry array (once refused as unevaluable) and Databricks'
+    /// `reasoning.summary` (once never read), signed or not, every
+    /// duplicate key included — but never their signatures.
+    #[test]
+    fn replayed_reasoning_parts_are_request_guardrail_text() {
+        let body = br#"{"messages":[{"role":"assistant","content":[{"type":"thinking","signature":"SIGMISTRAL","thinking":[{"type":"text","text":"MISTRALBLOCKME"}]},{"type":"reasoning","summary":[{"type":"summary_text","text":"clean","signature":"SIGDATABRICKS"}],"summary":[{"type":"summary_text","text":"DATABRICKSBLOCKME"}]},{"type":"text","text":"answer"}]}]}"#;
+        let scanned = try_request_guardrail_text(PassthroughProtocol::OpenaiChat, body)
+            .expect("reasoning parts are evaluable");
+        for expected in ["MISTRALBLOCKME", "DATABRICKSBLOCKME", "clean", "answer"] {
+            assert!(scanned.contains(expected), "{scanned:?}");
+        }
+        assert!(!scanned.contains("SIG"), "{scanned:?}");
+
+        // Opaque members beside the text are not scan text.
+        let opaque = br#"{"messages":[{"role":"assistant","content":[{"type":"reasoning","summary":[{"type":"summary_text","text":"clean","encrypted_content":"OPAQUEBLOB","signature":"SIG"}]},{"type":"thinking","thinking":{"type":"text","text":"\u0042LOCKME","signature":"SIG"}}]}]}"#;
+        let scanned =
+            try_request_guardrail_text(PassthroughProtocol::OpenaiChat, opaque).expect("evaluable");
+        assert!(
+            scanned.contains("clean") && scanned.contains("BLOCKME"),
+            "{scanned:?}"
+        );
+        assert!(
+            !scanned.contains("OPAQUE") && !scanned.contains("SIG"),
+            "{scanned:?}"
+        );
+
+        // Other carriers are read, never refused as unscannable.
+        for body in [
+            &br#"{"messages":[{"role":"assistant","content":[{"type":"reasoning","summary":null,"encrypted_content":"opaque"},{"type":"text","text":"answer"}]}]}"#[..],
+            br#"{"messages":[{"role":"assistant","content":[{"type":"reasoning","summary":["BLOCKME"]},{"type":"text","text":"answer"}]}]}"#,
+            br#"{"messages":[{"role":"assistant","content":[{"type":"reasoning","summary":"BLOCKME"},{"type":"text","text":"answer"}]}]}"#,
+            br#"{"messages":[{"role":"assistant","content":[{"type":"reasoning","summary":[{"type":"other","text":"BLOCKME"}]},{"type":"text","text":"answer"}]}]}"#,
+        ] {
+            let scanned = try_request_guardrail_text(PassthroughProtocol::OpenaiChat, body)
+                .expect("evaluable");
+            assert!(scanned.contains("answer"), "{scanned:?}");
+            if !String::from_utf8_lossy(body).contains("null") {
+                assert!(scanned.contains("BLOCKME"), "{scanned:?}");
+            }
         }
     }
 

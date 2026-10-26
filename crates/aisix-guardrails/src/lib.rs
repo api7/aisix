@@ -147,6 +147,10 @@ pub(crate) async fn read_body_capped(
 ///     is a different question and stays out of the output scope — this
 ///     helper only ever sees REQUEST messages (`check_input`); the output
 ///     collectors read `ChatResponse::guardrail_output_text`.
+///   * reasoning content parts (`aisix_gateway::chat::reasoning_part_slots`)
+///     — the same replayed reasoning written into `content` instead of the
+///     slot, read IN ADDITION to the slot so a benign one cannot hide the
+///     other.
 ///
 /// Non-text content blocks (image/audio) are out of scope — multimodal
 /// moderation is a separate feature. Every blob-check guardrail's input
@@ -180,6 +184,14 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
             parts.push(reasoning.to_string());
         }
     }
+    parts.extend(
+        m.content_blocks
+            .iter()
+            .flatten()
+            .flat_map(aisix_gateway::chat::reasoning_part_slots)
+            .filter(|slot| !slot.text.is_empty())
+            .map(|slot| slot.text.to_string()),
+    );
     parts.join("\n")
 }
 
@@ -1423,6 +1435,37 @@ mod tests {
     /// assistant turn's replayed reasoning is caller-supplied text that the
     /// bridges forward upstream verbatim, so parking a payload there must
     /// not be a way past a deny-list the same text trips in `content`.
+    /// The same replayed reasoning written as content parts — Mistral's
+    /// `thinking` and Databricks' `reasoning` — is scanned too, signed or
+    /// not, and beside a benign `reasoning_content` rather than instead of
+    /// it.
+    #[test]
+    fn message_scan_text_scans_replayed_reasoning_parts() {
+        let msg: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "reasoning_content": "benign slot",
+            "content": [
+                {"type": "thinking", "thinking": [{"type": "text", "text": "mistral payload"}]},
+                {"type": "thinking", "thinking": "anthropic payload", "signature": "sig"},
+                {"type": "reasoning", "summary": [
+                    {"type": "summary_text", "text": "databricks payload", "signature": "sig"}
+                ]},
+                {"type": "text", "text": "answer"}
+            ]
+        }))
+        .unwrap();
+        let scanned = message_scan_text(&msg);
+        for want in [
+            "benign slot",
+            "mistral payload",
+            "anthropic payload",
+            "databricks payload",
+            "answer",
+        ] {
+            assert!(scanned.contains(want), "missing {want:?} in {scanned:?}");
+        }
+    }
+
     #[test]
     fn message_scan_text_scans_replayed_reasoning_content() {
         let msg: ChatMessage = serde_json::from_value(serde_json::json!({
