@@ -313,9 +313,8 @@ pub(crate) fn top_k_field(req: &ChatFormat, model_id: &str) -> Option<(&'static 
 
 /// `stop` as Converse `stopSequences`. A lone empty string is skipped, as
 /// Converse rejects it. Every other valid `stop` is sent, also to the
-/// models AWS refuses it for, whose error then reaches the caller. A Claude
-/// caller's native
-/// `stop_sequences`, top-level or inside its own
+/// models AWS refuses it for, whose error then reaches the caller. A
+/// Claude caller's native `stop_sequences`, top-level or inside its own
 /// `additionalModelRequestFields`, wins even when `null`, as on the
 /// Anthropic route: it reaches the model as sent there, and Converse
 /// rejects a request that also sets `stopSequences`.
@@ -591,17 +590,24 @@ mod tests {
     #[test]
     fn an_invalid_stop_or_max_completion_tokens_is_refused() {
         let nova = "amazon.nova-lite-v1:0";
-        for stop in [
-            serde_json::json!(5),
-            serde_json::json!({"a": 1}),
-            serde_json::json!(["a", 1]),
-            serde_json::json!(["a", ""]),
+        for id in [
+            nova,
+            "openai.gpt-oss-20b-1:0",
+            "us.openai.gpt-6-luna",
+            "xai.grok-4.6",
         ] {
-            let err = stop_sequences(&req(serde_json::json!({"stop": stop})), nova).unwrap_err();
-            assert!(
-                matches!(&err, BridgeError::InvalidRequest(m) if m.starts_with("stop ")),
-                "{stop}: {err:?}"
-            );
+            for stop in [
+                serde_json::json!(5),
+                serde_json::json!({"a": 1}),
+                serde_json::json!(["a", 1]),
+                serde_json::json!(["a", ""]),
+            ] {
+                let err = stop_sequences(&req(serde_json::json!({"stop": stop})), id).unwrap_err();
+                assert!(
+                    matches!(&err, BridgeError::InvalidRequest(m) if m.starts_with("stop ")),
+                    "{id} {stop}: {err:?}"
+                );
+            }
         }
         assert_eq!(
             stop_sequences(&req(serde_json::json!({"stop": null})), nova).unwrap(),
