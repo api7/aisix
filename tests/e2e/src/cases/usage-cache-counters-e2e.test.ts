@@ -367,6 +367,8 @@ describe("usage cache-counter passthrough on /v1/chat/completions (#542)", () =>
         body: JSON.stringify({
           model: "cache-ds-stream",
           stream: true,
+          // A stream carries usage only when the caller asks for it.
+          stream_options: { include_usage: true },
           messages: [{ role: "user", content: "hello" }],
         }),
       });

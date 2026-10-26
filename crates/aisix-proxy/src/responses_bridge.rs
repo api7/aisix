@@ -2543,7 +2543,7 @@ pub fn build_responses_bridge_stream(
                                 }
                             }
                         }
-                        if let Some(u) = chunk.usage.as_ref() {
+                        if let Some(u) = chunk.usage.as_ref().or(chunk.accounting_usage.as_ref()) {
                             comp.prompt_tokens = comp.prompt_tokens.max(u.prompt_tokens);
                             comp.completion_tokens = comp.completion_tokens.max(u.completion_tokens);
                             comp.reasoning_tokens = comp.reasoning_tokens.max(u.reasoning_tokens);
