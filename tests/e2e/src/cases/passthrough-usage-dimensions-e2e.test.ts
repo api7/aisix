@@ -197,6 +197,24 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
         `event:done\ndata:${JSON.stringify({ ok: true })}\n\n`,
       ],
     });
+    // A chat-shaped exchange whose server reports usage only on its own
+    // labelled frame: the typed parser reads nothing, so the label decides.
+    const detectedLabelled = await startOpenAiUpstream({
+      rawStreamFrames: [
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "hi" } }] })}\n\n`,
+        `event:token_usage\ndata:${JSON.stringify({ name: "", ...AGENT_USAGE })}\n\n`,
+        "data: [DONE]\n\n",
+      ],
+    });
+    // The same, plus a typed usage chunk: the typed report wins alone.
+    const detectedBoth = await startOpenAiUpstream({
+      rawStreamFrames: [
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "hi" } }] })}\n\n`,
+        `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } })}\n\n`,
+        `event:token_usage\ndata:${JSON.stringify({ name: "", ...AGENT_USAGE })}\n\n`,
+        "data: [DONE]\n\n",
+      ],
+    });
     // 3. Detected chat envelope, buffered, nested OpenAI usage details.
     const chat = await startOpenAiUpstream({
       nonStreamBody: {
@@ -333,6 +351,8 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
       },
     });
     upstreams.push(
+      detectedLabelled,
+      detectedBoth,
       embeddings,
       images,
       labelled,
@@ -353,6 +373,8 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
     for (const [name, prefix, upstream] of [
       ["ptr-dims-labelled", "/dims-labelled", labelled],
       ["ptr-dims-unlabelled", "/dims-unlabelled", unlabelled],
+      ["ptr-dims-detected-labelled", "/dims-detected-labelled", detectedLabelled],
+      ["ptr-dims-detected-both", "/dims-detected-both", detectedBoth],
       ["ptr-dims-chat", "/dims-chat", chat],
       ["ptr-dims-slow", "/dims-slow", slow],
       ["ptr-dims-anthropic", "/dims-anthropic", anthropic],
@@ -495,6 +517,42 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
     expect(chat["aisix.cache_write_tokens"]).toBe(113);
     expect(chat["aisix.reasoning_tokens"]).toBe(17);
     expect(chat["aisix.requested_model"]).toBe("gpt-4o-mini");
+  });
+
+  test("a detected protocol falls back to the server-labelled usage frame only when it read none itself", async (ctx) => {
+    if (!etcdReachable || !app || !seed || !dd) {
+      ctx.skip();
+      return;
+    }
+    await waitConfigPropagation(async () => {
+      const r = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      await r.text();
+      return r.status === 200;
+    });
+    const body = {
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: "hi" }],
+      stream: true,
+    };
+
+    const labelledRes = await post("/dims-detected-labelled/v1/chat/completions", body);
+    expect(labelledRes.status).toBe(200);
+    await labelledRes.text();
+    const labelled = await logFor("ptr-dims-detected-labelled");
+    expect(labelled["gen_ai.usage.input_tokens"]).toBe(AGENT_USAGE.prompt_tokens);
+    expect(labelled["gen_ai.usage.output_tokens"]).toBe(AGENT_USAGE.completion_tokens);
+    expect(labelled["aisix.cached_prompt_tokens"]).toBe(AGENT_USAGE.cache_read_input_tokens);
+    expect(labelled["aisix.requested_model"]).toBe("gpt-4o-mini");
+
+    const bothRes = await post("/dims-detected-both/v1/chat/completions", body);
+    expect(bothRes.status).toBe(200);
+    await bothRes.text();
+    const both = await logFor("ptr-dims-detected-both");
+    expect(both["gen_ai.usage.input_tokens"]).toBe(3);
+    expect(both["gen_ai.usage.output_tokens"]).toBe(4);
+    expect(both["aisix.cached_prompt_tokens"] ?? 0).toBe(0);
   });
 
   test("a streamed relay reports the caller's wait to the first frame, not the whole stream", async (ctx) => {
