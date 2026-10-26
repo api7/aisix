@@ -1458,6 +1458,7 @@ mod tests {
         for want in [
             "benign slot",
             "mistral payload",
+            "anthropic payload",
             "databricks payload",
             "answer",
         ] {
