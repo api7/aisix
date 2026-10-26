@@ -866,6 +866,8 @@ mod tests {
 
     fn resp(content: &str) -> ChatResponse {
         ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "stream-req-1".into(),
             model: "m".into(),
             message: ChatMessage::assistant(content),

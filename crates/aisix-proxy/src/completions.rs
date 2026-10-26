@@ -653,6 +653,8 @@ async fn dispatch(
             let mut resp_json = resp_json;
             if !resolved_chain.is_empty() {
                 let synth = ChatResponse {
+                    logprobs: None,
+                    more_choices: Vec::new(),
                     id: String::new(),
                     model: model_name.to_string(),
                     message: ChatMessage::assistant(completion_output_text(&resp_json)),

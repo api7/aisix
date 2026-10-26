@@ -49,7 +49,8 @@ type Key =
   | "openai-operator-rename"
   | "openai-default-cap"
   | "azure"
-  | "azure-default-cap";
+  | "azure-default-cap"
+  | "openrouter";
 type Inbound = "chat" | "chat-stream" | "messages" | "responses";
 
 interface Case {
@@ -91,6 +92,16 @@ const cases: Case[] = [
     key: "openai-operator-rename",
     inbound: "chat",
     upstreamModel: "o3",
+    want: { max_tokens: 50 },
+  },
+  // Only OpenAI's own API defines `max_completion_tokens`; OpenRouter
+  // documents `max_tokens` alone, so the caller's field goes out as sent
+  // even when the model is one of OpenAI's reasoning models.
+  {
+    label: "openrouter serving an OpenAI reasoning model",
+    key: "openrouter",
+    inbound: "chat",
+    upstreamModel: "openai/o3-mini",
     want: { max_tokens: 50 },
   },
   { label: "azure o-series deployment", key: "azure", inbound: "chat", upstreamModel: "prod-o3-deploy", want: { max_completion_tokens: 50 } },
@@ -214,6 +225,14 @@ describe("reasoning models receive max_completion_tokens (AISIX-Cloud#936)", () 
           request: { default_body_fields: { max_tokens: 64 } },
         })
       ).id,
+      openrouter: (
+        await seed.createProviderKey({
+          display_name: "k936-openrouter",
+          secret: "sk-or-mock",
+          api_base: `${plain.baseUrl}/v1`,
+          provider: "openrouter",
+        })
+      ).id,
       azure: (
         await seed.createProviderKey({
           display_name: "k936-azure",
@@ -227,7 +246,7 @@ describe("reasoning models receive max_completion_tokens (AISIX-Cloud#936)", () 
     for (const c of cases) {
       await seed.createModel({
         display_name: `m936-${c.upstreamModel}`,
-        provider: c.key.startsWith("azure") ? "azure" : "openai",
+        provider: c.key.startsWith("azure") ? "azure" : c.key === "openrouter" ? "openrouter" : "openai",
         model_name: c.upstreamModel,
         provider_key_id: keys[c.key],
       });

@@ -42,19 +42,6 @@ impl BedrockBridge {
         let upstream_id = upstream_model(ctx)?;
         validate_model_id_chars(upstream_id)?;
         let stream = body.get("stream").and_then(Value::as_bool) == Some(true);
-        // Bedrock refuses a request with no turn on every rail; refused here
-        // with the same message the chat rails give.
-        if body
-            .get("messages")
-            .and_then(Value::as_array)
-            .is_none_or(|m| m.is_empty())
-        {
-            return Err(BridgeError::InvalidRequest(
-                "messages must include at least one user or assistant turn; \
-                 a system-only request is not supported for this model"
-                    .into(),
-            ));
-        }
         let fetched = fetch_urls(platform::media_urls(&body), ctx, Encoding::Base64).await?;
         let charged = fetched.charge(ctx);
         let ctx = &*charged;

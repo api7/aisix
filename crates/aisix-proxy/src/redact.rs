@@ -1311,11 +1311,32 @@ pub fn redact_chat_response(chain: &dyn Guardrail, resp: &mut ChatResponse) -> R
     if !chain.redacts_output() {
         return counts;
     }
-    if let Some(content) = resp.message.content.as_mut() {
-        apply_to_string(chain, Direction::Output, content, &mut counts);
-    }
-    if let Some(tool_calls) = resp.message.extra.get_mut("tool_calls") {
-        redact_tool_call_arguments(chain, Direction::Output, tool_calls, &mut counts);
+    for message in resp.messages_mut() {
+        if let Some(content) = message.content.as_mut() {
+            apply_to_string(chain, Direction::Output, content, &mut counts);
+        } else if let Some(parts) = message.content_blocks.as_mut() {
+            for part in parts.iter_mut() {
+                if part.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(text) = part.get_mut("text") {
+                        apply_to_value_string(chain, Direction::Output, text, &mut counts);
+                    }
+                }
+            }
+        }
+        if let Some(refusal) = message.extra.get_mut("refusal") {
+            apply_to_value_string(chain, Direction::Output, refusal, &mut counts);
+        }
+        if let Some(tool_calls) = message.extra.get_mut("tool_calls") {
+            redact_tool_call_arguments(chain, Direction::Output, tool_calls, &mut counts);
+        }
+        if let Some(call) = message.extra.get_mut("function_call") {
+            offer_tool_name(chain, Direction::Output, call.get("name"));
+            if let Some(Value::String(s)) = call.get_mut("arguments") {
+                let mut owned = std::mem::take(s);
+                redact_json_encoded(chain, Direction::Output, &mut owned, &mut counts);
+                *s = owned;
+            }
+        }
     }
     counts
 }
@@ -1340,21 +1361,21 @@ pub fn redact_chat_chunks(chain: &dyn Guardrail, chunks: &mut [ChatChunk]) -> Re
         return counts;
     }
 
-    // Content channel: all chunks stream one assistant message.
-    let content_sites: Vec<usize> = chunks
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.delta.content.as_deref().is_some_and(|t| !t.is_empty()))
-        .map(|(i, _)| i)
-        .collect();
-    if !content_sites.is_empty() {
+    // Content channels: each choice streams one assistant message.
+    let mut content_channels: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (i, c) in chunks.iter().enumerate() {
+        if c.delta.content.as_deref().is_some_and(|t| !t.is_empty()) {
+            content_channels.entry(c.choice_index).or_default().push(i);
+        }
+    }
+    for content_sites in content_channels.values() {
         let joined: String = content_sites
             .iter()
             .map(|&i| chunks[i].delta.content.as_deref().unwrap_or(""))
             .collect();
         if let Some(r) = chain.redact_output_text(&joined) {
             let mut first = true;
-            for &i in &content_sites {
+            for &i in content_sites {
                 chunks[i].delta.content = Some(if first {
                     first = false;
                     r.text.clone()
@@ -1366,10 +1387,50 @@ pub fn redact_chat_chunks(chain: &dyn Guardrail, chunks: &mut [ChatChunk]) -> Re
         }
     }
 
-    // Tool-call channels: fragments carry an `index` discriminator; the
-    // concatenation of each channel's `function.arguments` strings is the
-    // complete JSON-encoded argument document.
-    let mut channels: BTreeMap<u64, Vec<(usize, usize)>> = BTreeMap::new();
+    // Refusal channels: a choice streams its refusal text beside its content.
+    let mut refusal_channels: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (i, c) in chunks.iter().enumerate() {
+        if c.delta
+            .extra
+            .get("refusal")
+            .and_then(Value::as_str)
+            .is_some_and(|t| !t.is_empty())
+        {
+            refusal_channels.entry(c.choice_index).or_default().push(i);
+        }
+    }
+    for refusal_sites in refusal_channels.values() {
+        let joined: String = refusal_sites
+            .iter()
+            .filter_map(|&i| chunks[i].delta.extra.get("refusal").and_then(Value::as_str))
+            .collect();
+        if let Some(r) = chain.redact_output_text(&joined) {
+            let mut first = true;
+            for &i in refusal_sites {
+                let text = if first {
+                    first = false;
+                    r.text.clone()
+                } else {
+                    String::new()
+                };
+                chunks[i]
+                    .delta
+                    .extra
+                    .insert("refusal".into(), Value::String(text));
+            }
+            merge_counts(&mut counts, r.counts);
+        }
+    }
+
+    // Tool-call channels: fragments carry an `index` discriminator within
+    // their choice; the concatenation of each channel's
+    // `function.arguments` strings is the complete JSON-encoded argument
+    // document. A legacy `delta.function_call` is one more channel per
+    // choice.
+    // Keyed by (choice, tool-call index — `None` for the legacy call); each
+    // site is (chunk, position in its `tool_calls` — `None` likewise).
+    type Channels = BTreeMap<(u32, Option<u64>), Vec<(usize, Option<usize>)>>;
+    let mut channels = Channels::new();
     for (ci, chunk) in chunks.iter().enumerate() {
         if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
             for (ti, tc) in tcs.iter().enumerate() {
@@ -1385,20 +1446,52 @@ pub fn redact_chat_chunks(chain: &dyn Guardrail, chunks: &mut [ChatChunk]) -> Re
                     .and_then(Value::as_str)
                     .is_some_and(|s| !s.is_empty())
                 {
-                    channels.entry(idx).or_default().push((ci, ti));
+                    channels
+                        .entry((chunk.choice_index, Some(idx)))
+                        .or_default()
+                        .push((ci, Some(ti)));
                 }
             }
         }
+        if let Some(call) = chunk.delta.extra.get("function_call") {
+            offer_tool_name(chain, Direction::Output, call.get("name"));
+            if call
+                .get("arguments")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+            {
+                channels
+                    .entry((chunk.choice_index, None))
+                    .or_default()
+                    .push((ci, None));
+            }
+        }
+    }
+    fn function_of(chunk: &ChatChunk, ti: Option<usize>) -> Option<&Value> {
+        match ti {
+            Some(ti) => chunk.delta.tool_calls.as_ref()?.get(ti)?.get("function"),
+            None => chunk.delta.extra.get("function_call"),
+        }
+    }
+    fn arguments_slot(chunk: &mut ChatChunk, ti: Option<usize>) -> Option<&mut Value> {
+        let function = match ti {
+            Some(ti) => chunk
+                .delta
+                .tool_calls
+                .as_mut()?
+                .get_mut(ti)?
+                .get_mut("function")?,
+            None => chunk.delta.extra.get_mut("function_call")?,
+        };
+        function.get_mut("arguments")
     }
     for sites in channels.values() {
         let joined: String = sites
             .iter()
-            .map(|&(ci, ti)| {
-                chunks[ci].delta.tool_calls.as_ref().unwrap()[ti]
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
+            .filter_map(|&(ci, ti)| {
+                function_of(&chunks[ci], ti)?
+                    .get("arguments")
                     .and_then(Value::as_str)
-                    .unwrap_or("")
             })
             .collect();
         let mut rewritten = joined.clone();
@@ -1409,16 +1502,14 @@ pub fn redact_chat_chunks(chain: &dyn Guardrail, chunks: &mut [ChatChunk]) -> Re
         }
         let mut first = true;
         for &(ci, ti) in sites {
-            let args = chunks[ci].delta.tool_calls.as_mut().unwrap()[ti]
-                .get_mut("function")
-                .and_then(|f| f.get_mut("arguments"))
-                .expect("site was selected for having arguments");
-            *args = Value::String(if first {
-                first = false;
-                rewritten.clone()
-            } else {
-                String::new()
-            });
+            if let Some(args) = arguments_slot(&mut chunks[ci], ti) {
+                *args = Value::String(if first {
+                    first = false;
+                    rewritten.clone()
+                } else {
+                    String::new()
+                });
+            }
         }
         merge_counts(&mut counts, local);
     }
@@ -2958,6 +3049,8 @@ mod tests {
     fn input_only_chain_skips_output_and_vice_versa() {
         let input_only = mask_chain(aisix_core::models::GuardrailHookPoint::Input);
         let mut resp = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "r".into(),
             model: "m".into(),
             message: ChatMessage::assistant("mail a@x.com"),
@@ -2992,6 +3085,8 @@ mod tests {
             }]),
         );
         let mut resp = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "r".into(),
             model: "m".into(),
             message: msg,
@@ -3094,6 +3189,8 @@ mod tests {
 
     fn content_chunk(text: &str) -> ChatChunk {
         ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -3136,6 +3233,8 @@ mod tests {
         let chain = both();
         let mut chunks = vec![
             ChatChunk {
+                choice_index: 0,
+                logprobs: None,
                 id: "c".into(),
                 model: "m".into(),
                 delta: ChatDelta {
@@ -3151,6 +3250,8 @@ mod tests {
                 accounting_usage: None,
             },
             ChatChunk {
+                choice_index: 0,
+                logprobs: None,
                 id: "c".into(),
                 model: "m".into(),
                 delta: ChatDelta {

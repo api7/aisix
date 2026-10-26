@@ -1186,6 +1186,8 @@ async fn dispatch(
         };
         if let Some(text) = text {
             let synth = aisix_gateway::ChatResponse {
+                logprobs: None,
+                more_choices: Vec::new(),
                 id: String::new(),
                 model: route.name.clone(),
                 message: aisix_gateway::ChatMessage::assistant(text),
@@ -6782,6 +6784,8 @@ async fn scan_output(
 ) -> aisix_guardrails::GuardrailVerdict {
     use aisix_guardrails::Guardrail as _;
     let synth = aisix_gateway::ChatResponse {
+        logprobs: None,
+        more_choices: Vec::new(),
         id: String::new(),
         model: route_name.to_string(),
         message: aisix_gateway::ChatMessage::assistant(text.to_string()),

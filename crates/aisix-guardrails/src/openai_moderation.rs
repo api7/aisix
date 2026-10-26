@@ -610,6 +610,8 @@ mod tests {
         // outage must still block the OUTPUT hook.
         let g = build(&server.uri(), true);
         let resp = aisix_gateway::ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "r".into(),
             model: "m".into(),
             message: ChatMessage::assistant("model output"),

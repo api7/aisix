@@ -35,7 +35,7 @@ use crate::state::ProxyState;
 
 /// Fixed judge sampling temperature. The judge runs cool for stable
 /// synthesis; this is intentionally not operator-configurable in v1.
-const JUDGE_TEMPERATURE: f32 = 0.2;
+const JUDGE_TEMPERATURE: f64 = 0.2;
 
 /// Per-candidate text cap (bytes) fed to the judge. Bounds the synthesis
 /// prompt so a panel of N long answers cannot overflow the judge's
@@ -631,7 +631,9 @@ fn panel_request(req: &ChatFormat, member: &PanelMember) -> ChatFormat {
     let mut out = req.clone();
     out.model = member.model.clone();
     if let Some(temperature) = member.temperature {
-        out.temperature = Some(temperature);
+        // Through its shortest decimal, so a configured `0.7` is sent as
+        // `0.7` rather than the widened `0.699999988`.
+        out.temperature = temperature.to_string().parse().ok();
     }
     if let Some(seed) = member.seed {
         out.extra
@@ -705,6 +707,7 @@ fn role_label(role: Role) -> &'static str {
         Role::User => "User",
         Role::Assistant => "Assistant",
         Role::Tool => "Tool",
+        Role::Function => "Function",
     }
 }
 
@@ -810,6 +813,8 @@ mod tests {
 
     fn ok(model: &str, content: &str) -> Result<ChatResponse, BridgeError> {
         Ok(ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: format!("id-{model}"),
             model: model.to_string(),
             message: ChatMessage::assistant(content),

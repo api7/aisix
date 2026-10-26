@@ -304,7 +304,7 @@ impl TokenMinter {
             });
         }
         let parsed: TokenResponse = resp.json().await.map_err(|e| {
-            BridgeError::UpstreamDecode(format!("azure aad token mint response: {e}"))
+            BridgeError::TokenExchangeDecode(format!("azure aad token mint response: {e}"))
         })?;
         Ok((parsed.access_token, parsed.expires_in))
     }
@@ -388,6 +388,24 @@ mod tests {
         assert!(body.contains("client_id=22222222-2222-2222-2222-222222222222"));
         assert!(body.contains("client_secret=fake-secret-not-a-real-one"));
         assert!(body.contains("scope=https%3A%2F%2Fcognitiveservices.azure.com%2F.default"));
+    }
+
+    /// An unreadable token answer is not a model answer: nothing was
+    /// served or billed, so it must stay retryable rather than take the
+    /// never-retry rule an undecodable 2xx model response gets.
+    #[tokio::test]
+    async fn an_unreadable_token_answer_is_a_retryable_exchange_failure() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>proxy</html>"))
+            .mount(&server)
+            .await;
+        let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(server.uri());
+        let err = minter.get_token(&sample_creds()).await.unwrap_err();
+        assert!(
+            matches!(err, BridgeError::TokenExchangeDecode(_)),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]

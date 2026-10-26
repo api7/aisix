@@ -997,6 +997,7 @@ mod tests {
     #[test]
     fn chat_delta_counts_text_reasoning_and_tool_arguments_only() {
         let delta = ChatDelta {
+            extra: Default::default(),
             role: None,
             content: Some("abc".into()),
             reasoning_content: Some("de".into()),

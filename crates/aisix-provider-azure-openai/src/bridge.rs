@@ -37,7 +37,7 @@ use aisix_provider_openai::overrides::{
 };
 use aisix_provider_openai::reasoning::{is_reasoning_model, ReasoningFamily};
 use aisix_provider_openai::wire::{
-    build_request, messages_from, response_into_chat_response, stream_chunk_into_chat_chunk,
+    build_request, messages_from, response_into_chat_response, stream_chunk_into_chat_chunks,
     DeveloperRoleMode, OpenAiResponse, OpenAiStreamChunk, ToolCallIndexer,
 };
 
@@ -604,6 +604,7 @@ where
 /// transforms before sending. Mirrors `OpenAiBridge::prepare_outbound_body`.
 fn prepare_outbound_body<T: serde::Serialize>(
     typed: &T,
+    gateway_strict_schema: bool,
     reasoning_model: bool,
     request: Option<&RequestOverrides>,
     response: Option<&ResponseOverrides>,
@@ -613,7 +614,7 @@ fn prepare_outbound_body<T: serde::Serialize>(
     // Azure serves the OpenAI wire, so it owes the same strict-mode
     // schema closing the OpenAI edge applies — one function, not a
     // second copy, because these two bodies have to stay identical.
-    close_strict_response_format_schema(&mut body);
+    close_strict_response_format_schema(&mut body, gateway_strict_schema);
     // Before `param_renames`, so an operator's explicit rename wins.
     if reasoning_model {
         aisix_provider_openai::reasoning::apply_reasoning_token_cap(&mut body);
@@ -760,6 +761,7 @@ impl Bridge for AzureOpenAiBridge {
             let typed = build_request(&req, deployment, &messages, false);
             aisix_gateway::json_body(&prepare_outbound_body(
                 &typed,
+                req.gateway_strict_schema,
                 is_reasoning_model(ReasoningFamily::AzureOpenai, deployment),
                 ctx.provider_key.request.as_ref(),
                 ctx.provider_key.response.as_ref(),
@@ -829,6 +831,7 @@ impl Bridge for AzureOpenAiBridge {
             let typed = build_request(&req, deployment, &messages, true);
             aisix_gateway::json_body(&prepare_outbound_body(
                 &typed,
+                req.gateway_strict_schema,
                 is_reasoning_model(ReasoningFamily::AzureOpenai, deployment),
                 ctx.provider_key.request.as_ref(),
                 ctx.provider_key.response.as_ref(),
@@ -938,7 +941,7 @@ where
                     }
                     SseEvent::Data(payload) => {
                         let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                        if let Some(chunk) = stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                        for chunk in stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
                             yield chunk;
                         }
                     }
@@ -951,7 +954,7 @@ where
             }
             Some(SseEvent::Data(payload)) => {
                 let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                if let Some(chunk) = stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                for chunk in stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
                     yield chunk;
                 }
             }
@@ -1041,13 +1044,15 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        translate_extras_to_openai_shape(&mut extra, aisix_core::MappedEffort::AsWritten);
+        let gateway_strict =
+            translate_extras_to_openai_shape(&mut extra, aisix_core::MappedEffort::AsWritten);
+        assert!(gateway_strict);
 
         let mut req = ChatFormat::new("m", vec![ChatMessage::user("weather?")]);
         req.extra = extra;
         let messages = messages_from(&req, AZURE_DEVELOPER_ROLE_MODE);
         let typed = build_request(&req, "ci-chat", &messages, false);
-        let body = prepare_outbound_body(&typed, false, None, None).unwrap();
+        let body = prepare_outbound_body(&typed, gateway_strict, false, None, None).unwrap();
 
         assert_eq!(
             body["response_format"],

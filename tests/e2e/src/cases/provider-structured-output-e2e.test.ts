@@ -439,7 +439,9 @@ describe("chat response_format → Gemini and Bedrock", () => {
     const tools = sent.body.toolConfig.tools;
     expect(tools).toHaveLength(1);
     expect(tools[0].toolSpec.name).toBe("json_tool_call");
-    expect(tools[0].toolSpec.inputSchema.json.additionalProperties).toBe(false);
+    // Claude's sealed schema subset is not Nova's contract: the schema
+    // goes as the caller sent it.
+    expect(tools[0].toolSpec.inputSchema.json).toEqual(PERSON_SCHEMA);
     // Nova is one of the two families whose Converse honours a
     // `toolChoice`, so the tool is forced rather than merely offered.
     expect(sent.body.toolConfig.toolChoice).toEqual({

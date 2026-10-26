@@ -25,6 +25,11 @@ pub enum Role {
     User,
     Assistant,
     Tool,
+    /// The deprecated function-calling result turn (`role: "function"`,
+    /// with `name` and `content`). OpenAI-wire upstreams receive it as is;
+    /// every other bridge sees it as a `tool` result through
+    /// [`crate::tool_calls::legacy_functions_as_tools`].
+    Function,
 }
 
 impl Role {
@@ -73,7 +78,7 @@ impl Role {
 ///     to the upstream so vision input reaches OpenAI / Gemini /
 ///     DeepSeek upstreams unchanged.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(from = "ChatMessageRaw")]
+#[serde(try_from = "ChatMessageRaw")]
 pub struct ChatMessage {
     pub role: Role,
     /// Assistant/text content. `Option<String>` (not `String`) so the
@@ -161,9 +166,11 @@ struct ChatMessageRaw {
     extra: serde_json::Map<String, serde_json::Value>,
 }
 
-impl From<ChatMessageRaw> for ChatMessage {
-    fn from(raw: ChatMessageRaw) -> Self {
-        let (content, derived_blocks) = split_content(raw.content);
+impl TryFrom<ChatMessageRaw> for ChatMessage {
+    type Error = String;
+
+    fn try_from(raw: ChatMessageRaw) -> Result<Self, Self::Error> {
+        let (content, derived_blocks) = split_content(raw.content)?;
         // If the wire form supplied `content_blocks` explicitly
         // (round-trip from a previous serialization), prefer it over
         // anything we'd derive from `content`. Otherwise use the
@@ -180,7 +187,7 @@ impl From<ChatMessageRaw> for ChatMessage {
         // A serialized block-array message (a cache round trip) carries the
         // derived text beside its blocks; it is not stored twice either.
         message.drop_derived_content();
-        message
+        Ok(message)
     }
 }
 
@@ -204,16 +211,15 @@ pub fn blocks_text(blocks: &[Value]) -> String {
 ///     blocks), Some(raw array)) — vision / multimodal input. Non-text
 ///     blocks (e.g. `image_url`) are skipped on the text-extraction path
 ///     but preserved verbatim in the raw array for forwarding.
-///   * Anything else → (None, None) — defensive default; unexpected
-///     shapes don't fail the request, they degrade to absent text
-///     so the bridge can still dispatch.
-fn split_content(v: Value) -> (Option<String>, Option<Vec<Value>>) {
+///   * Anything else is not a `content` any OpenAI role takes, and is
+///     refused rather than read as absent text.
+fn split_content(v: Value) -> Result<(Option<String>, Option<Vec<Value>>), String> {
     match v {
-        Value::String(s) => (Some(s), None),
-        Value::Null => (None, None),
+        Value::String(s) => Ok((Some(s), None)),
+        Value::Null => Ok((None, None)),
         // The text is derived from the blocks on read.
-        Value::Array(blocks) => (None, Some(blocks)),
-        _ => (None, None),
+        Value::Array(blocks) => Ok((None, Some(blocks))),
+        _ => Err("`content` must be a string, an array of content parts, or null".into()),
     }
 }
 
@@ -346,10 +352,12 @@ impl ChatMessage {
 pub struct ChatFormat {
     pub model: String,
     pub messages: Vec<ChatMessage>,
+    /// `f64`, so the caller's decimal reaches the upstream as written
+    /// (`0.7`, not `0.699999988`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
+    pub temperature: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
+    pub top_p: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -358,6 +366,27 @@ pub struct ChatFormat {
     /// params at the gateway — each Bridge decides what to forward.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty", flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+    /// The gateway itself set `response_format.json_schema.strict` while
+    /// translating another protocol's structured-output request, so the
+    /// OpenAI edge owes the schema the closing strict mode demands. A
+    /// `strict` the caller sent is theirs, and its schema goes out as
+    /// written.
+    #[serde(skip)]
+    pub gateway_strict_schema: bool,
+    /// `top_k` from a `/v1/messages` caller. The OpenAI wire has no such
+    /// parameter, so it never rides `extra`; a bridge whose target takes a
+    /// top-k slot writes it there (Claude `top_k`, Converse Claude / Nova,
+    /// Gemini `topK`) and every other bridge leaves it unsent.
+    #[serde(skip)]
+    pub top_k: Option<u64>,
+    /// The exact `thinking.budget_tokens` of a `/v1/messages` caller whose
+    /// thinking is `enabled`. `extra.reasoning_effort` still carries the
+    /// tier bucketed from it, for targets that take only a tier; a target
+    /// with a token-budget slot (Claude `thinking.budget_tokens`, Gemini 2.5
+    /// `thinkingBudget`) writes this exact budget instead of mapping the
+    /// tier back to one.
+    #[serde(skip)]
+    pub thinking_budget_tokens: Option<u64>,
 }
 
 impl ChatFormat {
@@ -370,6 +399,9 @@ impl ChatFormat {
             max_tokens: None,
             stream: None,
             extra: serde_json::Map::new(),
+            gateway_strict_schema: false,
+            top_k: None,
+            thinking_budget_tokens: None,
         }
     }
 
@@ -1183,8 +1215,17 @@ pub fn anthropic_usage_service_tier(usage: &serde_json::Value) -> Option<String>
 pub struct ChatResponse {
     pub id: String,
     pub model: String,
+    /// The first choice's message.
     pub message: ChatMessage,
     pub finish_reason: FinishReason,
+    /// The first choice's `logprobs`, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<Value>,
+    /// Every choice after the first (`n > 1`), in upstream order. A
+    /// renderer whose protocol has one answer per response reads only the
+    /// first choice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub more_choices: Vec<ChatChoice>,
     pub usage: UsageStats,
     /// Not serialized: a cached response was served by no upstream, so a
     /// cache hit reports no tier — and this type denies unknown fields, so
@@ -1194,7 +1235,29 @@ pub struct ChatResponse {
     pub service_tier: Option<ServiceTier>,
 }
 
+/// One choice of a multi-choice response, past the first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatChoice {
+    pub index: u32,
+    pub message: ChatMessage,
+    pub finish_reason: FinishReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<Value>,
+}
+
 impl ChatResponse {
+    /// Every choice's message, the first included.
+    pub fn messages(&self) -> impl Iterator<Item = &ChatMessage> {
+        std::iter::once(&self.message).chain(self.more_choices.iter().map(|c| &c.message))
+    }
+
+    /// [`Self::messages`], mutably.
+    pub fn messages_mut(&mut self) -> impl Iterator<Item = &mut ChatMessage> {
+        std::iter::once(&mut self.message)
+            .chain(self.more_choices.iter_mut().map(|c| &mut c.message))
+    }
+
     /// Take `fallback` as the tier when the body reported none.
     pub fn with_fallback_service_tier(mut self, fallback: Option<ServiceTier>) -> Self {
         if self.service_tier.is_none() {
@@ -1212,17 +1275,31 @@ impl ChatResponse {
     ///
     /// Reasoning/thinking content is intentionally NOT included — it is
     /// left out of output-guardrail scope by design.
+    ///
+    /// Every choice is scanned: a multi-choice response renders them all.
     pub fn guardrail_output_text(&self) -> String {
-        let mut out = self.message.content.clone().unwrap_or_default();
-        if let Some(tool_calls) = self.message.extra.get("tool_calls") {
-            if !tool_calls.is_null() {
+        let mut out = String::new();
+        for message in self.messages() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&message.content_str());
+            if let Some(refusal) = message.extra.get("refusal").and_then(Value::as_str) {
                 if !out.is_empty() {
                     out.push('\n');
                 }
-                // Serialize the whole tool-call payload so no function
-                // name or argument can escape inspection regardless of the
-                // provider-specific shape (tool-call ids left out).
-                out.push_str(&crate::tool_calls::tool_calls_scan_text(tool_calls));
+                out.push_str(refusal);
+            }
+            for key in ["tool_calls", "function_call"] {
+                if let Some(calls) = message.extra.get(key).filter(|v| !v.is_null()) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    // Serialize the whole tool-call payload so no function
+                    // name or argument can escape inspection regardless of
+                    // the provider-specific shape (tool-call ids left out).
+                    out.push_str(&crate::tool_calls::tool_calls_scan_text(calls));
+                }
             }
         }
         out
@@ -1235,9 +1312,17 @@ impl ChatResponse {
 pub struct ChatChunk {
     pub id: String,
     pub model: String,
+    /// The choice this delta belongs to (`n > 1`); `0` for the first. A
+    /// renderer whose protocol has one answer per response drops the
+    /// others.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub choice_index: u32,
     pub delta: ChatDelta,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<FinishReason>,
+    /// The choice's streamed `logprobs`, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageStats>,
     /// The tier the upstream reported so far on this stream; see
@@ -1271,6 +1356,28 @@ impl ChatChunk {
             && d.tool_calls.is_none()
             && d.reasoning_content.is_none()
             && d.audio.is_none()
+            && d.extra.is_empty()
+            && self.logprobs.is_none()
+    }
+
+    /// This chunk as a renderer with one answer per response reads it: a
+    /// later choice's delta, finish and logprobs are left out, and only
+    /// what the stream as a whole reports (usage, tier) stays.
+    pub fn first_choice_only(&self) -> std::borrow::Cow<'_, ChatChunk> {
+        if self.choice_index == 0 {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        std::borrow::Cow::Owned(ChatChunk {
+            id: self.id.clone(),
+            model: self.model.clone(),
+            choice_index: 0,
+            delta: ChatDelta::default(),
+            finish_reason: None,
+            logprobs: None,
+            usage: self.usage.clone(),
+            service_tier: self.service_tier.clone(),
+            accounting_usage: self.accounting_usage.clone(),
+        })
     }
 
     /// The `include_usage` terminal frame: usage and nothing else.
@@ -1280,7 +1387,6 @@ impl ChatChunk {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ChatDelta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<Role>,
@@ -1303,6 +1409,10 @@ pub struct ChatDelta {
     /// streaming counterpart of the non-stream `message.audio`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<serde_json::Value>,
+    /// Every other delta field an OpenAI-shape upstream streamed
+    /// (`refusal`, `function_call`, `annotations`, …), relayed as sent.
+    #[serde(default, flatten, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 // ─── Embeddings ──────────────────────────────────────────────────────────────
@@ -1384,6 +1494,27 @@ pub struct EmbeddingRequest {
     /// (Cohere's `embedding_types`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_types: Option<serde_json::Value>,
+    /// The caller's `input` when it is token ids (`[1, 2]` or
+    /// `[[1, 2], [3]]`), verbatim; `input` is then empty. Only an
+    /// OpenAI-wire upstream takes it; any other refuses the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_input: Option<serde_json::Value>,
+    /// Every other field the caller sent (`user`, …), forwarded as is to
+    /// an OpenAI-wire upstream.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl EmbeddingRequest {
+    /// Refuse token-id input on an upstream that takes text only.
+    pub fn require_text_input(&self) -> Result<(), crate::BridgeError> {
+        match self.token_input {
+            Some(_) => Err(crate::BridgeError::InvalidRequest(
+                "`input` as token ids is not supported for this model; send text".into(),
+            )),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Normalised embedding response.
@@ -1431,6 +1562,9 @@ mod tests {
     #[test]
     fn chat_format_round_trips_through_json() {
         let f = ChatFormat {
+            gateway_strict_schema: false,
+            top_k: None,
+            thinking_budget_tokens: None,
             model: "my-gpt4".into(),
             messages: vec![
                 ChatMessage::system("you are helpful"),
@@ -2195,9 +2329,12 @@ mod tests {
     #[test]
     fn chat_chunk_omits_optional_fields_on_wire() {
         let chunk = ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "cmpl-1".into(),
             model: "m".into(),
             delta: ChatDelta {
+                extra: Default::default(),
                 role: None,
                 content: Some("hello".into()),
                 tool_calls: None,

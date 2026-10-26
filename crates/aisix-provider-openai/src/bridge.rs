@@ -46,9 +46,19 @@ use crate::overrides::{
 use crate::reasoning::{is_reasoning_model, ReasoningFamily};
 use crate::wire::{
     build_request, embed_request_body, embed_response_into, messages_from,
-    response_into_chat_response, stream_chunk_into_chat_chunk, DeveloperRoleMode,
+    response_into_chat_response, stream_chunk_into_chat_chunks, DeveloperRoleMode,
     OpenAiEmbedResponse, OpenAiResponse, OpenAiStreamChunk, ToolCallIndexer,
 };
+
+/// Whether this dispatch moves a reasoning model's `max_tokens` to
+/// `max_completion_tokens`. Only OpenAI's own API defines the second
+/// field; an OpenAI-compatible platform serving the same model names
+/// (OpenRouter documents only `max_tokens`) gets the field the caller
+/// sent.
+fn renames_token_cap(ctx: &BridgeContext, upstream: &str) -> bool {
+    developer_role_mode(ctx) == DeveloperRoleMode::Preserve
+        && is_reasoning_model(ReasoningFamily::Openai, upstream)
+}
 
 fn developer_role_mode(ctx: &BridgeContext) -> DeveloperRoleMode {
     let provider = ctx.provider_key.provider.trim();
@@ -297,20 +307,32 @@ fn parse_openai_error_envelope(body: &[u8]) -> Option<aisix_gateway::UpstreamErr
     struct Outer {
         error: Inner,
     }
+    // Every field but the message is read leniently: compatible servers
+    // send a numeric `code` (`429`) or a non-string `param`, and one such
+    // field must not cost the caller the upstream's message.
     #[derive(serde::Deserialize)]
     struct Inner {
         message: Option<String>,
-        #[serde(rename = "type")]
-        kind: Option<String>,
-        code: Option<String>,
-        param: Option<String>,
+        #[serde(rename = "type", default)]
+        kind: Option<Value>,
+        #[serde(default)]
+        code: Option<Value>,
+        #[serde(default)]
+        param: Option<Value>,
+    }
+    fn text(v: Option<Value>) -> Option<String> {
+        match v? {
+            Value::String(s) => Some(s),
+            Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }
     }
     let outer: Outer = serde_json::from_slice(body).ok()?;
     Some(aisix_gateway::UpstreamErrorView {
-        kind: outer.error.kind,
+        kind: text(outer.error.kind),
         message: outer.error.message,
-        code: outer.error.code,
-        param: outer.error.param,
+        code: text(outer.error.code),
+        param: text(outer.error.param),
     })
 }
 
@@ -345,12 +367,14 @@ where
 /// gateway convention). Anything not configured is a no-op.
 fn prepare_outbound_body<T: serde::Serialize>(
     typed: &T,
+    gateway_strict_schema: bool,
     reasoning_model: bool,
     request: Option<&RequestOverrides>,
     response: Option<&ResponseOverrides>,
 ) -> Result<Value, BridgeError> {
     let mut body = serde_json::to_value(typed)
         .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
+    close_strict_response_format_schema(&mut body, gateway_strict_schema);
     apply_outbound_overrides(&mut body, reasoning_model, request, response);
     Ok(body)
 }
@@ -363,7 +387,6 @@ fn apply_outbound_overrides(
     request: Option<&RequestOverrides>,
     response: Option<&ResponseOverrides>,
 ) {
-    close_strict_response_format_schema(body);
     // Before `param_renames`, so an operator's explicit rename wins.
     if reasoning_model {
         crate::reasoning::apply_reasoning_token_cap(body);
@@ -395,8 +418,10 @@ fn outbound_bytes(body: &Value) -> Result<Bytes, BridgeError> {
         .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))
 }
 
-/// Apply OpenAI strict mode's schema rule at the edge that declares it:
-/// when `response_format.json_schema.strict` is true, every object in
+/// Apply OpenAI strict mode's schema rule at the edge that declares it,
+/// for a `strict` the gateway set itself (`gateway_strict_schema`, from
+/// translating another protocol's structured output): when
+/// `response_format.json_schema.strict` is true, every object in
 /// the schema must carry `additionalProperties: false` and list each of
 /// its declared properties in `required`, or the API rejects it.
 ///
@@ -411,9 +436,12 @@ fn outbound_bytes(body: &Value) -> Result<Bytes, BridgeError> {
 /// Gemini edges, and there `required` is an ordinary keyword whose
 /// contents are the caller's own statement — promoting it would silently
 /// make their optional fields mandatory. A caller who sent `strict`
-/// themselves gets the same treatment they would have got from OpenAI's
-/// own validation, so a schema that was already complete is unchanged.
-pub fn close_strict_response_format_schema(body: &mut Value) {
+/// themselves gets their schema forwarded as written, and OpenAI's own
+/// validation answers it.
+pub fn close_strict_response_format_schema(body: &mut Value, gateway_strict_schema: bool) {
+    if !gateway_strict_schema {
+        return;
+    }
     let Some(json_schema) = body.pointer_mut("/response_format/json_schema") else {
         return;
     };
@@ -506,7 +534,8 @@ impl Bridge for OpenAiBridge {
             let typed = build_request(&req, upstream, &messages, false);
             outbound_bytes(&prepare_outbound_body(
                 &typed,
-                is_reasoning_model(ReasoningFamily::Openai, upstream),
+                req.gateway_strict_schema,
+                renames_token_cap(ctx, upstream),
                 ctx.provider_key.request.as_ref(),
                 ctx.provider_key.response.as_ref(),
             )?)?
@@ -565,6 +594,7 @@ impl Bridge for OpenAiBridge {
         // consistency follow-up). No-op when the PK carries no overrides.
         let body = outbound_bytes(&prepare_outbound_body(
             &embed_request_body(req, upstream),
+            false,
             false,
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
@@ -752,7 +782,8 @@ impl Bridge for OpenAiBridge {
             let typed = build_request(&req, upstream, &messages, true);
             outbound_bytes(&prepare_outbound_body(
                 &typed,
-                is_reasoning_model(ReasoningFamily::Openai, upstream),
+                req.gateway_strict_schema,
+                renames_token_cap(ctx, upstream),
                 ctx.provider_key.request.as_ref(),
                 ctx.provider_key.response.as_ref(),
             )?)?
@@ -844,7 +875,7 @@ where
                     }
                     SseEvent::Data(payload) => {
                         let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                        if let Some(chunk) = stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                        for chunk in stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
                             yield chunk.with_fallback_service_tier(&header_tier);
                         }
                     }
@@ -864,7 +895,7 @@ where
             }
             Some(SseEvent::Data(payload)) => {
                 let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-                if let Some(chunk) = stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                for chunk in stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
                     yield chunk.with_fallback_service_tier(&header_tier);
                 }
             }
@@ -965,13 +996,15 @@ mod tests {
         .as_object()
         .unwrap()
         .clone();
-        translate_extras_to_openai_shape(&mut extra, aisix_core::MappedEffort::AsWritten);
+        let gateway_strict =
+            translate_extras_to_openai_shape(&mut extra, aisix_core::MappedEffort::AsWritten);
+        assert!(gateway_strict);
 
         let mut req = ChatFormat::new("m", vec![ChatMessage::user("weather?")]);
         req.extra = extra;
         let messages = messages_from(&req, DeveloperRoleMode::Preserve);
         let typed = build_request(&req, "gpt-4o", &messages, false);
-        let body = prepare_outbound_body(&typed, false, None, None).unwrap();
+        let body = prepare_outbound_body(&typed, gateway_strict, false, None, None).unwrap();
 
         assert_eq!(
             body["response_format"],
@@ -1021,7 +1054,7 @@ mod tests {
         );
         let messages = messages_from(&req, DeveloperRoleMode::Preserve);
         let typed = build_request(&req, "gpt-4o", &messages, false);
-        let body = prepare_outbound_body(&typed, false, None, None).unwrap();
+        let body = prepare_outbound_body(&typed, false, false, None, None).unwrap();
         // Not strict: the caller's `required` is theirs, and OpenAI does
         // not demand the closing.
         assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
@@ -2047,6 +2080,8 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
         );
         let ctx = BridgeContext::new("req-1", sample_model(), pk);
         let request = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "my-embed".into(),
             input: vec!["hi".into()],
             input_was_single: true,

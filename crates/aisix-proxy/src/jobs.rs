@@ -561,6 +561,8 @@ async fn scan_output_blob(
         *applied = chain.applied().to_vec();
     }
     let synth = aisix_gateway::ChatResponse {
+        logprobs: None,
+        more_choices: Vec::new(),
         id: String::new(),
         model: target.display_name().to_string(),
         message: aisix_gateway::ChatMessage::assistant(String::from_utf8_lossy(blob).into_owned()),

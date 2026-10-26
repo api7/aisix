@@ -62,7 +62,8 @@ use aisix_provider_anthropic::wire::{
     claude_media_kind, message_cache_control, response_into_chat_response,
     retain_cache_control_fields, split_system_with, structured_output_for,
     tool_choice_states_a_preference, tool_message_cache_control,
-    translate_reasoning_effort_to_anthropic, AnthropicResponse, MediaUrls, StructuredOutput,
+    translate_reasoning_effort_to_anthropic, write_thinking_budget, AnthropicResponse, MediaUrls,
+    StructuredOutput,
 };
 
 // Per-`ProviderKey` request override pipeline (#302 §5 / #340). The JSON-body
@@ -892,8 +893,21 @@ impl Intercept for DefaultHeadersInterceptor {
 /// rewritten bytes and the original body is not kept alongside them.
 ///
 /// Reference: <https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html>
-#[derive(Debug)]
-struct StableJsonBodyInterceptor;
+///
+/// It also writes the caller's `temperature` / `top_p` into
+/// `inferenceConfig` exactly: the SDK types those slots as `f32`, which
+/// would send a client's `0.7` as `0.699999988079071`.
+#[derive(Debug, Default, Clone, Copy)]
+struct StableJsonBodyInterceptor {
+    sampling: ExactSampling,
+}
+
+/// The `inferenceConfig` sampling values as the caller sent them.
+#[derive(Debug, Default, Clone, Copy)]
+struct ExactSampling {
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+}
 
 impl Intercept for StableJsonBodyInterceptor {
     fn name(&self) -> &'static str {
@@ -907,7 +921,11 @@ impl Intercept for StableJsonBodyInterceptor {
         _cfg: &mut ConfigBag,
     ) -> Result<(), BoxError> {
         let request = context.request_mut();
-        let Some(body) = request.body().bytes().and_then(stable_json) else {
+        let Some(body) = request
+            .body()
+            .bytes()
+            .and_then(|b| stable_json_with(b, &self.sampling))
+        else {
             return Ok(());
         };
         request
@@ -921,15 +939,31 @@ impl Intercept for StableJsonBodyInterceptor {
 /// `body` with every object's keys sorted, or `None` when it is not JSON.
 /// Only keys are re-encoded; every scalar is copied as its original bytes, so
 /// numbers keep their exact digits and large inline media strings are never
-/// materialized, and the output is the input's length.
+/// materialized.
+#[cfg(test)]
 fn stable_json(body: &[u8]) -> Option<Vec<u8>> {
+    stable_json_with(body, &ExactSampling::default())
+}
+
+/// [`stable_json`], with `inferenceConfig.temperature` / `topP` written
+/// from `sampling` where it holds a value.
+fn stable_json_with(body: &[u8], sampling: &ExactSampling) -> Option<Vec<u8>> {
     let root: &RawValue = serde_json::from_slice(body).ok()?;
     let mut out = Vec::with_capacity(body.len());
-    write_sorted(root, &mut out).ok()?;
+    write_sorted(root, &mut out, Slot::Root(sampling)).ok()?;
     Some(out)
 }
 
-fn write_sorted(value: &RawValue, out: &mut Vec<u8>) -> serde_json::Result<()> {
+/// Where in the body [`write_sorted`] is, as far as the exact sampling
+/// values care.
+#[derive(Clone, Copy)]
+enum Slot<'a> {
+    Root(&'a ExactSampling),
+    InferenceConfig(&'a ExactSampling),
+    Other,
+}
+
+fn write_sorted(value: &RawValue, out: &mut Vec<u8>, slot: Slot<'_>) -> serde_json::Result<()> {
     let raw = value.get();
     match raw.as_bytes().first() {
         Some(b'{') => {
@@ -941,7 +975,20 @@ fn write_sorted(value: &RawValue, out: &mut Vec<u8>) -> serde_json::Result<()> {
                 }
                 serde_json::to_writer(&mut *out, &k)?;
                 out.push(b':');
-                write_sorted(v, out)?;
+                let exact = match (slot, k.as_str()) {
+                    (Slot::InferenceConfig(s), "temperature") => s.temperature,
+                    (Slot::InferenceConfig(s), "topP") => s.top_p,
+                    _ => None,
+                };
+                if let Some(exact) = exact {
+                    serde_json::to_writer(&mut *out, &exact)?;
+                    continue;
+                }
+                let inner = match (slot, k.as_str()) {
+                    (Slot::Root(s), "inferenceConfig") => Slot::InferenceConfig(s),
+                    _ => Slot::Other,
+                };
+                write_sorted(v, out, inner)?;
             }
             out.push(b'}');
         }
@@ -952,7 +999,7 @@ fn write_sorted(value: &RawValue, out: &mut Vec<u8>) -> serde_json::Result<()> {
                 if i > 0 {
                     out.push(b',');
                 }
-                write_sorted(v, out)?;
+                write_sorted(v, out, Slot::Other)?;
             }
             out.push(b']');
         }
@@ -1073,32 +1120,38 @@ impl Bridge for BedrockBridge {
         req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
-        // Converse has no slot for the legacy fields and would drop them.
-        aisix_gateway::tool_calls::reject_legacy_function_calling(&req)?;
         let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let upstream_id = upstream_model(ctx)?;
         validate_model_id_chars(upstream_id)?;
         let publisher = resolve_publisher(upstream_id)?;
-        reject_system_only(&req)?;
         if crate::openai_compat::serves(&req, upstream_id) {
             let endpoint = self.chat_completions_endpoint(ctx)?;
             return crate::openai_compat::chat(endpoint, req, ctx, upstream_id).await;
         }
+        // InvokeModel and Converse take tools, not the legacy fields.
+        let (req, legacy) = aisix_gateway::tool_calls::legacy_functions_as_tools(req)?;
         // Claude answers a non-streamed request through InvokeModel, in
         // Anthropic Messages shape; every other publisher, and every
         // streamed request, through Converse.
-        // InvokeModel has no place for `requestMetadata` or a Bedrock
-        // `outputConfig`, so a Claude request carrying either is served by
+        // InvokeModel has no place for `requestMetadata`, a Bedrock
+        // `outputConfig`, `additionalModelResponseFieldPaths` or
+        // `promptVariables`, so a Claude request carrying one is served by
         // Converse, as it is when streamed.
-        let needs_converse = ["requestMetadata", "outputConfig"]
-            .iter()
-            .any(|k| req.extra.get(*k).is_some_and(|v| !v.is_null()));
+        let needs_converse = [
+            "requestMetadata",
+            "outputConfig",
+            "additionalModelResponseFieldPaths",
+            "promptVariables",
+        ]
+        .iter()
+        .any(|k| req.extra.get(*k).is_some_and(|v| !v.is_null()));
         match publisher {
             Some(BedrockPublisher::Anthropic) if !needs_converse => {
                 self.chat_anthropic(req, ctx, upstream_id).await
             }
             _ => self.chat_converse(req, ctx, upstream_id).await,
         }
+        .map(|resp| legacy.reply(resp))
     }
 
     async fn chat_stream(
@@ -1115,17 +1168,16 @@ impl Bridge for BedrockBridge {
         req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
-        // Converse has no slot for the legacy fields and would drop them.
-        aisix_gateway::tool_calls::reject_legacy_function_calling(&req)?;
         let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let upstream_id = upstream_model(ctx)?;
         validate_model_id_chars(upstream_id)?;
         resolve_publisher(upstream_id)?;
-        reject_system_only(&req)?;
         if crate::openai_compat::serves(&req, upstream_id) {
             let endpoint = self.chat_completions_endpoint(ctx)?;
             return crate::openai_compat::chat_stream(endpoint, req, ctx, upstream_id).await;
         }
+        // InvokeModel and Converse take tools, not the legacy fields.
+        let (req, legacy) = aisix_gateway::tool_calls::legacy_functions_as_tools(req)?;
         // The tool route's JSON only exists once the synthetic tool call
         // has been assembled, so it cannot be streamed as it arrives.
         // Run the request non-streaming — through `chat`, so each
@@ -1143,13 +1195,15 @@ impl Bridge for BedrockBridge {
             let chunks = response_into_fake_stream_chunks(
                 self.chat_cow(req, &ctx.non_streaming_ctx()).await?,
             );
-            return Ok(Box::pin(async_stream::stream! {
+            return Ok(legacy.reply_stream(Box::pin(async_stream::stream! {
                 for chunk in chunks {
                     yield Ok(chunk);
                 }
-            }));
+            })));
         }
-        self.chat_converse_stream(req, ctx, upstream_id).await
+        self.chat_converse_stream(req, ctx, upstream_id)
+            .await
+            .map(|stream| legacy.reply_stream(stream))
     }
 
     /// Native Bedrock embeddings (#723), LiteLLM `litellm/llms/bedrock/embed/`
@@ -1162,6 +1216,7 @@ impl Bridge for BedrockBridge {
         req: &EmbeddingRequest,
         ctx: &BridgeContext,
     ) -> Result<EmbeddingResponse, BridgeError> {
+        req.require_text_input()?;
         let upstream_id = upstream_model(ctx)?;
         validate_model_id_chars(upstream_id)?;
         let client = self.build_client_from_ctx(ctx).await?;
@@ -1177,9 +1232,14 @@ impl Bridge for BedrockBridge {
             usage_reported = !req.input.is_empty();
             for (i, text) in req.input.iter().enumerate() {
                 let mut body = serde_json::json!({"inputText": text});
-                // `dimensions` is a Titan V2 knob; G1 rejects unknown keys.
+                // Text V2 takes `dimensions`, Multimodal G1 takes
+                // `embeddingConfig.outputEmbeddingLength`, and Text G1 has
+                // no vector length (and rejects unknown keys).
                 if let Some(dims) = req.dimensions {
-                    if base_id.contains("v2") {
+                    if base_id.starts_with("amazon.titan-embed-image") {
+                        body["embeddingConfig"] =
+                            serde_json::json!({"outputEmbeddingLength": dims});
+                    } else if base_id.contains("v2") {
                         body["dimensions"] = dims.into();
                     }
                 }
@@ -1410,7 +1470,7 @@ impl BedrockBridge {
         // name before it runs.
         let mut req = req;
         if req.max_tokens.is_none() {
-            if let Some(cap) = crate::converse_req::max_tokens(&req, upstream_id) {
+            if let Some(cap) = crate::converse_req::max_tokens(&req) {
                 req.to_mut().max_tokens = Some(cap);
             }
         }
@@ -1431,7 +1491,7 @@ impl BedrockBridge {
         let body_bytes = {
             let (system, messages) = split_system_with(&req, urls, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
-            let mut anthropic_req = build_request(&req, anthropic_model, system, messages, false);
+            let mut anthropic_req = build_request(&req, anthropic_model, system, messages, false)?;
             apply_auto_prompt_caching(&mut anthropic_req, &ctx.model);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
@@ -1600,7 +1660,7 @@ impl BedrockBridge {
             StructuredOutput::Tool(schema) => Some(schema),
             _ => None,
         };
-        let tool_config = build_tool_config(&req, json_tool_schema, publisher, upstream_id);
+        let tool_config = build_tool_config(&req, json_tool_schema, publisher, upstream_id)?;
         let parts = ConverseParts::build(
             &req,
             upstream_id,
@@ -1612,6 +1672,9 @@ impl BedrockBridge {
 
         let started = Instant::now();
         let deadline = ctx.deadline;
+        let interceptor = StableJsonBodyInterceptor {
+            sampling: parts.sampling,
+        };
         let mut call = client.converse().model_id(upstream_id);
         for sb in parts.systems {
             call = call.system(sb);
@@ -1647,12 +1710,16 @@ impl BedrockBridge {
         for (k, v) in native.request_metadata {
             call = call.request_metadata(k, v);
         }
+        for (k, v) in native.prompt_variables {
+            call = call.prompt_variables(k, v);
+        }
+        call = call.set_additional_model_response_field_paths(native.response_field_paths);
 
         // The owned request is not needed past its wire bytes.
         drop(req);
         let resp = call
             .customize()
-            .interceptor(StableJsonBodyInterceptor)
+            .interceptor(interceptor)
             .send()
             .await
             .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
@@ -1692,7 +1759,7 @@ impl BedrockBridge {
         // Only the native structured-output shape reaches this path —
         // `chat_stream` diverts the tool route before it gets here,
         // because a tool call cannot be streamed before it is complete.
-        let tool_config = build_tool_config(&req, None, publisher, upstream_id);
+        let tool_config = build_tool_config(&req, None, publisher, upstream_id)?;
         let parts = ConverseParts::build(
             &req,
             upstream_id,
@@ -1704,6 +1771,9 @@ impl BedrockBridge {
 
         let started = Instant::now();
         let deadline = ctx.deadline;
+        let interceptor = StableJsonBodyInterceptor {
+            sampling: parts.sampling,
+        };
         let mut call = client.converse_stream().model_id(upstream_id);
         for sb in parts.systems {
             call = call.system(sb);
@@ -1739,12 +1809,16 @@ impl BedrockBridge {
         for (k, v) in native.request_metadata {
             call = call.request_metadata(k, v);
         }
+        for (k, v) in native.prompt_variables {
+            call = call.prompt_variables(k, v);
+        }
+        call = call.set_additional_model_response_field_paths(native.response_field_paths);
 
         // The owned request is not needed past its wire bytes.
         drop(req);
         let mut resp = call
             .customize()
-            .interceptor(StableJsonBodyInterceptor)
+            .interceptor(interceptor)
             .send()
             .await
             .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
@@ -1781,6 +1855,7 @@ struct ConverseParts {
     messages: Vec<BedrockMessage>,
     inference: Option<InferenceConfiguration>,
     additional: Option<aws_smithy_types::Document>,
+    sampling: ExactSampling,
 }
 
 impl ConverseParts {
@@ -1792,6 +1867,7 @@ impl ConverseParts {
         guarded: bool,
         ctx: &BridgeContext,
     ) -> Result<Self, BridgeError> {
+        check_history_tool_calls(req)?;
         let auto_cache_ttl = auto_prompt_caching_ttl(&ctx.model);
         let publisher = BedrockPublisher::from_model_id(upstream_id);
         // Converse rejects tool blocks in a request without a
@@ -1817,11 +1893,16 @@ impl ConverseParts {
             thinking_max_tokens,
             pk_param_constraints(ctx),
         )?;
+        let sampling = ExactSampling {
+            temperature: clamped_temperature(req, pk_param_constraints(ctx)),
+            top_p: req.top_p,
+        };
         Ok(Self {
             systems,
             messages,
             inference,
             additional,
+            sampling,
         })
     }
 }
@@ -1836,9 +1917,8 @@ impl ConverseParts {
 /// `tool_calls` entry (#560, multi-turn history).
 /// `role:"tool"` results → `toolResult` blocks carried in a user
 /// message; consecutive results coalesce into one (Converse requires all
-/// of a turn's results in a single user message). A request that leaves
-/// `messages[]` empty never reaches here: [`reject_system_only`] refuses
-/// it before the rail is picked.
+/// of a turn's results in a single user message). A request with no turn
+/// leaves `messages[]` empty, and Bedrock answers it.
 fn build_converse_inputs(
     req: &ChatFormat,
     publisher: Option<BedrockPublisher>,
@@ -1913,7 +1993,7 @@ fn build_converse_inputs(
                 mark_end_of_turn(&mut blocks, cache, msg);
                 messages.push(build_message(ConversationRole::Assistant, blocks)?);
             }
-            Role::Tool => {
+            Role::Tool | Role::Function => {
                 // #560: `role:"tool"` → Converse `toolResult` block. The
                 // correlation id rides `tool_call_id`, the result rides
                 // `content`. A result that names no call still goes
@@ -2440,27 +2520,6 @@ fn guard_trailing_user_text(messages: &mut [BedrockMessage]) -> Result<(), Bridg
     Ok(())
 }
 
-/// Bedrock rejects an empty `messages[]`, which is what a request holding
-/// only system / developer turns (and replayed reasoning, which no rail
-/// carries) leaves behind. That is the caller's request to fix, so it is
-/// refused as one rather than as a gateway fault. Checked once before the
-/// rail is picked, so Converse, ConverseStream and the Claude `/invoke`
-/// path give one request the same answer whether or not it streams.
-fn reject_system_only(req: &ChatFormat) -> Result<(), BridgeError> {
-    let has_turn = req
-        .messages
-        .iter()
-        .any(|m| !matches!(m.role, Role::System | Role::Developer) && !m.is_reasoning_only());
-    if has_turn {
-        return Ok(());
-    }
-    Err(BridgeError::InvalidRequest(
-        "messages must include at least one user or assistant turn; \
-         a system-only request is not supported for this model"
-            .into(),
-    ))
-}
-
 /// Build a Converse [`BedrockMessage`] from a role and its content blocks.
 fn build_message(
     role: ConversationRole,
@@ -2525,9 +2584,6 @@ fn assistant_content_blocks(
             .and_then(|f| f.get("name"))
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        if id.is_empty() || name.is_empty() {
-            continue; // malformed history entry — can't build a toolUse
-        }
         // OpenAI `arguments` is a JSON-ENCODED STRING; parse it back to a
         // value for the Document. Tolerate a blank/invalid string as `{}`.
         let arguments = function
@@ -2549,11 +2605,6 @@ fn assistant_content_blocks(
         if let Some(point) = cache.point(call.get("cache_control")) {
             blocks.push(ContentBlock::CachePoint(point));
         }
-    }
-    // If every tool_calls entry was malformed, fall back to a text block
-    // so Converse still receives a valid (non-empty) assistant message.
-    if blocks.is_empty() {
-        blocks.push(ContentBlock::Text(msg.content_str().to_string()));
     }
     Ok(blocks)
 }
@@ -2620,6 +2671,8 @@ fn converse_output_into_chat_response(
         })
         .unwrap_or_default();
     ChatResponse {
+        logprobs: None,
+        more_choices: Vec::new(),
         id: String::new(),
         model: upstream_id.to_string(),
         message,
@@ -2742,6 +2795,8 @@ fn emit_converse_chunk(
             if !state.emitted_role {
                 state.emitted_role = true;
                 out.push(ChatChunk {
+                    choice_index: 0,
+                    logprobs: None,
                     id: String::new(),
                     model: upstream_id.to_string(),
                     delta: ChatDelta {
@@ -2777,6 +2832,8 @@ fn emit_converse_chunk(
             match d.delta {
                 Some(ContentBlockDelta::Text(text)) => {
                     out.push(ChatChunk {
+                        choice_index: 0,
+                        logprobs: None,
                         id: String::new(),
                         model: upstream_id.to_string(),
                         delta: ChatDelta {
@@ -2810,6 +2867,8 @@ fn emit_converse_chunk(
                         .is_some_and(|last| last != block_index);
                     state.reasoning_block = Some(block_index);
                     out.push(ChatChunk {
+                        choice_index: 0,
+                        logprobs: None,
                         id: String::new(),
                         model: upstream_id.to_string(),
                         delta: ChatDelta {
@@ -2831,6 +2890,8 @@ fn emit_converse_chunk(
         }
         ConverseStreamOutput::MessageStop(m) => {
             out.push(ChatChunk {
+                choice_index: 0,
+                logprobs: None,
                 id: String::new(),
                 model: upstream_id.to_string(),
                 delta: ChatDelta::default(),
@@ -2846,6 +2907,8 @@ fn emit_converse_chunk(
             let service_tier = converse_service_tier(m.service_tier());
             if let Some(u) = m.usage {
                 out.push(ChatChunk {
+                    choice_index: 0,
+                    logprobs: None,
                     id: String::new(),
                     model: upstream_id.to_string(),
                     delta: ChatDelta::default(),
@@ -2914,6 +2977,8 @@ fn tool_call_chunk(
     }
     call.insert("function".to_string(), serde_json::Value::Object(function));
     ChatChunk {
+        choice_index: 0,
+        logprobs: None,
         id: String::new(),
         model: upstream_id.to_string(),
         delta: ChatDelta {
@@ -2998,7 +3063,7 @@ fn build_inference_config(
     constraints: Option<&ParamConstraints>,
 ) -> Result<Option<InferenceConfiguration>, BridgeError> {
     crate::converse_req::check_max_completion_tokens(req)?;
-    let max_tokens = crate::converse_req::max_tokens(req, upstream_id).or(thinking_max_tokens);
+    let max_tokens = crate::converse_req::max_tokens(req).or(thinking_max_tokens);
     let stop_sequences = crate::converse_req::stop_sequences(req, upstream_id)?;
     if req.temperature.is_none()
         && max_tokens.is_none()
@@ -3008,24 +3073,10 @@ fn build_inference_config(
         return Ok(None);
     }
     let mut b = InferenceConfiguration::builder();
-    if let Some(t) = req.temperature {
-        let mut next = t;
-        if let Some(c) = constraints {
-            // Compare in f64-space (exact) and cast only on assignment, so
-            // an f64 bound not representable in f32 still clamps at the
-            // right boundary. Max-then-min order matches the /invoke path.
-            if let Some(max) = c.temperature_max {
-                if f64::from(next) > max {
-                    next = max as f32;
-                }
-            }
-            if let Some(min) = c.temperature_min {
-                if f64::from(next) < min {
-                    next = min as f32;
-                }
-            }
-        }
-        b = b.temperature(next);
+    if let Some(t) = clamped_temperature(req, constraints) {
+        // The SDK's inference config is `f32`; the exact value is written
+        // over it on the wire (`StableJsonBodyInterceptor`).
+        b = b.temperature(t as f32);
     }
     if let Some(m) = max_tokens {
         // Bedrock's API uses i32; ChatFormat's u32 is always non-negative.
@@ -3033,12 +3084,31 @@ fn build_inference_config(
         b = b.max_tokens(clamped);
     }
     if let Some(p) = req.top_p {
-        b = b.top_p(p);
+        b = b.top_p(p as f32);
     }
     if let Some(stops) = stop_sequences {
         b = b.set_stop_sequences(Some(stops));
     }
     Ok(Some(b.build()))
+}
+
+/// The caller's `temperature`, held inside the provider key's
+/// `temperature_{min,max}` (max first, as on the `/invoke` path).
+fn clamped_temperature(req: &ChatFormat, constraints: Option<&ParamConstraints>) -> Option<f64> {
+    let mut next = req.temperature?;
+    if let Some(c) = constraints {
+        if let Some(max) = c.temperature_max {
+            if next > max {
+                next = max;
+            }
+        }
+        if let Some(min) = c.temperature_min {
+            if next < min {
+                next = min;
+            }
+        }
+    }
+    Some(next)
 }
 
 /// `additionalModelRequestFields` for a Converse request: the caller's own
@@ -3057,16 +3127,18 @@ fn build_converse_additional_model_request_fields(
     tool_config: Option<&ToolConfiguration>,
     ctx: &BridgeContext,
 ) -> Result<(Option<aws_smithy_types::Document>, Option<u32>), BridgeError> {
-    let mut fields = crate::converse_req::caller_additional_fields(req);
+    let mut fields = crate::converse_req::caller_additional_fields(req, upstream_id);
     let mut thinking_max_tokens = None;
     let claude = BedrockPublisher::from_model_id(upstream_id) == Some(BedrockPublisher::Anthropic);
     if claude {
         let mut extras = req.extra.clone();
+        let budget_max_tokens = write_thinking_budget(req, &mut extras);
         thinking_max_tokens = translate_reasoning_effort_to_anthropic(
             &mut extras,
             bedrock_claude_model_name(upstream_id).unwrap_or(upstream_id),
-            crate::converse_req::max_tokens(req, upstream_id),
-        );
+            crate::converse_req::max_tokens(req),
+        )?
+        .or(budget_max_tokens);
         for name in ["thinking", "output_config", "anthropic_beta"] {
             if let Some(value) = extras.remove(name) {
                 fields.insert(name.to_string(), value);
@@ -3113,14 +3185,28 @@ fn build_converse_additional_model_request_fields(
 
 /// Decide what a request's OpenAI `response_format` becomes on Bedrock.
 ///
-/// The decision is the Anthropic crate's — same gate, same schema
-/// sealing — asked with the Claude model name Bedrock's id *carries*
-/// rather than the id itself, which that gate cannot read. Every model
-/// that is not a Claude one — every publisher, and an ARN naming no
-/// model — takes [`StructuredOutput::Tool`]; AWS's native structured
-/// output on Converse covers the same Claude families Anthropic's own
-/// API does.
+/// For Claude the decision is the Anthropic crate's — same gate, same
+/// schema sealing and limits — asked with the Claude model name Bedrock's
+/// id *carries* rather than the id itself, which that gate cannot read.
+/// Every model that is not a Claude one takes [`StructuredOutput::Tool`];
+/// a model of another publisher gets the caller's schema as sent, since
+/// Claude's schema subset is not its contract, while an ARN naming no
+/// model keeps the Claude-safe schema. AWS's native structured output on
+/// Converse covers the same Claude families Anthropic's own API does.
 fn bedrock_structured_output(req: &ChatFormat, upstream_id: &str) -> StructuredOutput {
+    if !matches!(
+        BedrockPublisher::from_model_id(upstream_id),
+        None | Some(BedrockPublisher::Anthropic)
+    ) {
+        return match req
+            .extra
+            .get("response_format")
+            .and_then(aisix_gateway::structured_output::json_schema_from_response_format)
+        {
+            Some(schema) => StructuredOutput::Tool(schema),
+            None => StructuredOutput::None,
+        };
+    }
     structured_output_for(
         req,
         bedrock_claude_model_name(upstream_id).unwrap_or(upstream_id),
@@ -3217,7 +3303,7 @@ fn build_tool_config(
     json_tool_schema: Option<&serde_json::Value>,
     publisher: Option<BedrockPublisher>,
     upstream_id: &str,
-) -> Option<ToolConfiguration> {
+) -> Result<Option<ToolConfiguration>, BridgeError> {
     // OpenAI `tool_choice:"none"` means "don't call any tool this turn".
     // Converse has no `none`, so send no toolConfig — the model answers
     // in prose, honouring the user-visible contract (no tool call). Tool
@@ -3231,26 +3317,23 @@ fn build_tool_config(
     let caller_forbade_tools =
         req.extra.get("tool_choice").and_then(|v| v.as_str()) == Some("none");
     if caller_forbade_tools && json_tool_schema.is_none() {
-        return None;
+        return Ok(None);
     }
     // With `response_format` beside it the schema wins — the JSON has to
     // come out of a tool call on this route — but only the synthetic
     // tool goes on the table. Putting the caller's own tools back under
     // no `toolChoice` would hand the model exactly what "none" told it
     // not to use.
-    let tools_json = if caller_forbade_tools {
-        &[][..]
-    } else {
-        req.extra
-            .get("tools")
-            .and_then(|v| v.as_array())
-            .map(Vec::as_slice)
-            .unwrap_or_default()
+    let tools_json = match req.extra.get("tools") {
+        _ if caller_forbade_tools => &[][..],
+        None | Some(serde_json::Value::Null) => &[][..],
+        Some(serde_json::Value::Array(tools)) => tools.as_slice(),
+        Some(_) => return Err(BridgeError::InvalidRequest("tools must be an array".into())),
     };
     let mut tools: Vec<Tool> = Vec::new();
-    for entry in tools_json {
-        // OpenAI only defines `type:"function"` tools today; skip any
-        // other shape rather than guessing how to translate it.
+    for (i, entry) in tools_json.iter().enumerate() {
+        // A `custom` tool takes free-form text, which Converse has no tool
+        // shape for.
         if entry
             .get("type")
             .and_then(|v| v.as_str())
@@ -3258,23 +3341,27 @@ fn build_tool_config(
         {
             continue;
         }
-        let Some(function) = entry.get("function") else {
-            continue;
-        };
-        let Some(name) = function.get("name").and_then(|v| v.as_str()) else {
-            continue;
-        };
+        let invalid = |what: &str| BridgeError::InvalidRequest(format!("tools[{i}].{what}"));
+        let function = entry
+            .get("function")
+            .filter(|f| f.is_object())
+            .ok_or_else(|| invalid("function is required"))?;
+        let name = function
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| invalid("function.name is required"))?;
         let mut spec = ToolSpecification::builder().name(name);
         if let Some(description) = function.get("description").and_then(|v| v.as_str()) {
             spec = spec.description(description);
         }
-        // OpenAI `parameters` is a JSON Schema object. Default to an empty
-        // object schema when omitted; skip the tool if `parameters` is
-        // present but not an object — a non-object schema is malformed and
-        // Bedrock would reject the whole Converse request with a 400.
+        if let Some(strict) = function.get("strict").and_then(|v| v.as_bool()) {
+            spec = spec.strict(strict);
+        }
+        // OpenAI `parameters` is a JSON Schema object, an empty object
+        // schema when omitted.
         let parameters = match function.get("parameters") {
             Some(p) if p.is_object() => p.clone(),
-            Some(_) => continue,
+            Some(_) => return Err(invalid("function.parameters must be an object")),
             None => serde_json::json!({"type": "object", "properties": {}}),
         };
         spec = spec.input_schema(ToolInputSchema::Json(json_to_document(&parameters)));
@@ -3289,17 +3376,29 @@ fn build_tool_config(
         }
     }
     if let Some(schema) = json_tool_schema {
+        // The caller's `json_schema.strict` rides the tool that carries
+        // their schema; one the gateway set while translating is not theirs.
+        let strict = req
+            .extra
+            .get("response_format")
+            .and_then(|rf| rf.pointer("/json_schema/strict"))
+            .and_then(|v| v.as_bool())
+            .filter(|_| !req.gateway_strict_schema);
         if let Ok(spec) = ToolSpecification::builder()
             .name(JSON_TOOL_NAME)
             .description(JSON_TOOL_DESCRIPTION)
             .input_schema(ToolInputSchema::Json(json_to_document(schema)))
+            .set_strict(strict)
             .build()
         {
             tools.push(Tool::ToolSpec(spec));
         }
     }
+    // Checked even when no tool is sent, so an illegal choice is refused
+    // the same way on every request.
+    let choice = map_tool_choice(req.extra.get("tool_choice"))?;
     if tools.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut config = ToolConfiguration::builder().set_tools(Some(tools));
     let client_set_tool_choice = tool_choice_states_a_preference(req.extra.get("tool_choice"));
@@ -3317,36 +3416,87 @@ fn build_tool_config(
         if let Ok(choice) = SpecificToolChoice::builder().name(JSON_TOOL_NAME).build() {
             config = config.tool_choice(ToolChoice::Tool(choice));
         }
-    } else if let Some(choice) = req.extra.get("tool_choice").and_then(map_tool_choice) {
+    } else if let Some(choice) = choice {
         config = config.tool_choice(choice);
     }
-    config.build().ok()
+    Ok(config.build().ok())
 }
 
 /// Map an OpenAI `tool_choice` to a Converse [`ToolChoice`], or `None` to
 /// leave it unset (Converse then applies its `auto` default). `"none"` is
-/// handled by the caller (no toolConfig at all).
-fn map_tool_choice(choice: &serde_json::Value) -> Option<ToolChoice> {
+/// handled by the caller (no toolConfig at all), and the shapes naming
+/// something Converse cannot be offered — an `allowed_tools` subset, a
+/// `custom` tool — set no choice. Any other shape is not a valid OpenAI
+/// `tool_choice` and is refused, naming the field.
+fn map_tool_choice(choice: Option<&serde_json::Value>) -> Result<Option<ToolChoice>, BridgeError> {
+    let invalid = || {
+        BridgeError::InvalidRequest(
+            "tool_choice must be \"none\", \"auto\", \"required\" or a \
+             {\"type\": \"function\", \"function\": {\"name\": …}} object"
+                .into(),
+        )
+    };
     match choice {
-        serde_json::Value::String(s) => match s.as_str() {
-            "required" => Some(ToolChoice::Any(AnyToolChoice::builder().build())),
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => match s.as_str() {
+            "required" => Ok(Some(ToolChoice::Any(AnyToolChoice::builder().build()))),
             // "auto" is Converse's default — omit rather than send an
             // explicit field some publishers reject.
-            _ => None,
+            "auto" | "none" => Ok(None),
+            _ => Err(invalid()),
         },
-        serde_json::Value::Object(map) => {
-            let name = map
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|v| v.as_str())?;
-            SpecificToolChoice::builder()
-                .name(name)
-                .build()
-                .ok()
-                .map(ToolChoice::Tool)
-        }
-        _ => None,
+        Some(serde_json::Value::Object(map)) => match map.get("type").and_then(|t| t.as_str()) {
+            Some("function") => {
+                let name = map
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|v| v.as_str())
+                    .filter(|n| !n.is_empty())
+                    .ok_or_else(|| {
+                        BridgeError::InvalidRequest("tool_choice.function.name is required".into())
+                    })?;
+                Ok(SpecificToolChoice::builder()
+                    .name(name)
+                    .build()
+                    .ok()
+                    .map(ToolChoice::Tool))
+            }
+            Some("allowed_tools" | "custom") => Ok(None),
+            _ => Err(invalid()),
+        },
+        Some(_) => Err(invalid()),
     }
+}
+
+/// A replayed assistant `tool_calls[]` entry needs the `id` its tool
+/// result answers and the function `name` a `toolUse` block requires;
+/// without either the turn cannot be written.
+fn check_history_tool_calls(req: &ChatFormat) -> Result<(), BridgeError> {
+    let present = |v: Option<&serde_json::Value>| {
+        v.and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+    };
+    for (index, msg) in req.messages.iter().enumerate() {
+        if !matches!(msg.role, Role::Assistant) {
+            continue;
+        }
+        let Some(calls) = msg.extra.get("tool_calls").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for (i, call) in calls.iter().enumerate() {
+            if !present(call.get("id")) {
+                return Err(BridgeError::InvalidRequest(format!(
+                    "messages[{index}].tool_calls[{i}].id is required"
+                )));
+            }
+            if !present(call.get("function").and_then(|f| f.get("name"))) {
+                return Err(BridgeError::InvalidRequest(format!(
+                    "messages[{index}].tool_calls[{i}].function.name is required"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4265,15 +4415,31 @@ mod tests {
             );
         }
 
-        // Values that cannot be mapped reach the upstream as sent.
-        let body = send(
-            serde_json::json!({"stop": 5, "max_completion_tokens": "many"}),
-            None,
-        )
-        .await;
-        assert_eq!(body["stop"], 5, "body={body}");
-        assert!(body.get("stop_sequences").is_none(), "body={body}");
-        assert_eq!(body["max_completion_tokens"], "many", "body={body}");
+        // A value OpenAI's contract does not allow is refused, naming the
+        // field, before the upstream is called.
+        for (extra, field) in [
+            (serde_json::json!({"stop": 5}), "stop"),
+            (
+                serde_json::json!({"max_completion_tokens": "many"}),
+                "max_completion_tokens",
+            ),
+        ] {
+            let bridge = BedrockBridge::new().with_endpoint_override("http://127.0.0.1:9");
+            let ctx = BridgeContext::new(
+                "req-1",
+                sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+                sample_pk_with_secret(valid_secret_json()),
+            );
+            let req = ChatFormat {
+                extra: extra.as_object().unwrap().clone(),
+                ..ChatFormat::new("my-claude", vec![ChatMessage::user("hi")])
+            };
+            let err = bridge.chat(&req, &ctx).await.unwrap_err();
+            assert!(
+                matches!(&err, BridgeError::InvalidRequest(m) if m.starts_with(field)),
+                "{err:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5342,6 +5508,32 @@ mod tests {
         body.unwrap_or_else(|| panic!("no {route} request was captured"))
     }
 
+    #[tokio::test]
+    async fn converse_sends_the_callers_temperature_and_top_p_exactly() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse$"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
+        req.temperature = Some(0.7);
+        req.top_p = Some(0.9);
+        let _ = bridge.chat(&req, &ctx).await;
+        let sent = server.received_requests().await.unwrap();
+        let raw = String::from_utf8_lossy(&sent[0].body).into_owned();
+        assert!(
+            raw.contains(r#""inferenceConfig":{"temperature":0.7,"topP":0.9}"#),
+            "{raw}"
+        );
+    }
+
     #[test]
     fn native_gate_reads_the_claude_name_out_of_the_bedrock_model_id() {
         // Bedrock wraps the Anthropic model name in a publisher tag, an
@@ -5547,10 +5739,11 @@ mod tests {
         let tools = body["toolConfig"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["toolSpec"]["name"], JSON_TOOL_NAME);
-        assert_eq!(
-            tools[0]["toolSpec"]["inputSchema"]["json"]["additionalProperties"],
-            false
-        );
+        // Another publisher gets the caller's schema as sent, not Claude's
+        // sealed subset.
+        assert_eq!(tools[0]["toolSpec"]["inputSchema"]["json"], person_schema());
+        // The caller's `json_schema.strict` rides the synthetic tool.
+        assert_eq!(tools[0]["toolSpec"]["strict"], true);
         assert_eq!(
             body["toolConfig"]["toolChoice"]["tool"]["name"],
             JSON_TOOL_NAME
@@ -6589,40 +6782,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_converse_skips_tool_with_non_object_parameters() {
-        // A malformed tool (non-object `parameters`) must be skipped rather
-        // than forwarded as an invalid inputSchema that Bedrock would 400 on;
-        // a valid sibling tool still goes through.
-        let req: ChatFormat = serde_json::from_value(serde_json::json!({
-            "model": "my-llama",
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [
-                {"type": "function", "function": {"name": "bad", "parameters": 42}},
-                {"type": "function", "function": {
-                    "name": "good",
-                    "parameters": {"type": "object", "properties": {}}
-                }}
-            ],
-        }))
-        .expect("request deserializes");
-        let body = capture_converse_body(&req).await;
-        let tools = body
-            .get("toolConfig")
-            .and_then(|c| c.get("tools"))
-            .and_then(|v| v.as_array())
-            .unwrap_or_else(|| panic!("toolConfig.tools must be present; body={body}"));
-        assert_eq!(
-            tools.len(),
-            1,
-            "the malformed tool must be skipped; body={body}"
+    async fn chat_converse_refuses_a_malformed_tool_naming_it() {
+        let bridge = BedrockBridge::new().with_endpoint_override("http://127.0.0.1:9");
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
         );
-        assert_eq!(
-            tools[0]
-                .get("toolSpec")
-                .and_then(|s| s.get("name"))
-                .and_then(|v| v.as_str()),
-            Some("good"),
-        );
+        for (tools, want) in [
+            (
+                serde_json::json!([{"type": "function", "function": {"name": "bad", "parameters": 42}}]),
+                "tools[0].function.parameters",
+            ),
+            (
+                serde_json::json!([{"type": "function"}]),
+                "tools[0].function",
+            ),
+            (
+                serde_json::json!([{"type": "function", "function": {}}]),
+                "tools[0].function.name",
+            ),
+            (
+                serde_json::json!({"type": "function"}),
+                "tools must be an array",
+            ),
+        ] {
+            let req: ChatFormat = serde_json::from_value(serde_json::json!({
+                "model": "my-llama",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": tools,
+            }))
+            .expect("request deserializes");
+            let err = bridge.chat(&req, &ctx).await.unwrap_err();
+            assert!(
+                matches!(&err, BridgeError::InvalidRequest(m) if m.starts_with(want)),
+                "{want}: {err:?}"
+            );
+        }
     }
 
     // ─── RequestOverrides applied on the wire (#340) ───────────────────
@@ -7158,6 +7354,8 @@ mod tests {
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["a".into(), "b".into()],
             input_was_single: false,
@@ -7208,6 +7406,8 @@ mod tests {
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["a".into()],
             input_was_single: true,
@@ -7244,6 +7444,8 @@ mod tests {
 
         let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["a".into()],
             input_was_single: true,
@@ -7297,6 +7499,8 @@ mod tests {
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["a".into(), "b".into()],
             input_was_single: false,
@@ -7327,6 +7531,8 @@ mod tests {
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["a".into()],
             input_was_single: true,

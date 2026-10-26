@@ -1464,6 +1464,8 @@ mod tests {
     async fn empty_output_still_reaches_the_script() {
         let cfg = config("export function checkOutput() { return { action: 'block' }; }");
         let resp = aisix_gateway::ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: String::new(),
             model: "gpt-4o".into(),
             message: aisix_gateway::ChatMessage::assistant(String::new()),

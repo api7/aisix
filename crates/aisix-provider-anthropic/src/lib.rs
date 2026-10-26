@@ -13,6 +13,7 @@
 #![deny(rust_2018_idioms)]
 
 mod bridge;
+pub mod json_tool;
 pub mod platform;
 pub mod wire;
 
@@ -37,6 +38,7 @@ pub use bridge::{AnthropicBridge, ANTHROPIC_DEFAULT_BASE, ANTHROPIC_VERSION};
 ///   body is sent to any other provider.
 /// - [`strip_unsigned_thinking_blocks`] drops the unsigned thinking blocks
 ///   Anthropic's own API rejects before a body is sent there.
+pub use bridge::map_http_error;
 pub use wire::{
     chat_response_into_anthropic_json, parse_inbound_request, parse_inbound_request_for_scan,
     strip_billing_header_attribution, strip_unsigned_thinking_blocks,

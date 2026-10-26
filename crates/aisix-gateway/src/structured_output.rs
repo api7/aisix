@@ -587,14 +587,20 @@ pub fn response_into_fake_stream_chunks(resp: ChatResponse) -> Vec<ChatChunk> {
         model,
         message,
         finish_reason,
+        logprobs,
+        // Only the bridges whose upstream answers with one choice fake a
+        // stream.
+        more_choices: _,
         usage,
         service_tier,
     } = resp;
     let chunk = |delta, finish_reason, usage| ChatChunk {
         id: id.clone(),
         model: model.clone(),
+        choice_index: 0,
         delta,
         finish_reason,
+        logprobs: None,
         usage,
         service_tier: service_tier.clone(),
         accounting_usage: None,
@@ -645,16 +651,18 @@ pub fn response_into_fake_stream_chunks(resp: ChatResponse) -> Vec<ChatChunk> {
         None,
     )];
     chunks.extend(reasoning);
+    let mut content = chunk(
+        ChatDelta {
+            content: Some(message.content.unwrap_or_default()),
+            tool_calls,
+            ..ChatDelta::default()
+        },
+        None,
+        None,
+    );
+    content.logprobs = logprobs;
     chunks.extend([
-        chunk(
-            ChatDelta {
-                content: Some(message.content.unwrap_or_default()),
-                tool_calls,
-                ..ChatDelta::default()
-            },
-            None,
-            None,
-        ),
+        content,
         chunk(ChatDelta::default(), Some(finish_reason), None),
         chunk(ChatDelta::default(), None, Some(usage)),
     ]);

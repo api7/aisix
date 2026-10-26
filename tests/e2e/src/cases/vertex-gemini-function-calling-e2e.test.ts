@@ -263,7 +263,8 @@ describe("function calling on Vertex's native Gemini wire", () => {
     const declarations = sent.tools[0].functionDeclarations;
     expect(declarations).toHaveLength(1);
     expect(declarations[0].name).toBe("get_weather");
-    expect(declarations[0].parameters.properties.city.type).toMatch(/^string$/i);
+    // Gemini 2.5 takes the caller's JSON Schema verbatim.
+    expect(declarations[0].parametersJsonSchema).toEqual(WEATHER_TOOL.function.parameters);
     expect(sent.toolConfig.functionCallingConfig.mode).toBe("ANY");
 
     const choice = body.choices[0];
@@ -582,12 +583,10 @@ describe("function calling on Vertex's native Gemini wire", () => {
   });
 
   test.for<[string, Record<string, unknown>]>([
-    ["legacy functions", { functions: [WEATHER_TOOL.function] }],
-    ["legacy function_call", { tools: [WEATHER_TOOL], function_call: "auto" }],
     ["a hosted tool", { tools: [{ type: "web_search_preview" }] }],
     [
       "an unnamed tool_choice object",
-      { tools: [WEATHER_TOOL], tool_choice: { type: "allowed_tools", allowed_tools: {} } },
+      { tools: [WEATHER_TOOL], tool_choice: { type: "function", function: {} } },
     ],
   ])("chat: %s is refused, not dropped", async ([, extra], ctx) => {
     if (!etcdReachable || !app || !upstream) return ctx.skip();

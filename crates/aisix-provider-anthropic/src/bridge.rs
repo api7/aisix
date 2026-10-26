@@ -220,7 +220,11 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
         .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
 }
 
-async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
+/// A non-2xx answer from an Anthropic-wire endpoint as a [`BridgeError`]
+/// carrying the upstream's own `error.type` and `error.message`, never the
+/// raw body as the message. Shared with the proxy's `/v1/messages` and
+/// `count_tokens` passthroughs.
+pub async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     aisix_gateway::capture_upstream_error_http(
         status,
         resp,
@@ -368,6 +372,7 @@ impl Bridge for AnthropicBridge {
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
         let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
+        let (req, legacy) = aisix_gateway::tool_calls::legacy_functions_as_tools(req)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -380,7 +385,7 @@ impl Bridge for AnthropicBridge {
         let body = {
             let (system, messages) = split_system_with(&req, MediaUrls::Accepted, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
-            let mut body = build_request(&req, upstream, system, messages, false);
+            let mut body = build_request(&req, upstream, system, messages, false)?;
             apply_auto_prompt_caching(&mut body, &ctx.model);
             outbound_bytes(&body)?
         };
@@ -430,7 +435,7 @@ impl Bridge for AnthropicBridge {
             if synthetic_json_tool {
                 unwrap_json_tool_call(&mut chat);
             }
-            Ok(chat)
+            Ok(legacy.reply(chat))
         })
         .await
     }
@@ -450,6 +455,7 @@ impl Bridge for AnthropicBridge {
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
         let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
+        let (req, legacy) = aisix_gateway::tool_calls::legacy_functions_as_tools(req)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -468,7 +474,9 @@ impl Bridge for AnthropicBridge {
             let chunks = response_into_fake_stream_chunks(
                 self.chat_cow(req, &ctx.non_streaming_ctx()).await?,
             );
-            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+            return Ok(
+                legacy.reply_stream(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            );
         }
 
         let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, |m| {
@@ -480,7 +488,7 @@ impl Bridge for AnthropicBridge {
         let body = {
             let (system, messages) = split_system_with(&req, MediaUrls::Accepted, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
-            let mut body = build_request(&req, upstream, system, messages, true);
+            let mut body = build_request(&req, upstream, system, messages, true)?;
             apply_auto_prompt_caching(&mut body, &ctx.model);
             outbound_bytes(&body)?
         };
@@ -521,7 +529,7 @@ impl Bridge for AnthropicBridge {
 
         let byte_stream = resp.bytes_stream();
         let stream = build_chunk_stream(byte_stream);
-        Ok(Box::pin(stream))
+        Ok(legacy.reply_stream(Box::pin(stream)))
     }
 }
 

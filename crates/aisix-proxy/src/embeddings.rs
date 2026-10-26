@@ -46,6 +46,9 @@ pub struct EmbeddingRequestBody {
     pub input_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_types: Option<serde_json::Value>,
+    /// Every other field the caller sent (`user`, …).
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The client-facing request body as content capture records it: the text
@@ -58,6 +61,7 @@ fn captured_embeddings_prompt(req: &EmbeddingRequest) -> String {
     enum Input<'a> {
         Single(&'a str),
         Multi(&'a [String]),
+        Tokens(&'a serde_json::Value),
     }
     #[derive(serde::Serialize)]
     struct Body<'a> {
@@ -69,10 +73,13 @@ fn captured_embeddings_prompt(req: &EmbeddingRequest) -> String {
         input_type: &'a Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         embedding_types: &'a Option<serde_json::Value>,
+        #[serde(flatten)]
+        extra: &'a serde_json::Map<String, serde_json::Value>,
     }
-    let input = match req.input.as_slice() {
-        [single] if req.input_was_single => Input::Single(single),
-        all => Input::Multi(all),
+    let input = match (&req.token_input, req.input.as_slice()) {
+        (Some(tokens), _) => Input::Tokens(tokens),
+        (None, [single]) if req.input_was_single => Input::Single(single),
+        (None, all) => Input::Multi(all),
     };
     serde_json::to_string(&Body {
         model: &req.model,
@@ -81,24 +88,48 @@ fn captured_embeddings_prompt(req: &EmbeddingRequest) -> String {
         dimensions: req.dimensions,
         input_type: &req.input_type,
         embedding_types: &req.embedding_types,
+        extra: &req.extra,
     })
     .unwrap_or_default()
 }
 
-/// Deserialises both `"text"` and `["text", ...]` forms of the
-/// OpenAI embeddings `input` field.
+/// The token ids in a token-id `input`, nested arrays included.
+fn token_id_count(tokens: &serde_json::Value) -> u32 {
+    match tokens {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .fold(0u32, |acc, item| acc.saturating_add(token_id_count(item))),
+        _ => 1,
+    }
+}
+
+/// Deserialises every form of the OpenAI embeddings `input` field: a
+/// string, an array of strings, an array of token ids, or an array of
+/// token-id arrays.
 #[derive(Debug, Deserialize, serde::Serialize)]
 #[serde(untagged)]
 pub enum InputField {
     Single(String),
     Multi(Vec<String>),
+    Tokens(Vec<u64>),
+    TokenArrays(Vec<Vec<u64>>),
 }
 
 impl InputField {
+    /// The text inputs; token ids have none.
     pub fn into_vec(self) -> Vec<String> {
         match self {
             InputField::Single(s) => vec![s],
             InputField::Multi(v) => v,
+            InputField::Tokens(_) | InputField::TokenArrays(_) => Vec::new(),
+        }
+    }
+
+    /// The token ids as the caller sent them, `None` for text input.
+    fn token_input(&self) -> Option<serde_json::Value> {
+        match self {
+            InputField::Tokens(_) | InputField::TokenArrays(_) => serde_json::to_value(self).ok(),
+            InputField::Single(_) | InputField::Multi(_) => None,
         }
     }
 }
@@ -116,6 +147,8 @@ fn embeddings_input_to_chat(model: &str, input: &InputField) -> ChatFormat {
             .filter(|s| !s.is_empty())
             .map(|s| ChatMessage::user(s.clone()))
             .collect(),
+        // Token ids carry no text to scan.
+        InputField::Tokens(_) | InputField::TokenArrays(_) => Vec::new(),
     };
     ChatFormat::new(model, messages)
 }
@@ -499,6 +532,7 @@ async fn dispatch(
                     }
                 }
             }
+            InputField::Tokens(_) | InputField::TokenArrays(_) => {}
         }
     }
 
@@ -535,12 +569,14 @@ async fn dispatch(
     // context, like chat.
     let req = EmbeddingRequest {
         model: client_facing_model.clone(),
+        token_input: body.input.token_input(),
         input: body.input.into_vec(),
         input_was_single,
         encoding_format: body.encoding_format,
         dimensions: body.dimensions,
         input_type: body.input_type,
         embedding_types: body.embedding_types,
+        extra: body.extra,
     };
 
     // A Model Group walks its targets (AISIX-Cloud#1111); every per-target
@@ -644,9 +680,12 @@ async fn dispatch(
                     (reported, false)
                 } else {
                     let upstream_model = model.upstream_model().unwrap_or("unknown");
-                    let estimated = req.input.iter().fold(0u32, |acc, s| {
-                        acc.saturating_add(crate::token_estimate::count_text(upstream_model, s))
-                    });
+                    let estimated = match &req.token_input {
+                        Some(tokens) => token_id_count(tokens),
+                        None => req.input.iter().fold(0u32, |acc, s| {
+                            acc.saturating_add(crate::token_estimate::count_text(upstream_model, s))
+                        }),
+                    };
                     (estimated, estimated > 0)
                 };
             // Commit the reservation — release the concurrency permit
@@ -963,11 +1002,13 @@ mod tests {
             let req = aisix_gateway::EmbeddingRequest {
                 model: body.model.clone(),
                 input_was_single: matches!(body.input, super::InputField::Single(_)),
+                token_input: body.input.token_input(),
                 input: body.input.into_vec(),
                 encoding_format: body.encoding_format,
                 dimensions: body.dimensions,
                 input_type: body.input_type,
                 embedding_types: body.embedding_types,
+                extra: body.extra,
             };
             assert_eq!(super::captured_embeddings_prompt(&req), expected, "{raw}");
         }

@@ -49,6 +49,8 @@ pub struct NonStreamChoice {
     pub index: u32,
     pub message: RenderedMessage,
     pub finish_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,8 +62,9 @@ pub struct RenderedMessage {
     /// `None` MUST serialize as JSON `null`, not be omitted (#395).
     /// Contrast the streaming `RenderedDelta.content`, which correctly
     /// uses `skip_serializing_if` because OpenAI omits `delta.content`
-    /// on tool-call chunks.
-    pub content: Option<String>,
+    /// on tool-call chunks. An upstream that answered with an array of
+    /// content parts has them relayed as the array.
+    pub content: Option<RenderedContent>,
     /// Forward-compatible bag for OpenAI message-level fields the
     /// gateway doesn't model directly on `ChatMessage` (e.g.
     /// `tool_calls` for cross-provider tool-use translation,
@@ -72,6 +75,30 @@ pub struct RenderedMessage {
     /// standard shape.
     #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum RenderedContent {
+    Text(String),
+    Parts(Vec<serde_json::Value>),
+}
+
+impl RenderedMessage {
+    fn from_message(message: aisix_gateway::ChatMessage) -> Self {
+        let content = match (message.content, message.content_blocks) {
+            (Some(text), _) => Some(RenderedContent::Text(text)),
+            (None, Some(parts)) => Some(RenderedContent::Parts(parts)),
+            (None, None) => None,
+        };
+        Self {
+            role: role_to_str(message.role),
+            content,
+            // Forward bridge-populated fields (`tool_calls`, `refusal`,
+            // `annotations`, `audio`, …) through to the caller.
+            extra: message.extra,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -243,6 +270,8 @@ pub struct StreamChoice {
     pub delta: RenderedDelta,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -262,6 +291,10 @@ pub struct RenderedDelta {
     /// OpenAI's `delta.audio`, as the upstream streamed it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio: Option<serde_json::Value>,
+    /// Every other delta field the upstream streamed (`refusal`, the
+    /// legacy `function_call`, …).
+    #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 pub fn render_response(
@@ -277,17 +310,19 @@ pub fn render_response(
         object: "chat.completion",
         created: created_unix_ts,
         model: client_facing_model.to_string(),
-        choices: vec![NonStreamChoice {
+        choices: std::iter::once(NonStreamChoice {
             index: 0,
-            message: RenderedMessage {
-                role: role_to_str(resp.message.role),
-                content: resp.message.content,
-                // Forward bridge-populated fields (`tool_calls`,
-                // `refusal`, `audio`, …) through to the caller.
-                extra: resp.message.extra,
-            },
+            message: RenderedMessage::from_message(resp.message),
             finish_reason: finish_to_str(&resp.finish_reason).to_string(),
-        }],
+            logprobs: resp.logprobs,
+        })
+        .chain(resp.more_choices.into_iter().map(|c| NonStreamChoice {
+            index: c.index,
+            message: RenderedMessage::from_message(c.message),
+            finish_reason: finish_to_str(&c.finish_reason).to_string(),
+            logprobs: c.logprobs,
+        }))
+        .collect(),
         usage: Usage::from_stats(&resp.usage),
         service_tier: openai_service_tier(resp.service_tier.as_ref()),
     }
@@ -305,18 +340,20 @@ pub fn render_chunk(
         Vec::new()
     } else {
         vec![StreamChoice {
-            index: 0,
+            index: chunk.choice_index,
             delta: RenderedDelta {
                 role: chunk.delta.role.map(role_to_str),
                 content: chunk.delta.content,
                 tool_calls: chunk.delta.tool_calls,
                 reasoning_content: chunk.delta.reasoning_content,
                 audio: chunk.delta.audio,
+                extra: chunk.delta.extra,
             },
             finish_reason: chunk
                 .finish_reason
                 .as_ref()
                 .map(|f| finish_to_str(f).to_string()),
+            logprobs: chunk.logprobs,
         }]
     };
     // Same contract as `render_response`: every chunk's `model` field
@@ -400,6 +437,7 @@ fn role_to_str(role: Role) -> &'static str {
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
+        Role::Function => "function",
     }
 }
 
@@ -421,6 +459,8 @@ mod tests {
     #[test]
     fn render_response_matches_openai_shape() {
         let r = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "cmpl-1".into(),
             model: "m".into(),
             message: ChatMessage::assistant("hello"),
@@ -452,6 +492,8 @@ mod tests {
     fn service_tier_passes_through_only_from_an_openai_shape_upstream() {
         use aisix_gateway::ServiceTier;
         let resp = |tier| ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "c".into(),
             model: "m".into(),
             message: ChatMessage::assistant("hi"),
@@ -471,6 +513,8 @@ mod tests {
             .is_none());
 
         let chunk = |tier| ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: Default::default(),
@@ -513,6 +557,8 @@ mod tests {
             extra,
         };
         let r = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "cmpl-1".into(),
             model: "m".into(),
             message,
@@ -554,6 +600,8 @@ mod tests {
             ..UsageStats::default()
         };
         let r = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "cmpl-1".into(),
             model: "m".into(),
             message: ChatMessage::assistant("hi"),
@@ -590,6 +638,8 @@ mod tests {
             ..UsageStats::default()
         };
         let r = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "cmpl-ds".into(),
             model: "deepseek-chat".into(),
             message: ChatMessage::assistant("hi"),
@@ -622,9 +672,12 @@ mod tests {
             ..UsageStats::default()
         };
         let chunk = ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: aisix_gateway::ChatDelta {
+                extra: Default::default(),
                 role: None,
                 content: None,
                 tool_calls: None,
@@ -649,6 +702,8 @@ mod tests {
     #[test]
     fn render_response_uses_client_facing_model_not_upstream_raw() {
         let r = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "cmpl-1".into(),
             // Upstream raw — e.g. what OpenAI returned for a routing
             // target inside `failover-group-XXX`.
@@ -669,9 +724,12 @@ mod tests {
     #[test]
     fn render_chunk_omits_finish_reason_when_absent() {
         let chunk = ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: aisix_gateway::ChatDelta {
+                extra: Default::default(),
                 role: None,
                 content: Some("hi".into()),
                 tool_calls: None,
@@ -697,9 +755,12 @@ mod tests {
     #[test]
     fn render_chunk_uses_client_facing_model_not_upstream_raw() {
         let chunk = ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "gpt-4o".into(),
             delta: aisix_gateway::ChatDelta {
+                extra: Default::default(),
                 role: None,
                 content: Some("hi".into()),
                 tool_calls: None,
@@ -719,6 +780,8 @@ mod tests {
     #[test]
     fn finish_reason_other_serialises_verbatim() {
         let r = ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "cmpl".into(),
             model: "m".into(),
             message: ChatMessage::assistant(""),

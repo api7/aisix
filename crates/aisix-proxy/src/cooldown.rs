@@ -123,7 +123,11 @@ pub fn decide_cooldown(
         {
             Some((default_ttl, "transport_error"))
         }
-        BridgeError::UpstreamDecode(_) if cfg.trigger_on_transport_or_default() => {
+        // A 2xx whose body the gateway could not read says nothing about
+        // the upstream's health.
+        BridgeError::UpstreamDecode(_) => None,
+        // A credential exchange that answered unreadably served nothing.
+        BridgeError::TokenExchangeDecode(_) if cfg.trigger_on_transport_or_default() => {
             Some((default_ttl, "upstream_decode_error"))
         }
         // Config errors mean WE are misconfigured (missing provider, bad
@@ -268,14 +272,29 @@ mod tests {
     }
 
     #[test]
-    fn note_failure_marks_cooldown_for_decode_errors() {
+    fn note_failure_leaves_a_decode_error_out_of_cooldown() {
         let tracker = ModelRuntimeStatusTracker::new();
         let err = BridgeError::UpstreamDecode("bad json".into());
         let cfg = enabled();
         let _ = note_failure(&tracker, "m-1", Some(&cfg), err);
+        assert_ne!(
+            tracker.status("m-1").status,
+            crate::health::RuntimeStatus::Cooldown
+        );
+    }
+
+    #[test]
+    fn note_failure_cools_down_on_an_unreadable_token_exchange() {
+        let tracker = ModelRuntimeStatusTracker::new();
+        let err = BridgeError::TokenExchangeDecode("bad token json".into());
+        let _ = note_failure(&tracker, "m-1", Some(&enabled()), err);
         assert_eq!(
             tracker.status("m-1").status,
             crate::health::RuntimeStatus::Cooldown
+        );
+        assert_eq!(
+            tracker.status("m-1").status_reason.as_deref(),
+            Some("upstream_decode_error")
         );
     }
 

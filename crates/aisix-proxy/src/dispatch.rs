@@ -1834,6 +1834,8 @@ mod tests {
                 _ctx: &BridgeContext,
             ) -> Result<ChatResponse, BridgeError> {
                 Ok(ChatResponse {
+                    logprobs: None,
+                    more_choices: Vec::new(),
                     id: "stub".into(),
                     model: req.model.clone(),
                     message: ChatMessage::assistant("stub"),

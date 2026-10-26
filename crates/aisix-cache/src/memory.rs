@@ -121,6 +121,8 @@ mod tests {
 
     fn sample_response() -> ChatResponse {
         ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "cmpl-1".into(),
             model: "m".into(),
             message: ChatMessage::assistant("hi back"),

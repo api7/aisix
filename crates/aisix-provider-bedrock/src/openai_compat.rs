@@ -3,9 +3,9 @@
 //!
 //! AWS serves Grok and OpenAI GPT 5.6 and newer here, and the request keeps
 //! its OpenAI shape instead of being rewritten to Converse. A request that
-//! needs something only Converse offers — a Bedrock-native block, a JSON
-//! mode without a schema, or tools on a GPT model while it reasons — is still
-//! served by Converse ([`needs_converse`]).
+//! needs something only Converse offers — a Bedrock-native block, a
+//! `json_schema` format without its schema, or tools on a GPT model while it
+//! reasons — is still served by Converse ([`needs_converse`]).
 //!
 //! The endpoint authenticates with the provider key's AWS credentials,
 //! signed with SigV4 for the `bedrock` service.
@@ -20,7 +20,7 @@ use aisix_gateway::{
     SseDecoder, SseEvent,
 };
 use aisix_provider_openai::wire::{
-    build_request, messages_from, response_into_chat_response, stream_chunk_into_chat_chunk,
+    build_request, messages_from, response_into_chat_response, stream_chunk_into_chat_chunks,
     DeveloperRoleMode, OpenAiResponse, OpenAiStreamChunk, ToolCallIndexer,
 };
 use futures::StreamExt;
@@ -100,9 +100,9 @@ const CONVERSE_ONLY_FIELDS: &[&str] = &[
     "serviceTier",
     "requestMetadata",
     "outputConfig",
-    "thinking",
     "additionalModelRequestFields",
-    "top_k",
+    "additionalModelResponseFieldPaths",
+    "promptVariables",
 ];
 
 /// Whether a request on a Chat Completions model must still go to Converse.
@@ -113,17 +113,13 @@ pub(crate) fn needs_converse(req: &ChatFormat, model_id: &str) -> bool {
     {
         return true;
     }
-    // AWS enforces a `json_schema` response format for both families here;
-    // a `json_object` one is answered with a 400 unless the prompt mentions
-    // JSON, so Converse keeps handling it.
-    match req.extra.get("response_format") {
-        None | Some(Value::Null) => {}
-        Some(Value::Object(rf)) => match rf.get("type").and_then(Value::as_str) {
-            Some("text") => {}
-            Some("json_schema") if rf.contains_key("json_schema") => {}
-            _ => return true,
-        },
-        Some(_) => {}
+    // A `json_schema` format without its schema object stays on Converse.
+    if let Some(Value::Object(rf)) = req.extra.get("response_format") {
+        if rf.get("type").and_then(Value::as_str) == Some("json_schema")
+            && !rf.contains_key("json_schema")
+        {
+            return true;
+        }
     }
     let has_tools = ["tools", "functions"].iter().any(|k| {
         req.extra
@@ -271,12 +267,13 @@ fn mint_tool_call_id() -> String {
     format!("call_{}", uuid::Uuid::new_v4().simple())
 }
 
-/// A streamed delta names its call by `index`, so one call keeps one minted
-/// id across its deltas; a whole response's calls carry no `index` and are
-/// told apart by position.
+/// A streamed delta names its call by its choice and `index`, so one call
+/// keeps one minted id across its deltas; a whole response's calls carry no
+/// `index` and are told apart by position.
 fn mint_positional_ids(
     tool_calls: &mut [Value],
-    minted: &mut Vec<(u64, String)>,
+    choice: u32,
+    minted: &mut Vec<((u32, u64), String)>,
     by_position: bool,
 ) {
     for (position, call) in tool_calls.iter_mut().enumerate() {
@@ -294,11 +291,12 @@ fn mint_positional_ids(
         } else {
             obj.get("index").and_then(Value::as_u64).unwrap_or(0)
         };
-        let id = match minted.iter().find(|(i, _)| *i == index) {
+        let key = (choice, index);
+        let id = match minted.iter().find(|(k, _)| *k == key) {
             Some((_, id)) => id.clone(),
             None => {
                 let id = mint_tool_call_id();
-                minted.push((index, id.clone()));
+                minted.push((key, id.clone()));
                 id
             }
         };
@@ -382,7 +380,7 @@ async fn send(
 ) -> Result<(reqwest::Response, Instant, Option<Duration>), BridgeError> {
     let (req, deadline) = inline_remote_images(req, ctx).await?;
     let body = {
-        let messages = messages_from(&req, DeveloperRoleMode::MapToSystem);
+        let messages = messages_from(&req, DeveloperRoleMode::Preserve);
         let mut body = serde_json::to_value(build_request(
             &req,
             capability_id(model_id),
@@ -468,8 +466,10 @@ pub(crate) async fn chat(
     if chat.id.is_empty() {
         chat.id = request_id;
     }
-    if let Some(Value::Array(calls)) = chat.message.extra.get_mut("tool_calls") {
-        mint_positional_ids(calls, &mut Vec::new(), true);
+    for message in chat.messages_mut() {
+        if let Some(Value::Array(calls)) = message.extra.get_mut("tool_calls") {
+            mint_positional_ids(calls, 0, &mut Vec::new(), true);
+        }
     }
     Ok(chat)
 }
@@ -486,7 +486,7 @@ pub(crate) async fn chat_stream(
     let stream = async_stream::try_stream! {
         let mut decoder = SseDecoder::new();
         let mut indexer = ToolCallIndexer::default();
-        let mut minted: Vec<(u64, String)> = Vec::new();
+        let mut minted: Vec<((u32, u64), String)> = Vec::new();
         let mut byte_stream = Box::pin(byte_stream);
         'outer: while let Some(next) = byte_stream.next().await {
             let bytes = next.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))?;
@@ -494,7 +494,7 @@ pub(crate) async fn chat_stream(
                 match event {
                     SseEvent::Done => break 'outer,
                     SseEvent::Data(payload) => {
-                        if let Some(chunk) = chunk_from(&payload, &mut indexer, &mut minted, &request_id)? {
+                        for chunk in chunk_from(&payload, &mut indexer, &mut minted, &request_id)? {
                             yield chunk;
                         }
                     }
@@ -502,7 +502,7 @@ pub(crate) async fn chat_stream(
             }
         }
         if let Some(SseEvent::Data(payload)) = decoder.finish().map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
-            if let Some(chunk) = chunk_from(&payload, &mut indexer, &mut minted, &request_id)? {
+            for chunk in chunk_from(&payload, &mut indexer, &mut minted, &request_id)? {
                 yield chunk;
             }
         }
@@ -513,28 +513,59 @@ pub(crate) async fn chat_stream(
 fn chunk_from(
     payload: &str,
     indexer: &mut ToolCallIndexer,
-    minted: &mut Vec<(u64, String)>,
+    minted: &mut Vec<((u32, u64), String)>,
     request_id: &str,
-) -> Result<Option<ChatChunk>, BridgeError> {
+) -> Result<Vec<ChatChunk>, BridgeError> {
     let parsed: OpenAiStreamChunk = serde_json::from_str(payload).map_err(|e| {
         aisix_gateway::capture_in_band_error(payload, aisix_gateway::UpstreamWire::OpenAI)
             .unwrap_or(BridgeError::UpstreamDecode(e.to_string()))
     })?;
-    let Some(mut chunk) = stream_chunk_into_chat_chunk(parsed, indexer) else {
-        return Ok(None);
-    };
-    if chunk.id.is_empty() {
-        chunk.id = request_id.to_string();
+    let mut chunks = stream_chunk_into_chat_chunks(parsed, indexer);
+    for chunk in &mut chunks {
+        if chunk.id.is_empty() {
+            chunk.id = request_id.to_string();
+        }
+        if let Some(calls) = chunk.delta.tool_calls.as_mut() {
+            mint_positional_ids(calls, chunk.choice_index, minted, false);
+        }
     }
-    if let Some(calls) = chunk.delta.tool_calls.as_mut() {
-        mint_positional_ids(calls, minted, false);
-    }
-    Ok(Some(chunk))
+    Ok(chunks)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_positional_ids_are_minted_per_choice() {
+        let mut indexer = ToolCallIndexer::default();
+        let mut minted = Vec::new();
+        let delta = |choice: u32, args: &str| {
+            serde_json::json!({
+                "id": "r",
+                "object": "chat.completion.chunk",
+                "model": "m",
+                "choices": [{"index": choice, "delta": {"tool_calls": [{
+                    "index": 0, "id": "call_0", "type": "function",
+                    "function": {"name": "f", "arguments": args}
+                }]}}]
+            })
+            .to_string()
+        };
+        let mut id_of = |payload: String| {
+            let chunks = chunk_from(&payload, &mut indexer, &mut minted, "r").unwrap();
+            chunks[0].delta.tool_calls.as_ref().unwrap()[0]["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let c0_first = id_of(delta(0, "{"));
+        let c1 = id_of(delta(1, "{"));
+        let c0_again = id_of(delta(0, "}"));
+        assert_ne!(c0_first, c1);
+        assert_eq!(c0_first, c0_again);
+        assert_ne!(c0_first, "call_0");
+    }
 
     #[test]
     fn default_route_needs_the_family_and_a_cross_region_prefix() {

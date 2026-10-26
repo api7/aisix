@@ -675,9 +675,9 @@ async fn dispatch(
                         })?;
                         // The edits response is a JSON object (`{created,
                         // data, usage?}`) on every documented success; a
-                        // body that doesn't parse is a failed attempt, so
-                        // it neither marks the target healthy nor ends a
-                        // group's failover.
+                        // body that doesn't parse is a failed answer that
+                        // was still served, so it is neither retried nor
+                        // failed over.
                         serde_json::from_slice::<Value>(&body_bytes).map_err(|e| {
                             crate::cooldown::note_failure(
                                 tracker,
@@ -981,10 +981,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// A 2xx whose body is not JSON is a failed attempt: a Model Group
-    /// fails over to its next target instead of answering 502.
+    /// A 2xx whose body is not JSON was still served — and billed — by the
+    /// upstream, so a Model Group answers 502 rather than running the edit
+    /// again on its next target.
     #[tokio::test]
-    async fn a_non_json_2xx_fails_over_to_the_next_group_target() {
+    async fn a_non_json_2xx_is_not_failed_over() {
         let upstream = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/v1/images/edits"))
@@ -997,7 +998,7 @@ mod tests {
             .and(path("/v1/images/edits"))
             .and(wiremock::matchers::body_string_contains("gpt-image-2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
-            .expect(1)
+            .expect(0)
             .mount(&upstream)
             .await;
 
@@ -1022,10 +1023,7 @@ mod tests {
         let resp = tower::ServiceExt::oneshot(app, make_req("edit-group", "add a hat"))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert!(v["data"][0]["b64_json"].is_string());
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     /// The alias must NOT reach the upstream — the form's `model` field

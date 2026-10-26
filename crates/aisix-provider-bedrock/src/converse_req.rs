@@ -13,57 +13,63 @@ use aisix_gateway::{BridgeError, ChatFormat};
 use aws_sdk_bedrockruntime::types::{
     GuardrailConfiguration, GuardrailStreamConfiguration, GuardrailStreamProcessingMode,
     GuardrailTrace, JsonSchemaDefinition, OutputConfig, OutputFormat, OutputFormatStructure,
-    OutputFormatType, PerformanceConfigLatency, PerformanceConfiguration, ServiceTier,
-    ServiceTierType,
+    OutputFormatType, PerformanceConfigLatency, PerformanceConfiguration, PromptVariableValues,
+    ServiceTier, ServiceTierType,
 };
 use serde_json::{Map, Value};
 
 use crate::bridge::{capability_id, strip_region_prefix};
 use crate::openai_compat::is_openai_gpt;
 
-/// Top-level request fields that are never forwarded as
-/// `additionalModelRequestFields`: every OpenAI Chat Completions parameter,
-/// the fields the gateway translates or consumes itself, and the
-/// Bedrock-native blocks that have their own place in the request.
-/// Anything else the caller sent is a model-specific parameter, and reaches
-/// the model there.
-const NOT_FORWARDED: &[&str] = &[
-    // OpenAI Chat Completions
+/// OpenAI Chat Completions parameters with no Converse field of their
+/// own. A publisher whose Converse contract defines one takes it as an
+/// `additionalModelRequestFields` member ([`passes_through`]); every
+/// other publisher has no place for it.
+const OPENAI_UNTRANSLATED: &[&str] = &[
     "audio",
     "frequency_penalty",
-    "function_call",
-    "functions",
     "logit_bias",
     "logprobs",
-    "max_completion_tokens",
-    "max_tokens",
-    "messages",
     "metadata",
     "modalities",
-    "model",
     "n",
     "parallel_tool_calls",
     "prediction",
     "presence_penalty",
     "prompt_cache_key",
     "prompt_cache_retention",
-    "reasoning_effort",
     "response_format",
     "safety_identifier",
     "seed",
+    "store",
+    "top_logprobs",
+    "user",
+    "verbosity",
+    "web_search_options",
+];
+
+/// Top-level request fields that are never forwarded as
+/// `additionalModelRequestFields`: the OpenAI parameters Converse carries in
+/// its own fields or the gateway translates, the fields the gateway
+/// consumes itself, and the Bedrock-native blocks that have their own place
+/// in the request.
+const TRANSLATED: &[&str] = &[
+    // OpenAI Chat Completions, carried by Converse's own fields
+    "function_call",
+    "functions",
+    "max_completion_tokens",
+    "max_tokens",
+    "messages",
+    "model",
+    "reasoning_effort",
     "service_tier",
     "stop",
-    "store",
     "stream",
     "stream_options",
     "temperature",
     "tool_choice",
     "tools",
-    "top_logprobs",
     "top_p",
-    "user",
-    "verbosity",
-    "web_search_options",
     // Translated or consumed by the gateway
     "thinking",
     "output_config",
@@ -74,8 +80,10 @@ const NOT_FORWARDED: &[&str] = &[
     "extra_body",
     "extra_headers",
     "model_id",
-    // Bedrock-native request blocks
+    // Bedrock-native request blocks and top-level Converse fields
     "additionalModelRequestFields",
+    "additionalModelResponseFieldPaths",
+    "promptVariables",
     "guardrailConfig",
     "performanceConfig",
     "serviceTier",
@@ -83,20 +91,102 @@ const NOT_FORWARDED: &[&str] = &[
     "outputConfig",
 ];
 
+/// The OpenAI models on Converse: gpt-oss, GPT and Grok. AWS's OpenAI
+/// model page: "Include any other fields in the
+/// `additionalModelRequestFields` object."
+fn is_openai_family(id: &str) -> bool {
+    id.contains("gpt-oss") || is_openai_gpt(id) || id.starts_with("xai.grok-")
+}
+
+/// Whether an untranslated OpenAI parameter reaches this model as an
+/// `additionalModelRequestFields` member, per its publisher's Bedrock
+/// request body. `n`, `logprobs` and `top_logprobs` never do: Converse
+/// answers with one message and no log probabilities, so what they ask
+/// for would be billed and lost. A `json_schema` `response_format` becomes
+/// the request's tool or output config instead.
+fn passes_through(key: &str, req: &ChatFormat, id: &str) -> bool {
+    if is_openai_family(id) {
+        return match key {
+            "n" | "logprobs" | "top_logprobs" => false,
+            "response_format" => {
+                req.extra
+                    .get("response_format")
+                    .and_then(|rf| rf.get("type"))
+                    .and_then(Value::as_str)
+                    != Some("json_schema")
+            }
+            _ => true,
+        };
+    }
+    // Cohere Command R / R+: `seed`, `frequency_penalty`, `presence_penalty`.
+    if id.starts_with("cohere.command-r") {
+        return matches!(key, "seed" | "frequency_penalty" | "presence_penalty");
+    }
+    // AI21 Jamba: `frequency_penalty`, `presence_penalty`.
+    if id.starts_with("ai21.jamba") {
+        return matches!(key, "frequency_penalty" | "presence_penalty");
+    }
+    false
+}
+
 /// The caller's own `additionalModelRequestFields`: the object they sent
 /// under that name, merged with every top-level field that is not an
-/// OpenAI parameter or one the gateway handles.
-pub(crate) fn caller_additional_fields(req: &ChatFormat) -> Map<String, Value> {
+/// OpenAI parameter or one the gateway handles, and with the OpenAI
+/// parameters this model's Converse contract takes there.
+pub(crate) fn caller_additional_fields(req: &ChatFormat, model_id: &str) -> Map<String, Value> {
+    let id = base_id(model_id);
     let mut fields = match req.extra.get("additionalModelRequestFields") {
         Some(Value::Object(m)) => m.clone(),
         _ => Map::new(),
     };
     for (key, value) in &req.extra {
-        if !NOT_FORWARDED.contains(&key.as_str()) {
-            fields.insert(key.clone(), value.clone());
+        let key = key.as_str();
+        let forward = if TRANSLATED.contains(&key) {
+            false
+        } else if OPENAI_UNTRANSLATED.contains(&key) {
+            passes_through(key, req, &id)
+        } else {
+            true
+        };
+        if forward {
+            fields.insert(key.to_string(), value.clone());
         }
     }
     fields
+}
+
+/// `additionalModelResponseFieldPaths`: the JSON pointers into the model's
+/// response that Converse returns as `additionalModelResponseFields`.
+fn additional_response_field_paths(req: &ChatFormat) -> Result<Option<Vec<String>>, BridgeError> {
+    const WANT: &str = "must be an array of strings";
+    match req.extra.get("additionalModelResponseFieldPaths") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| v.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .map(Some)
+            .ok_or_else(|| invalid("additionalModelResponseFieldPaths", WANT)),
+        Some(_) => Err(invalid("additionalModelResponseFieldPaths", WANT)),
+    }
+}
+
+/// `promptVariables`: the values for a Prompt management prompt's
+/// variables, each `{"text": "..."}`.
+fn prompt_variables(req: &ChatFormat) -> Result<Vec<(String, PromptVariableValues)>, BridgeError> {
+    const WANT: &str = "values must be {\"text\": string} objects";
+    let Some(vars) = object(req, "promptVariables")? else {
+        return Ok(Vec::new());
+    };
+    vars.iter()
+        .map(|(name, value)| {
+            let text = value
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("promptVariables", WANT))?;
+            Ok((name.clone(), PromptVariableValues::Text(text.to_string())))
+        })
+        .collect()
 }
 
 /// The Bedrock-native blocks of a Converse request.
@@ -107,6 +197,8 @@ pub(crate) struct NativeBlocks {
     pub service_tier: Option<ServiceTier>,
     pub request_metadata: Vec<(String, String)>,
     pub output_config: Option<OutputConfig>,
+    pub response_field_paths: Option<Vec<String>>,
+    pub prompt_variables: Vec<(String, PromptVariableValues)>,
 }
 
 fn invalid(field: &str, why: &str) -> BridgeError {
@@ -159,10 +251,15 @@ impl NativeBlocks {
                     .ok_or_else(|| invalid("serviceTier", "must carry a type"))?
                     .to_string(),
             ),
-            None => match req.extra.get("service_tier").and_then(Value::as_str) {
-                Some("auto") => Some("default".to_string()),
-                Some(t @ ("default" | "flex" | "priority")) => Some(t.to_string()),
-                _ => None,
+            None => match req.extra.get("service_tier") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(t)) => match t.as_str() {
+                    "auto" => Some("default".to_string()),
+                    "default" | "flex" | "priority" => Some(t.clone()),
+                    // A tier Bedrock has no counterpart for.
+                    _ => None,
+                },
+                Some(_) => return Err(invalid("service_tier", "must be a string")),
             },
         };
         if let Some(tier) = tier {
@@ -184,6 +281,8 @@ impl NativeBlocks {
         if let Some(config) = object(req, "outputConfig")? {
             blocks.output_config = output_config(config)?;
         }
+        blocks.response_field_paths = additional_response_field_paths(req)?;
+        blocks.prompt_variables = prompt_variables(req)?;
         Ok(blocks)
     }
 
@@ -256,23 +355,31 @@ fn is_nova_2(model_id: &str) -> bool {
 }
 
 /// `reasoning_effort` in the shape each non-Claude publisher takes on
-/// Converse, as one `additionalModelRequestFields` member: gpt-oss and
-/// DeepSeek V3 take it verbatim, OpenAI GPT-5.x/6 as `reasoning.effort`,
-/// Amazon Nova 2 as `reasoningConfig`. DeepSeek R1 always reasons and
-/// rejects every shape, and other publishers have none, so it is dropped
-/// for them. Claude's translation lives with the Anthropic request builder.
+/// Converse, as one `additionalModelRequestFields` member: gpt-oss, Grok,
+/// DeepSeek V3, Z.AI GLM and Kimi K3 take it verbatim, OpenAI GPT-5.x/6 as
+/// `reasoning.effort`, Amazon Nova 2 as `reasoningConfig`. DeepSeek R1
+/// always reasons and rejects every shape, and other publishers have none,
+/// so it is dropped for them. Claude's translation lives with the
+/// Anthropic request builder.
 pub(crate) fn reasoning_field(
     req: &ChatFormat,
     model_id: &str,
 ) -> Result<Option<(&'static str, Value)>, BridgeError> {
-    let Some(effort) = req.extra.get("reasoning_effort").and_then(Value::as_str) else {
-        return Ok(None);
+    let effort = match req.extra.get("reasoning_effort") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(effort)) => effort.as_str(),
+        Some(_) => return Err(invalid("reasoning_effort", "must be a string")),
     };
     let id = base_id(model_id);
     if id.contains("deepseek.r1") {
         return Ok(None);
     }
-    if id.contains("gpt-oss") || id.contains("deepseek") {
+    if id.contains("gpt-oss")
+        || id.contains("deepseek")
+        || id.starts_with("xai.grok-")
+        || id.starts_with("zai.")
+        || id.starts_with("moonshotai.kimi-k3")
+    {
         return Ok(Some((
             "reasoning_effort",
             Value::String(effort.to_string()),
@@ -282,16 +389,16 @@ pub(crate) fn reasoning_field(
         return Ok(Some(("reasoning", serde_json::json!({"effort": effort}))));
     }
     if is_nova_2(model_id) {
-        if !matches!(effort, "low" | "medium" | "high") {
-            return Err(BridgeError::InvalidRequest(format!(
-                "Invalid reasoning_effort value '{effort}' for Nova 2 models. \
-                 Supported values: low, medium, high"
-            )));
-        }
-        return Ok(Some((
-            "reasoningConfig",
-            serde_json::json!({"type": "enabled", "maxReasoningEffort": effort}),
-        )));
+        // Nova 2 reasons at low, medium or high, or not at all; any other
+        // tier has no `reasoningConfig` and is dropped.
+        return Ok(match effort {
+            "none" => Some(("reasoningConfig", serde_json::json!({"type": "disabled"}))),
+            "low" | "medium" | "high" => Some((
+                "reasoningConfig",
+                serde_json::json!({"type": "enabled", "maxReasoningEffort": effort}),
+            )),
+            _ => None,
+        });
     }
     Ok(None)
 }
@@ -300,7 +407,10 @@ pub(crate) fn reasoning_field(
 /// additional field, Nova inside its own `inferenceConfig`. Dropped
 /// elsewhere.
 pub(crate) fn top_k_field(req: &ChatFormat, model_id: &str) -> Option<(&'static str, Value)> {
-    let top_k = req.extra.get("top_k").filter(|v| !v.is_null())?.clone();
+    let top_k = match req.extra.get("top_k").filter(|v| !v.is_null()) {
+        Some(v) => v.clone(),
+        None => req.top_k?.into(),
+    };
     let id = base_id(model_id);
     if id.starts_with("anthropic.") {
         Some(("top_k", top_k))
@@ -342,7 +452,7 @@ pub(crate) fn stop_sequences(
         Some(_) => return Err(invalid("stop", WANT)),
     };
     if base_id(model_id).starts_with("anthropic.")
-        && caller_additional_fields(req).contains_key("stop_sequences")
+        && caller_additional_fields(req, model_id).contains_key("stop_sequences")
     {
         return Ok(None);
     }
@@ -363,20 +473,13 @@ pub(crate) fn check_max_completion_tokens(req: &ChatFormat) -> Result<(), Bridge
     }
 }
 
-/// The output-token cap: `max_completion_tokens`, else `max_tokens`. On
-/// Converse the OpenAI-family models (and Kimi K3) reject a cap below 16,
-/// so a smaller one is raised to it.
-pub(crate) fn max_tokens(req: &ChatFormat, model_id: &str) -> Option<u32> {
-    let cap = req
-        .extra
+/// The output-token cap: `max_completion_tokens`, else `max_tokens`.
+pub(crate) fn max_tokens(req: &ChatFormat) -> Option<u32> {
+    req.extra
         .get("max_completion_tokens")
         .and_then(Value::as_u64)
         .map(|v| v.min(u32::MAX as u64) as u32)
-        .or(req.max_tokens)?;
-    let id = capability_id(model_id);
-    let needs_floor =
-        is_openai_gpt(id) || id.contains("xai.grok-") || id.contains("moonshotai.kimi-k3");
-    Some(if needs_floor { cap.max(16) } else { cap })
+        .or(req.max_tokens)
 }
 
 /// Whether a request's `response_format` tool is forced on this model. A
@@ -498,7 +601,7 @@ mod tests {
             "user": "u",
             "guardrailConfig": {"guardrailIdentifier": "g", "guardrailVersion": "1"},
         }));
-        let fields = caller_additional_fields(&r);
+        let fields = caller_additional_fields(&r, "meta.llama3-3-70b-instruct-v1:0");
         assert_eq!(
             serde_json::Value::Object(fields),
             serde_json::json!({"a": 1, "custom_knob": true})
@@ -528,8 +631,82 @@ mod tests {
             reasoning_field(&r, "meta.llama3-3-70b-instruct-v1:0").unwrap(),
             None
         );
-        let bad = req(serde_json::json!({"reasoning_effort": "xhigh"}));
-        assert!(reasoning_field(&bad, "amazon.nova-2-lite-v1:0").is_err());
+        assert_eq!(
+            reasoning_field(&r, "zai.glm-5.3").unwrap(),
+            Some(("reasoning_effort", serde_json::json!("high")))
+        );
+        assert_eq!(
+            reasoning_field(&r, "moonshotai.kimi-k3").unwrap(),
+            Some(("reasoning_effort", serde_json::json!("high")))
+        );
+        // Nova 2: "none" turns reasoning off, a tier it lacks is dropped.
+        let none = req(serde_json::json!({"reasoning_effort": "none"}));
+        assert_eq!(
+            reasoning_field(&none, "amazon.nova-2-lite-v1:0").unwrap(),
+            Some(("reasoningConfig", serde_json::json!({"type": "disabled"})))
+        );
+        let xhigh = req(serde_json::json!({"reasoning_effort": "xhigh"}));
+        assert_eq!(
+            reasoning_field(&xhigh, "amazon.nova-2-lite-v1:0").unwrap(),
+            None
+        );
+        let wrong = req(serde_json::json!({"reasoning_effort": 3}));
+        assert!(matches!(
+            reasoning_field(&wrong, "amazon.nova-2-lite-v1:0"),
+            Err(BridgeError::InvalidRequest(m)) if m.starts_with("reasoning_effort ")
+        ));
+    }
+
+    #[test]
+    fn openai_fields_reach_the_models_whose_converse_contract_takes_them() {
+        let r = req(serde_json::json!({
+            "seed": 7,
+            "frequency_penalty": 0.5,
+            "presence_penalty": 0.25,
+            "user": "u",
+            "logit_bias": {"1": 2},
+            "parallel_tool_calls": false,
+            "response_format": {"type": "json_object"},
+            "n": 2,
+            "logprobs": true,
+            "top_logprobs": 2,
+        }));
+        let keys = |id: &str| {
+            let mut k: Vec<String> = caller_additional_fields(&r, id).keys().cloned().collect();
+            k.sort();
+            k
+        };
+        for id in [
+            "openai.gpt-oss-120b-1:0",
+            "openai.gpt-6-sol",
+            "xai.grok-4.6",
+        ] {
+            assert_eq!(
+                keys(id),
+                [
+                    "frequency_penalty",
+                    "logit_bias",
+                    "parallel_tool_calls",
+                    "presence_penalty",
+                    "response_format",
+                    "seed",
+                    "user"
+                ],
+                "{id}"
+            );
+        }
+        assert_eq!(
+            keys("cohere.command-r-plus-v1:0"),
+            ["frequency_penalty", "presence_penalty", "seed"]
+        );
+        assert_eq!(
+            keys("ai21.jamba-1-5-large-v1:0"),
+            ["frequency_penalty", "presence_penalty"]
+        );
+        assert!(keys("meta.llama3-3-70b-instruct-v1:0").is_empty());
+        // A json_schema format becomes the tool or output config instead.
+        let schema = req(serde_json::json!({"response_format": {"type": "json_schema"}}));
+        assert!(caller_additional_fields(&schema, "openai.gpt-oss-120b-1:0").is_empty());
     }
 
     #[test]
@@ -538,7 +715,7 @@ mod tests {
         let both = req(serde_json::json!({"stop": ["delta"], "stop_sequences": ["beta"]}));
         assert_eq!(stop_sequences(&both, claude).unwrap(), None);
         assert_eq!(
-            caller_additional_fields(&both).get("stop_sequences"),
+            caller_additional_fields(&both, claude).get("stop_sequences"),
             Some(&serde_json::json!(["beta"]))
         );
         let nested = req(serde_json::json!({
@@ -551,7 +728,7 @@ mod tests {
         let null_native = req(serde_json::json!({"stop": ["delta"], "stop_sequences": null}));
         assert_eq!(stop_sequences(&null_native, claude).unwrap(), None);
         assert_eq!(
-            caller_additional_fields(&null_native).get("stop_sequences"),
+            caller_additional_fields(&null_native, claude).get("stop_sequences"),
             Some(&serde_json::Value::Null)
         );
         // Other publishers keep `stop` as before.

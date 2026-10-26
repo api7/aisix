@@ -306,7 +306,7 @@ pub(crate) fn routing_error_class(err: &BridgeError) -> &'static str {
     match err {
         BridgeError::Timeout { .. } => "timeout",
         BridgeError::UpstreamStatus { .. } => "upstream_status",
-        BridgeError::UpstreamDecode(_) => "upstream_decode",
+        BridgeError::UpstreamDecode(_) | BridgeError::TokenExchangeDecode(_) => "upstream_decode",
         BridgeError::UpstreamInBand { .. } => "upstream_in_band",
         // Deliberately the same class `Config` reports: this variant was
         // spelled as a `Config` until #1093, and giving it a class of its
@@ -620,6 +620,7 @@ mod tests {
             },
             BridgeError::upstream_status(502, "bad gateway"),
             BridgeError::UpstreamDecode("unparseable body".into()),
+            BridgeError::TokenExchangeDecode("unparseable token".into()),
             BridgeError::UpstreamInBand {
                 status: Some(500),
                 message: "overloaded".into(),
@@ -652,6 +653,7 @@ mod tests {
         let expected = [
             ("timeout", "timeout"),
             ("upstream_status", "upstream_error"),
+            ("upstream_decode", "upstream_decode_error"),
             ("upstream_decode", "upstream_decode_error"),
             ("upstream_in_band", "upstream_in_band_error"),
             ("transport", "transport_error"),
@@ -697,7 +699,9 @@ mod tests {
                 // would hide the outage the family exists to show.
                 BridgeError::Timeout { .. } => (true, "timeout"),
                 BridgeError::UpstreamStatus { .. } => (true, "upstream_status"),
-                BridgeError::UpstreamDecode(_) => (true, "upstream_decode"),
+                BridgeError::UpstreamDecode(_) | BridgeError::TokenExchangeDecode(_) => {
+                    (true, "upstream_decode")
+                }
                 BridgeError::UpstreamInBand { .. } => (true, "upstream_in_band"),
                 BridgeError::Transport(_) => (true, "transport"),
                 BridgeError::StreamAborted => (true, "stream_aborted"),

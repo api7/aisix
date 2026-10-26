@@ -138,6 +138,7 @@ impl DecisionFailure {
                 BridgeError::UpstreamStatus { .. }
                 | BridgeError::UpstreamInBand { .. }
                 | BridgeError::UpstreamDecode(_)
+                | BridgeError::TokenExchangeDecode(_)
                 | BridgeError::Transport(_)
                 | BridgeError::StreamAborted,
             )) => Self::EmbeddingUpstream,
@@ -850,6 +851,8 @@ async fn embed_texts_inner(
     let dimensions = model.embedding.as_ref().map(|e| e.dimensions);
 
     let req = EmbeddingRequest {
+        extra: Default::default(),
+        token_input: None,
         model: upstream_model,
         input: texts.to_vec(),
         input_was_single: texts.len() == 1,

@@ -63,11 +63,8 @@ pub fn responses_request_to_chat(model: &str, body: &Value) -> ChatFormat {
     }
 
     let mut chat = ChatFormat::new(model, messages);
-    chat.temperature = body
-        .get("temperature")
-        .and_then(|v| v.as_f64())
-        .map(|f| f as f32);
-    chat.top_p = body.get("top_p").and_then(|v| v.as_f64()).map(|f| f as f32);
+    chat.temperature = body.get("temperature").and_then(|v| v.as_f64());
+    chat.top_p = body.get("top_p").and_then(|v| v.as_f64());
     // Responses calls the cap `max_output_tokens`; tolerate `max_tokens`
     // too for clients that send the chat-style name. A value that doesn't
     // fit u32 is dropped (left unset) rather than silently wrapped to a
@@ -352,9 +349,11 @@ fn attach_replayed_reasoning(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
         for text in pending.drain(..) {
             let mut extra = Map::new();
             extra.insert(REASONING_CONTENT.to_string(), Value::String(text));
+            // `""`, not `null`: a turn with no tool call and no text still
+            // states an (empty) answer.
             out.push(ChatMessage {
                 role: Role::Assistant,
-                content: None,
+                content: Some(String::new()),
                 content_blocks: None,
                 name: None,
                 tool_call_id: None,
@@ -1835,6 +1834,8 @@ impl ResponsesSseEncoder {
         if self.finished {
             return Vec::new();
         }
+        // A Responses response is one answer.
+        let chunk = &*chunk.first_choice_only();
         self.accumulate_usage(chunk);
         if let Some(tier) = chunk.service_tier.as_ref().and_then(|t| t.openai_value()) {
             self.service_tier = Some(tier.to_owned());
@@ -2763,7 +2764,7 @@ pub fn build_responses_bridge_stream(
             if !tool_calls.is_empty() {
                 message.extra.insert("tool_calls".to_string(), Value::Array(tool_calls));
             }
-            let synth = ChatResponse {
+            let synth = ChatResponse { logprobs: None, more_choices: Vec::new(),
                 id: String::new(),
                 model: model_label.clone(),
                 message,
@@ -3822,6 +3823,8 @@ mod tests {
             extra.insert("tool_calls".into(), tc);
         }
         ChatResponse {
+            logprobs: None,
+            more_choices: Vec::new(),
             id: "id".into(),
             model: "m".into(),
             message: ChatMessage {
@@ -3944,6 +3947,8 @@ mod tests {
 
     fn content_chunk(text: &str) -> ChatChunk {
         ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -3969,6 +3974,8 @@ mod tests {
         all.extend(enc.next_events(&content_chunk("lo")));
         // Finish chunk carrying usage (Anthropic attaches it here).
         all.extend(enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta::default(),
@@ -4013,6 +4020,8 @@ mod tests {
         let _ = enc.next_events(&content_chunk("hi"));
         // Finish without usage → close items but NOT completed yet.
         let at_finish = enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta::default(),
@@ -4025,6 +4034,8 @@ mod tests {
         assert!(!enc.is_finished());
         // Trailing usage frame releases completed.
         let usage_frame = enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta::default(),
@@ -4041,6 +4052,8 @@ mod tests {
     fn streaming_tool_call_emits_function_call_events() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let chunk = ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -4057,6 +4070,8 @@ mod tests {
         };
         let mut all = enc.next_events(&chunk);
         all.extend(enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -4071,6 +4086,8 @@ mod tests {
             accounting_usage: None,
         }));
         all.extend(enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta::default(),
@@ -4099,6 +4116,8 @@ mod tests {
     fn streaming_custom_tool_call_emits_one_unwrapped_input_delta() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, custom_tools(&["apply_patch"]));
         let mut all = enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -4114,6 +4133,8 @@ mod tests {
             accounting_usage: None,
         });
         all.extend(enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -4128,6 +4149,8 @@ mod tests {
             accounting_usage: None,
         }));
         all.extend(enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta::default(),
@@ -4196,6 +4219,8 @@ mod tests {
         // First fragment carries a PREFIX of the custom tool's name, so the
         // item opens as a plain function call.
         let mut all = enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -4211,6 +4236,8 @@ mod tests {
             accounting_usage: None,
         });
         all.extend(enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -4245,6 +4272,8 @@ mod tests {
     fn streaming_custom_tool_call_emits_no_function_call_argument_events() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, custom_tools(&["apply_patch"]));
         let mut all = enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -4270,7 +4299,7 @@ mod tests {
     #[test]
     fn streaming_mixed_tool_calls_keep_their_own_event_families() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, custom_tools(&["apply_patch"]));
-        let mut all = enc.next_events(&ChatChunk {
+        let mut all = enc.next_events(&ChatChunk { choice_index: 0, logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -4286,6 +4315,8 @@ mod tests {
             usage: None,
             service_tier: None, accounting_usage: None, });
         all.extend(enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta::default(),
@@ -4319,6 +4350,8 @@ mod tests {
     fn only_a_renderable_chunk_counts_as_output() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let usage_only = ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta::default(),
@@ -4339,6 +4372,8 @@ mod tests {
         // force_finish must NOT re-emit the per-item done events.
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let _ = enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -4354,6 +4389,8 @@ mod tests {
             accounting_usage: None,
         });
         let at_finish = enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta::default(),
@@ -4392,6 +4429,8 @@ mod tests {
             let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
             let _ = enc.next_events(&content_chunk("hi"));
             let done = enc.next_events(&ChatChunk {
+                choice_index: 0,
+                logprobs: None,
                 id: "c".into(),
                 model: "m".into(),
                 delta: ChatDelta::default(),
@@ -4433,6 +4472,8 @@ mod tests {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let _ = enc.next_events(&content_chunk("partial"));
         let done = enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta::default(),
@@ -4610,6 +4651,8 @@ mod tests {
 
     fn reasoning_chunk(text: &str) -> ChatChunk {
         ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -4625,6 +4668,8 @@ mod tests {
 
     fn finish_chunk(usage: Option<UsageStats>) -> ChatChunk {
         ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta::default(),
@@ -4693,6 +4738,8 @@ mod tests {
         let mut all = enc.next_events(&reasoning_chunk("why"));
         all.extend(enc.next_events(&content_chunk("because")));
         all.extend(enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -4825,6 +4872,8 @@ mod tests {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let _ = enc.next_events(&content_chunk("hello"));
         let _ = enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta::default(),
@@ -4880,6 +4929,8 @@ mod tests {
         let mut partial = UsageStats::new(3, 0);
         partial.total_tokens = 3;
         let _ = enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta::default(),
@@ -4902,6 +4953,8 @@ mod tests {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let _ = enc.next_events(&content_chunk("hi"));
         let _ = enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta::default(),
@@ -5056,7 +5109,7 @@ mod tests {
         );
         assert_eq!(chat.messages.len(), 3);
         assert!(matches!(chat.messages[1].role, Role::Assistant));
-        assert!(chat.messages[1].content.is_none());
+        assert_eq!(chat.messages[1].content.as_deref(), Some(""));
         assert_eq!(
             reasoning_of(&chat.messages[1]),
             Some("thinking, then interrupted")
@@ -5209,6 +5262,8 @@ mod tests {
     fn streaming_namespace_call_announces_and_closes_the_sub_tool() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, namespace_reply());
         let mut events = enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -5224,6 +5279,8 @@ mod tests {
             accounting_usage: None,
         });
         events.extend(enc.next_events(&ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta {
@@ -5476,6 +5533,8 @@ mod tests {
     #[tokio::test]
     async fn an_empty_upstream_stream_fails_instead_of_completing() {
         let usage_only = ChatChunk {
+            choice_index: 0,
+            logprobs: None,
             id: "c".into(),
             model: "m".into(),
             delta: ChatDelta::default(),

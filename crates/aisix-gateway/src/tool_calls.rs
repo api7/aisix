@@ -11,9 +11,13 @@
 
 use std::borrow::Cow;
 
-use serde_json::Value;
+use futures::StreamExt;
+use serde_json::{json, Value};
 
-use crate::{BridgeError, ChatFormat};
+use crate::{
+    BridgeError, ChatChunk, ChatChunkStream, ChatFormat, ChatMessage, ChatResponse, FinishReason,
+    Role,
+};
 
 /// Separates a tool-call id from the thought signature appended to it.
 pub const THOUGHT_SIGNATURE_SEPARATOR: &str = "__thought__";
@@ -99,20 +103,200 @@ pub fn strip_thought_signatures_in_body(body: &mut Value) {
     }
 }
 
-/// Refuse the deprecated `functions` / `function_call` request fields on a
-/// bridge that builds its upstream body itself. Such a bridge has no
-/// translation for them, and dropping them would answer a function-calling
-/// request with prose.
-pub fn reject_legacy_function_calling(req: &ChatFormat) -> Result<(), BridgeError> {
-    match ["functions", "function_call"]
-        .into_iter()
-        .find(|k| req.extra.contains_key(*k))
-    {
-        Some(field) => Err(BridgeError::InvalidRequest(format!(
-            "`{field}` is not supported for this model; use `tools` and `tool_choice` instead"
-        ))),
-        None => Ok(()),
+/// How a request that used the deprecated function-calling fields is
+/// answered, returned by [`legacy_functions_as_tools`].
+#[derive(Debug, Clone, Copy, Default)]
+#[must_use = "the reply must be rendered back in the shape the caller asked for"]
+pub struct LegacyFunctionCalling {
+    /// The caller declared `functions` (and no `tools`), so it reads the
+    /// answer's call from `message.function_call`.
+    legacy_reply: bool,
+}
+
+/// Rewrite the deprecated `functions` / `function_call` request fields and
+/// the history turns they produce into their `tools` equivalents, for a
+/// bridge whose upstream has no slot for the legacy shape but has one for
+/// tools:
+///
+/// - `functions[]` → `tools[]` of `{type: "function", function}` (appended
+///   when the caller also sent `tools`);
+/// - `function_call` → `tool_choice` (`"none"` / `"auto"` as is, `{name}`
+///   as a named function choice), unless the caller sent `tool_choice`;
+/// - an assistant turn's `function_call` → a one-entry `tool_calls`, and
+///   the `function` result turn that follows → a `tool` result answering
+///   that call's id.
+///
+/// The returned [`LegacyFunctionCalling`] renders the answer back in the
+/// legacy shape when the caller asked in it. OpenAI-wire upstreams take
+/// the legacy fields themselves and never go through this.
+///
+/// A field whose shape is not one the legacy API defines is refused with a
+/// 400 naming it.
+pub fn legacy_functions_as_tools(
+    req: Cow<'_, ChatFormat>,
+) -> Result<(Cow<'_, ChatFormat>, LegacyFunctionCalling), BridgeError> {
+    // A legacy field set to `null` is absent: an SDK replaying a turn it
+    // dumped writes `function_call: null` beside its content.
+    const LEGACY: [&str; 2] = ["functions", "function_call"];
+    let set = |v: Option<&Value>| v.is_some_and(|v| !v.is_null());
+    let declares = LEGACY.iter().any(|k| set(req.extra.get(*k)));
+    let replays = req
+        .messages
+        .iter()
+        .any(|m| m.role == Role::Function || set(m.extra.get("function_call")));
+    let nulls = LEGACY
+        .iter()
+        .any(|k| req.extra.get(*k).is_some_and(Value::is_null))
+        || req
+            .messages
+            .iter()
+            .any(|m| m.extra.get("function_call").is_some_and(Value::is_null));
+    if !declares && !replays && !nulls {
+        return Ok((req, LegacyFunctionCalling::default()));
     }
+    let mut req = req.into_owned();
+    req.extra
+        .retain(|k, v| !(v.is_null() && LEGACY.contains(&k.as_str())));
+    for message in &mut req.messages {
+        if message
+            .extra
+            .get("function_call")
+            .is_some_and(Value::is_null)
+        {
+            message.extra.remove("function_call");
+        }
+    }
+    let legacy_reply = req.extra.contains_key("functions") && !set(req.extra.get("tools"));
+
+    if let Some(functions) = req.extra.remove("functions") {
+        let Value::Array(functions) = functions else {
+            return Err(BridgeError::InvalidRequest(
+                "`functions` must be an array of function definitions".into(),
+            ));
+        };
+        let mapped = functions
+            .into_iter()
+            .map(|function| json!({"type": "function", "function": function}));
+        match req.extra.get_mut("tools") {
+            Some(Value::Array(tools)) => tools.extend(mapped),
+            _ => {
+                req.extra
+                    .insert("tools".into(), Value::Array(mapped.collect()));
+            }
+        }
+    }
+    if let Some(function_call) = req.extra.remove("function_call") {
+        let choice = match &function_call {
+            Value::String(mode) if mode == "none" || mode == "auto" => function_call.clone(),
+            Value::Object(o) if o.get("name").is_some_and(Value::is_string) => {
+                json!({"type": "function", "function": {"name": o["name"]}})
+            }
+            _ => {
+                return Err(BridgeError::InvalidRequest(
+                    "`function_call` must be \"none\", \"auto\" or {\"name\": \"...\"}".into(),
+                ))
+            }
+        };
+        req.extra.entry("tool_choice").or_insert(choice);
+    }
+
+    let mut last_call_id: Option<String> = None;
+    for (index, message) in req.messages.iter_mut().enumerate() {
+        if let Some(call) = message.extra.remove("function_call") {
+            let Some(name) = call.get("name").and_then(Value::as_str) else {
+                return Err(BridgeError::InvalidRequest(format!(
+                    "`messages[{index}].function_call.name` must be a string"
+                )));
+            };
+            let id = format!("call_function_{index}");
+            let arguments = call.get("arguments").cloned().unwrap_or(json!("{}"));
+            let tool_call = json!({
+                "id": id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            });
+            match message.extra.get_mut("tool_calls") {
+                Some(Value::Array(calls)) => calls.push(tool_call),
+                _ => {
+                    message
+                        .extra
+                        .insert("tool_calls".into(), json!([tool_call]));
+                }
+            }
+            last_call_id = Some(id);
+        }
+        if message.role == Role::Function {
+            message.role = Role::Tool;
+            if message.tool_call_id.is_none() {
+                message.tool_call_id = Some(
+                    last_call_id
+                        .clone()
+                        .unwrap_or_else(|| format!("call_function_{index}")),
+                );
+            }
+        }
+    }
+    Ok((Cow::Owned(req), LegacyFunctionCalling { legacy_reply }))
+}
+
+impl LegacyFunctionCalling {
+    /// `resp` in the shape the caller asked in: with the first tool call
+    /// of each choice as `message.function_call` and a `tool_calls` finish
+    /// as `function_call`. The legacy shape holds one call per turn, so
+    /// any further call has no slot.
+    pub fn reply(self, mut resp: ChatResponse) -> ChatResponse {
+        if !self.legacy_reply {
+            return resp;
+        }
+        legacy_message(&mut resp.message, &mut resp.finish_reason);
+        for choice in &mut resp.more_choices {
+            legacy_message(&mut choice.message, &mut choice.finish_reason);
+        }
+        resp
+    }
+
+    /// [`Self::reply`] for a stream: each tool-call delta of the first call
+    /// becomes a `delta.function_call` fragment.
+    pub fn reply_stream(self, stream: ChatChunkStream) -> ChatChunkStream {
+        if !self.legacy_reply {
+            return stream;
+        }
+        Box::pin(stream.map(|chunk| chunk.map(legacy_chunk)))
+    }
+}
+
+fn legacy_finish(finish: &mut FinishReason) {
+    if *finish == FinishReason::ToolCalls {
+        *finish = FinishReason::Other("function_call".into());
+    }
+}
+
+fn legacy_message(message: &mut ChatMessage, finish: &mut FinishReason) {
+    if let Some(Value::Array(calls)) = message.extra.remove("tool_calls") {
+        if let Some(function) = calls
+            .into_iter()
+            .next()
+            .and_then(|c| c.get("function").cloned())
+        {
+            message.extra.insert("function_call".into(), function);
+        }
+    }
+    legacy_finish(finish);
+}
+
+fn legacy_chunk(mut chunk: ChatChunk) -> ChatChunk {
+    if let Some(calls) = chunk.delta.tool_calls.take() {
+        let first = calls
+            .into_iter()
+            .find(|c| c.get("index").and_then(Value::as_u64).unwrap_or(0) == 0);
+        if let Some(function) = first.and_then(|c| c.get("function").cloned()) {
+            chunk.delta.extra.insert("function_call".into(), function);
+        }
+    }
+    if let Some(finish) = chunk.finish_reason.as_mut() {
+        legacy_finish(finish);
+    }
+    chunk
 }
 
 /// The text a guardrail scans for a `tool_calls` array: every call as it
@@ -216,13 +400,79 @@ mod tests {
     }
 
     #[test]
-    fn legacy_function_fields_are_refused() {
+    fn legacy_function_calling_maps_onto_tools_and_back() {
+        let req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": null,
+                 "function_call": {"name": "w", "arguments": "{\"c\":\"x\"}"}},
+                {"role": "function", "name": "w", "content": "75F"}
+            ],
+            "functions": [{"name": "w", "parameters": {"type": "object"}}],
+            "function_call": {"name": "w"}
+        }))
+        .unwrap();
+        let (mapped, legacy) = legacy_functions_as_tools(Cow::Borrowed(&req)).unwrap();
+        assert!(!mapped.extra.contains_key("functions"));
+        assert_eq!(mapped.extra["tools"][0]["function"]["name"], "w");
+        assert_eq!(mapped.extra["tool_choice"]["function"]["name"], "w");
+        let call_id = &mapped.messages[1].extra["tool_calls"][0]["id"];
+        assert_eq!(mapped.messages[2].role, Role::Tool);
+        assert_eq!(mapped.messages[2].tool_call_id.as_deref(), call_id.as_str());
+
+        let mut message = ChatMessage::assistant("");
+        message.extra.insert(
+            "tool_calls".into(),
+            json!([{"id": "t", "type": "function", "function": {"name": "w", "arguments": "{}"}}]),
+        );
+        let resp = legacy.reply(ChatResponse {
+            id: "r".into(),
+            model: "m".into(),
+            message,
+            finish_reason: FinishReason::ToolCalls,
+            logprobs: None,
+            more_choices: Vec::new(),
+            usage: crate::UsageStats::default(),
+            service_tier: None,
+        });
+        assert_eq!(resp.message.extra["function_call"]["name"], "w");
+        assert!(!resp.message.extra.contains_key("tool_calls"));
+        assert_eq!(
+            resp.finish_reason,
+            FinishReason::Other("function_call".into())
+        );
+    }
+
+    #[test]
+    fn null_legacy_fields_are_absent() {
+        let req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello", "function_call": null, "tool_calls": null},
+                {"role": "user", "content": "again"}
+            ],
+            "functions": null,
+            "function_call": null
+        }))
+        .unwrap();
+        let (mapped, legacy) = legacy_functions_as_tools(Cow::Borrowed(&req)).unwrap();
+        assert!(!mapped.extra.contains_key("functions"));
+        assert!(!mapped.extra.contains_key("function_call"));
+        assert!(!mapped.extra.contains_key("tools"));
+        assert!(!mapped.extra.contains_key("tool_choice"));
+        assert!(!mapped.messages[1].extra.contains_key("function_call"));
+        assert!(!legacy.legacy_reply);
+    }
+
+    #[test]
+    fn a_function_call_of_another_shape_is_refused() {
         let mut req = ChatFormat::new("m", vec![]);
-        assert!(reject_legacy_function_calling(&req).is_ok());
-        req.extra.insert("functions".into(), json!([]));
+        req.extra.insert("function_call".into(), json!(42));
         assert!(matches!(
-            reject_legacy_function_calling(&req),
-            Err(BridgeError::InvalidRequest(m)) if m.contains("tools")
+            legacy_functions_as_tools(Cow::Borrowed(&req)),
+            Err(BridgeError::InvalidRequest(m)) if m.contains("function_call")
         ));
     }
 

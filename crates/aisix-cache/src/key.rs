@@ -308,18 +308,19 @@ fn role_str(role: Role) -> &'static str {
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
+        Role::Function => "function",
     }
 }
 
-/// Convert an f32 in [0.0, 1.0]-ish range to a u32 in milli units.
+/// Convert an f64 in [0.0, 1.0]-ish range to a u32 in milli units.
 /// Saturates negatives at 0 and >65 at u32::MAX-ish; collisions on weird
 /// values are fine — the cache just doesn't help that request.
-fn quantise_milli(v: f32) -> u32 {
+fn quantise_milli(v: f64) -> u32 {
     if v.is_nan() || v.is_sign_negative() {
         return 0;
     }
     let scaled = v * 1_000.0;
-    if scaled > u32::MAX as f32 {
+    if scaled > f64::from(u32::MAX) {
         u32::MAX
     } else {
         scaled as u32
@@ -347,7 +348,7 @@ mod tests {
     }
     use super::*;
 
-    fn req(model: &str, messages: Vec<ChatMessage>, temp: Option<f32>) -> ChatFormat {
+    fn req(model: &str, messages: Vec<ChatMessage>, temp: Option<f64>) -> ChatFormat {
         let mut f = ChatFormat::new(model, messages);
         f.temperature = temp;
         f
@@ -578,11 +579,11 @@ mod tests {
 
     #[test]
     fn quantise_handles_pathological_floats() {
-        assert_eq!(quantise_milli(f32::NAN), 0);
+        assert_eq!(quantise_milli(f64::NAN), 0);
         assert_eq!(quantise_milli(-1.0), 0);
         assert_eq!(quantise_milli(0.0), 0);
         assert_eq!(quantise_milli(0.5), 500);
-        assert_eq!(quantise_milli(f32::INFINITY), u32::MAX);
+        assert_eq!(quantise_milli(f64::INFINITY), u32::MAX);
     }
 
     #[test]

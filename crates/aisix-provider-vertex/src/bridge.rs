@@ -23,6 +23,7 @@
 //!  locations/<region>/publishers/google/models/<model>:generateContent`
 
 use aisix_gateway::{
+    chat::ChatChoice,
     sse::{SseDecoder, SseEvent},
     structured_output::{
         apply_schema_limits, json_schema_from_response_format, response_into_fake_stream_chunks,
@@ -48,11 +49,10 @@ use aisix_gateway::content_part::{
     check_tool_result_parts, display_uri, translate_user_parts, Media, MediaSource,
 };
 use aisix_gateway::media_fetch::{fetch_media_urls, Encoding, FetchedMedia};
-use aisix_gateway::tool_calls::reject_legacy_function_calling;
 
 use crate::gemini_tools::{
-    function_call_parts, function_response_part, gemini_tool_config, gemini_tools,
-    tool_call_from_function_call, GeminiFunctionCall,
+    function_call_parts, function_response_part, gemini_2_5, gemini_3_or_newer, gemini_model_name,
+    gemini_tool_config, gemini_tools, tool_call_from_function_call, GeminiFunctionCall,
 };
 use crate::token_mint::{ServiceAccountKey, TokenMinter};
 use crate::wire;
@@ -80,7 +80,7 @@ use aisix_provider_anthropic::wire::{
 use aisix_provider_openai::wire::{
     build_request as build_openai_request, messages_from as openai_messages_from,
     response_into_chat_response as openai_response_into_chat_response,
-    stream_chunk_into_chat_chunk as openai_stream_chunk_into_chat_chunk, DeveloperRoleMode,
+    stream_chunk_into_chat_chunks as openai_stream_chunk_into_chat_chunks, DeveloperRoleMode,
     OpenAiResponse, OpenAiStreamChunk, ToolCallIndexer,
 };
 
@@ -740,8 +740,16 @@ impl Bridge for VertexBridge {
         };
 
         match publisher {
-            VertexPublisher::Google => self.chat_gemini(req, ctx, upstream_id).await,
-            VertexPublisher::Anthropic => self.chat_anthropic(req, ctx, upstream_id).await,
+            VertexPublisher::Google | VertexPublisher::Anthropic => {
+                // Gemini and Claude take tools, not the legacy fields.
+                let (req, legacy) = aisix_gateway::tool_calls::legacy_functions_as_tools(req)?;
+                let resp = if publisher == VertexPublisher::Google {
+                    self.chat_gemini(req, ctx, upstream_id).await
+                } else {
+                    self.chat_anthropic(req, ctx, upstream_id).await
+                };
+                resp.map(|resp| legacy.reply(resp))
+            }
             VertexPublisher::OpenAiCompat => self.chat_openai_shim(req, ctx, upstream_id).await,
             VertexPublisher::Mistral | VertexPublisher::Ai21 => {
                 self.chat_mistral_ai21(req, ctx, upstream_id, publisher)
@@ -777,6 +785,13 @@ impl Bridge for VertexBridge {
             VertexPublisher::Google => req,
             _ => aisix_gateway::tool_calls::chat_without_thought_signatures(req),
         };
+        // Gemini and Claude take tools, not the legacy fields.
+        let (req, legacy) = match publisher {
+            VertexPublisher::Google | VertexPublisher::Anthropic => {
+                aisix_gateway::tool_calls::legacy_functions_as_tools(req)?
+            }
+            _ => (req, Default::default()),
+        };
         // The Claude tool route's JSON only exists once the synthetic
         // tool call has been assembled, so it cannot be streamed as it
         // arrives. Run the request non-streaming and fake-stream the
@@ -797,9 +812,11 @@ impl Bridge for VertexBridge {
             let chunks = response_into_fake_stream_chunks(
                 self.chat_cow(req, &ctx.non_streaming_ctx()).await?,
             );
-            return Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))));
+            return Ok(
+                legacy.reply_stream(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+            );
         }
-        match publisher {
+        let stream = match publisher {
             VertexPublisher::Google => self.chat_gemini_stream(req, ctx, upstream_id).await,
             VertexPublisher::OpenAiCompat => {
                 self.chat_openai_shim_stream(req, ctx, upstream_id).await
@@ -809,7 +826,8 @@ impl Bridge for VertexBridge {
                 self.chat_mistral_ai21_stream(req, ctx, upstream_id, publisher)
                     .await
             }
-        }
+        };
+        stream.map(|stream| legacy.reply_stream(stream))
     }
 
     /// Native Vertex embeddings (#723): google-publisher `:predict`
@@ -823,6 +841,7 @@ impl Bridge for VertexBridge {
         req: &EmbeddingRequest,
         ctx: &BridgeContext,
     ) -> Result<EmbeddingResponse, BridgeError> {
+        req.require_text_input()?;
         let upstream_id = upstream_model(ctx)?;
         let creds = VertexSecret::parse(&ctx.provider_key.api_key)?;
         validate_url_token("project", &creds.project)?;
@@ -998,6 +1017,7 @@ impl VertexBridge {
         let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, gemini_needs_fetch).await?;
         let charged = fetched.charge(ctx);
         let ctx = &*charged;
+        let shared_request_type = gemini_shared_request_type(&req)?;
         let body = {
             let typed = build_gemini_request_with(&req, upstream_id, &fetched)?;
             // Serialize to JSON, then apply the per-ProviderKey override
@@ -1017,7 +1037,8 @@ impl VertexBridge {
         // via the in-process token minter from SA JSON. Failure
         // surfaces as a Config error (operator-actionable).
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        with_shared_request_type(&mut headers, shared_request_type);
         let client = self.client_for(ctx);
         let started = Instant::now();
 
@@ -1120,7 +1141,7 @@ impl VertexBridge {
             let (system, messages) = split_system_with(&req, urls, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
             let mut anthropic_req =
-                build_anthropic_request(&req, upstream_id, system, messages, false);
+                build_anthropic_request(&req, upstream_id, system, messages, false)?;
             apply_auto_prompt_caching(&mut anthropic_req, &ctx.model);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
@@ -1242,7 +1263,7 @@ impl VertexBridge {
             let (system, messages) = split_system_with(&req, urls, &fetched)
                 .map_err(|e| BridgeError::InvalidRequest(format!("{e}")))?;
             let mut anthropic_req =
-                build_anthropic_request(&req, upstream_id, system, messages, true);
+                build_anthropic_request(&req, upstream_id, system, messages, true)?;
             apply_auto_prompt_caching(&mut anthropic_req, &ctx.model);
             let mut body_value = serde_json::to_value(&anthropic_req).map_err(|e| {
                 BridgeError::Config(format!("serialize Anthropic request body: {e}"))
@@ -1517,7 +1538,7 @@ impl VertexBridge {
                                 &data,
                                 "vertex openai-shim stream chunk parse",
                             )?;
-                            if let Some(chunk) = openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                            for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
                                 yield chunk.with_fallback_service_tier(&header_tier);
                             }
                         }
@@ -1537,7 +1558,7 @@ impl VertexBridge {
                     &data,
                     "vertex openai-shim stream tail parse",
                 )?;
-                if let Some(chunk) = openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
                     yield chunk.with_fallback_service_tier(&header_tier);
                 }
             }
@@ -1760,7 +1781,7 @@ impl VertexBridge {
                                 &data,
                                 "vertex partner :streamRawPredict chunk parse",
                             )?;
-                            if let Some(chunk) = openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                            for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
                                 yield chunk.with_fallback_service_tier(&header_tier);
                             }
                         }
@@ -1778,7 +1799,7 @@ impl VertexBridge {
                     &data,
                     "vertex partner :streamRawPredict tail parse",
                 )?;
-                if let Some(chunk) = openai_stream_chunk_into_chat_chunk(parsed, &mut tool_call_indexer) {
+                for chunk in openai_stream_chunk_into_chat_chunks(parsed, &mut tool_call_indexer) {
                     yield chunk.with_fallback_service_tier(&header_tier);
                 }
             }
@@ -1840,6 +1861,7 @@ impl VertexBridge {
         let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, gemini_needs_fetch).await?;
         let charged = fetched.charge(ctx);
         let ctx = &*charged;
+        let shared_request_type = gemini_shared_request_type(&req)?;
         let body = {
             let typed = build_gemini_request_with(&req, upstream_id, &fetched)?;
             // Serialize + apply the per-ProviderKey override pipeline (#339)
@@ -1856,7 +1878,8 @@ impl VertexBridge {
         // entering the stream future so token-mint errors surface
         // as a direct Err return rather than being yielded mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        let mut headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
+        with_shared_request_type(&mut headers, shared_request_type);
         let client = self.client_for(ctx);
         let started = Instant::now();
 
@@ -1940,62 +1963,47 @@ impl VertexBridge {
 /// What one Gemini stream remembers across its chunks.
 #[derive(Default)]
 struct GeminiStreamState {
-    /// The assistant role chunk has gone out.
-    emitted_role: bool,
-    /// Tool calls emitted so far — the next call's `index`.
-    tool_calls: usize,
+    /// Per choice: the assistant role chunk has gone out, and the tool
+    /// calls emitted so far — the next call's `index`.
+    choices: std::collections::BTreeMap<u32, GeminiStreamChoice>,
     /// The last tier the stream reported, stamped on every chunk.
     service_tier: Option<ServiceTier>,
 }
 
+#[derive(Default)]
+struct GeminiStreamChoice {
+    emitted_role: bool,
+    tool_calls: usize,
+}
+
+impl GeminiStreamState {
+    fn choice(&mut self, index: u32) -> &mut GeminiStreamChoice {
+        self.choices.entry(index).or_default()
+    }
+}
+
 /// Translate one Gemini stream chunk into the gateway's
-/// [`ChatChunk`] sequence. Returns up to TWO chunks per upstream
-/// chunk:
+/// [`ChatChunk`] sequence. Every candidate (`n > 1` streams several per
+/// frame, keyed by `index`) yields up to TWO chunks for its choice:
 ///
-/// 1. **Role chunk** (only on the first emission carrying text or a
-///    tool call) — sets `delta.role = Role::Assistant` so downstream
+/// 1. **Role chunk** (only on the choice's first emission carrying text
+///    or a tool call) — sets `delta.role = Role::Assistant` so downstream
 ///    consumers know this is an assistant turn. Mirrors OpenAI's
 ///    "first-chunk-is-role" wire convention.
-/// 2. **Content / terminal chunk** — carries the text delta, any
-///    `functionCall` parts as complete `tool_calls` deltas (Gemini
-///    streams each call whole, never split across chunks; each gets the
-///    next `index` of the stream), and, on the final upstream chunk, the
-///    `finish_reason` + `usage` populated from `finishReason` +
-///    `usageMetadata`.
+/// 2. **Content / terminal chunk** — carries the text delta, its
+///    `logprobs`, any `functionCall` parts as complete `tool_calls` deltas
+///    (Gemini streams each call whole, never split across chunks; each gets
+///    the next `index` of its choice), and, on the final upstream chunk, the
+///    `finish_reason` populated from `finishReason`.
 ///
-/// Returns 0 chunks if the upstream chunk had no candidates AND no
-/// usage metadata (which would be an empty keep-alive — Gemini
-/// doesn't emit those today, but the no-op is the safe response).
+/// The frame's usage rides its last chunk. A frame with no candidate
+/// still reports its usage, and a blocked prompt — feedback and no
+/// candidate — finishes choice 0 as `content_filter`.
 fn gemini_chunk_into_chat_chunks(
-    raw: GeminiGenerateContentResponse,
+    mut raw: GeminiGenerateContentResponse,
     upstream_id: &str,
     state: &mut GeminiStreamState,
 ) -> Vec<ChatChunk> {
-    let first_candidate = raw.candidates.into_iter().next();
-    let (text, tool_calls, finish_reason_raw) = match first_candidate {
-        Some(c) => {
-            let (text, tool_calls) = c.content.map(gemini_parts_into_message).unwrap_or_default();
-            (text, tool_calls, c.finish_reason)
-        }
-        None => (String::new(), Vec::new(), None),
-    };
-    // Distinguish "no finishReason field" from "finishReason: STOP".
-    // The non-stream path collapses both to FinishReason::Stop (since
-    // ChatResponse always carries a finish_reason); on the stream
-    // path we only attach finish_reason when upstream explicitly set
-    // one, otherwise downstream consumers assume "stream still going".
-    //
-    // Gemini ends a tool-calling turn with `STOP`, often on a later
-    // chunk than the calls; a stream that called tools finishes as
-    // `tool_calls`, like the non-stream response.
-    let finish_reason = finish_reason_raw.as_deref().map(|s| {
-        if !tool_calls.is_empty() || state.tool_calls > 0 {
-            finish_with_tool_calls(Some(s))
-        } else {
-            map_gemini_finish_reason(Some(s))
-        }
-    });
-
     // Vertex stamps `usageMetadata` on every frame but fills the counters
     // only on the last; the earlier ones carry `trafficType` alone. Such a
     // frame is not a usage report: read as one, its missing
@@ -2007,58 +2015,110 @@ fn gemini_chunk_into_chat_chunks(
     {
         state.service_tier = Some(tier);
     }
-    let usage = raw
+    let blocked = raw.prompt_blocked();
+    let candidates = raw.indexed_candidates();
+    let mut usage = raw
         .usage_metadata
         .filter(GeminiUsageMetadata::reports_counts)
         .map(GeminiUsageMetadata::into_usage_stats);
 
-    let mut chunks = Vec::with_capacity(2);
+    let chunk = |choice_index: u32, delta: ChatDelta, state: &GeminiStreamState| ChatChunk {
+        choice_index,
+        logprobs: None,
+        id: String::new(),
+        model: upstream_id.to_string(),
+        delta,
+        finish_reason: None,
+        usage: None,
+        service_tier: state.service_tier.clone(),
+        accounting_usage: None,
+    };
+    let role = || ChatDelta {
+        role: Some(Role::Assistant),
+        ..Default::default()
+    };
 
-    // Role-setting chunk on first content emission.
-    if !state.emitted_role && (!text.is_empty() || !tool_calls.is_empty()) {
-        state.emitted_role = true;
-        chunks.push(ChatChunk {
-            id: String::new(),
-            model: upstream_id.to_string(),
-            delta: ChatDelta {
-                role: Some(Role::Assistant),
-                ..Default::default()
-            },
-            finish_reason: None,
-            usage: None,
-            service_tier: state.service_tier.clone(),
-            accounting_usage: None,
-        });
+    let mut chunks = Vec::with_capacity(2 * candidates.len().max(1));
+    if candidates.is_empty() && (blocked || usage.is_some()) {
+        let mut terminal = chunk(0, ChatDelta::default(), state);
+        if blocked {
+            let choice = state.choice(0);
+            if !choice.emitted_role {
+                choice.emitted_role = true;
+                terminal.delta = role();
+            }
+            terminal.finish_reason = Some(FinishReason::ContentFilter);
+        }
+        terminal.usage = usage.take();
+        chunks.push(terminal);
+        return chunks;
     }
-
-    let tool_calls: Vec<serde_json::Value> = tool_calls
-        .into_iter()
-        .map(|mut call| {
-            call["index"] = state.tool_calls.into();
-            state.tool_calls += 1;
-            call
-        })
-        .collect();
-
-    // Content / terminal chunk — emit when there's text, a tool call,
-    // a finishReason OR usage, so the terminal-state chunk lands even
-    // when its content is empty.
-    if !text.is_empty() || !tool_calls.is_empty() || finish_reason.is_some() || usage.is_some() {
-        chunks.push(ChatChunk {
-            id: String::new(),
-            model: upstream_id.to_string(),
-            delta: ChatDelta {
-                content: (!text.is_empty()).then_some(text),
-                tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
-                ..Default::default()
-            },
-            finish_reason,
-            usage,
-            service_tier: state.service_tier.clone(),
-            accounting_usage: None,
+    for (index, c) in candidates {
+        let logprobs = gemini_logprobs(c.logprobs_result.as_ref());
+        let (text, tool_calls) = c.content.map(gemini_parts_into_message).unwrap_or_default();
+        // Distinguish "no finishReason field" from "finishReason: STOP".
+        // The non-stream path collapses both to FinishReason::Stop (since
+        // ChatResponse always carries a finish_reason); on the stream
+        // path we only attach finish_reason when upstream explicitly set
+        // one, otherwise downstream consumers assume "stream still going".
+        //
+        // Gemini ends a tool-calling turn with `STOP`, often on a later
+        // chunk than the calls; a choice that called tools finishes as
+        // `tool_calls`, like the non-stream response.
+        let choice = state.choice(index);
+        let finish_reason = c.finish_reason.as_deref().map(|s| {
+            if !tool_calls.is_empty() || choice.tool_calls > 0 {
+                finish_with_tool_calls(Some(s))
+            } else {
+                map_gemini_finish_reason(Some(s))
+            }
         });
+        let emit_role = !choice.emitted_role && (!text.is_empty() || !tool_calls.is_empty());
+        if emit_role {
+            choice.emitted_role = true;
+        }
+        let tool_calls: Vec<serde_json::Value> = tool_calls
+            .into_iter()
+            .map(|mut call| {
+                call["index"] = choice.tool_calls.into();
+                choice.tool_calls += 1;
+                call
+            })
+            .collect();
+        if emit_role {
+            chunks.push(chunk(index, role(), state));
+        }
+        // Content / terminal chunk — emit when there's text, a tool call,
+        // logprobs or a finishReason, so the terminal-state chunk lands
+        // even when its content is empty.
+        if !text.is_empty()
+            || !tool_calls.is_empty()
+            || logprobs.is_some()
+            || finish_reason.is_some()
+        {
+            let mut content = chunk(
+                index,
+                ChatDelta {
+                    content: (!text.is_empty()).then_some(text),
+                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                    ..Default::default()
+                },
+                state,
+            );
+            content.finish_reason = finish_reason;
+            content.logprobs = logprobs;
+            chunks.push(content);
+        }
     }
-
+    if let Some(usage) = usage {
+        match chunks.last_mut() {
+            Some(last) => last.usage = Some(usage),
+            None => chunks.push(ChatChunk {
+                usage: Some(usage),
+                ..chunk(0, ChatDelta::default(), state)
+            }),
+        }
+    }
     chunks
 }
 
@@ -2127,6 +2187,38 @@ fn build_request_headers(
     headers.insert(HeaderName::from_static("x-aisix-request-id"), rid);
     apply_request_headers(&mut headers, hdr);
     Ok(headers)
+}
+
+/// OpenAI's `service_tier` as the Vertex header that picks a PayGo tier:
+/// `flex` and `priority` are its `X-Vertex-AI-LLM-Shared-Request-Type`
+/// values, per
+/// <https://cloud.google.com/vertex-ai/generative-ai/docs/flex-paygo> and
+/// <https://cloud.google.com/vertex-ai/generative-ai/docs/priority-paygo>.
+/// Vertex has no request setting for `auto`, `default` or `scale`.
+fn gemini_shared_request_type(req: &ChatFormat) -> Result<Option<&'static str>, BridgeError> {
+    match req.extra.get("service_tier") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(tier)) => Ok(match tier.as_str() {
+            "flex" => Some("flex"),
+            "priority" => Some("priority"),
+            _ => None,
+        }),
+        Some(_) => Err(BridgeError::InvalidRequest(
+            "service_tier must be a string".into(),
+        )),
+    }
+}
+
+/// Set the tier header, unless the provider key's `default_headers` or a
+/// forwarded client header already names one.
+fn with_shared_request_type(headers: &mut HeaderMap, tier: Option<&'static str>) {
+    if let Some(tier) = tier {
+        headers
+            .entry(HeaderName::from_static(
+                "x-vertex-ai-llm-shared-request-type",
+            ))
+            .or_insert(HeaderValue::from_static(tier));
+    }
 }
 
 /// The wire bytes of an outbound body. Called where the `Value` is a
@@ -2217,14 +2309,40 @@ impl GeminiPart {
     }
 }
 
-#[derive(Debug, Serialize, Default)]
+/// Gemini's `GenerationConfig`, per
+/// <https://cloud.google.com/vertex-ai/generative-ai/docs/reference/rest/v1/GenerationConfig>.
+/// The caller's values go in as sent; Vertex answers for the ones it
+/// refuses.
+#[derive(Debug, Serialize, Default, PartialEq)]
 struct GeminiGenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "topP")]
-    top_p: Option<f32>,
+    top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "topK")]
+    top_k: Option<u64>,
+    /// `max_completion_tokens`, else `max_tokens`.
     #[serde(skip_serializing_if = "Option::is_none", rename = "maxOutputTokens")]
-    max_output_tokens: Option<u32>,
+    max_output_tokens: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "stopSequences")]
+    stop_sequences: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "presencePenalty")]
+    presence_penalty: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "frequencyPenalty")]
+    frequency_penalty: Option<serde_json::Value>,
+    /// OpenAI `n`.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "candidateCount")]
+    candidate_count: Option<serde_json::Value>,
+    /// OpenAI `logprobs`.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "responseLogprobs")]
+    response_logprobs: Option<serde_json::Value>,
+    /// OpenAI `top_logprobs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingConfig")]
+    thinking_config: Option<serde_json::Value>,
     /// Gemini's constrained-decoding switch. `"application/json"` is the
     /// only value this bridge sets; without it neither schema field has
     /// any effect.
@@ -2267,21 +2385,108 @@ enum GeminiJsonOutput {
 /// is the older OpenAPI-derived subset every generation accepts. An
 /// unrecognisable model name therefore falls back to `responseSchema`,
 /// the one that works everywhere.
-fn gemini_json_output(req: &ChatFormat, upstream_model: &str) -> GeminiJsonOutput {
-    let Some(response_format) = req.extra.get("response_format") else {
-        return GeminiJsonOutput::None;
+///
+/// A `response_format` that is not an OpenAI one — not an object, or a
+/// `type` other than `text` / `json_object` / `json_schema` — is refused.
+fn gemini_json_output(
+    req: &ChatFormat,
+    upstream_model: &str,
+) -> Result<GeminiJsonOutput, BridgeError> {
+    let response_format = match req.extra.get("response_format") {
+        None | Some(serde_json::Value::Null) => return Ok(GeminiJsonOutput::None),
+        Some(rf @ serde_json::Value::Object(_)) => rf,
+        Some(_) => {
+            return Err(BridgeError::InvalidRequest(
+                "response_format must be an object".into(),
+            ))
+        }
     };
-    let Some(schema) = json_schema_from_response_format(response_format) else {
-        return match response_format.get("type").and_then(|t| t.as_str()) {
-            Some("json_object") => GeminiJsonOutput::MimeOnly,
-            _ => GeminiJsonOutput::None,
-        };
-    };
-    if gemini_major_version(upstream_model).is_some_and(|major| major >= 2) {
-        GeminiJsonOutput::JsonSchema(schema)
-    } else {
-        GeminiJsonOutput::OpenApiSchema(gemini_openapi_schema(&schema))
+    match response_format.get("type").and_then(|t| t.as_str()) {
+        Some("text") => return Ok(GeminiJsonOutput::None),
+        Some("json_object") => return Ok(GeminiJsonOutput::MimeOnly),
+        Some("json_schema") => {}
+        _ => {
+            return Err(BridgeError::InvalidRequest(
+                "response_format.type must be \"text\", \"json_object\" or \"json_schema\"".into(),
+            ))
+        }
     }
+    let Some(schema) = json_schema_from_response_format(response_format) else {
+        return Ok(GeminiJsonOutput::None);
+    };
+    Ok(
+        if gemini_major_version(upstream_model).is_some_and(|major| major >= 2) {
+            GeminiJsonOutput::JsonSchema(schema)
+        } else {
+            GeminiJsonOutput::OpenApiSchema(gemini_openapi_schema(&schema))
+        },
+    )
+}
+
+/// OpenAI's `stop` (a string or an array of strings) as Gemini's
+/// `stopSequences`, which takes an array only.
+fn gemini_stop_sequences(req: &ChatFormat) -> Result<Option<serde_json::Value>, BridgeError> {
+    match req.extra.get("stop") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(serde_json::json!([s]))),
+        Some(serde_json::Value::Array(items)) if items.iter().all(|i| i.is_string()) => {
+            Ok(Some(serde_json::Value::Array(items.clone())))
+        }
+        Some(_) => Err(BridgeError::InvalidRequest(
+            "stop must be a string or an array of strings".into(),
+        )),
+    }
+}
+
+/// `reasoning_effort` (and a `/v1/messages` caller's exact thinking
+/// budget) as Gemini's `thinkingConfig`.
+///
+/// Gemini 3 and later take a `thinkingLevel`; `minimal` / `low` / `medium` /
+/// `high` go there as sent, and a model that lacks the level answers for
+/// it. Gemini 2.5 takes a `thinkingBudget`: the caller's exact budget when
+/// there is one, else the tier through the table Google publishes for its
+/// OpenAI-compatible endpoint
+/// (<https://ai.google.dev/gemini-api/docs/openai#thinking>: minimal and low
+/// 1,024, medium 8,192, high 24,576), and `none` as a budget of 0 on the
+/// models that can turn thinking off — 2.5 Flash and Flash-Lite, not 2.5 Pro
+/// (<https://cloud.google.com/vertex-ai/generative-ai/docs/thinking>).
+/// A tier the model has no setting for, and every tier on an older model,
+/// is dropped.
+fn gemini_thinking_config(
+    req: &ChatFormat,
+    upstream_model: &str,
+) -> Result<Option<serde_json::Value>, BridgeError> {
+    let effort = match req.extra.get("reasoning_effort") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(effort)) => Some(effort.as_str()),
+        Some(_) => {
+            return Err(BridgeError::InvalidRequest(
+                "reasoning_effort must be a string".into(),
+            ))
+        }
+    };
+    if gemini_3_or_newer(upstream_model) {
+        let level = match effort {
+            Some("minimal") => "MINIMAL",
+            Some("low") => "LOW",
+            Some("medium") => "MEDIUM",
+            Some("high") => "HIGH",
+            _ => return Ok(None),
+        };
+        return Ok(Some(serde_json::json!({ "thinkingLevel": level })));
+    }
+    if !gemini_2_5(upstream_model) {
+        return Ok(None);
+    }
+    let budget = match (req.thinking_budget_tokens, effort) {
+        (Some(budget), _) => budget,
+        (None, Some("minimal" | "low")) => 1024,
+        (None, Some("medium")) => 8192,
+        (None, Some("high")) => 24576,
+        (None, Some("none")) if !gemini_model_name(upstream_model).contains("-pro") => 0,
+        _ => return Ok(None),
+    };
+    Ok(Some(serde_json::json!({ "thinkingBudget": budget })))
 }
 
 /// Read the generation off a Gemini model name: `2` from
@@ -2480,18 +2685,21 @@ fn build_gemini_request(
 ///   `functionResponse` parts, as Gemini pairs a turn's calls with the
 ///   next turn's responses — see [`crate::gemini_tools`]
 /// - `tools` → `tools[].functionDeclarations`, `tool_choice` →
-///   `toolConfig.functionCallingConfig`
-/// - `temperature`, `top_p`, `max_tokens` → `generationConfig.*`
+///   `toolConfig.functionCallingConfig` (the legacy `functions` /
+///   `function_call` arrive here already rewritten as tools, by
+///   [`aisix_gateway::tool_calls::legacy_functions_as_tools`])
+/// - `temperature`, `top_p`, `top_k`, `max_completion_tokens` /
+///   `max_tokens`, `stop`, `seed`, the penalties, `n`, `logprobs` /
+///   `top_logprobs` and `reasoning_effort` → their `generationConfig`
+///   slots (see [`GeminiGenerationConfig`], [`gemini_thinking_config`])
 /// - `response_format` → `generationConfig.responseMimeType` plus the
 ///   schema field this model's generation reads — see
-///   [`gemini_json_output`]. Every other `extra` field is dropped: this
-///   body carries only the fields named on the struct, so an OpenAI-only
-///   knob can never ride onto the wire and 400.
+///   [`gemini_json_output`]. Every other `extra` field has no slot in this
+///   body and is dropped.
 ///
-/// Fails (400) on what this translation cannot express rather than
-/// dropping it: the legacy `functions` / `function_call` fields, a
-/// non-function tool, an unsupported `tool_choice`, a tool result with no
-/// call to answer, or call arguments that are not JSON.
+/// Fails (400) on a value OpenAI's own contract forbids, naming the field,
+/// and on what this translation cannot express: a hosted tool, a tool
+/// result with no call to answer, or call arguments that are not JSON.
 ///
 /// `fetched` holds the media URLs the gateway downloaded for Gemini.
 fn build_gemini_request_with(
@@ -2499,7 +2707,6 @@ fn build_gemini_request_with(
     upstream_model: &str,
     fetched: &FetchedMedia,
 ) -> Result<GeminiGenerateContentRequest, BridgeError> {
-    reject_legacy_function_calling(req)?;
     let mut system_parts: Vec<String> = Vec::new();
     let mut contents: Vec<GeminiContent> = Vec::new();
     let mut tool_responses: Vec<GeminiPart> = Vec::new();
@@ -2522,7 +2729,7 @@ fn build_gemini_request_with(
                 role: "user",
                 parts: gemini_user_parts(m, index, fetched)?,
             }),
-            Role::Tool => {
+            Role::Tool | Role::Function => {
                 check_tool_result_parts(m, index).map_err(BridgeError::InvalidRequest)?;
                 tool_responses.push(GeminiPart::Raw(function_response_part(
                     m,
@@ -2584,22 +2791,19 @@ fn build_gemini_request_with(
         })
     };
     let tools = match req.extra.get("tools") {
-        Some(tools) => gemini_tools(tools)?,
+        Some(tools) => gemini_tools(tools, upstream_model)?,
         None => None,
     };
-    // A calling mode with nothing to call is meaningless; the choice is
-    // dropped with the (absent) tools.
-    let tool_config = match (&tools, req.extra.get("tool_choice")) {
-        (Some(_), Some(choice)) => gemini_tool_config(choice)?,
-        _ => None,
-    };
-    let json_output = gemini_json_output(req, upstream_model);
-    let generation_config = if req.temperature.is_some()
-        || req.top_p.is_some()
-        || req.max_tokens.is_some()
-        || json_output != GeminiJsonOutput::None
-    {
-        let (response_mime_type, response_json_schema, response_schema) = match json_output {
+    // Checked even when no tool is sent, so an illegal choice is refused
+    // the same way on every request. A calling mode with nothing to call
+    // is meaningless; the choice is dropped with the (absent) tools.
+    let tool_config = match req.extra.get("tool_choice") {
+        Some(choice) => gemini_tool_config(choice)?,
+        None => None,
+    }
+    .filter(|_| tools.is_some());
+    let (response_mime_type, response_json_schema, response_schema) =
+        match gemini_json_output(req, upstream_model)? {
             GeminiJsonOutput::None => (None, None, None),
             GeminiJsonOutput::MimeOnly => (Some(GEMINI_JSON_MIME_TYPE), None, None),
             GeminiJsonOutput::JsonSchema(schema) => {
@@ -2609,17 +2813,26 @@ fn build_gemini_request_with(
                 (Some(GEMINI_JSON_MIME_TYPE), None, Some(schema))
             }
         };
-        Some(GeminiGenerationConfig {
-            temperature: req.temperature,
-            top_p: req.top_p,
-            max_output_tokens: req.max_tokens,
-            response_mime_type,
-            response_json_schema,
-            response_schema,
-        })
-    } else {
-        None
+    let extra = |key: &str| req.extra.get(key).filter(|v| !v.is_null()).cloned();
+    let config = GeminiGenerationConfig {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        top_k: req.top_k,
+        max_output_tokens: extra("max_completion_tokens")
+            .or_else(|| req.max_tokens.map(Into::into)),
+        stop_sequences: gemini_stop_sequences(req)?,
+        seed: extra("seed"),
+        presence_penalty: extra("presence_penalty"),
+        frequency_penalty: extra("frequency_penalty"),
+        candidate_count: extra("n"),
+        response_logprobs: extra("logprobs"),
+        logprobs: extra("top_logprobs"),
+        thinking_config: gemini_thinking_config(req, upstream_model)?,
+        response_mime_type,
+        response_json_schema,
+        response_schema,
     };
+    let generation_config = (config != GeminiGenerationConfig::default()).then_some(config);
     Ok(GeminiGenerateContentRequest {
         contents,
         system_instruction,
@@ -2636,13 +2849,92 @@ struct GeminiGenerateContentResponse {
     candidates: Vec<GeminiCandidate>,
     #[serde(default, rename = "usageMetadata")]
     usage_metadata: Option<GeminiUsageMetadata>,
+    /// Set, with no candidates, when the prompt itself was blocked.
+    #[serde(default, rename = "promptFeedback")]
+    prompt_feedback: Option<GeminiPromptFeedback>,
+}
+
+impl GeminiGenerateContentResponse {
+    fn prompt_blocked(&self) -> bool {
+        self.prompt_feedback
+            .as_ref()
+            .is_some_and(|f| f.block_reason.is_some())
+    }
+
+    /// The candidates keyed by their `index`, in choice order.
+    fn indexed_candidates(&mut self) -> Vec<(u32, GeminiCandidate)> {
+        // Proto3 JSON omits a zero `index`, so where any candidate names
+        // one, an unnamed candidate is choice 0.
+        let indexed = self.candidates.iter().any(|c| c.index.is_some());
+        let mut candidates: Vec<(u32, GeminiCandidate)> = std::mem::take(&mut self.candidates)
+            .into_iter()
+            .enumerate()
+            .map(|(position, c)| {
+                let fallback = if indexed { 0 } else { position as u32 };
+                (c.index.unwrap_or(fallback), c)
+            })
+            .collect();
+        candidates.sort_by_key(|(index, _)| *index);
+        candidates
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiPromptFeedback {
+    #[serde(default, rename = "blockReason")]
+    block_reason: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct GeminiCandidate {
+    #[serde(default)]
+    index: Option<u32>,
     content: Option<GeminiResponseContent>,
     #[serde(default, rename = "finishReason")]
     finish_reason: Option<String>,
+    #[serde(default, rename = "logprobsResult")]
+    logprobs_result: Option<serde_json::Value>,
+}
+
+/// Gemini's `logprobsResult` in OpenAI's `logprobs` shape: one `content`
+/// entry per chosen token, carrying that position's top candidates.
+fn gemini_logprobs(result: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    fn entry(candidate: &serde_json::Value) -> serde_json::Value {
+        let token = candidate
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        serde_json::json!({
+            "token": token,
+            // Proto3 JSON omits a zero float: a certain token has no
+            // `logProbability`.
+            "logprob": candidate.get("logProbability").cloned().unwrap_or(0.0.into()),
+            "bytes": token.as_bytes(),
+        })
+    }
+    let result = result?;
+    let chosen = result.get("chosenCandidates")?.as_array()?;
+    let top = result
+        .get("topCandidates")
+        .and_then(serde_json::Value::as_array);
+    let content: Vec<serde_json::Value> = chosen
+        .iter()
+        .enumerate()
+        .map(|(i, candidate)| {
+            let mut out = entry(candidate);
+            let top_logprobs: Vec<serde_json::Value> = top
+                .and_then(|top| top.get(i))
+                .and_then(|t| t.get("candidates"))
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(entry)
+                .collect();
+            out["top_logprobs"] = top_logprobs.into();
+            out
+        })
+        .collect();
+    Some(serde_json::json!({ "content": content }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2805,33 +3097,34 @@ impl GeminiUsageMetadata {
     }
 }
 
-/// Translate Gemini's response into the gateway's [`ChatResponse`].
+/// Translate Gemini's response into the gateway's [`ChatResponse`]: the
+/// first candidate is the message, every other one a further choice.
 fn gemini_response_into_chat_response(
-    raw: GeminiGenerateContentResponse,
+    mut raw: GeminiGenerateContentResponse,
     upstream_id: &str,
 ) -> ChatResponse {
-    let first = raw.candidates.into_iter().next();
-    let (message, finish) = match first {
-        Some(c) => {
-            let (text, tool_calls) = c.content.map(gemini_parts_into_message).unwrap_or_default();
-            if tool_calls.is_empty() {
-                (
-                    ChatMessage::assistant(text),
-                    map_gemini_finish_reason(c.finish_reason.as_deref()),
-                )
-            } else {
-                let mut message = ChatMessage::assistant(text);
-                if message.content.as_deref() == Some("") {
-                    message.content = None;
-                }
-                message
-                    .extra
-                    .insert("tool_calls".into(), serde_json::Value::Array(tool_calls));
-                (message, finish_with_tool_calls(c.finish_reason.as_deref()))
-            }
+    let mut choices = raw
+        .indexed_candidates()
+        .into_iter()
+        .map(|(index, c)| gemini_candidate_into_choice(index, c))
+        .peekable();
+    let first = choices.next_if(|c| c.index == 0).unwrap_or_else(|| {
+        // A blocked prompt is answered with feedback and no candidate.
+        let mut message = ChatMessage::assistant("");
+        let finish_reason = if raw.prompt_blocked() {
+            message.content = None;
+            FinishReason::ContentFilter
+        } else {
+            FinishReason::Stop
+        };
+        ChatChoice {
+            index: 0,
+            message,
+            finish_reason,
+            logprobs: None,
         }
-        None => (ChatMessage::assistant(""), FinishReason::Stop),
-    };
+    });
+    let more_choices = choices.collect();
     let service_tier = raw
         .usage_metadata
         .as_ref()
@@ -2841,12 +3134,37 @@ fn gemini_response_into_chat_response(
         .map(GeminiUsageMetadata::into_usage_stats)
         .unwrap_or_default();
     ChatResponse {
+        logprobs: first.logprobs,
+        more_choices,
         id: String::new(), // Gemini doesn't return a request id in the body
         model: upstream_id.to_string(),
-        message,
-        finish_reason: finish,
+        message: first.message,
+        finish_reason: first.finish_reason,
         usage,
         service_tier,
+    }
+}
+
+fn gemini_candidate_into_choice(index: u32, c: GeminiCandidate) -> ChatChoice {
+    let logprobs = gemini_logprobs(c.logprobs_result.as_ref());
+    let (text, tool_calls) = c.content.map(gemini_parts_into_message).unwrap_or_default();
+    let mut message = ChatMessage::assistant(text);
+    let finish_reason = if tool_calls.is_empty() {
+        map_gemini_finish_reason(c.finish_reason.as_deref())
+    } else {
+        if message.content.as_deref() == Some("") {
+            message.content = None;
+        }
+        message
+            .extra
+            .insert("tool_calls".into(), serde_json::Value::Array(tool_calls));
+        finish_with_tool_calls(c.finish_reason.as_deref())
+    };
+    ChatChoice {
+        index,
+        message,
+        finish_reason,
+        logprobs,
     }
 }
 
@@ -3524,7 +3842,297 @@ mod tests {
         let gc = body.generation_config.as_ref().unwrap();
         assert_eq!(gc.temperature, Some(0.7));
         assert_eq!(gc.top_p, Some(0.9));
-        assert_eq!(gc.max_output_tokens, Some(100));
+        assert_eq!(gc.max_output_tokens, Some(100.into()));
+    }
+
+    fn gemini_body(extra: serde_json::Value, model: &str) -> serde_json::Value {
+        let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        req.extra = extra.as_object().unwrap().clone();
+        serde_json::to_value(build_gemini_request(&req, model).unwrap()).unwrap()
+    }
+
+    fn gemini_refusal(extra: serde_json::Value) -> String {
+        let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        req.extra = extra.as_object().unwrap().clone();
+        match build_gemini_request(&req, "gemini-2.5-flash") {
+            Err(BridgeError::InvalidRequest(m)) => m,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_sampling_fields_reach_their_generation_config_slots() {
+        let body = gemini_body(
+            serde_json::json!({
+                "max_tokens": 10, "max_completion_tokens": 20, "stop": "END", "seed": 7,
+                "presence_penalty": 0.5, "frequency_penalty": -0.25, "n": 2,
+                "logprobs": true, "top_logprobs": 3, "top_k": 9,
+            }),
+            "gemini-2.5-flash",
+        );
+        assert_eq!(
+            body["generationConfig"],
+            serde_json::json!({
+                "maxOutputTokens": 20, "stopSequences": ["END"], "seed": 7,
+                "presencePenalty": 0.5, "frequencyPenalty": -0.25, "candidateCount": 2,
+                "responseLogprobs": true, "logprobs": 3,
+            })
+        );
+        assert_eq!(
+            gemini_body(serde_json::json!({"stop": ["a", "b"]}), "gemini-2.5-flash")
+                ["generationConfig"]["stopSequences"],
+            serde_json::json!(["a", "b"])
+        );
+        // `top_k` reaches Gemini from a `/v1/messages` caller.
+        let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        req.top_k = Some(40);
+        let body =
+            serde_json::to_value(build_gemini_request(&req, "gemini-2.5-flash").unwrap()).unwrap();
+        assert_eq!(body["generationConfig"], serde_json::json!({"topK": 40}));
+    }
+
+    #[test]
+    fn reasoning_effort_becomes_each_generation_s_thinking_setting() {
+        let thinking = |effort: &str, model: &str| {
+            gemini_body(serde_json::json!({"reasoning_effort": effort}), model)
+                .pointer("/generationConfig/thinkingConfig")
+                .cloned()
+        };
+        for (effort, level) in [
+            ("minimal", "MINIMAL"),
+            ("low", "LOW"),
+            ("medium", "MEDIUM"),
+            ("high", "HIGH"),
+        ] {
+            assert_eq!(
+                thinking(effort, "gemini-3-flash-preview"),
+                Some(serde_json::json!({"thinkingLevel": level}))
+            );
+        }
+        assert_eq!(thinking("none", "gemini-3-pro-preview"), None);
+        for (effort, budget) in [
+            ("minimal", 1024),
+            ("low", 1024),
+            ("medium", 8192),
+            ("high", 24576),
+        ] {
+            assert_eq!(
+                thinking(effort, "gemini-2.5-pro"),
+                Some(serde_json::json!({"thinkingBudget": budget}))
+            );
+        }
+        assert_eq!(
+            thinking("none", "gemini-2.5-flash"),
+            Some(serde_json::json!({"thinkingBudget": 0}))
+        );
+        assert_eq!(
+            thinking("none", "gemini-2.5-flash-lite"),
+            Some(serde_json::json!({"thinkingBudget": 0}))
+        );
+        // 2.5 Pro cannot turn thinking off.
+        assert_eq!(thinking("none", "gemini-2.5-pro"), None);
+        assert_eq!(thinking("high", "gemini-2.0-flash"), None);
+
+        // A `/v1/messages` caller's exact budget wins over its bucketed tier.
+        let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        req.extra
+            .insert("reasoning_effort".into(), serde_json::json!("medium"));
+        req.thinking_budget_tokens = Some(3000);
+        let body =
+            serde_json::to_value(build_gemini_request(&req, "gemini-2.5-flash").unwrap()).unwrap();
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            serde_json::json!({"thinkingBudget": 3000})
+        );
+    }
+
+    #[test]
+    fn values_openai_forbids_are_refused_naming_the_field() {
+        assert_eq!(
+            gemini_refusal(serde_json::json!({"stop": 3})),
+            "stop must be a string or an array of strings"
+        );
+        assert_eq!(
+            gemini_refusal(serde_json::json!({"reasoning_effort": 1})),
+            "reasoning_effort must be a string"
+        );
+        assert_eq!(
+            gemini_refusal(serde_json::json!({"response_format": "json"})),
+            "response_format must be an object"
+        );
+        assert_eq!(
+            gemini_refusal(serde_json::json!({"response_format": {"type": "yaml"}})),
+            "response_format.type must be \"text\", \"json_object\" or \"json_schema\""
+        );
+        assert_eq!(
+            gemini_refusal(serde_json::json!({"tools": {"type": "function"}})),
+            "tools must be an array"
+        );
+        // Refused even with no tools to choose from.
+        assert!(gemini_refusal(serde_json::json!({"tool_choice": false}))
+            .starts_with("tool_choice must be"));
+        let mut req = ChatFormat::new("m", vec![]);
+        req.extra
+            .insert("service_tier".into(), serde_json::json!(1));
+        assert!(matches!(
+            gemini_shared_request_type(&req),
+            Err(BridgeError::InvalidRequest(m)) if m == "service_tier must be a string"
+        ));
+    }
+
+    #[test]
+    fn service_tier_flex_and_priority_pick_the_paygo_header() {
+        let tier = |t: serde_json::Value| {
+            let mut req = ChatFormat::new("m", vec![]);
+            req.extra.insert("service_tier".into(), t);
+            gemini_shared_request_type(&req).unwrap()
+        };
+        assert_eq!(tier(serde_json::json!("flex")), Some("flex"));
+        assert_eq!(tier(serde_json::json!("priority")), Some("priority"));
+        for none in ["auto", "default", "scale"] {
+            assert_eq!(tier(serde_json::json!(none)), None);
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-vertex-ai-llm-shared-request-type",
+            HeaderValue::from_static("priority"),
+        );
+        with_shared_request_type(&mut headers, Some("flex"));
+        assert_eq!(headers["x-vertex-ai-llm-shared-request-type"], "priority");
+    }
+
+    #[test]
+    fn a_blocked_prompt_finishes_as_content_filter() {
+        let raw: GeminiGenerateContentResponse = serde_json::from_value(serde_json::json!({
+            "promptFeedback": {"blockReason": "PROHIBITED_CONTENT"},
+            "usageMetadata": {"promptTokenCount": 8, "totalTokenCount": 8},
+        }))
+        .unwrap();
+        let resp = gemini_response_into_chat_response(raw, "gemini-2.5-flash");
+        assert_eq!(resp.finish_reason, FinishReason::ContentFilter);
+        assert_eq!(resp.message.content, None);
+        assert_eq!(resp.usage.prompt_tokens, 8);
+
+        let raw: GeminiGenerateContentResponse = serde_json::from_value(serde_json::json!({
+            "promptFeedback": {"blockReason": "SAFETY"},
+            "usageMetadata": {"promptTokenCount": 8, "totalTokenCount": 8},
+        }))
+        .unwrap();
+        let chunks =
+            gemini_chunk_into_chat_chunks(raw, "gemini-2.5-flash", &mut Default::default());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].delta.role, Some(Role::Assistant));
+        assert_eq!(chunks[0].finish_reason, Some(FinishReason::ContentFilter));
+        assert!(chunks[0].usage.is_some());
+    }
+
+    fn logprobs_result(token: &str) -> serde_json::Value {
+        serde_json::json!({
+            "chosenCandidates": [{"token": token, "logProbability": -0.5}],
+            "topCandidates": [{"candidates": [
+                {"token": token, "logProbability": -0.5},
+                {"token": "x", "logProbability": -2.0}
+            ]}]
+        })
+    }
+
+    fn openai_logprobs(token: &str) -> serde_json::Value {
+        serde_json::json!({"content": [{
+            "token": token, "logprob": -0.5, "bytes": token.as_bytes(),
+            "top_logprobs": [
+                {"token": token, "logprob": -0.5, "bytes": token.as_bytes()},
+                {"token": "x", "logprob": -2.0, "bytes": [120]}
+            ]
+        }]})
+    }
+
+    #[test]
+    fn every_candidate_comes_back_as_a_choice_with_its_logprobs() {
+        let raw: GeminiGenerateContentResponse = serde_json::from_value(serde_json::json!({
+            "candidates": [
+                {"index": 1, "content": {"parts": [{"text": "B"}]}, "finishReason": "MAX_TOKENS",
+                 "logprobsResult": logprobs_result("B")},
+                {"content": {"parts": [{"text": "A"}]}, "finishReason": "STOP",
+                 "logprobsResult": logprobs_result("A")}
+            ],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2, "totalTokenCount": 5},
+        }))
+        .unwrap();
+        let resp = gemini_response_into_chat_response(raw, "gemini-2.5-flash");
+        assert_eq!(resp.message.content.as_deref(), Some("A"));
+        assert_eq!(resp.finish_reason, FinishReason::Stop);
+        assert_eq!(resp.logprobs, Some(openai_logprobs("A")));
+        assert_eq!(resp.more_choices.len(), 1);
+        assert_eq!(resp.more_choices[0].index, 1);
+        assert_eq!(resp.more_choices[0].message.content.as_deref(), Some("B"));
+        assert_eq!(resp.more_choices[0].finish_reason, FinishReason::Length);
+        assert_eq!(resp.more_choices[0].logprobs, Some(openai_logprobs("B")));
+    }
+
+    #[test]
+    fn a_certain_token_and_a_missing_first_candidate_keep_their_place() {
+        let raw: GeminiGenerateContentResponse = serde_json::from_value(serde_json::json!({
+            "candidates": [{"index": 1, "content": {"parts": [{"text": "B"}]}, "finishReason": "STOP",
+                            "logprobsResult": {"chosenCandidates": [{"token": "B"}]}}],
+        }))
+        .unwrap();
+        let resp = gemini_response_into_chat_response(raw, "gemini-2.5-flash");
+        assert_eq!(resp.message.content.as_deref(), Some(""));
+        assert_eq!(resp.more_choices.len(), 1);
+        assert_eq!(resp.more_choices[0].index, 1);
+        // Proto3 JSON omits a zero `logProbability`.
+        assert_eq!(
+            resp.more_choices[0].logprobs.as_ref().unwrap()["content"][0]["logprob"],
+            0.0
+        );
+    }
+
+    #[test]
+    fn a_stream_keys_every_candidate_by_its_choice() {
+        let mut state = GeminiStreamState::default();
+        let frame = |v: serde_json::Value| serde_json::from_value(v).unwrap();
+        let first = gemini_chunk_into_chat_chunks(
+            frame(serde_json::json!({"candidates": [
+                {"index": 0, "content": {"parts": [{"text": "A"}]}, "logprobsResult": logprobs_result("A")},
+                {"index": 1, "content": {"parts": [{"text": "B"}]}}
+            ]})),
+            "gemini-2.5-flash",
+            &mut state,
+        );
+        let shape: Vec<(u32, Option<Role>, Option<String>)> = first
+            .iter()
+            .map(|c| (c.choice_index, c.delta.role, c.delta.content.clone()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (0, Some(Role::Assistant), None),
+                (0, None, Some("A".into())),
+                (1, Some(Role::Assistant), None),
+                (1, None, Some("B".into())),
+            ]
+        );
+        assert_eq!(first[1].logprobs, Some(openai_logprobs("A")));
+        let last = gemini_chunk_into_chat_chunks(
+            frame(serde_json::json!({
+                "candidates": [
+                    {"index": 0, "finishReason": "STOP"},
+                    {"index": 1, "finishReason": "STOP"}
+                ],
+                "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2, "totalTokenCount": 5}
+            })),
+            "gemini-2.5-flash",
+            &mut state,
+        );
+        assert_eq!(last.len(), 2);
+        assert_eq!(
+            last.iter().map(|c| c.choice_index).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(last
+            .iter()
+            .all(|c| c.finish_reason == Some(FinishReason::Stop)));
+        assert!(last[0].usage.is_none() && last[1].usage.is_some());
     }
 
     // ─── Gemini structured outputs ─────────────────────────────────────
@@ -6674,6 +7282,8 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["hello".into(), "world".into()],
             input_was_single: false,
@@ -6742,6 +7352,8 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["hello".into()],
             input_was_single: true,
@@ -6780,6 +7392,8 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = EmbeddingRequest {
+            extra: Default::default(),
+            token_input: None,
             model: "customer-facing-name".into(),
             input: vec!["hello".into()],
             input_was_single: true,
@@ -6841,7 +7455,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         assert_eq!(
             body["tools"],
             serde_json::json!([{"functionDeclarations": [{"name": "get_weather",
-                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}]}])
+                "parametersJsonSchema": {"type": "object", "properties": {"city": {"type": "string"}}}}]}])
         );
         assert_eq!(
             body["toolConfig"],
@@ -6948,21 +7562,6 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
             chunks.last().unwrap().finish_reason,
             Some(FinishReason::ToolCalls)
         );
-    }
-
-    #[test]
-    fn legacy_function_fields_are_refused_not_dropped() {
-        for field in ["functions", "function_call"] {
-            let mut req = ChatFormat::new("m", vec![ChatMessage::user("hi")]);
-            req.extra.insert(field.into(), serde_json::json!([]));
-            assert!(
-                matches!(
-                    build_gemini_request(&req, "gemini-2.5-flash"),
-                    Err(BridgeError::InvalidRequest(_))
-                ),
-                "{field}"
-            );
-        }
     }
 
     #[test]
