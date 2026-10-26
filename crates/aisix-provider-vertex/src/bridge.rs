@@ -51,8 +51,8 @@ use aisix_gateway::content_part::{
 use aisix_gateway::media_fetch::{fetch_media_urls, Encoding, FetchedMedia};
 
 use crate::gemini_tools::{
-    function_call_parts, function_response_part, gemini_3_or_newer, gemini_tool_config,
-    gemini_tools, tool_call_from_function_call, GeminiFunctionCall,
+    function_call_parts, function_response_part, gemini_2_5, gemini_3_or_newer, gemini_model_name,
+    gemini_tool_config, gemini_tools, tool_call_from_function_call, GeminiFunctionCall,
 };
 use crate::token_mint::{ServiceAccountKey, TokenMinter};
 use crate::wire;
@@ -1965,12 +1965,12 @@ impl VertexBridge {
 struct GeminiStreamState {
     /// Per choice: the assistant role chunk has gone out, and the tool
     /// calls emitted so far — the next call's `index`.
-    choices: Vec<GeminiStreamChoice>,
+    choices: std::collections::BTreeMap<u32, GeminiStreamChoice>,
     /// The last tier the stream reported, stamped on every chunk.
     service_tier: Option<ServiceTier>,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 struct GeminiStreamChoice {
     emitted_role: bool,
     tool_calls: usize,
@@ -1978,12 +1978,7 @@ struct GeminiStreamChoice {
 
 impl GeminiStreamState {
     fn choice(&mut self, index: u32) -> &mut GeminiStreamChoice {
-        let index = index as usize;
-        if self.choices.len() <= index {
-            self.choices
-                .resize(index + 1, GeminiStreamChoice::default());
-        }
-        &mut self.choices[index]
+        self.choices.entry(index).or_default()
     }
 }
 
@@ -2494,20 +2489,6 @@ fn gemini_thinking_config(
     Ok(Some(serde_json::json!({ "thinkingBudget": budget })))
 }
 
-/// The bare, lower-cased model id (`models/` and other path prefixes
-/// dropped).
-fn gemini_model_name(model: &str) -> String {
-    let lowered = model.trim().to_ascii_lowercase();
-    lowered.rsplit('/').next().unwrap_or(&lowered).to_string()
-}
-
-/// A Gemini 2.5 model (`gemini-2.5-flash`, `gemini-2.5-pro-preview-…`).
-fn gemini_2_5(model: &str) -> bool {
-    gemini_model_name(model)
-        .strip_prefix("gemini-2.5")
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
-}
-
 /// Read the generation off a Gemini model name: `2` from
 /// `gemini-2.5-flash`, `3` from `gemini-3-pro-preview`. The gateway
 /// holds no capability map, so the name is all there is.
@@ -2925,7 +2906,9 @@ fn gemini_logprobs(result: Option<&serde_json::Value>) -> Option<serde_json::Val
             .unwrap_or_default();
         serde_json::json!({
             "token": token,
-            "logprob": candidate.get("logProbability").cloned().unwrap_or(serde_json::Value::Null),
+            // Proto3 JSON omits a zero float: a certain token has no
+            // `logProbability`.
+            "logprob": candidate.get("logProbability").cloned().unwrap_or(0.0.into()),
             "bytes": token.as_bytes(),
         })
     }
@@ -3123,8 +3106,9 @@ fn gemini_response_into_chat_response(
     let mut choices = raw
         .indexed_candidates()
         .into_iter()
-        .map(|(index, c)| gemini_candidate_into_choice(index, c));
-    let first = choices.next().unwrap_or_else(|| {
+        .map(|(index, c)| gemini_candidate_into_choice(index, c))
+        .peekable();
+    let first = choices.next_if(|c| c.index == 0).unwrap_or_else(|| {
         // A blocked prompt is answered with feedback and no candidate.
         let mut message = ChatMessage::assistant("");
         let finish_reason = if raw.prompt_blocked() {
@@ -4083,6 +4067,24 @@ mod tests {
         assert_eq!(resp.more_choices[0].message.content.as_deref(), Some("B"));
         assert_eq!(resp.more_choices[0].finish_reason, FinishReason::Length);
         assert_eq!(resp.more_choices[0].logprobs, Some(openai_logprobs("B")));
+    }
+
+    #[test]
+    fn a_certain_token_and_a_missing_first_candidate_keep_their_place() {
+        let raw: GeminiGenerateContentResponse = serde_json::from_value(serde_json::json!({
+            "candidates": [{"index": 1, "content": {"parts": [{"text": "B"}]}, "finishReason": "STOP",
+                            "logprobsResult": {"chosenCandidates": [{"token": "B"}]}}],
+        }))
+        .unwrap();
+        let resp = gemini_response_into_chat_response(raw, "gemini-2.5-flash");
+        assert_eq!(resp.message.content.as_deref(), Some(""));
+        assert_eq!(resp.more_choices.len(), 1);
+        assert_eq!(resp.more_choices[0].index, 1);
+        // Proto3 JSON omits a zero `logProbability`.
+        assert_eq!(
+            resp.more_choices[0].logprobs.as_ref().unwrap()["content"][0]["logprob"],
+            0.0
+        );
     }
 
     #[test]

@@ -232,15 +232,20 @@ pub(crate) fn gemini_tools(
 /// verified live (2.5 Flash / Flash-Lite / Pro, 3 Flash, 3.1 Pro). Older
 /// families get the typed `parameters` form.
 pub(crate) fn takes_parameters_json_schema(model: &str) -> bool {
-    if gemini_3_or_newer(model) {
-        return true;
-    }
-    let name = model
-        .rsplit('/')
-        .next()
-        .unwrap_or(model)
-        .to_ascii_lowercase();
-    name.strip_prefix("gemini-2.5")
+    gemini_3_or_newer(model) || gemini_2_5(model)
+}
+
+/// The bare, lower-cased model id (`models/` and other path prefixes
+/// dropped).
+pub(crate) fn gemini_model_name(model: &str) -> String {
+    let lowered = model.trim().to_ascii_lowercase();
+    lowered.rsplit('/').next().unwrap_or(&lowered).to_string()
+}
+
+/// A Gemini 2.5 model (`gemini-2.5-flash`, `gemini-2.5-pro-preview-…`).
+pub(crate) fn gemini_2_5(model: &str) -> bool {
+    gemini_model_name(model)
+        .strip_prefix("gemini-2.5")
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
 }
 
