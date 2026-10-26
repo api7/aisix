@@ -234,7 +234,7 @@ describe("streamed reasoning content parts", () => {
     },
   );
 
-  test("keep their place between the text parts of one delta", async (ctx) => {
+  test("keep their place between the text parts of one delta on /v1/chat/completions", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const raw = await stream(app, "/v1/chat/completions", chatBody("srp-interleaved"));
     expect(chatRuns(raw), raw).toEqual([
@@ -242,6 +242,38 @@ describe("streamed reasoning content parts", () => {
       ["reasoning", "Checking the atlas."],
       ["content", "Paris."],
     ]);
+  });
+
+  test("keep their place between the text parts of one delta on /v1/messages", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const raw = await stream(app, "/v1/messages", messagesBody("srp-interleaved"));
+    expect(messagesBlocks(raw), raw).toEqual([
+      { type: "text", text: "Let me check. " },
+      { type: "thinking", thinking: "Checking the atlas.", signature: "" },
+      { type: "text", text: "Paris." },
+    ]);
+  });
+
+  test("keep their place between the text parts of one delta on /v1/responses", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const raw = await stream(app, "/v1/responses", responsesBody("srp-interleaved"));
+    const events = namedEvents(raw);
+    // Each item is finished before the next one is added.
+    const open = new Set<number>();
+    for (const { event, data } of events) {
+      if (event === "response.output_item.added") {
+        expect(open.size, `item ${data.output_index} added while ${[...open]} open\n${raw}`).toBe(0);
+        open.add(data.output_index);
+      }
+      if (event === "response.output_item.done") open.delete(data.output_index);
+    }
+    const completed = events.find((e) => e.event === "response.completed");
+    expect(completed, raw).toBeDefined();
+    const output = completed!.data.response.output;
+    expect(output.map((item: any) => item.type)).toEqual(["message", "reasoning", "message"]);
+    expect(output[0].content).toMatchObject([{ type: "output_text", text: "Let me check. " }]);
+    expect(output[1].summary).toEqual([{ type: "summary_text", text: "Checking the atlas." }]);
+    expect(output[2].content).toMatchObject([{ type: "output_text", text: "Paris." }]);
   });
 
   test.for(["mistral", "databricks"] as const)(
