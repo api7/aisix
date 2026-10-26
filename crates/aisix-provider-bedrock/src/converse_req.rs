@@ -311,33 +311,58 @@ pub(crate) fn top_k_field(req: &ChatFormat, model_id: &str) -> Option<(&'static 
     }
 }
 
-/// `stop` as Converse `stopSequences`. An empty string is skipped, as
-/// Converse rejects it. Grok and GPT 5.6 and newer refuse stop sequences on
-/// every route, so they get none. A Claude caller's native `stop_sequences`,
-/// top-level or inside its own `additionalModelRequestFields`, wins even
-/// when `null`, as on the Anthropic route: it reaches the model as sent
-/// there, and Converse rejects a request that also sets `stopSequences`.
-pub(crate) fn stop_sequences(req: &ChatFormat, model_id: &str) -> Option<Vec<String>> {
-    if chat_completions_family(capability_id(model_id)) {
-        return None;
+/// `stop` as Converse `stopSequences`. A lone empty string is skipped, as
+/// Converse rejects it. Grok, GPT 5.6 and newer, and gpt-oss refuse stop
+/// sequences on every route, so they get none. A Claude caller's native
+/// `stop_sequences`, top-level or inside its own
+/// `additionalModelRequestFields`, wins even when `null`, as on the
+/// Anthropic route: it reaches the model as sent there, and Converse
+/// rejects a request that also sets `stopSequences`.
+///
+/// Converse is built from typed fields, so a `stop` it cannot carry cannot
+/// be forwarded for the upstream to reject: anything else that is not a
+/// non-empty string or an array of them is refused here.
+pub(crate) fn stop_sequences(
+    req: &ChatFormat,
+    model_id: &str,
+) -> Result<Option<Vec<String>>, BridgeError> {
+    let id = capability_id(model_id);
+    if chat_completions_family(id) || base_id(model_id).contains("gpt-oss") {
+        return Ok(None);
     }
     if base_id(model_id).starts_with("anthropic.")
         && caller_additional_fields(req).contains_key("stop_sequences")
     {
-        return None;
+        return Ok(None);
     }
-    match req.extra.get("stop")? {
-        Value::String(s) if !s.is_empty() => Some(vec![s.clone()]),
-        Value::Array(items) => {
-            let seqs: Vec<String> = items
+    const WANT: &str = "must be a non-empty string or an array of non-empty strings";
+    match req.extra.get("stop") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.is_empty() => Ok(None),
+        Some(Value::String(s)) => Ok(Some(vec![s.clone()])),
+        Some(Value::Array(items)) => {
+            let seqs = items
                 .iter()
-                .filter_map(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect();
-            (!seqs.is_empty()).then_some(seqs)
+                .map(|v| v.as_str().filter(|s| !s.is_empty()).map(str::to_string))
+                .collect::<Option<Vec<String>>>()
+                .ok_or_else(|| invalid("stop", WANT))?;
+            Ok((!seqs.is_empty()).then_some(seqs))
         }
-        _ => None,
+        Some(_) => Err(invalid("stop", WANT)),
+    }
+}
+
+/// Refuse a `max_completion_tokens` Converse cannot carry: anything but a
+/// non-negative integer (or `null`). Converse is built from typed fields,
+/// so the value cannot be forwarded for the upstream to reject.
+pub(crate) fn check_max_completion_tokens(req: &ChatFormat) -> Result<(), BridgeError> {
+    match req.extra.get("max_completion_tokens") {
+        None | Some(Value::Null) => Ok(()),
+        Some(v) if v.as_u64().is_some() => Ok(()),
+        Some(_) => Err(invalid(
+            "max_completion_tokens",
+            "must be a non-negative integer",
+        )),
     }
 }
 
@@ -514,7 +539,7 @@ mod tests {
     fn a_claude_callers_native_stop_sequences_wins_over_stop() {
         let claude = "us.anthropic.claude-haiku-4-5-20251001-v1:0";
         let both = req(serde_json::json!({"stop": ["delta"], "stop_sequences": ["beta"]}));
-        assert_eq!(stop_sequences(&both, claude), None);
+        assert_eq!(stop_sequences(&both, claude).unwrap(), None);
         assert_eq!(
             caller_additional_fields(&both).get("stop_sequences"),
             Some(&serde_json::json!(["beta"]))
@@ -523,18 +548,18 @@ mod tests {
             "stop": ["delta"],
             "additionalModelRequestFields": {"stop_sequences": ["beta"]},
         }));
-        assert_eq!(stop_sequences(&nested, claude), None);
+        assert_eq!(stop_sequences(&nested, claude).unwrap(), None);
         // A null native field is still the caller's statement, as on the
         // Anthropic route.
         let null_native = req(serde_json::json!({"stop": ["delta"], "stop_sequences": null}));
-        assert_eq!(stop_sequences(&null_native, claude), None);
+        assert_eq!(stop_sequences(&null_native, claude).unwrap(), None);
         assert_eq!(
             caller_additional_fields(&null_native).get("stop_sequences"),
             Some(&serde_json::Value::Null)
         );
         // Other publishers keep `stop` as before.
         assert_eq!(
-            stop_sequences(&both, "us.amazon.nova-lite-v1:0"),
+            stop_sequences(&both, "us.amazon.nova-lite-v1:0").unwrap(),
             Some(vec!["delta".into()])
         );
     }
@@ -543,16 +568,65 @@ mod tests {
     fn stop_sequences_skip_the_families_that_refuse_them() {
         let r = req(serde_json::json!({"stop": "END"}));
         assert_eq!(
-            stop_sequences(&r, "meta.llama3-3-70b-instruct-v1:0"),
+            stop_sequences(&r, "meta.llama3-3-70b-instruct-v1:0").unwrap(),
             Some(vec!["END".into()])
         );
-        assert_eq!(stop_sequences(&r, "us.openai.gpt-6-luna"), None);
+        assert_eq!(stop_sequences(&r, "us.openai.gpt-6-luna").unwrap(), None);
         assert_eq!(
             stop_sequences(
                 &req(serde_json::json!({"stop": ""})),
                 "amazon.nova-lite-v1:0"
-            ),
+            )
+            .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn gpt_oss_gets_no_stop_sequences() {
+        let r = req(serde_json::json!({"stop": ["END"]}));
+        for id in ["openai.gpt-oss-20b-1:0", "us.openai.gpt-oss-120b-1:0"] {
+            assert_eq!(stop_sequences(&r, id).unwrap(), None, "{id}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_stop_or_max_completion_tokens_is_refused() {
+        let nova = "amazon.nova-lite-v1:0";
+        for stop in [
+            serde_json::json!(5),
+            serde_json::json!({"a": 1}),
+            serde_json::json!(["a", 1]),
+            serde_json::json!(["a", ""]),
+        ] {
+            let err = stop_sequences(&req(serde_json::json!({"stop": stop})), nova).unwrap_err();
+            assert!(
+                matches!(&err, BridgeError::InvalidRequest(m) if m.starts_with("stop ")),
+                "{stop}: {err:?}"
+            );
+        }
+        assert_eq!(
+            stop_sequences(&req(serde_json::json!({"stop": null})), nova).unwrap(),
+            None
+        );
+        assert_eq!(
+            stop_sequences(&req(serde_json::json!({"stop": []})), nova).unwrap(),
+            None
+        );
+        for cap in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("100"),
+        ] {
+            let err = check_max_completion_tokens(&req(serde_json::json!({
+                "max_completion_tokens": cap
+            })))
+            .unwrap_err();
+            assert!(
+                matches!(&err, BridgeError::InvalidRequest(m) if m.starts_with("max_completion_tokens ")),
+                "{cap}: {err:?}"
+            );
+        }
+        check_max_completion_tokens(&req(serde_json::json!({"max_completion_tokens": 0}))).unwrap();
     }
 }
