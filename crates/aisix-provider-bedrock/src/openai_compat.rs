@@ -78,8 +78,8 @@ pub(crate) fn is_openai_gpt(model_id: &str) -> bool {
 }
 
 /// Grok, and GPT 5.6 and newer: the families AWS serves on the Chat
-/// Completions endpoint, and that refuse stop sequences on every route.
-pub(crate) fn chat_completions_family(model_id: &str) -> bool {
+/// Completions endpoint.
+fn chat_completions_family(model_id: &str) -> bool {
     is_grok(model_id) || gpt_version(model_id).is_some_and(|v| v >= (5, 6))
 }
 
@@ -143,48 +143,15 @@ pub(crate) fn serves(req: &ChatFormat, model_id: &str) -> bool {
     is_default_route(model_id) && !needs_converse(req, model_id)
 }
 
-/// GPT sampling and logprob parameters AWS refuses while the model reasons.
-const REFUSED_WHILE_REASONING: &[&str] = &[
-    "temperature",
-    "top_p",
-    "frequency_penalty",
-    "presence_penalty",
-    "logprobs",
-    "top_logprobs",
-];
-
-/// Shape the OpenAI body for this endpoint, dropping what AWS refuses
-/// rather than forwarding it into an error: `n` everywhere, `stop` on both
-/// families, Grok's penalties and its `reasoning_effort: "none"`, GPT's
-/// sampling and logprob parameters while it reasons, and a non-string
-/// `reasoning_effort`. `max_tokens` is sent as `max_completion_tokens`,
-/// which every model here accepts and GPT 5.6 requires.
-fn shape_body(body: &mut Value, model_id: &str) {
+/// Shape the OpenAI body for this endpoint. Every parameter goes out as
+/// the caller sent it, including ones AWS refuses for the model, so the
+/// caller gets AWS's own error; only `max_tokens` is sent as
+/// `max_completion_tokens`, which every model here accepts and GPT 5.6
+/// requires.
+fn shape_body(body: &mut Value) {
     let Some(obj) = body.as_object_mut() else {
         return;
     };
-    let mut dropped: Vec<&str> = vec!["n", "stop"];
-    if obj.get("reasoning_effort").is_some_and(|e| !e.is_string()) {
-        dropped.push("reasoning_effort");
-    }
-    let effort = obj.get("reasoning_effort").and_then(Value::as_str);
-    if is_grok(model_id) {
-        dropped.extend(["frequency_penalty", "presence_penalty"]);
-        if effort == Some("none") {
-            dropped.push("reasoning_effort");
-        }
-    } else if is_openai_gpt(model_id) && effort != Some("none") {
-        dropped.extend(REFUSED_WHILE_REASONING);
-    }
-    for key in dropped {
-        if obj.remove(key).is_some() {
-            tracing::debug!(
-                field = key,
-                model = model_id,
-                "dropping a parameter Bedrock's Chat Completions endpoint refuses for this model"
-            );
-        }
-    }
     if let Some(max_tokens) = obj.remove("max_tokens") {
         obj.entry("max_completion_tokens").or_insert(max_tokens);
     }
@@ -423,7 +390,7 @@ async fn send(
             stream,
         ))
         .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
-        shape_body(&mut body, model_id);
+        shape_body(&mut body);
         bytes::Bytes::from(
             serde_json::to_vec(&body)
                 .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?,

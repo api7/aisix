@@ -19,7 +19,7 @@ use aws_sdk_bedrockruntime::types::{
 use serde_json::{Map, Value};
 
 use crate::bridge::{capability_id, strip_region_prefix};
-use crate::openai_compat::{chat_completions_family, is_openai_gpt};
+use crate::openai_compat::is_openai_gpt;
 
 /// Top-level request fields that are never forwarded as
 /// `additionalModelRequestFields`: every OpenAI Chat Completions parameter,
@@ -312,8 +312,9 @@ pub(crate) fn top_k_field(req: &ChatFormat, model_id: &str) -> Option<(&'static 
 }
 
 /// `stop` as Converse `stopSequences`. A lone empty string is skipped, as
-/// Converse rejects it. Grok, GPT 5.6 and newer, and gpt-oss refuse stop
-/// sequences on every route, so they get none. A Claude caller's native
+/// Converse rejects it. Every other valid `stop` is sent, also to the
+/// models AWS refuses it for, whose error then reaches the caller. A Claude
+/// caller's native
 /// `stop_sequences`, top-level or inside its own
 /// `additionalModelRequestFields`, wins even when `null`, as on the
 /// Anthropic route: it reaches the model as sent there, and Converse
@@ -341,12 +342,6 @@ pub(crate) fn stop_sequences(
         }
         Some(_) => return Err(invalid("stop", WANT)),
     };
-    // Checked first, so the same `stop` is refused whichever model a
-    // routing group picks.
-    let id = capability_id(model_id);
-    if chat_completions_family(id) || base_id(model_id).contains("gpt-oss") {
-        return Ok(None);
-    }
     if base_id(model_id).starts_with("anthropic.")
         && caller_additional_fields(req).contains_key("stop_sequences")
     {
@@ -568,13 +563,21 @@ mod tests {
     }
 
     #[test]
-    fn stop_sequences_skip_the_families_that_refuse_them() {
-        let r = req(serde_json::json!({"stop": "END"}));
-        assert_eq!(
-            stop_sequences(&r, "meta.llama3-3-70b-instruct-v1:0").unwrap(),
-            Some(vec!["END".into()])
-        );
-        assert_eq!(stop_sequences(&r, "us.openai.gpt-6-luna").unwrap(), None);
+    fn stop_sequences_reach_every_model() {
+        let r = req(serde_json::json!({"stop": ["END"]}));
+        for id in [
+            "meta.llama3-3-70b-instruct-v1:0",
+            "openai.gpt-oss-20b-1:0",
+            "us.openai.gpt-oss-120b-1:0",
+            "us.openai.gpt-6-luna",
+            "xai.grok-4.6",
+        ] {
+            assert_eq!(
+                stop_sequences(&r, id).unwrap(),
+                Some(vec!["END".into()]),
+                "{id}"
+            );
+        }
         assert_eq!(
             stop_sequences(
                 &req(serde_json::json!({"stop": ""})),
@@ -583,26 +586,6 @@ mod tests {
             .unwrap(),
             None
         );
-    }
-
-    #[test]
-    fn an_invalid_stop_is_refused_on_models_that_get_none() {
-        let r = req(serde_json::json!({"stop": 5}));
-        for id in [
-            "openai.gpt-oss-20b-1:0",
-            "us.openai.gpt-6-luna",
-            "us.xai.grok-4.6",
-        ] {
-            assert!(stop_sequences(&r, id).is_err(), "{id}");
-        }
-    }
-
-    #[test]
-    fn gpt_oss_gets_no_stop_sequences() {
-        let r = req(serde_json::json!({"stop": ["END"]}));
-        for id in ["openai.gpt-oss-20b-1:0", "us.openai.gpt-oss-120b-1:0"] {
-            assert_eq!(stop_sequences(&r, id).unwrap(), None, "{id}");
-        }
     }
 
     #[test]
