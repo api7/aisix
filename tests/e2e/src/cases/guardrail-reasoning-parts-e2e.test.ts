@@ -28,6 +28,7 @@ const CALLER = "sk-reasoning-parts-e2e";
 const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
 const MODEL = "reasoning-parts-model";
 const BLOCKWORD = "reasoningpartforbidden";
+const LATEST_TURN_BLOCKWORD = "latestturnreasoningforbidden";
 const EMAIL = "carol@example.com";
 const MASKED = "[EMAIL_REDACTED]";
 
@@ -86,6 +87,16 @@ describe("input guardrails read replayed reasoning content parts", () => {
       hook_point: "input",
       kind: "keyword",
       patterns: [{ kind: "literal", value: BLOCKWORD }],
+    });
+    // Reads only the turn the model has not answered yet — which includes a
+    // trailing assistant prefill.
+    await seed.createGuardrail({
+      name: "reasoning-parts-latest-turn-block",
+      enabled: true,
+      hook_point: "input",
+      kind: "keyword",
+      input_messages: "latest_turn",
+      patterns: [{ kind: "literal", value: LATEST_TURN_BLOCKWORD }],
     });
     await seed.createGuardrail({
       name: "reasoning-parts-mask",
@@ -170,6 +181,24 @@ describe("input guardrails read replayed reasoning content parts", () => {
         { text: `signed ${EMAIL}`, signature: "sig-databricks" },
       ),
     );
+  });
+
+  test("a latest_turn block rule fires on a signed part in a trailing assistant prefill", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const before = upstream!.receivedRequests.length;
+    const res = await proxy!.chat({
+      model: MODEL,
+      messages: [
+        { role: "user", content: "What is the weather in Paris?" },
+        {
+          role: "assistant",
+          content: [mistralPart(`maybe ${LATEST_TURN_BLOCKWORD}`, "sig-mistral")],
+        },
+      ],
+    });
+    expect(res.status).toBe(422);
+    expect((res.body as { error?: { type?: unknown } }).error?.type).toBe("content_filter");
+    expect(upstream!.receivedRequests.length).toBe(before);
   });
 
   async function passthrough(parts: unknown[]): Promise<Response> {

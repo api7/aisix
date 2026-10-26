@@ -188,7 +188,9 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
         m.content_blocks
             .iter()
             .flatten()
-            .filter_map(aisix_gateway::chat::reasoning_part_text),
+            .flat_map(aisix_gateway::chat::reasoning_part_slots)
+            .filter(|slot| !slot.text.is_empty())
+            .map(|slot| slot.text.to_string()),
     );
     parts.join("\n")
 }

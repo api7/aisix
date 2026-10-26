@@ -229,11 +229,11 @@ fn reasoning_entries_key(part: &Value) -> Option<&'static str> {
     part.get(key).is_some_and(Value::is_array).then_some(key)
 }
 
+/// Any entry with a string `text`, whatever its `type`: the whole part is
+/// forwarded verbatim, so an entry type this list did not name would
+/// otherwise carry text past the scan.
 fn is_reasoning_entry(entry: &Value) -> bool {
-    matches!(
-        entry.get("type").and_then(Value::as_str),
-        Some("text" | "summary_text")
-    ) && entry.get("text").is_some_and(Value::is_string)
+    entry.get("text").is_some_and(Value::is_string)
 }
 
 /// Whether `part` is a reasoning content part (see [`reasoning_part_slots`]).
@@ -1675,7 +1675,7 @@ mod tests {
     #[test]
     fn reasoning_part_slots_read_text_and_signature() {
         let mistral = serde_json::json!({"type": "thinking", "signature": "s",
-            "thinking": [{"type": "text", "text": "a"}, {"type": "image", "text": "x"}]});
+            "thinking": [{"type": "text", "text": "a"}, {"type": "image", "url": "x"}]});
         let slots = reasoning_part_slots(&mistral);
         assert_eq!(slots.len(), 1);
         assert_eq!((slots[0].text, slots[0].signed), ("a", true));

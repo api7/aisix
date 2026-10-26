@@ -2743,23 +2743,30 @@ fn append_reasoning_part_strings(
             append_scan_text(out, &decoded)?;
             continue;
         }
-        let Some(entries) = raw_array_item_refs(&value) else {
-            mark_unevaluable(scan_error);
-            return None;
-        };
-        for entry in entries {
-            if !raw_is_object(&entry) {
-                mark_unevaluable(scan_error);
-                return None;
-            }
+        // Any other carrier (`null`, an object, a scalar) is scanned whole
+        // rather than refused: it is forwarded as it is.
+        let Some(entries) = text
+            .starts_with('[')
+            .then(|| raw_array_item_refs(&value))
+            .flatten()
+        else {
             append_scan_text(
                 out,
-                &decoded_json_string_values_except_root_keys(
+                &decoded_json_string_values_including_empty(value.get().as_bytes(), scan_error)?,
+            )?;
+            continue;
+        };
+        for entry in entries {
+            let strings = if raw_is_object(&entry) {
+                decoded_json_string_values_except_root_keys(
                     entry.get().as_bytes(),
                     &["type", "signature"],
                     scan_error,
-                )?,
-            )?;
+                )?
+            } else {
+                decoded_json_string_values_including_empty(entry.get().as_bytes(), scan_error)?
+            };
+            append_scan_text(out, &strings)?;
         }
     }
     Some(())
@@ -9105,6 +9112,21 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
             assert!(scanned.contains(expected), "{scanned:?}");
         }
         assert!(!scanned.contains("SIG"), "{scanned:?}");
+
+        // Other carriers are scanned whole, never refused as unscannable.
+        for body in [
+            &br#"{"messages":[{"role":"assistant","content":[{"type":"reasoning","summary":null,"encrypted_content":"opaque"},{"type":"text","text":"answer"}]}]}"#[..],
+            br#"{"messages":[{"role":"assistant","content":[{"type":"reasoning","summary":["BLOCKME"]},{"type":"text","text":"answer"}]}]}"#,
+            br#"{"messages":[{"role":"assistant","content":[{"type":"reasoning","summary":"BLOCKME"},{"type":"text","text":"answer"}]}]}"#,
+            br#"{"messages":[{"role":"assistant","content":[{"type":"reasoning","summary":[{"type":"other","text":"BLOCKME"}]},{"type":"text","text":"answer"}]}]}"#,
+        ] {
+            let scanned = try_request_guardrail_text(PassthroughProtocol::OpenaiChat, body)
+                .expect("evaluable");
+            assert!(scanned.contains("answer"), "{scanned:?}");
+            if !String::from_utf8_lossy(body).contains("null") {
+                assert!(scanned.contains("BLOCKME"), "{scanned:?}");
+            }
+        }
     }
 
     #[test]
