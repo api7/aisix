@@ -38,7 +38,14 @@ const arrayReply = (text: string) => ({
   choices: [
     {
       index: 0,
-      message: { role: "assistant", content: [{ type: "text", text }] },
+      // Split across two text parts: the answer is their concatenation.
+      message: {
+        role: "assistant",
+        content: [
+          { type: "text", text: text.slice(0, 10) },
+          { type: "text", text: text.slice(10) },
+        ],
+      },
       finish_reason: "stop",
     },
   ],
@@ -145,7 +152,7 @@ describe("an answer whose content is an array of parts", () => {
     await model("ac-short", up.short);
     await model("ac-long", up.long);
     await model("ac-cached", up.cached);
-    await seed.createCachePolicy({ name: "ac-cache", enabled: true, applies_to: "all" });
+    await seed.createCachePolicy({ name: "ac-cache", enabled: true, applies_to: "model:ac-cached" });
     await seed.createObservabilityExporter({
       name: "ac-otlp",
       enabled: true,
