@@ -2719,10 +2719,13 @@ fn append_chat_request_content_strings(
 
 /// Request text of a replayed reasoning part's `key`: an Anthropic
 /// `thinking` string, or the entry array of Mistral's `thinking` and
-/// Databricks' `reasoning.summary` — every string of each entry but its
-/// `type` and `signature`, the same text the typed chat route reads
-/// through `aisix_gateway::chat::reasoning_part_slots`. A signed entry is
-/// scanned too; nothing on this route is rewritten.
+/// Databricks' `reasoning.summary` — each entry's `text`, every duplicate
+/// included, the same text the typed chat route reads through
+/// `aisix_gateway::chat::reasoning_part_slots`. A signed entry is scanned
+/// too; nothing on this route is rewritten. Opaque members beside the text
+/// (`signature`, `encrypted_content`) are never scan text. A carrier of
+/// another shape is read the same way rather than refused: an object for
+/// its `text`, a bare string as text, anything else as nothing.
 fn append_reasoning_part_strings(
     out: &mut String,
     block_body: &[u8],
@@ -2734,40 +2737,45 @@ fn append_reasoning_part_strings(
         return None;
     };
     for value in values {
-        let text = value.get().trim_start();
-        if text.starts_with('"') {
-            let Ok(decoded) = serde_json::from_str::<String>(value.get()) else {
+        match raw_array_item_refs(&value) {
+            Some(entries) => {
+                for entry in entries {
+                    append_reasoning_entry_strings(out, &entry, scan_error)?;
+                }
+            }
+            None if value.get().trim_start().starts_with('[') => {
                 mark_unevaluable(scan_error);
                 return None;
-            };
-            append_scan_text(out, &decoded)?;
-            continue;
+            }
+            None => append_reasoning_entry_strings(out, &value, scan_error)?,
         }
-        // Any other carrier (`null`, an object, a scalar) is scanned whole
-        // rather than refused: it is forwarded as it is.
-        let Some(entries) = text
-            .starts_with('[')
-            .then(|| raw_array_item_refs(&value))
-            .flatten()
-        else {
+    }
+    Some(())
+}
+
+fn append_reasoning_entry_strings(
+    out: &mut String,
+    entry: &RawJson<'_>,
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> Option<()> {
+    let source = entry.get().trim_start();
+    if raw_is_object(entry) {
+        let Some(texts) = raw_top_level_values(entry.get().as_bytes(), "text") else {
+            mark_unevaluable(scan_error);
+            return None;
+        };
+        for text in texts {
             append_scan_text(
                 out,
-                &decoded_json_string_values_including_empty(value.get().as_bytes(), scan_error)?,
+                &decoded_json_string_values_including_empty(text.get().as_bytes(), scan_error)?,
             )?;
-            continue;
-        };
-        for entry in entries {
-            let strings = if raw_is_object(&entry) {
-                decoded_json_string_values_except_root_keys(
-                    entry.get().as_bytes(),
-                    &["type", "signature"],
-                    scan_error,
-                )?
-            } else {
-                decoded_json_string_values_including_empty(entry.get().as_bytes(), scan_error)?
-            };
-            append_scan_text(out, &strings)?;
         }
+    } else if source.starts_with('"') {
+        let Ok(decoded) = serde_json::from_str::<String>(source) else {
+            mark_unevaluable(scan_error);
+            return None;
+        };
+        append_scan_text(out, &decoded)?;
     }
     Some(())
 }
@@ -9113,7 +9121,20 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         }
         assert!(!scanned.contains("SIG"), "{scanned:?}");
 
-        // Other carriers are scanned whole, never refused as unscannable.
+        // Opaque members beside the text are not scan text.
+        let opaque = br#"{"messages":[{"role":"assistant","content":[{"type":"reasoning","summary":[{"type":"summary_text","text":"clean","encrypted_content":"OPAQUEBLOB","signature":"SIG"}]},{"type":"thinking","thinking":{"type":"text","text":"\u0042LOCKME","signature":"SIG"}}]}]}"#;
+        let scanned =
+            try_request_guardrail_text(PassthroughProtocol::OpenaiChat, opaque).expect("evaluable");
+        assert!(
+            scanned.contains("clean") && scanned.contains("BLOCKME"),
+            "{scanned:?}"
+        );
+        assert!(
+            !scanned.contains("OPAQUE") && !scanned.contains("SIG"),
+            "{scanned:?}"
+        );
+
+        // Other carriers are read, never refused as unscannable.
         for body in [
             &br#"{"messages":[{"role":"assistant","content":[{"type":"reasoning","summary":null,"encrypted_content":"opaque"},{"type":"text","text":"answer"}]}]}"#[..],
             br#"{"messages":[{"role":"assistant","content":[{"type":"reasoning","summary":["BLOCKME"]},{"type":"text","text":"answer"}]}]}"#,

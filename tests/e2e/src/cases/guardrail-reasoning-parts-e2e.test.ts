@@ -30,6 +30,7 @@ const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
 const MODEL = "reasoning-parts-model";
 const BLOCKWORD = "reasoningpartforbidden";
 const LATEST_TURN_BLOCKWORD = "latestturnreasoningforbidden";
+const SEGMENT_BLOCKWORD = "segmentreasoningforbidden";
 const EMAIL = "carol@example.com";
 const MASKED = "[EMAIL_REDACTED]";
 
@@ -105,6 +106,21 @@ describe("input guardrails read replayed reasoning content parts", () => {
       input_messages: "latest_turn",
       patterns: [{ kind: "literal", value: LATEST_TURN_BLOCKWORD }],
     });
+    // A segment-moderating kind: it takes its verdict from the segment
+    // pass, which receives signed reasoning only as scan-only text.
+    await seed.createGuardrail({
+      name: "reasoning-parts-segment-block",
+      enabled: true,
+      hook_point: "input",
+      fail_open: false,
+      kind: "custom",
+      script: `export async function checkInput(ctx) {
+  return ctx.text.includes("${SEGMENT_BLOCKWORD}")
+    ? { action: "block", reason_code: "R-1" }
+    : { action: "none" };
+}`,
+      timeout_ms: 5000,
+    });
     await seed.createGuardrail({
       name: "reasoning-parts-mask",
       enabled: true,
@@ -173,6 +189,15 @@ describe("input guardrails read replayed reasoning content parts", () => {
     expect(content[1]).toEqual(signed);
   });
 
+  test("a segment-moderating block rule fires on signed reasoning parts", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    await expectBlocked([mistralPart(`maybe ${SEGMENT_BLOCKWORD}`, "sig-mistral")]);
+    await expectBlocked([anthropicPart(`maybe ${SEGMENT_BLOCKWORD}`, "sig-anthropic")]);
+    await expectBlocked([
+      databricksPart({ text: `maybe ${SEGMENT_BLOCKWORD}`, signature: "sig-databricks" }),
+    ]);
+  });
+
   test("a block rule fires on a signed Databricks reasoning part", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     await expectBlocked([
@@ -238,6 +263,7 @@ describe("input guardrails read replayed reasoning content parts", () => {
     for (const part of [
       mistralPart(`maybe ${BLOCKWORD}`),
       databricksPart({ text: `maybe ${BLOCKWORD}`, signature: "sig-databricks" }),
+      { type: "thinking", thinking: { type: "text", text: `maybe ${BLOCKWORD}` } },
     ]) {
       const before = upstream!.receivedRequests.length;
       const res = await passthrough([part]);
