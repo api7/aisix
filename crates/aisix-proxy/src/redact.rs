@@ -676,8 +676,10 @@ pub fn redact_json_encoded(
 /// the flat `content` string and the `text` field of typed content
 /// blocks — the same surface `check_input` scans (`message_scan_text`).
 /// Tool-call arguments and replayed `reasoning_content` are covered too
-/// (both reach the upstream verbatim through `extra`). Returns the merged
-/// counts (empty = untouched).
+/// (both reach the upstream verbatim through `extra`), and so are
+/// unsigned reasoning content parts (a signed one is judged through
+/// [`chat_signed_reasoning_texts`] instead and forwarded unchanged).
+/// Returns the merged counts (empty = untouched).
 ///
 /// This list and `message_scan_text`'s must stay equal: a slot the scan
 /// reads but this does not is a Mask rule that reports a hit and then
@@ -698,6 +700,17 @@ pub fn redact_chat_format(chain: &dyn Guardrail, req: &mut ChatFormat) -> Redact
                 if block.get("type").and_then(Value::as_str) == Some("text") {
                     if let Some(text) = block.get_mut("text") {
                         apply_to_value_string(chain, dir, text, &mut counts);
+                    }
+                }
+                // Replayed reasoning written as a content part is masked
+                // like `reasoning_content` below — unless a signature
+                // covers it: that slot must reach the upstream
+                // byte-identical, as a signed Anthropic `thinking` block
+                // does (#1104), so it is judged through
+                // `chat_signed_reasoning_texts` and never offered here.
+                for slot in aisix_gateway::chat::reasoning_part_slots_mut(block) {
+                    if !slot.signed {
+                        apply_to_value_string(chain, dir, slot.text, &mut counts);
                     }
                 }
             }
@@ -863,6 +876,20 @@ fn redact_anthropic_content(
         }
         _ => {}
     }
+}
+
+/// The text of every signed reasoning content part in a chat request, for
+/// SCAN-ONLY submission to the segment pass ([`moderate_body_scanning`]) —
+/// the chat-wire counterpart of [`anthropic_signed_reasoning_texts`], and
+/// the slots [`redact_chat_format`] leaves unoffered.
+pub fn chat_signed_reasoning_texts(req: &ChatFormat) -> Vec<String> {
+    req.messages
+        .iter()
+        .flat_map(|m| m.content_blocks.iter().flatten())
+        .flat_map(aisix_gateway::chat::reasoning_part_slots)
+        .filter(|slot| slot.signed && !slot.text.is_empty())
+        .map(|slot| slot.text.to_owned())
+        .collect()
 }
 
 /// The plaintext of every signed reasoning block in an Anthropic request,
@@ -2680,6 +2707,45 @@ mod tests {
             Some("the user meant [EMAIL_REDACTED] I think"),
         );
         assert!(!counts.is_empty());
+    }
+
+    /// Reasoning content parts are masked like `reasoning_content` when
+    /// unsigned, and left byte-identical (but handed to the scan-only
+    /// tail) when a signature covers them.
+    #[test]
+    fn chat_format_masks_unsigned_reasoning_parts_only() {
+        let chain = both();
+        let mut req: ChatFormat = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "who?"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": [{"type": "text", "text": "mistral a@x.com"}]},
+                        {"type": "thinking", "signature": "sig", "thinking": [{"type": "text", "text": "signed b@x.com"}]},
+                        {"type": "reasoning", "summary": [
+                            {"type": "summary_text", "text": "unsigned c@x.com", "signature": ""},
+                            {"type": "summary_text", "text": "signed d@x.com", "signature": "sig"}
+                        ]},
+                        {"type": "text", "text": "answer"}
+                    ]
+                },
+                {"role": "user", "content": "go on"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            chat_signed_reasoning_texts(&req),
+            vec!["signed b@x.com".to_string(), "signed d@x.com".to_string()],
+        );
+        let counts = redact_chat_format(chain.as_ref(), &mut req);
+        assert!(!counts.is_empty());
+        let blocks = req.messages[1].content_blocks.as_ref().unwrap();
+        assert_eq!(blocks[0]["thinking"][0]["text"], "mistral [EMAIL_REDACTED]");
+        assert_eq!(blocks[1]["thinking"][0]["text"], "signed b@x.com");
+        assert_eq!(blocks[2]["summary"][0]["text"], "unsigned [EMAIL_REDACTED]");
+        assert_eq!(blocks[2]["summary"][1]["text"], "signed d@x.com");
     }
 
     /// C1: the `/v1/responses` scan reads a `reasoning` item's

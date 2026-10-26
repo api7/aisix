@@ -6412,6 +6412,46 @@ mod tests {
         ));
     }
 
+    /// The same skip for a turn whose only payload is reasoning content
+    /// parts (Mistral `thinking`, Databricks `reasoning`).
+    #[test]
+    fn build_converse_inputs_skips_a_reasoning_parts_only_assistant_turn() {
+        for parts in [
+            serde_json::json!([{"type": "thinking", "thinking": [{"type": "text", "text": "t"}]}]),
+            serde_json::json!([{"type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "t", "signature": "s"}]}]),
+        ] {
+            let req: ChatFormat = serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "q"},
+                    {"role": "assistant", "content": parts.clone()},
+                    {"role": "assistant", "content": "a"}
+                ]
+            }))
+            .unwrap();
+            let (_systems, messages) = build_converse_inputs(
+                &req,
+                None,
+                "meta.llama3-3-70b-instruct-v1:0",
+                &FetchedMedia::default(),
+                None,
+                false,
+            )
+            .unwrap();
+            let roles: Vec<ConversationRole> = messages.iter().map(|m| m.role().clone()).collect();
+            assert_eq!(
+                roles,
+                [ConversationRole::User, ConversationRole::Assistant],
+                "{parts}"
+            );
+            assert!(matches!(
+                messages[1].content(),
+                [ContentBlock::Text(t)] if t == "a"
+            ));
+        }
+    }
+
     #[test]
     fn build_converse_inputs_lifts_developer_to_system_blocks() {
         let req = ChatFormat::new(

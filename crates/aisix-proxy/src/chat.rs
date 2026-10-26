@@ -1617,13 +1617,15 @@ async fn dispatch(
     // The segment walker below borrows `req` mutably, so the addressed
     // model the check pass just read from `req.model` is taken first.
     let addressed_model = req.model.clone();
-    let input_verdict = crate::redact::moderate_body(
+    let signed_reasoning = crate::redact::chat_signed_reasoning_texts(req);
+    let input_verdict = crate::redact::moderate_body_scanning(
         resolved_chain.as_ref(),
         crate::redact::Direction::Input,
         Some(addressed_model.as_str()),
         input_verdict,
         redactions_out,
         monitor_hits_out,
+        signed_reasoning,
         |g| crate::redact::redact_chat_format(g, req),
     )
     .await;

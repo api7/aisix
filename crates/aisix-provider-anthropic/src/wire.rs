@@ -4645,6 +4645,34 @@ mod tests {
         assert_eq!(msgs.len(), 2);
     }
 
+    /// The same skip for a turn whose only payload is reasoning content
+    /// parts (Mistral `thinking`, Databricks `reasoning`): sent through,
+    /// it became an empty text block Anthropic rejects.
+    #[test]
+    fn a_reasoning_parts_only_assistant_turn_is_skipped() {
+        for parts in [
+            serde_json::json!([{"type": "thinking", "thinking": [{"type": "text", "text": "t"}]}]),
+            serde_json::json!([{"type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "t", "signature": "s"}]}]),
+        ] {
+            let reasoning_only: ChatMessage = serde_json::from_value(serde_json::json!({
+                "role": "assistant", "content": parts,
+            }))
+            .unwrap();
+            let req = ChatFormat::new(
+                "m",
+                vec![
+                    ChatMessage::user("q1"),
+                    reasoning_only,
+                    ChatMessage::user("q2"),
+                ],
+            );
+            let (_system, msgs) = split_system(&req).unwrap();
+            let roles: Vec<&str> = msgs.iter().map(|m| m.role).collect();
+            assert_eq!(roles, ["user"], "{parts}");
+        }
+    }
+
     /// Build an assistant ChatMessage replaying a single tool call, the
     /// OpenAI history shape an agent loop sends back.
     fn tool_call_assistant(id: &str, name: &str, arguments: &str) -> ChatMessage {

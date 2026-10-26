@@ -1418,6 +1418,9 @@ fn request_content_text(v: &serde_json::Value) -> String {
         .filter_map(|b| match b.get("type").and_then(|t| t.as_str()) {
             Some("tool_result") => b.get("content").map(request_content_text),
             Some("tool_use") => b.get("input").map(|i| i.to_string()),
+            Some("thinking" | "reasoning") if aisix_gateway::chat::is_reasoning_part(b) => {
+                aisix_gateway::chat::reasoning_part_text(b)
+            }
             Some("thinking") => b
                 .get("thinking")
                 .and_then(|t| t.as_str())
@@ -2697,7 +2700,11 @@ fn append_chat_request_content_strings(
                         }
                     }
                     Some("thinking") => {
-                        append_typed_top_level_strings(out, block_body, "thinking", scan_error)?
+                        append_reasoning_part_strings(out, block_body, "thinking", scan_error)?
+                    }
+                    Some("reasoning") => {
+                        append_reasoning_part_strings(out, block_body, "summary", scan_error)?;
+                        append_raw_top_level_strings(out, block_body, "text")?
                     }
                     Some("text") => {
                         append_typed_top_level_strings(out, block_body, "text", scan_error)?
@@ -2705,6 +2712,54 @@ fn append_chat_request_content_strings(
                     _ => append_raw_top_level_strings(out, block_body, "text")?,
                 }
             }
+        }
+    }
+    Some(())
+}
+
+/// Request text of a replayed reasoning part's `key`: an Anthropic
+/// `thinking` string, or the entry array of Mistral's `thinking` and
+/// Databricks' `reasoning.summary` — every string of each entry but its
+/// `type` and `signature`, the same text the typed chat route reads
+/// through `aisix_gateway::chat::reasoning_part_slots`. A signed entry is
+/// scanned too; nothing on this route is rewritten.
+fn append_reasoning_part_strings(
+    out: &mut String,
+    block_body: &[u8],
+    key: &str,
+    scan_error: &mut Option<crate::json_splice::SpliceError>,
+) -> Option<()> {
+    let Some(values) = raw_top_level_values(block_body, key) else {
+        mark_unevaluable(scan_error);
+        return None;
+    };
+    for value in values {
+        let text = value.get().trim_start();
+        if text.starts_with('"') {
+            let Ok(decoded) = serde_json::from_str::<String>(value.get()) else {
+                mark_unevaluable(scan_error);
+                return None;
+            };
+            append_scan_text(out, &decoded)?;
+            continue;
+        }
+        let Some(entries) = raw_array_item_refs(&value) else {
+            mark_unevaluable(scan_error);
+            return None;
+        };
+        for entry in entries {
+            if !raw_is_object(&entry) {
+                mark_unevaluable(scan_error);
+                return None;
+            }
+            append_scan_text(
+                out,
+                &decoded_json_string_values_except_root_keys(
+                    entry.get().as_bytes(),
+                    &["type", "signature"],
+                    scan_error,
+                )?,
+            )?;
         }
     }
     Some(())
@@ -9035,6 +9090,21 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
                 "{protocol:?}: {scanned:?}"
             );
         }
+    }
+
+    /// Replayed reasoning parts are request text: Mistral's `thinking`
+    /// entry array (once refused as unevaluable) and Databricks'
+    /// `reasoning.summary` (once never read), signed or not, every
+    /// duplicate key included — but never their signatures.
+    #[test]
+    fn replayed_reasoning_parts_are_request_guardrail_text() {
+        let body = br#"{"messages":[{"role":"assistant","content":[{"type":"thinking","signature":"SIGMISTRAL","thinking":[{"type":"text","text":"MISTRALBLOCKME"}]},{"type":"reasoning","summary":[{"type":"summary_text","text":"clean","signature":"SIGDATABRICKS"}],"summary":[{"type":"summary_text","text":"DATABRICKSBLOCKME"}]},{"type":"text","text":"answer"}]}]}"#;
+        let scanned = try_request_guardrail_text(PassthroughProtocol::OpenaiChat, body)
+            .expect("reasoning parts are evaluable");
+        for expected in ["MISTRALBLOCKME", "DATABRICKSBLOCKME", "clean", "answer"] {
+            assert!(scanned.contains(expected), "{scanned:?}");
+        }
+        assert!(!scanned.contains("SIG"), "{scanned:?}");
     }
 
     #[test]
