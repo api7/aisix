@@ -3354,6 +3354,9 @@ fn build_tool_config(
         if let Some(description) = function.get("description").and_then(|v| v.as_str()) {
             spec = spec.description(description);
         }
+        if let Some(strict) = function.get("strict").and_then(|v| v.as_bool()) {
+            spec = spec.strict(strict);
+        }
         // OpenAI `parameters` is a JSON Schema object, an empty object
         // schema when omitted.
         let parameters = match function.get("parameters") {
@@ -3373,10 +3376,19 @@ fn build_tool_config(
         }
     }
     if let Some(schema) = json_tool_schema {
+        // The caller's `json_schema.strict` rides the tool that carries
+        // their schema; one the gateway set while translating is not theirs.
+        let strict = req
+            .extra
+            .get("response_format")
+            .and_then(|rf| rf.pointer("/json_schema/strict"))
+            .and_then(|v| v.as_bool())
+            .filter(|_| !req.gateway_strict_schema);
         if let Ok(spec) = ToolSpecification::builder()
             .name(JSON_TOOL_NAME)
             .description(JSON_TOOL_DESCRIPTION)
             .input_schema(ToolInputSchema::Json(json_to_document(schema)))
+            .set_strict(strict)
             .build()
         {
             tools.push(Tool::ToolSpec(spec));
@@ -5730,6 +5742,8 @@ mod tests {
         // Another publisher gets the caller's schema as sent, not Claude's
         // sealed subset.
         assert_eq!(tools[0]["toolSpec"]["inputSchema"]["json"], person_schema());
+        // The caller's `json_schema.strict` rides the synthetic tool.
+        assert_eq!(tools[0]["toolSpec"]["strict"], true);
         assert_eq!(
             body["toolConfig"]["toolChoice"]["tool"]["name"],
             JSON_TOOL_NAME

@@ -193,12 +193,13 @@ describe("Amazon Bedrock: request fields by the target's contract", () => {
     }
   });
 
-  test("Cohere Command R, Jamba and Z.AI GLM get the fields their Bedrock request body defines", async (ctx) => {
+  test("Cohere Command R, Jamba, Z.AI GLM and Kimi K3 get the fields their Bedrock request body defines", async (ctx) => {
     if (skip(ctx)) return;
     const cases: Array<[string, Record<string, unknown>, Record<string, unknown>]> = [
       ["pb-cohere", { seed: 3, frequency_penalty: 0.5, presence_penalty: 0.5, user: "u" }, { seed: 3, frequency_penalty: 0.5, presence_penalty: 0.5 }],
       ["pb-jamba", { seed: 3, frequency_penalty: 0.5, presence_penalty: 0.5 }, { frequency_penalty: 0.5, presence_penalty: 0.5 }],
       ["pb-glm", { reasoning_effort: "max" }, { reasoning_effort: "max" }],
+      ["pb-kimi", { reasoning_effort: "high" }, { reasoning_effort: "high" }],
     ];
     for (const [model, extra, want] of cases) {
       const { result, sent } = await capture(() => chat({ model, messages: HI, ...extra }));
@@ -272,6 +273,32 @@ describe("Amazon Bedrock: request fields by the target's contract", () => {
       chat({ model: "pb-llama", messages: HI, response_format: { type: "json_schema", json_schema: { name: "p", schema } } }),
     );
     expect(sent[0].body.toolConfig.tools[0].toolSpec.inputSchema.json).toEqual(schema);
+  });
+
+  test("a function's strict and the caller's json_schema.strict reach Converse toolSpec.strict", async (ctx) => {
+    if (skip(ctx)) return;
+    const parameters = { type: "object", properties: { city: { type: "string" } } };
+    const tools = await capture(() =>
+      chat({
+        model: "pb-nova",
+        messages: HI,
+        tools: [
+          { type: "function", function: { name: "strict_fn", strict: true, parameters } },
+          { type: "function", function: { name: "loose_fn", parameters } },
+        ],
+      }),
+    );
+    expect(tools.result.status, tools.result.text).toBe(200);
+    expect(tools.sent[0].body.toolConfig.tools.map((t: any) => [t.toolSpec.name, t.toolSpec.strict])).toEqual([
+      ["strict_fn", true],
+      ["loose_fn", undefined],
+    ]);
+    const schema = { type: "object", properties: { name: { type: "string" } }, required: ["name"], additionalProperties: false };
+    const json = await capture(() =>
+      chat({ model: "pb-nova", messages: HI, response_format: { type: "json_schema", json_schema: { name: "p", schema, strict: true } } }),
+    );
+    expect(json.result.status, json.result.text).toBe(200);
+    expect(json.sent[0].body.toolConfig.tools[0].toolSpec.strict).toBe(true);
   });
 
   test("Chat Completions keeps developer and serves thinking, top_k and json_object itself", async (ctx) => {

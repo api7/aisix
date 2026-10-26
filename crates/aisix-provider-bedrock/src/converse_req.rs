@@ -356,7 +356,7 @@ fn is_nova_2(model_id: &str) -> bool {
 
 /// `reasoning_effort` in the shape each non-Claude publisher takes on
 /// Converse, as one `additionalModelRequestFields` member: gpt-oss, Grok,
-/// DeepSeek V3 and Z.AI GLM take it verbatim, OpenAI GPT-5.x/6 as
+/// DeepSeek V3, Z.AI GLM and Kimi K3 take it verbatim, OpenAI GPT-5.x/6 as
 /// `reasoning.effort`, Amazon Nova 2 as `reasoningConfig`. DeepSeek R1
 /// always reasons and rejects every shape, and other publishers have none,
 /// so it is dropped for them. Claude's translation lives with the
@@ -378,6 +378,7 @@ pub(crate) fn reasoning_field(
         || id.contains("deepseek")
         || id.starts_with("xai.grok-")
         || id.starts_with("zai.")
+        || id.starts_with("moonshotai.kimi-k3")
     {
         return Ok(Some((
             "reasoning_effort",
@@ -632,6 +633,10 @@ mod tests {
         );
         assert_eq!(
             reasoning_field(&r, "zai.glm-5.3").unwrap(),
+            Some(("reasoning_effort", serde_json::json!("high")))
+        );
+        assert_eq!(
+            reasoning_field(&r, "moonshotai.kimi-k3").unwrap(),
             Some(("reasoning_effort", serde_json::json!("high")))
         );
         // Nova 2: "none" turns reasoning off, a tier it lacks is dropped.

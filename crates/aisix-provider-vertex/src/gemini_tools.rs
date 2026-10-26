@@ -152,19 +152,32 @@ pub(crate) fn gemini_3_or_newer(model: &str) -> bool {
 }
 
 /// `tools` → Gemini's `tools` array: every function tool becomes a
-/// declaration in ONE `functionDeclarations` tool. A tool of any other
-/// type (another provider's hosted tool) has no Gemini equivalent here
-/// and is refused rather than dropped.
-pub(crate) fn gemini_tools(tools: &Value) -> Result<Option<Vec<Value>>, BridgeError> {
-    let Some(entries) = tools.as_array() else {
-        return Ok(None);
+/// declaration in ONE `functionDeclarations` tool. An OpenAI `custom` tool
+/// takes free-form text, which Gemini has no declaration for, and is
+/// dropped; a tool of any other type (another provider's hosted tool) is
+/// refused.
+///
+/// The parameters go as `parametersJsonSchema`, verbatim, on the families
+/// that take it ([`takes_parameters_json_schema`]); older ones get the typed
+/// `parameters` schema where it can express them
+/// ([`gemini_function_parameters`]).
+pub(crate) fn gemini_tools(
+    tools: &Value,
+    upstream_model: &str,
+) -> Result<Option<Vec<Value>>, BridgeError> {
+    let entries = match tools {
+        Value::Null => return Ok(None),
+        Value::Array(entries) => entries,
+        _ => return Err(BridgeError::InvalidRequest("tools must be an array".into())),
     };
+    let json_schema = takes_parameters_json_schema(upstream_model);
     let mut declarations = Vec::new();
-    for entry in entries {
+    for (i, entry) in entries.iter().enumerate() {
         let kind = entry.get("type").and_then(Value::as_str);
         // `{"type":"function","function":{...}}`, or the bare function
         // object some clients send.
         let function = match (kind, entry.get("function")) {
+            (Some("custom"), _) => continue,
             (None | Some("function"), Some(f)) => f,
             (None, None) if entry.get("name").is_some() => entry,
             _ => {
@@ -175,9 +188,9 @@ pub(crate) fn gemini_tools(tools: &Value) -> Result<Option<Vec<Value>>, BridgeEr
             }
         };
         let Some(name) = function.get("name").and_then(Value::as_str) else {
-            return Err(BridgeError::InvalidRequest(
-                "function tool has no name".into(),
-            ));
+            return Err(BridgeError::InvalidRequest(format!(
+                "tools[{i}].function.name is required"
+            )));
         };
         let mut declaration = Map::new();
         declaration.insert("name".into(), name.into());
@@ -187,7 +200,15 @@ pub(crate) fn gemini_tools(tools: &Value) -> Result<Option<Vec<Value>>, BridgeEr
         match function.get("parameters") {
             None | Some(Value::Null) => {}
             Some(Value::String(s)) if s.is_empty() => {
-                declaration.insert("parameters".into(), json!({"type": "object"}));
+                let key = if json_schema {
+                    "parametersJsonSchema"
+                } else {
+                    "parameters"
+                };
+                declaration.insert(key.into(), json!({"type": "object"}));
+            }
+            Some(schema) if json_schema => {
+                declaration.insert("parametersJsonSchema".into(), schema.clone());
             }
             Some(schema) => match gemini_function_parameters(schema) {
                 GeminiParameters::Typed(typed) => {
@@ -206,40 +227,89 @@ pub(crate) fn gemini_tools(tools: &Value) -> Result<Option<Vec<Value>>, BridgeEr
     Ok(Some(vec![json!({ "functionDeclarations": declarations })]))
 }
 
+/// Whether `model` takes a function's JSON Schema verbatim as
+/// `parametersJsonSchema`: Gemini 2.5 and later, which is where it was
+/// verified live (2.5 Flash / Flash-Lite / Pro, 3 Flash, 3.1 Pro). Older
+/// families get the typed `parameters` form.
+pub(crate) fn takes_parameters_json_schema(model: &str) -> bool {
+    if gemini_3_or_newer(model) {
+        return true;
+    }
+    let name = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    name.strip_prefix("gemini-2.5")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+}
+
 /// `tool_choice` → `toolConfig`. `none` / `auto` / `required` become the
-/// `NONE` / `AUTO` / `ANY` calling modes; a named function becomes `ANY`
-/// restricted to that one name. Anything else is refused.
+/// `NONE` / `AUTO` / `ANY` calling modes, a named function becomes `ANY`
+/// restricted to that one name, and an `allowed_tools` subset in
+/// `required` mode becomes `ANY` restricted to the subset's functions.
+/// `null`, an `allowed_tools` subset in `auto` mode (Gemini restricts
+/// names only when a call is forced) and a `custom` tool set no choice.
+/// Any other shape is not a valid OpenAI `tool_choice` and is refused.
 pub(crate) fn gemini_tool_config(choice: &Value) -> Result<Option<Value>, BridgeError> {
+    let invalid = || {
+        BridgeError::InvalidRequest(
+            "tool_choice must be \"none\", \"auto\", \"required\" or a \
+             {\"type\": \"function\", \"function\": {\"name\": …}} object"
+                .into(),
+        )
+    };
     let config = match choice {
+        Value::Null => return Ok(None),
         Value::String(mode) => {
             let mode = match mode.as_str() {
                 "none" => "NONE",
                 "auto" => "AUTO",
                 "required" => "ANY",
-                other => {
-                    return Err(BridgeError::InvalidRequest(format!(
-                        "tool_choice {other:?} is not supported for this model; \
-                         use \"auto\", \"none\", \"required\" or a named function"
-                    )))
-                }
+                _ => return Err(invalid()),
             };
             json!({ "mode": mode })
         }
-        Value::Object(_) => {
-            let Some(name) = choice
-                .pointer("/function/name")
-                .and_then(Value::as_str)
-                .filter(|n| !n.is_empty())
-            else {
-                return Err(BridgeError::InvalidRequest(
-                    "tool_choice object must name a function: \
-                     {\"type\":\"function\",\"function\":{\"name\":...}}"
-                        .into(),
-                ));
-            };
-            json!({ "mode": "ANY", "allowedFunctionNames": [name] })
-        }
-        _ => return Ok(None),
+        Value::Object(o) => match o.get("type").and_then(Value::as_str) {
+            None | Some("function") => {
+                let Some(name) = choice
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .filter(|n| !n.is_empty())
+                else {
+                    return Err(BridgeError::InvalidRequest(
+                        "tool_choice.function.name is required".into(),
+                    ));
+                };
+                json!({ "mode": "ANY", "allowedFunctionNames": [name] })
+            }
+            Some("allowed_tools") => {
+                let allowed = choice.get("allowed_tools");
+                if allowed.and_then(|a| a.get("mode")).and_then(Value::as_str) != Some("required") {
+                    return Ok(None);
+                }
+                let names: Vec<&str> = allowed
+                    .and_then(|a| a.get("tools"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    // A `custom` tool is not declared to Gemini.
+                    .filter(|t| t.get("type").and_then(Value::as_str) != Some("custom"))
+                    .filter_map(|t| {
+                        t.pointer("/function/name")
+                            .or_else(|| t.get("name"))
+                            .and_then(Value::as_str)
+                    })
+                    .collect();
+                if names.is_empty() {
+                    return Ok(None);
+                }
+                json!({ "mode": "ANY", "allowedFunctionNames": names })
+            }
+            Some("custom") => return Ok(None),
+            Some(_) => return Err(invalid()),
+        },
+        _ => return Err(invalid()),
     };
     Ok(Some(json!({ "functionCallingConfig": config })))
 }
@@ -758,24 +828,50 @@ mod tests {
             mode(json!({"type": "function", "function": {"name": "get_weather"}})),
             json!({"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["get_weather"]}})
         );
+        assert_eq!(
+            mode(
+                json!({"type": "allowed_tools", "allowed_tools": {"mode": "required", "tools": [
+                    {"type": "function", "function": {"name": "get_weather"}},
+                    {"type": "custom", "name": "grammar"},
+                    {"type": "function", "function": {"name": "now"}},
+                ]}})
+            ),
+            json!({"functionCallingConfig": {"mode": "ANY",
+                                             "allowedFunctionNames": ["get_weather", "now"]}})
+        );
+        for unset in [
+            Value::Null,
+            json!({"type": "allowed_tools", "allowed_tools": {"mode": "auto", "tools": [
+                {"type": "function", "function": {"name": "get_weather"}}]}}),
+            json!({"type": "custom", "custom": {"name": "grammar"}}),
+        ] {
+            assert_eq!(gemini_tool_config(&unset).unwrap(), None, "{unset}");
+        }
+        let refusal = |c: Value| match gemini_tool_config(&c) {
+            Err(BridgeError::InvalidRequest(m)) => m,
+            other => panic!("{c}: {other:?}"),
+        };
         for refused in [
             json!("any"),
-            json!({"type": "allowed_tools", "allowed_tools": {"mode": "auto", "tools": []}}),
-            json!({"type": "function", "function": {}}),
+            json!(1),
+            json!(true),
+            json!({"type": "hosted"}),
         ] {
-            assert!(
-                matches!(
-                    gemini_tool_config(&refused),
-                    Err(BridgeError::InvalidRequest(_))
-                ),
-                "{refused}"
+            assert_eq!(
+                refusal(refused),
+                "tool_choice must be \"none\", \"auto\", \"required\" or a \
+                 {\"type\": \"function\", \"function\": {\"name\": …}} object"
             );
         }
+        assert_eq!(
+            refusal(json!({"type": "function", "function": {}})),
+            "tool_choice.function.name is required"
+        );
     }
 
     #[test]
     fn function_tools_become_one_declarations_tool() {
-        let tools = gemini_tools(&json!([
+        let tools = json!([
             {"type": "function", "function": {
                 "name": "get_weather", "description": "Weather", "strict": true,
                 "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
@@ -783,11 +879,11 @@ mod tests {
             {"type": "function", "function": {"name": "now"}},
             {"type": "function", "function": {"name": "pick", "parameters":
                 {"type": "object", "properties": {"x": {"oneOf": [{"type": "string"}, {"type": "integer"}]}}}}},
-        ]))
-        .unwrap()
-        .unwrap();
+        ]);
         assert_eq!(
-            tools,
+            gemini_tools(&tools, "gemini-2.0-flash-001")
+                .unwrap()
+                .unwrap(),
             vec![json!({"functionDeclarations": [
                 {"name": "get_weather", "description": "Weather",
                  "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
@@ -797,23 +893,76 @@ mod tests {
                     {"type": "object", "properties": {"x": {"oneOf": [{"type": "string"}, {"type": "integer"}]}}}},
             ]})]
         );
-        assert_eq!(gemini_tools(&json!([])).unwrap(), None);
+        assert_eq!(gemini_tools(&json!([]), "gemini-2.5-flash").unwrap(), None);
+        assert_eq!(
+            gemini_tools(&Value::Null, "gemini-2.5-flash").unwrap(),
+            None
+        );
     }
 
     #[test]
-    fn a_tool_type_without_a_gemini_equivalent_is_refused() {
-        for tool in [
-            json!({"type": "web_search_preview"}),
-            json!({"type": "custom", "custom": {"name": "x"}}),
+    fn gemini_2_5_and_later_take_the_parameters_verbatim_as_json_schema() {
+        let parameters = json!({"type": "object", "properties": {"city": {"type": "string"}},
+                                "required": ["city"], "additionalProperties": false});
+        for model in [
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.5-pro",
+            "gemini-3-flash-preview",
+            "gemini-3.1-pro-preview",
+            "gemini-flash-latest",
         ] {
-            assert!(
-                matches!(
-                    gemini_tools(&json!([tool])),
-                    Err(BridgeError::InvalidRequest(_))
-                ),
-                "{tool}"
+            let tools = json!([{"type": "function",
+                                "function": {"name": "get_weather", "parameters": parameters}}]);
+            assert_eq!(
+                gemini_tools(&tools, model).unwrap().unwrap(),
+                vec![json!({"functionDeclarations": [
+                    {"name": "get_weather", "parametersJsonSchema": parameters}
+                ]})],
+                "{model}"
             );
         }
+        for model in ["gemini-2.0-flash-001", "gemini-1.5-pro", "gemini-pro"] {
+            assert!(!takes_parameters_json_schema(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn a_custom_tool_is_dropped_and_another_tool_type_refused() {
+        let tools = json!([
+            {"type": "custom", "custom": {"name": "x"}},
+            {"type": "function", "function": {"name": "now"}},
+        ]);
+        assert_eq!(
+            gemini_tools(&tools, "gemini-2.5-flash").unwrap().unwrap(),
+            vec![json!({"functionDeclarations": [{"name": "now"}]})]
+        );
+        let only_custom = json!([{"type": "custom", "custom": {"name": "x"}}]);
+        assert_eq!(
+            gemini_tools(&only_custom, "gemini-2.5-flash").unwrap(),
+            None
+        );
+        assert!(matches!(
+            gemini_tools(&json!([{"type": "web_search_preview"}]), "gemini-2.5-flash"),
+            Err(BridgeError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_tools_are_refused_naming_the_field() {
+        let message = |tools: Value| match gemini_tools(&tools, "gemini-2.5-flash") {
+            Err(BridgeError::InvalidRequest(m)) => m,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            message(json!({"type": "function"})),
+            "tools must be an array"
+        );
+        assert_eq!(
+            message(json!([{"type": "function", "function": {"name": "a"}},
+                           {"type": "function", "function": {}}])),
+            "tools[1].function.name is required"
+        );
     }
 
     #[test]
