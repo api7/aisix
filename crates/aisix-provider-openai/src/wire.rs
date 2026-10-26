@@ -589,7 +589,7 @@ pub struct OpenAiStreamDelta {
     #[serde(default)]
     pub role: Option<String>,
     /// A string, or (from some compatible servers) an array of content
-    /// parts, whose text is relayed.
+    /// parts, whose text and reasoning parts are relayed.
     #[serde(default)]
     pub content: Option<OpenAiResponseContent>,
     #[serde(default)]
@@ -685,10 +685,46 @@ impl ChoiceToolCallIndexer {
     }
 }
 
+/// One stretch of a streamed delta's text or reasoning.
+enum DeltaRun {
+    Text(String),
+    Reasoning(String),
+}
+
+/// The text and reasoning of a part-array delta `content`, in the order
+/// the upstream streamed them, adjacent parts of one kind joined into one
+/// run. A `reasoning_content` field on the same delta leads. Reasoning
+/// parts are read by [`aisix_gateway::chat::reasoning_part_text`], text
+/// parts as [`aisix_gateway::chat::blocks_text`] reads them.
+fn part_runs(reasoning_field: Option<String>, parts: &[serde_json::Value]) -> Vec<DeltaRun> {
+    let mut runs: Vec<DeltaRun> = reasoning_field
+        .map(DeltaRun::Reasoning)
+        .into_iter()
+        .collect();
+    for part in parts {
+        let run = if let Some(text) = aisix_gateway::chat::reasoning_part_text(part) {
+            DeltaRun::Reasoning(text)
+        } else {
+            match aisix_gateway::chat::blocks_text(std::slice::from_ref(part)) {
+                text if text.is_empty() => continue,
+                text => DeltaRun::Text(text),
+            }
+        };
+        match (runs.last_mut(), run) {
+            (Some(DeltaRun::Text(acc)), DeltaRun::Text(text))
+            | (Some(DeltaRun::Reasoning(acc)), DeltaRun::Reasoning(text)) => acc.push_str(&text),
+            (_, run) => runs.push(run),
+        }
+    }
+    runs
+}
+
 /// One gateway chunk per choice the frame carries, each keyed by its
-/// choice index; the frame's usage rides the last of them. A frame with
-/// no choice is one chunk with an empty delta. Empty for a frame with no
-/// `choices` key and no usage, which carries nothing to relay.
+/// choice index; the frame's usage rides the last of them. A choice whose
+/// part-array content interleaves text and reasoning is one chunk per
+/// run, in order (see [`part_runs`]). A frame with no choice is one chunk
+/// with an empty delta. Empty for a frame with no `choices` key and no
+/// usage, which carries nothing to relay.
 pub fn stream_chunk_into_chat_chunks(
     mut raw: OpenAiStreamChunk,
     tool_call_indexer: &mut ToolCallIndexer,
@@ -703,29 +739,40 @@ pub fn stream_chunk_into_chat_chunks(
         .unwrap_or_default()
         .into_iter()
         .enumerate()
-        .map(|(position, c)| {
+        .flat_map(|(position, c)| {
             let choice_index = c.index.unwrap_or(position as u32);
             let indexer = tool_call_indexer.choice(choice_index);
-            let content = c.delta.content.map(|content| match content {
-                OpenAiResponseContent::Text(text) => text,
-                OpenAiResponseContent::Parts(parts) => aisix_gateway::chat::blocks_text(&parts),
-            });
-            let delta = ChatDelta {
+            // #648 canonical precedence, mirrored on the streaming path
+            // (#502): DeepSeek-canonical `reasoning_content` wins; fall
+            // back to OpenRouter's `reasoning`. Skip empties so a model
+            // that streams `""` doesn't emit a noise field.
+            let reasoning_field = c
+                .delta
+                .reasoning_content
+                .filter(|s| !s.is_empty())
+                .or(c.delta.reasoning.filter(|s| !s.is_empty()));
+            let (mut runs, content, reasoning_content) = match c.delta.content {
+                Some(OpenAiResponseContent::Parts(parts)) => {
+                    let mut runs = part_runs(reasoning_field, &parts);
+                    match runs.pop() {
+                        Some(DeltaRun::Text(text)) => (runs, Some(text), None),
+                        Some(DeltaRun::Reasoning(text)) => (runs, None, Some(text)),
+                        None => (runs, Some(String::new()), None),
+                    }
+                }
+                Some(OpenAiResponseContent::Text(text)) => {
+                    (Vec::new(), Some(text), reasoning_field)
+                }
+                None => (Vec::new(), None, reasoning_field),
+            };
+            let mut delta = ChatDelta {
                 role: c.delta.role.as_deref().map(role_from_str),
                 content,
                 tool_calls: c.delta.tool_calls.map(|mut calls| {
                     indexer.fill(&mut calls);
                     calls
                 }),
-                // #648 canonical precedence, mirrored on the streaming path
-                // (#502): DeepSeek-canonical `reasoning_content` wins; fall
-                // back to OpenRouter's `reasoning`. Skip empties so a model
-                // that streams `""` doesn't emit a noise field.
-                reasoning_content: c
-                    .delta
-                    .reasoning_content
-                    .filter(|s| !s.is_empty())
-                    .or(c.delta.reasoning.filter(|s| !s.is_empty())),
+                reasoning_content,
                 audio: c.delta.audio.filter(|a| !a.is_null()),
                 extra: c.delta.extra,
             };
@@ -733,17 +780,45 @@ pub fn stream_chunk_into_chat_chunks(
                 .finish_reason
                 .as_deref()
                 .map(|r| turn_finish_reason(Some(r), indexer.saw_tool_call()));
-            ChatChunk {
+            let chunk = |delta| ChatChunk {
                 id: raw.id.clone(),
                 model: raw.model.clone(),
                 choice_index,
                 delta,
-                finish_reason,
-                logprobs: c.logprobs.filter(|l| !l.is_null()),
+                finish_reason: None,
+                logprobs: None,
                 usage: None,
                 service_tier: service_tier.clone(),
                 accounting_usage: None,
-            }
+            };
+            // Every run but the last is a chunk of its own ahead of the
+            // delta's other fields, so text and reasoning keep the order
+            // the upstream streamed them in. The role rides the first.
+            let mut role = delta.role.take();
+            let mut out: Vec<ChatChunk> = runs
+                .drain(..)
+                .map(|run| {
+                    let role = role.take();
+                    chunk(match run {
+                        DeltaRun::Text(text) => ChatDelta {
+                            role,
+                            content: Some(text),
+                            ..ChatDelta::default()
+                        },
+                        DeltaRun::Reasoning(text) => ChatDelta {
+                            role,
+                            reasoning_content: Some(text),
+                            ..ChatDelta::default()
+                        },
+                    })
+                })
+                .collect();
+            delta.role = role;
+            let mut last = chunk(delta);
+            last.finish_reason = finish_reason;
+            last.logprobs = c.logprobs.filter(|l| !l.is_null());
+            out.push(last);
+            out
         })
         .collect();
     // A frame with no choice (an empty `choices`, or usage alone) is still
@@ -1719,6 +1794,75 @@ mod tests {
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
         let chunk = first_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
         assert!(chunk.delta.reasoning_content.is_none());
+    }
+
+    /// Reasoning content parts in a streamed delta reach the reasoning
+    /// slot, in the order the upstream streamed them relative to the text:
+    /// Mistral's `thinking` entries and Databricks' `reasoning` summary.
+    #[test]
+    fn stream_chunk_reasoning_parts_keep_their_order_with_text() {
+        let raw = stream_chunk(serde_json::json!({
+            "id": "c", "model": "m",
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": [{"type": "text", "text": "plan "}]},
+                    {"type": "thinking", "thinking": [{"type": "text", "text": "more"}],
+                     "signature": "sig"},
+                    {"type": "text", "text": "Hello"},
+                    {"type": "reasoning", "summary": [
+                        {"type": "summary_text", "text": "after", "signature": "s2"}]},
+                ]},
+                "finish_reason": "stop",
+                "logprobs": {"content": []}
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
+        }));
+        let chunks = stream_chunk_into_chat_chunks(raw, &mut ToolCallIndexer::default());
+        let shape: Vec<_> = chunks
+            .iter()
+            .map(|c| {
+                (
+                    c.delta.role.is_some(),
+                    c.delta.reasoning_content.as_deref(),
+                    c.delta.content.as_deref(),
+                    c.finish_reason.is_some(),
+                    c.logprobs.is_some(),
+                    c.usage.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (true, Some("plan more"), None, false, false, false),
+                (false, None, Some("Hello"), false, false, false),
+                (false, Some("after"), None, true, true, true),
+            ]
+        );
+        assert!(chunks.iter().all(|c| c.choice_index == 0));
+    }
+
+    /// A delta whose parts carry no text keeps relaying an empty content,
+    /// and a lone reasoning part is one reasoning chunk.
+    #[test]
+    fn stream_chunk_parts_without_runs_and_a_lone_reasoning_part() {
+        let delta = |content: serde_json::Value| {
+            let raw = stream_chunk(serde_json::json!({
+                "id": "c", "model": "m",
+                "choices": [{"index": 0, "delta": {"content": content}}]
+            }));
+            stream_chunk_into_chat_chunks(raw, &mut ToolCallIndexer::default())
+        };
+        let empty = delta(serde_json::json!([{"type": "image_url", "image_url": {"url": "u"}}]));
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].delta.content.as_deref(), Some(""));
+        let lone = delta(serde_json::json!([
+            {"type": "thinking", "thinking": [{"type": "text", "text": "why"}]}
+        ]));
+        assert_eq!(lone.len(), 1);
+        assert_eq!(lone[0].delta.reasoning_content.as_deref(), Some("why"));
+        assert_eq!(lone[0].delta.content, None);
     }
 
     #[test]
