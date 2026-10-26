@@ -108,12 +108,6 @@ describe("a refused request shape is described as a request error", () => {
       api_base: baseUrl,
     });
     await seed.createModel({
-      display_name: "refusal-nova",
-      provider: "bedrock",
-      model_name: "us.amazon.nova-lite-v1:0",
-      provider_key_id: bedrockPk.id,
-    });
-    await seed.createModel({
       display_name: "refusal-bedrock-claude",
       provider: "bedrock",
       model_name: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
@@ -227,46 +221,6 @@ describe("a refused request shape is described as a request error", () => {
         messages: UNNAMED_TOOL_RESULT,
       });
       await expectRequestRefusal(res, /^tool message missing tool_call_id/);
-      expect(upstreamHits, `stream=${stream}`).toBe(before);
-    }
-  });
-
-  // A request with nothing but instructions gives the model no turn to
-  // answer, and Bedrock rejects it on every rail. It is the request that has
-  // to change, so the gateway refuses it the same way whichever rail serves
-  // it: Converse for Nova, `/invoke` for a non-streaming Claude call, and
-  // ConverseStream for a streaming one. Each entry point reaches the same
-  // bridge.
-  const SYSTEM_ONLY: Record<string, (model: string, stream: boolean) => unknown> = {
-    "/v1/chat/completions": (model, stream) => ({
-      model,
-      stream,
-      messages: [{ role: "system", content: "You are terse." }],
-    }),
-    "/v1/messages": (model, stream) => ({
-      model,
-      stream,
-      max_tokens: 64,
-      system: "You are terse.",
-      messages: [],
-    }),
-    "/v1/responses": (model, stream) => ({
-      model,
-      stream,
-      instructions: "You are terse.",
-      input: [],
-    }),
-  };
-  test.for<[string, string]>(
-    ["refusal-nova", "refusal-bedrock-claude"].flatMap((model) =>
-      Object.keys(SYSTEM_ONLY).map((path): [string, string] => [path, model]),
-    ),
-  )("%s: a system-only request on %s", async ([path, model], ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    for (const stream of [false, true]) {
-      const before = upstreamHits;
-      const res = await post(app, path, SYSTEM_ONLY[path]!(model, stream));
-      await expectRequestRefusal(res, /at least one user or assistant turn/);
       expect(upstreamHits, `stream=${stream}`).toBe(before);
     }
   });

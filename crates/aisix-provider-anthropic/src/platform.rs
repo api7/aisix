@@ -121,6 +121,10 @@ const BEDROCK_BETAS: &[(&str, &str)] = &[
         "context-management-2025-06-27",
         "context-management-2025-06-27",
     ),
+    (
+        "dev-full-thinking-2025-05-14",
+        "dev-full-thinking-2025-05-14",
+    ),
     ("effort-2025-11-24", "effort-2025-11-24"),
     (
         "fine-grained-tool-streaming-2025-05-14",

@@ -612,14 +612,13 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
   });
 
   // Values Claude's Messages API refuses are the upstream's to refuse, as on
-  // the Anthropic route: nothing is dropped or filtered on the way.
-  test("a non-streamed Claude request forwards stop and max_completion_tokens as sent", async (ctx) => {
+  // the Anthropic route; a value OpenAI itself does not allow is refused,
+  // naming the field.
+  test("a non-streamed Claude request forwards stop as sent and refuses a wrong-typed stop or cap", async (ctx) => {
     if (skip(ctx)) return;
     const cases: Array<[Record<string, unknown>, Record<string, unknown>]> = [
       [{ stop: "" }, { stop_sequences: [""] }],
       [{ stop: ["", "gamma"] }, { stop_sequences: ["", "gamma"] }],
-      [{ stop: 5 }, { stop: 5 }],
-      [{ max_completion_tokens: "many" }, { max_completion_tokens: "many" }],
     ];
     for (const [extra, expected] of cases) {
       const { result, sent } = await capture(() =>
@@ -629,9 +628,20 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
       expect(sent[0].path).toMatch(/\/invoke$/);
       expect(sent[0].body, JSON.stringify(extra)).toMatchObject(expected);
     }
+    for (const [field, extra] of [
+      ["stop", { stop: 5 }],
+      ["max_completion_tokens", { max_completion_tokens: "many" }],
+    ] as const) {
+      const { result, sent } = await capture(() =>
+        chat({ model: "cc-claude", messages: [{ role: "user", content: "hi" }], ...extra }),
+      );
+      expect(result.status, result.text).toBe(400);
+      expect(JSON.parse(result.text).error.message).toContain(field);
+      expect(sent).toHaveLength(0);
+    }
   });
 
-  test("an OpenAI GPT model on Converse gets reasoning.effort, its stop sequences, and a cap of at least 16", async (ctx) => {
+  test("an OpenAI GPT model on Converse gets reasoning.effort, its stop sequences, and its cap as sent", async (ctx) => {
     if (skip(ctx)) return;
     const { result, sent } = await capture(() =>
       chat({
@@ -644,7 +654,7 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
     );
     expect(result.status, result.text).toBe(200);
     expect(sent[0].body.additionalModelRequestFields).toEqual({ reasoning: { effort: "high" } });
-    expect(sent[0].body.inferenceConfig).toEqual({ maxTokens: 16, stopSequences: ["END"] });
+    expect(sent[0].body.inferenceConfig).toEqual({ maxTokens: 4, stopSequences: ["END"] });
   });
 
   test("Nova 2 takes reasoning_effort as reasoningConfig", async (ctx) => {
@@ -692,7 +702,12 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
     );
     expect(result.status, result.text).toBe(200);
     const body = sent[0].body;
-    expect(body.additionalModelRequestFields).toEqual({ custom_a: 1, custom_b: "two", reasoning_effort: "high" });
+    expect(body.additionalModelRequestFields).toEqual({
+      custom_a: 1,
+      custom_b: "two",
+      reasoning_effort: "high",
+      seed: 7,
+    });
     expect(body.toolConfig.tools[0].toolSpec.name).toBe("json_tool_call");
     expect(body.toolConfig.toolChoice).toEqual({ tool: { name: "json_tool_call" } });
     const reply = JSON.parse(result.text);

@@ -3,9 +3,9 @@
 //!
 //! AWS serves Grok and OpenAI GPT 5.6 and newer here, and the request keeps
 //! its OpenAI shape instead of being rewritten to Converse. A request that
-//! needs something only Converse offers — a Bedrock-native block, a JSON
-//! mode without a schema, or tools on a GPT model while it reasons — is still
-//! served by Converse ([`needs_converse`]).
+//! needs something only Converse offers — a Bedrock-native block, a
+//! `json_schema` format without its schema, or tools on a GPT model while it
+//! reasons — is still served by Converse ([`needs_converse`]).
 //!
 //! The endpoint authenticates with the provider key's AWS credentials,
 //! signed with SigV4 for the `bedrock` service.
@@ -100,9 +100,9 @@ const CONVERSE_ONLY_FIELDS: &[&str] = &[
     "serviceTier",
     "requestMetadata",
     "outputConfig",
-    "thinking",
     "additionalModelRequestFields",
-    "top_k",
+    "additionalModelResponseFieldPaths",
+    "promptVariables",
 ];
 
 /// Whether a request on a Chat Completions model must still go to Converse.
@@ -113,17 +113,13 @@ pub(crate) fn needs_converse(req: &ChatFormat, model_id: &str) -> bool {
     {
         return true;
     }
-    // AWS enforces a `json_schema` response format for both families here;
-    // a `json_object` one is answered with a 400 unless the prompt mentions
-    // JSON, so Converse keeps handling it.
-    match req.extra.get("response_format") {
-        None | Some(Value::Null) => {}
-        Some(Value::Object(rf)) => match rf.get("type").and_then(Value::as_str) {
-            Some("text") => {}
-            Some("json_schema") if rf.contains_key("json_schema") => {}
-            _ => return true,
-        },
-        Some(_) => {}
+    // A `json_schema` format without its schema object stays on Converse.
+    if let Some(Value::Object(rf)) = req.extra.get("response_format") {
+        if rf.get("type").and_then(Value::as_str) == Some("json_schema")
+            && !rf.contains_key("json_schema")
+        {
+            return true;
+        }
     }
     let has_tools = ["tools", "functions"].iter().any(|k| {
         req.extra
@@ -382,7 +378,7 @@ async fn send(
 ) -> Result<(reqwest::Response, Instant, Option<Duration>), BridgeError> {
     let (req, deadline) = inline_remote_images(req, ctx).await?;
     let body = {
-        let messages = messages_from(&req, DeveloperRoleMode::MapToSystem);
+        let messages = messages_from(&req, DeveloperRoleMode::Preserve);
         let mut body = serde_json::to_value(build_request(
             &req,
             capability_id(model_id),

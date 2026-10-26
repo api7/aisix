@@ -906,8 +906,9 @@ const OPENAI_ONLY_FIELDS: &[&str] = &[
 /// differently into their Anthropic slots:
 ///
 /// - `user` / `safety_identifier` → `metadata.user_id`, the identifier
-///   Anthropic uses for the same abuse attribution. A caller that sent
-///   both keeps them as sent.
+///   Anthropic uses for the same abuse attribution. OpenAI's precedence
+///   picks the one: a non-empty `safety_identifier`, else `user`. Neither
+///   key reaches Claude as itself.
 /// - `metadata` keeps only `user_id`, its one Anthropic member; OpenAI's
 ///   stored-completion tags have nowhere to go.
 fn translate_openai_only_fields(extras: &mut serde_json::Map<String, serde_json::Value>) {
@@ -918,13 +919,16 @@ fn translate_openai_only_fields(extras: &mut serde_json::Map<String, serde_json:
     if let Some(metadata) = extras.remove("metadata") {
         user_id = metadata.get("user_id").filter(|v| !v.is_null()).cloned();
     }
-    let identifier = match (extras.get("user"), extras.get("safety_identifier")) {
-        (Some(_), Some(_)) => None,
-        (Some(_), None) => extras.remove("user"),
-        (None, Some(_)) => extras.remove("safety_identifier"),
-        (None, None) => None,
+    let user = extras.remove("user").filter(|v| !v.is_null());
+    let safety_identifier = extras.remove("safety_identifier").filter(|v| !v.is_null());
+    let identifier = match safety_identifier {
+        Some(serde_json::Value::String(s)) if s.is_empty() => {
+            user.or(Some(serde_json::Value::String(s)))
+        }
+        Some(sid) => Some(sid),
+        None => user,
     };
-    if let Some(user_id) = user_id.or(identifier.filter(|v| !v.is_null())) {
+    if let Some(user_id) = user_id.or(identifier) {
         extras.insert("metadata".into(), serde_json::json!({ "user_id": user_id }));
     }
 }
@@ -5563,12 +5567,31 @@ mod tests {
         assert_eq!(body["metadata"], serde_json::json!({"user_id": "sid"}));
         let body = build(serde_json::json!({"metadata": {"tag": "x"}}));
         assert!(body.get("metadata").is_none());
-        // Both identifiers: kept as sent.
-        let body = build(serde_json::json!({"user": "u", "safety_identifier": "s"}));
-        assert_eq!(
-            (body["user"].clone(), body["safety_identifier"].clone()),
-            ("u".into(), "s".into())
-        );
+        // Both identifiers: a non-empty safety_identifier wins, an empty
+        // or null one falls back to user, and neither key reaches Claude.
+        for (sent, want) in [
+            (
+                serde_json::json!({"user": "u", "safety_identifier": "s"}),
+                "s",
+            ),
+            (
+                serde_json::json!({"user": "u", "safety_identifier": ""}),
+                "u",
+            ),
+            (
+                serde_json::json!({"user": "u", "safety_identifier": null}),
+                "u",
+            ),
+        ] {
+            let body = build(sent.clone());
+            assert_eq!(
+                body["metadata"],
+                serde_json::json!({"user_id": want}),
+                "{sent}"
+            );
+            assert!(body.get("user").is_none(), "{sent}");
+            assert!(body.get("safety_identifier").is_none(), "{sent}");
+        }
     }
 
     #[test]
