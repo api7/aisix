@@ -2876,6 +2876,9 @@ async fn dispatch(
                 // hit reports it, whichever backend served it.
                 let cache_creation_ttl = aisix_gateway::CacheCreationTtl::NONE;
                 let reasoning_tokens = cached.usage.reasoning_tokens;
+                // The replayed body carries it to the caller, so the row
+                // reports it too — the exported output message requires it.
+                let finish_reason = finish_reason_label(&cached.finish_reason);
                 let upstream_total_tokens = cached.usage.upstream_total_tokens;
                 let reasoning_folded_into_completion =
                     cached.usage.reasoning_folded_into_completion;
@@ -3045,7 +3048,7 @@ async fn dispatch(
                     service_tier: None,
                     provider_key_id,
                     upstream_model,
-                    finish_reason: String::new(),
+                    finish_reason,
                     // Cache hits don't burn cost on our side (we already
                     // paid the upstream price the first time around).
                     cost_usd: 0.0,

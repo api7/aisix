@@ -21,6 +21,9 @@
 //! URL pattern (Gemini, `generateContent`):
 //! `https://<region>-aiplatform.googleapis.com/v1/projects/<project>/
 //!  locations/<region>/publishers/google/models/<model>:generateContent`
+//! (host `https://aiplatform.googleapis.com` when `<region>` is `global`,
+//! `https://aiplatform.<region>.rep.googleapis.com` for a multi-region
+//! location such as `us` or `eu`)
 
 use aisix_gateway::{
     chat::ChatChoice,
@@ -182,7 +185,10 @@ impl VertexBridge {
     ///      operator-supplied value is trimmed and any trailing `/`
     ///      is stripped so `chat_gemini`'s URL stitching produces
     ///      a single-slash separator.
-    ///   3. Canonical `https://<region>-aiplatform.googleapis.com`.
+    ///   3. Canonical `https://<region>-aiplatform.googleapis.com`;
+    ///      `https://aiplatform.googleapis.com` for region `global`, and
+    ///      `https://aiplatform.<region>.rep.googleapis.com` for a
+    ///      multi-region location (`us`, `eu`).
     ///
     /// Mirrors the Bedrock bridge's `endpoint_url` precedence
     /// (`crates/aisix-provider-bedrock/src/bridge.rs::build_client_from_ctx`).
@@ -268,6 +274,14 @@ impl VertexBridge {
                 )));
             }
             return Ok(b.trim_end_matches('/').to_string());
+        }
+        // Only a regional location (`us-central1`) prefixes the host; the
+        // global location and the multi-region ones (`us`, `eu`) do not.
+        if region == "global" {
+            return Ok("https://aiplatform.googleapis.com".to_string());
+        }
+        if !region.contains('-') {
+            return Ok(format!("https://aiplatform.{region}.rep.googleapis.com"));
         }
         Ok(format!("https://{region}-aiplatform.googleapis.com"))
     }
@@ -3332,6 +3346,36 @@ mod tests {
         assert_eq!(
             bridge.resolve_api_base("us-central1", None).unwrap(),
             "https://us-central1-aiplatform.googleapis.com",
+        );
+    }
+
+    #[test]
+    fn non_regional_locations_resolve_to_their_own_host() {
+        let bridge = VertexBridge::new();
+        assert_eq!(
+            bridge.resolve_api_base("global", None).unwrap(),
+            "https://aiplatform.googleapis.com",
+        );
+        assert_eq!(
+            bridge.resolve_api_base("us", None).unwrap(),
+            "https://aiplatform.us.rep.googleapis.com",
+        );
+        assert_eq!(
+            bridge.resolve_api_base("eu", None).unwrap(),
+            "https://aiplatform.eu.rep.googleapis.com",
+        );
+        let creds =
+            VertexSecret::parse(r#"{"access_token":"t","project":"my-proj","region":"global"}"#)
+                .unwrap();
+        assert_eq!(
+            bridge.openai_shim_url(&creds, None).unwrap(),
+            "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/endpoints/openapi/chat/completions",
+        );
+        assert_eq!(
+            bridge
+                .partner_rawpredict_url(&creds, None, "publishers/mistralai", "mistral-medium-3", "rawPredict")
+                .unwrap(),
+            "https://aiplatform.googleapis.com/v1/projects/my-proj/locations/global/publishers/mistralai/models/mistral-medium-3:rawPredict",
         );
     }
 

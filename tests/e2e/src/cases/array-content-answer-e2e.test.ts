@@ -102,7 +102,9 @@ async function startOtlpReceiver(): Promise<OtlpReceiver> {
               const attrs: Record<string, string> = {};
               for (const a of span.attributes ?? []) {
                 const v = a.value ?? {};
-                attrs[a.key] = v.stringValue ?? String(v.intValue ?? v.boolValue ?? "");
+                attrs[a.key] = v.arrayValue
+                  ? JSON.stringify((v.arrayValue.values ?? []).map((e: any) => e.stringValue))
+                  : (v.stringValue ?? String(v.intValue ?? v.boolValue ?? ""));
               }
               spanAttrs.push(attrs);
             }
@@ -171,6 +173,7 @@ describe("an answer whose content is an array of parts", () => {
     up.cached = await startOpenAiUpstream({ nonStreamBody: arrayReply(LONG_ANSWER) });
     up.mistral = await startOpenAiUpstream({ nonStreamBody: reasoningReply(REASONING_PARTS.mistral) });
     up.databricks = await startOpenAiUpstream({ nonStreamBody: reasoningReply(REASONING_PARTS.databricks) });
+    up.mistralCached = await startOpenAiUpstream({ nonStreamBody: reasoningReply(REASONING_PARTS.mistral) });
     up.noUsage = await startOpenAiUpstream({
       nonStreamBody: reasoningReply({ type: "thinking", thinking: [{ type: "text", text: LONG_THINKING }] }, false),
     });
@@ -199,7 +202,13 @@ describe("an answer whose content is an array of parts", () => {
     await model("ac-mistral", up.mistral);
     await model("ac-databricks", up.databricks);
     await model("ac-no-usage", up.noUsage);
+    await model("ac-mistral-cached", up.mistralCached);
     await seed.createCachePolicy({ name: "ac-cache", enabled: true, applies_to: "model:ac-cached" });
+    await seed.createCachePolicy({
+      name: "ac-cache-reasoning",
+      enabled: true,
+      applies_to: "model:ac-mistral-cached",
+    });
     await seed.createObservabilityExporter({
       name: "ac-otlp",
       enabled: true,
@@ -352,5 +361,37 @@ describe("an answer whose content is an array of parts", () => {
         expect.objectContaining({ type: "text", content: ANSWER }),
       ]),
     );
+  });
+
+  test("a response-cache hit reaches the content exporter with the output messages of the answer it replays", async (ctx) => {
+    if (!etcdReachable || !app || !otlpWide) return ctx.skip();
+    const probe = "reasoning-cache-capture-probe";
+    const before = up.mistralCached.receivedRequests.length;
+    const statuses: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      const res = await post(app, "/v1/chat/completions", {
+        model: "ac-mistral-cached",
+        messages: [{ role: "user", content: probe }],
+      });
+      expect(res.status, await res.text()).toBe(200);
+      statuses.push(res.headers.get("x-aisix-cache") ?? "");
+    }
+    expect(statuses).toEqual(["miss", "hit"]);
+    expect(up.mistralCached.receivedRequests.length - before).toBe(1);
+    const spans = await waitForSpans(otlpWide, (a) => promptOf(a).includes(probe), 2);
+    // Only the answer the upstream produced carries its response id.
+    const fresh = spans.find((a) => a["gen_ai.response.id"] !== undefined)!;
+    const hit = spans.find((a) => a["gen_ai.response.id"] === undefined)!;
+    expect(fresh && hit, JSON.stringify(spans)).toBeTruthy();
+    const freshOutput = JSON.parse(fresh["gen_ai.output.messages"] ?? "null");
+    expect(freshOutput?.[0]?.parts, fresh["gen_ai.output.messages"]).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "reasoning", content: THINKING }),
+        expect.objectContaining({ type: "text", content: ANSWER }),
+      ]),
+    );
+    expect(JSON.parse(hit["gen_ai.output.messages"] ?? "null"), JSON.stringify(hit)).toEqual(freshOutput);
+    expect(fresh["gen_ai.response.finish_reasons"]).toBe('["stop"]');
+    expect(hit["gen_ai.response.finish_reasons"]).toBe('["stop"]');
   });
 });
