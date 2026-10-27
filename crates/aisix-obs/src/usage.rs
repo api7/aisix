@@ -344,6 +344,9 @@ pub struct UsageEvent {
     /// routing, and the inter-attempt retry backoff. Summing a request's
     /// attempts yields upstream time, NOT what the caller waited — that
     /// is `downstream_latency_ms`.
+    ///
+    /// 0 ("not measured") on an event that reached no upstream: a cache
+    /// hit, or a request refused before its first attempt.
     pub upstream_latency_ms: u32,
 
     /// Time to the upstream's first streamed frame, in milliseconds —

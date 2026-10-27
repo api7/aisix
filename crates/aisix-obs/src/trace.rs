@@ -377,13 +377,11 @@ impl RequestTraceBundle {
     ///   the SERVER span alone. No fictitious upstream CLIENT span.
     ///
     /// `dispatched_upstream` is the CALLER's statement of fact and the
-    /// ONLY signal consulted — never inferred from the event's latency: a
-    /// cache hit and a pre-dispatch error legitimately carry the handler's
-    /// elapsed time in `upstream_latency_ms` (which an inference would
-    /// misread as an upstream call), while a real sub-millisecond upstream
-    /// call legitimately measures 0ms (which an inference would drop,
-    /// orphaning any spans parented under the never-exported logical
-    /// span). A 0ms dispatched call yields a truthful zero-length span.
+    /// ONLY signal consulted — never inferred from the latency passed in,
+    /// which a caller may hand over unscrubbed for undispatched work (the
+    /// handler's elapsed time, which an inference would misread as an
+    /// upstream call). A 0ms dispatched call yields a truthful zero-length
+    /// span.
     pub fn emission(
         &self,
         terminal: bool,
