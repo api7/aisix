@@ -85,7 +85,11 @@ pub(crate) fn flac_duration_seconds(audio: &[u8]) -> Option<f64> {
             (min_block == max_block && min_block >= 16).then_some(u64::from(min_block));
         last_frame_end_sample(audio, fixed_block, max_frame)?
     };
-    Some(total as f64 / f64::from(sample_rate)).filter(|s| *s > 0.0)
+    let seconds = total as f64 / f64::from(sample_rate);
+    // The position comes off a caller-written frame header, so a forged one
+    // can claim any length. No real stream spends under a byte per second
+    // of audio; anything that would is not measured at all.
+    (seconds > 0.0 && seconds <= audio.len() as f64).then_some(seconds)
 }
 
 /// The sample count the stream ends on, from the header of the frame that
@@ -296,6 +300,20 @@ mod tests {
     fn a_streamed_flac_without_a_block_size_yields_nothing() {
         let mut flac = STREAMED_FLAC.to_vec();
         flac[8..10].copy_from_slice(&0u16.to_be_bytes());
+        assert_eq!(super::flac_duration_seconds(&flac), None);
+    }
+
+    /// A forged last-frame header can claim any position; one implying
+    /// less than a byte per second of audio is declined, not billed.
+    #[test]
+    fn a_streamed_flac_claiming_an_impossible_length_yields_nothing() {
+        // STREAMINFO rewritten to 65535-sample blocks at 1 Hz: the same
+        // last frame now claims days of audio in an 11.6 kB file.
+        let mut flac = STREAMED_FLAC.to_vec();
+        flac[8..12].copy_from_slice(&[0xFF; 4]);
+        flac[18] = 0;
+        flac[19] = 0;
+        flac[20] = (flac[20] & 0x0F) | 0x10;
         assert_eq!(super::flac_duration_seconds(&flac), None);
     }
 
