@@ -5,8 +5,8 @@
 //! document whose operations the gateway itself exposes as tools
 //! (`type: openapi`). Either way the tools are aggregated into the gateway's
 //! own MCP endpoint under the namespace `<name>__<tool>`, and tool calls are
-//! routed back to the source. The upstream credential is held by the gateway
-//! and is never exposed to the calling client.
+//! routed back to the source. A gateway-held upstream credential is never
+//! exposed to the calling client.
 //!
 //! etcd path: `{prefix}/mcp_servers/{uuid}`. Secondary index on `name`.
 
@@ -95,9 +95,10 @@ pub struct McpServer {
     #[serde(default)]
     pub transport: McpTransport,
 
-    /// How the gateway authenticates to the upstream server. The credential is
-    /// held by the gateway and is never forwarded from or exposed to the calling
-    /// client.
+    /// How the gateway authenticates to the upstream server. A gateway-held
+    /// credential (`bearer`, `api_key`, `oauth2`, `oauth2_token_exchange`) is
+    /// never exposed to the calling client. `oauth_delegate` holds none: the
+    /// caller's own upstream token is relayed instead.
     #[serde(default)]
     pub auth_type: McpAuthType,
 
@@ -106,7 +107,8 @@ pub struct McpServer {
     /// `Authorization: Bearer <secret>`), the API key when `auth_type` is
     /// `api_key` (sent as `x-api-key: <secret>`, or under `api_key_header`
     /// for `type: openapi`), or the OAuth client secret when `auth_type` is
-    /// `oauth2`. Leave unset when `auth_type` is `none`.
+    /// `oauth2` or `oauth2_token_exchange`. Leave unset when `auth_type` is
+    /// `none` or `oauth_delegate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
 
@@ -116,22 +118,30 @@ pub struct McpServer {
     // `mcp_server_credential_coupling`. That keeps the resource flat (no oneOf
     // restructuring) while giving the published schema and every runtime
     // validator one shared definition.
-    /// OAuth client identifier used for the OAuth 2.0 client credentials
-    /// grant. Required when `auth_type` is `oauth2`; ignored otherwise.
+    /// OAuth client identifier the gateway authenticates to `token_url` with.
+    /// Required when `auth_type` is `oauth2` or `oauth2_token_exchange`;
+    /// ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
 
-    /// OAuth token endpoint URL where the gateway exchanges the client
-    /// credentials for an access token, such as
-    /// `https://auth.example.com/oauth/token`. Required when `auth_type` is
-    /// `oauth2`; ignored otherwise.
+    /// OAuth token endpoint URL where the gateway obtains the upstream access
+    /// token, such as `https://auth.example.com/oauth/token`. Required when
+    /// `auth_type` is `oauth2` or `oauth2_token_exchange`; ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_url: Option<String>,
 
     /// OAuth scopes to request. Joined with spaces into the `scope` parameter
-    /// of the token request. Only used when `auth_type` is `oauth2`.
+    /// of the token request. Used when `auth_type` is `oauth2` (optional) or
+    /// `oauth2_token_exchange` (required, at least one — for `entra_obo` the
+    /// target API's scope, such as `api://<app-id>/.default`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
+
+    /// Token exchange protocol used when `auth_type` is
+    /// `oauth2_token_exchange`. Required for that `auth_type`; ignored
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_exchange_profile: Option<McpTokenExchangeProfile>,
 
     /// MCP protocol revision the gateway uses when connecting to this
     /// upstream server. When omitted, the gateway opens the session with the
@@ -162,7 +172,9 @@ pub struct McpServer {
     /// otherwise do with it. Naming the credential slot `auth_type` would
     /// fill — `authorization` for `bearer` and `oauth2`, `api_key_header`
     /// for `api_key` — hands the server the caller's own credential in
-    /// place of the gateway's, never both. That is what lets an internal
+    /// place of the gateway's, never both. `oauth_delegate` and
+    /// `oauth2_token_exchange` own `authorization` themselves, so naming it
+    /// on such a server has no effect. That is what lets an internal
     /// server that already authorizes on the end user's `Authorization`
     /// keep doing so unchanged. A server that validates the `aud` claim
     /// will reject a token minted for the gateway.
@@ -266,6 +278,38 @@ pub enum McpAuthType {
     /// until shortly before their reported expiry.
     #[serde(rename = "oauth2")]
     OAuth2,
+    /// Delegated OAuth: the gateway holds no upstream credential and relays
+    /// the caller's own `Authorization` header to the server unchanged. An
+    /// `Authorization` the caller authenticated to the gateway with is never
+    /// relayed, so a caller that needs both sends its gateway API key in
+    /// `x-aisix-api-key` and its upstream token in `Authorization`. With no
+    /// upstream token the server is called without credentials and its own
+    /// response decides.
+    OauthDelegate,
+    /// OAuth token exchange on behalf of the caller: the gateway exchanges
+    /// the caller's bearer token for an access token to this server at
+    /// `token_url`, authenticating with `client_id` and the client secret in
+    /// `secret` and requesting `scopes`, and sends the result as
+    /// `Authorization: Bearer <access_token>`. `token_exchange_profile`
+    /// selects the exchange protocol. Only a token the gateway itself
+    /// verified through a JWT trust provider on the same request is
+    /// exchanged; for a caller authenticated any other way there is nothing
+    /// to exchange, and the single-server endpoint `/mcp/{name}` answers
+    /// `401`. The caller's token never reaches the server. Exchanged tokens
+    /// are cached per caller token until shortly before their reported
+    /// expiry.
+    #[serde(rename = "oauth2_token_exchange")]
+    OAuth2TokenExchange,
+}
+
+/// Token exchange protocol for `auth_type: oauth2_token_exchange`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTokenExchangeProfile {
+    /// Microsoft Entra ID On-Behalf-Of flow: a `jwt-bearer` grant carrying the
+    /// caller's token as `assertion` with `requested_token_use=on_behalf_of`.
+    /// The caller's token must be issued for the gateway's `client_id`.
+    EntraObo,
 }
 
 impl Resource for McpServer {
@@ -326,6 +370,28 @@ pub fn mcp_server_credential_coupling() -> Value {
                     "secret": { "type": "string", "minLength": 1 },
                     "client_id": { "type": "string", "minLength": 1 },
                     "token_url": { "type": "string", "minLength": 1 }
+                }
+            }
+        },
+        // The exchange carries the caller's token to `token_url` and needs
+        // the target in `scope`: no field may be left for the IdP to guess.
+        {
+            "if": {
+                "properties": { "auth_type": { "const": "oauth2_token_exchange" } },
+                "required": ["auth_type"]
+            },
+            "then": {
+                "required": ["secret", "client_id", "token_url", "scopes", "token_exchange_profile"],
+                "properties": {
+                    "secret": { "type": "string", "minLength": 1 },
+                    "client_id": { "type": "string", "minLength": 1 },
+                    "token_url": { "type": "string", "minLength": 1 },
+                    "scopes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": { "type": "string", "minLength": 1 }
+                    },
+                    "token_exchange_profile": { "type": "string" }
                 }
             }
         },
@@ -592,6 +658,50 @@ mod tests {
         });
         crate::models::schema::validate_mcp_server(&complete)
             .expect("a complete oauth2 credential set must be accepted");
+
+        // oauth_delegate holds no credential of its own.
+        let delegate = json!({"name": "s", "url": "https://x/mcp", "auth_type": "oauth_delegate"});
+        crate::models::schema::validate_mcp_server(&delegate)
+            .expect("oauth_delegate needs no gateway-held credential");
+    }
+
+    #[test]
+    fn token_exchange_requires_its_whole_configuration() {
+        use crate::models::schema::{validate_mcp_server, validate_mcp_server_lenient};
+        let complete = json!({
+            "name": "s", "url": "https://x/mcp", "auth_type": "oauth2_token_exchange",
+            "secret": "cs", "client_id": "cid",
+            "token_url": "https://login.example.com/tenant/oauth2/v2.0/token",
+            "scopes": ["api://upstream/.default"],
+            "token_exchange_profile": "entra_obo"
+        });
+        validate_mcp_server(&complete).expect("a complete exchange configuration");
+        let s: McpServer = serde_json::from_value(complete.clone()).unwrap();
+        assert_eq!(s.auth_type, McpAuthType::OAuth2TokenExchange);
+        assert_eq!(
+            s.token_exchange_profile,
+            Some(McpTokenExchangeProfile::EntraObo)
+        );
+
+        for field in [
+            "secret",
+            "client_id",
+            "token_url",
+            "scopes",
+            "token_exchange_profile",
+        ] {
+            let mut doc = complete.clone();
+            doc.as_object_mut().unwrap().remove(field);
+            validate_mcp_server(&doc).expect_err(&format!("{field} is required"));
+        }
+        let mut empty_scopes = complete.clone();
+        empty_scopes["scopes"] = json!([]);
+        validate_mcp_server(&empty_scopes).expect_err("at least one scope");
+        let mut generic = complete.clone();
+        generic["token_exchange_profile"] = json!("rfc8693");
+        validate_mcp_server(&generic).expect_err("entra_obo is the only profile");
+        validate_mcp_server_lenient(&generic)
+            .expect_err("an unknown profile is not loadable either");
     }
 
     #[test]
@@ -748,6 +858,7 @@ mod tests {
             client_id: None,
             token_url: None,
             scopes: None,
+            token_exchange_profile: None,
             protocol_version: None,
             forward_client_headers: Vec::new(),
             timeout_ms: None,

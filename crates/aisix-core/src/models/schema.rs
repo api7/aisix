@@ -1468,7 +1468,17 @@ pub fn mcp_server_root_schema(strict: bool) -> Value {
                 ("bearer", "Bearer token"),
                 ("api_key", "API key"),
                 ("oauth2", "OAuth 2.0 client credentials"),
+                ("oauth_delegate", "Delegated OAuth (caller's own token)"),
+                (
+                    "oauth2_token_exchange",
+                    "OAuth 2.0 token exchange on behalf of the caller",
+                ),
             ],
+        );
+        title_single_value_enum_variants(
+            defs,
+            "McpTokenExchangeProfile",
+            &[("entra_obo", "Microsoft Entra ID On-Behalf-Of")],
         );
         title_single_value_enum_variants(
             defs,
@@ -2349,7 +2359,12 @@ pub fn observability_exporter_root_schema(strict: bool) -> Value {
             let Some(field) = props.get_mut(key).and_then(Value::as_object_mut) else {
                 continue;
             };
-            let refused: Vec<&str> = credential.iter().chain(extra).copied().collect();
+            let refused: Vec<&str> = credential
+                .iter()
+                .chain(extra)
+                .copied()
+                .chain([crate::forwarded_headers::GATEWAY_CREDENTIAL_HEADER])
+                .collect();
             field.insert("uniqueItems".to_string(), json!(true));
             field.insert(
                 "items".to_string(),

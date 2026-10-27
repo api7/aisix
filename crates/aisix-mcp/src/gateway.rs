@@ -49,8 +49,10 @@ use aisix_core::models::{
 use aisix_core::{AisixSnapshot, ResourceEntry};
 
 use crate::bridge::{
-    forwarded_client_headers, upstream_from_mcp_server, EphemeralBridge, McpBridge,
+    forwarded_client_headers, upstream_from_mcp_server, CallerCredentials, EphemeralBridge,
+    McpBridge,
 };
+use crate::error::{McpError, TokenExchangeFailure};
 use crate::openapi::OpenApiBridge;
 
 /// Separator between an upstream server's registered name and a tool name in
@@ -386,6 +388,32 @@ impl ToolAcl {
         self.granted
     }
 
+    /// Whether this ACL can permit ANY tool of the registered server
+    /// `name` (stored under `id`). Decided from the rules alone, before the
+    /// server's tools are known: every allow layer must have an entry that
+    /// could match a `<name>__…` tool or that names the server's id, and no
+    /// deny may cover the whole server. Errs towards `true` only where a
+    /// glob genuinely could match one of the server's tools.
+    pub fn may_reach_server(&self, name: &str, id: &str) -> bool {
+        let prefix = format!("{name}{TOOL_NAMESPACE_SEPARATOR}");
+        let allowed = self.allow.iter().all(|layer| match layer {
+            AllowLayer::All => true,
+            AllowLayer::Patterns(patterns) => patterns
+                .iter()
+                .any(|p| pattern_may_match_prefix(p, &prefix)),
+            AllowLayer::Refs(refs) => refs.iter().any(|r| r.server_id == id),
+        });
+        let denied = self.deny.iter().any(|rule| match rule {
+            // A trailing-`*` glob whose head every `<name>__…` tool starts
+            // with (`*`, `gh__*`, `g*`) covers the whole server.
+            DenyRule::Pattern(p) => p
+                .strip_suffix('*')
+                .is_some_and(|head| !head.contains('*') && prefix.starts_with(head)),
+            DenyRule::Ref(r) => r.server_id == id && r.tool == "*",
+        });
+        allowed && !denied
+    }
+
     /// Whether `namespaced_tool` is permitted: every allow layer must admit
     /// it and no deny rule may match it. Name patterns are single-`*` globs:
     /// `"<server>__*"` covers every tool on that server, a pattern without a
@@ -414,6 +442,24 @@ impl ToolAcl {
     }
 }
 
+/// Whether the single-`*` glob `pattern` can match some string that starts
+/// with `prefix`, under the matching rule of
+/// `aisix_core::wildcard::wildcard_matches`.
+fn pattern_may_match_prefix(pattern: &str, prefix: &str) -> bool {
+    let head = match pattern.find('*') {
+        None => return pattern.starts_with(prefix),
+        Some(star) if pattern[star + 1..].contains('*') => return false,
+        Some(star) => &pattern[..star],
+    };
+    // A head at least as long as the prefix must start with it; a shorter
+    // one only has to agree with it, and the `*` covers the rest.
+    if head.len() >= prefix.len() {
+        head.starts_with(prefix)
+    } else {
+        prefix.starts_with(head)
+    }
+}
+
 /// What one `tools/list` produced, before and after the caller's ACL — the
 /// only way an operator can tell an empty list caused by the ACL apart from
 /// an upstream that has no tools.
@@ -439,6 +485,12 @@ pub struct McpGateway {
     /// builds one from `*_for_request`; a gateway kept alive across requests
     /// (conformance server, tests) keeps the first numbers forever.
     tools_list: Arc<OnceLock<ToolsListCounts>>,
+    /// The first token-exchange failure an upstream operation hit while
+    /// serving the request, shared with every clone like `tools_list`. The
+    /// single-server endpoint answers it with an HTTP status rather than
+    /// inside a JSON-RPC result, where a client never looks for an
+    /// authorization challenge.
+    auth_failure: Arc<OnceLock<TokenExchangeFailure>>,
     /// When set, this gateway serves exactly one upstream under its **original**
     /// tool names: `tools/list` strips the `<server>__` namespace prefix and
     /// `tools/call` accepts both the bare and the prefixed form. ACL decisions
@@ -459,6 +511,11 @@ struct ScopedServer {
     /// Disabled servers stay reserved so this scope's callable name surface
     /// does not shift when another server's `enabled` flag is toggled.
     foreign: std::collections::HashSet<String>,
+    /// Whether the caller's ACL can reach this server. One it cannot gets
+    /// no caller credentials, so its token-exchange failure is a missing
+    /// grant, not a sign-in the caller could repeat: it is the ACL that
+    /// answers (an empty list, a refused call), never an auth challenge.
+    reachable: bool,
 }
 
 impl McpGateway {
@@ -497,6 +554,7 @@ impl McpGateway {
             tool_acl: ToolAcl::allow_all(),
             scoped: None,
             tools_list: Arc::new(OnceLock::new()),
+            auth_failure: Arc::new(OnceLock::new()),
         }
     }
 
@@ -519,6 +577,39 @@ impl McpGateway {
         self.tools_list.clone()
     }
 
+    /// Handle on the first token-exchange failure this gateway hit, read by
+    /// the mount after the transport ran — cloned out the same way as
+    /// [`McpGateway::tools_list_counts`].
+    pub fn token_exchange_failure(&self) -> Arc<OnceLock<TokenExchangeFailure>> {
+        self.auth_failure.clone()
+    }
+
+    /// Run, before any MCP message is served, the token exchange the single
+    /// upstream of a scoped gateway needs for this caller (an
+    /// `oauth2_token_exchange` server). The `initialize` handshake never
+    /// reaches an upstream otherwise, and a client decides whether to sign
+    /// in from how its first request is answered. Other auth types, and the
+    /// aggregated gateway, pass without contacting anything.
+    pub async fn preflight_upstream_auth(&self) -> Option<TokenExchangeFailure> {
+        if !self.scoped.as_ref()?.reachable {
+            return None;
+        }
+        let upstream = self.upstreams.first()?;
+        match upstream.bridge.preflight_auth().await {
+            Err(McpError::TokenExchange(kind)) => Some(kind),
+            _ => None,
+        }
+    }
+
+    fn note_auth_failure(&self, error: &McpError) {
+        if self.scoped.as_ref().is_some_and(|scoped| !scoped.reachable) {
+            return;
+        }
+        if let McpError::TokenExchange(kind) = error {
+            let _ = self.auth_failure.set(kind.clone());
+        }
+    }
+
     /// Build a gateway whose upstreams are the **enabled** `mcp_servers` in the
     /// snapshot: a `type: mcp` server is reached through an [`EphemeralBridge`]
     /// (connect per request), a `type: openapi` server through an
@@ -527,7 +618,12 @@ impl McpGateway {
     /// iteration order; duplicate names are deduped (first wins) by
     /// [`McpGateway::new`], though the Admin API already enforces uniqueness.
     pub fn from_snapshot(snapshot: &AisixSnapshot) -> Self {
-        Self::from_snapshot_for_request(snapshot, None)
+        Self::from_snapshot_for_request(
+            snapshot,
+            None,
+            &CallerCredentials::default(),
+            ToolAcl::allow_all(),
+        )
     }
 
     /// [`McpGateway::from_snapshot`], additionally forwarding the inbound
@@ -538,10 +634,16 @@ impl McpGateway {
     /// property of the REQUEST, not of the snapshot: the `/mcp` handler
     /// builds a gateway per request and is the only place that holds them.
     /// `None` forwards nothing, which is what every server does by
-    /// default.
+    /// default. `caller` carries the agent's own credentials to the
+    /// `oauth_delegate` and `oauth2_token_exchange` servers — only to those
+    /// `acl` (the caller's tool ACL, which also scopes the gateway) can
+    /// reach. Any other server is still listed, without them, and its
+    /// tools are filtered out by the same ACL.
     pub fn from_snapshot_for_request(
         snapshot: &AisixSnapshot,
         client_headers: Option<&http::HeaderMap>,
+        caller: &CallerCredentials,
+        acl: ToolAcl,
     ) -> Self {
         crate::openapi::sweep_tool_cache(&snapshot.mcp_servers);
         let upstreams = snapshot
@@ -555,20 +657,11 @@ impl McpGateway {
                 // cleartext warning covers both.
                 crate::bridge::warn_cleartext_credential(&entry.value);
                 let name = entry.value.name.clone();
-                let forwarded = forwarded_client_headers(&entry.value, client_headers);
-                let bridge: Arc<dyn McpBridge> = match entry.value.server_type {
-                    McpServerType::Mcp => {
-                        let upstream = upstream_from_mcp_server(&entry.value)
-                            .with_forwarded_client_headers(forwarded);
-                        Arc::new(EphemeralBridge::new(upstream))
-                    }
-                    McpServerType::Openapi => {
-                        Arc::new(OpenApiBridge::new(entry).with_forwarded_client_headers(forwarded))
-                    }
-                };
+                let bridge = bridge_for(entry, client_headers, caller, &acl);
                 (name, bridge)
-            });
-        McpGateway::new(upstreams)
+            })
+            .collect::<Vec<_>>();
+        McpGateway::new(upstreams).with_tool_acl(acl)
     }
 
     /// Build a gateway scoped to the single **enabled** `mcp_servers` entry
@@ -577,7 +670,13 @@ impl McpGateway {
     /// registered or is disabled — a disabled server is treated as absent,
     /// same as the aggregated endpoint skipping it.
     pub fn from_snapshot_scoped(snapshot: &AisixSnapshot, server: &str) -> Option<Self> {
-        Self::from_snapshot_scoped_for_request(snapshot, server, None)
+        Self::from_snapshot_scoped_for_request(
+            snapshot,
+            server,
+            None,
+            &CallerCredentials::default(),
+            ToolAcl::allow_all(),
+        )
     }
 
     /// [`McpGateway::from_snapshot_scoped`], forwarding client headers the
@@ -586,6 +685,8 @@ impl McpGateway {
         snapshot: &AisixSnapshot,
         server: &str,
         client_headers: Option<&http::HeaderMap>,
+        caller: &CallerCredentials,
+        acl: ToolAcl,
     ) -> Option<Self> {
         crate::openapi::sweep_tool_cache(&snapshot.mcp_servers);
         let entry = snapshot.mcp_servers.get_by_name(server)?;
@@ -594,17 +695,8 @@ impl McpGateway {
         }
         crate::bridge::warn_cleartext_credential(&entry.value);
         let name = entry.value.name.clone();
-        let forwarded = forwarded_client_headers(&entry.value, client_headers);
-        let bridge: Arc<dyn McpBridge> = match entry.value.server_type {
-            McpServerType::Mcp => {
-                let upstream =
-                    upstream_from_mcp_server(&entry.value).with_forwarded_client_headers(forwarded);
-                Arc::new(EphemeralBridge::new(upstream))
-            }
-            McpServerType::Openapi => {
-                Arc::new(OpenApiBridge::new(entry).with_forwarded_client_headers(forwarded))
-            }
-        };
+        let reachable = acl.may_reach_server(&name, &entry.id);
+        let bridge = bridge_for(entry, client_headers, caller, &acl);
         let foreign = snapshot
             .mcp_servers
             .entries()
@@ -612,8 +704,12 @@ impl McpGateway {
             .filter(|e| e.value.name != name)
             .map(|e| e.value.name.clone())
             .collect();
-        let mut gateway = McpGateway::new([(name.clone(), bridge)]);
-        gateway.scoped = Some(Arc::new(ScopedServer { name, foreign }));
+        let mut gateway = McpGateway::new([(name.clone(), bridge)]).with_tool_acl(acl);
+        gateway.scoped = Some(Arc::new(ScopedServer {
+            name,
+            foreign,
+            reachable,
+        }));
         Some(gateway)
     }
 
@@ -646,7 +742,18 @@ impl ServerHandler for McpGateway {
                 Ok(upstream_tools) => {
                     tools.extend(upstream_tools.into_iter().map(|t| prefixed_tool(server, t)));
                 }
+                // A caller with nothing to exchange is the expected state
+                // for every API-key caller on the aggregated endpoint, not
+                // an upstream failure worth a warning per request.
+                Err(error @ McpError::TokenExchange(TokenExchangeFailure::NoSubject)) => {
+                    self.note_auth_failure(&error);
+                    tracing::debug!(
+                        upstream = server,
+                        "skipping upstream in tools/list: no verified caller token to exchange"
+                    );
+                }
                 Err(error) => {
+                    self.note_auth_failure(&error);
                     // Degrade gracefully: drop this upstream's tools, keep the
                     // rest. Detail is logged server-side (never client-visible).
                     tracing::warn!(
@@ -794,6 +901,7 @@ impl ServerHandler for McpGateway {
             .unwrap_or(serde_json::Value::Null);
 
         let result = bridge.call_tool(tool, arguments).await.map_err(|error| {
+            self.note_auth_failure(&error);
             // Generic client-facing message; the upstream's detail (which may
             // include its URL) is logged server-side, not surfaced to the agent.
             tracing::warn!(
@@ -857,6 +965,45 @@ impl ServerHandler for McpGateway {
             }
         }
         info
+    }
+}
+
+/// The bridge to one registered server, carrying this request's forwarded
+/// client headers and caller credentials.
+fn bridge_for(
+    entry: Arc<ResourceEntry<aisix_core::McpServer>>,
+    client_headers: Option<&http::HeaderMap>,
+    caller: &CallerCredentials,
+    acl: &ToolAcl,
+) -> Arc<dyn McpBridge> {
+    let mut forwarded = forwarded_client_headers(&entry.value, client_headers);
+    if matches!(
+        entry.value.auth_type,
+        aisix_core::McpAuthType::OauthDelegate | aisix_core::McpAuthType::OAuth2TokenExchange
+    ) {
+        // The auth type owns the `authorization` slot: a forwarded copy
+        // would relay the caller's `Authorization` even when it was the
+        // gateway credential itself.
+        forwarded.retain(|(name, _)| name != http::header::AUTHORIZATION);
+    }
+    let no_caller = CallerCredentials::default();
+    let caller = if acl.may_reach_server(&entry.value.name, &entry.id) {
+        caller
+    } else {
+        &no_caller
+    };
+    match entry.value.server_type {
+        McpServerType::Mcp => {
+            let upstream = upstream_from_mcp_server(&entry.value)
+                .with_forwarded_client_headers(forwarded)
+                .with_caller_credentials(caller);
+            Arc::new(EphemeralBridge::new(upstream))
+        }
+        McpServerType::Openapi => Arc::new(
+            OpenApiBridge::new(entry)
+                .with_forwarded_client_headers(forwarded)
+                .with_caller_credentials(caller.clone()),
+        ),
     }
 }
 
@@ -994,6 +1141,47 @@ mod tests {
 
     fn ids(servers: &[&str]) -> McpServerAllowlist {
         McpServerAllowlist::Ids(servers.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn a_server_is_reachable_only_where_some_rule_could_admit_its_tools() {
+        let acl = |allow: &[&str], deny: &[&str]| ToolAcl {
+            allow: vec![AllowLayer::from_patterns(
+                &allow.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )],
+            deny: deny
+                .iter()
+                .map(|s| DenyRule::Pattern(s.to_string()))
+                .collect(),
+            servers: Arc::new(McpServerIndex::default()),
+            granted: true,
+        };
+        assert!(acl(&["*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["gh__*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["gh__read"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["g*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["*__read"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["slack__*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["ghost__*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["gh_x*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&[], &[]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["*"], &["gh__*"]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["*"], &["g*"]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["*"], &["*"]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["*"], &["ghost*"]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["*"], &["*__write"]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["*"], &["gh__write"]).may_reach_server("gh", "id-gh"));
+        let by_id = ToolAcl {
+            allow: vec![AllowLayer::Refs(vec![McpToolRef {
+                server_id: "id-gh".into(),
+                tool: "read".into(),
+            }])],
+            deny: Vec::new(),
+            servers: Arc::new(McpServerIndex::default()),
+            granted: true,
+        };
+        assert!(by_id.may_reach_server("gh", "id-gh"));
+        assert!(!by_id.may_reach_server("slack", "id-slack"));
     }
 
     /// The anonymous ceiling intersects — it can only ever remove tools.

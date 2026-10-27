@@ -133,7 +133,8 @@
                 "x-amz-date",
                 "x-amz-security-token",
                 "x-api-key",
-                "x-goog-api-key"
+                "x-goog-api-key",
+                "x-aisix-api-key"
               ]
             },
             "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -163,7 +164,8 @@
                 "x-amz-security-token",
                 "x-api-key",
                 "x-goog-api-key",
-                "set-cookie"
+                "set-cookie",
+                "x-aisix-api-key"
               ]
             },
             "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -250,7 +252,8 @@
                 "x-amz-date",
                 "x-amz-security-token",
                 "x-api-key",
-                "x-goog-api-key"
+                "x-goog-api-key",
+                "x-aisix-api-key"
               ]
             },
             "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -273,7 +276,8 @@
                 "x-amz-security-token",
                 "x-api-key",
                 "x-goog-api-key",
-                "set-cookie"
+                "set-cookie",
+                "x-aisix-api-key"
               ]
             },
             "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -406,7 +410,8 @@
                 "x-amz-date",
                 "x-amz-security-token",
                 "x-api-key",
-                "x-goog-api-key"
+                "x-goog-api-key",
+                "x-aisix-api-key"
               ]
             },
             "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -429,7 +434,8 @@
                 "x-amz-security-token",
                 "x-api-key",
                 "x-goog-api-key",
-                "set-cookie"
+                "set-cookie",
+                "x-aisix-api-key"
               ]
             },
             "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -509,7 +515,8 @@
                 "x-amz-date",
                 "x-amz-security-token",
                 "x-api-key",
-                "x-goog-api-key"
+                "x-goog-api-key",
+                "x-aisix-api-key"
               ]
             },
             "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -550,7 +557,8 @@
                 "x-amz-security-token",
                 "x-api-key",
                 "x-goog-api-key",
-                "set-cookie"
+                "set-cookie",
+                "x-aisix-api-key"
               ]
             },
             "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -594,7 +602,8 @@
             "x-amz-date",
             "x-amz-security-token",
             "x-api-key",
-            "x-goog-api-key"
+            "x-goog-api-key",
+            "x-aisix-api-key"
           ]
         },
         "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",
@@ -617,7 +626,8 @@
             "x-amz-security-token",
             "x-api-key",
             "x-goog-api-key",
-            "set-cookie"
+            "set-cookie",
+            "x-aisix-api-key"
           ]
         },
         "pattern": "^[a-z0-9!#$%&'*+.^_`|~-]+$",

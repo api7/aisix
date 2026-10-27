@@ -812,6 +812,12 @@ async fn dispatch(
             // headers the GATEWAY consumed, so its own credential never
             // leaks upstream.
             match route.auth_mode {
+                // A caller that sent the gateway key in its dedicated
+                // header left `authorization` / `x-api-key` for the
+                // upstream; that header itself never leaves
+                // (`header_forward_blocked`).
+                PassthroughAuthMode::GatewayKey
+                    if crate::auth::admitted_via_gateway_key_header(&incoming_headers) => {}
                 PassthroughAuthMode::GatewayKey => {
                     strip.insert("authorization".into());
                     strip.insert("x-api-key".into());
@@ -1277,9 +1283,14 @@ async fn authenticate(
     };
     match route.auth_mode {
         PassthroughAuthMode::GatewayKey => {
-            let token = bearer_of(headers.get(header::AUTHORIZATION))
-                .or_else(|| raw_of(headers.get("x-api-key")))
-                .ok_or(ProxyError::MissingAuth)?;
+            // The dedicated gateway-key header, when present, is the only
+            // one read (and an empty one is not a fall-through).
+            let token = match headers.get(crate::auth::GATEWAY_KEY_HEADER) {
+                Some(raw) => crate::auth::gateway_key_header_credential(raw)?,
+                None => bearer_of(headers.get(header::AUTHORIZATION))
+                    .or_else(|| raw_of(headers.get("x-api-key")))
+                    .ok_or(ProxyError::MissingAuth)?,
+            };
             crate::auth::authenticate_token(state, &token, ctx).await
         }
         PassthroughAuthMode::HeaderKey => {

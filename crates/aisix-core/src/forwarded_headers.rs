@@ -72,6 +72,12 @@ pub const NON_FORWARDABLE_HEADERS: &[&str] = &[
 /// caller forge them upstream, and would lose the assertion itself.
 pub const GATEWAY_HEADER_PREFIX: &str = "x-aisix-";
 
+/// The header a caller may carry its gateway credential in instead of
+/// `authorization` / `x-api-key`. Never forwarded (it is in the
+/// [`GATEWAY_HEADER_PREFIX`] namespace), and refused wherever a credential
+/// slot is refused for capture or as a request-id source.
+pub const GATEWAY_CREDENTIAL_HEADER: &str = "x-aisix-api-key";
+
 /// Client headers never forwarded by a surface that REBUILDS the outbound
 /// message, on top of [`NON_FORWARDABLE_HEADERS`].
 ///

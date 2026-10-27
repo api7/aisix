@@ -546,7 +546,8 @@ async fn prepare(
     })
 }
 
-/// Header bearer (`Authorization` / `x-api-key`) first, then the browser
+/// Header credential (`x-aisix-api-key` / `Authorization` / `x-api-key`,
+/// see [`crate::auth::header_credential`]) first, then the browser
 /// subprotocol credential.
 async fn authenticate(
     state: &ProxyState,
@@ -562,20 +563,8 @@ async fn authenticate(
         request_id: &client.request_id,
         source_ip: crate::auth::LazySourceIp::Ready(&client.source_ip),
     };
-    if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
-        let s = auth.to_str().map_err(|_| ProxyError::MissingAuth)?;
-        let token = s.strip_prefix("Bearer ").map(str::trim).unwrap_or("");
-        if token.is_empty() {
-            return Err(ProxyError::MissingAuth);
-        }
-        return crate::auth::authenticate_token(state, token, ctx).await;
-    }
-    if let Some(raw) = headers.get("x-api-key") {
-        let token = raw.to_str().map_err(|_| ProxyError::MissingAuth)?.trim();
-        if token.is_empty() {
-            return Err(ProxyError::MissingAuth);
-        }
-        return crate::auth::authenticate_token(state, token, ctx).await;
+    if let Some(token) = crate::auth::header_credential(headers) {
+        return crate::auth::authenticate_token(state, &token?, ctx).await;
     }
     // List-valued and splittable across repeated fields, like the beta
     // opt-in above: reading only the first field 401s a caller whose

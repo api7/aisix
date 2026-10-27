@@ -1,11 +1,11 @@
 //! Bearer-token authentication for the proxy surface.
 //!
-//! The extractor [`AuthenticatedKey`] parses `Authorization: Bearer <key>`
-//! (or `x-api-key: <key>` as a convenience alternative), looks the key
-//! up in the current `AisixSnapshot`, and yields the matching `ApiKey`
-//! entity. Handlers take `AuthenticatedKey` as an argument — if parsing
-//! or lookup fails the request is short-circuited with a 401 envelope
-//! before the handler runs.
+//! The extractor [`AuthenticatedKey`] reads the caller's gateway credential
+//! from the request headers ([`header_credential`] has the precedence),
+//! looks the key up in the current `AisixSnapshot`, and yields the
+//! matching `ApiKey` entity. Handlers take `AuthenticatedKey` as an
+//! argument — if parsing or lookup fails the request is short-circuited
+//! with a 401 envelope before the handler runs.
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::ApiKey;
@@ -64,14 +64,24 @@ pub struct JwtIdentity {
     /// Name of the claim mapping that selected the API key, or `None`
     /// when the subject was bound to the key directly via `jwt_subject`.
     pub claim_mapping: Option<String>,
+    /// The bearer token itself, exactly as the trust provider verified it —
+    /// what an `oauth2_token_exchange` MCP server exchanges on the caller's
+    /// behalf. Never printed.
+    pub(crate) token: Arc<str>,
 }
 
 impl JwtIdentity {
-    pub fn new(subject: String, provider: String, claim_mapping: Option<String>) -> Self {
+    pub fn new(
+        subject: String,
+        provider: String,
+        claim_mapping: Option<String>,
+        token: Arc<str>,
+    ) -> Self {
         Self {
             subject,
             provider,
             claim_mapping,
+            token,
         }
     }
 }
@@ -432,46 +442,94 @@ fn deny_key(
     err
 }
 
+/// Dedicated header for the caller's gateway credential. When present it
+/// is the ONLY header read for gateway authentication, which leaves
+/// `Authorization` free to carry a credential meant for an upstream (an MCP
+/// server's own OAuth token, for instance). Its `x-aisix-` prefix keeps it
+/// off every upstream request (`aisix_core::header_forward_blocked`).
+pub(crate) const GATEWAY_KEY_HEADER: &str =
+    aisix_core::forwarded_headers::GATEWAY_CREDENTIAL_HEADER;
+
 /// Whether the request OFFERS an inbound gateway credential at all.
 ///
-/// Deliberately wider than [`extract_bearer`]: a present-but-unusable
-/// `Authorization` — wrong scheme, empty value, bytes that are not
+/// Deliberately wider than [`header_credential`]: a present-but-unusable
+/// credential header — wrong scheme, empty value, bytes that are not
 /// ASCII — counts as offered. Anonymous entry (AISIX-Cloud#1313) is the
 /// no-credential path, so a caller that tried to authenticate and got
 /// it wrong must be rejected rather than quietly succeed as the
 /// anonymous principal with a different grant than it asked for.
 pub(crate) fn credential_offered(parts: &Parts) -> bool {
-    [axum::http::header::AUTHORIZATION.as_str(), "x-api-key"]
-        .iter()
-        .any(|name| {
-            parts
-                .headers
-                .get(*name)
-                .is_some_and(|v| v.to_str().map_or(true, |s| !s.trim().is_empty()))
-        })
+    [
+        GATEWAY_KEY_HEADER,
+        axum::http::header::AUTHORIZATION.as_str(),
+        "x-api-key",
+    ]
+    .iter()
+    .any(|name| {
+        parts
+            .headers
+            .get(*name)
+            .is_some_and(|v| v.to_str().map_or(true, |s| !s.trim().is_empty()))
+    })
+}
+
+/// Whether the caller's gateway credential came from [`GATEWAY_KEY_HEADER`]
+/// rather than `Authorization` / `x-api-key` — i.e. whether an
+/// `Authorization` on the request was NOT what the gateway admitted it with.
+pub(crate) fn admitted_via_gateway_key_header(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(GATEWAY_KEY_HEADER)
+}
+
+/// The caller's gateway credential, read from the request headers by
+/// precedence: [`GATEWAY_KEY_HEADER`] when the header is present, else
+/// `Authorization: Bearer`, else `x-api-key`. The first header present
+/// decides — an empty or malformed one is `MissingAuth`, never a
+/// fall-through to the next. `None` when none of the three is present.
+pub(crate) fn header_credential(
+    headers: &axum::http::HeaderMap,
+) -> Option<Result<String, ProxyError>> {
+    if let Some(raw) = headers.get(GATEWAY_KEY_HEADER) {
+        return Some(gateway_key_header_credential(raw));
+    }
+    if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
+        let Ok(s) = auth.to_str() else {
+            return Some(Err(ProxyError::MissingAuth));
+        };
+        return Some(match s.strip_prefix("Bearer ").map(str::trim) {
+            Some(rest) if !rest.is_empty() => Ok(rest.to_string()),
+            _ => Err(ProxyError::MissingAuth),
+        });
+    }
+    headers.get("x-api-key").map(raw_credential)
+}
+
+/// The credential in [`GATEWAY_KEY_HEADER`]: the key itself, or the key
+/// behind a `Bearer ` scheme for clients that only know how to send one.
+pub(crate) fn gateway_key_header_credential(
+    raw: &axum::http::HeaderValue,
+) -> Result<String, ProxyError> {
+    let value = raw_credential(raw)?;
+    match value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .map(str::trim)
+    {
+        Some("") => Err(ProxyError::MissingAuth),
+        Some(key) => Ok(key.to_string()),
+        None => Ok(value),
+    }
+}
+
+fn raw_credential(raw: &axum::http::HeaderValue) -> Result<String, ProxyError> {
+    let s = raw.to_str().map_err(|_| ProxyError::MissingAuth)?.trim();
+    if s.is_empty() {
+        return Err(ProxyError::MissingAuth);
+    }
+    Ok(s.to_string())
 }
 
 fn extract_bearer(parts: &Parts) -> Result<String, ProxyError> {
-    if let Some(auth) = parts.headers.get(axum::http::header::AUTHORIZATION) {
-        let s = auth.to_str().map_err(|_| ProxyError::MissingAuth)?;
-        if let Some(rest) = s.strip_prefix("Bearer ") {
-            let rest = rest.trim();
-            if rest.is_empty() {
-                return Err(ProxyError::MissingAuth);
-            }
-            return Ok(rest.to_string());
-        }
-        return Err(ProxyError::MissingAuth);
-    }
-    if let Some(raw) = parts.headers.get("x-api-key") {
-        let s = raw.to_str().map_err(|_| ProxyError::MissingAuth)?;
-        let s = s.trim();
-        if s.is_empty() {
-            return Err(ProxyError::MissingAuth);
-        }
-        return Ok(s.to_string());
-    }
-    Err(ProxyError::MissingAuth)
+    header_credential(&parts.headers).unwrap_or(Err(ProxyError::MissingAuth))
 }
 
 #[cfg(test)]
@@ -716,6 +774,47 @@ mod tests {
         h.insert("x-api-key", HeaderValue::from_static("sk-abc"));
         let parts = parts_with(h);
         assert_eq!(extract_bearer(&parts).unwrap(), "sk-abc");
+    }
+
+    #[test]
+    fn the_gateway_key_header_wins_and_never_falls_through() {
+        let headers = |pairs: &[(&'static str, &'static str)]| {
+            let mut h = HeaderMap::new();
+            for (name, value) in pairs {
+                h.insert(*name, HeaderValue::from_static(value));
+            }
+            h
+        };
+        let both = headers(&[
+            ("x-aisix-api-key", "sk-gateway"),
+            ("authorization", "Bearer upstream-token"),
+            ("x-api-key", "sk-other"),
+        ]);
+        assert_eq!(extract_bearer(&parts_with(both)).unwrap(), "sk-gateway");
+        let with_scheme = headers(&[("x-aisix-api-key", "Bearer sk-gateway")]);
+        assert_eq!(
+            extract_bearer(&parts_with(with_scheme)).unwrap(),
+            "sk-gateway"
+        );
+        // Present but empty: the missing-auth error, not the next header.
+        let empty = headers(&[
+            ("x-aisix-api-key", "  "),
+            ("authorization", "Bearer sk-valid"),
+        ]);
+        assert!(matches!(
+            extract_bearer(&parts_with(empty.clone())),
+            Err(ProxyError::MissingAuth)
+        ));
+        assert!(credential_offered(&parts_with(headers(&[(
+            "x-aisix-api-key",
+            "sk-gateway"
+        )]))));
+        // Without it, Authorization still precedes x-api-key.
+        let legacy = headers(&[
+            ("authorization", "Bearer sk-auth"),
+            ("x-api-key", "sk-xapi"),
+        ]);
+        assert_eq!(extract_bearer(&parts_with(legacy)).unwrap(), "sk-auth");
     }
 
     #[test]

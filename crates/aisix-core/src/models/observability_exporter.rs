@@ -516,6 +516,7 @@ mod tests {
                 bad.extend(
                     crate::forwarded_headers::CREDENTIAL_SLOT_HEADERS
                         .iter()
+                        .chain([&crate::forwarded_headers::GATEWAY_CREDENTIAL_HEADER])
                         .map(|n| serde_json::json!([n])),
                 );
                 for names in bad {

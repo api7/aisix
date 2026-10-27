@@ -24,17 +24,17 @@ use crate::error::McpError;
 
 /// Stop reusing a cached token this long before its reported expiry, so an
 /// upstream operation never starts with a token about to lapse mid-flight.
-const EXPIRY_SKEW: Duration = Duration::from_secs(60);
+pub(crate) const EXPIRY_SKEW: Duration = Duration::from_secs(60);
 
 /// Assumed lifetime when the token endpoint omits `expires_in` (RFC 6749 §5.1
 /// only recommends it).
-const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(3600);
+pub(crate) const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(3600);
 
 /// Cap on a reported `expires_in`. A hostile or broken identity provider can
 /// return any u64; an absurd value would overflow `Instant + Duration` and
 /// panic the connect task. Thirty days is beyond any sane token lifetime and
 /// far below the overflow horizon.
-const MAX_TOKEN_LIFETIME: Duration = Duration::from_secs(30 * 24 * 3600);
+pub(crate) const MAX_TOKEN_LIFETIME: Duration = Duration::from_secs(30 * 24 * 3600);
 
 /// One minted upstream access token. Never printed: the struct deliberately
 /// has no `Debug` impl, and nothing in this module logs the token value.
@@ -59,7 +59,7 @@ fn cache() -> &'static RwLock<HashMap<String, CachedToken>> {
 /// disabled: a token endpoint never legitimately redirects, and following one
 /// would re-POST the secret-bearing form to wherever it points (307/308 keep
 /// the body; a chain may even downgrade to plain HTTP).
-fn http_client() -> &'static reqwest::Client {
+pub(crate) fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         aisix_gateway::client_builder()

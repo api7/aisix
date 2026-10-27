@@ -371,6 +371,9 @@ fn protected_resource_response(method: &axum::http::Method, state: &ProxyState) 
         .expect("well-formed PRM response")
 }
 
+const STEP_UP_DESCRIPTION: &str =
+    "Step-up authentication required; satisfy the returned claims challenge with the IdP and retry";
+
 /// The `WWW-Authenticate` value for one challenge classification.
 /// Values interpolated into the header are filtered to RFC 6750 NQCHAR
 /// (visible ASCII minus `"` and `\`) so a config value can neither
@@ -403,6 +406,12 @@ fn challenge_header_value(challenge: &AuthChallenge, challenge_url: &str) -> Opt
                  resource_metadata=\"{url}\""
             )
         }
+        // The base64 alphabet needs no quoting.
+        AuthChallenge::InsufficientClaims { claims } => format!(
+            "Bearer resource_metadata=\"{url}\", error=\"insufficient_claims\", \
+             error_description=\"{STEP_UP_DESCRIPTION}\", claims=\"{}\"",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, claims)
+        ),
     };
     HeaderValue::from_str(&value).ok()
 }
@@ -681,6 +690,28 @@ mod tests {
             format!(
                 "Bearer error=\"insufficient_scope\", scope=\"mcp:tools mcp:read\", \
                  resource_metadata=\"{url}\""
+            )
+        );
+    }
+
+    #[test]
+    fn step_up_challenge_carries_the_claims_base64_encoded() {
+        let url = "https://gw.example.com/.well-known/oauth-protected-resource/mcp";
+        let claims = r#"{"access_token":{"acrs":{"essential":true,"value":"c1"}}}"#;
+        let h = challenge_header_value(
+            &AuthChallenge::InsufficientClaims {
+                claims: claims.into(),
+            },
+            url,
+        )
+        .unwrap();
+        assert_eq!(
+            h.to_str().unwrap(),
+            format!(
+                "Bearer resource_metadata=\"{url}\", error=\"insufficient_claims\", \
+                 error_description=\"Step-up authentication required; satisfy the returned \
+                 claims challenge with the IdP and retry\", \
+                 claims=\"eyJhY2Nlc3NfdG9rZW4iOnsiYWNycyI6eyJlc3NlbnRpYWwiOnRydWUsInZhbHVlIjoiYzEifX19\""
             )
         );
     }
