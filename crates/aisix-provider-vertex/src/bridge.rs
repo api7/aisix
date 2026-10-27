@@ -21,6 +21,7 @@
 //! URL pattern (Gemini, `generateContent`):
 //! `https://<region>-aiplatform.googleapis.com/v1/projects/<project>/
 //!  locations/<region>/publishers/google/models/<model>:generateContent`
+//! (host `https://aiplatform.googleapis.com` when `<region>` is `global`)
 
 use aisix_gateway::{
     chat::ChatChoice,
