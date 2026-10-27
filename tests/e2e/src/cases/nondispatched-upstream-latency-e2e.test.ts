@@ -33,6 +33,9 @@ const LOGSTORE = "nondispatched-latency";
 const FORBIDDEN = "forbidden-nondispatched-word";
 
 const upstreamLatency = (row: Map<string, string>) => Number(row.get("upstream_latency_ms") ?? 0);
+// The exporter writes the field even at 0; reading it raw keeps a row that
+// lost the field from passing as "not measured".
+const unmeasured = (row: Map<string, string>) => row.get("upstream_latency_ms");
 const downstreamLatency = (row: Map<string, string>) =>
   Number(row.get("downstream_latency_ms") ?? 0);
 
@@ -153,9 +156,9 @@ describe("rows that reached no upstream carry no upstream latency", () => {
     expect(blocked.status).toBeLessThan(500);
     const blockedRow = await row(blocked.requestId, "chat guardrail block");
     expect(blockedRow.get("guardrail_blocked")).toBe("true");
-    expect(upstreamLatency(blockedRow), "no upstream was contacted").toBe(0);
-    // The caller's wait is recorded the way it is for a request whose
-    // upstream failed: refusing earlier does not change that rule.
+    expect(unmeasured(blockedRow), "no upstream was contacted").toBe("0");
+    // The caller's wait follows the same rule as a request whose upstream
+    // failed: refusing earlier does not change whether it is recorded.
     expect(downstreamLatency(blockedRow) > 0).toBe(downstreamLatency(failedRow) > 0);
   });
 
@@ -164,7 +167,7 @@ describe("rows that reached no upstream carry no upstream latency", () => {
     const missing = await post("/v1/chat/completions", chat("nd-no-such-model", "hello"));
     expect(missing.status).toBeGreaterThanOrEqual(400);
     expect(missing.status).toBeLessThan(500);
-    expect(upstreamLatency(await row(missing.requestId, "unknown model"))).toBe(0);
+    expect(unmeasured(await row(missing.requestId, "unknown model"))).toBe("0");
   });
 
   test("a chat response served from the exact-match cache", async (ctx) => {
@@ -178,7 +181,7 @@ describe("rows that reached no upstream carry no upstream latency", () => {
     expect(hit.status).toBe(200);
     expect(hit.cache).toBe("hit");
     const hitRow = await row(hit.requestId, "cache hit");
-    expect(upstreamLatency(hitRow), "a cache hit contacts no upstream").toBe(0);
+    expect(unmeasured(hitRow), "a cache hit contacts no upstream").toBe("0");
     expect(downstreamLatency(hitRow), "the caller's wait is still measured").toBeGreaterThanOrEqual(1);
   });
 
@@ -193,7 +196,7 @@ describe("rows that reached no upstream carry no upstream latency", () => {
     expect(blocked.status).toBeLessThan(500);
     const blockedRow = await row(blocked.requestId, "messages guardrail block");
     expect(blockedRow.get("guardrail_blocked")).toBe("true");
-    expect(upstreamLatency(blockedRow)).toBe(0);
+    expect(unmeasured(blockedRow)).toBe("0");
   });
 
   test("a /v1/responses request blocked by an input guardrail", async (ctx) => {
@@ -203,6 +206,6 @@ describe("rows that reached no upstream carry no upstream latency", () => {
     expect(blocked.status).toBeLessThan(500);
     const blockedRow = await row(blocked.requestId, "responses guardrail block");
     expect(blockedRow.get("guardrail_blocked")).toBe("true");
-    expect(upstreamLatency(blockedRow)).toBe(0);
+    expect(unmeasured(blockedRow)).toBe("0");
   });
 });
