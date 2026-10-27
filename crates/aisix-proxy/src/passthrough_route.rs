@@ -1285,13 +1285,12 @@ async fn authenticate(
         PassthroughAuthMode::GatewayKey => {
             // The dedicated gateway-key header, when present, is the only
             // one read (and an empty one is not a fall-through).
-            let token = if let Some(raw) = headers.get(crate::auth::GATEWAY_KEY_HEADER) {
-                raw_of(Some(raw))
-            } else {
-                bearer_of(headers.get(header::AUTHORIZATION))
+            let token = match headers.get(crate::auth::GATEWAY_KEY_HEADER) {
+                Some(raw) => crate::auth::gateway_key_header_credential(raw)?,
+                None => bearer_of(headers.get(header::AUTHORIZATION))
                     .or_else(|| raw_of(headers.get("x-api-key")))
-            }
-            .ok_or(ProxyError::MissingAuth)?;
+                    .ok_or(ProxyError::MissingAuth)?,
+            };
             crate::auth::authenticate_token(state, &token, ctx).await
         }
         PassthroughAuthMode::HeaderKey => {

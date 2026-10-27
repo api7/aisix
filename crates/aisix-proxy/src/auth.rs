@@ -488,7 +488,7 @@ pub(crate) fn header_credential(
     headers: &axum::http::HeaderMap,
 ) -> Option<Result<String, ProxyError>> {
     if let Some(raw) = headers.get(GATEWAY_KEY_HEADER) {
-        return Some(raw_credential(raw));
+        return Some(gateway_key_header_credential(raw));
     }
     if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
         let Ok(s) = auth.to_str() else {
@@ -500,6 +500,23 @@ pub(crate) fn header_credential(
         });
     }
     headers.get("x-api-key").map(raw_credential)
+}
+
+/// The credential in [`GATEWAY_KEY_HEADER`]: the key itself, or the key
+/// behind a `Bearer ` scheme for clients that only know how to send one.
+pub(crate) fn gateway_key_header_credential(
+    raw: &axum::http::HeaderValue,
+) -> Result<String, ProxyError> {
+    let value = raw_credential(raw)?;
+    match value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .map(str::trim)
+    {
+        Some("") => Err(ProxyError::MissingAuth),
+        Some(key) => Ok(key.to_string()),
+        None => Ok(value),
+    }
 }
 
 fn raw_credential(raw: &axum::http::HeaderValue) -> Result<String, ProxyError> {
@@ -773,6 +790,11 @@ mod tests {
             ("x-api-key", "sk-other"),
         ]);
         assert_eq!(extract_bearer(&parts_with(both)).unwrap(), "sk-gateway");
+        let with_scheme = headers(&[("x-aisix-api-key", "Bearer sk-gateway")]);
+        assert_eq!(
+            extract_bearer(&parts_with(with_scheme)).unwrap(),
+            "sk-gateway"
+        );
         // Present but empty: the missing-auth error, not the next header.
         let empty = headers(&[
             ("x-aisix-api-key", "  "),

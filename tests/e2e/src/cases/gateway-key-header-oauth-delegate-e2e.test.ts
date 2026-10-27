@@ -198,6 +198,13 @@ describe("x-aisix-api-key + oauth_delegate e2e", () => {
     // The provider still gets the gateway-held key, not the caller's token.
     expect(seen[0].headers.authorization).toBe("Bearer sk-provider-secret");
 
+    // A client that can only send a scheme may send one.
+    const withScheme = await chat({
+      "x-aisix-api-key": `Bearer ${CALLER_KEY}`,
+      authorization: USER_TOKEN,
+    });
+    expect(withScheme.status).toBe(200);
+
     // Present means it is the only header read: wrong or empty is refused
     // even beside a valid gateway key in Authorization or x-api-key.
     for (const value of ["sk-not-a-key", ""]) {
