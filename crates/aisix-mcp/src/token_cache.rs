@@ -113,3 +113,57 @@ fn shrink(entries: &mut HashMap<String, CachedToken>, capacity: usize) {
         entries.remove(&key);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LONG: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn a_token_within_the_skew_of_expiry_is_not_reused() {
+        let cache = TokenCache::new(None);
+        cache.insert("fresh".into(), "a", LONG);
+        cache.insert("short".into(), "b", EXPIRY_SKEW);
+        assert_eq!(cache.get("fresh").as_deref(), Some("a"));
+        assert_eq!(cache.get("short"), None);
+        cache.remove("fresh");
+        assert_eq!(cache.get("fresh"), None);
+    }
+
+    #[test]
+    fn lifetime_defaults_and_is_capped() {
+        assert_eq!(token_lifetime(None), DEFAULT_TOKEN_LIFETIME);
+        assert_eq!(token_lifetime(Some(120)), Duration::from_secs(120));
+        assert_eq!(token_lifetime(Some(u64::MAX)), MAX_TOKEN_LIFETIME);
+    }
+
+    #[test]
+    fn a_full_bounded_cache_drops_expired_then_soonest_to_expire() {
+        let cache = TokenCache::new(Some(10));
+        cache.insert("expired".into(), "x", Duration::ZERO);
+        for i in 0..9 {
+            cache.insert(format!("k{i}"), "t", LONG + Duration::from_secs(i));
+        }
+        // Full: the expired entry makes room.
+        cache.insert("k9".into(), "t", LONG + Duration::from_secs(9));
+        assert_eq!(cache.entries.read().unwrap().len(), 10);
+        assert!(!cache.entries.read().unwrap().contains_key("expired"));
+
+        // Full of live tokens: the two closest to expiry go.
+        cache.insert("new".into(), "t", LONG + Duration::from_secs(100));
+        let entries = cache.entries.read().unwrap();
+        assert_eq!(entries.len(), 9);
+        assert!(!entries.contains_key("k0") && !entries.contains_key("k1"));
+        assert!(entries.contains_key("k2") && entries.contains_key("new"));
+    }
+
+    #[test]
+    fn an_unbounded_cache_never_evicts() {
+        let cache = TokenCache::new(None);
+        for i in 0..50 {
+            cache.insert(format!("k{i}"), "t", Duration::ZERO);
+        }
+        assert_eq!(cache.entries.read().unwrap().len(), 50);
+    }
+}

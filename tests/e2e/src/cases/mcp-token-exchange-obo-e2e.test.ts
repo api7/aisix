@@ -638,13 +638,23 @@ describe("oauth2_token_exchange (entra_obo) e2e", () => {
     expect(restCall.status, restCall.text).toBe(503);
     expect(JSON.parse(restCall.text).error?.code).toBe("token_exchange_unavailable");
     expect(restCall.elapsed).toBeLessThan(bound);
+    const restStarted = Date.now();
+    const restInit = await mcpPost("/mcp/oboresthang", initialize, bearer(jwt2));
+    const restInitText = await restInit.text();
+    expect(restInit.status, restInitText).toBe(503);
+    expect(JSON.parse(restInitText).error?.code).toBe("token_exchange_unavailable");
+    expect(Date.now() - restStarted).toBeLessThan(bound);
 
     // The request that gave up did not take the exchange down with it: once
     // the identity provider answers, its token is there for the next
-    // request, without a second exchange.
-    await new Promise((r) => setTimeout(r, Math.max(0, started + HANG_MS + 500 - Date.now())));
-    const after = await mcpPost("/mcp/obohang", initialize, bearer(jwt1));
-    expect(after.status, await after.text()).toBe(200);
+    // request, without a second exchange. A request that arrives before it
+    // answers joins it rather than starting another.
+    await new Promise((r) => setTimeout(r, Math.max(0, started + HANG_MS - Date.now())));
+    await waitConfigPropagation(async () => {
+      const res = await mcpPost("/mcp/obohang", initialize, bearer(jwt1));
+      await res.text();
+      return res.status === 200;
+    });
     expect(entra!.hits("/hang-mint-a/token")).toBe(1);
   });
 
