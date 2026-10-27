@@ -167,11 +167,12 @@ pub(crate) async fn get_or_exchange(
     flight.await.map_err(failure)
 }
 
-/// The exchange behind one [`Flight`]. It runs to completion as long as any
-/// waiter still polls it, so a waiter that goes away does not cancel the
-/// others' exchange.
+/// The exchange behind one [`Flight`], spawned so that it finishes and
+/// leaves the in-flight map even when every waiter goes away (a client
+/// disconnect, an upstream connect timeout) — otherwise the abandoned
+/// flight would stay in the map and be resumed, stale, by a later request.
 fn start_flight(key: String, cfg: TokenExchangeConfig, subject: String) -> Flight {
-    async move {
+    let task = tokio::spawn(async move {
         // A flight that finished between this caller's cache miss and its
         // lookup in the in-flight map has already cached the token.
         let outcome = match cached_token(&key) {
@@ -186,9 +187,10 @@ fn start_flight(key: String, cfg: TokenExchangeConfig, subject: String) -> Fligh
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&key);
         outcome
-    }
-    .boxed()
-    .shared()
+    });
+    async move { task.await.unwrap_or(Err(TokenExchangeFailure::Unavailable)) }
+        .boxed()
+        .shared()
 }
 
 fn store(key: &str, access_token: &str, lifetime: Duration) {
