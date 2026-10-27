@@ -852,7 +852,7 @@ fn emit_usage_event(
     winner: Option<&crate::attempt::AttemptRecord>,
 ) {
     let usage = &success.usage;
-    let elapsed_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
+    let elapsed_ms = crate::attempt::measured_ms(elapsed);
     let mut event = UsageEvent {
         // NO-GUARDRAIL-CHAIN: guardrails do not apply to the decision
         // endpoints, so no chain is ever resolved for this request.

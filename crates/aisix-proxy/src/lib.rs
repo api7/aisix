@@ -93,6 +93,7 @@ mod stream_timeout;
 #[cfg(test)]
 mod test_log;
 mod token_estimate;
+mod unsized_audio;
 mod usage_attr;
 /// The `model` metric label for a request that resolved no model. Exported
 /// because the retirement sweep's liveness predicate lives in the server

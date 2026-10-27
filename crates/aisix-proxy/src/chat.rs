@@ -315,7 +315,7 @@ pub async fn chat_completions(
                         // upstream TTFT; the caller waited for the whole
                         // response, which is the request clock.
                         upstream_ttft_ms: 0,
-                        downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+                        downstream_latency_ms: crate::attempt::measured_ms(elapsed),
                         attempt_index: winner.map(|w| w.index).unwrap_or(0),
                         attempt_kind: winner.map(|w| w.kind).unwrap_or("initial").to_string(),
                         attempt_model: winner.map(|w| w.target_model.clone()).unwrap_or_default(),
@@ -636,7 +636,7 @@ pub async fn chat_completions(
                             cache_hit_saved_input_tokens: 0,
                             cache_hit_saved_output_tokens: 0,
                             upstream_ttft_ms: 0,
-                            downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+                            downstream_latency_ms: crate::attempt::measured_ms(elapsed),
                             attempt_index: winner.map(|w| w.index).unwrap_or(0),
                             attempt_kind: winner.map(|w| w.kind).unwrap_or("initial").to_string(),
                             attempt_model: winner
@@ -2054,7 +2054,7 @@ async fn dispatch(
                             }
                         }
                     };
-                let latency_ms = attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                let latency_ms = crate::attempt::measured_ms(attempt_started.elapsed());
                 match attempt_stream {
                     Ok(upstream) => {
                         state.health.record_success(&model.display_name);
@@ -3280,8 +3280,7 @@ async fn dispatch(
             // built the wire body rather than keeping it for the upstream wait.
             let upstream_req = crate::effort_mapping::chat_request(req, model);
             let result = bridge.chat_cow(upstream_req, &ctx).await;
-            let attempt_latency_ms =
-                attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            let attempt_latency_ms = crate::attempt::measured_ms(attempt_started.elapsed());
             match result {
                 Ok(resp) => {
                     state.health.record_success(&model.display_name);
@@ -4908,7 +4907,7 @@ fn emit_usage_event(
         cache_creation_tokens: extras.cache_creation_tokens,
         cache_read_tokens: extras.cache_read_tokens,
         usage_estimated: extras.usage_estimated,
-        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        upstream_latency_ms: crate::attempt::measured_ms(elapsed),
         downstream_latency_ms: extras.downstream_latency_ms,
         status_code,
         provider_request_id: extras.provider_request_id,
@@ -6300,7 +6299,7 @@ where
                 // disconnects mid-stream still reports what it waited for.
                 if guard.comp().downstream_latency_ms == 0 {
                     guard.comp().downstream_latency_ms =
-                        started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        crate::attempt::measured_ms(started.elapsed());
                 }
                 let rendered = render_chunk(created, $chunk, &client_facing_model);
                 match serde_json::to_string(&rendered) {
@@ -6324,7 +6323,7 @@ where
                     if !first_chunk_seen {
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
-                            attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                            crate::attempt::measured_ms(attempt_started.elapsed());
                         crate::attribution::note_upstream_first_frame();
                     }
                     if !chunk.id.is_empty() {

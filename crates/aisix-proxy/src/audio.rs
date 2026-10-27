@@ -861,6 +861,9 @@ struct StreamedTranscript {
     /// before one arrived (a client that disconnected, an upstream that
     /// reports no tokens).
     usage: Option<UsageStats>,
+    /// Audio length a `usage: {type: "duration"}` block reported — the
+    /// duration-billed counterpart of `usage`.
+    duration_seconds: Option<f64>,
     /// The transcript assembled from the `transcript.text.delta` events.
     deltas: String,
     /// The whole transcript as the terminal `transcript.text.done` event
@@ -1107,6 +1110,9 @@ fn observe_transcript_events(
         }
         if let Some(usage) = extract_token_usage(&value) {
             observed.usage = Some(usage);
+        }
+        if let Some(seconds) = duration_from_response(&value) {
+            observed.duration_seconds = Some(seconds);
         }
         if let Some(full) = value.get("text").and_then(Value::as_str) {
             observed.terminal = Some(truncate_on_char_boundary(full, cap).to_string());
@@ -1631,15 +1637,14 @@ async fn multipart_dispatch(
         // terminal `transcript.text.done` off the same stream so the
         // request is still billed and attributed.
         AudioUpstreamBody::Live(resp) => {
-            // Duration cost basis (#457): a streamed transcription reports
-            // no duration anywhere — the terminal event carries tokens
-            // only — so the uploaded file is the only basis. Probed here,
-            // while `fields` is still in scope.
-            let duration_seconds = fields
+            // Duration cost basis (#457): what the terminal event's usage
+            // reports, else what the uploaded file says — the buffered
+            // path's precedence. Probed here, while `fields` is still in
+            // scope; the event is read at end-of-stream.
+            let probed_seconds = fields
                 .iter()
                 .find(|(name, ..)| name == "file")
-                .and_then(|(.., data)| probe_audio_duration_seconds(data))
-                .unwrap_or(0.0);
+                .and_then(|(.., data)| probe_audio_duration_seconds(data));
 
             // #450/#688: the reservation outlives the handler. The
             // concurrency slot stays held until the stream ends, and the
@@ -1700,6 +1705,8 @@ async fn multipart_dispatch(
                 eos_scan,
                 move |outcome| {
                     let usage = outcome.usage.clone().unwrap_or_default();
+                    let duration_seconds =
+                        duration_cost_basis(outcome.duration_seconds, || probed_seconds);
                     let total = u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens);
                     for key in &post_stream_keys {
                         limiter.add_tokens_post_stream(key, total);
@@ -1777,7 +1784,8 @@ async fn multipart_dispatch(
                 // The Drop guard owns the emit; the handler must not
                 // double-emit with the counts it cannot see yet.
                 usage: None,
-                duration_seconds,
+                // Not known until the stream ends; the guard's emit owns it.
+                duration_seconds: 0.0,
                 applied_guardrails,
                 redactions,
                 monitor_hits,
@@ -1807,15 +1815,18 @@ async fn multipart_dispatch(
 
     // Duration cost basis (#457): what the upstream reported, else what
     // the uploaded file says. The probe runs only when the response
-    // carried nothing, so the common `json` path never pays for it.
-    let duration_seconds = upstream_duration_seconds(&body_bytes)
-        .or_else(|| {
+    // carried nothing, so the common `json` path never pays for it. A
+    // buffered stream reports it on its terminal event, like the tokens.
+    let duration_seconds = duration_cost_basis(
+        upstream_duration_seconds(&body_bytes)
+            .or_else(|| last_sse_value(&upstream_headers, &body_bytes, duration_from_response)),
+        || {
             fields
                 .iter()
                 .find(|(name, ..)| name == "file")
                 .and_then(|(.., data)| probe_audio_duration_seconds(data))
-        })
-        .unwrap_or(0.0);
+        },
+    );
 
     // #911 [21]: commit the actual token cost so TPM/TPD is enforced for the
     // audio transcription/translation endpoints like chat + embeddings.
@@ -2418,6 +2429,15 @@ async fn speech_dispatch(
 /// Gated on the upstream content type so a `text`/`srt`/`vtt` transcript
 /// that happens to contain a `data:` line is never mistaken for a stream.
 fn extract_sse_token_usage(headers: &HeaderMap, body: &[u8]) -> Option<UsageStats> {
+    last_sse_value(headers, body, extract_token_usage)
+}
+
+/// The last event of a buffered SSE body that `read` finds something in.
+fn last_sse_value<T>(
+    headers: &HeaderMap,
+    body: &[u8],
+    read: impl Fn(&Value) -> Option<T>,
+) -> Option<T> {
     if !is_event_stream(headers) {
         return None;
     }
@@ -2430,7 +2450,7 @@ fn extract_sse_token_usage(headers: &HeaderMap, body: &[u8]) -> Option<UsageStat
         aisix_gateway::SseEvent::Data(payload) => serde_json::from_str::<Value>(payload)
             .ok()
             .as_ref()
-            .and_then(extract_token_usage),
+            .and_then(&read),
         aisix_gateway::SseEvent::Done => None,
     })
 }
@@ -2475,13 +2495,48 @@ fn extract_token_usage(body: &Value) -> Option<UsageStats> {
 /// JSON at all — which is what `probe_audio_duration_seconds` covers.
 /// <https://platform.openai.com/docs/api-reference/audio/json-object>
 fn upstream_duration_seconds(body: &[u8]) -> Option<f64> {
-    let json = serde_json::from_slice::<Value>(body).ok()?;
+    duration_from_response(&serde_json::from_slice::<Value>(body).ok()?)
+}
+
+/// [`upstream_duration_seconds`] over an already-parsed object — a JSON
+/// body or one SSE event of a streamed transcription.
+fn duration_from_response(json: &Value) -> Option<f64> {
     let from_usage = json
         .get("usage")
         .and_then(|u| u.get("seconds"))
         .and_then(Value::as_f64);
     let seconds = from_usage.or_else(|| json.get("duration").and_then(Value::as_f64))?;
     (seconds.is_finite() && seconds > 0.0).then_some(seconds)
+}
+
+/// The largest audio length the control plane can store: its column is
+/// `numeric(12,3)`.
+const MAX_AUDIO_DURATION_SECONDS: f64 = 999_999_999.999;
+
+/// The duration a transcription is priced on: what the upstream reported,
+/// else what the uploaded file says, else 0.
+///
+/// Both sources are untrusted — a caller writes the file header, and an
+/// upstream can report anything — so a length the control plane cannot
+/// store is treated as not measured (0) rather than emitted, where it
+/// would fail the whole usage batch on ingest.
+fn duration_cost_basis(reported: Option<f64>, probe: impl FnOnce() -> Option<f64>) -> f64 {
+    let (seconds, source) = match reported {
+        Some(seconds) => (seconds, "upstream"),
+        None => match probe() {
+            Some(seconds) => (seconds, "uploaded file"),
+            None => return 0.0,
+        },
+    };
+    if seconds <= MAX_AUDIO_DURATION_SECONDS {
+        return seconds;
+    }
+    tracing::warn!(
+        source,
+        seconds,
+        "audio duration exceeds what usage can record; treating it as not measured"
+    );
+    0.0
 }
 
 /// Audio length in seconds read off the uploaded file.
@@ -2496,7 +2551,7 @@ fn upstream_duration_seconds(body: &[u8]) -> Option<f64> {
 /// costs microseconds and cannot pull in a decode path. Anything it
 /// cannot identify yields `None` → a zero cost basis, never an error:
 /// the transcript already succeeded and the upstream already billed.
-fn probe_audio_duration_seconds(audio: &[u8]) -> Option<f64> {
+pub(crate) fn probe_audio_duration_seconds(audio: &[u8]) -> Option<f64> {
     use lofty::file::AudioFile;
     use lofty::probe::Probe;
 
@@ -2509,11 +2564,16 @@ fn probe_audio_duration_seconds(audio: &[u8]) -> Option<f64> {
 
     let probed = Probe::new(std::io::Cursor::new(audio))
         .guess_file_type()
-        .ok()?
-        .read()
-        .ok()?;
-    let seconds = probed.properties().duration().as_secs_f64();
-    (seconds > 0.0).then_some(seconds)
+        .ok()
+        .and_then(|p| p.read().ok())
+        .map(|f| f.properties().duration().as_secs_f64())
+        .filter(|seconds| *seconds > 0.0);
+    // A streamed WAV / FLAC leaves its length unset, which `lofty` reads
+    // as no file or as 0 s — OpenAI's own `/v1/audio/speech` output among
+    // them.
+    probed
+        .or_else(|| crate::unsized_audio::wav_duration_seconds(audio))
+        .or_else(|| crate::unsized_audio::flac_duration_seconds(audio))
 }
 
 /// Terminal request-metric emit for the two transcription-shaped routes,
@@ -2682,8 +2742,8 @@ fn emit_usage_event(
         // Narrowed to the winning attempt's own latency below
         // (`apply_winning_attempt`) once a failover put earlier attempts
         // in front of it; they emitted their own events.
-        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
-        downstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        upstream_latency_ms: crate::attempt::measured_ms(elapsed),
+        downstream_latency_ms: crate::attempt::measured_ms(elapsed),
         status_code,
         inbound_protocol: "openai".to_string(),
         applied_guardrails: applied_guardrails.to_vec(),
@@ -3517,6 +3577,41 @@ mod tests {
         );
     }
 
+    /// A length the control plane cannot store is not measured, whichever
+    /// source reported it — and the report wins over the file even then,
+    /// rather than the file standing in for a figure the upstream did give.
+    #[test]
+    fn an_unstorable_duration_is_not_measured() {
+        assert_eq!(super::duration_cost_basis(Some(11.0), || Some(3.0)), 11.0);
+        assert_eq!(super::duration_cost_basis(None, || Some(3.0)), 3.0);
+        assert_eq!(super::duration_cost_basis(Some(4.0e9), || Some(3.0)), 0.0);
+        assert_eq!(super::duration_cost_basis(None, || Some(4.0e9)), 0.0);
+        assert_eq!(super::duration_cost_basis(None, || None), 0.0);
+    }
+
+    /// A FLAC header can declare a 36-bit sample count; at 1 Hz that is
+    /// ~2,000 years of audio, which `lofty` reports as read.
+    #[test]
+    fn a_header_declaring_an_absurd_length_is_not_measured() {
+        let flac = absurd_flac_header();
+        let probed = super::probe_audio_duration_seconds(&flac).expect("lofty reads the header");
+        assert!(probed > super::MAX_AUDIO_DURATION_SECONDS, "got {probed}");
+        assert_eq!(super::duration_cost_basis(None, || Some(probed)), 0.0);
+    }
+
+    /// `fLaC` + a lone STREAMINFO declaring 2^36-1 samples at 1 Hz.
+    fn absurd_flac_header() -> Vec<u8> {
+        let mut flac = b"fLaC".to_vec();
+        flac.extend_from_slice(&[0x80, 0, 0, 34]); // last block, STREAMINFO
+        flac.extend_from_slice(&[0x10, 0x00, 0x10, 0x00]); // block 4096..4096
+        flac.extend_from_slice(&[0; 6]); // frame sizes unknown
+                                         // 1 Hz, mono, 16 bits, total samples 0xF_FFFF_FFFF.
+        flac.extend_from_slice(&[0x00, 0x00, 0x10, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        flac.extend_from_slice(&[0; 16]); // MD5
+        flac.extend_from_slice(&[0xFF, 0xF8, 0x69, 0x08, 0x00, 0x00, 0x00, 0x00]);
+        flac
+    }
+
     /// The default `json` transcription reports its length under
     /// `usage.seconds` (the duration variant of OpenAI's usage oneOf),
     /// which is the cost basis for whisper-1 — a model that reports no
@@ -3634,6 +3729,48 @@ mod tests {
             (26, 12),
             "the terminal transcript.text.done usage must be billed"
         );
+    }
+
+    /// An SSE answer read whole (the caller did not ask to stream, or an
+    /// output chain holds it back) reports a duration-billed model's length
+    /// on its terminal event, and that figure is the cost basis — not the
+    /// uploaded file, which here would probe as nothing at all.
+    #[tokio::test]
+    async fn buffered_stream_takes_the_terminal_event_duration() {
+        let upstream = MockServer::builder().start().await;
+        let sse = concat!(
+            "data: {\"type\":\"transcript.text.delta\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"transcript.text.done\",\"text\":\"hello\",",
+            "\"usage\":{\"type\":\"duration\",\"seconds\":11.5}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = transcription_multipart("my-transcribe");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.audio_duration_seconds, 11.5);
     }
 
     /// #998: with `stream=true` and an SSE answer the relay is live —
