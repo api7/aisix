@@ -56,6 +56,7 @@ const CLIENT_ID = "gateway-client-id";
 const CLIENT_SECRET = "gateway-client-secret";
 const KEY_1 = "sk-obo-agent-1";
 const KEY_2 = "sk-obo-agent-2";
+const KEY_3 = "sk-obo-agent-3";
 const hash = (key: string) => createHash("sha256").update(key).digest("hex");
 const STEP_UP_CLAIMS = '{"access_token":{"capolids":{"essential":true,"values":["c1"]}}}';
 
@@ -158,6 +159,7 @@ describe("oauth2_token_exchange (entra_obo) e2e", () => {
   let etcdReachable = false;
   let jwt1 = "";
   let jwt2 = "";
+  let jwt3 = "";
 
   const initialize = {
     jsonrpc: "2.0",
@@ -278,6 +280,14 @@ describe("oauth2_token_exchange (entra_obo) e2e", () => {
         mcp_access: { allow: ["*"] },
       });
     }
+    await seed.createApiKey({
+      key_hash: hash(KEY_3),
+      allowed_models: [],
+      jwt_subject: "agent-3",
+      jwt_provider: "corp-entra",
+      mcp_access: { allow: ["oborest__*"] },
+    });
+    jwt3 = idp.sign(agentClaims(idp.url, { sub: "agent-3" }));
     jwt1 = idp.sign(agentClaims(idp.url, { sub: "agent-1" }));
     jwt2 = idp.sign(agentClaims(idp.url, { sub: "agent-2" }));
     const proxy = new ProxyClient(app.proxyUrl, KEY_2);
@@ -363,6 +373,22 @@ describe("oauth2_token_exchange (entra_obo) e2e", () => {
 
     expect(entra!.hits("/mint/token")).toBe(before);
     expect(upstream!.receivedHeaders.length).toBe(upstreamBefore);
+  });
+
+  test("a server outside the caller's grant is an ACL outcome, not a sign-in challenge", async () => {
+    if (!etcdReachable) return;
+    const before = entra!.hits("/mint/token");
+    const init = await mcpPost("/mcp/obo", initialize, bearer(jwt3));
+    expect(init.status, await init.clone().text()).toBe(200);
+    const list = await mcpPost(
+      "/mcp/obo",
+      { jsonrpc: "2.0", id: 2, method: "tools/list" },
+      bearer(jwt3),
+    );
+    expect(list.status, await list.clone().text()).toBe(200);
+    const body = (await list.json()) as { result?: { tools?: unknown[] } };
+    expect(body.result?.tools).toEqual([]);
+    expect(entra!.hits("/mint/token")).toBe(before);
   });
 
   test("the identity provider's answer maps to the caller's status", async () => {

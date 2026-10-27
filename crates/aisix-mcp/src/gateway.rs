@@ -511,6 +511,11 @@ struct ScopedServer {
     /// Disabled servers stay reserved so this scope's callable name surface
     /// does not shift when another server's `enabled` flag is toggled.
     foreign: std::collections::HashSet<String>,
+    /// Whether the caller's ACL can reach this server. One it cannot gets
+    /// no caller credentials, so its token-exchange failure is a missing
+    /// grant, not a sign-in the caller could repeat: it is the ACL that
+    /// answers (an empty list, a refused call), never an auth challenge.
+    reachable: bool,
 }
 
 impl McpGateway {
@@ -586,7 +591,9 @@ impl McpGateway {
     /// in from how its first request is answered. Other auth types, and the
     /// aggregated gateway, pass without contacting anything.
     pub async fn preflight_upstream_auth(&self) -> Option<TokenExchangeFailure> {
-        self.scoped.as_ref()?;
+        if !self.scoped.as_ref()?.reachable {
+            return None;
+        }
         let upstream = self.upstreams.first()?;
         match upstream.bridge.preflight_auth().await {
             Err(McpError::TokenExchange(kind)) => Some(kind),
@@ -595,6 +602,9 @@ impl McpGateway {
     }
 
     fn note_auth_failure(&self, error: &McpError) {
+        if self.scoped.as_ref().is_some_and(|scoped| !scoped.reachable) {
+            return;
+        }
         if let McpError::TokenExchange(kind) = error {
             let _ = self.auth_failure.set(kind.clone());
         }
@@ -685,6 +695,7 @@ impl McpGateway {
         }
         crate::bridge::warn_cleartext_credential(&entry.value);
         let name = entry.value.name.clone();
+        let reachable = acl.may_reach_server(&name, &entry.id);
         let bridge = bridge_for(entry, client_headers, caller, &acl);
         let foreign = snapshot
             .mcp_servers
@@ -694,7 +705,11 @@ impl McpGateway {
             .map(|e| e.value.name.clone())
             .collect();
         let mut gateway = McpGateway::new([(name.clone(), bridge)]).with_tool_acl(acl);
-        gateway.scoped = Some(Arc::new(ScopedServer { name, foreign }));
+        gateway.scoped = Some(Arc::new(ScopedServer {
+            name,
+            foreign,
+            reachable,
+        }));
         Some(gateway)
     }
 
