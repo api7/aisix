@@ -390,6 +390,41 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     expect(hs.openaiBeta).toBeUndefined();
   });
 
+  test("x-aisix-api-key authenticates the session ahead of Authorization", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+    const wsUrl = `${app.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=realtime-e2e-model`;
+    const dial = (headers: Record<string, string>) =>
+      new Promise<number | string>((resolve) => {
+        const c = new WsClient(wsUrl, { headers });
+        c.on("open", () => c.send(JSON.stringify({ type: "session.update" })));
+        c.on("message", (d) => {
+          resolve(JSON.parse(d.toString()).type as string);
+          c.terminate();
+        });
+        c.on("unexpected-response", (_q, res) => resolve(res.statusCode ?? 0));
+        c.on("error", () => resolve("error"));
+      });
+    // The gateway key in its dedicated header; Authorization carries a
+    // token meant for someone else and is not read for gateway auth.
+    expect(
+      await dial({
+        "x-aisix-api-key": CALLER_PLAINTEXT,
+        authorization: "Bearer not-a-gateway-key",
+      }),
+    ).toBe("response.done");
+    // Present, so it is the only credential read: a wrong value is refused
+    // even beside a valid Authorization.
+    expect(
+      await dial({
+        "x-aisix-api-key": "sk-not-a-key",
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+      }),
+    ).toBe(401);
+  });
+
   test("forward_client_headers reaches the upstream handshake, minus the browser credential", async (ctx) => {
     if (!etcdReachable || !app || !upstream) {
       ctx.skip();
