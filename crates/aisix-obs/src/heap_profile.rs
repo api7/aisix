@@ -312,6 +312,9 @@ pub fn spawn_auto_dump(cfg: &AutoDumpConfig, metrics: Metrics) {
                         });
                     match written {
                         Ok(path) => {
+                            // Prune before counting, so the counter never
+                            // runs ahead of retention.
+                            prune(&dir, &host, keep);
                             metrics.record_heap_profile_dump("auto", true);
                             tracing::warn!(
                                 file = %path.display(),
@@ -319,7 +322,6 @@ pub fn spawn_auto_dump(cfg: &AutoDumpConfig, metrics: Metrics) {
                                 fraction,
                                 "resident memory crossed a heap-dump threshold; heap profile written"
                             );
-                            prune(&dir, &host, keep);
                         }
                         Err(error) => {
                             metrics.record_heap_profile_dump("auto", false);
