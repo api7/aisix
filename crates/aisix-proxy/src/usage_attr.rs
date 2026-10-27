@@ -1018,8 +1018,8 @@ fn stamp_requested_model_id(event: &mut UsageEvent) {
 /// body EOF/drop), a non-terminal one carries its own attempt span alone.
 /// `dispatched` is the caller's statement that this event describes work
 /// that actually reached an upstream — a cache hit and a pre-dispatch
-/// error pass `false` so no fictitious upstream CLIENT span is fabricated
-/// from the handler-elapsed time their events carry. The event's public
+/// error pass `false`, which zeroes the event's `upstream_*` latencies and
+/// keeps an upstream CLIENT span from being fabricated. The event's public
 /// `trace_id` is stamped here so the CP row and the exported spans always
 /// agree.
 #[allow(clippy::too_many_arguments)]
@@ -1074,6 +1074,12 @@ pub(crate) fn emit_usage(
         if event.provider_request_id.is_empty() {
             event.provider_request_id = sanitize_provider_response_id(&response.request_id);
         }
+    } else {
+        // The `upstream_*` latencies time one upstream attempt. An event that
+        // reached no upstream has none, whatever duration its builder had at
+        // hand (a cache hit's or a refusal's handler time).
+        event.upstream_latency_ms = 0;
+        event.upstream_ttft_ms = 0;
     }
     // The request's access-log line, for the families that deferred it to
     // their stream (AISIX-Cloud#1571). Here, and after the stamping above,

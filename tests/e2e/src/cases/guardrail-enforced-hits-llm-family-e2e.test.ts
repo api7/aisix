@@ -468,6 +468,8 @@ describe("guardrail enforced hits on the LLM handler family", () => {
     expect(log.get("status_code")).toBe("501");
     expect(log.get("prompt_tokens") ?? "0").toBe("0");
     expect(log.get("completion_tokens") ?? "0").toBe("0");
+    // The gateway answered the 501 itself, so no upstream latency exists.
+    expect(log.get("upstream_latency_ms")).toBe("0");
     const hits = JSON.parse(log.get("guardrail_enforced_hits") ?? "[]") as EnforcedHit[];
     const hit = hits.find(
       (candidate) =>

@@ -600,7 +600,8 @@ pub(crate) fn ms_since(started: Instant) -> u32 {
 
 /// A latency in whole milliseconds, for the telemetry fields where 0 means
 /// "not measured": a measured duration reads as at least 1, so a
-/// sub-millisecond response (a cache hit) is not reported as missing.
+/// sub-millisecond wait (a cache hit's caller latency) is not reported as
+/// missing.
 /// `Duration::ZERO` is what callers pass for nothing measured (an attempt
 /// refused before dispatch), and stays 0. Saturates at `u32::MAX`.
 pub(crate) fn measured_ms(elapsed: std::time::Duration) -> u32 {

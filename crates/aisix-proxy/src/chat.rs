@@ -4872,9 +4872,9 @@ fn emit_usage_event(
     // its own attempt span alone.
     terminal: bool,
     // Whether the work this event describes actually reached an upstream.
-    // A cache hit and a pre-dispatch error pass false: their events carry
-    // the HANDLER's elapsed time, which must not fabricate an upstream
-    // CLIENT span.
+    // A cache hit and a pre-dispatch error pass false; `emit_usage` then
+    // drops the handler time they pass as `elapsed` from the upstream
+    // latency and fabricates no upstream CLIENT span.
     dispatched: bool,
     // The request's enforced-guardrail audit handle (AISIX-Cloud#1330).
     audit: &crate::usage_attr::GuardrailAudit,
