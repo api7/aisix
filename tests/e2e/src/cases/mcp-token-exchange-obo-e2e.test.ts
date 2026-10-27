@@ -82,11 +82,14 @@ interface MockEntra {
   url: string;
   forms: Record<string, Record<string, string>[]>;
   hits(path: string): number;
+  /** How many responses on `path` have been written in full. */
+  answered(path: string): number;
   close(): Promise<void>;
 }
 
 async function startMockEntra(): Promise<MockEntra> {
   const forms: Record<string, Record<string, string>[]> = {};
+  const answered: Record<string, number> = {};
   const server: Server = createServer((req, res) => {
     let raw = "";
     req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
@@ -106,7 +109,9 @@ async function startMockEntra(): Promise<MockEntra> {
           () =>
             res
               .writeHead(status, { "content-type": "application/json" })
-              .end(JSON.stringify(body)),
+              .end(JSON.stringify(body), () => {
+                answered[path] = (answered[path] ?? 0) + 1;
+              }),
           hang ? HANG_MS : slow ? 500 : 0,
         );
       if (behavior.startsWith("mint-once") && seen.length > 1) {
@@ -155,6 +160,7 @@ async function startMockEntra(): Promise<MockEntra> {
     url: `http://127.0.0.1:${address.port}`,
     forms,
     hits: (path) => forms[path]?.length ?? 0,
+    answered: (path) => answered[path] ?? 0,
     close: () => new Promise((resolve) => server.close(() => resolve())),
   };
 }
@@ -647,14 +653,12 @@ describe("oauth2_token_exchange (entra_obo) e2e", () => {
 
     // The request that gave up did not take the exchange down with it: once
     // the identity provider answers, its token is there for the next
-    // request, without a second exchange. A request that arrives before it
-    // answers joins it rather than starting another.
-    await new Promise((r) => setTimeout(r, Math.max(0, started + HANG_MS - Date.now())));
-    await waitConfigPropagation(async () => {
-      const res = await mcpPost("/mcp/obohang", initialize, bearer(jwt1));
-      await res.text();
-      return res.status === 200;
-    });
+    // request, without a second exchange. Nothing touches the gateway until
+    // the identity provider has answered the abandoned exchange.
+    await waitConfigPropagation(async () => entra!.answered("/hang-mint-a/token") === 1);
+    await new Promise((r) => setTimeout(r, 200));
+    const after = await mcpPost("/mcp/obohang", initialize, bearer(jwt1));
+    expect(after.status, await after.text()).toBe(200);
     expect(entra!.hits("/hang-mint-a/token")).toBe(1);
   });
 
