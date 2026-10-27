@@ -36,11 +36,14 @@ const HITS = 30;
 interface OtlpReceiver {
   url: string;
   spanAttrs: Array<Record<string, string>>;
+  /** Exports that did not parse — answered 400 and surfaced by `waitSpan`. */
+  errors: string[];
   close(): Promise<void>;
 }
 
 async function startOtlpReceiver(): Promise<OtlpReceiver> {
   const spanAttrs: Array<Record<string, string>> = [];
+  const errors: string[] = [];
   const server: Server = createServer((req, res) => {
     let raw = "";
     req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
@@ -61,8 +64,11 @@ async function startOtlpReceiver(): Promise<OtlpReceiver> {
             }
           }
         }
-      } catch {
-        // ignore malformed bodies — assertions fail on missing spans
+      } catch (err) {
+        errors.push(String(err));
+        res.statusCode = 400;
+        res.end("{}");
+        return;
       }
       res.statusCode = 200;
       res.end("{}");
@@ -73,6 +79,7 @@ async function startOtlpReceiver(): Promise<OtlpReceiver> {
   return {
     url: `http://127.0.0.1:${port}/v1/traces`,
     spanAttrs,
+    errors,
     async close() {
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
@@ -88,6 +95,9 @@ async function waitSpan(
 ): Promise<Record<string, string>> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    if (recv.errors.length > 0) {
+      throw new Error(`malformed OTLP export: ${recv.errors[0]}`);
+    }
     const hit = recv.spanAttrs.find(
       (a) =>
         a["aisix.request_id"] === requestId &&
