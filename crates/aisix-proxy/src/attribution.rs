@@ -684,7 +684,7 @@ impl GatewayEmbeddingCallGuard {
     /// elapsed time for the ordinary success/error record.
     pub(crate) fn settle(&mut self) -> u32 {
         self.recorded = true;
-        u32::try_from(self.started.elapsed().as_millis()).unwrap_or(u32::MAX)
+        crate::attempt::measured_ms(self.started.elapsed())
     }
 }
 
@@ -699,8 +699,7 @@ impl Drop for GatewayEmbeddingCallGuard {
                     prompt_tokens: 0,
                     total_tokens: 0,
                     usage_source: aisix_obs::GatewayEmbeddingUsageSource::Unavailable,
-                    latency_ms: u32::try_from(self.started.elapsed().as_millis())
-                        .unwrap_or(u32::MAX),
+                    latency_ms: crate::attempt::measured_ms(self.started.elapsed()),
                     outcome: aisix_obs::GatewayEmbeddingOutcome::Failed,
                 });
             }

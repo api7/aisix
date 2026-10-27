@@ -402,7 +402,7 @@ pub async fn responses(
                     // response, which is exactly the request clock. Streamed
                     // responses stamp this from inside the stream and never
                     // reach this branch (`usage` is None there).
-                    usage.downstream_latency_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
+                    usage.downstream_latency_ms = crate::attempt::measured_ms(elapsed);
                     // Winning-attempt classification (#655). Direct models
                     // have no recorded attempt → AttemptInfo defaults.
                     let winner = success.routing.winner();
@@ -1595,8 +1595,7 @@ async fn responses_to_target(
                 buf.extend_from_slice(&chunk);
                 buf_held.set(buf.len());
                 if upstream_ttft_ms == 0 && has_complete_responses_sse_event(&buf) {
-                    upstream_ttft_ms =
-                        attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                    upstream_ttft_ms = crate::attempt::measured_ms(attempt_started.elapsed());
                     crate::attribution::note_upstream_first_frame();
                 }
                 let end = counted_upto + crate::redact::last_frame_end(&buf[counted_upto..]);
@@ -3287,7 +3286,7 @@ fn drain_responses_sse_frames(
                 if !*first_frame_seen {
                     *first_frame_seen = true;
                     acc.get_or_insert_with(Default::default).upstream_ttft_ms =
-                        attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        crate::attempt::measured_ms(attempt_started.elapsed());
                     crate::attribution::note_upstream_first_frame();
                 }
                 // `resp_…` off any frame that carries the response object —
@@ -3640,7 +3639,7 @@ where
                 let acc = usage_acc.get_or_insert_with(Default::default);
                 if acc.downstream_latency_ms == 0 {
                     acc.downstream_latency_ms =
-                        started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        crate::attempt::measured_ms(started.elapsed());
                 }
                 yield Ok(bytes::Bytes::from(forward));
                 continue;
@@ -3710,7 +3709,7 @@ where
             let acc = usage_acc.get_or_insert_with(Default::default);
             if acc.downstream_latency_ms == 0 {
                 acc.downstream_latency_ms =
-                    started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                    crate::attempt::measured_ms(started.elapsed());
             }
             yield Ok(bytes::Bytes::from(tail));
         }
@@ -4085,7 +4084,7 @@ fn emit_usage_event(
         cache_creation_tokens: usage.cache_creation_tokens,
         cache_read_tokens: usage.cache_read_tokens,
         usage_estimated: usage.usage_estimated,
-        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        upstream_latency_ms: crate::attempt::measured_ms(elapsed),
         upstream_ttft_ms: usage.upstream_ttft_ms,
         downstream_latency_ms: usage.downstream_latency_ms,
         status_code,
@@ -4251,7 +4250,7 @@ fn emit_zero_token_event(
         requested_model: requested_model.to_string(),
         redacted_entity_counts,
         guardrail_monitor_hits,
-        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        upstream_latency_ms: crate::attempt::measured_ms(elapsed),
         status_code,
         inbound_protocol: "openai".to_string(),
         attempt_index: attempt.index,

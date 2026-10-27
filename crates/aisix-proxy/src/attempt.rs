@@ -593,15 +593,34 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
     }
 }
 
-/// Milliseconds elapsed since `started`, saturating at `u32::MAX`.
+/// Milliseconds elapsed since `started`; see [`measured_ms`].
 pub(crate) fn ms_since(started: Instant) -> u32 {
-    started.elapsed().as_millis().min(u32::MAX as u128) as u32
+    measured_ms(started.elapsed())
+}
+
+/// A measured latency in whole milliseconds, for the telemetry fields where
+/// 0 means "not measured": anything that was measured reads as at least 1,
+/// so a sub-millisecond response (a cache hit) is not reported as missing.
+/// Saturates at `u32::MAX`.
+pub(crate) fn measured_ms(elapsed: std::time::Duration) -> u32 {
+    elapsed.as_millis().clamp(1, u128::from(u32::MAX)) as u32
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use aisix_gateway::{BridgeCapability, UpstreamWire, MAX_UPSTREAM_ERROR_MESSAGE_BYTES};
+
+    /// 0 is the "not measured" sentinel on every latency field, so a
+    /// measured wait under a millisecond must not collapse into it.
+    #[test]
+    fn a_measured_latency_is_at_least_one_millisecond() {
+        use std::time::Duration;
+        assert_eq!(measured_ms(Duration::ZERO), 1);
+        assert_eq!(measured_ms(Duration::from_micros(400)), 1);
+        assert_eq!(measured_ms(Duration::from_micros(2_700)), 2);
+        assert_eq!(measured_ms(Duration::from_secs(u64::MAX)), u32::MAX);
+    }
 
     /// One sample of every `BridgeError` variant.
     ///

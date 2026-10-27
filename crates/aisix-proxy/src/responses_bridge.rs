@@ -2472,7 +2472,7 @@ pub fn build_responses_bridge_stream(
                 }
                 if guard.comp().downstream_latency_ms == 0 {
                     guard.comp().downstream_latency_ms =
-                        started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        crate::attempt::measured_ms(started.elapsed());
                 }
             };
         }
@@ -2502,7 +2502,7 @@ pub fn build_responses_bridge_stream(
                     if !first_chunk_seen {
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
-                            attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                            crate::attempt::measured_ms(attempt_started.elapsed());
                             crate::attribution::note_upstream_first_frame();
                     }
                     {

@@ -357,10 +357,9 @@ pub struct UsageEvent {
     /// (AISIX-Cloud#1225) shows the wait in `upstream_latency_ms`, not
     /// here. Same attempt scope as `upstream_latency_ms`, so the two
     /// are directly comparable. 0 on non-streaming, error, and
-    /// cache-hit paths (omitted from the wire via skip_serializing_if)
-    /// — and, since the field is whole milliseconds, also on a stream
-    /// whose first frame arrived in under one. Absent therefore means
-    /// "no streamed first frame was measured", not "there was no
+    /// cache-hit paths (omitted from the wire via skip_serializing_if).
+    /// A frame that arrived in under a millisecond reads as 1, so absent
+    /// means "no streamed first frame was measured", not "there was no
     /// stream".
     ///
     /// This is what the UPSTREAM delivered on this attempt. What the

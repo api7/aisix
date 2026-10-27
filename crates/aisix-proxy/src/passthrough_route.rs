@@ -5976,11 +5976,7 @@ fn stream_opaque_response(
             match chunk {
                 Ok(chunk) => {
                     if telemetry.upstream_ttft_ms == 0 {
-                        telemetry.upstream_ttft_ms = telemetry
-                            .attempt_started
-                            .elapsed()
-                            .as_millis()
-                            .min(u32::MAX as u128) as u32;
+                        telemetry.upstream_ttft_ms = crate::attempt::measured_ms(telemetry.attempt_started.elapsed());
                         crate::attribution::note_upstream_first_frame();
                     }
                     telemetry.mark_first_delivery();
@@ -6137,11 +6133,7 @@ fn stream_response(
             // TTFT on the first upstream chunk of any type — the same
             // convention the typed streaming endpoints stamp.
             if telemetry.upstream_ttft_ms == 0 {
-                telemetry.upstream_ttft_ms = telemetry
-                    .attempt_started
-                    .elapsed()
-                    .as_millis()
-                    .min(u32::MAX as u128) as u32;
+                telemetry.upstream_ttft_ms = crate::attempt::measured_ms(telemetry.attempt_started.elapsed());
                 crate::attribution::note_upstream_first_frame();
             }
             for frame in splitter.push(&chunk) {
@@ -7077,8 +7069,7 @@ impl RouteTelemetry {
     /// chunk renderer.
     fn mark_first_delivery(&mut self) {
         if self.downstream_first_ms.is_none() {
-            self.downstream_first_ms =
-                Some(self.started.elapsed().as_millis().min(u32::MAX as u128) as u32);
+            self.downstream_first_ms = Some(crate::attempt::measured_ms(self.started.elapsed()));
         }
     }
 
@@ -7230,11 +7221,7 @@ impl RouteTelemetry {
             cache_creation_tokens: usage.cache_creation_tokens,
             cache_read_tokens: usage.cache_read_tokens,
             service_tier: self.service_tier.clone(),
-            upstream_latency_ms: self
-                .attempt_started
-                .elapsed()
-                .as_millis()
-                .min(u32::MAX as u128) as u32,
+            upstream_latency_ms: crate::attempt::measured_ms(self.attempt_started.elapsed()),
             upstream_ttft_ms: self.upstream_ttft_ms,
             // Streaming reports the caller's wait to the FIRST relayed
             // frame, per the field's contract — a relay is a delivery
@@ -7245,7 +7232,7 @@ impl RouteTelemetry {
             downstream_latency_ms: if self.streaming {
                 self.downstream_first_ms.unwrap_or(0)
             } else {
-                elapsed.as_millis().min(u32::MAX as u128) as u32
+                crate::attempt::measured_ms(elapsed)
             },
             error_class: std::mem::take(&mut self.error_class),
             error_message: std::mem::take(&mut self.error_message),

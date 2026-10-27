@@ -316,7 +316,7 @@ pub async fn messages(
                 // which is exactly the request clock. (The streaming paths
                 // stamp this from inside the stream and skip this branch.)
                 let mut metrics = metrics;
-                metrics.downstream_latency_ms = elapsed.as_millis().min(u32::MAX as u128) as u32;
+                metrics.downstream_latency_ms = crate::attempt::measured_ms(elapsed);
                 emit_anthropic_usage_event(
                     &state,
                     &snapshot,
@@ -2914,7 +2914,7 @@ fn build_anthropic_sse_stream(
         ($guard:expr, $ev:expr) => {{
             if $guard.comp().downstream_latency_ms == 0 {
                 $guard.comp().downstream_latency_ms =
-                    started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                    crate::attempt::measured_ms(started.elapsed());
             }
             bytes::Bytes::from($ev.to_sse_string())
         }};
@@ -2965,7 +2965,7 @@ fn build_anthropic_sse_stream(
                     if !first_chunk_seen {
                         first_chunk_seen = true;
                         guard.comp().upstream_ttft_ms =
-                            attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                            crate::attempt::measured_ms(attempt_started.elapsed());
                             crate::attribution::note_upstream_first_frame();
                     }
                     let comp = guard.comp();
@@ -3677,7 +3677,7 @@ fn emit_anthropic_usage_event(
         cache_creation_tokens: metrics.cache_creation_tokens,
         cache_read_tokens: metrics.cache_read_tokens,
         usage_estimated: metrics.usage_estimated,
-        upstream_latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        upstream_latency_ms: crate::attempt::measured_ms(elapsed),
         downstream_latency_ms: metrics.downstream_latency_ms,
         status_code,
         provider_request_id: metrics.provider_request_id,
@@ -3920,7 +3920,7 @@ fn update_anthropic_usage(
     // so the figure matches external observers (AISIX-Cloud#1225).
     if !*first_token_seen {
         *first_token_seen = true;
-        acc.upstream_ttft_ms = attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        acc.upstream_ttft_ms = crate::attempt::measured_ms(attempt_started.elapsed());
         crate::attribution::note_upstream_first_frame();
     }
     match json.get("type").and_then(Value::as_str) {
@@ -4428,7 +4428,7 @@ where
                 }
                 if guard.usage().downstream_latency_ms == 0 {
                     guard.usage().downstream_latency_ms =
-                        started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        crate::attempt::measured_ms(started.elapsed());
                 }
                 keep_live_copy(&mut live_copy, &forward);
                 yield Ok(Bytes::from(forward));
@@ -4514,7 +4514,7 @@ where
                         }
                         if guard.usage().downstream_latency_ms == 0 {
                             guard.usage().downstream_latency_ms =
-                                started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                                crate::attempt::measured_ms(started.elapsed());
                         }
                         yield Ok(Bytes::from(std::mem::take(&mut held)));
                         held_len.clear();
@@ -4540,7 +4540,7 @@ where
                 .unwrap_or(tail);
                 if guard.usage().downstream_latency_ms == 0 {
                     guard.usage().downstream_latency_ms =
-                        started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        crate::attempt::measured_ms(started.elapsed());
                 }
                 // The copy is walked frame by frame, so give the final frame
                 // the terminator the upstream left off.
@@ -4774,14 +4774,14 @@ where
                     );
                     if guard.usage().downstream_latency_ms == 0 {
                         guard.usage().downstream_latency_ms =
-                            started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                            crate::attempt::measured_ms(started.elapsed());
                     }
                     yield Ok(Bytes::from(rewritten));
                 }
                 None => {
                     if guard.usage().downstream_latency_ms == 0 {
                         guard.usage().downstream_latency_ms =
-                            started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                            crate::attempt::measured_ms(started.elapsed());
                     }
                     yield Ok(Bytes::from(std::mem::take(&mut held)));
                     held_len.clear();
