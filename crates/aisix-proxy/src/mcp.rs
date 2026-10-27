@@ -2121,16 +2121,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_gates_non_post_methods() {
-        // The route is `any(...)`, so every method must be auth-gated — a GET
-        // with no key must 401 (not fall through to rmcp's 405).
+    async fn mcp_rejects_unsupported_methods_only_after_authentication() {
         let router = router_with(snapshot_with_key());
-        let req = HttpRequest::get("/mcp")
-            .header("host", "mcp.aisix.example.com")
-            .body(Body::empty())
-            .unwrap();
-        let resp = router.oneshot(req).await.expect("router responds");
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        for method in [axum::http::Method::GET, axum::http::Method::DELETE] {
+            let unauthenticated = HttpRequest::builder()
+                .method(method.clone())
+                .uri("/mcp")
+                .header("host", "mcp.aisix.example.com")
+                .header("accept", "application/json, text/event-stream")
+                .body(Body::empty())
+                .unwrap();
+            let resp = router
+                .clone()
+                .oneshot(unauthenticated)
+                .await
+                .expect("router responds");
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "unauthenticated {method} must be rejected before the MCP transport"
+            );
+
+            let authenticated = HttpRequest::builder()
+                .method(method.clone())
+                .uri("/mcp")
+                .header("host", "mcp.aisix.example.com")
+                .header("accept", "application/json, text/event-stream")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap();
+            let resp = router
+                .clone()
+                .oneshot(authenticated)
+                .await
+                .expect("router responds");
+            assert_eq!(
+                resp.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "authenticated {method} must reach the MCP transport"
+            );
+        }
     }
 
     #[tokio::test]
