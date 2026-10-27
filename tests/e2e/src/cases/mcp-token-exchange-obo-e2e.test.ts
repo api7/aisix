@@ -40,6 +40,13 @@ import {
 //   4. An upstream 401 drops the cached token and the exchange is redone,
 //      once.
 //   5. A `type: openapi` server exchanges the same way.
+//   6. Throttling (429) and a request timeout (408) at the token endpoint
+//      are the provider being unavailable (503), not the caller's token
+//      being rejected.
+//   7. Concurrent first requests from one caller share one exchange, and
+//      its outcome; a failed exchange is not reused by the next request.
+//   8. A rejection carrying a claims challenge (Conditional Access
+//      step-up) reaches the caller in the 401's `WWW-Authenticate`.
 //
 // Reference: Microsoft identity platform OAuth 2.0 On-Behalf-Of flow,
 // <https://learn.microsoft.com/entra/identity-platform/v2-oauth2-on-behalf-of-flow>.
@@ -50,6 +57,7 @@ const CLIENT_SECRET = "gateway-client-secret";
 const KEY_1 = "sk-obo-agent-1";
 const KEY_2 = "sk-obo-agent-2";
 const hash = (key: string) => createHash("sha256").update(key).digest("hex");
+const STEP_UP_CLAIMS = '{"access_token":{"capolids":{"essential":true,"values":["c1"]}}}';
 
 /** A mock Entra token endpoint: `/<behavior>/token`, counted per path. */
 interface MockEntra {
@@ -68,11 +76,19 @@ async function startMockEntra(): Promise<MockEntra> {
       const path = (req.url ?? "").split("?")[0];
       const seen = (forms[path] ??= []);
       seen.push(Object.fromEntries(new URLSearchParams(raw)));
-      const behavior = path.split("/")[1] ?? "";
+      const segment = path.split("/")[1] ?? "";
+      // `slow-<behavior>` answers like `<behavior>`, late enough for
+      // concurrent requests to overlap.
+      const slow = segment.startsWith("slow-");
+      const behavior = slow ? segment.slice("slow-".length) : segment;
       const json = (status: number, body: unknown) =>
-        res
-          .writeHead(status, { "content-type": "application/json" })
-          .end(JSON.stringify(body));
+        setTimeout(
+          () =>
+            res
+              .writeHead(status, { "content-type": "application/json" })
+              .end(JSON.stringify(body)),
+          slow ? 500 : 0,
+        );
       if (behavior.startsWith("mint")) {
         json(200, {
           token_type: "Bearer",
@@ -87,6 +103,18 @@ async function startMockEntra(): Promise<MockEntra> {
           error_description: "AADSTS50013: Assertion failed signature validation.",
           error_codes: [50013],
         });
+      } else if (behavior === "stepup") {
+        json(400, {
+          error: "invalid_grant",
+          error_description: "AADSTS50076: multi-factor authentication required.",
+          error_codes: [50076],
+          suberror: "basic_action",
+          claims: STEP_UP_CLAIMS,
+        });
+      } else if (behavior === "throttle") {
+        json(429, { error: "invalid_request", error_description: "AADSTS90055: throttled." });
+      } else if (behavior === "timeout") {
+        json(408, { error: "invalid_request", error_description: "AADSTS: request timeout." });
       } else if (behavior === "fault") {
         json(401, {
           error: "invalid_client",
@@ -215,6 +243,11 @@ describe("oauth2_token_exchange (entra_obo) e2e", () => {
       ["oboreject", "reject", upstream.url],
       ["obofault", "fault", upstream.url],
       ["obodown", "down", upstream.url],
+      ["obothrottle", "throttle", upstream.url],
+      ["obotimeout", "timeout", upstream.url],
+      ["oboslow", "slow-mint-slow", upstream.url],
+      ["oboslowreject", "slow-reject", upstream.url],
+      ["obostepup", "stepup", upstream.url],
     ] as const) {
       await seed.update("mcp_servers", randomUUID(), { name, type: "mcp", url, ...exchange(behavior) });
     }
@@ -339,6 +372,8 @@ describe("oauth2_token_exchange (entra_obo) e2e", () => {
       ["/mcp/obofault", 500, "token_exchange_misconfigured"],
       ["/mcp/obodown", 503, "token_exchange_unavailable"],
       ["/mcp/obounreachable", 503, "token_exchange_unavailable"],
+      ["/mcp/obothrottle", 503, "token_exchange_unavailable"],
+      ["/mcp/obotimeout", 503, "token_exchange_unavailable"],
     ];
     for (const [path, status, code] of cases) {
       const res = await mcpPost(path, initialize, bearer(jwt1));
@@ -376,5 +411,68 @@ describe("oauth2_token_exchange (entra_obo) e2e", () => {
     expect(call!.headers.authorization).toBe("Bearer mint-rest-1");
     expect(JSON.stringify(call!.headers)).not.toContain(jwt2);
     expect(entra!.forms["/mint-rest/token"][0].assertion).toBe(jwt2);
+  });
+
+  test("concurrent first requests from one caller share one exchange", async () => {
+    if (!etcdReachable) return;
+    const N = 8;
+    const burst = (path: string) =>
+      Promise.all(Array.from({ length: N }, () => mcpPost(path, initialize, bearer(jwt1))));
+
+    const minted = await burst("/mcp/oboslow");
+    for (const res of minted) expect(res.status, await res.clone().text()).toBe(200);
+    expect(entra!.hits("/slow-mint-slow/token")).toBe(1);
+
+    // A failure goes to every request that waited on it, and the next
+    // request asks the provider again rather than reusing it.
+    const rejected = await burst("/mcp/oboslowreject");
+    for (const res of rejected) {
+      expect(res.status).toBe(401);
+      expect(await errorCode(res)).toBe("token_exchange_subject_rejected");
+    }
+    expect(entra!.hits("/slow-reject/token")).toBe(1);
+    const again = await mcpPost("/mcp/oboslowreject", initialize, bearer(jwt1));
+    expect(again.status).toBe(401);
+    expect(entra!.hits("/slow-reject/token")).toBe(2);
+  });
+
+  test("a step-up rejection hands the provider's claims to the caller", async () => {
+    if (!etcdReachable) return;
+    const etcd = new EtcdClient();
+    const seed = new SeedClient(etcd, app!.etcdPrefix);
+    const settingsId = randomUUID();
+    await seed.update("mcp_auth_settings", settingsId, { resource_url: `${app!.proxyUrl}/mcp` });
+    try {
+      const metadata = `${app!.proxyUrl}/.well-known/oauth-protected-resource/mcp`;
+      await waitConfigPropagation(async () => {
+        const res = await mcpPost("/mcp/oboreject", initialize, bearer(jwt1));
+        return res.headers.get("www-authenticate") !== null;
+      });
+
+      const res = await mcpPost("/mcp/obostepup", initialize, bearer(jwt1));
+      const text = await res.text();
+      expect(res.status, text).toBe(401);
+      expect(JSON.parse(text).error?.code).toBe("token_exchange_subject_rejected");
+      expect(text).not.toContain("AADSTS");
+      const encoded = Buffer.from(STEP_UP_CLAIMS, "utf8").toString("base64");
+      expect(res.headers.get("www-authenticate")).toBe(
+        `Bearer resource_metadata="${metadata}", error="insufficient_claims", ` +
+          `error_description="Step-up authentication required; satisfy the returned claims ` +
+          `challenge with the IdP and retry", claims="${encoded}"`,
+      );
+
+      // A rejection without claims keeps the plain invalid-token challenge.
+      const plain = await mcpPost("/mcp/oboreject", initialize, bearer(jwt1));
+      expect(plain.status).toBe(401);
+      expect(plain.headers.get("www-authenticate")).toBe(
+        `Bearer error="invalid_token", resource_metadata="${metadata}"`,
+      );
+
+      // The aggregated endpoint still absorbs the failure.
+      const aggregated = await session("/mcp", "obostepup__echo", bearer(jwt1));
+      expect(aggregated.map((r) => r.status)).toEqual([200, 202, 200]);
+    } finally {
+      await seed.delete("mcp_auth_settings", settingsId);
+    }
   });
 });

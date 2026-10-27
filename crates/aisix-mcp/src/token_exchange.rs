@@ -11,13 +11,14 @@
 //! subject token, the whole exchange configuration and the server, so two
 //! callers can never share an entry, and reused until shortly before their
 //! reported expiry. [`invalidate`] drops an entry when the upstream rejects
-//! the token.
+//! the token. Concurrent misses on one key share a single exchange.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use aisix_core::McpTokenExchangeProfile;
+use futures::future::{BoxFuture, FutureExt, Shared};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -96,6 +97,16 @@ fn cache() -> &'static RwLock<HashMap<String, CachedToken>> {
     CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// One exchange in progress, awaited by every concurrent miss on its key.
+/// Its outcome — token or failure — goes to all of them; it leaves the map
+/// when it completes, so a failure is never served to a later request.
+type Flight = Shared<BoxFuture<'static, Result<String, TokenExchangeFailure>>>;
+
+fn inflight() -> &'static Mutex<HashMap<String, Flight>> {
+    static INFLIGHT: OnceLock<Mutex<HashMap<String, Flight>>> = OnceLock::new();
+    INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// SHA-256 over every input that shapes the exchanged token, each
 /// length-prefixed so no field value can shift a boundary. Nothing secret
 /// is held in the key itself.
@@ -147,7 +158,40 @@ pub(crate) async fn get_or_exchange(
     if let Some(token) = cached_token(&key) {
         return Ok(token);
     }
-    let (access_token, lifetime) = exchange(cfg, subject).await?;
+    let flight = inflight()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(key.clone())
+        .or_insert_with(|| start_flight(key, cfg.clone(), subject.to_owned()))
+        .clone();
+    flight.await.map_err(failure)
+}
+
+/// The exchange behind one [`Flight`]. It runs to completion as long as any
+/// waiter still polls it, so a waiter that goes away does not cancel the
+/// others' exchange.
+fn start_flight(key: String, cfg: TokenExchangeConfig, subject: String) -> Flight {
+    async move {
+        // A flight that finished between this caller's cache miss and its
+        // lookup in the in-flight map has already cached the token.
+        let outcome = match cached_token(&key) {
+            Some(token) => Ok(token),
+            None => exchange(&cfg, &subject).await.map(|(token, lifetime)| {
+                store(&key, &token, lifetime);
+                token
+            }),
+        };
+        inflight()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+        outcome
+    }
+    .boxed()
+    .shared()
+}
+
+fn store(key: &str, access_token: &str, lifetime: Duration) {
     let mut cache = cache()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -155,13 +199,12 @@ pub(crate) async fn get_or_exchange(
         shrink(&mut cache);
     }
     cache.insert(
-        key,
+        key.to_owned(),
         CachedToken {
-            access_token: access_token.clone(),
+            access_token: access_token.to_owned(),
             expires_at: Instant::now() + lifetime,
         },
     );
-    Ok(access_token)
 }
 
 /// Drop the cached token for `(cfg, subject)` so the next call exchanges
@@ -217,6 +260,11 @@ struct TokenResponse {
 struct ErrorResponse {
     #[serde(default)]
     error: Option<String>,
+    /// Microsoft Entra's claims challenge (Conditional Access step-up,
+    /// continuous access evaluation): what the caller must satisfy at the
+    /// identity provider before its token is accepted.
+    #[serde(default)]
+    claims: Option<serde_json::Value>,
 }
 
 /// POST the exchange and classify the outcome.
@@ -227,10 +275,10 @@ struct ErrorResponse {
 async fn exchange(
     cfg: &TokenExchangeConfig,
     subject: &str,
-) -> Result<(String, Duration), McpError> {
+) -> Result<(String, Duration), TokenExchangeFailure> {
     let scope = cfg.scopes.join(" ");
     let form: Vec<(&str, &str)> = match cfg.profile {
-        None => return Err(failure(TokenExchangeFailure::Misconfigured)),
+        None => return Err(TokenExchangeFailure::Misconfigured),
         Some(McpTokenExchangeProfile::EntraObo) => vec![
             ("grant_type", JWT_BEARER_GRANT),
             ("assertion", subject),
@@ -254,16 +302,28 @@ async fn exchange(
                 error = %crate::bridge::sanitize_error_message(&e.to_string()),
                 "upstream token exchange request failed"
             );
-            return Err(failure(TokenExchangeFailure::Unavailable));
+            return Err(TokenExchangeFailure::Unavailable);
         }
     };
     let status = response.status();
-    if status.is_client_error() {
-        let code = response
-            .json::<ErrorResponse>()
-            .await
-            .ok()
-            .and_then(|body| body.error);
+    // Throttling and a request timeout say nothing about the caller's
+    // token: the same token can succeed on a retry.
+    let transient = matches!(
+        status,
+        http::StatusCode::TOO_MANY_REQUESTS | http::StatusCode::REQUEST_TIMEOUT
+    );
+    if status.is_client_error() && !transient {
+        let body = response.json::<ErrorResponse>().await.ok();
+        let (code, claims) = match body {
+            Some(body) => (
+                body.error,
+                body.claims.and_then(|claims| match claims {
+                    serde_json::Value::String(claims) if !claims.is_empty() => Some(claims),
+                    _ => None,
+                }),
+            ),
+            None => (None, None),
+        };
         let gateway_fault = code
             .as_deref()
             .is_some_and(|code| GATEWAY_FAULT_ERRORS.contains(&code));
@@ -273,13 +333,14 @@ async fn exchange(
             server = %cfg.server,
             status = status.as_u16(),
             error = code.as_deref().filter(|_| gateway_fault).unwrap_or("-"),
+            step_up = claims.is_some(),
             "upstream token exchange rejected"
         );
-        return Err(failure(if gateway_fault {
+        return Err(if gateway_fault {
             TokenExchangeFailure::Misconfigured
         } else {
-            TokenExchangeFailure::SubjectRejected
-        }));
+            TokenExchangeFailure::SubjectRejected { claims }
+        });
     }
     if !status.is_success() {
         tracing::warn!(
@@ -287,11 +348,11 @@ async fn exchange(
             status = status.as_u16(),
             "upstream token exchange failed"
         );
-        return Err(failure(TokenExchangeFailure::Unavailable));
+        return Err(TokenExchangeFailure::Unavailable);
     }
     let unusable = |reason: &str| {
         tracing::warn!(server = %cfg.server, "upstream token exchange returned {reason}");
-        failure(TokenExchangeFailure::Unavailable)
+        TokenExchangeFailure::Unavailable
     };
     let Ok(token) = response.json::<TokenResponse>().await else {
         return Err(unusable("a malformed token response"));

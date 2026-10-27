@@ -28,21 +28,23 @@ pub enum McpError {
 
 /// Why an on-behalf-of token exchange produced no upstream token. Each
 /// kind maps to one client-visible status on the single-server endpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TokenExchangeFailure {
     /// The caller was not authenticated with a token the gateway verified
     /// through a JWT trust provider, so there is nothing to exchange.
     #[error("the caller presented no verified token to exchange")]
     NoSubject,
-    /// The identity provider refused the caller's token.
+    /// The identity provider refused the caller's token. `claims` is the
+    /// provider's step-up challenge when it sent one: what the caller must
+    /// satisfy at the provider before retrying.
     #[error("the identity provider rejected the caller's token")]
-    SubjectRejected,
+    SubjectRejected { claims: Option<String> },
     /// The identity provider refused the gateway's own client registration
     /// or requested scope, or the server's exchange settings are incomplete.
     #[error("the gateway's token exchange configuration was not accepted")]
     Misconfigured,
-    /// The identity provider could not be reached, failed, or answered
-    /// without a usable access token.
+    /// The identity provider could not be reached, failed, throttled or
+    /// timed out the request, or answered without a usable access token.
     #[error("the identity provider did not return a usable token")]
     Unavailable,
 }

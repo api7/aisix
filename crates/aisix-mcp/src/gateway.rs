@@ -593,7 +593,7 @@ impl McpGateway {
 
     fn note_auth_failure(&self, error: &McpError) {
         if let McpError::TokenExchange(kind) = error {
-            let _ = self.auth_failure.set(*kind);
+            let _ = self.auth_failure.set(kind.clone());
         }
     }
 

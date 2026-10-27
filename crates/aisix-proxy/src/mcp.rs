@@ -844,9 +844,9 @@ async fn dispatch(
     crate::attribution::note_upstream_wait_end(true);
     let latency = started.elapsed();
 
-    if let (Some(_), Some(failure)) = (scope, token_exchange_failure.get().copied()) {
+    if let (Some(_), Some(failure)) = (scope, token_exchange_failure.get().cloned()) {
+        let response = crate::error::ProxyError::McpTokenExchange(failure.clone()).into_response();
         let error = crate::error::ProxyError::McpTokenExchange(failure);
-        let response = error.into_response();
         if is_tool_call {
             emit_tool_call_usage(
                 state,
@@ -858,7 +858,7 @@ async fn dispatch(
                 &mcp_tool,
                 response.status().as_u16(),
                 latency,
-                Some(&crate::error::ProxyError::McpTokenExchange(failure)),
+                Some(&error),
                 monitor_hits,
                 redaction_counts,
                 guardrail_chain.as_ref(),
