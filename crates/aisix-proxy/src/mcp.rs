@@ -785,6 +785,7 @@ async fn dispatch(
             server,
             Some(&client_headers),
             &caller_credentials,
+            acl,
         ) {
             Some(gateway) => gateway,
             None => {
@@ -799,19 +800,24 @@ async fn dispatch(
             &snapshot,
             Some(&client_headers),
             &caller_credentials,
+            acl,
         ),
-    }
-    .with_tool_acl(acl);
+    };
     // The single-server endpoint answers a token-exchange failure with an
     // HTTP status, which is where an MCP client looks for a sign-in
-    // challenge. `initialize` reaches no upstream on its own, so the
+    // challenge. The opening request — `initialize`, or `server/discover`
+    // for a handshake-free client — reaches no upstream on its own, so the
     // exchange is run for it here; every later operation records its
     // failure for the check after the transport ran. The aggregated
     // endpoint keeps absorbing a per-server failure (its tools drop out of
     // the list, a call to it fails as a tool error), so one server cannot
     // fail the whole surface.
     let token_exchange_failure = gateway.token_exchange_failure();
-    if scope.is_some() && peek.as_ref().and_then(|p| p.method.as_deref()) == Some("initialize") {
+    let opening = matches!(
+        peek.as_ref().and_then(|p| p.method.as_deref()),
+        Some("initialize" | "server/discover")
+    );
+    if scope.is_some() && opening {
         if let Some(failure) = gateway.preflight_upstream_auth().await {
             return crate::error::ProxyError::McpTokenExchange(failure).into_response();
         }
@@ -858,7 +864,9 @@ async fn dispatch(
                 guardrail_chain.as_ref(),
                 None,
                 trace,
-                /* dispatched */ true,
+                // The exchange runs before the upstream is contacted.
+                /* dispatched */
+                false,
             );
         }
         return response;

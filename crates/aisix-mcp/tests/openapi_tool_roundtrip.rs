@@ -404,6 +404,7 @@ async fn whoami_via_gateway(config: Value, client: &[(&str, &str)]) -> Value {
         &snapshot,
         Some(&inbound),
         &aisix_mcp::CallerCredentials::default(),
+        aisix_mcp::ToolAcl::from_allowed(Some(&["*".to_string()])),
     ))
     .await;
     let client = ()

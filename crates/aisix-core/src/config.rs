@@ -1036,6 +1036,7 @@ impl RealIpConfig {
 /// into a logged identifier is never useful.
 pub const CREDENTIAL_HEADERS: &[&str] = &[
     "authorization",        // OpenAI / Anthropic / Vertex Bearer
+    "x-aisix-api-key",      // the gateway's own credential header
     "x-api-key",            // Anthropic raw, also OpenAI legacy proxies
     "x-goog-api-key",       // Gemini API key
     "api-key",              // Azure OpenAI key

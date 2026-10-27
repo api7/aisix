@@ -401,6 +401,29 @@ impl ToolAcl {
     /// server, and an entry whose `server_id` names no registered server,
     /// therefore match no id-form entry at all — the fail-closed answer for
     /// an allow side, and one that leaves the layer's other entries intact.
+    /// Whether this ACL can permit ANY tool of the registered server
+    /// `name` (stored under `id`). Decided from the rules alone, before the
+    /// server's tools are known: every allow layer must have an entry that
+    /// could match a `<name>__…` tool or that names the server's id, and no
+    /// deny may cover the whole server. Errs towards `true` only where a
+    /// glob genuinely could match one of the server's tools.
+    pub fn may_reach_server(&self, name: &str, id: &str) -> bool {
+        let prefix = format!("{name}{TOOL_NAMESPACE_SEPARATOR}");
+        let whole_server = format!("{prefix}*");
+        let allowed = self.allow.iter().all(|layer| match layer {
+            AllowLayer::All => true,
+            AllowLayer::Patterns(patterns) => patterns
+                .iter()
+                .any(|p| pattern_may_match_prefix(p, &prefix)),
+            AllowLayer::Refs(refs) => refs.iter().any(|r| r.server_id == id),
+        });
+        let denied = self.deny.iter().any(|rule| match rule {
+            DenyRule::Pattern(p) => p == "*" || *p == whole_server,
+            DenyRule::Ref(r) => r.server_id == id && r.tool == "*",
+        });
+        allowed && !denied
+    }
+
     pub fn permits(&self, namespaced_tool: &str) -> bool {
         // Resolved once per decision and shared by both sides: with only
         // name patterns configured nothing reads it, and `address` is one
@@ -413,6 +436,24 @@ impl ToolAcl {
                 .deny
                 .iter()
                 .any(|rule| rule.matches(namespaced_tool, addressed))
+    }
+}
+
+/// Whether the single-`*` glob `pattern` can match some string that starts
+/// with `prefix`, under the matching rule of
+/// `aisix_core::wildcard::wildcard_matches`.
+fn pattern_may_match_prefix(pattern: &str, prefix: &str) -> bool {
+    let head = match pattern.find('*') {
+        None => return pattern.starts_with(prefix),
+        Some(star) if pattern[star + 1..].contains('*') => return false,
+        Some(star) => &pattern[..star],
+    };
+    // A head at least as long as the prefix must start with it; a shorter
+    // one only has to agree with it, and the `*` covers the rest.
+    if head.len() >= prefix.len() {
+        head.starts_with(prefix)
+    } else {
+        prefix.starts_with(head)
     }
 }
 
@@ -544,21 +585,10 @@ impl McpGateway {
     pub async fn preflight_upstream_auth(&self) -> Option<TokenExchangeFailure> {
         self.scoped.as_ref()?;
         let upstream = self.upstreams.first()?;
-        let error = upstream.bridge.preflight_auth().await.err()?;
-        let failure = match error {
-            McpError::TokenExchange(kind) => Some(kind),
+        match upstream.bridge.preflight_auth().await {
+            Err(McpError::TokenExchange(kind)) => Some(kind),
             _ => None,
-        };
-        if failure.is_none() {
-            // Not the caller's to fix: serve the request as usual and let
-            // the operation fail where it always has.
-            tracing::debug!(
-                upstream = upstream.name.as_str(),
-                error = %error,
-                "upstream auth preflight failed"
-            );
         }
-        failure
     }
 
     fn note_auth_failure(&self, error: &McpError) {
@@ -575,7 +605,12 @@ impl McpGateway {
     /// iteration order; duplicate names are deduped (first wins) by
     /// [`McpGateway::new`], though the Admin API already enforces uniqueness.
     pub fn from_snapshot(snapshot: &AisixSnapshot) -> Self {
-        Self::from_snapshot_for_request(snapshot, None, &CallerCredentials::default())
+        Self::from_snapshot_for_request(
+            snapshot,
+            None,
+            &CallerCredentials::default(),
+            ToolAcl::allow_all(),
+        )
     }
 
     /// [`McpGateway::from_snapshot`], additionally forwarding the inbound
@@ -587,11 +622,15 @@ impl McpGateway {
     /// builds a gateway per request and is the only place that holds them.
     /// `None` forwards nothing, which is what every server does by
     /// default. `caller` carries the agent's own credentials to the
-    /// `oauth_delegate` and `oauth2_token_exchange` servers.
+    /// `oauth_delegate` and `oauth2_token_exchange` servers — only to those
+    /// `acl` (the caller's tool ACL, which also scopes the gateway) can
+    /// reach. Any other server is still listed, without them, and its
+    /// tools are filtered out by the same ACL.
     pub fn from_snapshot_for_request(
         snapshot: &AisixSnapshot,
         client_headers: Option<&http::HeaderMap>,
         caller: &CallerCredentials,
+        acl: ToolAcl,
     ) -> Self {
         crate::openapi::sweep_tool_cache(&snapshot.mcp_servers);
         let upstreams = snapshot
@@ -605,10 +644,11 @@ impl McpGateway {
                 // cleartext warning covers both.
                 crate::bridge::warn_cleartext_credential(&entry.value);
                 let name = entry.value.name.clone();
-                let bridge = bridge_for(entry, client_headers, caller);
+                let bridge = bridge_for(entry, client_headers, caller, &acl);
                 (name, bridge)
-            });
-        McpGateway::new(upstreams)
+            })
+            .collect::<Vec<_>>();
+        McpGateway::new(upstreams).with_tool_acl(acl)
     }
 
     /// Build a gateway scoped to the single **enabled** `mcp_servers` entry
@@ -622,6 +662,7 @@ impl McpGateway {
             server,
             None,
             &CallerCredentials::default(),
+            ToolAcl::allow_all(),
         )
     }
 
@@ -632,6 +673,7 @@ impl McpGateway {
         server: &str,
         client_headers: Option<&http::HeaderMap>,
         caller: &CallerCredentials,
+        acl: ToolAcl,
     ) -> Option<Self> {
         crate::openapi::sweep_tool_cache(&snapshot.mcp_servers);
         let entry = snapshot.mcp_servers.get_by_name(server)?;
@@ -640,7 +682,7 @@ impl McpGateway {
         }
         crate::bridge::warn_cleartext_credential(&entry.value);
         let name = entry.value.name.clone();
-        let bridge = bridge_for(entry, client_headers, caller);
+        let bridge = bridge_for(entry, client_headers, caller, &acl);
         let foreign = snapshot
             .mcp_servers
             .entries()
@@ -648,7 +690,7 @@ impl McpGateway {
             .filter(|e| e.value.name != name)
             .map(|e| e.value.name.clone())
             .collect();
-        let mut gateway = McpGateway::new([(name.clone(), bridge)]);
+        let mut gateway = McpGateway::new([(name.clone(), bridge)]).with_tool_acl(acl);
         gateway.scoped = Some(Arc::new(ScopedServer { name, foreign }));
         Some(gateway)
     }
@@ -681,6 +723,16 @@ impl ServerHandler for McpGateway {
             match result {
                 Ok(upstream_tools) => {
                     tools.extend(upstream_tools.into_iter().map(|t| prefixed_tool(server, t)));
+                }
+                // A caller with nothing to exchange is the expected state
+                // for every API-key caller on the aggregated endpoint, not
+                // an upstream failure worth a warning per request.
+                Err(error @ McpError::TokenExchange(TokenExchangeFailure::NoSubject)) => {
+                    self.note_auth_failure(&error);
+                    tracing::debug!(
+                        upstream = server,
+                        "skipping upstream in tools/list: no verified caller token to exchange"
+                    );
                 }
                 Err(error) => {
                     self.note_auth_failure(&error);
@@ -904,8 +956,24 @@ fn bridge_for(
     entry: Arc<ResourceEntry<aisix_core::McpServer>>,
     client_headers: Option<&http::HeaderMap>,
     caller: &CallerCredentials,
+    acl: &ToolAcl,
 ) -> Arc<dyn McpBridge> {
-    let forwarded = forwarded_client_headers(&entry.value, client_headers);
+    let mut forwarded = forwarded_client_headers(&entry.value, client_headers);
+    if matches!(
+        entry.value.auth_type,
+        aisix_core::McpAuthType::OauthDelegate | aisix_core::McpAuthType::OAuth2TokenExchange
+    ) {
+        // The auth type owns the `authorization` slot: a forwarded copy
+        // would relay the caller's `Authorization` even when it was the
+        // gateway credential itself.
+        forwarded.retain(|(name, _)| name != http::header::AUTHORIZATION);
+    }
+    let no_caller = CallerCredentials::default();
+    let caller = if acl.may_reach_server(&entry.value.name, &entry.id) {
+        caller
+    } else {
+        &no_caller
+    };
     match entry.value.server_type {
         McpServerType::Mcp => {
             let upstream = upstream_from_mcp_server(&entry.value)
@@ -1062,6 +1130,43 @@ mod tests {
     /// listed servers, which is what stops an anonymous caller from
     /// reaching an unlisted server by naming `<server>__<tool>` on the
     /// aggregated endpoint while its scoped entry is closed.
+    #[test]
+    fn a_server_is_reachable_only_where_some_rule_could_admit_its_tools() {
+        let acl = |allow: &[&str], deny: &[&str]| ToolAcl {
+            allow: vec![AllowLayer::from_patterns(
+                &allow.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )],
+            deny: deny
+                .iter()
+                .map(|s| DenyRule::Pattern(s.to_string()))
+                .collect(),
+            servers: Arc::new(McpServerIndex::default()),
+            granted: true,
+        };
+        assert!(acl(&["*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["gh__*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["gh__read"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["g*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["*__read"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["slack__*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["ghost__*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["gh_x*"], &[]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&[], &[]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["*"], &["gh__*"]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["*"], &["gh__write"]).may_reach_server("gh", "id-gh"));
+        let by_id = ToolAcl {
+            allow: vec![AllowLayer::Refs(vec![McpToolRef {
+                server_id: "id-gh".into(),
+                tool: "read".into(),
+            }])],
+            deny: Vec::new(),
+            servers: Arc::new(McpServerIndex::default()),
+            granted: true,
+        };
+        assert!(by_id.may_reach_server("gh", "id-gh"));
+        assert!(!by_id.may_reach_server("slack", "id-slack"));
+    }
+
     #[test]
     fn server_ceiling_narrows_a_wide_grant() {
         let wide = ToolAcl::from_allowed(Some(&["*".to_string()]));

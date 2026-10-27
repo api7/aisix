@@ -2359,7 +2359,12 @@ pub fn observability_exporter_root_schema(strict: bool) -> Value {
             let Some(field) = props.get_mut(key).and_then(Value::as_object_mut) else {
                 continue;
             };
-            let refused: Vec<&str> = credential.iter().chain(extra).copied().collect();
+            let refused: Vec<&str> = credential
+                .iter()
+                .chain(extra)
+                .copied()
+                .chain([crate::forwarded_headers::GATEWAY_CREDENTIAL_HEADER])
+                .collect();
             field.insert("uniqueItems".to_string(), json!(true));
             field.insert(
                 "items".to_string(),

@@ -36,6 +36,7 @@ import {
 
 const CALLER_KEY = "sk-gateway-key-header-e2e";
 const CALLER_HASH = createHash("sha256").update(CALLER_KEY).digest("hex");
+const NARROW_KEY = "sk-gateway-key-header-narrow";
 const USER_TOKEN = "Bearer upstream-user-token-123";
 const MODEL = "gw-key-header-model";
 const ROUTE_PREFIX = "/passthrough/gw-key-header";
@@ -59,6 +60,7 @@ describe("x-aisix-api-key + oauth_delegate e2e", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let mcpUpstream: McpUpstream | undefined;
+  let otherUpstream: McpUpstream | undefined;
   let etcdReachable = false;
 
   const chat = (headers: Record<string, string>): Promise<Response> =>
@@ -133,6 +135,7 @@ describe("x-aisix-api-key + oauth_delegate e2e", () => {
 
     upstream = await startOpenAiUpstream();
     mcpUpstream = await startMcpUpstream("deleg");
+    otherUpstream = await startMcpUpstream("other");
     app = await spawnApp({});
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
@@ -152,6 +155,15 @@ describe("x-aisix-api-key + oauth_delegate e2e", () => {
       type: "mcp",
       url: mcpUpstream.url,
       auth_type: "oauth_delegate",
+      // Naming the slot the auth type owns must not reopen it: the gateway
+      // credential still never reaches the upstream.
+      forward_client_headers: ["authorization"],
+    });
+    await seed.update("mcp_servers", randomUUID(), {
+      name: "delegother",
+      type: "mcp",
+      url: otherUpstream.url,
+      auth_type: "oauth_delegate",
     });
     await seed.update("mcp_servers", randomUUID(), {
       name: "delegrest",
@@ -168,6 +180,11 @@ describe("x-aisix-api-key + oauth_delegate e2e", () => {
       credential_mode: "forward_client",
     });
     await seed.createApiKey({
+      key_hash: createHash("sha256").update(NARROW_KEY).digest("hex"),
+      allowed_models: [],
+      mcp_access: { allow: ["delegmcp__*"] },
+    });
+    await seed.createApiKey({
       key_hash: CALLER_HASH,
       allowed_models: ["*"],
       allowed_routes: ["*"],
@@ -181,6 +198,7 @@ describe("x-aisix-api-key + oauth_delegate e2e", () => {
     await app?.exit();
     await upstream?.close();
     await mcpUpstream?.close();
+    await otherUpstream?.close();
   });
 
   test("an LLM endpoint authenticates with x-aisix-api-key, ignoring Authorization", async () => {
@@ -275,6 +293,28 @@ describe("x-aisix-api-key + oauth_delegate e2e", () => {
     for (const h of seen) {
       expect(h.authorization).toBeUndefined();
       expect(JSON.stringify(h)).not.toContain(CALLER_KEY);
+    }
+  });
+
+  test("a delegate server outside the caller's grant never receives its token", async () => {
+    if (!etcdReachable) return;
+    const markGranted = mcpUpstream!.receivedHeaders.length;
+    const markOther = otherUpstream!.receivedHeaders.length;
+    const headers = { "x-aisix-api-key": NARROW_KEY, authorization: USER_TOKEN };
+    for (const body of [
+      initialize,
+      { jsonrpc: "2.0", method: "notifications/initialized" },
+      { jsonrpc: "2.0", id: 3, method: "tools/list" },
+    ]) {
+      const res = await mcpPost("/mcp", body, headers);
+      expect(res.ok, `${res.status}`).toBe(true);
+      await res.text();
+    }
+    const granted = mcpUpstream!.receivedHeaders.slice(markGranted);
+    expect(granted.length).toBeGreaterThan(0);
+    for (const h of granted) expect(h.authorization).toBe(USER_TOKEN);
+    for (const h of otherUpstream!.receivedHeaders.slice(markOther)) {
+      expect(h.authorization).toBeUndefined();
     }
   });
 

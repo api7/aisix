@@ -447,7 +447,8 @@ fn deny_key(
 /// `Authorization` free to carry a credential meant for an upstream (an MCP
 /// server's own OAuth token, for instance). Its `x-aisix-` prefix keeps it
 /// off every upstream request (`aisix_core::header_forward_blocked`).
-pub(crate) const GATEWAY_KEY_HEADER: &str = "x-aisix-api-key";
+pub(crate) const GATEWAY_KEY_HEADER: &str =
+    aisix_core::forwarded_headers::GATEWAY_CREDENTIAL_HEADER;
 
 /// Whether the request OFFERS an inbound gateway credential at all.
 ///

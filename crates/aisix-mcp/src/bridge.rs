@@ -503,9 +503,13 @@ impl RmcpBridge {
                 }
                 McpAuth::TokenExchange(auth) => {
                     auth.invalidate();
-                    Self::connect_once(upstream)
-                        .await
-                        .map_err(ConnectFailure::into_error)
+                    Self::connect_once(upstream).await.map_err(|failure| {
+                        // A fresh token rejected too is not kept either.
+                        if matches!(failure, ConnectFailure::Unauthorized(_)) {
+                            auth.invalidate();
+                        }
+                        failure.into_error()
+                    })
                 }
                 _ => Err(error),
             },
