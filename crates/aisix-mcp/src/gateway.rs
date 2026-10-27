@@ -388,6 +388,32 @@ impl ToolAcl {
         self.granted
     }
 
+    /// Whether this ACL can permit ANY tool of the registered server
+    /// `name` (stored under `id`). Decided from the rules alone, before the
+    /// server's tools are known: every allow layer must have an entry that
+    /// could match a `<name>__…` tool or that names the server's id, and no
+    /// deny may cover the whole server. Errs towards `true` only where a
+    /// glob genuinely could match one of the server's tools.
+    pub fn may_reach_server(&self, name: &str, id: &str) -> bool {
+        let prefix = format!("{name}{TOOL_NAMESPACE_SEPARATOR}");
+        let allowed = self.allow.iter().all(|layer| match layer {
+            AllowLayer::All => true,
+            AllowLayer::Patterns(patterns) => patterns
+                .iter()
+                .any(|p| pattern_may_match_prefix(p, &prefix)),
+            AllowLayer::Refs(refs) => refs.iter().any(|r| r.server_id == id),
+        });
+        let denied = self.deny.iter().any(|rule| match rule {
+            // A trailing-`*` glob whose head every `<name>__…` tool starts
+            // with (`*`, `gh__*`, `g*`) covers the whole server.
+            DenyRule::Pattern(p) => p
+                .strip_suffix('*')
+                .is_some_and(|head| !head.contains('*') && prefix.starts_with(head)),
+            DenyRule::Ref(r) => r.server_id == id && r.tool == "*",
+        });
+        allowed && !denied
+    }
+
     /// Whether `namespaced_tool` is permitted: every allow layer must admit
     /// it and no deny rule may match it. Name patterns are single-`*` globs:
     /// `"<server>__*"` covers every tool on that server, a pattern without a
@@ -401,29 +427,6 @@ impl ToolAcl {
     /// server, and an entry whose `server_id` names no registered server,
     /// therefore match no id-form entry at all — the fail-closed answer for
     /// an allow side, and one that leaves the layer's other entries intact.
-    /// Whether this ACL can permit ANY tool of the registered server
-    /// `name` (stored under `id`). Decided from the rules alone, before the
-    /// server's tools are known: every allow layer must have an entry that
-    /// could match a `<name>__…` tool or that names the server's id, and no
-    /// deny may cover the whole server. Errs towards `true` only where a
-    /// glob genuinely could match one of the server's tools.
-    pub fn may_reach_server(&self, name: &str, id: &str) -> bool {
-        let prefix = format!("{name}{TOOL_NAMESPACE_SEPARATOR}");
-        let whole_server = format!("{prefix}*");
-        let allowed = self.allow.iter().all(|layer| match layer {
-            AllowLayer::All => true,
-            AllowLayer::Patterns(patterns) => patterns
-                .iter()
-                .any(|p| pattern_may_match_prefix(p, &prefix)),
-            AllowLayer::Refs(refs) => refs.iter().any(|r| r.server_id == id),
-        });
-        let denied = self.deny.iter().any(|rule| match rule {
-            DenyRule::Pattern(p) => p == "*" || *p == whole_server,
-            DenyRule::Ref(r) => r.server_id == id && r.tool == "*",
-        });
-        allowed && !denied
-    }
-
     pub fn permits(&self, namespaced_tool: &str) -> bool {
         // Resolved once per decision and shared by both sides: with only
         // name patterns configured nothing reads it, and `address` is one
@@ -1125,11 +1128,6 @@ mod tests {
         McpServerAllowlist::Ids(servers.iter().map(|s| s.to_string()).collect())
     }
 
-    /// The anonymous ceiling intersects — it can only ever remove tools.
-    /// A principal whose own grant is `*` must still be confined to the
-    /// listed servers, which is what stops an anonymous caller from
-    /// reaching an unlisted server by naming `<server>__<tool>` on the
-    /// aggregated endpoint while its scoped entry is closed.
     #[test]
     fn a_server_is_reachable_only_where_some_rule_could_admit_its_tools() {
         let acl = |allow: &[&str], deny: &[&str]| ToolAcl {
@@ -1153,6 +1151,10 @@ mod tests {
         assert!(!acl(&["gh_x*"], &[]).may_reach_server("gh", "id-gh"));
         assert!(!acl(&[], &[]).may_reach_server("gh", "id-gh"));
         assert!(!acl(&["*"], &["gh__*"]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["*"], &["g*"]).may_reach_server("gh", "id-gh"));
+        assert!(!acl(&["*"], &["*"]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["*"], &["ghost*"]).may_reach_server("gh", "id-gh"));
+        assert!(acl(&["*"], &["*__write"]).may_reach_server("gh", "id-gh"));
         assert!(acl(&["*"], &["gh__write"]).may_reach_server("gh", "id-gh"));
         let by_id = ToolAcl {
             allow: vec![AllowLayer::Refs(vec![McpToolRef {
@@ -1167,6 +1169,11 @@ mod tests {
         assert!(!by_id.may_reach_server("slack", "id-slack"));
     }
 
+    /// The anonymous ceiling intersects — it can only ever remove tools.
+    /// A principal whose own grant is `*` must still be confined to the
+    /// listed servers, which is what stops an anonymous caller from
+    /// reaching an unlisted server by naming `<server>__<tool>` on the
+    /// aggregated endpoint while its scoped entry is closed.
     #[test]
     fn server_ceiling_narrows_a_wide_grant() {
         let wide = ToolAcl::from_allowed(Some(&["*".to_string()]));

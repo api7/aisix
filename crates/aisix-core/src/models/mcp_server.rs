@@ -170,10 +170,11 @@ pub struct McpServer {
     ///
     /// A header named here reaches the server whatever the gateway would
     /// otherwise do with it. Naming the credential slot `auth_type` would
-    /// fill — `authorization` for `bearer`, `oauth2`, `oauth_delegate` and
-    /// `oauth2_token_exchange`, `api_key_header` for `api_key` — hands the
-    /// server the caller's own credential in place of the gateway's, never
-    /// both. That is what lets an internal
+    /// fill — `authorization` for `bearer` and `oauth2`, `api_key_header`
+    /// for `api_key` — hands the server the caller's own credential in
+    /// place of the gateway's, never both. `oauth_delegate` and
+    /// `oauth2_token_exchange` own `authorization` themselves, so naming it
+    /// on such a server has no effect. That is what lets an internal
     /// server that already authorizes on the end user's `Authorization`
     /// keep doing so unchanged. A server that validates the `aud` claim
     /// will reject a token minted for the gateway.
