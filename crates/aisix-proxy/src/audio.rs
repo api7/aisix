@@ -1706,7 +1706,7 @@ async fn multipart_dispatch(
                 move |outcome| {
                     let usage = outcome.usage.clone().unwrap_or_default();
                     let duration_seconds =
-                        outcome.duration_seconds.or(probed_seconds).unwrap_or(0.0);
+                        duration_cost_basis(outcome.duration_seconds, || probed_seconds);
                     let total = u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens);
                     for key in &post_stream_keys {
                         limiter.add_tokens_post_stream(key, total);
@@ -1817,15 +1817,16 @@ async fn multipart_dispatch(
     // the uploaded file says. The probe runs only when the response
     // carried nothing, so the common `json` path never pays for it. A
     // buffered stream reports it on its terminal event, like the tokens.
-    let duration_seconds = upstream_duration_seconds(&body_bytes)
-        .or_else(|| last_sse_value(&upstream_headers, &body_bytes, duration_from_response))
-        .or_else(|| {
+    let duration_seconds = duration_cost_basis(
+        upstream_duration_seconds(&body_bytes)
+            .or_else(|| last_sse_value(&upstream_headers, &body_bytes, duration_from_response)),
+        || {
             fields
                 .iter()
                 .find(|(name, ..)| name == "file")
                 .and_then(|(.., data)| probe_audio_duration_seconds(data))
-        })
-        .unwrap_or(0.0);
+        },
+    );
 
     // #911 [21]: commit the actual token cost so TPM/TPD is enforced for the
     // audio transcription/translation endpoints like chat + embeddings.
@@ -2506,6 +2507,36 @@ fn duration_from_response(json: &Value) -> Option<f64> {
         .and_then(Value::as_f64);
     let seconds = from_usage.or_else(|| json.get("duration").and_then(Value::as_f64))?;
     (seconds.is_finite() && seconds > 0.0).then_some(seconds)
+}
+
+/// The largest audio length the control plane can store: its column is
+/// `numeric(12,3)`.
+const MAX_AUDIO_DURATION_SECONDS: f64 = 999_999_999.999;
+
+/// The duration a transcription is priced on: what the upstream reported,
+/// else what the uploaded file says, else 0.
+///
+/// Both sources are untrusted — a caller writes the file header, and an
+/// upstream can report anything — so a length the control plane cannot
+/// store is treated as not measured (0) rather than emitted, where it
+/// would fail the whole usage batch on ingest.
+fn duration_cost_basis(reported: Option<f64>, probe: impl FnOnce() -> Option<f64>) -> f64 {
+    let (seconds, source) = match reported {
+        Some(seconds) => (seconds, "upstream"),
+        None => match probe() {
+            Some(seconds) => (seconds, "uploaded file"),
+            None => return 0.0,
+        },
+    };
+    if seconds <= MAX_AUDIO_DURATION_SECONDS {
+        return seconds;
+    }
+    tracing::warn!(
+        source,
+        seconds,
+        "audio duration exceeds what usage can record; treating it as not measured"
+    );
+    0.0
 }
 
 /// Audio length in seconds read off the uploaded file.
@@ -3544,6 +3575,41 @@ mod tests {
             (probed - 7.008).abs() < 0.01,
             "webm should probe as ~7.008s, got {probed}"
         );
+    }
+
+    /// A length the control plane cannot store is not measured, whichever
+    /// source reported it — and the report wins over the file even then,
+    /// rather than the file standing in for a figure the upstream did give.
+    #[test]
+    fn an_unstorable_duration_is_not_measured() {
+        assert_eq!(super::duration_cost_basis(Some(11.0), || Some(3.0)), 11.0);
+        assert_eq!(super::duration_cost_basis(None, || Some(3.0)), 3.0);
+        assert_eq!(super::duration_cost_basis(Some(4.0e9), || Some(3.0)), 0.0);
+        assert_eq!(super::duration_cost_basis(None, || Some(4.0e9)), 0.0);
+        assert_eq!(super::duration_cost_basis(None, || None), 0.0);
+    }
+
+    /// A FLAC header can declare a 36-bit sample count; at 1 Hz that is
+    /// ~2,000 years of audio, which `lofty` reports as read.
+    #[test]
+    fn a_header_declaring_an_absurd_length_is_not_measured() {
+        let flac = absurd_flac_header();
+        let probed = super::probe_audio_duration_seconds(&flac).expect("lofty reads the header");
+        assert!(probed > super::MAX_AUDIO_DURATION_SECONDS, "got {probed}");
+        assert_eq!(super::duration_cost_basis(None, || Some(probed)), 0.0);
+    }
+
+    /// `fLaC` + a lone STREAMINFO declaring 2^36-1 samples at 1 Hz.
+    fn absurd_flac_header() -> Vec<u8> {
+        let mut flac = b"fLaC".to_vec();
+        flac.extend_from_slice(&[0x80, 0, 0, 34]); // last block, STREAMINFO
+        flac.extend_from_slice(&[0x10, 0x00, 0x10, 0x00]); // block 4096..4096
+        flac.extend_from_slice(&[0; 6]); // frame sizes unknown
+                                         // 1 Hz, mono, 16 bits, total samples 0xF_FFFF_FFFF.
+        flac.extend_from_slice(&[0x00, 0x00, 0x10, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        flac.extend_from_slice(&[0; 16]); // MD5
+        flac.extend_from_slice(&[0xFF, 0xF8, 0x69, 0x08, 0x00, 0x00, 0x00, 0x00]);
+        flac
     }
 
     /// The default `json` transcription reports its length under

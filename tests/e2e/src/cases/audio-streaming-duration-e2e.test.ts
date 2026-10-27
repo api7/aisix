@@ -63,6 +63,22 @@ function wavBytes(seconds: number, sized: boolean): Uint8Array {
   return new Uint8Array(buf);
 }
 
+/**
+ * A FLAC header declaring 2^36-1 samples at 1 Hz — about 2,000 years of
+ * audio, far beyond what the control plane's duration column can hold.
+ */
+function absurdFlacBytes(): Uint8Array {
+  return new Uint8Array([
+    ...Buffer.from("fLaC"),
+    0x80, 0, 0, 34, // last metadata block: STREAMINFO
+    0x10, 0x00, 0x10, 0x00, // block size 4096..4096
+    0, 0, 0, 0, 0, 0, // frame sizes unknown
+    0x00, 0x00, 0x10, 0xff, 0xff, 0xff, 0xff, 0xff, // 1 Hz, mono, 16-bit, 2^36-1 samples
+    ...new Array(16).fill(0), // MD5
+    0xff, 0xf8, 0x69, 0x08, 0, 0, 0, 0,
+  ]);
+}
+
 // OpenAI frames this stream with CRLF.
 const FRAME_END = "\r\n\r\n";
 function transcriptSse(usage: Record<string, unknown>): string {
@@ -154,6 +170,7 @@ describe("streamed transcription duration cost basis", () => {
   let app: SpawnedApp | undefined;
   let tokensUp: OpenAiUpstream | undefined;
   let durationUp: OpenAiUpstream | undefined;
+  let absurdUp: OpenAiUpstream | undefined;
   let otlp: OtlpReceiver | undefined;
   let etcdReachable = false;
 
@@ -174,6 +191,9 @@ describe("streamed transcription duration cost basis", () => {
     durationUp = await startOpenAiUpstream({
       rawBody: transcriptSse({ type: "duration", seconds: REPORTED_SECONDS }),
       rawContentType: "text/event-stream",
+    });
+    absurdUp = await startOpenAiUpstream({
+      nonStreamBody: { text: "hello", usage: { type: "duration", seconds: 4e9 } },
     });
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
@@ -199,6 +219,7 @@ describe("streamed transcription duration cost basis", () => {
     };
     await model("stream-tokens", tokensUp, "gpt-4o-transcribe");
     await model("stream-duration", durationUp, "whisper-1");
+    await model("absurd-duration", absurdUp, "whisper-1");
     await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
     const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
@@ -208,10 +229,16 @@ describe("streamed transcription duration cost basis", () => {
     await app?.exit();
     await tokensUp?.close();
     await durationUp?.close();
+    await absurdUp?.close();
     await otlp?.close();
   });
 
-  const transcribe = async (model: string, audio: Uint8Array, stream: boolean) => {
+  const transcribe = async (
+    model: string,
+    audio: Uint8Array,
+    stream: boolean,
+    expectBody = "transcript.text.done",
+  ) => {
     const form = new FormData();
     form.set("model", model);
     if (stream) form.set("stream", "true");
@@ -222,9 +249,9 @@ describe("streamed transcription duration cost basis", () => {
       body: form,
     });
     expect(resp.status).toBe(200);
-    expect(await resp.text()).toContain("transcript.text.done");
+    expect(await resp.text()).toContain(expectBody);
     const span = await waitSpan(otlp!, resp.headers.get("x-aisix-request-id") ?? "");
-    return Number(span["aisix.audio.duration_seconds"]);
+    return Number(span["aisix.audio.duration_seconds"] ?? 0);
   };
 
   test("a streaming-encoder WAV upload is measured to its end", async (ctx) => {
@@ -254,5 +281,22 @@ describe("streamed transcription duration cost basis", () => {
       await transcribe("stream-duration", upload, false),
       "a buffered stream prices what the upstream reported, not the upload",
     ).toBe(REPORTED_SECONDS);
+  });
+
+  // The control plane stores the duration as numeric(12,3); one it cannot
+  // hold would fail the whole usage batch, so it is reported as unmeasured.
+  test("a duration the control plane cannot store is not measured", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    expect(
+      await transcribe("stream-tokens", absurdFlacBytes(), true),
+      "a header declaring an impossible length",
+    ).toBe(0);
+    expect(
+      await transcribe("absurd-duration", wavBytes(UPLOADED_SECONDS, true), false, "hello"),
+      "an upstream reporting an impossible length",
+    ).toBe(0);
   });
 });
