@@ -312,8 +312,8 @@ pub fn spawn_auto_dump(cfg: &AutoDumpConfig, metrics: Metrics) {
                         });
                     match written {
                         Ok(path) => {
-                            // Retention first: an observer that sees the
-                            // counter move must find the directory pruned.
+                            // Prune before counting, so the counter never
+                            // runs ahead of retention.
                             prune(&dir, &host, keep);
                             metrics.record_heap_profile_dump("auto", true);
                             tracing::warn!(
