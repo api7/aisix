@@ -64,14 +64,24 @@ pub struct JwtIdentity {
     /// Name of the claim mapping that selected the API key, or `None`
     /// when the subject was bound to the key directly via `jwt_subject`.
     pub claim_mapping: Option<String>,
+    /// The bearer token itself, exactly as the trust provider verified it —
+    /// what an `oauth2_token_exchange` MCP server exchanges on the caller's
+    /// behalf. Never printed.
+    pub(crate) token: Arc<str>,
 }
 
 impl JwtIdentity {
-    pub fn new(subject: String, provider: String, claim_mapping: Option<String>) -> Self {
+    pub fn new(
+        subject: String,
+        provider: String,
+        claim_mapping: Option<String>,
+        token: Arc<str>,
+    ) -> Self {
         Self {
             subject,
             provider,
             claim_mapping,
+            token,
         }
     }
 }

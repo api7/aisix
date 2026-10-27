@@ -12,6 +12,7 @@
 //! rmcp's still-moving API contained to this file.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_core::{McpAuthType, McpServer};
@@ -27,6 +28,7 @@ use rmcp::ClientCacheConfig;
 use rmcp::{ClientLifecycleMode, ClientServiceExt};
 
 use crate::error::McpError;
+use crate::token_exchange::{SubjectToken, TokenExchangeAuth, TokenExchangeConfig};
 
 /// Default deadline for a single upstream operation (connect / list / call).
 /// rmcp's high-level client sets no request timeout and reqwest has no default
@@ -142,10 +144,10 @@ impl rmcp_reqwest::dns::Resolve for CachedResolver {
 /// Header carrying the gateway-held key for `api_key` upstream auth.
 const API_KEY_HEADER: &str = "x-api-key";
 
-/// How the gateway authenticates to an upstream MCP server. Every variant is
-/// a distinct, gateway-held credential — a Bearer, an API key, or an OAuth
-/// token the gateway mints itself — and none of them is ever exposed to the
-/// calling agent, which presents only its AISIX key.
+/// How the gateway authenticates to an upstream MCP server. Every variant but
+/// [`McpAuth::Delegate`] is a gateway-held credential — a Bearer, an API key,
+/// or an OAuth token the gateway mints or exchanges itself — and none of them
+/// is ever exposed to the calling agent.
 ///
 /// Relaying the CALLER's own credentials is a separate, opt-in mechanism
 /// ([`McpUpstream::forwarded_client_headers`], from the server's
@@ -171,6 +173,47 @@ pub enum McpAuth {
     /// <access_token>`. The token is gateway-minted and gateway-held — never
     /// the caller's credential (see [`crate::oauth`]).
     OAuth2(OAuthClientConfig),
+    /// Relay the caller's own `Authorization` value unchanged — the one the
+    /// caller did NOT authenticate to the gateway with. `None` reaches the
+    /// upstream without credentials.
+    Delegate(Option<HeaderValue>),
+    /// Exchange the caller's verified token for an upstream access token and
+    /// send it as `Authorization: Bearer <access_token>` (see
+    /// [`crate::token_exchange`]).
+    TokenExchange(TokenExchangeAuth),
+}
+
+/// The calling agent's own credentials, resolved per request by the proxy,
+/// for the auth types that act for the caller rather than with a
+/// gateway-held credential.
+#[derive(Clone, Default)]
+pub struct CallerCredentials {
+    /// The caller's `Authorization` header when it was not what the gateway
+    /// admitted the request with — the upstream token an `oauth_delegate`
+    /// server receives.
+    pub delegated_authorization: Option<HeaderValue>,
+    /// The bearer token the gateway verified through a JWT trust provider on
+    /// this request — the only token an `oauth2_token_exchange` server
+    /// exchanges.
+    pub subject_token: Option<Arc<str>>,
+}
+
+impl std::fmt::Debug for CallerCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallerCredentials")
+            .field(
+                "delegated_authorization",
+                &self
+                    .delegated_authorization
+                    .as_ref()
+                    .map(|_| "***redacted***"),
+            )
+            .field(
+                "subject_token",
+                &self.subject_token.as_ref().map(|_| "***redacted***"),
+            )
+            .finish()
+    }
 }
 
 /// Client-credentials parameters for [`McpAuth::OAuth2`].
@@ -212,6 +255,11 @@ impl std::fmt::Debug for McpAuth {
             McpAuth::ApiKey(_) => f.write_str("ApiKey(***redacted***)"),
             // Delegates to the redacting `OAuthClientConfig` impl above.
             McpAuth::OAuth2(cfg) => f.debug_tuple("OAuth2").field(cfg).finish(),
+            McpAuth::Delegate(value) => f
+                .debug_tuple("Delegate")
+                .field(&value.as_ref().map(|_| "***redacted***"))
+                .finish(),
+            McpAuth::TokenExchange(auth) => f.debug_tuple("TokenExchange").field(auth).finish(),
         }
     }
 }
@@ -329,6 +377,20 @@ impl McpUpstream {
         self
     }
 
+    /// Fill the caller-held halves of [`McpAuth::Delegate`] and
+    /// [`McpAuth::TokenExchange`] from this request's caller. Other auth
+    /// types are gateway-held and unaffected.
+    pub fn with_caller_credentials(mut self, caller: &CallerCredentials) -> Self {
+        match &mut self.auth {
+            McpAuth::Delegate(value) => *value = caller.delegated_authorization.clone(),
+            McpAuth::TokenExchange(auth) => {
+                auth.subject = caller.subject_token.clone().map(SubjectToken);
+            }
+            _ => {}
+        }
+        self
+    }
+
     /// Override the per-operation deadline.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -381,6 +443,14 @@ pub trait McpBridge: Send + Sync {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<McpToolResult, McpError>;
+
+    /// Obtain, without running any MCP operation, the upstream credential an
+    /// `oauth2_token_exchange` server needs for the current caller (see
+    /// `McpGateway::preflight_upstream_auth`). Every other bridge has nothing
+    /// to check.
+    async fn preflight_auth(&self) -> Result<(), McpError> {
+        Ok(())
+    }
 }
 
 /// `rmcp`-backed [`McpBridge`]: holds one running client session to the
@@ -421,7 +491,29 @@ impl RmcpBridge {
     /// or handshake-free `server/discover` for `2026-07-28` upstreams. The
     /// whole sequence, token minting included, is bounded by the upstream's
     /// timeout.
+    ///
+    /// An upstream `401` drops a cached minted or exchanged token; an
+    /// exchanged one is then exchanged afresh and the connect retried once.
     pub async fn connect(upstream: &McpUpstream) -> Result<Self, McpError> {
+        match Self::connect_once(upstream).await {
+            Err(ConnectFailure::Unauthorized(error)) => match &upstream.auth {
+                McpAuth::OAuth2(cfg) => {
+                    crate::oauth::invalidate(cfg);
+                    Err(error)
+                }
+                McpAuth::TokenExchange(auth) => {
+                    auth.invalidate();
+                    Self::connect_once(upstream)
+                        .await
+                        .map_err(ConnectFailure::into_error)
+                }
+                _ => Err(error),
+            },
+            other => other.map_err(ConnectFailure::into_error),
+        }
+    }
+
+    async fn connect_once(upstream: &McpUpstream) -> Result<Self, ConnectFailure> {
         let establish = async {
             // Every arm goes through `with_client(shared_http_client(), ..)`
             // so the transport inherits the deployment's `upstream.*`
@@ -473,6 +565,19 @@ impl RmcpBridge {
                         auth_header = Some(crate::oauth::get_or_fetch(cfg).await?);
                     }
                 }
+                McpAuth::Delegate(value) => {
+                    // Relayed as the caller sent it, scheme included.
+                    if let (false, Some(value)) = (claims("authorization"), value) {
+                        let mut value = value.clone();
+                        value.set_sensitive(true);
+                        custom.insert(http::header::AUTHORIZATION, value);
+                    }
+                }
+                McpAuth::TokenExchange(auth) => {
+                    if !claims("authorization") {
+                        auth_header = Some(auth.token().await?);
+                    }
+                }
             }
             for (name, value) in forwarded {
                 custom.insert(name.clone(), value.clone());
@@ -505,25 +610,29 @@ impl RmcpBridge {
                 .serve_with_lifecycle(transport, lifecycle)
                 .await
                 .map_err(|e| {
-                    // An upstream 401 against a minted token means the token was
-                    // revoked or expired earlier than promised: drop the cache
-                    // entry so the next attempt re-mints instead of replaying it.
-                    if let McpAuth::OAuth2(cfg) = &upstream.auth {
-                        if init_error_is_unauthorized(&e) {
-                            crate::oauth::invalidate(cfg);
-                        }
-                    }
                     // Bound + sanitize: a bare-401 shape embeds the upstream's
                     // response body in the error text, which lands in gateway
                     // logs. An upstream that reflects request headers into its
                     // error body (or emits control characters for log injection)
                     // must not get either past this point verbatim.
-                    McpError::Connect(sanitize_error_message(&e.to_string()))
+                    let error = McpError::Connect(sanitize_error_message(&e.to_string()));
+                    // An upstream 401 is handed to `connect`, which decides
+                    // per auth type (drop a minted token, re-exchange, or
+                    // surface it to the caller).
+                    if init_error_is_unauthorized(&e) {
+                        ConnectFailure::Unauthorized(error)
+                    } else {
+                        ConnectFailure::Other(error)
+                    }
                 })
         };
         let running = tokio::time::timeout(upstream.timeout, establish)
             .await
-            .map_err(|_| McpError::Connect("upstream MCP connect timed out".to_string()))??;
+            .map_err(|_| {
+                ConnectFailure::Other(McpError::Connect(
+                    "upstream MCP connect timed out".to_string(),
+                ))
+            })??;
         // rmcp 3.x ships a client response cache that is ENABLED by default
         // (`ClientCacheConfig::default()`), keyed per peer and honoring the
         // server's `ttlMs`/`cacheScope` hints. A pooled or persistent bridge
@@ -545,6 +654,27 @@ impl RmcpBridge {
             running,
             timeout: upstream.timeout,
         })
+    }
+}
+
+/// A failed connect attempt, with an upstream `401` kept apart so
+/// [`RmcpBridge::connect`] can act on it.
+enum ConnectFailure {
+    Unauthorized(McpError),
+    Other(McpError),
+}
+
+impl ConnectFailure {
+    fn into_error(self) -> McpError {
+        match self {
+            ConnectFailure::Unauthorized(error) | ConnectFailure::Other(error) => error,
+        }
+    }
+}
+
+impl From<McpError> for ConnectFailure {
+    fn from(error: McpError) -> Self {
+        ConnectFailure::Other(error)
     }
 }
 
@@ -712,14 +842,31 @@ fn is_cleartext(url: &str) -> bool {
 /// pin the selection.
 pub(crate) fn cleartext_findings(server: &McpServer) -> Vec<(&'static str, String)> {
     let mut findings = Vec::new();
-    if server.auth_type != McpAuthType::None && is_cleartext(&server.url) {
-        findings.push(("the gateway-held upstream credential", server.url.clone()));
+    match server.auth_type {
+        McpAuthType::None => {}
+        McpAuthType::OauthDelegate => {
+            if is_cleartext(&server.url) {
+                findings.push(("the caller's relayed upstream token", server.url.clone()));
+            }
+        }
+        _ => {
+            if is_cleartext(&server.url) {
+                findings.push(("the gateway-held upstream credential", server.url.clone()));
+            }
+        }
     }
-    if server.auth_type == McpAuthType::OAuth2 {
-        let token_url = server.token_url.as_deref().unwrap_or_default();
-        if is_cleartext(token_url) {
+    let token_url = server.token_url.as_deref().unwrap_or_default();
+    match server.auth_type {
+        McpAuthType::OAuth2 if is_cleartext(token_url) => {
             findings.push(("the OAuth client secret", token_url.to_string()));
         }
+        McpAuthType::OAuth2TokenExchange if is_cleartext(token_url) => {
+            findings.push((
+                "the OAuth client secret and the caller's token",
+                token_url.to_string(),
+            ));
+        }
+        _ => {}
     }
     findings
 }
@@ -793,6 +940,13 @@ pub fn upstream_from_mcp_server(server: &McpServer) -> McpUpstream {
             token_url: server.token_url.clone().unwrap_or_default(),
             scopes: server.scopes.clone().unwrap_or_default(),
         }),
+        // The caller-held halves are filled per request
+        // (`McpUpstream::with_caller_credentials`).
+        McpAuthType::OauthDelegate => McpAuth::Delegate(None),
+        McpAuthType::OAuth2TokenExchange => McpAuth::TokenExchange(TokenExchangeAuth {
+            config: token_exchange_config(server),
+            subject: None,
+        }),
     };
     let timeout = server
         .timeout_ms
@@ -814,6 +968,20 @@ pub fn upstream_from_mcp_server(server: &McpServer) -> McpUpstream {
         // inbound headers (`McpGateway::from_snapshot_for_request`), not
         // derived from the stored server row here.
         forwarded_client_headers: Vec::new(),
+    }
+}
+
+/// The exchange parameters of an `oauth2_token_exchange` server. A row
+/// missing any of them fails at exchange time, like every other incomplete
+/// credential set.
+pub(crate) fn token_exchange_config(server: &McpServer) -> TokenExchangeConfig {
+    TokenExchangeConfig {
+        profile: server.token_exchange_profile,
+        token_url: server.token_url.clone().unwrap_or_default(),
+        client_id: server.client_id.clone().unwrap_or_default(),
+        client_secret: server.secret.clone().unwrap_or_default(),
+        scopes: server.scopes.clone().unwrap_or_default(),
+        server: format!("{}\x1f{}", server.name, server.url),
     }
 }
 
@@ -854,6 +1022,18 @@ impl McpBridge for EphemeralBridge {
             .await?
             .call_tool(name, arguments)
             .await
+    }
+
+    async fn preflight_auth(&self) -> Result<(), McpError> {
+        let claimed = self
+            .upstream
+            .forwarded_client_headers
+            .iter()
+            .any(|(name, _)| name == http::header::AUTHORIZATION);
+        match &self.upstream.auth {
+            McpAuth::TokenExchange(auth) if !claimed => auth.token().await.map(drop),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -954,10 +1134,26 @@ mod tests {
             protocol: McpProtocol::default(),
             forwarded_client_headers: Vec::new(),
         };
+        let exchange = McpAuth::TokenExchange(TokenExchangeAuth {
+            config: TokenExchangeConfig {
+                profile: Some(aisix_core::McpTokenExchangeProfile::EntraObo),
+                token_url: "https://login.example.com/token".into(),
+                client_id: "cid".into(),
+                client_secret: "obo-secret-LEAK".into(),
+                scopes: vec!["api://x/.default".into()],
+                server: "s".into(),
+            },
+            subject: Some(SubjectToken("subject-LEAK".into())),
+        });
+        let caller = CallerCredentials {
+            delegated_authorization: Some(HeaderValue::from_static("Bearer user-LEAK")),
+            subject_token: Some("jwt-LEAK".into()),
+        };
         let rendered = format!(
-            "{oauth:?} {:?} {:?} {upstream:?}",
+            "{oauth:?} {:?} {:?} {upstream:?} {exchange:?} {caller:?} {:?}",
             McpAuth::ApiKey("key-LEAK".into()),
-            McpAuth::Bearer("tok-LEAK".into())
+            McpAuth::Bearer("tok-LEAK".into()),
+            McpAuth::Delegate(Some(HeaderValue::from_static("Bearer user-LEAK"))),
         );
         assert!(
             !rendered.contains("LEAK"),

@@ -232,6 +232,10 @@ pub enum ProxyError {
     /// gateway just cannot verify it right now — retryable.
     #[error("unable to fetch the identity provider's signing keys")]
     JwksUnavailable,
+    /// The single-server MCP endpoint could not obtain an upstream token for
+    /// the caller from an `oauth2_token_exchange` server's token endpoint.
+    #[error("upstream token exchange failed: {0}")]
+    McpTokenExchange(aisix_mcp::TokenExchangeFailure),
     #[error("model {0:?} not found")]
     ModelNotFound(String),
     /// A `/v1/videos/{video_id}` id that this gateway could not have
@@ -460,6 +464,12 @@ impl ProxyError {
                 StatusCode::FORBIDDEN
             }
             ProxyError::JwksUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ProxyError::McpTokenExchange(failure) => match failure {
+                aisix_mcp::TokenExchangeFailure::NoSubject
+                | aisix_mcp::TokenExchangeFailure::SubjectRejected => StatusCode::UNAUTHORIZED,
+                aisix_mcp::TokenExchangeFailure::Misconfigured => StatusCode::INTERNAL_SERVER_ERROR,
+                aisix_mcp::TokenExchangeFailure::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            },
             ProxyError::ModelForbidden(_) => StatusCode::FORBIDDEN,
             ProxyError::ModelIpRestricted(_) => StatusCode::FORBIDDEN,
             ProxyError::RouteIpRestricted(_) => StatusCode::FORBIDDEN,
@@ -498,6 +508,12 @@ impl ProxyError {
             // Auth infrastructure fault, not a credential judgment — the
             // generic server-fault family, like a 5xx from dispatch.
             ProxyError::JwksUnavailable => "api_error",
+            ProxyError::McpTokenExchange(failure) => match failure {
+                aisix_mcp::TokenExchangeFailure::NoSubject
+                | aisix_mcp::TokenExchangeFailure::SubjectRejected => "authentication_error",
+                aisix_mcp::TokenExchangeFailure::Misconfigured
+                | aisix_mcp::TokenExchangeFailure::Unavailable => "api_error",
+            },
             ProxyError::ModelForbidden(_) => "permission_denied",
             ProxyError::ModelIpRestricted(_) => "permission_denied",
             ProxyError::RouteIpRestricted(_) => "permission_denied",
@@ -650,6 +666,14 @@ impl ProxyError {
             }
             ProxyError::JwtIdentityUnmapped => env.with_code("jwt_identity_unmapped"),
             ProxyError::JwksUnavailable => env.with_code("jwks_unavailable"),
+            ProxyError::McpTokenExchange(failure) => env.with_code(match failure {
+                aisix_mcp::TokenExchangeFailure::NoSubject => "token_exchange_subject_missing",
+                aisix_mcp::TokenExchangeFailure::SubjectRejected => {
+                    "token_exchange_subject_rejected"
+                }
+                aisix_mcp::TokenExchangeFailure::Misconfigured => "token_exchange_misconfigured",
+                aisix_mcp::TokenExchangeFailure::Unavailable => "token_exchange_unavailable",
+            }),
             ProxyError::SemanticDecisionFailed { .. } => env.with_code("semantic_routing_failed"),
             // Same stable-code convention, for the one distinction a
             // caller cannot make from `error.type`: `content_filter`
@@ -755,6 +779,13 @@ impl ProxyError {
                     required_scopes: required_scopes.clone(),
                 })
             }
+            // The token an on-behalf-of exchange needs is one the
+            // environment's own trust provider issues, which is exactly
+            // what the gateway's discovery document names.
+            ProxyError::McpTokenExchange(
+                aisix_mcp::TokenExchangeFailure::NoSubject
+                | aisix_mcp::TokenExchangeFailure::SubjectRejected,
+            ) => Some(AuthChallenge::InvalidToken),
             _ => None,
         }
     }

@@ -83,6 +83,52 @@
     {
       "if": {
         "properties": {
+          "auth_type": {
+            "const": "oauth2_token_exchange"
+          }
+        },
+        "required": [
+          "auth_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "client_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "scopes": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "secret": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "token_exchange_profile": {
+            "type": "string"
+          },
+          "token_url": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "secret",
+          "client_id",
+          "token_url",
+          "scopes",
+          "token_exchange_profile"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
           "type": {
             "const": "openapi"
           }
@@ -219,6 +265,22 @@
           ],
           "title": "OAuth 2.0 client credentials",
           "type": "string"
+        },
+        {
+          "description": "Delegated OAuth: the gateway holds no upstream credential and relays the caller's own `Authorization` header to the server unchanged. An `Authorization` the caller authenticated to the gateway with is never relayed, so a caller that needs both sends its gateway API key in `x-aisix-api-key` and its upstream token in `Authorization`. With no upstream token the server is called without credentials and its own response decides.",
+          "enum": [
+            "oauth_delegate"
+          ],
+          "title": "Delegated OAuth (caller's own token)",
+          "type": "string"
+        },
+        {
+          "description": "OAuth token exchange on behalf of the caller: the gateway exchanges the caller's bearer token for an access token to this server at `token_url`, authenticating with `client_id` and the client secret in `secret` and requesting `scopes`, and sends the result as `Authorization: Bearer <access_token>`. `token_exchange_profile` selects the exchange protocol. Only a token the gateway itself verified through a JWT trust provider on the same request is exchanged; for a caller authenticated any other way there is nothing to exchange, and the single-server endpoint `/mcp/{name}` answers `401`. The caller's token never reaches the server. Exchanged tokens are cached per caller token until shortly before their reported expiry.",
+          "enum": [
+            "oauth2_token_exchange"
+          ],
+          "title": "OAuth 2.0 token exchange on behalf of the caller",
+          "type": "string"
         }
       ]
     },
@@ -255,6 +317,19 @@
         }
       ]
     },
+    "McpTokenExchangeProfile": {
+      "description": "Token exchange protocol for `auth_type: oauth2_token_exchange`.",
+      "oneOf": [
+        {
+          "description": "Microsoft Entra ID On-Behalf-Of flow: a `jwt-bearer` grant carrying the caller's token as `assertion` with `requested_token_use=on_behalf_of`. The caller's token must be issued for the gateway's `client_id`.",
+          "enum": [
+            "entra_obo"
+          ],
+          "title": "Microsoft Entra ID On-Behalf-Of",
+          "type": "string"
+        }
+      ]
+    },
     "McpTransport": {
       "description": "Transport used to reach an upstream MCP server.",
       "oneOf": [
@@ -285,10 +360,10 @@
         }
       ],
       "default": "none",
-      "description": "How the gateway authenticates to the upstream server. The credential is held by the gateway and is never forwarded from or exposed to the calling client."
+      "description": "How the gateway authenticates to the upstream server. A gateway-held credential (`bearer`, `api_key`, `oauth2`, `oauth2_token_exchange`) is never exposed to the calling client. `oauth_delegate` holds none: the caller's own upstream token is relayed instead."
     },
     "client_id": {
-      "description": "OAuth client identifier used for the OAuth 2.0 client credentials grant. Required when `auth_type` is `oauth2`; ignored otherwise.",
+      "description": "OAuth client identifier the gateway authenticates to `token_url` with. Required when `auth_type` is `oauth2` or `oauth2_token_exchange`; ignored otherwise.",
       "type": [
         "string",
         "null"
@@ -306,7 +381,7 @@
       "type": "boolean"
     },
     "forward_client_headers": {
-      "description": "Inbound client headers forwarded to this server, as single-`*` glob patterns matched case-insensitively against the header name (`\"x-trace-*\"`, `\"authorization\"`). Empty — the default — forwards nothing. Applies to both `type: mcp` and `type: openapi`, so a REST API exposed here as tools receives them on every tool call.\n\nA header the caller sends more than once is forwarded with its first value only; the upstream receives one well-formed header rather than a list this gateway never interpreted. An HTTP/2 caller may split `cookie` across several header fields, and only the first of them is forwarded.\n\nA header named here reaches the server whatever the gateway would otherwise do with it. Naming the credential slot `auth_type` would fill — `authorization` for `bearer` and `oauth2`, `api_key_header` for `api_key` — hands the server the caller's own credential in place of the gateway's, never both. That is what lets an internal server that already authorizes on the end user's `Authorization` keep doing so unchanged. A server that validates the `aud` claim will reject a token minted for the gateway.\n\nA credential slot, and `traceparent` / `tracestate`, are forwarded only when a pattern names them exactly — a glob such as `\"*\"` or `\"x-*\"` is a statement about the operator's own headers, not consent to hand a third party the caller's credential or to graft the caller's trace onto that party's telemetry.\n\nHeaders whose forwarding would break the exchange rather than change who it comes from are never forwarded whatever the patterns say: `host`, the hop-by-hop headers that describe the caller's own connection, the gateway's `x-aisix-*` namespace, the headers describing a body this gateway re-serializes (`content-type`, `content-length`, `accept`), and the MCP session slots (`mcp-session-id`, `mcp-protocol-version`, `last-event-id`), which name the caller's session with this gateway and which an upstream MCP server refuses outright when they carry a foreign value.",
+      "description": "Inbound client headers forwarded to this server, as single-`*` glob patterns matched case-insensitively against the header name (`\"x-trace-*\"`, `\"authorization\"`). Empty — the default — forwards nothing. Applies to both `type: mcp` and `type: openapi`, so a REST API exposed here as tools receives them on every tool call.\n\nA header the caller sends more than once is forwarded with its first value only; the upstream receives one well-formed header rather than a list this gateway never interpreted. An HTTP/2 caller may split `cookie` across several header fields, and only the first of them is forwarded.\n\nA header named here reaches the server whatever the gateway would otherwise do with it. Naming the credential slot `auth_type` would fill — `authorization` for `bearer`, `oauth2`, `oauth_delegate` and `oauth2_token_exchange`, `api_key_header` for `api_key` — hands the server the caller's own credential in place of the gateway's, never both. That is what lets an internal server that already authorizes on the end user's `Authorization` keep doing so unchanged. A server that validates the `aud` claim will reject a token minted for the gateway.\n\nA credential slot, and `traceparent` / `tracestate`, are forwarded only when a pattern names them exactly — a glob such as `\"*\"` or `\"x-*\"` is a statement about the operator's own headers, not consent to hand a third party the caller's credential or to graft the caller's trace onto that party's telemetry.\n\nHeaders whose forwarding would break the exchange rather than change who it comes from are never forwarded whatever the patterns say: `host`, the hop-by-hop headers that describe the caller's own connection, the gateway's `x-aisix-*` namespace, the headers describing a body this gateway re-serializes (`content-type`, `content-length`, `accept`), and the MCP session slots (`mcp-session-id`, `mcp-protocol-version`, `last-event-id`), which name the caller's session with this gateway and which an upstream MCP server refuses outright when they carry a foreign value.",
       "items": {
         "type": "string"
       },
@@ -330,7 +405,7 @@
       "description": "MCP protocol revision the gateway uses when connecting to this upstream server. When omitted, the gateway opens the session with the `initialize` handshake, which negotiates among the pre-2026 protocol revisions — the right choice for most servers, including `2026-07-28` servers that keep backward compatibility. Set `2026-07-28` for a server that requires the stateless MCP `2026-07-28` revision (handshake-free `server/discover` startup); the connection fails rather than silently downgrading when the server does not support the configured revision. Only used when `type` is `mcp`; ignored for `type: openapi`."
     },
     "scopes": {
-      "description": "OAuth scopes to request. Joined with spaces into the `scope` parameter of the token request. Only used when `auth_type` is `oauth2`.",
+      "description": "OAuth scopes to request. Joined with spaces into the `scope` parameter of the token request. Used when `auth_type` is `oauth2` (optional) or `oauth2_token_exchange` (required, at least one — for `entra_obo` the target API's scope, such as `api://<app-id>/.default`).",
       "items": {
         "type": "string"
       },
@@ -340,7 +415,7 @@
       ]
     },
     "secret": {
-      "description": "Authentication credential for the upstream server. Its meaning follows `auth_type`: the bearer token when `auth_type` is `bearer` (sent as `Authorization: Bearer <secret>`), the API key when `auth_type` is `api_key` (sent as `x-api-key: <secret>`, or under `api_key_header` for `type: openapi`), or the OAuth client secret when `auth_type` is `oauth2`. Leave unset when `auth_type` is `none`.",
+      "description": "Authentication credential for the upstream server. Its meaning follows `auth_type`: the bearer token when `auth_type` is `bearer` (sent as `Authorization: Bearer <secret>`), the API key when `auth_type` is `api_key` (sent as `x-api-key: <secret>`, or under `api_key_header` for `type: openapi`), or the OAuth client secret when `auth_type` is `oauth2` or `oauth2_token_exchange`. Leave unset when `auth_type` is `none` or `oauth_delegate`.",
       "type": [
         "string",
         "null"
@@ -358,8 +433,19 @@
         "null"
       ]
     },
+    "token_exchange_profile": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/McpTokenExchangeProfile"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Token exchange protocol used when `auth_type` is `oauth2_token_exchange`. Required for that `auth_type`; ignored otherwise."
+    },
     "token_url": {
-      "description": "OAuth token endpoint URL where the gateway exchanges the client credentials for an access token, such as `https://auth.example.com/oauth/token`. Required when `auth_type` is `oauth2`; ignored otherwise.",
+      "description": "OAuth token endpoint URL where the gateway obtains the upstream access token, such as `https://auth.example.com/oauth/token`. Required when `auth_type` is `oauth2` or `oauth2_token_exchange`; ignored otherwise.",
       "type": [
         "string",
         "null"

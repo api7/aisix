@@ -52,6 +52,13 @@ export interface McpUpstreamOptions {
    * argument — a tool result carrying a JSON number rather than a string.
    */
   numericTool?: boolean;
+  /**
+   * Answer `401` (with a bare `WWW-Authenticate: Bearer`) to any request
+   * whose `Authorization` this predicate rejects — an OAuth-protected
+   * upstream. The request is still recorded first, so a suite can see what
+   * was refused.
+   */
+  rejectAuthorization?: (authorization: string | undefined) => boolean;
 }
 
 /**
@@ -117,6 +124,12 @@ async function handle(
         ]),
       ),
     );
+    if (options.rejectAuthorization?.(req.headers.authorization)) {
+      res
+        .writeHead(401, { "www-authenticate": "Bearer", "content-type": "application/json" })
+        .end(JSON.stringify({ error: "unauthorized" }));
+      return;
+    }
     const body: unknown = JSON.parse(raw);
 
     const server = new Server(

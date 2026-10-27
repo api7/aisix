@@ -777,12 +777,14 @@ async fn dispatch(
     // below: only `content-length` was ever rewritten, and that header is
     // never forwarded.
     let client_headers = parts.headers.clone();
+    let caller_credentials = caller_credentials(&auth, &parts.headers);
     let gateway = match scope {
         // Same snapshot as the resolution above, so the entry is still there.
         Some(server) => match aisix_mcp::McpGateway::from_snapshot_scoped_for_request(
             &snapshot,
             server,
             Some(&client_headers),
+            &caller_credentials,
         ) {
             Some(gateway) => gateway,
             None => {
@@ -793,9 +795,27 @@ async fn dispatch(
                     .into_response()
             }
         },
-        None => aisix_mcp::McpGateway::from_snapshot_for_request(&snapshot, Some(&client_headers)),
+        None => aisix_mcp::McpGateway::from_snapshot_for_request(
+            &snapshot,
+            Some(&client_headers),
+            &caller_credentials,
+        ),
     }
     .with_tool_acl(acl);
+    // The single-server endpoint answers a token-exchange failure with an
+    // HTTP status, which is where an MCP client looks for a sign-in
+    // challenge. `initialize` reaches no upstream on its own, so the
+    // exchange is run for it here; every later operation records its
+    // failure for the check after the transport ran. The aggregated
+    // endpoint keeps absorbing a per-server failure (its tools drop out of
+    // the list, a call to it fails as a tool error), so one server cannot
+    // fail the whole surface.
+    let token_exchange_failure = gateway.token_exchange_failure();
+    if scope.is_some() && peek.as_ref().and_then(|p| p.method.as_deref()) == Some("initialize") {
+        if let Some(failure) = gateway.preflight_upstream_auth().await {
+            return crate::error::ProxyError::McpTokenExchange(failure).into_response();
+        }
+    }
     // Cloned out before the gateway is handed to the transport, which clones
     // it per session; the slot itself is shared, so this handle sees what the
     // handler writes.
@@ -817,6 +837,32 @@ async fn dispatch(
     };
     crate::attribution::note_upstream_wait_end(true);
     let latency = started.elapsed();
+
+    if let (Some(_), Some(failure)) = (scope, token_exchange_failure.get().copied()) {
+        let error = crate::error::ProxyError::McpTokenExchange(failure);
+        let response = error.into_response();
+        if is_tool_call {
+            emit_tool_call_usage(
+                state,
+                &snapshot,
+                &auth,
+                request_id,
+                request_headers,
+                &mcp_server,
+                &mcp_tool,
+                response.status().as_u16(),
+                latency,
+                Some(&crate::error::ProxyError::McpTokenExchange(failure)),
+                monitor_hits,
+                redaction_counts,
+                guardrail_chain.as_ref(),
+                None,
+                trace,
+                /* dispatched */ true,
+            );
+        }
+        return response;
+    }
 
     // `tools/list` only — nothing else writes the slot. An empty list where
     // the upstreams did return tools is an ACL misconfiguration the operator
@@ -959,6 +1005,32 @@ async fn dispatch(
         );
     }
     response
+}
+
+/// The caller's own credentials for the servers that act on the caller's
+/// behalf.
+///
+/// The `Authorization` header is the caller's upstream token only when the
+/// gateway admitted the request with `x-aisix-api-key` — otherwise it is the
+/// gateway credential itself and is never relayed. The exchangeable subject
+/// is the bearer a JWT trust provider verified on this request, and nothing
+/// else: an API key, an anonymous entry, or an `Authorization` the gateway
+/// did not verify never becomes one.
+fn caller_credentials(
+    auth: &AuthenticatedKey,
+    headers: &axum::http::HeaderMap,
+) -> aisix_mcp::CallerCredentials {
+    aisix_mcp::CallerCredentials {
+        delegated_authorization: if crate::auth::admitted_via_gateway_key_header(headers) {
+            headers.get(axum::http::header::AUTHORIZATION).cloned()
+        } else {
+            None
+        },
+        subject_token: auth
+            .jwt
+            .as_ref()
+            .map(|jwt| std::sync::Arc::clone(&jwt.token)),
+    }
 }
 
 /// Splice-rewrite the string leaves under `params.arguments` of a

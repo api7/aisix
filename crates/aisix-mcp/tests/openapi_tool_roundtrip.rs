@@ -403,6 +403,7 @@ async fn whoami_via_gateway(config: Value, client: &[(&str, &str)]) -> Value {
     let gw = spawn_gateway(McpGateway::from_snapshot_for_request(
         &snapshot,
         Some(&inbound),
+        &aisix_mcp::CallerCredentials::default(),
     ))
     .await;
     let client = ()

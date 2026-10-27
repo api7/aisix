@@ -1468,7 +1468,17 @@ pub fn mcp_server_root_schema(strict: bool) -> Value {
                 ("bearer", "Bearer token"),
                 ("api_key", "API key"),
                 ("oauth2", "OAuth 2.0 client credentials"),
+                ("oauth_delegate", "Delegated OAuth (caller's own token)"),
+                (
+                    "oauth2_token_exchange",
+                    "OAuth 2.0 token exchange on behalf of the caller",
+                ),
             ],
+        );
+        title_single_value_enum_variants(
+            defs,
+            "McpTokenExchangeProfile",
+            &[("entra_obo", "Microsoft Entra ID On-Behalf-Of")],
         );
         title_single_value_enum_variants(
             defs,

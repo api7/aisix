@@ -95,6 +95,9 @@ pub struct OpenApiBridge {
     /// admits, resolved per request against the calling agent's own
     /// request and delivered to the REST API behind these tools.
     forwarded_client_headers: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
+    /// The calling agent's own credentials, read by `oauth_delegate` and
+    /// `oauth2_token_exchange`.
+    caller: crate::bridge::CallerCredentials,
 }
 
 impl OpenApiBridge {
@@ -108,6 +111,25 @@ impl OpenApiBridge {
             entry,
             timeout,
             forwarded_client_headers: Vec::new(),
+            caller: crate::bridge::CallerCredentials::default(),
+        }
+    }
+
+    /// Deliver the calling agent's own credentials for the auth types that
+    /// act for the caller.
+    pub fn with_caller_credentials(mut self, caller: crate::bridge::CallerCredentials) -> Self {
+        self.caller = caller;
+        self
+    }
+
+    fn token_exchange(&self) -> crate::token_exchange::TokenExchangeAuth {
+        crate::token_exchange::TokenExchangeAuth {
+            config: crate::bridge::token_exchange_config(self.server()),
+            subject: self
+                .caller
+                .subject_token
+                .clone()
+                .map(crate::token_exchange::SubjectToken),
         }
     }
 
@@ -197,6 +219,19 @@ impl OpenApiBridge {
                 let token = crate::oauth::get_or_fetch(&self.oauth_config()).await?;
                 request.bearer_auth(token)
             }
+            McpAuthType::OauthDelegate if claims("authorization") => request,
+            McpAuthType::OauthDelegate => match &self.caller.delegated_authorization {
+                Some(value) => {
+                    let mut value = value.clone();
+                    value.set_sensitive(true);
+                    request.header(reqwest::header::AUTHORIZATION, value)
+                }
+                None => request,
+            },
+            McpAuthType::OAuth2TokenExchange if claims("authorization") => request,
+            McpAuthType::OAuth2TokenExchange => {
+                request.bearer_auth(self.token_exchange().token().await?)
+            }
         };
         Ok(forwarded.iter().fold(request, |req, (name, value)| {
             req.header(name.clone(), value.clone())
@@ -238,39 +273,57 @@ impl OpenApiBridge {
         let method = reqwest::Method::from_bytes(tool.method.to_uppercase().as_bytes())
             .map_err(|_| McpError::Request(format!("unsupported HTTP method {}", tool.method)))?;
 
-        let mut request = http_client().request(method, url);
-        request = self.apply_auth(request).await?;
-
         let query = build_query_pairs(tool, &args);
-        if !query.is_empty() {
-            request = request.query(&query);
-        }
-
-        if tool.has_body {
-            if let Some(body) = coerce_body(args.get("body")) {
-                request = request.json(&body);
+        let body = if tool.has_body {
+            coerce_body(args.get("body"))
+        } else {
+            None
+        };
+        // An exchanged token the REST API rejects is dropped and exchanged
+        // afresh, once.
+        let attempts = if self.server().auth_type == McpAuthType::OAuth2TokenExchange {
+            2
+        } else {
+            1
+        };
+        let mut attempt = 0;
+        let response = loop {
+            attempt += 1;
+            let mut request = http_client().request(method.clone(), url.clone());
+            request = self.apply_auth(request).await?;
+            if !query.is_empty() {
+                request = request.query(&query);
             }
-        }
+            if let Some(body) = &body {
+                request = request.json(body);
+            }
 
-        // The error text (which may embed the operator-configured base URL)
-        // is logged server-side by the gateway and never returned to the
-        // agent; sanitizing bounds it and strips log-injection vectors.
-        let response = request.send().await.map_err(|e| {
-            McpError::Request(format!(
-                "HTTP request failed: {}",
-                crate::bridge::sanitize_error_message(&e.to_string())
-            ))
-        })?;
+            // The error text (which may embed the operator-configured base URL)
+            // is logged server-side by the gateway and never returned to the
+            // agent; sanitizing bounds it and strips log-injection vectors.
+            let response = request.send().await.map_err(|e| {
+                McpError::Request(format!(
+                    "HTTP request failed: {}",
+                    crate::bridge::sanitize_error_message(&e.to_string())
+                ))
+            })?;
+            if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+                break response;
+            }
+            // Mirrors the connect-time posture in `bridge.rs`: a 401 against a
+            // minted or exchanged token means it was revoked early — drop the
+            // cache entry so the next call re-mints instead of replaying it.
+            match self.server().auth_type {
+                McpAuthType::OAuth2 => crate::oauth::invalidate(&self.oauth_config()),
+                McpAuthType::OAuth2TokenExchange => self.token_exchange().invalidate(),
+                _ => {}
+            }
+            if attempt >= attempts {
+                break response;
+            }
+        };
 
         let status = response.status();
-        // Mirrors the connect-time posture in `bridge.rs`: a 401 against a
-        // minted token means it was revoked early — drop the cache entry so
-        // the next call re-mints instead of replaying it.
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            && self.server().auth_type == McpAuthType::OAuth2
-        {
-            crate::oauth::invalidate(&self.oauth_config());
-        }
         let body = response.text().await.map_err(|e| {
             McpError::Request(format!(
                 "failed to read response: {}",
@@ -369,6 +422,17 @@ impl McpBridge for OpenApiBridge {
         tokio::time::timeout(self.timeout, self.execute(tool, &arguments))
             .await
             .map_err(|_| McpError::Request("tool call timed out".to_string()))?
+    }
+
+    async fn preflight_auth(&self) -> Result<(), McpError> {
+        let claimed = self
+            .forwarded_client_headers
+            .iter()
+            .any(|(name, _)| name == reqwest::header::AUTHORIZATION);
+        if self.server().auth_type == McpAuthType::OAuth2TokenExchange && !claimed {
+            self.token_exchange().token().await?;
+        }
+        Ok(())
     }
 }
 

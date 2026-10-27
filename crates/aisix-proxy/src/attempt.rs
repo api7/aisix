@@ -515,6 +515,7 @@ pub(crate) fn gateway_error_message(err: &ProxyError) -> String {
         | ProxyError::JwtInsufficientScope { .. }
         | ProxyError::JwtIdentityUnmapped
         | ProxyError::JwksUnavailable
+        | ProxyError::McpTokenExchange(_)
         | ProxyError::ModelNotFound(_)
         | ProxyError::ModelForbidden(_)
         | ProxyError::ModelIpRestricted(_)
@@ -575,6 +576,7 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
         | ProxyError::JwtInsufficientScope { .. }
         | ProxyError::JwtIdentityUnmapped
         | ProxyError::JwksUnavailable
+        | ProxyError::McpTokenExchange(_)
         | ProxyError::ModelNotFound(_)
         | ProxyError::VideoNotFound(_)
         | ProxyError::ModelForbidden(_)
