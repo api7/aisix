@@ -21,10 +21,14 @@ const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("he
 
 const PROMPT_TOKENS = 31;
 const COMPLETION_TOKENS = 9;
+const PROMPT_AUDIO_TOKENS = 25;
+const COMPLETION_AUDIO_TOKENS = 4;
 const USAGE = {
   prompt_tokens: PROMPT_TOKENS,
   completion_tokens: COMPLETION_TOKENS,
   total_tokens: PROMPT_TOKENS + COMPLETION_TOKENS,
+  prompt_tokens_details: { audio_tokens: PROMPT_AUDIO_TOKENS },
+  completion_tokens_details: { audio_tokens: COMPLETION_AUDIO_TOKENS },
 };
 const JSON_BODY = JSON.stringify({ text: "hello world", usage: USAGE });
 const FRAME_END = "\r\n\r\n";
@@ -179,5 +183,7 @@ describe("audio usage reported in chat-style fields", () => {
     const span = await waitUsageSpan(otlp, requestId);
     expect(Number(span["gen_ai.usage.input_tokens"])).toBe(PROMPT_TOKENS);
     expect(Number(span["gen_ai.usage.output_tokens"])).toBe(COMPLETION_TOKENS);
+    expect(Number(span["gen_ai.usage.audio.input_tokens"])).toBe(PROMPT_AUDIO_TOKENS);
+    expect(Number(span["gen_ai.usage.audio.output_tokens"])).toBe(COMPLETION_AUDIO_TOKENS);
   });
 });

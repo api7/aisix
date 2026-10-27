@@ -4021,6 +4021,20 @@ mod tests {
         assert_eq!(usage.modality.prompt_audio_tokens, Some(20));
     }
 
+    #[test]
+    fn extract_token_usage_skips_a_null_transcription_count() {
+        let v = serde_json::json!({
+            "usage": {
+                "input_tokens": null,
+                "output_tokens": null,
+                "prompt_tokens": 31,
+                "completion_tokens": 9
+            }
+        });
+        let usage = super::extract_token_usage(&v).unwrap();
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (31, 9));
+    }
+
     /// #655 parity: an upstream 5xx on /v1/audio/speech now emits ONE zero-token
     /// UsageEvent so the failed request is visible in Logs (status + error
     /// class) and attributed to the api_key — instead of being dropped. Mirrors
