@@ -3350,7 +3350,7 @@ mod tests {
     }
 
     #[test]
-    fn global_region_targets_the_unprefixed_host_on_every_route() {
+    fn non_regional_locations_resolve_to_their_own_host() {
         let bridge = VertexBridge::new();
         assert_eq!(
             bridge.resolve_api_base("global", None).unwrap(),

@@ -2405,12 +2405,6 @@ async fn speech_dispatch(
     })
 }
 
-/// Pull `(prompt_tokens, completion_tokens)` from an audio response
-/// `usage` block. gpt-4o-transcribe returns
-/// `usage: {type:"tokens", input_tokens, output_tokens, ...}`;
-/// whisper-1 (and the `text`/`srt`/`vtt` response formats) return no
-/// token block → `None`. Spec:
-/// <https://platform.openai.com/docs/api-reference/audio/json-object>
 /// `(prompt, completion)` from a *streamed* transcription body.
 ///
 /// `stream=true` on the transcribe models answers `text/event-stream`:
@@ -2441,16 +2435,24 @@ fn extract_sse_token_usage(headers: &HeaderMap, body: &[u8]) -> Option<UsageStat
     })
 }
 
+/// Pull `(prompt_tokens, completion_tokens)` from an audio response
+/// `usage` block. gpt-4o-transcribe returns
+/// `usage: {type:"tokens", input_tokens, output_tokens, ...}`;
+/// whisper-1 (and the `text`/`srt`/`vtt` response formats) return no
+/// token block → `None`. An OpenAI-compatible upstream may report the
+/// counts in chat's `prompt_tokens` / `completion_tokens` instead. Spec:
+/// <https://platform.openai.com/docs/api-reference/audio/json-object>
 fn extract_token_usage(body: &Value) -> Option<UsageStats> {
     let usage = body.get("usage")?;
-    // OpenAI's transcription usage names its counts `input_tokens` /
-    // `output_tokens`; an OpenAI-compatible upstream may report them in
-    // chat's `prompt_tokens` / `completion_tokens` instead.
+    let count = |audio: &str, chat: &str| {
+        usage
+            .get(audio)
+            .and_then(Value::as_u64)
+            .or_else(|| usage.get(chat).and_then(Value::as_u64))
+    };
     let field = |audio: &str, chat: &str| usage.get(audio).or_else(|| usage.get(chat));
-    let input = field("input_tokens", "prompt_tokens").and_then(Value::as_u64)? as u32;
-    let output = field("output_tokens", "completion_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
+    let input = count("input_tokens", "prompt_tokens")? as u32;
+    let output = count("output_tokens", "completion_tokens").unwrap_or(0) as u32;
     // The token-billed transcription usage splits its input side as
     // `input_token_details: {text_tokens, audio_tokens}`.
     let modality = aisix_gateway::ModalityTokens::from_openai_details(
@@ -4003,6 +4005,20 @@ mod tests {
             "usage": {"type": "duration", "seconds": 42.7}
         });
         assert_eq!(super::extract_token_usage(&v), None);
+    }
+
+    #[test]
+    fn extract_token_usage_reads_chat_style_details() {
+        let v = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 31,
+                "completion_tokens": 9,
+                "prompt_tokens_details": {"audio_tokens": 20}
+            }
+        });
+        let usage = super::extract_token_usage(&v).unwrap();
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (31, 9));
+        assert_eq!(usage.modality.prompt_audio_tokens, Some(20));
     }
 
     /// #655 parity: an upstream 5xx on /v1/audio/speech now emits ONE zero-token
