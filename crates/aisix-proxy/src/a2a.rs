@@ -975,8 +975,18 @@ fn emit_a2a_usage(
         status_code,
         // Single-attempt endpoint: the attempt spans the whole request, so
         // the upstream figure and what the caller waited for coincide.
-        upstream_latency_ms: crate::attempt::measured_ms(latency),
-        downstream_latency_ms: crate::attempt::measured_ms(latency),
+        // A refusal before dispatch passes `Duration::ZERO`: nothing was
+        // measured, so it stays the 0 sentinel.
+        upstream_latency_ms: if latency.is_zero() {
+            0
+        } else {
+            crate::attempt::measured_ms(latency)
+        },
+        downstream_latency_ms: if latency.is_zero() {
+            0
+        } else {
+            crate::attempt::measured_ms(latency)
+        },
         inbound_protocol: "a2a".to_string(),
         a2a_agent_name: agent.to_string(),
         a2a_method: call.method.clone(),

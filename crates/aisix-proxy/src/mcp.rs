@@ -1525,8 +1525,18 @@ fn emit_tool_call_usage(
         redacted_entity_counts,
         // Single-attempt endpoint: the attempt spans the whole request, so
         // the upstream figure and what the caller waited for coincide.
-        upstream_latency_ms: crate::attempt::measured_ms(latency),
-        downstream_latency_ms: crate::attempt::measured_ms(latency),
+        // A refusal before dispatch passes `Duration::ZERO`: nothing was
+        // measured, so it stays the 0 sentinel.
+        upstream_latency_ms: if latency.is_zero() {
+            0
+        } else {
+            crate::attempt::measured_ms(latency)
+        },
+        downstream_latency_ms: if latency.is_zero() {
+            0
+        } else {
+            crate::attempt::measured_ms(latency)
+        },
         inbound_protocol: "mcp".to_string(),
         mcp_server_name: mcp_server.to_string(),
         mcp_tool_name: mcp_tool.to_string(),

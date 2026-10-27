@@ -1784,8 +1784,8 @@ async fn multipart_dispatch(
                 // The Drop guard owns the emit; the handler must not
                 // double-emit with the counts it cannot see yet.
                 usage: None,
-                // Unread: the guard's emit takes the terminal event's figure.
-                duration_seconds: probed_seconds.unwrap_or(0.0),
+                // Not known until the stream ends; the guard's emit owns it.
+                duration_seconds: 0.0,
                 applied_guardrails,
                 redactions,
                 monitor_hits,

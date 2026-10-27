@@ -54,7 +54,8 @@ pub(crate) fn flac_duration_seconds(audio: &[u8]) -> Option<f64> {
     if audio[4] & 0x7F != 0 {
         return None;
     }
-    let min_block = u64::from(u16::from_be_bytes([info[0], info[1]]));
+    let min_block = u16::from_be_bytes([info[0], info[1]]);
+    let max_block = u16::from_be_bytes([info[2], info[3]]);
     let sample_rate =
         (u32::from(info[10]) << 12) | (u32::from(info[11]) << 4) | (u32::from(info[12]) >> 4);
     if sample_rate == 0 {
@@ -65,19 +66,24 @@ pub(crate) fn flac_duration_seconds(audio: &[u8]) -> Option<f64> {
     let total = if declared > 0 {
         declared
     } else {
-        // STREAMINFO's maximum frame size, else the largest frame its
-        // block size, channel count and sample width allow uncompressed.
-        let max_frame =
-            match (u32::from(info[7]) << 16) | (u32::from(info[8]) << 8) | u32::from(info[9]) {
-                0 => {
-                    let max_block = usize::from(u16::from_be_bytes([info[2], info[3]]));
-                    let channels = usize::from((info[12] >> 1) & 0x07) + 1;
-                    let bits = usize::from(((info[12] & 1) << 4) | (info[13] >> 4)) + 1;
-                    max_block * channels * bits.div_ceil(8) + 64
-                }
-                n => n as usize,
-            };
-        last_frame_end_sample(audio, min_block, max_frame)?
+        // The largest frame the block size, channel count and sample width
+        // allow uncompressed (one extra bit per sample covers a stereo side
+        // channel), tightened by STREAMINFO's maximum frame size when set.
+        let channels = usize::from((info[12] >> 1) & 0x07) + 1;
+        let bits = usize::from(((info[12] & 1) << 4) | (info[13] >> 4)) + 1;
+        let bound = (usize::from(max_block) * channels * (bits + 1)).div_ceil(8) + 64;
+        let declared_max =
+            (usize::from(info[7]) << 16) | (usize::from(info[8]) << 8) | usize::from(info[9]);
+        let max_frame = if declared_max == 0 {
+            bound
+        } else {
+            declared_max.min(bound)
+        };
+        // A fixed-blocksize stream numbers frames, not samples, so its
+        // position is only known when STREAMINFO names one valid block size.
+        let fixed_block =
+            (min_block == max_block && min_block >= 16).then_some(u64::from(min_block));
+        last_frame_end_sample(audio, fixed_block, max_frame)?
     };
     Some(total as f64 / f64::from(sample_rate)).filter(|s| *s > 0.0)
 }
@@ -90,8 +96,8 @@ pub(crate) fn flac_duration_seconds(audio: &[u8]) -> Option<f64> {
 /// The search is bounded because the file is a caller upload: it starts no
 /// further back than one frame can be long, and at most
 /// `MAX_FRAME_CANDIDATES` headers get the CRC-16 check.
-fn last_frame_end_sample(audio: &[u8], fixed_block: u64, max_frame: usize) -> Option<u64> {
-    const MAX_FRAME_CANDIDATES: usize = 16;
+fn last_frame_end_sample(audio: &[u8], fixed_block: Option<u64>, max_frame: usize) -> Option<u64> {
+    const MAX_FRAME_CANDIDATES: usize = 4;
     let body_end = audio.len().checked_sub(2)?;
     let tail_crc = u16::from_be_bytes([audio[body_end], audio[body_end + 1]]);
     let earliest = body_end.saturating_sub(max_frame);
@@ -115,7 +121,7 @@ fn last_frame_end_sample(audio: &[u8], fixed_block: u64, max_frame: usize) -> Op
 }
 
 /// The first sample after the frame whose valid header starts `frame`.
-fn parse_frame_header(frame: &[u8], fixed_block: u64) -> Option<u64> {
+fn parse_frame_header(frame: &[u8], fixed_block: Option<u64>) -> Option<u64> {
     let variable = frame[1] & 1 == 1;
     let b2 = *frame.get(2)?;
     let b3 = *frame.get(3)?;
@@ -171,7 +177,7 @@ fn parse_frame_header(frame: &[u8], fixed_block: u64) -> Option<u64> {
     let first = if variable {
         number
     } else {
-        number.checked_mul(fixed_block)?
+        number.checked_mul(fixed_block?)?
     };
     first.checked_add(block)
 }
@@ -191,18 +197,31 @@ fn crc8_flac(bytes: &[u8]) -> u8 {
 }
 
 fn crc16_flac(bytes: &[u8]) -> u16 {
-    bytes.iter().fold(0u16, |mut crc, &b| {
-        crc ^= u16::from(b) << 8;
-        for _ in 0..8 {
+    bytes.iter().fold(0u16, |crc, &b| {
+        (crc << 8) ^ CRC16_TABLE[usize::from((crc >> 8) as u8 ^ b)]
+    })
+}
+
+/// CRC-16 with FLAC's polynomial (0x8005), one entry per byte value.
+const CRC16_TABLE: [u16; 256] = {
+    let mut table = [0u16; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = (i as u16) << 8;
+        let mut bit = 0;
+        while bit < 8 {
             crc = if crc & 0x8000 != 0 {
                 (crc << 1) ^ 0x8005
             } else {
                 crc << 1
             };
+            bit += 1;
         }
-        crc
-    })
-}
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
 
 #[cfg(test)]
 mod tests {
@@ -268,6 +287,16 @@ mod tests {
             crate::audio::probe_audio_duration_seconds(STREAMED_FLAC),
             Some(1.0)
         );
+    }
+
+    /// A fixed-blocksize stream numbers its frames, so without one valid
+    /// block size in STREAMINFO the position cannot be computed — declined
+    /// rather than billed as a single frame.
+    #[test]
+    fn a_streamed_flac_without_a_block_size_yields_nothing() {
+        let mut flac = STREAMED_FLAC.to_vec();
+        flac[8..10].copy_from_slice(&0u16.to_be_bytes());
+        assert_eq!(super::flac_duration_seconds(&flac), None);
     }
 
     /// A FLAC cut short no longer ends on a frame whose CRC-16 matches, so
