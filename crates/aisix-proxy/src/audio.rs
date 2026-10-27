@@ -2443,16 +2443,19 @@ fn extract_sse_token_usage(headers: &HeaderMap, body: &[u8]) -> Option<UsageStat
 
 fn extract_token_usage(body: &Value) -> Option<UsageStats> {
     let usage = body.get("usage")?;
-    let input = usage.get("input_tokens").and_then(Value::as_u64)? as u32;
-    let output = usage
-        .get("output_tokens")
+    // OpenAI's transcription usage names its counts `input_tokens` /
+    // `output_tokens`; an OpenAI-compatible upstream may report them in
+    // chat's `prompt_tokens` / `completion_tokens` instead.
+    let field = |audio: &str, chat: &str| usage.get(audio).or_else(|| usage.get(chat));
+    let input = field("input_tokens", "prompt_tokens").and_then(Value::as_u64)? as u32;
+    let output = field("output_tokens", "completion_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0) as u32;
     // The token-billed transcription usage splits its input side as
     // `input_token_details: {text_tokens, audio_tokens}`.
     let modality = aisix_gateway::ModalityTokens::from_openai_details(
-        usage.get("input_token_details"),
-        usage.get("output_token_details"),
+        field("input_token_details", "prompt_tokens_details"),
+        field("output_token_details", "completion_tokens_details"),
     );
     Some(UsageStats {
         modality,
