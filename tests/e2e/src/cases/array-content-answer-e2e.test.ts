@@ -102,7 +102,9 @@ async function startOtlpReceiver(): Promise<OtlpReceiver> {
               const attrs: Record<string, string> = {};
               for (const a of span.attributes ?? []) {
                 const v = a.value ?? {};
-                attrs[a.key] = v.stringValue ?? String(v.intValue ?? v.boolValue ?? "");
+                attrs[a.key] = v.arrayValue
+                  ? JSON.stringify((v.arrayValue.values ?? []).map((e: any) => e.stringValue))
+                  : (v.stringValue ?? String(v.intValue ?? v.boolValue ?? ""));
               }
               spanAttrs.push(attrs);
             }
@@ -376,7 +378,11 @@ describe("an answer whose content is an array of parts", () => {
     }
     expect(statuses).toEqual(["miss", "hit"]);
     expect(up.mistralCached.receivedRequests.length - before).toBe(1);
-    const [fresh, hit] = await waitForSpans(otlpWide, (a) => promptOf(a).includes(probe), 2);
+    const spans = await waitForSpans(otlpWide, (a) => promptOf(a).includes(probe), 2);
+    // Only the answer the upstream produced carries its response id.
+    const fresh = spans.find((a) => a["gen_ai.response.id"] !== undefined)!;
+    const hit = spans.find((a) => a["gen_ai.response.id"] === undefined)!;
+    expect(fresh && hit, JSON.stringify(spans)).toBeTruthy();
     const freshOutput = JSON.parse(fresh["gen_ai.output.messages"] ?? "null");
     expect(freshOutput?.[0]?.parts, fresh["gen_ai.output.messages"]).toEqual(
       expect.arrayContaining([
@@ -385,6 +391,7 @@ describe("an answer whose content is an array of parts", () => {
       ]),
     );
     expect(JSON.parse(hit["gen_ai.output.messages"] ?? "null"), JSON.stringify(hit)).toEqual(freshOutput);
-    expect(hit["gen_ai.response.finish_reasons"]).toBe(fresh["gen_ai.response.finish_reasons"]);
+    expect(fresh["gen_ai.response.finish_reasons"]).toBe('["stop"]');
+    expect(hit["gen_ai.response.finish_reasons"]).toBe('["stop"]');
   });
 });
