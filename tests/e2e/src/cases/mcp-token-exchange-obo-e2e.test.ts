@@ -10,11 +10,16 @@ import {
   spawnApp,
   startMcpUpstream,
   startMockIdp,
+  startMockSls,
   startOpenAiUpstream,
+  startRestUpstream,
   waitConfigPropagation,
+  waitForSlsLog,
   type McpUpstream,
   type MockIdp,
+  type MockSls,
   type OpenAiUpstream,
+  type RestUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
 
@@ -47,6 +52,12 @@ import {
 //      its outcome; a failed exchange is not reused by the next request.
 //   8. A rejection carrying a claims challenge (Conditional Access
 //      step-up) reaches the caller in the 401's `WWW-Authenticate`.
+//   9. An exchange slower than the server's `timeout_ms` is a 503 within
+//      that timeout — on `initialize` and on a tool call, for `type: mcp`
+//      and `type: openapi` alike — and the exchange still completes for
+//      the requests that come after.
+//  10. A re-exchange that fails after the upstream rejected the previous
+//      token is recorded as a call that reached the upstream.
 //
 // Reference: Microsoft identity platform OAuth 2.0 On-Behalf-Of flow,
 // <https://learn.microsoft.com/entra/identity-platform/v2-oauth2-on-behalf-of-flow>.
@@ -59,17 +70,26 @@ const KEY_2 = "sk-obo-agent-2";
 const KEY_3 = "sk-obo-agent-3";
 const hash = (key: string) => createHash("sha256").update(key).digest("hex");
 const STEP_UP_CLAIMS = '{"access_token":{"capolids":{"essential":true,"values":["c1"]}}}';
+// How long a `hang-` token endpoint takes, and the `timeout_ms` of the
+// servers that use one.
+const HANG_MS = 3000;
+const SHORT_TIMEOUT_MS = 400;
+const CREDENTIAL_REF = "obo";
+const LOGSTORE = "obo-usage";
 
 /** A mock Entra token endpoint: `/<behavior>/token`, counted per path. */
 interface MockEntra {
   url: string;
   forms: Record<string, Record<string, string>[]>;
   hits(path: string): number;
+  /** How many responses on `path` have been written in full. */
+  answered(path: string): number;
   close(): Promise<void>;
 }
 
 async function startMockEntra(): Promise<MockEntra> {
   const forms: Record<string, Record<string, string>[]> = {};
+  const answered: Record<string, number> = {};
   const server: Server = createServer((req, res) => {
     let raw = "";
     req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
@@ -79,18 +99,25 @@ async function startMockEntra(): Promise<MockEntra> {
       seen.push(Object.fromEntries(new URLSearchParams(raw)));
       const segment = path.split("/")[1] ?? "";
       // `slow-<behavior>` answers like `<behavior>`, late enough for
-      // concurrent requests to overlap.
+      // concurrent requests to overlap; `hang-<behavior>` later than any
+      // short server timeout.
       const slow = segment.startsWith("slow-");
-      const behavior = slow ? segment.slice("slow-".length) : segment;
+      const hang = segment.startsWith("hang-");
+      const behavior = slow || hang ? segment.slice(5) : segment;
       const json = (status: number, body: unknown) =>
         setTimeout(
           () =>
             res
               .writeHead(status, { "content-type": "application/json" })
-              .end(JSON.stringify(body)),
-          slow ? 500 : 0,
+              .end(JSON.stringify(body), () => {
+                answered[path] = (answered[path] ?? 0) + 1;
+              }),
+          hang ? HANG_MS : slow ? 500 : 0,
         );
-      if (behavior.startsWith("mint")) {
+      if (behavior.startsWith("mint-once") && seen.length > 1) {
+        // Mints once, then is down.
+        json(503, { error: "temporarily_unavailable" });
+      } else if (behavior.startsWith("mint")) {
         json(200, {
           token_type: "Bearer",
           scope: SCOPE,
@@ -133,7 +160,24 @@ async function startMockEntra(): Promise<MockEntra> {
     url: `http://127.0.0.1:${address.port}`,
     forms,
     hits: (path) => forms[path]?.length ?? 0,
+    answered: (path) => answered[path] ?? 0,
     close: () => new Promise((resolve) => server.close(() => resolve())),
+  };
+}
+
+function itemSpec(): Record<string, unknown> {
+  return {
+    openapi: "3.0.0",
+    info: { title: "obo-items", version: "1" },
+    paths: {
+      "/items/{id}": {
+        get: {
+          operationId: "getitem",
+          parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+          responses: { "200": { description: "ok" } },
+        },
+      },
+    },
   };
 }
 
@@ -156,6 +200,9 @@ describe("oauth2_token_exchange (entra_obo) e2e", () => {
   let upstream: McpUpstream | undefined;
   let retryUpstream: McpUpstream | undefined;
   let rest: OpenAiUpstream | undefined;
+  let rejectingUpstream: McpUpstream | undefined;
+  let items: RestUpstream | undefined;
+  let sls: MockSls | undefined;
   let etcdReachable = false;
   let jwt1 = "";
   let jwt2 = "";
@@ -207,6 +254,26 @@ describe("oauth2_token_exchange (entra_obo) e2e", () => {
   const errorCode = async (res: Response): Promise<string | undefined> =>
     ((await res.json()) as { error?: { code?: string } }).error?.code;
 
+  /** A lone `tools/call`, with how long the gateway took to answer it. */
+  const toolCall = async (path: string, name: string, args: unknown, token: string) => {
+    const started = Date.now();
+    const res = await mcpPost(
+      path,
+      { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name, arguments: args } },
+      bearer(token),
+    );
+    const text = await res.text();
+    return {
+      status: res.status,
+      text,
+      elapsed: Date.now() - started,
+      requestId: res.headers.get("x-aisix-request-id") ?? "",
+    };
+  };
+
+  const usageRow = (requestId: string, what: string) =>
+    waitForSlsLog(sls!, LOGSTORE, (l) => l.get("request_id") === requestId, what, 15_000);
+
   beforeAll(async () => {
     const etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
@@ -220,8 +287,27 @@ describe("oauth2_token_exchange (entra_obo) e2e", () => {
       rejectAuthorization: (value) => value === "Bearer mint-retry-1",
     });
     rest = await startOpenAiUpstream();
-    app = await spawnApp({});
+    // Rejects every token, so each call is answered with a 401.
+    rejectingUpstream = await startMcpUpstream("obo-401", { rejectAuthorization: () => true });
+    // Accepts only its own fixed token, so an exchanged one gets a 401.
+    items = await startRestUpstream();
+    sls = await startMockSls();
+    app = await spawnApp({
+      extraEnv: {
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "LTAI_mock_ak",
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock_ak_secret",
+      },
+    });
     const seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createObservabilityExporter({
+      name: "obo-sls",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: "aisix-e2e-obs",
+      logstore: LOGSTORE,
+      credential_ref: CREDENTIAL_REF,
+    });
 
     await seed.createOidcProvider({
       name: "corp-entra",
@@ -250,9 +336,37 @@ describe("oauth2_token_exchange (entra_obo) e2e", () => {
       ["oboslow", "slow-mint-slow", upstream.url],
       ["oboslowreject", "slow-reject", upstream.url],
       ["obostepup", "stepup", upstream.url],
+      ["obo401", "mint-once", rejectingUpstream.url],
     ] as const) {
       await seed.update("mcp_servers", randomUUID(), { name, type: "mcp", url, ...exchange(behavior) });
     }
+    for (const [name, behavior] of [
+      ["obohang", "hang-mint-a"],
+      ["obohangcall", "hang-mint-b"],
+    ] as const) {
+      await seed.update("mcp_servers", randomUUID(), {
+        name,
+        type: "mcp",
+        url: upstream.url,
+        timeout_ms: SHORT_TIMEOUT_MS,
+        ...exchange(behavior),
+      });
+    }
+    await seed.update("mcp_servers", randomUUID(), {
+      name: "oboresthang",
+      type: "openapi",
+      url: `${rest.baseUrl}/v1`,
+      spec: restSpec(),
+      timeout_ms: SHORT_TIMEOUT_MS,
+      ...exchange("hang-mint-rest"),
+    });
+    await seed.update("mcp_servers", randomUUID(), {
+      name: "oborest401",
+      type: "openapi",
+      url: items.baseUrl,
+      spec: itemSpec(),
+      ...exchange("mint-once-rest"),
+    });
     await seed.update("mcp_servers", randomUUID(), {
       name: "obounreachable",
       type: "mcp",
@@ -301,6 +415,9 @@ describe("oauth2_token_exchange (entra_obo) e2e", () => {
     await upstream?.close();
     await retryUpstream?.close();
     await rest?.close();
+    await rejectingUpstream?.close();
+    await items?.close();
+    await sls?.close();
   });
 
   test("a JWT caller's token is exchanged, the result sent upstream, and cached per caller", async () => {
@@ -500,5 +617,77 @@ describe("oauth2_token_exchange (entra_obo) e2e", () => {
     } finally {
       await seed.delete("mcp_auth_settings", settingsId);
     }
+  });
+
+  test("an exchange slower than the server's timeout_ms is 503 within it, and still completes", async () => {
+    if (!etcdReachable) return;
+    const bound = SHORT_TIMEOUT_MS + 1500;
+
+    // `initialize` on the single-server endpoint, which runs the exchange
+    // up front.
+    const started = Date.now();
+    const init = await mcpPost("/mcp/obohang", initialize, bearer(jwt1));
+    const initText = await init.text();
+    const initElapsed = Date.now() - started;
+    expect(init.status, initText).toBe(503);
+    expect(JSON.parse(initText).error?.code).toBe("token_exchange_unavailable");
+    expect(initElapsed).toBeLessThan(bound);
+
+    // A tool call, which exchanges while connecting to the upstream.
+    const call = await toolCall("/mcp/obohangcall", "echo", { text: "hi" }, jwt1);
+    expect(call.status, call.text).toBe(503);
+    expect(JSON.parse(call.text).error?.code).toBe("token_exchange_unavailable");
+    expect(call.elapsed).toBeLessThan(bound);
+
+    // The same on a REST API behind an OpenAPI server.
+    const restCall = await toolCall("/mcp/oboresthang", "listmodels", {}, jwt1);
+    expect(restCall.status, restCall.text).toBe(503);
+    expect(JSON.parse(restCall.text).error?.code).toBe("token_exchange_unavailable");
+    expect(restCall.elapsed).toBeLessThan(bound);
+    const restStarted = Date.now();
+    const restInit = await mcpPost("/mcp/oboresthang", initialize, bearer(jwt2));
+    const restInitText = await restInit.text();
+    expect(restInit.status, restInitText).toBe(503);
+    expect(JSON.parse(restInitText).error?.code).toBe("token_exchange_unavailable");
+    expect(Date.now() - restStarted).toBeLessThan(bound);
+
+    // The request that gave up did not take the exchange down with it: once
+    // the identity provider answers, its token is there for the next
+    // request, without a second exchange. Nothing touches the gateway until
+    // the identity provider has answered the abandoned exchange.
+    await waitConfigPropagation(async () => entra!.answered("/hang-mint-a/token") === 1);
+    await new Promise((r) => setTimeout(r, 200));
+    const after = await mcpPost("/mcp/obohang", initialize, bearer(jwt1));
+    expect(after.status, await after.text()).toBe(200);
+    expect(entra!.hits("/hang-mint-a/token")).toBe(1);
+  });
+
+  test("a re-exchange that fails after an upstream 401 is recorded as dispatched", async () => {
+    if (!etcdReachable) return;
+    const unmeasured = (row: Map<string, string>) => row.get("upstream_latency_ms");
+
+    // Nothing was contacted but the identity provider: no upstream latency.
+    const before = await toolCall("/mcp/obodown", "echo", { text: "hi" }, jwt1);
+    expect(before.status, before.text).toBe(503);
+    expect(unmeasured(await usageRow(before.requestId, "exchange failed up front"))).toBe("0");
+
+    // The upstream rejected the first token, and getting another failed.
+    const mark = rejectingUpstream!.receivedHeaders.length;
+    const mcp = await toolCall("/mcp/obo401", "echo", { text: "hi" }, jwt1);
+    expect(mcp.status, mcp.text).toBe(503);
+    expect(JSON.parse(mcp.text).error?.code).toBe("token_exchange_unavailable");
+    expect(entra!.hits("/mint-once/token")).toBe(2);
+    expect(rejectingUpstream!.receivedHeaders.slice(mark)[0]?.authorization).toBe(
+      "Bearer mint-once-1",
+    );
+    const mcpRow = await usageRow(mcp.requestId, "mcp re-exchange failed");
+    expect(Number(unmeasured(mcpRow) ?? 0)).toBeGreaterThanOrEqual(1);
+
+    const rest = await toolCall("/mcp/oborest401", "getitem", { id: "1" }, jwt1);
+    expect(rest.status, rest.text).toBe(503);
+    expect(JSON.parse(rest.text).error?.code).toBe("token_exchange_unavailable");
+    expect(entra!.hits("/mint-once-rest/token")).toBe(2);
+    const restRow = await usageRow(rest.requestId, "openapi re-exchange failed");
+    expect(Number(unmeasured(restRow) ?? 0)).toBeGreaterThanOrEqual(1);
   });
 });

@@ -189,6 +189,7 @@ impl OpenApiBridge {
     async fn apply_auth(
         &self,
         request: reqwest::RequestBuilder,
+        deadline: tokio::time::Instant,
     ) -> Result<reqwest::RequestBuilder, McpError> {
         let server = self.server();
         // A forwarded client header wins the slot it names:
@@ -216,7 +217,12 @@ impl OpenApiBridge {
             }
             McpAuthType::OAuth2 if claims("authorization") => request,
             McpAuthType::OAuth2 => {
-                let token = crate::oauth::get_or_fetch(&self.oauth_config()).await?;
+                let token = tokio::time::timeout_at(
+                    deadline,
+                    crate::oauth::get_or_fetch(&self.oauth_config()),
+                )
+                .await
+                .map_err(|_| tool_call_timed_out())??;
                 request.bearer_auth(token)
             }
             McpAuthType::OauthDelegate if claims("authorization") => request,
@@ -230,7 +236,7 @@ impl OpenApiBridge {
             },
             McpAuthType::OAuth2TokenExchange if claims("authorization") => request,
             McpAuthType::OAuth2TokenExchange => {
-                request.bearer_auth(self.token_exchange().token().await?)
+                request.bearer_auth(self.token_exchange().token(deadline).await?)
             }
         };
         Ok(forwarded.iter().fold(request, |req, (name, value)| {
@@ -248,10 +254,15 @@ impl OpenApiBridge {
         }
     }
 
+    /// Run one tool call. Every step that waits on the network is bounded
+    /// by `deadline` on its own, rather than the call as a whole, so a token
+    /// exchange that runs out of it is reported as the identity provider
+    /// being unavailable.
     async fn execute(
         &self,
         tool: &GeneratedTool,
         arguments: &Value,
+        deadline: tokio::time::Instant,
     ) -> Result<McpToolResult, McpError> {
         let args = match arguments {
             Value::Object(map) => map.clone(),
@@ -290,7 +301,12 @@ impl OpenApiBridge {
         let response = loop {
             attempt += 1;
             let mut request = http_client().request(method.clone(), url.clone());
-            request = self.apply_auth(request).await?;
+            request = match self.apply_auth(request, deadline).await {
+                Ok(request) => request,
+                // The REST API already rejected the previous token.
+                Err(error) if attempt > 1 => return Err(error.after_upstream_contact()),
+                Err(error) => return Err(error),
+            };
             if !query.is_empty() {
                 request = request.query(&query);
             }
@@ -301,12 +317,15 @@ impl OpenApiBridge {
             // The error text (which may embed the operator-configured base URL)
             // is logged server-side by the gateway and never returned to the
             // agent; sanitizing bounds it and strips log-injection vectors.
-            let response = request.send().await.map_err(|e| {
-                McpError::Request(format!(
-                    "HTTP request failed: {}",
-                    crate::bridge::sanitize_error_message(&e.to_string())
-                ))
-            })?;
+            let response = tokio::time::timeout_at(deadline, request.send())
+                .await
+                .map_err(|_| tool_call_timed_out())?
+                .map_err(|e| {
+                    McpError::Request(format!(
+                        "HTTP request failed: {}",
+                        crate::bridge::sanitize_error_message(&e.to_string())
+                    ))
+                })?;
             if response.status() != reqwest::StatusCode::UNAUTHORIZED {
                 break response;
             }
@@ -324,12 +343,15 @@ impl OpenApiBridge {
         };
 
         let status = response.status();
-        let body = response.text().await.map_err(|e| {
-            McpError::Request(format!(
-                "failed to read response: {}",
-                crate::bridge::sanitize_error_message(&e.to_string())
-            ))
-        })?;
+        let body = tokio::time::timeout_at(deadline, response.text())
+            .await
+            .map_err(|_| tool_call_timed_out())?
+            .map_err(|e| {
+                McpError::Request(format!(
+                    "failed to read response: {}",
+                    crate::bridge::sanitize_error_message(&e.to_string())
+                ))
+            })?;
 
         if status.is_success() {
             Ok(McpToolResult {
@@ -341,6 +363,10 @@ impl OpenApiBridge {
             Ok(tool_error(format!("HTTP {}: {}", status.as_u16(), body)))
         }
     }
+}
+
+fn tool_call_timed_out() -> McpError {
+    McpError::Request("tool call timed out".to_string())
 }
 
 /// A tool-level error result (`isError: true` with a text message) — the
@@ -419,9 +445,8 @@ impl McpBridge for OpenApiBridge {
             .iter()
             .find(|t| t.name == name)
             .ok_or_else(|| McpError::Request(format!("unknown tool '{name}'")))?;
-        tokio::time::timeout(self.timeout, self.execute(tool, &arguments))
+        self.execute(tool, &arguments, tokio::time::Instant::now() + self.timeout)
             .await
-            .map_err(|_| McpError::Request("tool call timed out".to_string()))?
     }
 
     async fn preflight_auth(&self) -> Result<(), McpError> {
@@ -430,7 +455,9 @@ impl McpBridge for OpenApiBridge {
             .iter()
             .any(|(name, _)| name == reqwest::header::AUTHORIZATION);
         if self.server().auth_type == McpAuthType::OAuth2TokenExchange && !claimed {
-            self.token_exchange().token().await?;
+            self.token_exchange()
+                .token(tokio::time::Instant::now() + self.timeout)
+                .await?;
         }
         Ok(())
     }

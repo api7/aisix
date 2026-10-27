@@ -508,7 +508,7 @@ impl RmcpBridge {
                         if matches!(failure, ConnectFailure::Unauthorized(_)) {
                             auth.invalidate();
                         }
-                        failure.into_error()
+                        failure.into_error().after_upstream_contact()
                     })
                 }
                 _ => Err(error),
@@ -518,74 +518,83 @@ impl RmcpBridge {
     }
 
     async fn connect_once(upstream: &McpUpstream) -> Result<Self, ConnectFailure> {
+        // One deadline for the whole sequence. The upstream credential is
+        // obtained outside `establish` so that a token exchange running out
+        // of it is reported as the identity provider being unavailable, not
+        // as the upstream failing to connect.
+        let deadline = tokio::time::Instant::now() + upstream.timeout;
+        // Gateway credential and forwarded client headers are
+        // resolved into one header set rather than one arm each,
+        // because they can name the same slot: an operator who lists
+        // `authorization` in `forward_client_headers` is choosing the
+        // caller's own credential over the gateway's, and the upstream
+        // must receive exactly one of them.
+        //
+        // The claimed set is read before anything fills a slot, so
+        // suppressing the gateway credential and delivering the
+        // forwarded value cannot disagree.
+        let forwarded = &upstream.forwarded_client_headers;
+        let claims = |name: &str| forwarded.iter().any(|(n, _)| n.as_str() == name);
+        let mut custom: HashMap<HeaderName, HeaderValue> = HashMap::new();
+        let mut auth_header: Option<String> = None;
+        match &upstream.auth {
+            McpAuth::None => {}
+            McpAuth::Bearer(token) => {
+                if !claims("authorization") {
+                    auth_header = Some(token.clone());
+                }
+            }
+            McpAuth::ApiKey(key) => {
+                if !claims(API_KEY_HEADER) {
+                    // A key with non-header-safe bytes is a clean config error,
+                    // not a panic — and the key itself never enters the message.
+                    let mut value = HeaderValue::from_str(key).map_err(|_| {
+                        McpError::Connect(
+                            "upstream API key is not a valid HTTP header value".to_string(),
+                        )
+                    })?;
+                    // Marks the value opaque to `Debug` formatting of the
+                    // header map, mirroring this module's redaction posture.
+                    value.set_sensitive(true);
+                    custom.insert(HeaderName::from_static(API_KEY_HEADER), value);
+                }
+            }
+            McpAuth::OAuth2(cfg) => {
+                // Minted only when it will actually be sent: a token a
+                // forwarded header is about to displace is a round trip
+                // to the identity provider whose only possible effect is
+                // failing a request that did not need it.
+                if !claims("authorization") {
+                    auth_header = Some(
+                        tokio::time::timeout_at(deadline, crate::oauth::get_or_fetch(cfg))
+                            .await
+                            .map_err(|_| connect_timed_out())??,
+                    );
+                }
+            }
+            McpAuth::Delegate(value) => {
+                // Relayed as the caller sent it, scheme included.
+                if let (false, Some(value)) = (claims("authorization"), value) {
+                    let mut value = value.clone();
+                    value.set_sensitive(true);
+                    custom.insert(http::header::AUTHORIZATION, value);
+                }
+            }
+            McpAuth::TokenExchange(auth) => {
+                if !claims("authorization") {
+                    auth_header = Some(auth.token(deadline).await?);
+                }
+            }
+        }
+        for (name, value) in forwarded {
+            custom.insert(name.clone(), value.clone());
+        }
         let establish = async {
-            // Every arm goes through `with_client(shared_http_client(), ..)`
-            // so the transport inherits the deployment's `upstream.*`
-            // connection settings — `from_uri`/`from_config` would build
-            // rmcp's own default client with none of them — and through
+            // Through `with_client(shared_http_client(), ..)` so the
+            // transport inherits the deployment's `upstream.*` connection
+            // settings — `from_uri`/`from_config` would build rmcp's own
+            // default client with none of them — and through
             // `transport_config` for the pinned transport defaults.
-            // Gateway credential and forwarded client headers are
-            // resolved into one header set rather than one arm each,
-            // because they can name the same slot: an operator who lists
-            // `authorization` in `forward_client_headers` is choosing the
-            // caller's own credential over the gateway's, and the upstream
-            // must receive exactly one of them.
-            //
-            // The claimed set is read before anything fills a slot, so
-            // suppressing the gateway credential and delivering the
-            // forwarded value cannot disagree.
-            let forwarded = &upstream.forwarded_client_headers;
-            let claims = |name: &str| forwarded.iter().any(|(n, _)| n.as_str() == name);
-            let mut custom: HashMap<HeaderName, HeaderValue> = HashMap::new();
-            let mut auth_header: Option<String> = None;
-            match &upstream.auth {
-                McpAuth::None => {}
-                McpAuth::Bearer(token) => {
-                    if !claims("authorization") {
-                        auth_header = Some(token.clone());
-                    }
-                }
-                McpAuth::ApiKey(key) => {
-                    if !claims(API_KEY_HEADER) {
-                        // A key with non-header-safe bytes is a clean config error,
-                        // not a panic — and the key itself never enters the message.
-                        let mut value = HeaderValue::from_str(key).map_err(|_| {
-                            McpError::Connect(
-                                "upstream API key is not a valid HTTP header value".to_string(),
-                            )
-                        })?;
-                        // Marks the value opaque to `Debug` formatting of the
-                        // header map, mirroring this module's redaction posture.
-                        value.set_sensitive(true);
-                        custom.insert(HeaderName::from_static(API_KEY_HEADER), value);
-                    }
-                }
-                McpAuth::OAuth2(cfg) => {
-                    // Minted only when it will actually be sent: a token a
-                    // forwarded header is about to displace is a round trip
-                    // to the identity provider whose only possible effect is
-                    // failing a request that did not need it.
-                    if !claims("authorization") {
-                        auth_header = Some(crate::oauth::get_or_fetch(cfg).await?);
-                    }
-                }
-                McpAuth::Delegate(value) => {
-                    // Relayed as the caller sent it, scheme included.
-                    if let (false, Some(value)) = (claims("authorization"), value) {
-                        let mut value = value.clone();
-                        value.set_sensitive(true);
-                        custom.insert(http::header::AUTHORIZATION, value);
-                    }
-                }
-                McpAuth::TokenExchange(auth) => {
-                    if !claims("authorization") {
-                        auth_header = Some(auth.token().await?);
-                    }
-                }
-            }
-            for (name, value) in forwarded {
-                custom.insert(name.clone(), value.clone());
-            }
             let mut config = transport_config(&upstream.url);
             if let Some(token) = auth_header {
                 config = config.auth_header(token);
@@ -630,13 +639,9 @@ impl RmcpBridge {
                     }
                 })
         };
-        let running = tokio::time::timeout(upstream.timeout, establish)
+        let running = tokio::time::timeout_at(deadline, establish)
             .await
-            .map_err(|_| {
-                ConnectFailure::Other(McpError::Connect(
-                    "upstream MCP connect timed out".to_string(),
-                ))
-            })??;
+            .map_err(|_| connect_timed_out())??;
         // rmcp 3.x ships a client response cache that is ENABLED by default
         // (`ClientCacheConfig::default()`), keyed per peer and honoring the
         // server's `ttlMs`/`cacheScope` hints. A pooled or persistent bridge
@@ -659,6 +664,10 @@ impl RmcpBridge {
             timeout: upstream.timeout,
         })
     }
+}
+
+fn connect_timed_out() -> McpError {
+    McpError::Connect("upstream MCP connect timed out".to_string())
 }
 
 /// A failed connect attempt, with an upstream `401` kept apart so
@@ -1035,7 +1044,10 @@ impl McpBridge for EphemeralBridge {
             .iter()
             .any(|(name, _)| name == http::header::AUTHORIZATION);
         match &self.upstream.auth {
-            McpAuth::TokenExchange(auth) if !claimed => auth.token().await.map(drop),
+            McpAuth::TokenExchange(auth) if !claimed => auth
+                .token(tokio::time::Instant::now() + self.upstream.timeout)
+                .await
+                .map(drop),
             _ => Ok(()),
         }
     }

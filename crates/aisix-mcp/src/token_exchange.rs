@@ -14,8 +14,8 @@
 //! the token. Concurrent misses on one key share a single exchange.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use aisix_core::McpTokenExchangeProfile;
 use futures::future::{BoxFuture, FutureExt, Shared};
@@ -23,7 +23,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::error::{McpError, TokenExchangeFailure};
-use crate::oauth::{DEFAULT_TOKEN_LIFETIME, EXPIRY_SKEW, MAX_TOKEN_LIFETIME};
+use crate::token_cache::{token_lifetime, TokenCache};
 
 /// RFC 7523 JWT bearer grant, which Microsoft Entra ID's On-Behalf-Of flow
 /// is built on.
@@ -87,14 +87,9 @@ impl std::fmt::Debug for TokenExchangeConfig {
     }
 }
 
-struct CachedToken {
-    access_token: String,
-    expires_at: Instant,
-}
-
-fn cache() -> &'static RwLock<HashMap<String, CachedToken>> {
-    static CACHE: OnceLock<RwLock<HashMap<String, CachedToken>>> = OnceLock::new();
-    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+fn cache() -> &'static TokenCache {
+    static CACHE: OnceLock<TokenCache> = OnceLock::new();
+    CACHE.get_or_init(|| TokenCache::new(Some(MAX_CACHED_TOKENS)))
 }
 
 /// One exchange in progress, awaited by every concurrent miss on its key.
@@ -132,10 +127,6 @@ fn cache_key(cfg: &TokenExchangeConfig, subject: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn failure(kind: TokenExchangeFailure) -> McpError {
-    McpError::TokenExchange(kind)
-}
-
 /// The upstream access token for `subject` under `cfg`, from the cache or
 /// a fresh exchange. `None` subject — the caller was not authenticated
 /// through a JWT trust provider — fails without contacting anyone.
@@ -144,7 +135,7 @@ pub(crate) async fn get_or_exchange(
     subject: Option<&str>,
 ) -> Result<String, McpError> {
     let Some(subject) = subject else {
-        return Err(failure(TokenExchangeFailure::NoSubject));
+        return Err(TokenExchangeFailure::NoSubject.into());
     };
     if cfg.profile.is_none()
         || cfg.token_url.is_empty()
@@ -152,10 +143,10 @@ pub(crate) async fn get_or_exchange(
         || cfg.client_secret.is_empty()
         || cfg.scopes.is_empty()
     {
-        return Err(failure(TokenExchangeFailure::Misconfigured));
+        return Err(TokenExchangeFailure::Misconfigured.into());
     }
     let key = cache_key(cfg, subject);
-    if let Some(token) = cached_token(&key) {
+    if let Some(token) = cache().get(&key) {
         return Ok(token);
     }
     let flight = inflight()
@@ -164,7 +155,7 @@ pub(crate) async fn get_or_exchange(
         .entry(key.clone())
         .or_insert_with(|| start_flight(key, cfg.clone(), subject.to_owned()))
         .clone();
-    flight.await.map_err(failure)
+    flight.await.map_err(McpError::from)
 }
 
 /// The exchange behind one [`Flight`], spawned so that it finishes and
@@ -175,10 +166,10 @@ fn start_flight(key: String, cfg: TokenExchangeConfig, subject: String) -> Fligh
     let task = tokio::spawn(async move {
         // A flight that finished between this caller's cache miss and its
         // lookup in the in-flight map has already cached the token.
-        let outcome = match cached_token(&key) {
+        let outcome = match cache().get(&key) {
             Some(token) => Ok(token),
             None => exchange(&cfg, &subject).await.map(|(token, lifetime)| {
-                store(&key, &token, lifetime);
+                cache().insert(key.clone(), &token, lifetime);
                 token
             }),
         };
@@ -193,57 +184,11 @@ fn start_flight(key: String, cfg: TokenExchangeConfig, subject: String) -> Fligh
         .shared()
 }
 
-fn store(key: &str, access_token: &str, lifetime: Duration) {
-    let mut cache = cache()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if cache.len() >= MAX_CACHED_TOKENS {
-        shrink(&mut cache);
-    }
-    cache.insert(
-        key.to_owned(),
-        CachedToken {
-            access_token: access_token.to_owned(),
-            expires_at: Instant::now() + lifetime,
-        },
-    );
-}
-
 /// Drop the cached token for `(cfg, subject)` so the next call exchanges
 /// again — called when the upstream rejects the token.
 pub(crate) fn invalidate(cfg: &TokenExchangeConfig, subject: Option<&str>) {
     let Some(subject) = subject else { return };
-    cache()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(&cache_key(cfg, subject));
-}
-
-fn cached_token(key: &str) -> Option<String> {
-    let cache = cache()
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let entry = cache.get(key)?;
-    if entry.expires_at <= Instant::now() + EXPIRY_SKEW {
-        return None;
-    }
-    Some(entry.access_token.clone())
-}
-
-fn shrink(cache: &mut HashMap<String, CachedToken>) {
-    let now = Instant::now();
-    cache.retain(|_, entry| entry.expires_at > now + EXPIRY_SKEW);
-    if cache.len() < MAX_CACHED_TOKENS {
-        return;
-    }
-    let mut by_expiry: Vec<(Instant, String)> = cache
-        .iter()
-        .map(|(key, entry)| (entry.expires_at, key.clone()))
-        .collect();
-    by_expiry.sort_unstable();
-    for (_, key) in by_expiry.into_iter().take(MAX_CACHED_TOKENS / 10 + 1) {
-        cache.remove(&key);
-    }
+    cache().remove(&cache_key(cfg, subject));
 }
 
 #[derive(Deserialize)]
@@ -378,13 +323,7 @@ async fn exchange(
     {
         return Err(unusable("a token that is not an access token"));
     }
-    let lifetime = token
-        .expires_in
-        .as_ref()
-        .and_then(expires_in_secs)
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_TOKEN_LIFETIME)
-        .min(MAX_TOKEN_LIFETIME);
+    let lifetime = token_lifetime(token.expires_in.as_ref().and_then(expires_in_secs));
     Ok((access_token, lifetime))
 }
 
@@ -420,8 +359,21 @@ impl TokenExchangeAuth {
         self.subject.as_ref().map(|s| &*s.0)
     }
 
-    pub(crate) async fn token(&self) -> Result<String, McpError> {
-        get_or_exchange(&self.config, self.subject()).await
+    /// The upstream token, or [`TokenExchangeFailure::Unavailable`] once
+    /// `deadline` — the server's per-operation deadline — passes. A waiter
+    /// that gives up leaves a shared exchange running for the others.
+    pub(crate) async fn token(&self, deadline: tokio::time::Instant) -> Result<String, McpError> {
+        match tokio::time::timeout_at(deadline, get_or_exchange(&self.config, self.subject())).await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                tracing::warn!(
+                    server = %self.config.server,
+                    "upstream token exchange timed out"
+                );
+                Err(TokenExchangeFailure::Unavailable.into())
+            }
+        }
     }
 
     pub(crate) fn invalidate(&self) {

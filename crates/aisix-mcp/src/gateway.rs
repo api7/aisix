@@ -52,7 +52,7 @@ use crate::bridge::{
     forwarded_client_headers, upstream_from_mcp_server, CallerCredentials, EphemeralBridge,
     McpBridge,
 };
-use crate::error::{McpError, TokenExchangeFailure};
+use crate::error::{McpError, TokenExchangeError, TokenExchangeFailure};
 use crate::openapi::OpenApiBridge;
 
 /// Separator between an upstream server's registered name and a tool name in
@@ -490,7 +490,7 @@ pub struct McpGateway {
     /// single-server endpoint answers it with an HTTP status rather than
     /// inside a JSON-RPC result, where a client never looks for an
     /// authorization challenge.
-    auth_failure: Arc<OnceLock<TokenExchangeFailure>>,
+    auth_failure: Arc<OnceLock<TokenExchangeError>>,
     /// When set, this gateway serves exactly one upstream under its **original**
     /// tool names: `tools/list` strips the `<server>__` namespace prefix and
     /// `tools/call` accepts both the bare and the prefixed form. ACL decisions
@@ -580,7 +580,7 @@ impl McpGateway {
     /// Handle on the first token-exchange failure this gateway hit, read by
     /// the mount after the transport ran — cloned out the same way as
     /// [`McpGateway::tools_list_counts`].
-    pub fn token_exchange_failure(&self) -> Arc<OnceLock<TokenExchangeFailure>> {
+    pub fn token_exchange_failure(&self) -> Arc<OnceLock<TokenExchangeError>> {
         self.auth_failure.clone()
     }
 
@@ -596,7 +596,7 @@ impl McpGateway {
         }
         let upstream = self.upstreams.first()?;
         match upstream.bridge.preflight_auth().await {
-            Err(McpError::TokenExchange(kind)) => Some(kind),
+            Err(McpError::TokenExchange(error)) => Some(error.failure),
             _ => None,
         }
     }
@@ -605,8 +605,8 @@ impl McpGateway {
         if self.scoped.as_ref().is_some_and(|scoped| !scoped.reachable) {
             return;
         }
-        if let McpError::TokenExchange(kind) = error {
-            let _ = self.auth_failure.set(kind.clone());
+        if let McpError::TokenExchange(error) = error {
+            let _ = self.auth_failure.set(error.clone());
         }
     }
 
@@ -745,7 +745,12 @@ impl ServerHandler for McpGateway {
                 // A caller with nothing to exchange is the expected state
                 // for every API-key caller on the aggregated endpoint, not
                 // an upstream failure worth a warning per request.
-                Err(error @ McpError::TokenExchange(TokenExchangeFailure::NoSubject)) => {
+                Err(
+                    error @ McpError::TokenExchange(TokenExchangeError {
+                        failure: TokenExchangeFailure::NoSubject,
+                        ..
+                    }),
+                ) => {
                     self.note_auth_failure(&error);
                     tracing::debug!(
                         upstream = server,

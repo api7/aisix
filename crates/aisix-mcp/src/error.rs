@@ -23,7 +23,40 @@ pub enum McpError {
     /// An `oauth2_token_exchange` server could not obtain an upstream token
     /// for the caller.
     #[error("upstream token exchange failed: {0}")]
-    TokenExchange(TokenExchangeFailure),
+    TokenExchange(TokenExchangeError),
+}
+
+impl From<TokenExchangeFailure> for McpError {
+    fn from(failure: TokenExchangeFailure) -> Self {
+        McpError::TokenExchange(TokenExchangeError {
+            failure,
+            reached_upstream: false,
+        })
+    }
+}
+
+impl McpError {
+    /// Mark a token-exchange failure as one that followed upstream contact:
+    /// the upstream rejected the previous token with a `401` and it was the
+    /// re-exchange that failed.
+    pub(crate) fn after_upstream_contact(self) -> Self {
+        match self {
+            McpError::TokenExchange(error) => McpError::TokenExchange(TokenExchangeError {
+                reached_upstream: true,
+                ..error
+            }),
+            other => other,
+        }
+    }
+}
+
+/// A failed token exchange and whether the operation that hit it had
+/// already contacted the upstream server.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{failure}")]
+pub struct TokenExchangeError {
+    pub failure: TokenExchangeFailure,
+    pub reached_upstream: bool,
 }
 
 /// Why an on-behalf-of token exchange produced no upstream token. Each

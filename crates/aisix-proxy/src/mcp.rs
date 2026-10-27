@@ -845,8 +845,9 @@ async fn dispatch(
     let latency = started.elapsed();
 
     if let (Some(_), Some(failure)) = (scope, token_exchange_failure.get().cloned()) {
-        let response = crate::error::ProxyError::McpTokenExchange(failure.clone()).into_response();
-        let error = crate::error::ProxyError::McpTokenExchange(failure);
+        let response =
+            crate::error::ProxyError::McpTokenExchange(failure.failure.clone()).into_response();
+        let error = crate::error::ProxyError::McpTokenExchange(failure.failure);
         if is_tool_call {
             emit_tool_call_usage(
                 state,
@@ -864,9 +865,10 @@ async fn dispatch(
                 guardrail_chain.as_ref(),
                 None,
                 trace,
-                // The exchange runs before the upstream is contacted.
+                // An exchange runs before the upstream is contacted, except
+                // the re-exchange after the upstream rejected a token.
                 /* dispatched */
-                false,
+                failure.reached_upstream,
             );
         }
         return response;
