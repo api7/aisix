@@ -55,3 +55,4 @@ export {
   eventStreamFrame,
   invokeChunk,
 } from "./aws-eventstream.js";
+export { startMockControlPlane, type MockControlPlane } from "./managed-cp.js";
