@@ -140,7 +140,7 @@ describe("strict budget mode follows usage delivery", () => {
 
   test("no request asks the control plane for a budget decision", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
-    expect(cp!.calls).toContain("/dp/telemetry");
     expect(cp!.calls.filter((path) => path.includes("budget"))).toEqual([]);
+    expect(cp!.calls).toContain("/dp/telemetry");
   });
 });
