@@ -74,6 +74,8 @@ pub struct Schemas {
     pub pricing: Validator,
     pub team: Validator,
     pub user: Validator,
+    pub budget: Validator,
+    pub budget_policy: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile(true)));
@@ -87,7 +89,7 @@ pub static LENIENT_SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::
 /// [`resource_root_schema`] takes. The published schema files and the
 /// validator sets are built from this list, so a new resource cannot reach
 /// one without reaching the other.
-pub const RESOURCES: [&str; 18] = [
+pub const RESOURCES: [&str; 20] = [
     "model",
     "api_key",
     "provider_key",
@@ -106,6 +108,8 @@ pub const RESOURCES: [&str; 18] = [
     "pricing",
     "team",
     "user",
+    "budget",
+    "budget_policy",
 ];
 
 /// Whether a resource's write contract closes unknown top-level fields.
@@ -146,6 +150,8 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "pricing" => pricing_root_schema(),
         "team" => team_root_schema(strict),
         "user" => user_root_schema(strict),
+        "budget" => budget_root_schema(strict),
+        "budget_policy" => budget_policy_root_schema(),
         other => panic!("unknown resource {other:?}"),
     };
     if strict {
@@ -184,6 +190,8 @@ impl Schemas {
             pricing: build("pricing"),
             team: build("team"),
             user: build("user"),
+            budget: build("budget"),
+            budget_policy: build("budget_policy"),
         }
     }
 }
@@ -779,6 +787,22 @@ pub fn validate_user(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_user_lenient(value: &Value) -> Result<(), SchemaError> {
     validate(&LENIENT_SCHEMAS.user, value)
+}
+
+pub fn validate_budget(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.budget, value)
+}
+
+pub fn validate_budget_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.budget, value)
+}
+
+pub fn validate_budget_policy(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.budget_policy, value)
+}
+
+pub fn validate_budget_policy_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.budget_policy, value)
 }
 
 pub fn validate_observability_exporter_lenient(value: &Value) -> Result<(), SchemaError> {
@@ -2290,6 +2314,42 @@ pub fn cache_policy_root_schema() -> Value {
 /// both the write and the read path.
 pub fn pricing_root_schema() -> Value {
     struct_root_schema::<crate::models::Pricing>(false)
+}
+
+/// Canonical JSON Schema for the `budget` resource, derived from the
+/// [`Budget`](crate::models::Budget) struct. The write contract adds the
+/// per-scope shape — `tag` only and always for scope `tag`, `scope_ref`
+/// for every other scope, `exhausted_members` only for `team_member` — which
+/// the read contract leaves out: a row missing its target simply matches no
+/// request, which is no worse than not loading it.
+pub fn budget_root_schema(strict: bool) -> Value {
+    let mut schema = struct_root_schema::<crate::models::Budget>(false);
+    if strict {
+        schema
+            .as_object_mut()
+            .expect("budget root schema is a JSON object")
+            .insert(
+                "allOf".to_string(),
+                json!([
+                    {
+                        "if": { "properties": { "scope": { "const": "tag" } } },
+                        "then": { "required": ["tag"], "not": { "required": ["scope_ref"] } },
+                        "else": { "required": ["scope_ref"], "not": { "required": ["tag"] } }
+                    },
+                    {
+                        "if": { "properties": { "scope": { "const": "team_member" } } },
+                        "else": { "not": { "required": ["exhausted_members"] } }
+                    }
+                ]),
+            );
+    }
+    schema
+}
+
+/// Canonical JSON Schema for the `budget_policy` resource, derived from the
+/// [`BudgetPolicy`](crate::models::BudgetPolicy) struct.
+pub fn budget_policy_root_schema() -> Value {
+    struct_root_schema::<crate::models::BudgetPolicy>(false)
 }
 
 /// Canonical JSON Schema for the `team` resource, derived from the

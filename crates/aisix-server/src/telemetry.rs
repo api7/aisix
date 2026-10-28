@@ -257,6 +257,7 @@ async fn run(
             maybe_event = rx.recv() => {
                 match maybe_event {
                     Some(event) => {
+                        metrics.usage_delivery().note_waiting();
                         buffer.push(event);
                         if buffer.len() >= MAX_BATCH {
                             flush(&client, &cfg, &metrics, &mut state, &mut buffer, Retry::Allowed, cancel).await;
@@ -278,6 +279,11 @@ async fn run(
                 }
             }
             _ = cancel.changed() => {}
+        }
+        // A POST that reached the control plane cleared the waiting mark;
+        // whatever is still queued behind it waits from now.
+        if !buffer.is_empty() || !rx.is_empty() {
+            metrics.usage_delivery().note_waiting();
         }
         // Checked here rather than inside the `cancel` branch because a
         // flush above may have consumed the change notification while it
@@ -446,6 +452,7 @@ async fn deliver(
         attempts += 1;
         let failure = match send(client, cfg, batch_id, events).await {
             Attempt::Delivered { dedup, rejected } => {
+                metrics.usage_delivery().note_reached();
                 state.dedup_seen = dedup;
                 // Delivered and final: the control plane judged these events
                 // and would refuse them again, so there is nothing to re-send.
@@ -475,8 +482,13 @@ async fn deliver(
             Attempt::Failed(failure) => failure,
         };
 
-        if matches!(failure, SendFailure::Response { .. }) {
+        if let SendFailure::Response { status, .. } = &failure {
             answered_failures += 1;
+            // A content rejection is the control plane judging the batch:
+            // delivery works, these events just will not be counted.
+            if *status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+                metrics.usage_delivery().note_reached();
+            }
         }
         let may_resend = state.may_resend(&failure);
         if !may_resend || last_attempt {
@@ -654,6 +666,7 @@ enum SendFailure {
     /// carried [`USAGE_BATCH_DEDUP_HEADER`]; `retryable` says whether the
     /// status is one a re-send could clear.
     Response {
+        status: reqwest::StatusCode,
         dedup: bool,
         retryable: bool,
         error: anyhow::Error,
@@ -722,6 +735,7 @@ async fn send(
     }
     let body = resp.text().await.unwrap_or_default();
     Attempt::Failed(SendFailure::Response {
+        status,
         dedup,
         retryable: is_retryable(status),
         error: anyhow!(
@@ -997,6 +1011,7 @@ mod tests {
     #[test]
     fn resend_permission_is_judged_per_response_and_never_cached() {
         let response = |dedup: bool, retryable: bool| SendFailure::Response {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
             dedup,
             retryable,
             error: anyhow!("boom"),

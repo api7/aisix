@@ -529,6 +529,7 @@ pub(crate) fn gateway_error_message(err: &ProxyError) -> String {
         // guardrail's name, never the matched content.
         | ProxyError::ContentFiltered { .. }
         | ProxyError::BudgetExceeded(_)
+        | ProxyError::BudgetUnverified
         | ProxyError::RequestTooLarge { .. }
         | ProxyError::RateLimit(_)
         | ProxyError::PolicyRateLimit { .. } => true,
@@ -589,6 +590,7 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
         | ProxyError::SemanticDecisionFailed { .. }
         | ProxyError::AllCandidatesUnavailable { .. }
         | ProxyError::BudgetExceeded(_)
+        | ProxyError::BudgetUnverified
         | ProxyError::RequestTooLarge { .. }
         | ProxyError::RateLimit(_)
         | ProxyError::PolicyRateLimit { .. } => false,

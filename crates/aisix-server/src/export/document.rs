@@ -399,6 +399,12 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             snapshot.users.len(),
             "the `user_name` metric label falls back to each api key's own `user_name`",
         ),
+        ("budgets", snapshot.budgets.len(), "no budget is enforced"),
+        (
+            "budget_policy",
+            snapshot.budget_policy.len(),
+            "budgeted traffic behaves as `sticky`",
+        ),
     ] {
         if count > 0 {
             diag.warnings.push(format!(

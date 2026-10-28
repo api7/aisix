@@ -2173,13 +2173,11 @@ const TOP_LEVEL_ENV_KEYS: [&str; 13] = [
 ///
 /// Spelled as the environment source sees them, as in
 /// [`TOP_LEVEL_ENV_KEYS`]: `AISIX_CONFIG` → `config`.
-const NON_CONFIG_ENV_KEYS: [&str; 3] = [
+const NON_CONFIG_ENV_KEYS: [&str; 2] = [
     // `--config`'s env fallback (clap, `aisix-server`).
     "config",
     // Selects which baked config the container entrypoint execs with.
     "config_path",
-    // Upper bound on a cached budget decision's age (`aisix-proxy`).
-    "dp_budget_stale_max_seconds",
 ];
 
 /// The `AISIX_*` variables the configuration loader consumes, split from
@@ -2814,15 +2812,14 @@ admin:
 
     #[test]
     fn the_gateways_own_non_config_env_vars_load_silently() {
-        // These three are read by name elsewhere — clap's `--config`
-        // fallback, the container entrypoint, the budget client — so they
-        // are set deliberately and a warning about them would be noise.
+        // These two are read by name elsewhere — clap's `--config`
+        // fallback and the container entrypoint — so they are set
+        // deliberately and a warning about them would be noise.
         // `AISIX_CONFIG` is the one that used to stop `aisix` from
         // starting from its own documented environment variable at all.
-        const OWN: [(&str, &str); 3] = [
+        const OWN: [(&str, &str); 2] = [
             ("AISIX_CONFIG", "/etc/aisix/config.yaml"),
             ("AISIX_CONFIG_PATH", "/etc/aisix/config.managed.yaml"),
-            ("AISIX_DP_BUDGET_STALE_MAX_SECONDS", "30"),
         ];
         if !in_child_with_env(
             "the_gateways_own_non_config_env_vars_load_silently",

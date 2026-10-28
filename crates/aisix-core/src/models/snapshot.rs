@@ -6,6 +6,7 @@
 
 use super::a2a_agent::A2aAgent;
 use super::apikey::ApiKey;
+use super::budget::{Budget, BudgetPolicy};
 use super::cache_policy::CachePolicy;
 use super::claim_mapping::ClaimMapping;
 use super::guardrail::{Guardrail, GuardrailAttachment};
@@ -98,6 +99,13 @@ pub struct AisixSnapshot {
     /// id API keys carry in `user_id`. Read only to label telemetry —
     /// see [`KeyOwnerNames`].
     pub users: ResourceTable<User>,
+    /// Hard-stop budgets that apply in the environment:
+    /// `/aisix/<env>/budgets/<budget-id>`. The proxy decides every
+    /// request's budget locally from these rows.
+    pub budgets: ResourceTable<Budget>,
+    /// What budgeted traffic does while usage cannot reach the control
+    /// plane: `/aisix/<env>/budget_policy/<env-id>` — a singleton row.
+    pub budget_policy: ResourceTable<BudgetPolicy>,
 }
 
 impl AisixSnapshot {
@@ -127,6 +135,8 @@ impl AisixSnapshot {
             + self.global_pricing.len()
             + self.teams.len()
             + self.users.len()
+            + self.budgets.len()
+            + self.budget_policy.len()
     }
 }
 

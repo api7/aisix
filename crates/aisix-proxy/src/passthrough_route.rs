@@ -764,6 +764,13 @@ async fn dispatch(
     let reservation = crate::quota::enforce(state, snapshot, &auth, model_rl.as_ref())
         .await
         .map_err(|e| RouteError::of(e, &auth))?;
+    // The injected credential's own budget, after the key's: when both are
+    // exhausted the key's is the more specific answer.
+    if let Some(pk) = pk_entry.as_ref() {
+        crate::budget::gate(state, snapshot)
+            .check_provider_key(&pk.id)
+            .map_err(|e| RouteError::of(e, &auth))?;
+    }
 
     // ----- outbound request -----
 

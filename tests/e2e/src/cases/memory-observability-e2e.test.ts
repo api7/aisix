@@ -426,7 +426,6 @@ describe("memory observability", () => {
       "log_queue",
       "response_cache",
       "semantic_cache",
-      "budget_cache",
       "route_embedding_cache",
       "ratelimit_local_keys",
       "snapshot_pending_reclaim",

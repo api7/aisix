@@ -28,7 +28,6 @@ use aisix_ratelimit::Limiter;
 use dashmap::DashSet;
 use std::sync::Arc;
 
-use crate::budget::BudgetClient;
 use crate::client_ip::ResolvedRealIp;
 use crate::health::{HealthTracker, LivezState, ModelRuntimeStatusTracker};
 use crate::routing::RoutingRegistry;
@@ -288,9 +287,9 @@ pub struct ProxyStateInner {
     /// server id read it — the tool ACL and the per-server rate limit — so
     /// the two resolve a rename at the same instant.
     pub mcp_servers: Arc<LiveMcpServerIndex>,
-    /// Per-request budget gate. Asks cp-api whether the api_key may
-    /// proceed; cached for 5s with sticky fallback on cp-api outage.
-    pub budgets: Arc<BudgetClient>,
+    /// The `budgets` documents indexed for the per-request budget gate,
+    /// rebuilt only when that table changes.
+    pub(crate) budgets: Arc<crate::budget::LiveBudgetIndex>,
     /// Per-model health tracker. Updated on every upstream call outcome;
     /// read by `GET /admin/v1/health`.
     pub health: Arc<HealthTracker>,
@@ -440,7 +439,7 @@ impl ProxyState {
             guardrail_index,
             pricing: Arc::new(LivePricingIndex::new()),
             mcp_servers: Arc::new(LiveMcpServerIndex::new()),
-            budgets: Arc::new(BudgetClient::disabled()),
+            budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
             config_apply_age: None,
@@ -493,7 +492,7 @@ impl ProxyState {
             guardrail_index,
             pricing: Arc::new(LivePricingIndex::new()),
             mcp_servers: Arc::new(LiveMcpServerIndex::new()),
-            budgets: Arc::new(BudgetClient::disabled()),
+            budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
             config_apply_age: None,
@@ -560,7 +559,7 @@ impl ProxyState {
             guardrail_index,
             pricing: Arc::new(LivePricingIndex::new()),
             mcp_servers: Arc::new(LiveMcpServerIndex::new()),
-            budgets: Arc::new(BudgetClient::disabled()),
+            budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
             health: Arc::new(HealthTracker::with_flags(bookkeeping_flags)),
             livez: Arc::new(LivezState::new()),
             config_apply_age: None,
@@ -636,13 +635,6 @@ impl ProxyState {
     /// the sender worker.
     pub fn with_usage_sink(mut self, sink: UsageSink) -> Self {
         Arc::make_mut(&mut self.inner).usage_sink = sink;
-        self
-    }
-
-    /// Swap in a live `BudgetClient` that talks to cp-api. Default is
-    /// the disabled (allow-all) client used in self-hosted dev.
-    pub fn with_budget_client(mut self, client: Arc<BudgetClient>) -> Self {
-        Arc::make_mut(&mut self.inner).budgets = client;
         self
     }
 

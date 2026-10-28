@@ -533,6 +533,7 @@ async fn prepare(
         )),
     )
     .await?;
+    crate::budget::gate(state, snapshot).check_provider_key(&pk_entry.id)?;
 
     let provider_label = model.provider.clone().unwrap_or_default();
     Ok(Prepared {

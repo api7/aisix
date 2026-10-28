@@ -10367,33 +10367,6 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn budget_exceeded_returns_429() {
-        use crate::budget::BudgetClient;
-
-        // cp-api stand-in: returns a deny decision for our key.
-        // Wire shape mirrors cp-api's budgetCheckResponse — see
-        // internal/cpapi/resources/budget_check.go (prd-09b rev 2 §5.5).
-        let cp = MockServer::builder().start().await;
-        Mock::given(method("GET"))
-            .and(path("/dp/budget_check"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "allow": false,
-                "fail_mode": "closed",
-                "reason": {
-                    "type": "billing_error",
-                    "code": "budget_exceeded",
-                    "message": "monthly cap exceeded",
-                    "scope": "api_key",
-                    "scope_ref": "ak-uuid",
-                    "limit_usd": "10.00",
-                    "spent_usd": "10.50",
-                    "period": "month",
-                    "period_resets_at": "2026-05-01T00:00:00Z",
-                    "retry_after_seconds": 86400
-                }
-            })))
-            .mount(&cp)
-            .await;
-
         // Upstream chat endpoint must NOT be hit — the budget check
         // fires before dispatch.
         let upstream = MockServer::builder().start().await;
@@ -10408,10 +10381,22 @@ data: [DONE]\n\n";
         hub.register_specialized("openai", Arc::new(openai_test_bridge()));
 
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
-        let state = build_state(snap, hub).with_budget_client(Arc::new(BudgetClient::new(
-            cp.uri(),
-            reqwest::Client::new(),
-        )));
+        let budget: aisix_core::models::Budget = serde_json::from_value(serde_json::json!({
+            "scope": "api_key",
+            "scope_ref": "key-id-1",
+            "period": "month",
+            "exhausted": {"reason": {
+                "message": "monthly cap exceeded",
+                "scope": "api_key",
+                "scope_ref": "key-id-1",
+                "limit_usd": "10.00",
+                "spent_usd": "10.50",
+                "period": "month"
+            }}
+        }))
+        .unwrap();
+        snap.budgets.insert(ResourceEntry::new("b-1", budget, 1));
+        let state = build_state(snap, hub);
 
         let app = build_router(state);
         let body = serde_json::json!({

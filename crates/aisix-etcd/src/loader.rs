@@ -35,7 +35,8 @@ use aisix_core::models::{
     RateLimitPolicy, SchemaError,
 };
 use aisix_core::models::{
-    validate_pricing_lenient, validate_team_lenient, validate_user_lenient, Pricing, Team, User,
+    validate_budget_lenient, validate_budget_policy_lenient, validate_pricing_lenient,
+    validate_team_lenient, validate_user_lenient, Budget, BudgetPolicy, Pricing, Team, User,
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
@@ -524,6 +525,30 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
                     &mut stats,
                 ) {
                     snapshot.users.insert(entry);
+                }
+            }
+            "budgets" => {
+                if let Some(entry) = validate_and_parse::<Budget>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_budget_lenient,
+                    &mut stats,
+                ) {
+                    snapshot.budgets.insert(entry);
+                }
+            }
+            "budget_policy" => {
+                if let Some(entry) = validate_and_parse::<BudgetPolicy>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_budget_policy_lenient,
+                    &mut stats,
+                ) {
+                    snapshot.budget_policy.insert(entry);
                 }
             }
             "pricing" => {

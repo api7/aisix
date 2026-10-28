@@ -711,6 +711,8 @@ fn attempt_for_target(snapshot: &AisixSnapshot, alias: &str) -> Result<AttemptMo
 ///   gets the same 403 as the entry gate, naming only the alias they
 ///   addressed (`routing.rs` does the same for all-excluded groups, so
 ///   a router never becomes a probe for which members exist);
+/// - the member's provider-key budget is a HARD gate too: with every
+///   candidate excluded by it, the caller gets the budget's own answer;
 /// - member health (request-path cooldown / background-unhealthy) is a
 ///   SOFT preference: prefer an available candidate, but with none
 ///   available dispatch the primary anyway — the router has no
@@ -752,6 +754,31 @@ fn select_eligible(
     });
     if candidates.is_empty() {
         return Err(ProxyError::ModelIpRestricted(router.display_name.clone()));
+    }
+    // A candidate on a provider key whose budget is exhausted is excluded
+    // as hard as one outside its allowlist.
+    let gate = crate::budget::gate(state, snapshot);
+    let mut refusal: Option<ProxyError> = None;
+    candidates.retain(
+        |(attempt, fell_back)| match gate.check_model(&attempt.model) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::debug!(
+                    router = %router.display_name,
+                    target = %attempt.model.display_name,
+                    fallback = fell_back,
+                    error = %err,
+                    "semantic target excluded by its provider key's budget",
+                );
+                if !matches!(refusal, Some(ProxyError::BudgetExceeded(_))) {
+                    refusal = Some(err);
+                }
+                false
+            }
+        },
+    );
+    if let (true, Some(err)) = (candidates.is_empty(), refusal) {
+        return Err(err);
     }
     let picked = candidates
         .iter()

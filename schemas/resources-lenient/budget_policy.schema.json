@@ -1,0 +1,35 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "BudgetFailMode": {
+      "enum": [
+        "sticky",
+        "closed"
+      ],
+      "type": "string"
+    }
+  },
+  "description": "What the gateway does with budgeted traffic while it cannot deliver usage to the control plane, whose spend counters are what mark a budget exhausted.\n\nAt most one document exists per environment, keyed by the environment id. Without it the gateway behaves as `sticky`.",
+  "properties": {
+    "closed_grace_seconds": {
+      "description": "How long usage delivery may fail before `closed` starts rejecting budgeted traffic, in seconds.",
+      "format": "uint64",
+      "minimum": 1.0,
+      "type": "integer"
+    },
+    "fail_mode": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/BudgetFailMode"
+        }
+      ],
+      "description": "`sticky` keeps enforcing the last exhausted state the gateway received and lets everything else through. `closed` additionally rejects budgeted traffic once usage delivery has failed for `closed_grace_seconds`: a request from an API key that at least one budget applies to is answered `503 budget_unverified`, and an upstream whose provider key has a budget is not used."
+    }
+  },
+  "required": [
+    "closed_grace_seconds",
+    "fail_mode"
+  ],
+  "title": "BudgetPolicy",
+  "type": "object"
+}

@@ -2073,6 +2073,7 @@ pub async fn get_video(
         // already paid an RPM slot to submit must not starve itself.
         // Key-level layers still apply.
         let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
+        crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_id)?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
         reservation.commit_tokens(0).await;
         let poll = result?;
@@ -2149,6 +2150,7 @@ pub async fn video_content(
         let (target, task_id, _) = resolve_get_target(&snapshot, &auth, &video_id, &client)?;
         // Same model-layer exemption as the poll route (see get_video).
         let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
+        crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_id)?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
         reservation.commit_tokens(0).await;
         let poll = result?;

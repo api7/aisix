@@ -1,7 +1,7 @@
 //! Pre-dispatch quota gate shared by every LLM endpoint.
 //!
 //! Applies budget + multi-layer rate limiting:
-//! 1. Budget pre-check (cp-api cached decision)
+//! 1. Budget pre-check (`budget::enforce_key`, from the pushed budget documents)
 //! 2. API-key inline rate limit (`auth.entry.id`)
 //! 3. Model inline rate limit (`model:<name>`) — when the resolved Model has one
 //! 4. MCP-server rate limit (`mcp:<api_key_id>:<server>`) — on an MCP
@@ -469,7 +469,7 @@ pub(crate) async fn enforce(
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
 ) -> Result<MultiReservation, ProxyError> {
-    check_budget(state, auth).await?;
+    crate::budget::enforce_key(state, snapshot, auth)?;
     reserve_layers(state, snapshot, auth, model_rl, None).await
 }
 
@@ -483,7 +483,7 @@ pub(crate) async fn enforce_mcp(
     auth: &AuthenticatedKey,
     mcp_server: &str,
 ) -> Result<MultiReservation, ProxyError> {
-    check_budget(state, auth).await?;
+    crate::budget::enforce_key(state, snapshot, auth)?;
     reserve_layers(state, snapshot, auth, None, Some(mcp_server)).await
 }
 
@@ -500,35 +500,6 @@ pub(crate) fn budget_labels(auth: &AuthenticatedKey) -> aisix_obs::BudgetLabels<
         user_id: caller.user_id,
         user_name: caller.user_name,
     }
-}
-
-/// Budget pre-check shared by the enforce entry points: refreshes the
-/// budget gauges from the cached cp-api decision and rejects the request
-/// when the key is over budget.
-async fn check_budget(state: &ProxyState, auth: &AuthenticatedKey) -> Result<(), ProxyError> {
-    let decision = state.budgets.check(&auth.entry.id).await;
-    let budget_labels = budget_labels(auth);
-    if let Some(budget) = decision.budget.as_ref() {
-        state.metrics.set_budget_gauges(
-            budget_labels,
-            aisix_obs::BudgetGauges {
-                limit_usd: budget.limit_usd,
-                spent_usd: budget.spent_usd,
-                remaining_usd: budget.remaining_usd,
-                reset_seconds: budget.reset_seconds,
-            },
-        );
-    } else {
-        state.metrics.clear_budget_gauges(budget_labels);
-    }
-    if !decision.allowed {
-        return Err(ProxyError::BudgetExceeded(Box::new(
-            decision.reason.unwrap_or_else(|| {
-                crate::budget::BudgetReason::message_only(auth.entry.id.clone())
-            }),
-        )));
-    }
-    Ok(())
 }
 
 /// Rate-limit-only enforcement (no budget check). Used by `chat.rs`

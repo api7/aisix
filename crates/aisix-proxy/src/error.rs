@@ -334,6 +334,12 @@ pub enum ProxyError {
     // enum small (budget denial is rare, so the extra alloc is fine).
     #[error("{}", .0.message)]
     BudgetExceeded(Box<crate::budget::BudgetReason>),
+    /// A budget applies to the request, but the environment's budget
+    /// policy is `closed` and usage has not reached the control plane for
+    /// longer than its grace period, so whether the budget still has room
+    /// cannot be known.
+    #[error("budget could not be verified: usage has not reached the control plane")]
+    BudgetUnverified,
     /// Per RFC 9110 §15.5.14, a request body that exceeds a server-
     /// imposed limit gets a `413 Content Too Large`. The caller-visible
     /// `message` is intentionally bare of the actual incoming size
@@ -485,6 +491,7 @@ impl ProxyError {
             ProxyError::AllCandidatesUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::ContentFiltered { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
+            ProxyError::BudgetUnverified => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::PolicyRateLimit { .. } => StatusCode::TOO_MANY_REQUESTS,
@@ -532,6 +539,9 @@ impl ProxyError {
             ProxyError::AllCandidatesUnavailable { .. } => "all_candidates_unavailable",
             ProxyError::ContentFiltered { .. } => "content_filter",
             ProxyError::BudgetExceeded(_) => "billing_error",
+            // A gateway-side dependency failed, like `JwksUnavailable`;
+            // `error.code` carries the distinction.
+            ProxyError::BudgetUnverified => "api_error",
             ProxyError::RateLimit(_) => "rate_limit_exceeded",
             ProxyError::PolicyRateLimit { .. } => "rate_limit_exceeded",
             ProxyError::Bridge(b) => b.error_type(),
@@ -636,6 +646,7 @@ impl ProxyError {
         let env = ErrorEnvelope::new(self.to_string(), self.kind());
         match self {
             ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
+            ProxyError::BudgetUnverified => env.with_code("budget_unverified"),
             // Attribution for policy-layer 429s (AISIX-Cloud#892): the
             // OpenAI envelope names the offending policy. The Anthropic
             // envelope keeps its strict {type,message} shape.
@@ -1567,6 +1578,7 @@ mod tests {
             period: Some("month".into()),
             period_resets_at: Some("2026-06-01T00:00:00Z".into()),
             retry_after_seconds: Some(259_200),
+            ..Default::default()
         }));
         // The Retry-After *header* must source the same value the body
         // carries — otherwise SDKs (which back off on the header) and
@@ -1610,6 +1622,7 @@ mod tests {
             period: Some("month".into()),
             period_resets_at: Some("2026-06-01T00:00:00Z".into()),
             retry_after_seconds: Some(259_200),
+            ..Default::default()
         }));
         let resp = err.into_anthropic_response();
         let json =
@@ -1788,6 +1801,7 @@ mod tests {
             period: None,
             period_resets_at: None,
             retry_after_seconds: Some(600),
+            ..Default::default()
         }));
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);

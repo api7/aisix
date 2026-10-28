@@ -23,8 +23,7 @@ use aisix_core::{AisixSnapshot, AppliedGuardrail};
 use aisix_gateway::{BridgeError, ChatFormat, ChatResponse};
 use aisix_guardrails::GuardrailVerdict;
 use aisix_obs::{
-    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, Metrics, UsageEvent,
-    UsageLabels,
+    content_capture_cap, AccessLog, CapturedContent, LatencyLabels, UsageEvent, UsageLabels,
 };
 use axum::extract::State;
 use axum::http::HeaderValue;
@@ -1688,21 +1687,8 @@ async fn dispatch(
         crate::redact::redact_chat_format(resolved_chain.as_ref(), req),
     );
 
-    // Budget pre-check via cp-api. The DP no longer owns budget state;
-    // cp-api returns a cached/live decision per api_key.
-    let decision = state.budgets.check(&auth.entry.id).await;
-    if let Some(budget) = decision.budget.as_ref() {
-        record_budget_gauges(&state.metrics, auth, Some(budget));
-    } else {
-        record_budget_gauges(&state.metrics, auth, None);
-    }
-    if !decision.allowed {
-        return Err(with_model(ProxyError::BudgetExceeded(Box::new(
-            decision.reason.unwrap_or_else(|| {
-                crate::budget::BudgetReason::message_only(auth.entry.id.clone())
-            }),
-        ))));
-    }
+    // Key-level budgets, decided from the pushed budget documents.
+    crate::budget::enforce_key(state, snapshot, auth).map_err(&with_model)?;
 
     // Resolve the attempt-list of underlying Model entries. A semantic
     // router embeds the request and scores it against route examples to
@@ -1727,6 +1713,7 @@ async fn dispatch(
             .await
             .map_err(&with_model)?
         } else {
+            let budget_gate = crate::budget::gate(state, snapshot);
             let attempts = resolve_attempt_models(
                 &state.routing,
                 &state.runtime_status,
@@ -1741,6 +1728,7 @@ async fn dispatch(
                     api_key_id: auth.entry.id.as_str(),
                     source_ip: &client.source_ip,
                     context_origin: None,
+                    budget: Some(&budget_gate),
                 },
             )
             .map_err(&with_model)?;
@@ -4060,6 +4048,19 @@ async fn dispatch_ensemble(
                 return Err(failure);
             }
         };
+        if let Err(refused) = crate::budget::gate(state, snapshot).check_provider_key(&judge_pk.id)
+        {
+            crate::attribution::settle_ensemble();
+            let err = BridgeError::upstream_status(refused.status().as_u16(), refused.to_string());
+            let failure = emit_panel_then_fail(
+                &panel,
+                &failed,
+                Some(&judge_failure(&err, false, Instant::now())),
+                refused,
+            );
+            reservation.commit_tokens(panel_total).await;
+            return Err(failure);
+        }
         let Some(judge_bridge) = crate::dispatch::resolve_bridge(&state.hub, &judge_pk.value)
         else {
             crate::attribution::settle_ensemble();
@@ -4824,27 +4825,6 @@ fn record_success(
         },
     );
     deferred
-}
-
-fn record_budget_gauges(
-    metrics: &Metrics,
-    auth: &AuthenticatedKey,
-    budget: Option<&crate::budget::BudgetDetails>,
-) {
-    let labels = crate::quota::budget_labels(auth);
-    if let Some(budget) = budget {
-        metrics.set_budget_gauges(
-            labels,
-            aisix_obs::BudgetGauges {
-                limit_usd: budget.limit_usd,
-                spent_usd: budget.spent_usd,
-                remaining_usd: budget.remaining_usd,
-                reset_seconds: budget.reset_seconds,
-            },
-        );
-    } else {
-        metrics.clear_budget_gauges(labels);
-    }
 }
 
 /// Push one telemetry event onto the CP-side sink **and** fan it out
