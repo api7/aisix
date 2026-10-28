@@ -417,7 +417,11 @@ impl LazyEtcdClient {
             options: Some(
                 options
                     .unwrap_or_default()
-                    .with_keep_alive(KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT),
+                    .with_keep_alive(KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT)
+                    // `ConnectOptions::new()` turns idle pings on, and a
+                    // server that does not permit them sends GOAWAY
+                    // `too_many_pings` to a connection with no stream.
+                    .with_keep_alive_while_idle(false),
             ),
             dial_timeout,
             connected: Mutex::new(None),
@@ -569,6 +573,22 @@ impl LazyEtcdClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keepalive_pings_only_while_a_stream_is_open() {
+        // `ConnectOptions::new()` is what the boot path hands in, and it
+        // enables idle pings on its own.
+        let client = LazyEtcdClient::new(vec![], Some(ConnectOptions::new()), None);
+        let options = format!("{:?}", client.options);
+        assert!(
+            options.contains("keep_alive: Some((10s, 10s))"),
+            "{options}"
+        );
+        assert!(
+            options.contains("keep_alive_while_idle: false"),
+            "{options}"
+        );
+    }
 
     #[test]
     fn format_error_chain_joins_sources_without_duplicating() {
