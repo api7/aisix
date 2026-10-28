@@ -209,8 +209,11 @@ Every line goes through `attribution::emit_access_log` (or
 `emit_access_log_spanning_body`), never `AccessLog::emit` directly: the line
 carries the request and response body sizes, which the telemetry middleware
 counts at its outermost layer and only knows once the response body is done
-with, so the cell holds the line and the middleware's guard writes it then. A
-line emitted directly is written without either size, and nothing errors.
+with, so the cell holds the line and the middleware's guard writes it then. The
+cell also fills a line that carries no token counts from the request's terminal
+usage event (`attribution::note_terminal_event`), so a handler need not thread
+the counts into its line. A line emitted directly is written without either
+size or those counts, and nothing errors.
 
 One exception, and it is the whole of it: **a STREAMED response's line — and
 its request metrics — are not the handler's to write.** Its tail runs when the
@@ -221,7 +224,7 @@ attribution cell (`attribution::PendingAccessLog`), together with its
 completed in
 `usage_attr::emit_usage` with the request's TERMINAL usage event, whichever of
 the stream's endings produced it. That is what makes the line and the row agree
-on `status`, `error_class` and `error_message` by construction, and puts the
+on `status_code`, `error_class` and the error message by construction, and puts the
 request families on the same status; writing either at the tail instead would
 report every abandoned stream as a `200` beside its own `499` row. Two consequences for a new streaming family: park
 the line whenever the response IS a stream (a "telemetry already emitted" flag

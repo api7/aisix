@@ -260,7 +260,7 @@ pub(crate) struct CancelContext {
 /// [`crate::usage_attr::emit_usage`], the one point every terminal event of
 /// every family passes through — then written with the body sizes once the
 /// response body is done with, like every other line ([`emit_access_log`]). That is what makes the two agree on
-/// `status`, `error_kind` and `error` by construction rather than by each
+/// `status_code`, `error_class` and `error` by construction rather than by each
 /// family remembering to.
 ///
 /// Taking it out of the cell is also the interlock: whichever completion
@@ -343,28 +343,7 @@ impl PendingAccessLog {
         // explains. Deliberately NOT the length of the stream, which
         // `duration` is (AISIX-Cloud#1394).
         let latency = Duration::from_millis(u64::from(event.downstream_latency_ms));
-        let prompt = u64::from(event.prompt_tokens);
-        // The gateway's own completion count, as the non-streamed line and
-        // Prometheus report it — not the record's raw one, which may keep
-        // an upstream's separately-counted reasoning apart.
-        let completion_tokens = event.folded_completion_tokens();
-        let completion = u64::from(completion_tokens);
-        // Cache-inclusive, the way every emitter in this crate computes a
-        // request's total: `prompt_tokens` excludes the cache dimensions on
-        // the Anthropic-shaped paths, so summing the two visible columns
-        // would put a cached request's line an order of magnitude under the
-        // row it was emitted beside.
-        let total = crate::usage_attr::total_tokens_with_cache(
-            event.prompt_tokens,
-            completion_tokens,
-            event.cache_creation_tokens,
-            event.cache_read_tokens,
-        );
-        // Keep a token-less outcome out of the token columns entirely,
-        // rather than logging an abandoned stream as a zero-token success —
-        // the same rule the rest of this line follows for `error_kind` and
-        // `provider_request_id`.
-        let counted = total > 0;
+        let tokens = LineTokens::of(event);
         let line = aisix_obs::AccessLog {
             method: &self.method,
             path: &self.path,
@@ -378,9 +357,9 @@ impl PendingAccessLog {
             provider_key_id: (!target.provider_key_id.is_empty())
                 .then_some(target.provider_key_id.as_str()),
             api_key_id: (!self.api_key_id.is_empty()).then_some(self.api_key_id.as_str()),
-            prompt_tokens: counted.then_some(prompt),
-            completion_tokens: counted.then_some(completion),
-            total_tokens: counted.then_some(total),
+            prompt_tokens: tokens.map(|t| t.prompt),
+            completion_tokens: tokens.map(|t| t.completion),
+            total_tokens: tokens.map(|t| t.total),
             request_id: &self.request_id,
             provider_request_id: (!event.provider_request_id.is_empty())
                 .then_some(event.provider_request_id.as_str()),
@@ -404,6 +383,44 @@ impl PendingAccessLog {
             response_body_bytes: None,
         };
         cell.park_access_log(&line, None);
+    }
+}
+
+/// The token columns of a request's line, read off its terminal usage
+/// event. `None` for a token-less outcome, which keeps the columns off the
+/// line entirely rather than logging, say, an abandoned stream as a
+/// zero-token success — the same rule the line follows for `error_class`
+/// and `provider_request_id`.
+#[derive(Clone, Copy)]
+struct LineTokens {
+    prompt: u64,
+    completion: u64,
+    total: u64,
+}
+
+impl LineTokens {
+    fn of(event: &aisix_obs::UsageEvent) -> Option<Self> {
+        // The gateway's own completion count, as the chat family's inline
+        // line and Prometheus report it — not the record's raw one, which
+        // may keep an upstream's separately-counted reasoning apart.
+        let completion = event.folded_completion_tokens();
+        // Cache-inclusive, the way every emitter in this crate computes a
+        // request's total: `prompt_tokens` excludes the cache dimensions on
+        // the Anthropic-shaped paths, so summing the two visible columns
+        // would put a cached request's line an order of magnitude under the
+        // row it was emitted beside. Never the event's own `total_tokens`,
+        // which is the upstream's raw figure.
+        let total = crate::usage_attr::total_tokens_with_cache(
+            event.prompt_tokens,
+            completion,
+            event.cache_creation_tokens,
+            event.cache_read_tokens,
+        );
+        (total > 0).then(|| Self {
+            prompt: u64::from(event.prompt_tokens),
+            completion: u64::from(completion),
+            total,
+        })
     }
 }
 
@@ -441,11 +458,14 @@ struct Cell {
     terminal_upstream: Option<Duration>,
     /// See [`note_semantic_decision`].
     semantic: Option<aisix_obs::SemanticAccessLog>,
-    /// See [`note_terminal_error`]: `(status, error_class, error_message)`
+    /// See [`note_terminal_event`]: `(status, error_class, error_message)`
     /// of the terminal event, `None` when it named no failure.
     terminal_error: Option<(u16, String, String)>,
-    /// The terminal event's `provider_request_id`; see [`note_terminal_error`].
+    /// The terminal event's `provider_request_id`; see [`note_terminal_event`].
     terminal_provider_request_id: String,
+    /// The terminal event's status and token columns; see
+    /// [`note_terminal_event`].
+    terminal_tokens: Option<(u16, LineTokens)>,
     /// The `upstream` end-to-end observation has been recorded.
     e2e_upstream_recorded: bool,
     /// See [`UpstreamClock`].
@@ -523,14 +543,18 @@ impl UpstreamClock {
 }
 
 impl Cell {
-    /// Name the request's failure on its line from the terminal usage event,
-    /// when the line's writer had no typed error to name it with — the
-    /// families that hand back an already-rendered response (`/a2a`,
-    /// `/mcp`) or report a refusal as a success (a buffered output
-    /// guardrail block). The line is completed when the request ends, after
-    /// the terminal event, so the event is known by then even where the
-    /// line was built first.
-    fn name_failure(&self, record: &mut aisix_obs::AccessLogRecord) {
+    /// Complete the request's line from the terminal usage event with what
+    /// its writer did not have in hand: the failure, for the families that
+    /// hand back an already-rendered response (`/a2a`, `/mcp`) or report a
+    /// refusal as a success (a buffered output guardrail block); and the
+    /// token counts, for every inline writer that never reads them itself
+    /// (`/v1/messages`, `/v1/embeddings`, `/v1/responses`, …). The line is
+    /// completed when the request ends, after the terminal event, so the
+    /// event is known by then even where the line was built first.
+    fn complete_from_terminal_event(&self, record: &mut aisix_obs::AccessLogRecord) {
+        if let Some((status, t)) = self.terminal_tokens {
+            record.fill_tokens_if_absent(status, t.prompt, t.completion, t.total);
+        }
         if let Some((status, class, message)) = &self.terminal_error {
             record.fill_failure_if_absent(
                 *status,
@@ -833,7 +857,7 @@ impl RequestAttribution {
         let mut cell = self.lock();
         let mut record = line.to_record();
         record.semantic = cell.semantic.clone();
-        cell.name_failure(&mut record);
+        cell.complete_from_terminal_event(&mut record);
         let ready = ReadyLine {
             record,
             duration_from,
@@ -869,7 +893,7 @@ impl RequestAttribution {
         cell.finished = true;
         let mut line = cell.ready_line.take();
         if let Some(line) = line.as_mut() {
-            cell.name_failure(&mut line.record);
+            cell.complete_from_terminal_event(&mut line.record);
         }
         let sizes = self.body_sizes(cell.head_written);
         let span = cell.request_span.clone();
@@ -1440,22 +1464,24 @@ pub(crate) fn note_e2e_downstream(
     record_e2e_upstream(|cell| cell.e2e_labels = Some((metrics, labels, downstream)));
 }
 
-/// Note the failure, and the provider's id, the request's terminal usage
-/// event names, so the access-log line carries them too
-/// ([`Cell::name_failure`]). Called from the
-/// emission chokepoint, so every family records it the same way.
-pub(crate) fn note_terminal_error(
-    status: u16,
-    error_class: &str,
-    error_message: &str,
-    provider_request_id: &str,
-) {
-    let failure = (!error_class.is_empty())
-        .then(|| (status, error_class.to_string(), error_message.to_string()));
+/// Note the failure, the provider's id and the token counts the request's
+/// terminal usage event names, so the access-log line carries them too
+/// ([`Cell::complete_from_terminal_event`]). Called from the emission
+/// chokepoint, so every family records it the same way.
+pub(crate) fn note_terminal_event(event: &aisix_obs::UsageEvent, provider_request_id: &str) {
+    let failure = (!event.error_class.is_empty()).then(|| {
+        (
+            event.status_code,
+            event.error_class.clone(),
+            event.error_message.clone(),
+        )
+    });
+    let tokens = LineTokens::of(event).map(|t| (event.status_code, t));
     let _ = CURRENT.try_with(|a| {
         let mut cell = a.lock();
         cell.terminal_error = failure;
         cell.terminal_provider_request_id = provider_request_id.to_string();
+        cell.terminal_tokens = tokens;
     });
 }
 

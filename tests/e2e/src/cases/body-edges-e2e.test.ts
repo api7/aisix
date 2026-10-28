@@ -50,7 +50,7 @@ const CALLER_KEY_HASH = createHash("sha256")
 const isRefusal = (line: string): boolean =>
   line.includes("proxy request completed") &&
   line.includes('path="/v1/completions"') &&
-  line.includes("status=413");
+  line.includes("status_code=413");
 
 const countRefusals = (output: string): number =>
   output.split("\n").filter(isRefusal).length;
@@ -272,9 +272,9 @@ describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
         );
       return line !== undefined;
     });
-    expect(line).toMatch(/status=413/);
+    expect(line).toMatch(/status_code=413/);
     expect(line).toContain("/v1/chat/completions");
-    // The reason, not just the status: `error_kind` carries the OpenAI
+    // The reason, not just the status: `error_class` carries the OpenAI
     // envelope's coarse `invalid_request_error`, so a cap hit is only
     // nameable through the message.
     expect(line).toMatch(/request body exceeds/);
@@ -359,7 +359,7 @@ describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
       .split("\n")
       .filter((l) => isRefusal(l))
       .at(-1)!;
-    expect(line).toMatch(/status=413/);
+    expect(line).toMatch(/status_code=413/);
     expect(line).toMatch(/request body exceeds/);
     // Auth ran before the body extractor here, so unlike the
     // middleware's short-circuit the refusal is attributable to a caller.

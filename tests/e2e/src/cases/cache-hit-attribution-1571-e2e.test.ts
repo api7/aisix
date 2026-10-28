@@ -280,7 +280,7 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
     const line = await accessLine(hit.requestId);
     expect(field(line, "cache_status"), line).toBe("hit");
     expect(field(line, "cache_hit_layer"), line).toBe("exact");
-    expect(field(line, "model"), line).toBe("chit-solo");
+    expect(field(line, "requested_model"), line).toBe("chit-solo");
     // Kept because they are properties of the row the caller addressed —
     // true whether or not a request ever left the gateway — not because
     // anything was dispatched.
@@ -300,7 +300,7 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
 
     const line = await accessLine(hit.requestId);
     expect(field(line, "cache_status"), line).toBe("hit");
-    expect(field(line, "model"), line).toBe("chit-pair");
+    expect(field(line, "requested_model"), line).toBe("chit-pair");
     expect(field(line, "upstream_model"), line).toBeUndefined();
     expect(field(line, "provider_key_id"), line).toBeUndefined();
     expect(field(line, "served_by_model"), line).toBeUndefined();
@@ -426,7 +426,7 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
     // written by the handler's ERROR branch, which never sees the cache at
     // all and can only read the attribution cell.
     const line = await accessLine(blocked.requestId);
-    expect(field(line, "status"), line).toBe("422");
+    expect(field(line, "status_code"), line).toBe("422");
     expect(field(line, "upstream_model"), line).toBeUndefined();
     expect(field(line, "provider_key_id"), line).toBeUndefined();
     // And it still says the cache is what answered — otherwise this 422 is

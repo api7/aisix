@@ -260,7 +260,7 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
       expect(row.get("completion_tokens") ?? "0").toBe("0");
 
       // The access-log line for the SAME request names the target too.
-      // Before this change `model=` (the group) was the only identity on the
+      // Before this change `requested_model=` (the group) was the only identity on the
       // line and the target was unreachable by request id anywhere. The row
       // above carries the id to join on — the aborted fetch never got to
       // read the `x-aisix-request-id` header.
@@ -268,10 +268,10 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
       expect(requestId).not.toBe("");
       const line = await waitForLogLine(
         app,
-        (l) => l.includes(`request_id="${requestId}"`) && l.includes("status=499"),
+        (l) => l.includes(`request_id="${requestId}"`) && l.includes("status_code=499"),
         `the 499 access-log line for ${requestId}`,
       );
-      expect(line).toContain(`model="${GROUP}"`);
+      expect(line).toContain(`requested_model="${GROUP}"`);
       expect(line).toContain(`upstream_model="${UPSTREAM_MODEL}"`);
       expect(line).toContain(`provider_key_id="${providerKeyId}"`);
     },
@@ -364,7 +364,7 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
       (l) =>
         l.includes("proxy request completed") &&
         l.includes(`request_id="${requestId}"`) &&
-        l.includes("status=200"),
+        l.includes("status_code=200"),
       `the 200 access-log line for ${requestId}`,
     );
     expect(line).toContain(`upstream_model="${FAST_UPSTREAM_MODEL}"`);
@@ -461,17 +461,17 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
         `one request, one line — got ${lines.length} for ${requestId}:\n${lines.join("\n")}`,
       ).toBe(1);
       const line = lines[0];
-      expect(line).toContain("status=499");
-      expect(line).toContain(`error_kind="client_disconnected"`);
+      expect(line).toContain("status_code=499");
+      expect(line).toContain(`error_class="client_disconnected"`);
       expect(line).toContain("while the response was streaming");
       // The target is still named — the line an operator reads to find out
       // which upstream the abandoned call was costing them.
-      expect(line).toContain(`model="${STREAM_MODEL}"`);
+      expect(line).toContain(`requested_model="${STREAM_MODEL}"`);
       expect(line).toContain(`upstream_model="${STREAM_UPSTREAM_MODEL}"`);
       expect(line).toContain(`provider_key_id="${streamProviderKeyId}"`);
       // And the two spans the line now separates: what the caller waited for
       // (the first token) inside how long the request ran.
-      expect(line).toMatch(/\blatency_ms=\d+/);
+      expect(line).toMatch(/\bdownstream_latency_ms=\d+/);
       expect(line).toMatch(/\bduration_ms=\d+/);
     },
     60_000,

@@ -7788,7 +7788,7 @@ data: [DONE]\n\n";
         crate::test_log::assert_latency_is_time_to_first_token(&endings);
         crate::test_log::assert_request_families_follow_the_endings(&metrics, "/v1/messages", true);
         assert_eq!(
-            endings.delivered.field("model").as_deref(),
+            endings.delivered.field("requested_model").as_deref(),
             Some("my-claude-alias"),
         );
         assert_eq!(

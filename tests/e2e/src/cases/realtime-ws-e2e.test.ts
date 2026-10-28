@@ -351,12 +351,17 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
       (l) =>
         l.includes("proxy request completed") &&
         l.includes('path="/v1/realtime"') &&
-        l.includes('model="realtime-e2e-model"') &&
-        l.includes("status=200"),
+        l.includes('requested_model="realtime-e2e-model"') &&
+        l.includes("status_code=200"),
       "the realtime session's access-log line",
     );
     expect(sessionLine).not.toContain("request_body_bytes");
     expect(sessionLine).not.toContain("response_body_bytes");
+    // The session's one `response.done` reported 9 in / 4 out, and the line
+    // carries the session's totals like its usage event does.
+    expect(sessionLine).toContain("prompt_tokens=9");
+    expect(sessionLine).toContain("completion_tokens=4");
+    expect(sessionLine).toContain("total_tokens=13");
   });
 
   test("a caller that did not opt in gets NO openai-beta header upstream", async (ctx) => {

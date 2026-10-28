@@ -15,7 +15,7 @@ import {
 // E2E: what the DP logs for a `/mcp` request, against a real gateway + etcd
 // + a real MCP upstream (official TypeScript SDK server). MCP tunnels every
 // operation through one `POST /mcp`, so before #1181 the access line said
-// only `method="POST" path="/mcp" status=200` — identical for a handshake, a
+// only `method="POST" path="/mcp" status_code=200` — identical for a handshake, a
 // tool call, and a `tools/list` the ACL had emptied.
 //
 // Pinned contract:
@@ -245,7 +245,7 @@ describe("mcp request logging e2e: JSON-RPC method, tool counts, ACL warning", (
         l.includes("proxy request completed") &&
         l.includes(`api_key_id="${keyIds[KEY_GRANTED]}"`) &&
         l.includes('mcp_method="tools/list"') &&
-        l.includes("status=400"),
+        l.includes("status_code=400"),
       "the access-log line for the rejected protocol version",
     );
     // Every MCP field the request could not have produced, not just the

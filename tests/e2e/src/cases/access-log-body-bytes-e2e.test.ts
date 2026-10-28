@@ -273,7 +273,7 @@ describe("the access log reports request and response body sizes", () => {
       "the abandoned stream's line",
       15_000,
     );
-    expect(line).toContain("status=499");
+    expect(line).toContain("status_code=499");
     expect(numField(line, "request_body_bytes"), line).toBe(Buffer.byteLength(body));
     const handed = numField(line, "response_body_bytes");
     expect(handed, line).toBeGreaterThanOrEqual(received);
@@ -295,7 +295,7 @@ describe("the access log reports request and response body sizes", () => {
     abort.abort();
     await pending;
     const line = await lineFor(requestId, "the head-phase cancel line");
-    expect(line).toContain("status=499");
+    expect(line).toContain("status_code=499");
     expect(numField(line, "request_body_bytes"), line).toBe(Buffer.byteLength(body));
     expect(line).not.toContain("response_body_bytes");
   }, 30_000);

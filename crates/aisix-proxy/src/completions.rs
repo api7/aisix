@@ -2110,7 +2110,7 @@ mod tests {
         assert_eq!(line.field("path").as_deref(), Some("/v1/completions"));
         assert_eq!(
             line.num("duration_ms"),
-            line.num("latency_ms"),
+            line.num("downstream_latency_ms"),
             "nothing is streamed here, so the wait and the request are the same span",
         );
     }

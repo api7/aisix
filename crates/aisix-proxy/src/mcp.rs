@@ -272,7 +272,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
         // `dispatch` renders its own `Response` rather than surfacing a
         // `ProxyError`, so there is no typed error to name here; the
         // request's terminal usage event names the failure on this line
-        // when it is completed (`attribution::note_terminal_error`).
+        // when it is completed (`attribution::note_terminal_event`).
         error_kind: None,
         error: None,
         provider_request_id: None,

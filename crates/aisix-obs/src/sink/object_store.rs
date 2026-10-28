@@ -7,7 +7,8 @@
 //! classification — is shared across all three backends.
 //!
 //! A batch becomes ONE object: the records are serialized to NDJSON (one
-//! [`SinkRecord`] per line, including opt-in captured content), optionally
+//! [`SinkRecord`] per line, metadata only — the fan-out attaches captured
+//! content to no object-storage exporter, see `content_record`), optionally
 //! gzipped, and `put` under a **content-addressed** key
 //! `…/dt=YYYY-MM-DD/hh=HH/<sha256(body)[..32]>.ndjson[.gz]`. The content
 //! address makes an *in-process* retry reuse the **same** key (the pipeline

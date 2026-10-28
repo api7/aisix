@@ -4948,7 +4948,7 @@ data: [DONE]\n\n";
     /// relay's end rather than when the head went out, so each of the three
     /// endings reports its own outcome (AISIX-Cloud#1571).
     ///
-    /// `latency_ms` is deliberately NOT asserted to be a time-to-first-frame
+    /// `downstream_latency_ms` is deliberately NOT asserted to be a time-to-first-frame
     /// here: this relay's usage event reports the WHOLE relay as what the
     /// caller waited for, and the line reports the same figure the event
     /// does. Changing that would be a change to the usage event's meaning,

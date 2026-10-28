@@ -323,6 +323,7 @@ pub(crate) async fn realtime(
                 api_key_id,
                 None,
                 Some(&err),
+                None,
             );
             // Count the refusal like every other pre-dispatch rejection
             // (unresolved labels, same as `reject_before_dispatch`) — logs
@@ -842,6 +843,7 @@ async fn run_session(
                 Some(&auth.entry.id),
                 Some((&provider_label, &requested_model)),
                 Some(&connect_err),
+                None,
             );
             // One load shared by the ProviderKey resolution below and the
             // usage event, like the session's own terminal path (#941) —
@@ -1107,6 +1109,7 @@ async fn run_session(
         Some(&auth.entry.id),
         Some((&provider_label, &requested_model)),
         session_error.as_ref(),
+        Some((usage.input_tokens, usage.output_tokens)),
     );
     // A realtime session can run for minutes, so its terminal emits read a
     // FRESH snapshot rather than the one `prepare` resolved against (#941) —
@@ -1439,6 +1442,7 @@ async fn guardrail_block_event(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     method: &Method,
     status: u16,
@@ -1447,7 +1451,13 @@ fn emit_access_log(
     api_key_id: Option<&str>,
     target: Option<(&str, &str)>,
     error: Option<&ProxyError>,
+    // The session's `(input, output)` totals, the same figures its usage
+    // event records. `None` before a session ran.
+    tokens: Option<(u64, u64)>,
 ) {
+    // A session that counted nothing carries no token columns, as on every
+    // other line.
+    let tokens = tokens.filter(|(input, output)| input + output > 0);
     let (error_kind, error) = match error {
         Some(e) => {
             let (kind, msg) = crate::attempt::access_log_error(e);
@@ -1467,9 +1477,11 @@ fn emit_access_log(
         upstream_model: log_target.upstream_model(),
         provider_key_id: log_target.provider_key_id(),
         api_key_id,
-        prompt_tokens: None,
-        completion_tokens: None,
-        total_tokens: None,
+        prompt_tokens: tokens.map(|(input, _)| input),
+        completion_tokens: tokens.map(|(_, output)| output),
+        // OpenAI's realtime usage reports a cache hit as a subset of
+        // `input_tokens`, so the cache-inclusive total is the plain sum.
+        total_tokens: tokens.map(|(input, output)| input + output),
         request_id,
         provider_request_id: None,
         served_by_model: None,

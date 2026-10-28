@@ -1,7 +1,13 @@
 //! Structured one-line access log — one line per request, success or error.
 //! Keeping the call explicit rather than inside a tower layer means the
-//! caller can attach `provider`, `model`, `api_key_id`, and `tokens` —
-//! fields the layer couldn't see.
+//! caller can attach `provider`, `requested_model`, `api_key_id`, and
+//! `tokens` — fields the layer couldn't see.
+//!
+//! A field that reports the same figure as the request's terminal
+//! `UsageEvent` is written under the event's name — `status_code`,
+//! `error_class`, `requested_model`, `downstream_latency_ms` — so a line and
+//! the row stored for the same `request_id` read the same way. The Rust
+//! field names below predate that and are not what the line is keyed by.
 //!
 //! # When the line is written, and what that costs
 //!
@@ -16,8 +22,8 @@
 //!   (`attribution::defer_access_log`) and it is completed beside the
 //!   request's TERMINAL usage event, at the point the stream's outcome is
 //!   known: fully consumed, abandoned mid-stream, or dropped before its
-//!   first poll. It therefore reports the same `status`, `error_kind` and
-//!   `error` as that event — a stream whose consumer walked away reads
+//!   first poll. It therefore reports the same `status_code`, `error_class`
+//!   and `error` as that event — a stream whose consumer walked away reads
 //!   `499` / `client_disconnected` on both — and it can carry the token
 //!   counts and `provider_request_id`, which only exist once the upstream
 //!   has answered (AISIX-Cloud#1571).
@@ -32,7 +38,7 @@
 //! - **Caller hung up before the response head was written** — from
 //!   `ClientCancelGuard::drop`, with no handler involved. Status is `499`,
 //!   and the fields it can fill are the ones the request published to its
-//!   attribution cell as it resolved: `model`, `provider`, and the
+//!   attribution cell as it resolved: `requested_model`, `provider`, and the
 //!   dispatched target (`upstream_model` + `provider_key_id`). The
 //!   handler-side figures — tokens, `provider_request_id`, the routing
 //!   counts — stay `None`, because the future was dropped before it could
@@ -74,12 +80,12 @@
 //! `provider_request_id`) report only what the request can honestly claim
 //! without one — see `upstream_model` below.
 //!
-//! # `latency` and `duration` answer two different questions
+//! # `downstream_latency_ms` and `duration_ms` answer two different questions
 //!
-//! - `latency_ms` is what the CALLER waited for: the first token forwarded
+//! - `downstream_latency_ms` is what the CALLER waited for: the first token forwarded
 //!   downstream on a streamed response, the complete response on a buffered
-//!   one. It is the same figure the request's terminal `UsageEvent` reports
-//!   as `downstream_latency_ms`. Deliberately not the length of the stream
+//!   one. It is the same figure, under the same name, as the request's
+//!   terminal `UsageEvent` reports. Deliberately not the length of the stream
 //!   (AISIX-Cloud#1394) — reading a minutes-long stream's wait as its
 //!   time-to-first-token is what makes a working stream look like a
 //!   connection sitting idle.
@@ -133,7 +139,7 @@ pub struct AccessLog<'a> {
     /// below for the other half.
     pub model: Option<&'a str>,
     /// The upstream model id of the target this request last selected, and
-    /// the ProviderKey it dispatched through. `model` alone cannot answer
+    /// the ProviderKey it dispatched through. `requested_model` alone cannot answer
     /// "which provider actually served this", and on a line written before
     /// any response exists — a `499` — nothing else names the target at all
     /// (AISIX-Cloud#1571). Both are `None` until a target was selected, and
@@ -150,6 +156,11 @@ pub struct AccessLog<'a> {
     pub upstream_model: Option<&'a str>,
     pub provider_key_id: Option<&'a str>,
     pub api_key_id: Option<&'a str>,
+    /// The three token columns, `total_tokens` cache-inclusive. All `None`
+    /// on a token-less outcome. A writer inside a request that does not
+    /// read the counts itself leaves them `None`, and the request's terminal
+    /// usage event fills them in before the line is written
+    /// ([`AccessLogRecord::fill_tokens_if_absent`]).
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
@@ -185,7 +196,7 @@ pub struct AccessLog<'a> {
     /// without parsing the free-text message below.
     pub error_kind: Option<&'a str>,
     /// Why the request failed — `None` on success. Without it a 5xx line
-    /// carries only `status` + `latency_ms`, which is the same shape for a
+    /// carries only `status_code` + `downstream_latency_ms`, which is the same shape for a
     /// kernel-level connect timeout, an upstream 500, and a blocked
     /// guardrail (AISIX-Cloud#1093).
     pub error: Option<&'a str>,
@@ -317,11 +328,11 @@ impl AccessLog<'_> {
         tracing::info!(
             method = self.method,
             path = self.path,
-            status = self.status,
-            latency_ms = self.latency.as_millis() as u64,
+            status_code = self.status,
+            downstream_latency_ms = self.latency.as_millis() as u64,
             duration_ms = self.duration.as_millis() as u64,
             provider = self.provider,
-            model = self.model,
+            requested_model = self.model,
             upstream_model = self.upstream_model,
             provider_key_id = self.provider_key_id,
             api_key_id = self.api_key_id,
@@ -333,7 +344,7 @@ impl AccessLog<'_> {
             served_by_model = self.served_by_model,
             routing_attempt_count = self.routing_attempt_count,
             routing_fallback_count = self.routing_fallback_count,
-            error_kind = self.error_kind,
+            error_class = self.error_kind,
             error = self.error,
             cache_status = self.cache.as_ref().map(|c| c.status),
             cache_hit_layer = self.cache.as_ref().and_then(|c| c.hit_layer),
@@ -455,6 +466,22 @@ impl AccessLogRecord {
         }
         self.error_kind = Some(error_kind.to_string());
         self.error = (!error.is_empty()).then(|| error.to_string());
+    }
+
+    /// Set the token columns on a line that carries none, from the
+    /// request's terminal usage event with status `status`. A line
+    /// reporting a different status describes another outcome — a caller
+    /// that left after the upstream answered — and is left alone.
+    pub fn fill_tokens_if_absent(&mut self, status: u16, prompt: u64, completion: u64, total: u64) {
+        let absent = self.prompt_tokens.is_none()
+            && self.completion_tokens.is_none()
+            && self.total_tokens.is_none();
+        if !absent || self.status != status {
+            return;
+        }
+        self.prompt_tokens = Some(prompt);
+        self.completion_tokens = Some(completion);
+        self.total_tokens = Some(total);
     }
 
     /// Set `provider_request_id` on a line that has none.
@@ -590,8 +617,17 @@ mod tests {
         assert!(out.contains("request_body_bytes=123"), "{out}");
         assert!(out.contains("response_body_bytes=4567"), "{out}");
         assert!(out.contains("method=\"POST\"") || out.contains("method=POST"));
-        assert!(out.contains("status=200"));
-        assert!(out.contains("latency_ms=42"));
+        assert!(out.contains("status_code=200"), "{out}");
+        assert!(out.contains("downstream_latency_ms=42"), "{out}");
+        assert!(
+            out.contains("requested_model=\"my-gpt4\"") || out.contains("requested_model=my-gpt4"),
+            "{out}"
+        );
+        // The UsageEvent's names only — the pre-rename keys are gone, not
+        // written beside them.
+        for old in [" status=", " latency_ms=", " model="] {
+            assert!(!out.contains(old), "{old} still on the line: {out}");
+        }
         // AISIX-Cloud#1571: the two figures are separate fields because on
         // a streamed line they are separate questions — what the caller
         // waited for, and how long the request held the gateway. This one
@@ -614,7 +650,7 @@ mod tests {
         );
         assert!(out.contains("routing_attempt_count=2"));
         assert!(out.contains("routing_fallback_count=1"));
-        // AISIX-Cloud#1571: `model` is what the caller addressed, so the
+        // AISIX-Cloud#1571: `requested_model` is what the caller addressed, so the
         // target it actually dispatched to has to be named separately —
         // otherwise a routing request's line says only the group, and a
         // `499` line names no target at all.
@@ -628,12 +664,12 @@ mod tests {
         );
         // A success line must not carry failure fields at all — an
         // always-present `error=""` would defeat filtering on it.
-        assert!(!out.contains("error_kind"), "{out}");
+        assert!(!out.contains("error_class"), "{out}");
         assert!(!out.contains("error="), "{out}");
     }
 
     /// The gap this field closes: without it a failed request's only trace
-    /// is `status=502 latency_ms=…`, identical for every cause.
+    /// is `status_code=502 downstream_latency_ms=…`, identical for every cause.
     #[test]
     fn emit_carries_the_failure_class_and_reason() {
         let writer = VecWriter::default();
@@ -675,15 +711,16 @@ mod tests {
         });
 
         let out = writer.contents();
-        assert!(out.contains("status=504"));
+        assert!(out.contains("status_code=504"), "{out}");
         // A call that never got a provider response must not carry an empty
         // `provider_request_id=""` — an always-present field defeats
-        // filtering on it, same rule as `error_kind` above.
+        // filtering on it, same rule as `error_class` above.
         assert!(!out.contains("provider_request_id"), "{out}");
         assert!(
-            out.contains("error_kind=\"timeout\"") || out.contains("error_kind=timeout"),
+            out.contains("error_class=\"timeout\"") || out.contains("error_class=timeout"),
             "{out}"
         );
+        assert!(!out.contains("error_kind"), "{out}");
         assert!(
             out.contains("upstream request timed out after 7167ms"),
             "{out}"
@@ -730,7 +767,7 @@ mod tests {
             .emit();
         });
         let out = writer.contents();
-        assert!(out.contains("status=401"));
+        assert!(out.contains("status_code=401"), "{out}");
         assert!(out.contains("proxy request completed"));
         // The fmt layer elides Option::None values; we should *not* see
         // a concrete provider rendered when the caller supplied None.
@@ -810,7 +847,7 @@ mod tests {
 
     /// A non-hit reports its status and no layer — an always-present
     /// `cache_hit_layer=""` would defeat filtering on it, the same rule
-    /// `error_kind` and `provider_request_id` follow above.
+    /// `error_class` and `provider_request_id` follow above.
     #[test]
     fn emit_omits_the_hit_layer_on_a_miss() {
         let writer = VecWriter::default();
@@ -859,6 +896,58 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("cache_hit_layer"), "{out}");
+    }
+
+    fn tokenless(status: u16) -> AccessLogRecord {
+        AccessLog {
+            method: "POST",
+            path: "/v1/messages",
+            status,
+            latency: Duration::from_millis(1),
+            duration: Duration::from_millis(1),
+            provider: None,
+            model: None,
+            upstream_model: None,
+            provider_key_id: None,
+            api_key_id: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            request_id: "req-tok",
+            provider_request_id: None,
+            served_by_model: None,
+            routing_attempt_count: None,
+            routing_fallback_count: None,
+            error_kind: None,
+            error: None,
+            mcp: None,
+            cache: None,
+            request_body_bytes: None,
+            response_body_bytes: None,
+        }
+        .to_record()
+    }
+
+    /// A line's token columns come from the terminal event only when the
+    /// line describes the same outcome and carries none of its own.
+    #[test]
+    fn fill_tokens_only_on_a_tokenless_line_of_the_same_status() {
+        let mut filled = tokenless(200);
+        filled.fill_tokens_if_absent(200, 5, 1, 6);
+        assert_eq!(
+            (
+                filled.prompt_tokens,
+                filled.completion_tokens,
+                filled.total_tokens
+            ),
+            (Some(5), Some(1), Some(6))
+        );
+        filled.fill_tokens_if_absent(200, 9, 9, 18);
+        assert_eq!(filled.total_tokens, Some(6), "never overwritten");
+
+        let mut cancelled = tokenless(499);
+        cancelled.fill_tokens_if_absent(200, 5, 1, 6);
+        assert_eq!(cancelled.total_tokens, None, "another outcome's counts");
     }
 
     /// The semantic half is completed on the owned record, after the line
