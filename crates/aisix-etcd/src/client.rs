@@ -392,6 +392,20 @@ impl std::fmt::Debug for LazyEtcdClient {
     }
 }
 
+/// HTTP/2 PING cadence on an etcd connection that carries a stream, and how
+/// long a PING may go unanswered before the connection is dropped and
+/// dialled again.
+///
+/// An established watch sends nothing upstream, so a peer that vanishes
+/// without a FIN or RST (a dropped NAT entry, a black-holed route) is
+/// otherwise never noticed: TCP has nothing to retransmit, and the watch
+/// waits forever while the configuration it should be delivering changes.
+/// The interval stays above the 5 s minimum both etcd and the control
+/// plane's etcd endpoint enforce; pings are only sent while a stream is
+/// open, which those servers also require.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl LazyEtcdClient {
     pub fn new(
         endpoints: Vec<String>,
@@ -400,7 +414,11 @@ impl LazyEtcdClient {
     ) -> Self {
         Self {
             endpoints,
-            options,
+            options: Some(
+                options
+                    .unwrap_or_default()
+                    .with_keep_alive(KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT),
+            ),
             dial_timeout,
             connected: Mutex::new(None),
             next_generation: AtomicU64::new(0),

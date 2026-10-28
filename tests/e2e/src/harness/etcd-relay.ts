@@ -41,6 +41,13 @@ export interface EtcdRelay {
   stallReplies(): void;
   /** Deliver everything withheld since `stallReplies()`, and resume relaying. */
   resumeReplies(): void;
+  /**
+   * Silence every connection forwarded so far, in both directions, while
+   * new connections are forwarded normally — a peer that vanished without
+   * a FIN or RST (a dropped NAT entry, a black-holed route). Nothing on
+   * the old connections is ever delivered again.
+   */
+  blackholeEstablished(): void;
   /** Tear the relay down. */
   stop(): Promise<void>;
 }
@@ -147,6 +154,16 @@ export async function startEtcdRelay(): Promise<EtcdRelay> {
     resumeReplies() {
       stalled = false;
       for (const { client, upstream } of pairs) upstream.pipe(client);
+    },
+    blackholeEstablished() {
+      for (const pair of pairs) {
+        const { client, upstream } = pair;
+        client.unpipe(upstream);
+        upstream.unpipe(client);
+        client.pause();
+        upstream.pause();
+      }
+      pairs.clear();
     },
     async stop() {
       await unlisten();
