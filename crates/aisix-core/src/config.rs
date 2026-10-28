@@ -789,6 +789,8 @@ pub struct ProxyConfig {
     /// model or route behind a model group answered (AISIX-Cloud#1917).
     /// Usage events, access logs, metrics and traces record the same
     /// facts either way.
+    ///
+    /// Applied at startup. Changing it requires a restart.
     #[serde(default)]
     pub expose_debug_headers: bool,
 }

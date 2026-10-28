@@ -140,12 +140,17 @@ describe.each([
     await embed?.close();
   });
 
-  async function chat(model: string, prompt: string): Promise<Response> {
+  async function chat(
+    model: string,
+    prompt: string,
+    extraHeaders: Record<string, string> = {},
+  ): Promise<Response> {
     const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        ...extraHeaders,
       },
       body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }] }),
     });
@@ -183,20 +188,24 @@ describe.each([
     }
   });
 
-  test("cache miss then hit: cache headers", async (ctx) => {
+  test("cache miss, hit and bypass: cache headers", async (ctx) => {
     if (!etcdReachable || !app || !upstream) return ctx.skip();
     const before = upstream.receivedRequests.length;
     const miss = await chat("dh-direct", "cache me please");
     const hit = await chat("dh-direct", "cache me please");
     // The cache works the same either way; only the headers differ.
     expect(upstream.receivedRequests.length).toBe(before + 1);
+    const bypass = await chat("dh-direct", "cache me please", { "cache-control": "no-cache" });
+    expect(upstream.receivedRequests.length).toBe(before + 2);
     if (expose) {
       expect(miss.headers.get("x-aisix-cache")).toBe("miss");
       expect(hit.headers.get("x-aisix-cache")).toBe("hit");
       expect(hit.headers.get("x-aisix-cache-layer")).toBe("exact");
+      expect(bypass.headers.get("x-aisix-cache")).toBe("bypass");
     } else {
       expectNoDebugHeaders(miss);
       expectNoDebugHeaders(hit);
+      expectNoDebugHeaders(bypass);
     }
   });
 });

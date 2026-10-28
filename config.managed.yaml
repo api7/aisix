@@ -163,7 +163,8 @@ proxy:
   # (the semantic route that matched) and x-aisix-cache / -cache-layer /
   # -cache-similarity. Off by default: served-by and route reveal to the
   # caller which model behind a model group answered. Usage events, access
-  # logs, metrics and traces record the same facts either way.
+  # logs, metrics and traces record the same facts either way. Applied at
+  # startup.
   # expose_debug_headers: false
 
 admin:

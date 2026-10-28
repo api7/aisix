@@ -832,8 +832,9 @@ struct Success {
     cache_hit_saved_output_tokens: u32,
     /// Display name of the routing target that actually served this
     /// request (AISIX-Cloud#410). Surfaces in the `x-aisix-served-by`
-    /// response header so callers can tell which target inside a
-    /// routing group won the failover loop.
+    /// response header (when `proxy.expose_debug_headers` is enabled) so
+    /// callers can tell which target inside a routing group won the
+    /// failover loop.
     ///
     /// `None` in two cases:
     ///   - Direct (non-routing) model — `display_name` of the served
@@ -847,8 +848,9 @@ struct Success {
     /// the routing group's display name.
     served_by_target: Option<String>,
     /// Name of the semantic route that matched this request (#641).
-    /// Surfaces in the `x-aisix-route` response header so callers can see
-    /// which intent the router resolved to. `None` for non-semantic
+    /// Surfaces in the `x-aisix-route` response header (when
+    /// `proxy.expose_debug_headers` is enabled) so callers can see which
+    /// intent the router resolved to. `None` for non-semantic
     /// requests and for a semantic request that fell through to `default`.
     served_by_route: Option<String>,
     routing: RoutingTelemetry,
@@ -1382,9 +1384,10 @@ fn last_user_message_text(req: &ChatFormat) -> Option<String> {
 /// - Anything else (direct model, no winner, cache hit) → `None`.
 ///
 /// `None` is the wire signal "this was not a routing request" — the
-/// `x-aisix-served-by` response header is emitted only when the
-/// returned `Option` is `Some`, so its presence alone tells callers
-/// that failover routing fired. Direct-model responses must never
+/// `x-aisix-served-by` response header (sent only with
+/// `proxy.expose_debug_headers`) is emitted only when the returned
+/// `Option` is `Some`, so its presence alone tells callers that
+/// failover routing fired. Direct-model responses must never
 /// carry the header.
 fn served_by_target_for_routing(
     is_routing_request: bool,
