@@ -291,6 +291,22 @@ describe("budgets pushed as documents decide requests locally", () => {
     expect(upA!.receivedRequests.length).toBe(before);
   });
 
+  test("/v1/responses refuses on both a key budget and a provider key budget", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const responses = async (key: string, model: string) => {
+      const res = await fetch(`${app!.proxyUrl}/v1/responses`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+        body: JSON.stringify({ model, input: "hi" }),
+      });
+      return { status: res.status, body: await res.json() };
+    };
+    const before = upA!.receivedRequests.length;
+    expect(refusal(await responses(KEYS.member, "bd-direct")).scope).toBe("member");
+    expect(refusal(await responses(KEYS.plain, "bd-group-out")).scope).toBe("provider_key");
+    expect(upA!.receivedRequests.length).toBe(before);
+  });
+
   // Last: it refuses every key in the environment until removed.
   test("an environment budget refuses every key until it is withdrawn", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();

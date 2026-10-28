@@ -232,6 +232,8 @@ async fn run(
         Ok(c) => Arc::new(c),
         Err(e) => {
             tracing::error!(error = %e, "telemetry: build mTLS client failed; worker disabled");
+            // Nothing will ever be delivered: strict budget mode must see it.
+            metrics.usage_delivery().note_waiting();
             return;
         }
     };
