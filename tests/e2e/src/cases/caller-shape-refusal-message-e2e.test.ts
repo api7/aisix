@@ -21,7 +21,7 @@ import {
 // upstream here only counts requests; every case asserts it saw none.
 //
 // The records name the refusal the same way the caller's envelope does: the
-// access log's `error_kind` (which the usage event's `error_class` mirrors)
+// access log's `error_class` (the same as the usage event's)
 // is `invalid_request_error`, the class every other refusal of the caller's
 // request records — not `invalid_config`, which points an operator at the
 // target's configuration.
@@ -162,7 +162,7 @@ describe("a refused request shape is described as a request error", () => {
       (l) => l.includes(requestId) && l.includes("proxy request completed"),
       `the access log of ${requestId}`,
     );
-    expect(field(line, "error_kind"), line).toBe("invalid_request_error");
+    expect(field(line, "error_class"), line).toBe("invalid_request_error");
   }
 
   const USER = { role: "user", content: "Weather in Paris?" };
