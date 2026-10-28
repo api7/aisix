@@ -1878,6 +1878,49 @@ mod tests {
         assert_eq!(drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED), 0);
     }
 
+    /// Usage delivery is healthy again only once a POST reaches the control
+    /// plane: a `2xx`, or a `422` judging the events. A `5xx` being re-sent
+    /// and an auth refusal leave the events' wait running — strict budget
+    /// enforcement reads exactly this.
+    #[tokio::test]
+    async fn delivery_health_recovers_only_on_a_post_that_reaches_the_control_plane() {
+        let health_after = |answer: Answer| async move {
+            let (server, posts) = scripted_server(vec![answer]).await;
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+            let metrics = Metrics::new(false);
+            let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+            let (mut sender, tx) = staged_sender(cfg, metrics.clone(), &mut cancel_rx, 2).await;
+            assert!(
+                metrics.usage_delivery().is_waiting(),
+                "received events wait until delivered"
+            );
+            // Two answers in for a re-sent status, one dropped batch for the
+            // rest: either way the sender has read the first answer.
+            drive_until(
+                sender.as_mut(),
+                STEP_WHILE_SERVING,
+                || {
+                    !metrics.usage_delivery().is_waiting()
+                        || posts.lock().unwrap().len() >= 2
+                        || drops_with_reason(&metrics, DROP_SEND_FAILED) == 2
+                },
+                "the first answer was never read",
+            )
+            .await;
+            let waiting = metrics.usage_delivery().is_waiting();
+            drop(tx);
+            drop(sender);
+            waiting
+        };
+        tokio::time::pause();
+        assert!(health_after(dedups(503)).await, "a 503 reaches nothing");
+        assert!(health_after(no_dedup(401)).await, "a 401 reaches nothing");
+        assert!(health_after(no_dedup(403)).await, "a 403 reaches nothing");
+        assert!(!health_after(no_dedup(422)).await, "a 422 reached it");
+        assert!(!health_after(no_dedup(200)).await, "a 200 reached it");
+    }
+
     /// A `400` is the control plane refusing THIS batch — a malformed body,
     /// a batch id it will not accept. Re-sending it changes nothing, so it
     /// is dropped on the first answer even though de-duplication is on.

@@ -43,6 +43,12 @@ impl UsageDeliveryHealth {
         self.waiting_since_ms.store(0, Ordering::Release);
     }
 
+    /// Whether events are waiting with no POST having reached the control
+    /// plane since they started to.
+    pub fn is_waiting(&self) -> bool {
+        self.waiting_since_ms.load(Ordering::Acquire) != 0
+    }
+
     /// How long delivery has been unhealthy; zero while healthy.
     pub fn unhealthy_for(&self) -> Duration {
         match self.waiting_since_ms.load(Ordering::Acquire) {
