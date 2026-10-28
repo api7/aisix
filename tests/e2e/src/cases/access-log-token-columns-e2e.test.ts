@@ -195,6 +195,19 @@ describe("access-log token columns and field names", () => {
     expect(tokens(line), line).toEqual(["7", "3", "10"]);
   });
 
+  test("a /v1/messages line that failed over carries the serving target's counts only", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const res = await post("/v1/messages", {
+      model: "tok-group",
+      max_tokens: 16,
+      messages: [{ role: "user", content: "hello" }],
+    });
+    expect(res.status).toBe(200);
+    const line = await lineOf(res.requestId);
+    expect(field(line, "routing_fallback_count"), line).toBe("1");
+    expect(tokens(line), line).toEqual(["7", "3", "10"]);
+  });
+
   test("a /v1/embeddings line carries the prompt count", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const res = await post("/v1/embeddings", { model: "tok-single-shot", input: "hello" });
