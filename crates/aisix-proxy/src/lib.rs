@@ -499,7 +499,7 @@ impl Drop for InFlightGuard {
 /// both reads one number.
 pub(crate) const CLIENT_CLOSED_REQUEST: u16 = 499;
 
-/// `error_kind` for an abandoned request, mirroring LiteLLM's
+/// `error_class` for an abandoned request, mirroring LiteLLM's
 /// `ClientDisconnected` error class.
 const CLIENT_DISCONNECTED_KIND: &str = "client_disconnected";
 
@@ -9711,7 +9711,7 @@ data: [DONE]\n\n",
                 "{what}: the line and the usage event disagree on why",
             );
             assert_eq!(
-                line.field("error_kind").unwrap_or_default(),
+                line.field("error_class").unwrap_or_default(),
                 event.error_class,
                 "{what}: the line and the usage event disagree on the class",
             );
@@ -9747,7 +9747,11 @@ data: [DONE]\n\n",
             ("a stream abandoned mid-flight", &endings.abandoned),
             ("a stream dropped before its first poll", &endings.unread),
         ] {
-            assert_eq!(line.field("model").as_deref(), Some("smart"), "{what}");
+            assert_eq!(
+                line.field("requested_model").as_deref(),
+                Some("smart"),
+                "{what}"
+            );
             assert_eq!(
                 line.field("upstream_model").as_deref(),
                 Some("gpt-4o"),
@@ -10162,13 +10166,13 @@ data: [DONE]\n\n",
         let line = capture.only("a head-phase cancel with a parked line");
         assert_eq!(line.status(), u64::from(CLIENT_CLOSED_REQUEST));
         assert_eq!(
-            line.field("error_kind").as_deref(),
+            line.field("error_class").as_deref(),
             Some(CLIENT_DISCONNECTED_KIND),
         );
         // The PARKED line is the one that went out — the guard's own names
         // no model, because nothing resolved one into the cell here.
         assert_eq!(
-            line.field("model").as_deref(),
+            line.field("requested_model").as_deref(),
             Some("my-gpt4"),
             "the guard wrote its own, thinner line instead of the parked one",
         );

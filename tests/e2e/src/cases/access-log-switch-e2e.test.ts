@@ -170,7 +170,7 @@ describe("observability.access_log switches the access log", () => {
         (l) => l.includes(ACCESS_LINE) && l.includes(`request_id="${id}"`),
         `the access-log line for ${id}`,
       );
-      expect(line).toContain(`status=${status}`);
+      expect(line).toContain(`status_code=${status}`);
     }
   });
 });

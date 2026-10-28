@@ -476,7 +476,7 @@ describe("semantic classifier e2e", () => {
     expect(r.status).toBe(503);
     expect(r.error).toEqual({ message, type: "api_error", code: "semantic_routing_failed" });
     const line = await accessLine(r.requestId);
-    expect(field(line, "error_kind"), line).toBe("semantic_decision_failed");
+    expect(field(line, "error_class"), line).toBe("semantic_decision_failed");
     expect(field(line, "error"), line).toBe(message);
     expect(field(line, "semantic_fallback"), line).toBe("decision_failed");
   }

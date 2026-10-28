@@ -130,7 +130,8 @@ impl AccessLine {
     }
 
     pub(crate) fn status(&self) -> u64 {
-        self.num("status").expect("every line carries a status")
+        self.num("status_code")
+            .expect("every line carries a status")
     }
 }
 
@@ -148,7 +149,7 @@ pub(crate) struct StreamEndings {
 
 /// How long the delivered ending holds the stream open after its first
 /// frame. Large enough that a line reporting the whole stream in
-/// `latency_ms` cannot be mistaken for one reporting the first frame.
+/// `downstream_latency_ms` cannot be mistaken for one reporting the first frame.
 pub(crate) const SLOW_DRAIN: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Drive `request` against `app` three times, once per stream ending, and
@@ -246,19 +247,19 @@ pub(crate) fn assert_one_line_per_ending(endings: &StreamEndings, path: &str, ap
             "{what}: the line must still name the caller",
         );
         let latency = line
-            .num("latency_ms")
-            .unwrap_or_else(|| panic!("{what}: no latency_ms"));
+            .num("downstream_latency_ms")
+            .unwrap_or_else(|| panic!("{what}: no downstream_latency_ms"));
         let duration = line
             .num("duration_ms")
             .unwrap_or_else(|| panic!("{what}: no duration_ms"));
         assert!(
             duration >= latency,
             "{what}: duration_ms ({duration}) is what the request took and \
-             latency_ms ({latency}) is the wait inside it — transposed",
+             downstream_latency_ms ({latency}) is the wait inside it — transposed",
         );
         let expected_class = (status != 200).then_some(crate::CLIENT_DISCONNECTED_KIND);
         assert_eq!(
-            line.field("error_kind").as_deref(),
+            line.field("error_class").as_deref(),
             expected_class,
             "{what}: the line and the usage event must name the same failure class",
         );
@@ -269,11 +270,11 @@ pub(crate) fn assert_one_line_per_ending(endings: &StreamEndings, path: &str, ap
 /// delivered ending held the stream open for [`SLOW_DRAIN`] after its first
 /// frame, so a line reporting the whole stream cannot pass.
 pub(crate) fn assert_latency_is_time_to_first_token(endings: &StreamEndings) {
-    let latency = endings.delivered.num("latency_ms").unwrap();
+    let latency = endings.delivered.num("downstream_latency_ms").unwrap();
     let duration = endings.delivered.num("duration_ms").unwrap();
     assert!(
         duration >= latency + SLOW_DRAIN.as_millis() as u64 / 2,
-        "latency_ms ({latency}) is supposed to be the wait to the FIRST token, \
+        "downstream_latency_ms ({latency}) is supposed to be the wait to the FIRST token, \
          but it is within a rounding error of the whole stream ({duration})",
     );
 }

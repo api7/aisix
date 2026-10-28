@@ -131,7 +131,7 @@ describe("requests answered outside dispatch write their access-log line", () =>
       expect(id, `${probe.label} carries x-aisix-request-id`).toBeTruthy();
       const mine = lines.filter((l) => l.includes(`request_id="${id}"`));
       expect(mine, `one access-log line for ${probe.label}`).toHaveLength(1);
-      expect(mine[0], probe.label).toContain(`status=${probe.status}`);
+      expect(mine[0], probe.label).toContain(`status_code=${probe.status}`);
       expect(mine[0], probe.label).toMatch(new RegExp(`method="?${probe.method}"?\\s`));
       expect(mine[0], probe.label).toMatch(new RegExp(`path="?${probe.path}"?\\s`));
     }

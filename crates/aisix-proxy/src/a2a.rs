@@ -208,7 +208,8 @@ pub async fn a2a_endpoint(
             provider_key_id: target.provider_key_id(),
             api_key_id: Some(&api_key_id),
             // Counted inside `dispatch`, which hands back only a rendered
-            // `Response`. The usage event carries them.
+            // `Response`; filled from the request's terminal usage event
+            // (`attribution::note_terminal_event`).
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
@@ -216,7 +217,7 @@ pub async fn a2a_endpoint(
             // Same as `/mcp`: `dispatch` returns an already-rendered
             // `Response`, so no typed error reaches this point; the
             // request's terminal usage event names the failure on this line
-            // when it is completed (`attribution::note_terminal_error`).
+            // when it is completed (`attribution::note_terminal_event`).
             error_kind: None,
             error: None,
             provider_request_id: None,
@@ -2229,7 +2230,7 @@ mod tests {
     /// family's line sees only an opaque `Response`, so the streaming branch
     /// tells it to park the line instead.
     ///
-    /// `latency_ms` is deliberately NOT asserted to be a time-to-first-event
+    /// `downstream_latency_ms` is deliberately NOT asserted to be a time-to-first-event
     /// here: an agent's stream of task updates is the call's product rather
     /// than a delivery mechanism, so `/a2a` records the WHOLE stream as what
     /// the caller waited for — and the line reports the same figure its

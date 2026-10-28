@@ -180,7 +180,7 @@ describe("an authentication denial writes its access-log line", () => {
     for (const s of sent) {
       const mine = lines.filter((l) => l.includes(`request_id="${s.id}"`));
       expect(mine, `one access-log line for ${s.label}`).toHaveLength(1);
-      expect(mine[0], s.label).toContain(`status=${s.status}`);
+      expect(mine[0], s.label).toContain(`status_code=${s.status}`);
       expect(mine[0], s.label).toMatch(new RegExp(`method="?${s.method}"?\\s`));
       expect(mine[0], s.label).toMatch(new RegExp(`path="?${s.path}"?\\s`));
       // Nothing about the caller is established by a refused credential.

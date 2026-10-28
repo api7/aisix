@@ -460,7 +460,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
   /**
    * The terminal usage event the request filed — checked against the
    * request's access-log line, which must name the same failure: the class
-   * as `error_kind`, and the event's message, where it carries one, as
+   * as `error_class`, and the event's message, where it carries one, as
    * `error`.
    */
   async function eventFor(requestId: string, what: string): Promise<Map<string, string>> {
@@ -476,7 +476,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
       (l) => l.includes("proxy request completed") && l.includes(`"${requestId}"`),
       `${what}: access-log line`,
     );
-    expect(field(line, "error_kind"), `${what}: ${line}`).toBe(event.get("error_class"));
+    expect(field(line, "error_class"), `${what}: ${line}`).toBe(event.get("error_class"));
     const message = event.get("error_message");
     if (message !== undefined) {
       expect(field(line, "error"), `${what}: ${line}`).toBe(message);

@@ -278,8 +278,8 @@ impl AttemptInfo {
     }
 }
 
-/// The failure class a request's records carry: the access log's
-/// `error_kind` and the usage event's `error_class`, on every path —
+/// The failure class a request's records carry: the access log's and the
+/// usage event's `error_class`, on every path —
 /// non-streamed, streamed, per attempt, and terminal.
 ///
 /// Both read it from here so the two cannot drift into two vocabularies
@@ -461,7 +461,7 @@ pub(crate) fn stream_status(reached_end: bool, failure: Option<&StreamFailure>) 
     }
 }
 
-/// Failure class + reason for the access log's `error_kind` / `error`
+/// Failure class + reason for the access log's `error_class` / `error`
 /// fields.
 ///
 /// Deliberately NOT [`attempt_error_from_proxy`]: that one leaves the
@@ -670,8 +670,8 @@ mod tests {
         ]
     }
 
-    /// One vocabulary for a failure's records: the access log's `error_kind`
-    /// and the usage event's `error_class` both name an upstream failure by
+    /// One vocabulary for a failure's records: the access log's and the
+    /// usage event's `error_class` both name an upstream failure by
     /// its routing class, while the client's envelope keeps its own public
     /// `error.type`. The two used to differ for the same failure — the
     /// non-streamed line said `upstream_error` where the row said

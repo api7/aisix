@@ -28,8 +28,8 @@ import {
 // head went out counted every one of those as a 200 success.
 //
 // The end-of-stream latency histograms carry the same status, and the
-// access log's `error_kind` and the usage event's `error_class` name a
-// failure with one vocabulary, whatever the response shape.
+// access log and the usage event name a failure's `error_class` with
+// one vocabulary, whatever the response shape.
 
 const CALLER_PLAINTEXT = "sk-stream-terminal-PLAINTEXT";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -338,8 +338,8 @@ describe("streamed responses record their terminal status", () => {
           (l) => l.includes(`request_id="${requestId}"`) && l.includes("proxy request completed"),
           `the access-log line for ${requestId}`,
         );
-        expect(line).toContain("status=502");
-        expect(line).toContain(`error_kind="${row.get("error_class")}"`);
+        expect(line).toContain("status_code=502");
+        expect(line).toContain(`error_class="${row.get("error_class")}"`);
       });
     });
   }
@@ -367,8 +367,8 @@ describe("streamed responses record their terminal status", () => {
       (l) => l.includes(`request_id="${requestId}"`) && l.includes("proxy request completed"),
       `the access-log line for ${requestId}`,
     );
-    expect(line).toContain("status=504");
-    expect(line).toContain('error_kind="timeout"');
+    expect(line).toContain("status_code=504");
+    expect(line).toContain('error_class="timeout"');
   });
 
   test("a non-streamed upstream timeout is 504 / timeout on the line and the row", async (ctx) => {
@@ -391,8 +391,8 @@ describe("streamed responses record their terminal status", () => {
       (l) => l.includes(`request_id="${requestId}"`) && l.includes("proxy request completed"),
       `the access-log line for ${requestId}`,
     );
-    expect(line).toContain("status=504");
-    expect(line).toContain('error_kind="timeout"');
+    expect(line).toContain("status_code=504");
+    expect(line).toContain('error_class="timeout"');
   });
 
   test("an upstream 5xx is named alike streamed and not, and the client envelope is unchanged", async (ctx) => {
@@ -419,7 +419,7 @@ describe("streamed responses record their terminal status", () => {
         (l) => l.includes(`request_id="${requestId}"`) && l.includes("proxy request completed"),
         `the access-log line for ${requestId}`,
       );
-      expect(line, model).toContain('error_kind="upstream_status"');
+      expect(line, model).toContain('error_class="upstream_status"');
     }
   });
 

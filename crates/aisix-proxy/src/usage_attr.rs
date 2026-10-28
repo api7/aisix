@@ -1088,10 +1088,8 @@ pub(crate) fn emit_usage(
     // endings this is. A request that wrote its line inline — everything
     // non-streamed — parked nothing, and this is a no-op for it.
     if terminal {
-        crate::attribution::note_terminal_error(
-            event.status_code,
-            &event.error_class,
-            &event.error_message,
+        crate::attribution::note_terminal_event(
+            &event,
             // Only an upstream's own id: a cache hit's stored one is not this
             // request's call.
             if dispatched {
