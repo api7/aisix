@@ -122,6 +122,28 @@ async function startRealtimeUpstream(): Promise<RealtimeUpstream> {
 }
 
 /**
+ * An upstream that accepts the session and then drops the connection
+ * without a close frame on the first client event — a session the upstream
+ * cut off mid-flight.
+ */
+async function startDroppingUpstream(): Promise<{ port: number; close(): Promise<void> }> {
+  const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  wss.on("connection", (socket: WsSocket) => {
+    socket.on("message", () => socket.terminate());
+  });
+  await new Promise<void>((resolve) => wss.on("listening", resolve));
+  const addr = wss.address();
+  if (addr === null || typeof addr === "string") throw new Error("no port");
+  return {
+    port: addr.port,
+    close: () =>
+      new Promise<void>((resolve, reject) =>
+        wss.close((e) => (e ? reject(e) : resolve())),
+      ),
+  };
+}
+
+/**
  * An upstream that completes the TCP connect and then says nothing —
  * the handshake never gets a response and the socket is never closed.
  *
@@ -158,6 +180,7 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
   let seed: SeedClient | undefined;
   let upstream: RealtimeUpstream | undefined;
   let silent: { port: number; close(): Promise<void> } | undefined;
+  let dropping: { port: number; close(): Promise<void> } | undefined;
   let idp: MockIdp | undefined;
   let otlp: MockOtlp | undefined;
   let restrictedKey: { id: string } | undefined;
@@ -176,6 +199,7 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     seed = new SeedClient(etcd, app.etcdPrefix);
     upstream = await startRealtimeUpstream();
     silent = await startSilentUpstream();
+    dropping = await startDroppingUpstream();
     idp = await startMockIdp();
     otlp = await startMockOtlp();
 
@@ -226,6 +250,19 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
       provider: "openai",
       model_name: "gpt-realtime-mock",
       provider_key_id: silentPk.id,
+    });
+
+    // A model whose upstream drops the session on its first event.
+    const droppingPk = await seed.createProviderKey({
+      display_name: "realtime-e2e-drop-pk",
+      secret: "sk-upstream-realtime",
+      api_base: `http://127.0.0.1:${dropping.port}/v1`,
+    });
+    await seed.createModel({
+      display_name: "realtime-e2e-drop-model",
+      provider: "openai",
+      model_name: "gpt-realtime-mock",
+      provider_key_id: droppingPk.id,
     });
 
     // JWT identity resolving (via a claim mapping) to a key that may NOT
@@ -285,6 +322,7 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     await app?.exit();
     await upstream?.close();
     await silent?.close();
+    await dropping?.close();
     await idp?.close();
     await otlp?.close();
   });
@@ -565,6 +603,53 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
       "the access-log line for the refusal",
     );
     expect(logLine).toContain(restrictedKey.id);
+  });
+
+  test("a session the upstream cut off names the failure on its usage event and its line alike", async (ctx) => {
+    if (!etcdReachable || !app || !otlp) {
+      ctx.skip();
+      return;
+    }
+    const wsUrl = `${app.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=realtime-e2e-drop-model`;
+    const c = new WsClient(wsUrl, {
+      headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+    });
+    let requestId = "";
+    c.on("upgrade", (res) => {
+      requestId = String(res.headers["x-aisix-request-id"] ?? "");
+    });
+    await new Promise<void>((resolve, reject) => {
+      c.on("open", () => {
+        c.send(JSON.stringify({ type: "session.update", session: { instructions: "hi" } }));
+      });
+      c.on("close", () => resolve());
+      c.on("error", (e) => reject(e));
+    });
+    expect(requestId).not.toBe("");
+
+    const line = await waitForLogLine(
+      app,
+      (l) => l.includes("proxy request completed") && l.includes(`request_id="${requestId}"`),
+      "the cut-off session's access-log line",
+      10_000,
+    );
+    const lineClass = /\berror_class="?([^"\s]+)"?/.exec(line)?.[1];
+    expect(lineClass, line).toBeTruthy();
+
+    let span;
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      span = otlp.spans.find(
+        (s) =>
+          s.attributes["aisix.request_id"] === requestId &&
+          s.attributes["aisix.attempt_index"] !== undefined,
+      );
+      if (span) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(span, `no usage span for request_id=${requestId}`).toBeTruthy();
+    // The row the control plane stores names the same failure the line does.
+    expect(span!.attributes["aisix.error_class"]).toBe(lineClass);
   });
 
   test("an unanswered upstream dial ends at upstream.connect_timeout_ms", async (ctx) => {

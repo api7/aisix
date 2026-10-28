@@ -1182,16 +1182,17 @@ async fn run_session(
         guardrail_blocked: session_error
             .as_ref()
             .is_some_and(ProxyError::is_guardrail_block),
-        // The refusal names itself, as on every other surface. An upstream
-        // failure that ended the session is not recorded here.
+        // Whatever ended the session names itself, as on every other
+        // surface and as the session's access-log line does: a guardrail
+        // refusal, or the upstream failure or timeout that cut it off. The
+        // message is the gateway's own text only — empty for an upstream
+        // failure, whose text the upstream wrote.
         error_class: session_error
             .as_ref()
-            .filter(|e| e.is_guardrail_block())
             .map(|e| crate::attempt::error_class(e).to_string())
             .unwrap_or_default(),
         error_message: session_error
             .as_ref()
-            .filter(|e| e.is_guardrail_block())
             .map(crate::attempt::gateway_error_message)
             .unwrap_or_default(),
         guardrail_monitor_hits: monitor_hits,
