@@ -158,6 +158,13 @@ proxy:
   #     hosts: ["gateway.example.com"]
   #     match: "^/mcp-servers/([^/]+)/mcp$"
   #     rewrite: "/mcp/$1"
+  # Send debug response headers on /v1/chat/completions: x-aisix-call-id,
+  # x-aisix-served-by (the routing target that answered), x-aisix-route
+  # (the semantic route that matched) and x-aisix-cache / -cache-layer /
+  # -cache-similarity. Off by default: served-by and route reveal to the
+  # caller which model behind a model group answered. Usage events, access
+  # logs, metrics and traces record the same facts either way.
+  # expose_debug_headers: false
 
 admin:
   # Bind to an unbindable port so even if managed mode somehow

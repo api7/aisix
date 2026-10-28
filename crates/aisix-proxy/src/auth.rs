@@ -678,6 +678,7 @@ mod tests {
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),
+            expose_debug_headers: false,
         };
         crate::build_router(
             ProxyState::new(

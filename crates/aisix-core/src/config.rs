@@ -781,6 +781,16 @@ pub struct ProxyConfig {
     /// `AISIX_PROXY__URL_REWRITES='[{"match":"^/x$","rewrite":"/y"}]'`.
     #[serde(default, deserialize_with = "deserialize_url_rewrites")]
     pub url_rewrites: Vec<UrlRewriteRule>,
+    /// Send the debug response headers on `/v1/chat/completions`:
+    /// `x-aisix-call-id`, `x-aisix-served-by`, `x-aisix-route`,
+    /// `x-aisix-cache`, `x-aisix-cache-layer` and
+    /// `x-aisix-cache-similarity`. Off by default, because
+    /// `x-aisix-served-by` and `x-aisix-route` reveal to the caller which
+    /// model or route behind a model group answered (AISIX-Cloud#1917).
+    /// Usage events, access logs, metrics and traces record the same
+    /// facts either way.
+    #[serde(default)]
+    pub expose_debug_headers: bool,
 }
 
 impl ProxyConfig {

@@ -82,7 +82,7 @@ describe("cache streaming bypass e2e: streaming responses are never cached", () 
     (upstream as unknown as { _second?: OpenAiUpstream })._second =
       nonStreamMock;
 
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pkStream = await seed.createProviderKey({

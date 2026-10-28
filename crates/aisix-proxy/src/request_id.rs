@@ -403,6 +403,7 @@ mod tests {
                 thread_per_core: None,
                 workers: None,
                 url_rewrites: Vec::new(),
+                expose_debug_headers: false,
             },
         )
     }

@@ -47,7 +47,7 @@ describe("cache scenarios e2e: different prompt → miss", () => {
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     await seed.createApiKey({

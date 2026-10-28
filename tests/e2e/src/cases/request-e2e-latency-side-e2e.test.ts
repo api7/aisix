@@ -140,7 +140,7 @@ describe("aisix_request_e2e_latency_seconds splits each request by side", () => 
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const cached = await startOpenAiUpstream({ responseDelayMs: UPSTREAM_DELAY_MS, nonStreamBody: CHAT_COMPLETION });
     upstreams.push(cached);

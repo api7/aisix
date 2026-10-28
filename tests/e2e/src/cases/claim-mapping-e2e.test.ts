@@ -161,7 +161,7 @@ describe("claim mapping e2e: verified claims resolve to an existing api key", ()
     upstream = await startOpenAiUpstream();
     idp = await startMockIdp();
     otlp = await startOtlpReceiver();
-    app = await spawnApp({});
+    app = await spawnApp({ exposeDebugHeaders: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = await seed.createProviderKey({

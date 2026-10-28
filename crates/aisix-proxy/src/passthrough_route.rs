@@ -7461,6 +7461,7 @@ mod tests {
             real_ip: Default::default(),
             request_id: Default::default(),
             url_rewrites: Vec::new(),
+            expose_debug_headers: false,
             tls: None,
             listeners: Vec::new(),
             thread_per_core: None,

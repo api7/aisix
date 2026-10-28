@@ -58,7 +58,7 @@ describe("cache edges: model in fingerprint + enabled:false bypass", () => {
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     // Two distinct Models pointing at the SAME mock upstream — only

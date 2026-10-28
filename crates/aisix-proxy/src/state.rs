@@ -323,6 +323,9 @@ pub struct ProxyStateInner {
     /// Boot-compiled `proxy.url_rewrites` rules, applied in order to every
     /// request before routing (first match wins). Empty = layer no-ops.
     pub url_rewrites: Arc<[crate::rewrite::CompiledRewrite]>,
+    /// `proxy.expose_debug_headers`: whether chat completions carry the
+    /// `x-aisix-call-id` / `-served-by` / `-route` / `-cache*` headers.
+    pub expose_debug_headers: bool,
     /// Optional config-freshness probe for `GET /readyz`: returns the time
     /// since the etcd watch last applied config (`None` = never applied).
     /// Wired from the watch supervisor in aisix-server; `None` here means
@@ -452,6 +455,7 @@ impl ProxyState {
                 .unwrap_or_default()
                 .into(),
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
+            expose_debug_headers: cfg.expose_debug_headers,
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
@@ -504,6 +508,7 @@ impl ProxyState {
                 .unwrap_or_default()
                 .into(),
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
+            expose_debug_headers: cfg.expose_debug_headers,
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
@@ -570,6 +575,7 @@ impl ProxyState {
                 .unwrap_or_default()
                 .into(),
             url_rewrites: crate::rewrite::compile(&cfg.url_rewrites),
+            expose_debug_headers: cfg.expose_debug_headers,
             billed_batches: Arc::new(dashmap::DashSet::new()),
             client_classifier: Arc::new(ClientTypeClassifier::builtin()),
             default_retries: aisix_core::config::DEFAULT_UPSTREAM_RETRIES,
@@ -705,6 +711,7 @@ mod tests {
                 thread_per_core: None,
                 workers: None,
                 url_rewrites: Vec::new(),
+                expose_debug_headers: false,
             },
         )
     }

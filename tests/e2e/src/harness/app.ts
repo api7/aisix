@@ -56,6 +56,12 @@ export interface AppOverrides {
    */
   urlRewrites?: Array<{ name?: string; hosts?: string[]; match: string; rewrite: string }>;
   /**
+   * `proxy.expose_debug_headers`. Omitted, the binary's default (off)
+   * applies, and chat completions carry none of `x-aisix-call-id`,
+   * `-served-by`, `-route`, `-cache`, `-cache-layer`, `-cache-similarity`.
+   */
+  exposeDebugHeaders?: boolean;
+  /**
    * `proxy.listeners` — the COMPLETE set of proxy listeners, replacing
    * the single `proxy.addr` one (AISIX-Cloud#1662). One harness-picked
    * free port per entry; the bound URLs come back as
@@ -429,6 +435,9 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
         ? { thread_per_core: overrides.threadPerCore ?? suiteThreadPerCore }
         : {}),
       ...(overrides.urlRewrites ? { url_rewrites: overrides.urlRewrites } : {}),
+      ...(overrides.exposeDebugHeaders !== undefined
+        ? { expose_debug_headers: overrides.exposeDebugHeaders }
+        : {}),
       ...(listenerSpecs
         ? {
             listeners: listenerSpecs.map((listener, i) => ({

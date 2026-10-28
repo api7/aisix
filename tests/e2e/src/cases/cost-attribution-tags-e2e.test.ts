@@ -128,6 +128,7 @@ describe("cost-attribution tags e2e", () => {
     upstreams.push(ok, down);
 
     app = await spawnApp({
+      exposeDebugHeaders: true,
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "LTAI_mock_ak",
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock_ak_secret",

@@ -85,6 +85,7 @@
     },
     "proxy": {
       "addr": "0.0.0.0:3000",
+      "expose_debug_headers": false,
       "listeners": [],
       "real_ip": {
         "header": "x-forwarded-for",

@@ -169,8 +169,8 @@ describe("response cache is isolated per env on a shared Redis (#788 P1-1)", () 
     });
 
     const cache = { backend: "memory", redis: { url: REDIS_URL } };
-    appA = await spawnApp({ extra: { etcd: envEtcd(prefix, envA), cache } });
-    appB = await spawnApp({ extra: { etcd: envEtcd(prefix, envB), cache } });
+    appA = await spawnApp({ exposeDebugHeaders: true, extra: { etcd: envEtcd(prefix, envA), cache } });
+    appB = await spawnApp({ exposeDebugHeaders: true, extra: { etcd: envEtcd(prefix, envB), cache } });
 
     await seed(`${prefix}/${envA}`, upstreamA.baseUrl);
     await seed(`${prefix}/${envB}`, upstreamB.baseUrl);

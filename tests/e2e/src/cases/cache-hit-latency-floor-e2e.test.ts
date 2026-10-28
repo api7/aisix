@@ -121,7 +121,7 @@ describe("cache-hit latency is never reported as unmeasured", () => {
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream();
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     const seed = new SeedClient(etcd, app.etcdPrefix);
     otlp = await startOtlpReceiver();
     await seed.createObservabilityExporter({
