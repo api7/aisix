@@ -126,16 +126,26 @@ async function startRealtimeUpstream(): Promise<RealtimeUpstream> {
  * without a close frame on the first client event — a session the upstream
  * cut off mid-flight.
  */
-async function startDroppingUpstream(): Promise<{ port: number; close(): Promise<void> }> {
+async function startDroppingUpstream(): Promise<{
+  port: number;
+  /** Client events the upstream received before dropping the session. */
+  received: string[];
+  close(): Promise<void>;
+}> {
+  const received: string[] = [];
   const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   wss.on("connection", (socket: WsSocket) => {
-    socket.on("message", () => socket.terminate());
+    socket.on("message", (data) => {
+      received.push(data.toString());
+      socket.terminate();
+    });
   });
   await new Promise<void>((resolve) => wss.on("listening", resolve));
   const addr = wss.address();
   if (addr === null || typeof addr === "string") throw new Error("no port");
   return {
     port: addr.port,
+    received,
     close: () =>
       new Promise<void>((resolve, reject) =>
         wss.close((e) => (e ? reject(e) : resolve())),
@@ -180,7 +190,7 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
   let seed: SeedClient | undefined;
   let upstream: RealtimeUpstream | undefined;
   let silent: { port: number; close(): Promise<void> } | undefined;
-  let dropping: { port: number; close(): Promise<void> } | undefined;
+  let dropping: Awaited<ReturnType<typeof startDroppingUpstream>> | undefined;
   let idp: MockIdp | undefined;
   let otlp: MockOtlp | undefined;
   let restrictedKey: { id: string } | undefined;
@@ -606,10 +616,11 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
   });
 
   test("a session the upstream cut off names the failure on its usage event and its line alike", async (ctx) => {
-    if (!etcdReachable || !app || !otlp) {
+    if (!etcdReachable || !app || !otlp || !dropping) {
       ctx.skip();
       return;
     }
+    const before = dropping.received.length;
     const wsUrl = `${app.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=realtime-e2e-drop-model`;
     const c = new WsClient(wsUrl, {
       headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
@@ -626,6 +637,9 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
       c.on("error", (e) => reject(e));
     });
     expect(requestId).not.toBe("");
+    // The session was open and relaying when the upstream dropped it — not
+    // a dial that failed, which names a transport failure too.
+    expect(dropping.received.length).toBe(before + 1);
 
     const line = await waitForLogLine(
       app,
