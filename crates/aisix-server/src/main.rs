@@ -94,7 +94,6 @@ use aisix_provider_bedrock::BedrockBridge;
 use aisix_provider_openai::OpenAiBridge;
 use aisix_provider_vertex::VertexBridge;
 use aisix_proxy::background::run_background_model_check_once;
-use aisix_proxy::budget::BudgetClient;
 use aisix_proxy::{CacheBackends, ProxyState};
 use aisix_ratelimit::{Limiter, RedisStore};
 use clap::Parser;
@@ -633,7 +632,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     );
 
     // Operator-supplied extra trust root, threaded into every
-    // outbound mTLS client (etcd, heartbeat, telemetry, BudgetClient).
+    // outbound mTLS client (etcd, heartbeat, telemetry).
     // Needed for e2e / on-prem deployments where the
     // CP serves a cert distinct from the cert-manager-issued client-
     // cert CA. Production with public-CA certs leaves this `None`.
@@ -954,23 +953,6 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     let telemetry_cfg = heartbeat_cfg
         .as_ref()
         .map(|h| telemetry::TelemetryConfig::new(telemetry_url(&h.url), h.mtls.clone()));
-    // Budget gate. Same on-disk mTLS bundle as heartbeat; URL is the
-    // dpmgr origin (heartbeat URL minus the /dp/heartbeat suffix), the
-    // BudgetClient appends /dp/budget_check itself. See prd-09b rev 2
-    // §5.5 and AISIX-Cloud PR #95. When the bundle build fails the DP
-    // logs and falls back to the default disabled() (allow-all) — a
-    // mid-boot config glitch shouldn't take the proxy down.
-    let budget_client = heartbeat_cfg.as_ref().and_then(|h| {
-        let dpmgr_base = dpmgr_origin(&h.url).to_string();
-        match heartbeat::build_mtls_client(&h.mtls) {
-            Ok(http) => Some(Arc::new(BudgetClient::new(dpmgr_base, http))),
-            Err(e) => {
-                tracing::warn!(error = %e, "budget_check disabled: mTLS client build failed");
-                None
-            }
-        }
-    });
-
     // Steps 7-8: build Hub, shared components, then routers.
     let hub = Arc::new(build_hub());
     // env_id is resolved by now (managed provisioning / sidecar restore
@@ -1277,9 +1259,6 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     proxy_state = proxy_state.with_default_retries(cfg.upstream.retries);
     proxy_state =
         proxy_state.with_default_timeouts(cfg.upstream.timeout_ms, cfg.upstream.stream_timeout_ms);
-    if let Some(client) = budget_client {
-        proxy_state = proxy_state.with_budget_client(client);
-    }
     // Live guardrail index: resolves per-request chains from
     // attachment scope + priority, rebuilding lazily whenever the
     // etcd watch supervisor stores a fresh snapshot. Dashboard
@@ -1766,8 +1745,6 @@ fn register_memory_probes(metrics: &aisix_obs::Metrics, state: &ProxyState) {
             entries(cache.semantic_cache_entries())
         });
     }
-    let budgets = state.budgets.clone();
-    probes.register_component("budget_cache", move || entries(budgets.cached_entries()));
     let vectors = state.semantic_cache.clone();
     probes.register_component("route_embedding_cache", move || {
         entries(vectors.entry_count())
@@ -2193,9 +2170,7 @@ fn default_domain_from_endpoint(endpoint: &str) -> anyhow::Result<String> {
     Ok(host.to_string())
 }
 
-/// Origin the budget gate asks cp-api on: the heartbeat URL with its
-/// path stripped back off. `BudgetClient` appends
-/// `/dp/budget_check` itself.
+/// The dpmgr origin: the heartbeat URL with its path stripped back off.
 fn dpmgr_origin(heartbeat_url: &str) -> &str {
     heartbeat_url
         .strip_suffix(heartbeat::HEARTBEAT_PATH)
@@ -2205,11 +2180,9 @@ fn dpmgr_origin(heartbeat_url: &str) -> &str {
 /// Telemetry URL, derived from the heartbeat URL by swapping the path
 /// suffix so the two stay in lock-step on a `cp_base_url` change.
 ///
-/// Built on `dpmgr_origin` rather than a `replace`, so the two
-/// derivations cannot read one base differently: a replace rewrites
+/// Built on `dpmgr_origin` rather than a `replace`: a replace rewrites
 /// every occurrence, and a base that itself ends in `/dp/heartbeat`
-/// would then yield `…/dp/telemetry/dp/telemetry` while the budget
-/// gate's suffix strip left the origin alone.
+/// would then yield `…/dp/telemetry/dp/telemetry`.
 fn telemetry_url(heartbeat_url: &str) -> String {
     format!(
         "{}{}",
@@ -4058,13 +4031,11 @@ mcp_servers:
         );
     }
 
-    /// All four consumers of `managed.cp_base_url` must read the same
+    /// All three consumers of `managed.cp_base_url` must read the same
     /// origin. Before AISIX-Cloud#1643 only the etcd dial attached a
     /// scheme of its own, so a bare `host:port` connected to etcd — the
-    /// console showed the gateway healthy — while heartbeat, telemetry
-    /// and budget check each concatenated a path onto a value reqwest
-    /// cannot parse, and the budget gate's sticky-deny fallback turned
-    /// every proxied request into a 429.
+    /// console showed the gateway healthy — while heartbeat and telemetry
+    /// each concatenated a path onto a value reqwest cannot parse.
     #[test]
     fn managed_urls_agree_on_a_scheme_less_cp_base_url() {
         let file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
@@ -4149,8 +4120,8 @@ managed:
     /// uses one), and the three derivations must still agree on it. The
     /// telemetry URL is the one that can drift: derived by rewriting
     /// every `/dp/heartbeat` it finds, a base ending in that path would
-    /// have produced `…/dp/telemetry/dp/telemetry` while the budget
-    /// gate's suffix strip returned the origin untouched.
+    /// have produced `…/dp/telemetry/dp/telemetry` while `dpmgr_origin`
+    /// returned the origin untouched.
     #[test]
     fn managed_urls_agree_on_a_base_carrying_a_path() {
         let hb = heartbeat::heartbeat_url("https://cp.example.com/api");
@@ -4605,7 +4576,7 @@ managed:
                 axum::routing::get(|| async {
                     // An upgrade handler that awaits before answering, as
                     // `/v1/realtime` does whenever authentication has to
-                    // go out (a JWKS fetch, a budget check).
+                    // go out (a JWKS fetch).
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     axum::http::Response::builder()
                         .status(axum::http::StatusCode::SWITCHING_PROTOCOLS)

@@ -750,6 +750,7 @@ async fn dispatch(
     // targets whose Provider Key serves `/v1/responses` natively take the
     // verbatim passthrough; every other target is bridged through ChatFormat
     // (#825), so a group can mix and fail over across both kinds.
+    let budget_gate = crate::budget::gate(state, snapshot);
     let attempt_models = crate::routing::resolve_attempt_models(
         &state.routing,
         &state.runtime_status,
@@ -764,6 +765,7 @@ async fn dispatch(
             api_key_id: auth.entry.id.as_str(),
             source_ip: &client.source_ip,
             context_origin: affinity.origin(),
+            budget: Some(&budget_gate),
         },
     )?;
     let retry_on_429 = model_entry

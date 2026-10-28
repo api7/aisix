@@ -232,6 +232,8 @@ async fn run(
         Ok(c) => Arc::new(c),
         Err(e) => {
             tracing::error!(error = %e, "telemetry: build mTLS client failed; worker disabled");
+            // Nothing will ever be delivered: strict budget mode must see it.
+            metrics.usage_delivery().note_waiting();
             return;
         }
     };
@@ -257,6 +259,7 @@ async fn run(
             maybe_event = rx.recv() => {
                 match maybe_event {
                     Some(event) => {
+                        metrics.usage_delivery().note_waiting();
                         buffer.push(event);
                         if buffer.len() >= MAX_BATCH {
                             flush(&client, &cfg, &metrics, &mut state, &mut buffer, Retry::Allowed, cancel).await;
@@ -278,6 +281,11 @@ async fn run(
                 }
             }
             _ = cancel.changed() => {}
+        }
+        // A POST that reached the control plane cleared the waiting mark;
+        // whatever is still queued behind it waits from now.
+        if !buffer.is_empty() || !rx.is_empty() {
+            metrics.usage_delivery().note_waiting();
         }
         // Checked here rather than inside the `cancel` branch because a
         // flush above may have consumed the change notification while it
@@ -446,6 +454,7 @@ async fn deliver(
         attempts += 1;
         let failure = match send(client, cfg, batch_id, events).await {
             Attempt::Delivered { dedup, rejected } => {
+                metrics.usage_delivery().note_reached();
                 state.dedup_seen = dedup;
                 // Delivered and final: the control plane judged these events
                 // and would refuse them again, so there is nothing to re-send.
@@ -475,8 +484,13 @@ async fn deliver(
             Attempt::Failed(failure) => failure,
         };
 
-        if matches!(failure, SendFailure::Response { .. }) {
+        if let SendFailure::Response { status, .. } = &failure {
             answered_failures += 1;
+            // A content rejection is the control plane judging the batch:
+            // delivery works, these events just will not be counted.
+            if *status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+                metrics.usage_delivery().note_reached();
+            }
         }
         let may_resend = state.may_resend(&failure);
         if !may_resend || last_attempt {
@@ -654,6 +668,7 @@ enum SendFailure {
     /// carried [`USAGE_BATCH_DEDUP_HEADER`]; `retryable` says whether the
     /// status is one a re-send could clear.
     Response {
+        status: reqwest::StatusCode,
         dedup: bool,
         retryable: bool,
         error: anyhow::Error,
@@ -722,6 +737,7 @@ async fn send(
     }
     let body = resp.text().await.unwrap_or_default();
     Attempt::Failed(SendFailure::Response {
+        status,
         dedup,
         retryable: is_retryable(status),
         error: anyhow!(
@@ -997,6 +1013,7 @@ mod tests {
     #[test]
     fn resend_permission_is_judged_per_response_and_never_cached() {
         let response = |dedup: bool, retryable: bool| SendFailure::Response {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
             dedup,
             retryable,
             error: anyhow!("boom"),
@@ -1861,6 +1878,49 @@ mod tests {
 
         assert_eq!(posts.lock().unwrap().len(), 1, "it must not be re-sent");
         assert_eq!(drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED), 0);
+    }
+
+    /// Usage delivery is healthy again only once a POST reaches the control
+    /// plane: a `2xx`, or a `422` judging the events. A `5xx` being re-sent
+    /// and an auth refusal leave the events' wait running — strict budget
+    /// enforcement reads exactly this.
+    #[tokio::test]
+    async fn delivery_health_recovers_only_on_a_post_that_reaches_the_control_plane() {
+        let health_after = |answer: Answer| async move {
+            let (server, posts) = scripted_server(vec![answer]).await;
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+            let metrics = Metrics::new(false);
+            let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+            let (mut sender, tx) = staged_sender(cfg, metrics.clone(), &mut cancel_rx, 2).await;
+            assert!(
+                metrics.usage_delivery().is_waiting(),
+                "received events wait until delivered"
+            );
+            // Two answers in for a re-sent status, one dropped batch for the
+            // rest: either way the sender has read the first answer.
+            drive_until(
+                sender.as_mut(),
+                STEP_WHILE_SERVING,
+                || {
+                    !metrics.usage_delivery().is_waiting()
+                        || posts.lock().unwrap().len() >= 2
+                        || drops_with_reason(&metrics, DROP_SEND_FAILED) == 2
+                },
+                "the first answer was never read",
+            )
+            .await;
+            let waiting = metrics.usage_delivery().is_waiting();
+            drop(tx);
+            drop(sender);
+            waiting
+        };
+        tokio::time::pause();
+        assert!(health_after(dedups(503)).await, "a 503 reaches nothing");
+        assert!(health_after(no_dedup(401)).await, "a 401 reaches nothing");
+        assert!(health_after(no_dedup(403)).await, "a 403 reaches nothing");
+        assert!(!health_after(no_dedup(422)).await, "a 422 reached it");
+        assert!(!health_after(no_dedup(200)).await, "a 200 reached it");
     }
 
     /// A `400` is the control plane refusing THIS batch — a malformed body,

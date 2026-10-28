@@ -2,31 +2,28 @@ import { describe, expect, test } from "vitest";
 import { spawnApp, type SpawnedApp } from "../harness/index.js";
 
 // `managed.cp_base_url` (env AISIX_MANAGED__CP_BASE_URL, Helm
-// controlPlane.baseURL) reaches four consumers with two different
+// controlPlane.baseURL) reaches three consumers with two different
 // appetites: the etcd dial strips whatever scheme is present and
-// re-attaches `https://` itself, while heartbeat, telemetry and the
-// budget gate concatenate a path onto the value verbatim.
+// re-attaches `https://` itself, while heartbeat and telemetry
+// concatenate a path onto the value verbatim.
 //
 // So a scheme-less `host:port` used to dial etcd happily — the console
 // showed the gateway connected — while every REST call produced
-// `host:port/dp/...`, which reqwest rejects when the request is BUILT.
-// That failure is indistinguishable from an unreachable control plane,
-// so the budget gate's no-cache fallback sticky-denied and every proxied
-// request answered `429 budget_exceeded` (AISIX-Cloud#1643).
+// `host:port/dp/...`, which reqwest rejects when the request is BUILT
+// (AISIX-Cloud#1643).
 //
 // The gateway now gives the value a scheme once, at config load. These
 // specs pin the two halves of that decision at the process boundary,
 // where an operator meets them: a scheme-less value is accepted, and a
 // value that is no http(s) URL stops the boot instead of booting into a
-// gateway that refuses all traffic.
+// gateway that cannot reach its control plane.
 
 describe("managed.cp_base_url scheme handling", () => {
   // This one pins that the new validation is not over-strict: it is
   // green on `main` too, because the gateway spawned here is NOT in
   // managed mode (no cert bundle, so `managed.enabled` stays false and
   // nothing reads the value) — the reject spec below is the one that
-  // goes red without the fix. Managed mode proper has no counterpart
-  // in this harness; it needs a real control plane to register against.
+  // goes red without the fix.
   test("a scheme-less control-plane URL is accepted and the gateway boots", async () => {
     let app: SpawnedApp | undefined;
     try {

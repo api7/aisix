@@ -96,9 +96,8 @@ pub struct PolicyErrorRef {
 }
 
 /// The structured budget fields that `budget_exceeded` 429s lift from
-/// cp-api's reason. Flattened into `ErrorBody`. Each field is omitted
-/// when absent so a fallback-mode denial (cp-api unreachable, no
-/// structured detail) still serializes cleanly with just a message.
+/// the exhausted budget's reason. Flattened into `ErrorBody`. Each field
+/// is omitted when the reason does not carry it.
 #[derive(Debug, Serialize, Clone)]
 pub struct BudgetErrorFields {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -323,8 +322,8 @@ pub enum ProxyError {
         message: String,
         unavailable: Option<String>,
     },
-    // Carries cp-api's structured reason. Display forwards the cp-api
-    // message verbatim (it's already a complete customer sentence —
+    // Carries the budget document's structured reason. Display forwards
+    // its message verbatim (it's already a complete customer sentence —
     // "<scope> budget '<name>' exceeded ($X/period). Resets …"); the
     // structured fields ride along in the 429 error block via
     // `with_budget` (prd-09b §5.8).
@@ -334,6 +333,12 @@ pub enum ProxyError {
     // enum small (budget denial is rare, so the extra alloc is fine).
     #[error("{}", .0.message)]
     BudgetExceeded(Box<crate::budget::BudgetReason>),
+    /// A budget applies to the request, but the environment's budget
+    /// policy is `closed` and usage has not reached the control plane for
+    /// longer than its grace period, so whether the budget still has room
+    /// cannot be known.
+    #[error("budget could not be verified: usage has not reached the control plane")]
+    BudgetUnverified,
     /// Per RFC 9110 §15.5.14, a request body that exceeds a server-
     /// imposed limit gets a `413 Content Too Large`. The caller-visible
     /// `message` is intentionally bare of the actual incoming size
@@ -485,6 +490,7 @@ impl ProxyError {
             ProxyError::AllCandidatesUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::ContentFiltered { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
+            ProxyError::BudgetUnverified => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::PolicyRateLimit { .. } => StatusCode::TOO_MANY_REQUESTS,
@@ -532,6 +538,9 @@ impl ProxyError {
             ProxyError::AllCandidatesUnavailable { .. } => "all_candidates_unavailable",
             ProxyError::ContentFiltered { .. } => "content_filter",
             ProxyError::BudgetExceeded(_) => "billing_error",
+            // A gateway-side dependency failed, like `JwksUnavailable`;
+            // `error.code` carries the distinction.
+            ProxyError::BudgetUnverified => "api_error",
             ProxyError::RateLimit(_) => "rate_limit_exceeded",
             ProxyError::PolicyRateLimit { .. } => "rate_limit_exceeded",
             ProxyError::Bridge(b) => b.error_type(),
@@ -636,6 +645,7 @@ impl ProxyError {
         let env = ErrorEnvelope::new(self.to_string(), self.kind());
         match self {
             ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
+            ProxyError::BudgetUnverified => env.with_code("budget_unverified"),
             // Attribution for policy-layer 429s (AISIX-Cloud#892): the
             // OpenAI envelope names the offending policy. The Anthropic
             // envelope keeps its strict {type,message} shape.
@@ -1554,7 +1564,7 @@ mod tests {
 
     #[test]
     fn openai_envelope_budget_exceeded_carries_structured_fields() {
-        // prd-09b §5.8: the budget_exceeded 429 lifts cp-api's structured
+        // prd-09b §5.8: the budget_exceeded 429 lifts the budget's structured
         // reason into the error block. Pin scope / scope_ref / limit_usd /
         // spent_usd / period so a regression that drops them (the old
         // String-only variant) fails here.
@@ -1567,6 +1577,7 @@ mod tests {
             period: Some("month".into()),
             period_resets_at: Some("2026-06-01T00:00:00Z".into()),
             retry_after_seconds: Some(259_200),
+            ..Default::default()
         }));
         // The Retry-After *header* must source the same value the body
         // carries — otherwise SDKs (which back off on the header) and
@@ -1610,6 +1621,7 @@ mod tests {
             period: Some("month".into()),
             period_resets_at: Some("2026-06-01T00:00:00Z".into()),
             retry_after_seconds: Some(259_200),
+            ..Default::default()
         }));
         let resp = err.into_anthropic_response();
         let json =
@@ -1788,6 +1800,7 @@ mod tests {
             period: None,
             period_resets_at: None,
             retry_after_seconds: Some(600),
+            ..Default::default()
         }));
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);

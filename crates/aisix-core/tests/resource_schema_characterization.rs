@@ -1056,6 +1056,7 @@ fn published_strict_schemas_are_what_the_write_path_compiles() {
 ///   semantic thresholds' `default: 0.75`). `script` itself is required on
 ///   BOTH sets.
 const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
+    ("budget", &["/allOf"]),
     (
         "api_key",
         &[
@@ -1679,6 +1680,23 @@ const UNKNOWN_FIELD_TOLERANCE: &[Probe] = &[
         resource: "user",
         pointer: "",
         document: || json!({"name": "Alice Example"}),
+    },
+    Probe {
+        resource: "budget",
+        pointer: "/exhausted/reason",
+        document: || {
+            json!({
+                "scope": "api_key",
+                "scope_ref": "k-1",
+                "period": "month",
+                "exhausted": {"period_start": "2026-10-01T00:00:00Z", "reason": {"message": "m"}}
+            })
+        },
+    },
+    Probe {
+        resource: "budget_policy",
+        pointer: "",
+        document: || json!({"fail_mode": "closed", "closed_grace_seconds": 300}),
     },
 ];
 

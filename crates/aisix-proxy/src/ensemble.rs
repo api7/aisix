@@ -171,6 +171,17 @@ impl ModelCaller for ProxyModelCaller<'_> {
                 "ensemble member has an unresolved provider key".to_string(),
             )
         })?;
+        // A member whose provider key's budget is exhausted is a failed
+        // member; for the judge, a failed ensemble.
+        if let Err(err) =
+            crate::budget::gate(self.state, self.snapshot).check_provider_key(&pk_entry.id)
+        {
+            tracing::warn!(member = %target, error = %err, "ensemble sub-call refused by its provider key's budget");
+            return Err(CallError::from(BridgeError::upstream_status(
+                err.status().as_u16(),
+                err.to_string(),
+            )));
+        }
         let bridge =
             crate::dispatch::resolve_bridge(&self.state.hub, &pk_entry.value).ok_or_else(|| {
                 tracing::warn!(member = %target, "ensemble member has no registered bridge");

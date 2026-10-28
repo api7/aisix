@@ -782,21 +782,11 @@ async fn dispatch(
     let mut reservation =
         Some(crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?);
 
-    // Budget pre-check via cp-api (mirrors /v1/chat/completions).
-    let budget_decision = state.budgets.check(&auth.entry.id).await;
-    if !budget_decision.allowed {
-        return Err(
-            ProxyError::BudgetExceeded(Box::new(budget_decision.reason.unwrap_or_else(|| {
-                crate::budget::BudgetReason::message_only(auth.entry.id.clone())
-            })))
-            .into(),
-        );
-    }
-
     // Resolve the attempt list. For a Model Group (routing model) this
     // walks `routing.targets` and health-filters them; for a direct
     // model it's just the model itself. Shared with /v1/chat/completions
     // so both endpoints dispatch Model Groups identically (#471).
+    let budget_gate = crate::budget::gate(state, snapshot);
     let attempt_models = crate::routing::resolve_attempt_models(
         &state.routing,
         &state.runtime_status,
@@ -811,6 +801,7 @@ async fn dispatch(
             api_key_id: auth.entry.id.as_str(),
             source_ip: &client.source_ip,
             context_origin: None,
+            budget: Some(&budget_gate),
         },
     )?;
 

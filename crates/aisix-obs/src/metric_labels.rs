@@ -499,6 +499,7 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
         required = &["trigger"]
     ),
     metric!(M_LOG_LINES_DROPPED_TOTAL, &[]),
+    metric!(M_USAGE_DELIVERY_UNHEALTHY_SECONDS, &[]),
     metric!(M_ALLOCATOR_BYTES, &["stat"], required = &["stat"]),
     metric!(M_MEMORY_LIMIT_BYTES, &[]),
     metric!(M_PROCESS_RESIDENT_MEMORY_BYTES, &[]),

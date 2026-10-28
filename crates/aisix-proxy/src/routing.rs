@@ -597,6 +597,7 @@ where
 {
     use crate::attempt::{AttemptRecord, AttemptTarget};
 
+    let budget_gate = crate::budget::gate(state, snapshot);
     let attempt_models = resolve_attempt_models(
         &state.routing,
         &state.runtime_status,
@@ -611,6 +612,7 @@ where
             api_key_id: auth.entry.id.as_str(),
             source_ip: &client.source_ip,
             context_origin: None,
+            budget: Some(&budget_gate),
         },
     )?;
     let routing = entry.value.routing.as_ref();
@@ -1426,6 +1428,10 @@ pub(crate) struct RoutingRequest<'a> {
     /// target and its provider-key peers are attempted first, ahead of the
     /// strategy's order. `None` everywhere else.
     pub context_origin: Option<&'a str>,
+    /// The request's budget gate. A target whose provider key's budget is
+    /// exhausted is not a candidate, and a direct model on one is refused.
+    /// `None` only in tests that exercise no budget.
+    pub budget: Option<&'a crate::budget::BudgetGate>,
 }
 
 /// Drop the targets whose own `allowed_cidrs` excludes `source_ip`.
@@ -1453,6 +1459,46 @@ fn targets_allowed_for_ip(
         .collect()
 }
 
+/// Drop the targets whose provider key has an exhausted `provider_key`
+/// budget (or, in strict mode, any budget it can no longer verify). With
+/// every target dropped, the request is refused with the budget's own
+/// answer: `budget_exceeded` when any target was exhausted, otherwise
+/// `budget_unverified`.
+fn targets_within_budget(
+    snapshot: &AisixSnapshot,
+    gate: &crate::budget::BudgetGate,
+    targets: Vec<RoutingTarget>,
+) -> Result<Vec<RoutingTarget>, ProxyError> {
+    let mut refusal: Option<ProxyError> = None;
+    let kept: Vec<RoutingTarget> = targets
+        .into_iter()
+        .filter(|t| {
+            // An unresolvable name stays, for the resolution loop to report.
+            let Some(entry) = snapshot.models.get_by_name(&t.model) else {
+                return true;
+            };
+            match gate.check_model(&entry.value) {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::debug!(
+                        target_model = %t.model,
+                        error = %err,
+                        "routing target excluded by its provider key's budget",
+                    );
+                    if !matches!(refusal, Some(ProxyError::BudgetExceeded(_))) {
+                        refusal = Some(err);
+                    }
+                    false
+                }
+            }
+        })
+        .collect();
+    match refusal {
+        Some(err) if kept.is_empty() => Err(err),
+        _ => Ok(kept),
+    }
+}
+
 /// Resolve the ordered list of concrete Models a request will attempt.
 ///
 /// For a routing model (Model Group), walk `routing.targets` per the
@@ -1474,6 +1520,9 @@ pub(crate) fn resolve_attempt_models(
     req: RoutingRequest<'_>,
 ) -> Result<Vec<AttemptModel>, ProxyError> {
     let Some(routing) = virtual_model.routing.as_ref() else {
+        if let Some(gate) = req.budget {
+            gate.check_model(virtual_model)?;
+        }
         return Ok(vec![AttemptModel {
             id: virtual_id.to_string(),
             model: virtual_model.clone(),
@@ -1543,6 +1592,14 @@ pub(crate) fn resolve_attempt_models(
         // matching `ModelForbidden`, and without disclosing group internals.
         return Err(ProxyError::ModelIpRestricted(virtual_name.to_string()));
     }
+    // Provider-key budget pre-filter: an upstream credential whose budget is
+    // exhausted is not a candidate either, for the same reasons as the IP
+    // allowlist — it must not consume a `max_fallbacks` slot, and it has no
+    // "try anyway".
+    let eligible = match req.budget {
+        Some(gate) => targets_within_budget(snapshot, gate, eligible)?,
+        None => eligible,
+    };
     let filtered_routing = Routing {
         targets: eligible,
         ..routing.clone()

@@ -1,0 +1,238 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "else": {
+        "not": {
+          "required": [
+            "tag"
+          ]
+        },
+        "required": [
+          "scope_ref"
+        ]
+      },
+      "if": {
+        "properties": {
+          "scope": {
+            "const": "tag"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "scope_ref"
+          ]
+        },
+        "required": [
+          "tag"
+        ]
+      }
+    },
+    {
+      "else": {
+        "not": {
+          "required": [
+            "exhausted_members"
+          ]
+        }
+      },
+      "if": {
+        "properties": {
+          "scope": {
+            "const": "team_member"
+          }
+        }
+      }
+    }
+  ],
+  "definitions": {
+    "BudgetExhausted": {
+      "additionalProperties": false,
+      "description": "The budget is exhausted for everything it applies to.",
+      "properties": {
+        "period_start": {
+          "description": "Start of the period the budget was exhausted in, as an RFC 3339 timestamp. The block holds only while this is the start of the current period, so it lifts at the next period boundary on its own. Omitted, the block holds in every period.",
+          "type": "string"
+        },
+        "reason": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/BudgetReason"
+            }
+          ],
+          "description": "What a rejected request is told."
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "type": "object"
+    },
+    "BudgetMemberExhausted": {
+      "additionalProperties": false,
+      "description": "One member's share of a `team_member` budget is exhausted.",
+      "properties": {
+        "period_start": {
+          "description": "Start of the period the member exhausted their share in, as an RFC 3339 timestamp. The block holds only while this is the start of the current period.",
+          "type": "string"
+        },
+        "reason": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/BudgetReason"
+            }
+          ],
+          "description": "What a rejected request is told."
+        }
+      },
+      "required": [
+        "period_start",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "BudgetPeriod": {
+      "enum": [
+        "day",
+        "week",
+        "month"
+      ],
+      "type": "string"
+    },
+    "BudgetReason": {
+      "additionalProperties": false,
+      "description": "The detail a request rejected by an exhausted budget is answered with. Amounts are decimal strings in the organization's currency.",
+      "properties": {
+        "code": {
+          "description": "Error code. The response always reports `budget_exceeded`.",
+          "type": "string"
+        },
+        "limit_usd": {
+          "description": "The budget's limit.",
+          "type": "string"
+        },
+        "message": {
+          "description": "Human-readable message returned to the caller.",
+          "type": "string"
+        },
+        "period": {
+          "description": "Accounting period.",
+          "type": "string"
+        },
+        "period_resets_at": {
+          "description": "Ignored: the gateway computes when the period resets."
+        },
+        "remaining_usd": {
+          "description": "Limit minus spend; zero or negative.",
+          "type": "string"
+        },
+        "retry_after_seconds": {
+          "description": "Ignored: the gateway computes how long until the period resets."
+        },
+        "scope": {
+          "description": "Scope of the exhausted budget.",
+          "type": "string"
+        },
+        "scope_ref": {
+          "description": "Id of the capped resource, or the tag for scope `tag`.",
+          "type": "string"
+        },
+        "spent_usd": {
+          "description": "Spend in the period when the budget was exhausted.",
+          "type": "string"
+        },
+        "type": {
+          "description": "Error type. The response always reports `billing_error`.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "BudgetScope": {
+      "enum": [
+        "org",
+        "environment",
+        "api_key",
+        "member",
+        "team",
+        "team_member",
+        "tag",
+        "provider_key"
+      ],
+      "type": "string"
+    },
+    "BudgetTag": {
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "description": "Tag key.",
+          "type": "string"
+        },
+        "value": {
+          "description": "Tag value.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "value"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "A hard-stop spend cap that applies in this environment, and whether it is currently exhausted.\n\nThe document's id is the budget's id. Only hard-stop budgets are present: a budget that only warns never blocks a request, so it has no document.",
+  "properties": {
+    "exhausted": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/BudgetExhausted"
+        }
+      ],
+      "description": "Set while the budget is exhausted for everything it applies to. For scope `team_member` it applies to every member of the team."
+    },
+    "exhausted_members": {
+      "additionalProperties": {
+        "$ref": "#/definitions/BudgetMemberExhausted"
+      },
+      "description": "Members of the team who have exhausted their own share of a `team_member` budget, keyed by member id. Read only for scope `team_member`.",
+      "type": "object"
+    },
+    "period": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/BudgetPeriod"
+        }
+      ],
+      "description": "Accounting period. Periods follow the UTC calendar: a day starts at 00:00 UTC, a week on Monday at 00:00 UTC, and a month on the 1st at 00:00 UTC."
+    },
+    "scope": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/BudgetScope"
+        }
+      ],
+      "description": "What the budget caps.\n\n- `org`, `environment`: every API key in this environment. - `api_key`: the API key whose id is `scope_ref`. - `member`: every API key whose `user_id` is `scope_ref`. - `team`: every API key whose `team_id` is `scope_ref`. - `team_member`: every API key whose `team_id` is `scope_ref` and that also names a member; each member is capped separately. - `tag`: every API key whose effective value for `tag.key` is `tag.value`. - `provider_key`: every upstream call made with the provider key whose id is `scope_ref`."
+    },
+    "scope_ref": {
+      "description": "Id of the capped resource. Present for every scope except `tag`.",
+      "type": "string"
+    },
+    "tag": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/BudgetTag"
+        }
+      ],
+      "description": "The capped tag. Present only for scope `tag`."
+    }
+  },
+  "required": [
+    "period",
+    "scope"
+  ],
+  "title": "Budget",
+  "type": "object"
+}

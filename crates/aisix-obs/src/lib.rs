@@ -27,6 +27,7 @@ mod scrape;
 pub mod sink;
 pub mod trace;
 pub mod usage;
+pub mod usage_delivery;
 
 use std::io::IsTerminal as _;
 use std::sync::OnceLock;
@@ -65,6 +66,7 @@ pub use usage::{
     GatewayEmbeddingCall, GatewayEmbeddingOutcome, GatewayEmbeddingPurpose,
     GatewayEmbeddingUsageSource, UsageEvent, UsageSink,
 };
+pub use usage_delivery::UsageDeliveryHealth;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ObsError {

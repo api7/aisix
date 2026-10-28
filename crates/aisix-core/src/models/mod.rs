@@ -17,6 +17,7 @@
 
 pub mod a2a_agent;
 pub mod apikey;
+pub mod budget;
 pub mod cache_policy;
 pub mod claim_mapping;
 pub mod embedding;
@@ -46,6 +47,10 @@ pub mod user;
 
 pub use a2a_agent::{A2aAgent, A2aAuthType, A2aProtocolVersion};
 pub use apikey::{ApiKey, McpServerLimit};
+pub use budget::{
+    Budget, BudgetExhausted, BudgetFailMode, BudgetMemberExhausted, BudgetPeriod, BudgetPolicy,
+    BudgetReason, BudgetScope, BudgetTag,
+};
 pub use cache_policy::{AppliesTo, CacheBackend, CachePolicy, CacheScope, SemanticCacheConfig};
 pub use claim_mapping::{ClaimMapping, ClaimMatch, ClaimMatchOp, ClaimResolve};
 pub use embedding::EmbeddingConfig;
@@ -95,7 +100,8 @@ pub use routing::{
 };
 pub use schema::{
     unknown_field_paths, validate_a2a_agent, validate_a2a_agent_lenient, validate_apikey,
-    validate_apikey_lenient, validate_cache_policy, validate_cache_policy_lenient,
+    validate_apikey_lenient, validate_budget, validate_budget_lenient, validate_budget_policy,
+    validate_budget_policy_lenient, validate_cache_policy, validate_cache_policy_lenient,
     validate_claim_mapping, validate_claim_mapping_lenient, validate_guardrail,
     validate_guardrail_attachment, validate_guardrail_attachment_lenient,
     validate_guardrail_lenient, validate_mcp_auth_settings, validate_mcp_auth_settings_lenient,

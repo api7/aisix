@@ -482,6 +482,7 @@ async fn dispatch(
     // Resolve the attempt list (routing-aware). count_tokens is
     // Anthropic-only, so we attempt the group's Anthropic targets in
     // order; a direct model resolves to itself (#471).
+    let budget_gate = crate::budget::gate(state, snapshot);
     let attempt_models = crate::routing::resolve_attempt_models(
         &state.routing,
         &state.runtime_status,
@@ -496,6 +497,7 @@ async fn dispatch(
             api_key_id: auth.entry.id.as_str(),
             source_ip: &client.source_ip,
             context_origin: None,
+            budget: Some(&budget_gate),
         },
     )?;
     let retry_on_429 = model_entry

@@ -1030,6 +1030,7 @@ pub(crate) async fn create_file(
             )),
         )
         .await?;
+        crate::budget::gate(&state, snapshot).check_provider_key(&target.pk_entry.id)?;
 
         let url = upstream_url(&target, "/files", "")?;
         let (status, resp_headers, bytes) = send_upstream(
@@ -1291,6 +1292,7 @@ pub(crate) async fn create_batch(
             )),
         )
         .await?;
+        crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_entry.id)?;
 
         let url = upstream_url(&target, "/batches", "")?;
         let (status, resp_headers, bytes) = send_upstream(
@@ -1376,6 +1378,7 @@ pub(crate) async fn get_batch(
             )),
         )
         .await?;
+        crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_entry.id)?;
 
         let url = upstream_url(&target, &format!("/batches/{raw}"), "")?;
         let (status, resp_headers, bytes) = send_upstream(
@@ -1593,6 +1596,7 @@ pub(crate) async fn create_ft_job(
             )),
         )
         .await?;
+        crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_entry.id)?;
 
         let url = upstream_url(&target, "/fine_tuning/jobs", "")?;
         let (status, resp_headers, bytes) = send_upstream(
@@ -1808,6 +1812,7 @@ async fn forward_simple(
             )),
         )
         .await?;
+        crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_entry.id)?;
 
         let query = forwardable_query(spec.raw_query.as_deref());
         let url = upstream_url(&target, &spec.upstream_path, &query)?;

@@ -430,12 +430,10 @@ const CP_BASE_URL_ENV: &str = "AISIX_MANAGED__CP_BASE_URL";
 ///
 /// The etcd dial strips whatever scheme is there and re-attaches
 /// `https://`, so a scheme-less `host:port` reached etcd and the
-/// console reported the gateway healthy — while the three REST
-/// consumers (heartbeat, telemetry, budget check) concatenated a path
-/// onto a value reqwest cannot parse as a URL, failed at request
-/// build, and logged one WARN per tick. The budget gate's no-cache
-/// fallback is a sticky deny, so every proxied request answered
-/// `429 budget_exceeded` (AISIX-Cloud#1643).
+/// console reported the gateway healthy — while the REST consumers
+/// (heartbeat, telemetry) concatenated a path onto a value reqwest
+/// cannot parse as a URL, failed at request build, and logged one WARN
+/// per tick (AISIX-Cloud#1643).
 ///
 /// The control plane normalises its own copy of this value by the same
 /// rule; keep the two in step.
@@ -2173,13 +2171,11 @@ const TOP_LEVEL_ENV_KEYS: [&str; 13] = [
 ///
 /// Spelled as the environment source sees them, as in
 /// [`TOP_LEVEL_ENV_KEYS`]: `AISIX_CONFIG` → `config`.
-const NON_CONFIG_ENV_KEYS: [&str; 3] = [
+const NON_CONFIG_ENV_KEYS: [&str; 2] = [
     // `--config`'s env fallback (clap, `aisix-server`).
     "config",
     // Selects which baked config the container entrypoint execs with.
     "config_path",
-    // Upper bound on a cached budget decision's age (`aisix-proxy`).
-    "dp_budget_stale_max_seconds",
 ];
 
 /// The `AISIX_*` variables the configuration loader consumes, split from
@@ -2814,15 +2810,14 @@ admin:
 
     #[test]
     fn the_gateways_own_non_config_env_vars_load_silently() {
-        // These three are read by name elsewhere — clap's `--config`
-        // fallback, the container entrypoint, the budget client — so they
-        // are set deliberately and a warning about them would be noise.
+        // These two are read by name elsewhere — clap's `--config`
+        // fallback and the container entrypoint — so they are set
+        // deliberately and a warning about them would be noise.
         // `AISIX_CONFIG` is the one that used to stop `aisix` from
         // starting from its own documented environment variable at all.
-        const OWN: [(&str, &str); 3] = [
+        const OWN: [(&str, &str); 2] = [
             ("AISIX_CONFIG", "/etc/aisix/config.yaml"),
             ("AISIX_CONFIG_PATH", "/etc/aisix/config.managed.yaml"),
-            ("AISIX_DP_BUDGET_STALE_MAX_SECONDS", "30"),
         ];
         if !in_child_with_env(
             "the_gateways_own_non_config_env_vars_load_silently",
@@ -3340,16 +3335,14 @@ observability:
         assert!(ObservabilityConfig::default().retired_settings().is_empty());
     }
 
-    /// `managed.cp_base_url` reaches four consumers with two different
+    /// `managed.cp_base_url` reaches three consumers with two different
     /// appetites: the etcd dial strips whatever scheme is there and
-    /// re-attaches `https://`, while heartbeat / telemetry / budget
-    /// concatenate a path onto the value verbatim. A scheme-less
-    /// `host:port` therefore used to dial etcd happily — so the console
-    /// showed the gateway connected — while every REST call failed at
-    /// request build and the budget gate's no-cache fallback turned
-    /// every proxied request into `429 budget_exceeded`
+    /// re-attaches `https://`, while heartbeat / telemetry concatenate a
+    /// path onto the value verbatim. A scheme-less `host:port` therefore
+    /// used to dial etcd happily — so the console showed the gateway
+    /// connected — while every REST call failed at request build
     /// (AISIX-Cloud#1643). Normalising once at load is what keeps the
-    /// four readings identical.
+    /// three readings identical.
     fn load_with_cp_base_url(value: &str) -> Result<Config, BootstrapError> {
         let f = write_yaml(&format!(
             r#"

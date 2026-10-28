@@ -392,6 +392,20 @@ impl std::fmt::Debug for LazyEtcdClient {
     }
 }
 
+/// HTTP/2 PING cadence on an etcd connection that carries a stream, and how
+/// long a PING may go unanswered before the connection is dropped and
+/// dialled again.
+///
+/// An established watch sends nothing upstream, so a peer that vanishes
+/// without a FIN or RST (a dropped NAT entry, a black-holed route) is
+/// otherwise never noticed: TCP has nothing to retransmit, and the watch
+/// waits forever while the configuration it should be delivering changes.
+/// The interval stays above the 5 s minimum both etcd and the control
+/// plane's etcd endpoint enforce; pings are only sent while a stream is
+/// open, which those servers also require.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl LazyEtcdClient {
     pub fn new(
         endpoints: Vec<String>,
@@ -400,7 +414,15 @@ impl LazyEtcdClient {
     ) -> Self {
         Self {
             endpoints,
-            options,
+            options: Some(
+                options
+                    .unwrap_or_default()
+                    .with_keep_alive(KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT)
+                    // `ConnectOptions::new()` turns idle pings on, and a
+                    // server that does not permit them sends GOAWAY
+                    // `too_many_pings` to a connection with no stream.
+                    .with_keep_alive_while_idle(false),
+            ),
             dial_timeout,
             connected: Mutex::new(None),
             next_generation: AtomicU64::new(0),
@@ -551,6 +573,22 @@ impl LazyEtcdClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keepalive_pings_only_while_a_stream_is_open() {
+        // `ConnectOptions::new()` is what the boot path hands in, and it
+        // enables idle pings on its own.
+        let client = LazyEtcdClient::new(vec![], Some(ConnectOptions::new()), None);
+        let options = format!("{:?}", client.options);
+        assert!(
+            options.contains("keep_alive: Some((10s, 10s))"),
+            "{options}"
+        );
+        assert!(
+            options.contains("keep_alive_while_idle: false"),
+            "{options}"
+        );
+    }
 
     #[test]
     fn format_error_chain_joins_sources_without_duplicating() {

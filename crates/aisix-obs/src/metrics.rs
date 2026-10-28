@@ -555,6 +555,12 @@ pub const M_CONFIG_APPLY_BATCH_EVENTS: &str = "aisix_config_apply_batch_events";
 /// Log events discarded because the log sink was not draining fast
 /// enough. Above zero means the log is incomplete for that window.
 pub const M_LOG_LINES_DROPPED_TOTAL: &str = "aisix_log_lines_dropped_total";
+/// How long usage events have been waiting with no telemetry POST reaching
+/// the control plane, in seconds; `0` while delivery is healthy. Reads up
+/// to one flush interval during normal operation. Strict budget enforcement
+/// (`budget_policy.fail_mode: closed`) starts rejecting budgeted traffic
+/// once this reaches the policy's `closed_grace_seconds`.
+pub const M_USAGE_DELIVERY_UNHEALTHY_SECONDS: &str = "aisix_usage_delivery_unhealthy_seconds";
 /// jemalloc's own byte counts, by `stat`: `allocated` (live objects),
 /// `active` (pages backing them), `resident` (allocator pages in RAM),
 /// `mapped`, `retained` (unmapped from RAM but kept reserved) and
@@ -780,6 +786,9 @@ struct MetricsInner {
     /// Exporter names reported on the previous scrape, so a removed
     /// exporter's queue reads 0 instead of its last depth.
     last_exporters: Mutex<Vec<String>>,
+    /// Usage delivery to the control plane, written by the telemetry
+    /// sender and read by budget enforcement.
+    usage_delivery: crate::usage_delivery::UsageDeliveryHealth,
 }
 
 /// A gauge family whose label set can outlive what it describes.
@@ -1201,8 +1210,14 @@ impl Metrics {
                 retirable: Mutex::new(HashMap::new()),
                 memory: crate::memory::MemoryProbes::new(),
                 last_exporters: Mutex::new(Vec::new()),
+                usage_delivery: crate::usage_delivery::UsageDeliveryHealth::default(),
             }),
         })
+    }
+
+    /// Usage delivery to the control plane.
+    pub fn usage_delivery(&self) -> &crate::usage_delivery::UsageDeliveryHealth {
+        &self.inner.usage_delivery
     }
 
     /// Record what one configuration apply cost.
@@ -1229,6 +1244,8 @@ impl Metrics {
         metrics::with_local_recorder(&self.inner.recorder, || {
             metrics::counter!(M_LOG_LINES_DROPPED_TOTAL)
                 .absolute(crate::log_writer::dropped_total());
+            metrics::gauge!(M_USAGE_DELIVERY_UNHEALTHY_SECONDS)
+                .set(self.inner.usage_delivery.unhealthy_for().as_secs_f64());
         });
     }
 

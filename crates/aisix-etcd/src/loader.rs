@@ -35,7 +35,8 @@ use aisix_core::models::{
     RateLimitPolicy, SchemaError,
 };
 use aisix_core::models::{
-    validate_pricing_lenient, validate_team_lenient, validate_user_lenient, Pricing, Team, User,
+    validate_budget_lenient, validate_budget_policy_lenient, validate_pricing_lenient,
+    validate_team_lenient, validate_user_lenient, Budget, BudgetPolicy, Pricing, Team, User,
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
@@ -524,6 +525,30 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
                     &mut stats,
                 ) {
                     snapshot.users.insert(entry);
+                }
+            }
+            "budgets" => {
+                if let Some(entry) = validate_and_parse::<Budget>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_budget_lenient,
+                    &mut stats,
+                ) {
+                    snapshot.budgets.insert(entry);
+                }
+            }
+            "budget_policy" => {
+                if let Some(entry) = validate_and_parse::<BudgetPolicy>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_budget_policy_lenient,
+                    &mut stats,
+                ) {
+                    snapshot.budget_policy.insert(entry);
                 }
             }
             "pricing" => {
@@ -1752,6 +1777,37 @@ mod tests {
         assert!(err.contains("no operations that can become tools"), "{err}");
         assert!(err.contains("POST /upload"), "{err}");
         reason("/aisix/mcp_servers/bad-header");
+    }
+
+    #[test]
+    fn budget_documents_load_by_their_key_id() {
+        let entries = vec![
+            raw(
+                "/aisix/budgets/b-1",
+                br#"{"scope":"api_key","scope_ref":"k-1","period":"month","exhausted":{"reason":{"message":"m"}}}"#,
+                1,
+            ),
+            raw(
+                "/aisix/budget_policy/env-1",
+                br#"{"fail_mode":"closed","closed_grace_seconds":120}"#,
+                2,
+            ),
+            // A scope this build does not know drops the row.
+            raw("/aisix/budgets/b-2", br#"{"scope":"project","scope_ref":"p","period":"day"}"#, 3),
+        ];
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+        assert_eq!(stats.accepted, 2, "{:?}", stats.rejections);
+        assert_eq!(stats.unknown_kind, 0);
+        assert!(snap.budgets.get_by_id("b-1").is_some());
+        assert!(snap.budgets.get_by_id("b-2").is_none());
+        assert_eq!(
+            snap.budget_policy
+                .get_by_id("env-1")
+                .unwrap()
+                .value
+                .closed_grace_seconds,
+            120
+        );
     }
 
     #[test]

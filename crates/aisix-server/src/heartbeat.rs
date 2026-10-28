@@ -91,7 +91,7 @@ pub type PartialCompatFetcher = Arc<dyn Fn() -> Vec<PartialCompatEntry> + Send +
 /// deployments where dp-manager's *server* cert is signed by a CA
 /// distinct from the cert-manager-issued one (which only signs DP
 /// *client* certs). When set, every outbound mTLS client built from
-/// this bundle (heartbeat, telemetry, BudgetClient) appends it to
+/// this bundle (heartbeat, telemetry) appends it to
 /// the verify chain. Production with public-CA certs leaves this
 /// `None`.
 #[derive(Debug, Clone)]
@@ -103,8 +103,7 @@ pub struct MtlsBundle {
 }
 
 /// Path the DP POSTs a heartbeat to, under `managed.cp_base_url`. The
-/// budget gate derives its own origin by stripping this suffix back
-/// off, and the telemetry worker by swapping it for `/dp/telemetry`.
+/// telemetry worker derives its URL by swapping it for `/dp/telemetry`.
 pub const HEARTBEAT_PATH: &str = "/dp/heartbeat";
 
 /// Build the heartbeat URL from `managed.cp_base_url`.
@@ -542,15 +541,6 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
 /// the presenting identity. Files are read here (not at config-load
 /// time) so an unreadable/rotated bundle surfaces an actionable error
 /// at the same place every other heartbeat error does.
-///
-/// Public so the BudgetClient (aisix-proxy) and any future per-request
-/// CP caller can reuse the same identity without duplicating the PEM-
-/// loading dance. `aisix-server::telemetry` keeps its own copy because
-/// it predates the extraction; consolidating later is fine.
-pub fn build_mtls_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
-    build_client(mtls)
-}
-
 fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
     let ca_pem = std::fs::read(&mtls.ca_cert_path)
         .with_context(|| format!("read {}", mtls.ca_cert_path.display()))?;

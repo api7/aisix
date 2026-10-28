@@ -444,3 +444,19 @@ just absent or off, which reads like a quiet upstream:
   that carries an assistant turn has to be added there; a buffered answer
   attaches its parts at its own `CapturedContent` site with
   `aisix_obs::OutputCollector::from_body` over the JSON the caller receives.
+
+## Every upstream credential a request spends passes the provider-key budget
+
+A `provider_key` budget caps one upstream credential, so it is judged where the
+credential is chosen, not once per request: `budget::BudgetGate::check_model` /
+`check_provider_key` against the provider key the attempt will actually use.
+`routing::resolve_attempt_models` covers every route that goes through it (it
+filters group targets beside the client-IP allowlist and refuses a direct
+model); the paths that resolve a provider key on their own — semantic
+`select_eligible`, the ensemble member and streaming-judge calls, realtime,
+`inject` passthrough routes, the files/batches/fine-tuning and video follow-up
+routes — each call the gate themselves. A new path that resolves a provider key
+for a client request must do the same. Gateway-internal calls (health checks,
+the semantic-routing and guardrail embedders) and MCP / A2A do not spend a
+provider key's budget.
+
