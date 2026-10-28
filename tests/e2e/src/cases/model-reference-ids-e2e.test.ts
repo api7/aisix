@@ -154,7 +154,7 @@ describe("model references by resource id", () => {
     embedMock = await startEmbeddingMock();
     failingEmbedMock = await startEmbeddingMock({ fail: true });
 
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const chatPk = await seed.createProviderKey({

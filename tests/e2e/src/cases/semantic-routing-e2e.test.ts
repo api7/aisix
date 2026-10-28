@@ -153,7 +153,7 @@ describe("semantic routing e2e", () => {
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     // Shared `prod-chat` fixture for the matched + default-fallthrough

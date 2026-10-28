@@ -247,8 +247,8 @@ describe("semantic cache on shared redis (vector-capable)", () => {
     const redisExtra = {
       cache: { backend: "memory", redis: { url: REDIS_URL } },
     };
-    appA = await spawnApp({ extra: redisExtra });
-    appB = await spawnApp({ extra: redisExtra, etcdPrefix: appA.etcdPrefix });
+    appA = await spawnApp({ exposeDebugHeaders: true, extra: redisExtra });
+    appB = await spawnApp({ exposeDebugHeaders: true, extra: redisExtra, etcdPrefix: appA.etcdPrefix });
     seed = new SeedClient(etcd, appA.etcdPrefix);
     ({ policyId, policyBody } = await seedFixtures(
       seed,
@@ -371,6 +371,7 @@ describe("semantic on backend=redis degrades to exact-only without vector suppor
     embedMock = await startEmbeddingMock();
     upstream = await startOpenAiUpstream();
     app = await spawnApp({
+      exposeDebugHeaders: true,
       extra: { cache: { backend: "memory", redis: { url: PLAIN_REDIS_URL } } },
     });
     const seed = new SeedClient(etcd, app.etcdPrefix);

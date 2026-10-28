@@ -142,6 +142,7 @@ describe("semantic embedding usage with a real OpenAI provider (#1747)", () => {
 
     sls = await startMockSls();
     app = await spawnApp({
+      exposeDebugHeaders: true,
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "real-provider-capture-akid",
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "real-provider-capture-secret",

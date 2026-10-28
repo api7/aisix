@@ -36,7 +36,7 @@ describe("cache hit runs output guardrails (#448)", () => {
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     upstream = await startOpenAiUpstream();
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "cache-gr-pk",

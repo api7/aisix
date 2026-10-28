@@ -171,7 +171,7 @@ describe("cache policy backend=redis on a memory-only DP disables caching", () =
     upstream = await startOpenAiUpstream();
     // Default harness config: `cache.backend = memory`, no
     // `cache.redis` block — a memory-only DP.
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     await seedApp(app, upstream.baseUrl, "cache-redis-only", "cache-canary");
     await waitCanaryPolicyLive(app.proxyUrl, "cache-canary");
   });
@@ -230,8 +230,8 @@ describe("cache policy backend=redis with a configured redis is shared across DP
     // Cache keys are scoped by resource ids (policy id, caller id), so
     // replicas MUST share the resource rows, exactly as they do behind
     // one environment in production.
-    appA = await spawnApp({ extra: redisExtra });
-    appB = await spawnApp({ extra: redisExtra, etcdPrefix: appA.etcdPrefix });
+    appA = await spawnApp({ exposeDebugHeaders: true, extra: redisExtra });
+    appB = await spawnApp({ exposeDebugHeaders: true, extra: redisExtra, etcdPrefix: appA.etcdPrefix });
     await seedApp(appA, upstream.baseUrl, "cache-redis-shared", "canary-a");
     await waitSeedLive(appA.proxyUrl);
     await waitSeedLive(appB.proxyUrl);

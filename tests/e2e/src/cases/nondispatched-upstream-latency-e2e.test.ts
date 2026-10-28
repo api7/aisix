@@ -55,6 +55,7 @@ describe("rows that reached no upstream carry no upstream latency", () => {
     failingUpstream = await startOpenAiUpstream({ status: 500, responseDelayMs: 20 });
     sls = await startMockSls();
     app = await spawnApp({
+      exposeDebugHeaders: true,
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "LTAI_mock_ak",
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock_ak_secret",

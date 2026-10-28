@@ -251,7 +251,7 @@ describe("upstream TTFT stops on the first streamed frame", () => {
     const etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
     otlp = await startOtlpReceiver();
     await seed.createObservabilityExporter({

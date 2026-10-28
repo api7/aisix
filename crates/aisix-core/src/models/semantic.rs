@@ -59,8 +59,9 @@ pub enum Aggregation {
 /// them dispatches to `target`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct SemanticRoute {
-    /// Operator-facing route label. Surfaced in the `x-aisix-route`
-    /// response header and access logs (e.g. `prod-chat -> route:legal`).
+    /// Operator-facing route label. Surfaced in access logs (e.g.
+    /// `prod-chat -> route:legal`), and in the `x-aisix-route` response
+    /// header only when `proxy.expose_debug_headers` is enabled.
     #[schemars(length(min = 1))]
     pub name: String,
     /// Direct model alias that receives traffic matching this route.

@@ -25,7 +25,8 @@
 //! When the caller wants to know *which* target actually served the
 //! request (cost attribution, "did my failover fire?", A/B analysis),
 //! the proxy emits an `x-aisix-served-by` response header carrying
-//! the winning target's display name. See `chat::chat_completions`.
+//! the winning target's display name, when `proxy.expose_debug_headers`
+//! is enabled. See `chat::chat_completions`.
 
 use aisix_gateway::{ChatChunk, ChatResponse, FinishReason, Role};
 use serde::Serialize;

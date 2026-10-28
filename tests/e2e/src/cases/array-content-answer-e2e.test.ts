@@ -180,7 +180,7 @@ describe("an answer whose content is an array of parts", () => {
     otlp = await startOtlpReceiver();
     otlpWide = await startOtlpReceiver();
 
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const model = async (name: string, upstream: OpenAiUpstream) => {
       const pk = await seed.createProviderKey({

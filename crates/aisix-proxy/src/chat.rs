@@ -360,58 +360,61 @@ pub async fn chat_completions(
                     rl_status.tpm_remaining(),
                 );
             }
-            // Correlation / routing headers.
-            if let Ok(v) = axum::http::HeaderValue::try_from(request_id.as_str()) {
-                success.response.headers_mut().insert("x-aisix-call-id", v);
-            }
-            // `x-aisix-served-by` exposes which routing target served
-            // the request — see AISIX-Cloud#410. Only emitted when a
-            // routing group was the entry point (direct models would
-            // just echo `req.model`, which the body already carries).
-            //
-            // `HeaderValue::try_from` rejects CR/LF and non-visible
-            // ASCII (RFC 7230) — correct from a response-splitting
-            // standpoint, but if a routing target's `display_name`
-            // carries such bytes the header is silently absent and
-            // a customer debugging failover would see the same wire
-            // shape as a direct-model response. Surface the rejection
-            // in DP logs so operators can rename the offending target.
-            if let Some(target) = success.served_by_target.as_deref() {
-                match axum::http::HeaderValue::try_from(target) {
-                    Ok(v) => {
-                        success
-                            .response
-                            .headers_mut()
-                            .insert("x-aisix-served-by", v);
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            target_display_name = %target,
-                            error = %err,
-                            "target display_name is not a valid HTTP header value; \
-                             omitting x-aisix-served-by — rename the target to use \
-                             only visible ASCII (no CR/LF, no non-ASCII characters)"
-                        );
+            // Correlation / routing headers — debug-only, behind
+            // `proxy.expose_debug_headers` (AISIX-Cloud#1917).
+            if state.expose_debug_headers {
+                if let Ok(v) = axum::http::HeaderValue::try_from(request_id.as_str()) {
+                    success.response.headers_mut().insert("x-aisix-call-id", v);
+                }
+                // `x-aisix-served-by` exposes which routing target served
+                // the request — see AISIX-Cloud#410. Only emitted when a
+                // routing group was the entry point (direct models would
+                // just echo `req.model`, which the body already carries).
+                //
+                // `HeaderValue::try_from` rejects CR/LF and non-visible
+                // ASCII (RFC 7230) — correct from a response-splitting
+                // standpoint, but if a routing target's `display_name`
+                // carries such bytes the header is silently absent and
+                // a customer debugging failover would see the same wire
+                // shape as a direct-model response. Surface the rejection
+                // in DP logs so operators can rename the offending target.
+                if let Some(target) = success.served_by_target.as_deref() {
+                    match axum::http::HeaderValue::try_from(target) {
+                        Ok(v) => {
+                            success
+                                .response
+                                .headers_mut()
+                                .insert("x-aisix-served-by", v);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target_display_name = %target,
+                                error = %err,
+                                "target display_name is not a valid HTTP header value; \
+                                 omitting x-aisix-served-by — rename the target to use \
+                                 only visible ASCII (no CR/LF, no non-ASCII characters)"
+                            );
+                        }
                     }
                 }
-            }
-            // `x-aisix-route` exposes which semantic route matched (#641).
-            // Only present for a semantic router that resolved to a route;
-            // absent on a fall-through to `default` and on non-semantic
-            // requests. Same RFC 7230 header-value guard as above.
-            if let Some(route) = success.served_by_route.as_deref() {
-                match axum::http::HeaderValue::try_from(route) {
-                    Ok(v) => {
-                        success.response.headers_mut().insert("x-aisix-route", v);
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            route_name = %route,
-                            error = %err,
-                            "semantic route name is not a valid HTTP header value; \
-                             omitting x-aisix-route — rename the route to use only \
-                             visible ASCII (no CR/LF, no non-ASCII characters)"
-                        );
+                // `x-aisix-route` exposes which semantic route matched (#641).
+                // Only present for a semantic router that resolved to a route;
+                // absent on a fall-through to `default` and on non-semantic
+                // requests. Same RFC 7230 header-value guard as above.
+                if let Some(route) = success.served_by_route.as_deref() {
+                    match axum::http::HeaderValue::try_from(route) {
+                        Ok(v) => {
+                            success.response.headers_mut().insert("x-aisix-route", v);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                route_name = %route,
+                                error = %err,
+                                "semantic route name is not a valid HTTP header value; \
+                                 omitting x-aisix-route — rename the route to use only \
+                                 visible ASCII (no CR/LF, no non-ASCII characters)"
+                            );
+                        }
                     }
                 }
             }
@@ -829,8 +832,9 @@ struct Success {
     cache_hit_saved_output_tokens: u32,
     /// Display name of the routing target that actually served this
     /// request (AISIX-Cloud#410). Surfaces in the `x-aisix-served-by`
-    /// response header so callers can tell which target inside a
-    /// routing group won the failover loop.
+    /// response header (when `proxy.expose_debug_headers` is enabled) so
+    /// callers can tell which target inside a routing group won the
+    /// failover loop.
     ///
     /// `None` in two cases:
     ///   - Direct (non-routing) model — `display_name` of the served
@@ -844,8 +848,9 @@ struct Success {
     /// the routing group's display name.
     served_by_target: Option<String>,
     /// Name of the semantic route that matched this request (#641).
-    /// Surfaces in the `x-aisix-route` response header so callers can see
-    /// which intent the router resolved to. `None` for non-semantic
+    /// Surfaces in the `x-aisix-route` response header (when
+    /// `proxy.expose_debug_headers` is enabled) so callers can see which
+    /// intent the router resolved to. `None` for non-semantic
     /// requests and for a semantic request that fell through to `default`.
     served_by_route: Option<String>,
     routing: RoutingTelemetry,
@@ -1379,9 +1384,10 @@ fn last_user_message_text(req: &ChatFormat) -> Option<String> {
 /// - Anything else (direct model, no winner, cache hit) → `None`.
 ///
 /// `None` is the wire signal "this was not a routing request" — the
-/// `x-aisix-served-by` response header is emitted only when the
-/// returned `Option` is `Some`, so its presence alone tells callers
-/// that failover routing fired. Direct-model responses must never
+/// `x-aisix-served-by` response header (sent only with
+/// `proxy.expose_debug_headers`) is emitted only when the returned
+/// `Option` is `Some`, so its presence alone tells callers that
+/// failover routing fired. Direct-model responses must never
 /// carry the header.
 fn served_by_target_for_routing(
     is_routing_request: bool,
@@ -3002,16 +3008,18 @@ async fn dispatch(
                     );
                 }
                 let mut response = Json(render_response(now, cached, &req.model)).into_response();
-                response
-                    .headers_mut()
-                    .insert(CACHE_HEADER, HeaderValue::from_static("hit"));
-                response.headers_mut().insert(
-                    CACHE_LAYER_HEADER,
-                    HeaderValue::from_static(hit_layer.as_str()),
-                );
-                if let Some(similarity) = hit_similarity {
-                    if let Ok(v) = HeaderValue::try_from(format!("{similarity:.4}")) {
-                        response.headers_mut().insert(CACHE_SIMILARITY_HEADER, v);
+                if state.expose_debug_headers {
+                    response
+                        .headers_mut()
+                        .insert(CACHE_HEADER, HeaderValue::from_static("hit"));
+                    response.headers_mut().insert(
+                        CACHE_LAYER_HEADER,
+                        HeaderValue::from_static(hit_layer.as_str()),
+                    );
+                    if let Some(similarity) = hit_similarity {
+                        if let Ok(v) = HeaderValue::try_from(format!("{similarity:.4}")) {
+                            response.headers_mut().insert(CACHE_SIMILARITY_HEADER, v);
+                        }
                     }
                 }
                 return Ok(Success {
@@ -3671,6 +3679,7 @@ async fn dispatch(
     // gate ran. `bypass` = the caller's `Cache-Control: no-cache`
     // skipped the read path.
     match cache_status {
+        _ if !state.expose_debug_headers => {}
         CacheStatus::Miss => {
             response
                 .headers_mut()

@@ -220,7 +220,7 @@ describe("semantic classifier e2e", () => {
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
-    app = await spawnApp({ logLevel: "info" });
+    app = await spawnApp({ exposeDebugHeaders: true, logLevel: "info" });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     decisions = await startDecisionMock();

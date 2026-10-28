@@ -166,7 +166,7 @@ describe("per-attempt telemetry e2e (#655): one UsageEvent per upstream attempt"
     const etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
     otlp = await startOtlpReceiver();
     await seed.createObservabilityExporter({

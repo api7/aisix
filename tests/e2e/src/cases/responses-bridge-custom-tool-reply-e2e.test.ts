@@ -227,6 +227,7 @@ describe("bridged custom tool calls come back as custom_tool_call items", () => 
     });
 
     app = await spawnApp({
+      exposeDebugHeaders: true,
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: MOCK_AK_ID,
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: MOCK_AK_SECRET,

@@ -165,6 +165,7 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
     // The access log is a `tracing::info!` event; the harness defaults the
     // gateway to `warn`.
     app = await spawnApp({
+      exposeDebugHeaders: true,
       extraEnv: {
         RUST_LOG: "info",
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "LTAI_mock_ak",

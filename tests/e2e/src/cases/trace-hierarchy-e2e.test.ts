@@ -90,7 +90,7 @@ describe("trace hierarchy e2e (AISIX-Cloud#1279)", () => {
     const etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,

@@ -395,6 +395,7 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
       streamEvents: STREAM_EVENTS,
     });
     app = await spawnApp({
+      exposeDebugHeaders: true,
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-secret",

@@ -143,7 +143,7 @@ describe("client-supplied request id (AISIX-Cloud#1288)", () => {
     const etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
     otlp = await startOtlpReceiver();
     await seed.createObservabilityExporter({
@@ -490,6 +490,7 @@ describe("client-supplied request id: x-request-id opted in", () => {
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     app = await spawnApp({
+      exposeDebugHeaders: true,
       requestId: { accept_headers: ["x-aisix-request-id", "x-request-id"] },
     });
     seed = new SeedClient(etcd, app.etcdPrefix);

@@ -204,7 +204,7 @@ describe("semantic router member gates e2e", () => {
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const embed = await startEmbeddingMock();
