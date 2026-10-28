@@ -1780,6 +1780,37 @@ mod tests {
     }
 
     #[test]
+    fn budget_documents_load_by_their_key_id() {
+        let entries = vec![
+            raw(
+                "/aisix/budgets/b-1",
+                br#"{"scope":"api_key","scope_ref":"k-1","period":"month","exhausted":{"reason":{"message":"m"}}}"#,
+                1,
+            ),
+            raw(
+                "/aisix/budget_policy/env-1",
+                br#"{"fail_mode":"closed","closed_grace_seconds":120}"#,
+                2,
+            ),
+            // A scope this build does not know drops the row.
+            raw("/aisix/budgets/b-2", br#"{"scope":"project","scope_ref":"p","period":"day"}"#, 3),
+        ];
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+        assert_eq!(stats.accepted, 2, "{:?}", stats.rejections);
+        assert_eq!(stats.unknown_kind, 0);
+        assert!(snap.budgets.get_by_id("b-1").is_some());
+        assert!(snap.budgets.get_by_id("b-2").is_none());
+        assert_eq!(
+            snap.budget_policy
+                .get_by_id("env-1")
+                .unwrap()
+                .value
+                .closed_grace_seconds,
+            120
+        );
+    }
+
+    #[test]
     fn team_and_user_documents_load_by_their_key_id() {
         let entries = vec![
             raw("/aisix/teams/team-1", br#"{"name":"Platform"}"#, 1),

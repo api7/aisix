@@ -247,3 +247,53 @@ impl Resource for BudgetPolicy {
         "budget_policy"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::models::{validate_budget, validate_budget_lenient, validate_budget_policy};
+    use serde_json::json;
+
+    /// The per-scope shape is a write-path rule only: the stored row still
+    /// loads, and a row without its target matches nothing.
+    #[test]
+    fn the_per_scope_shape_binds_the_write_path_only() {
+        for doc in [
+            json!({"scope": "tag", "period": "day"}),
+            json!({"scope": "tag", "scope_ref": "x", "tag": {"key": "k", "value": "v"}, "period": "day"}),
+            json!({"scope": "team", "period": "day"}),
+            json!({"scope": "team", "scope_ref": "t", "tag": {"key": "k", "value": "v"}, "period": "day"}),
+            json!({"scope": "team", "scope_ref": "t", "period": "day", "exhausted_members": {}}),
+        ] {
+            assert!(validate_budget(&doc).is_err(), "strict accepted {doc}");
+            assert!(
+                validate_budget_lenient(&doc).is_ok(),
+                "lenient rejected {doc}"
+            );
+        }
+        for doc in [
+            json!({"scope": "tag", "tag": {"key": "k", "value": "v"}, "period": "week"}),
+            json!({"scope": "team_member", "scope_ref": "t", "period": "month",
+                   "exhausted_members": {"u": {"period_start": "2026-10-01T00:00:00Z", "reason": {}}}}),
+            json!({"scope": "provider_key", "scope_ref": "pk", "period": "day",
+                   "exhausted": {"reason": {"message": "m", "limit_usd": "0.00"}}}),
+        ] {
+            assert!(validate_budget(&doc).is_ok(), "strict rejected {doc}");
+        }
+    }
+
+    #[test]
+    fn the_policy_grace_is_a_positive_integer() {
+        assert!(
+            validate_budget_policy(&json!({"fail_mode": "closed", "closed_grace_seconds": 1}))
+                .is_ok()
+        );
+        assert!(
+            validate_budget_policy(&json!({"fail_mode": "closed", "closed_grace_seconds": 0}))
+                .is_err()
+        );
+        assert!(
+            validate_budget_policy(&json!({"fail_mode": "open", "closed_grace_seconds": 60}))
+                .is_err()
+        );
+    }
+}

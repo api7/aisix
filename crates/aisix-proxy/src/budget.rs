@@ -446,4 +446,296 @@ mod tests {
             "2027-01-01T00:00:00+00:00"
         );
     }
+
+    fn snapshot_with(budgets: &[(&str, serde_json::Value)]) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        for (id, doc) in budgets {
+            let budget: Budget = serde_json::from_value(doc.clone()).unwrap();
+            snap.budgets.insert(ResourceEntry::new(*id, budget, 1));
+        }
+        snap.teams.insert(ResourceEntry::new(
+            "team-1",
+            serde_json::from_value(
+                serde_json::json!({"name": "T", "tags": {"dept": "team-dept", "cc": "team-cc"}}),
+            )
+            .unwrap(),
+            1,
+        ));
+        snap.users.insert(ResourceEntry::new(
+            "user-1",
+            serde_json::from_value(
+                serde_json::json!({"name": "U", "tags": {"dept": "user-dept", "region": "eu"}}),
+            )
+            .unwrap(),
+            1,
+        ));
+        snap
+    }
+
+    fn key(snap: &AisixSnapshot, id: &str, doc: serde_json::Value) -> AuthenticatedKey {
+        let mut doc = doc;
+        doc["key_hash"] = serde_json::json!("h");
+        let entry = Arc::new(ResourceEntry::new(
+            id,
+            serde_json::from_value(doc).unwrap(),
+            1,
+        ));
+        AuthenticatedKey::new(snap, entry, None, false)
+    }
+
+    fn gate_at(snap: &AisixSnapshot, now: DateTime<Utc>, unverified: bool) -> BudgetGate {
+        BudgetGate {
+            index: Arc::new(BudgetIndex::build(&snap.budgets)),
+            now,
+            unverified,
+        }
+    }
+
+    fn exhausted(
+        scope: &str,
+        target: serde_json::Value,
+        period_start: Option<&str>,
+    ) -> serde_json::Value {
+        let mut exhausted =
+            serde_json::json!({"reason": {"message": format!("{scope} out"), "scope": scope}});
+        if let Some(start) = period_start {
+            exhausted["period_start"] = serde_json::json!(start);
+        }
+        let mut doc =
+            serde_json::json!({"scope": scope, "period": "month", "exhausted": exhausted});
+        doc.as_object_mut()
+            .unwrap()
+            .extend(target.as_object().unwrap().clone());
+        doc
+    }
+
+    fn denied_scope(v: Verdict) -> Option<String> {
+        match v {
+            Verdict::Exceeded(r) => r.scope,
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_most_specific_exhausted_budget_is_reported() {
+        let snap = snapshot_with(&[
+            (
+                "b-org",
+                exhausted("org", serde_json::json!({"scope_ref": "o"}), None),
+            ),
+            (
+                "b-team",
+                exhausted("team", serde_json::json!({"scope_ref": "team-1"}), None),
+            ),
+            (
+                "b-member",
+                exhausted("member", serde_json::json!({"scope_ref": "user-1"}), None),
+            ),
+            (
+                "b-tm",
+                exhausted(
+                    "team_member",
+                    serde_json::json!({"scope_ref": "team-1"}),
+                    None,
+                ),
+            ),
+        ]);
+        let now = at(2026, 10, 29, 13);
+        let k = key(
+            &snap,
+            "k-1",
+            serde_json::json!({"team_id": "team-1", "user_id": "user-1"}),
+        );
+        // member and team_member share a rank; the control plane keeps the
+        // one whose scope sorts first.
+        assert_eq!(
+            denied_scope(gate_at(&snap, now, false).key_verdict(&k)).as_deref(),
+            Some("member")
+        );
+        // A key of no team and no member meets only the org budget.
+        let lone = key(&snap, "k-2", serde_json::json!({}));
+        assert_eq!(
+            denied_scope(gate_at(&snap, now, false).key_verdict(&lone)).as_deref(),
+            Some("org")
+        );
+    }
+
+    #[test]
+    fn an_exhausted_mark_lifts_at_the_period_boundary() {
+        let snap = snapshot_with(&[(
+            "b-1",
+            exhausted(
+                "api_key",
+                serde_json::json!({"scope_ref": "k-1"}),
+                Some("2026-10-01T00:00:00Z"),
+            ),
+        )]);
+        let k = key(&snap, "k-1", serde_json::json!({}));
+        assert!(matches!(
+            gate_at(&snap, at(2026, 10, 31, 23), false).key_verdict(&k),
+            Verdict::Exceeded(_)
+        ));
+        assert!(matches!(
+            gate_at(&snap, at(2026, 11, 1, 0), false).key_verdict(&k),
+            Verdict::Allow
+        ));
+        // An unparsable start never matches.
+        let snap = snapshot_with(&[(
+            "b-1",
+            exhausted(
+                "api_key",
+                serde_json::json!({"scope_ref": "k-1"}),
+                Some("October"),
+            ),
+        )]);
+        assert!(matches!(
+            gate_at(&snap, at(2026, 10, 2, 0), false).key_verdict(&k),
+            Verdict::Allow
+        ));
+    }
+
+    #[test]
+    fn team_member_blocks_per_member() {
+        let doc = serde_json::json!({
+            "scope": "team_member", "scope_ref": "team-1", "period": "day",
+            "exhausted_members": {"user-1": {"period_start": "2026-10-29T00:00:00Z", "reason": {"message": "you"}}}
+        });
+        let snap = snapshot_with(&[("b-1", doc)]);
+        let now = at(2026, 10, 29, 13);
+        let blocked = key(
+            &snap,
+            "k-1",
+            serde_json::json!({"team_id": "team-1", "user_id": "user-1"}),
+        );
+        let other = key(
+            &snap,
+            "k-2",
+            serde_json::json!({"team_id": "team-1", "user_id": "user-2"}),
+        );
+        let no_member = key(&snap, "k-3", serde_json::json!({"team_id": "team-1"}));
+        let gate = gate_at(&snap, now, false);
+        assert!(matches!(gate.key_verdict(&blocked), Verdict::Exceeded(_)));
+        assert!(matches!(gate.key_verdict(&other), Verdict::Allow));
+        assert!(matches!(gate.key_verdict(&no_member), Verdict::Allow));
+        // Strict mode: the budget applies to a member of the team only.
+        let strict = gate_at(&snap, now, true);
+        assert!(matches!(strict.key_verdict(&other), Verdict::Unverified));
+        assert!(matches!(strict.key_verdict(&no_member), Verdict::Allow));
+    }
+
+    #[test]
+    fn a_tag_budget_matches_the_effective_tag_value() {
+        let snap = snapshot_with(&[
+            (
+                "b-team",
+                exhausted(
+                    "tag",
+                    serde_json::json!({"tag": {"key": "dept", "value": "team-dept"}}),
+                    None,
+                ),
+            ),
+            (
+                "b-user",
+                exhausted(
+                    "tag",
+                    serde_json::json!({"tag": {"key": "dept", "value": "user-dept"}}),
+                    None,
+                ),
+            ),
+        ]);
+        let now = at(2026, 10, 29, 13);
+        let gate = gate_at(&snap, now, false);
+        // The team's value beats the member's; the member's budget does not apply.
+        let k = key(
+            &snap,
+            "k-1",
+            serde_json::json!({"team_id": "team-1", "user_id": "user-1"}),
+        );
+        let Verdict::Exceeded(r) = gate.key_verdict(&k) else {
+            panic!("team value applies")
+        };
+        assert_eq!(r.message, "tag out");
+        // The key's own value beats both.
+        let own = key(
+            &snap,
+            "k-2",
+            serde_json::json!({"team_id": "team-1", "user_id": "user-1", "tags": {"dept": "mine"}}),
+        );
+        assert!(matches!(gate.key_verdict(&own), Verdict::Allow));
+        // With no team, the member's value applies.
+        let member_only = key(&snap, "k-3", serde_json::json!({"user_id": "user-1"}));
+        assert!(matches!(
+            gate.key_verdict(&member_only),
+            Verdict::Exceeded(_)
+        ));
+    }
+
+    #[test]
+    fn the_reason_is_restated_with_the_gateways_own_reset() {
+        let mut doc = exhausted(
+            "api_key",
+            serde_json::json!({"scope_ref": "k-1"}),
+            Some("2026-10-01T00:00:00Z"),
+        );
+        doc["exhausted"]["reason"] = serde_json::json!({
+            "message": "api key budget 'x' exceeded", "scope": "api_key", "scope_ref": "k-1",
+            "limit_usd": "10", "spent_usd": "10.5", "remaining_usd": "-0.5", "period": "month",
+            "period_resets_at": "1999-01-01T00:00:00Z", "retry_after_seconds": 5
+        });
+        let snap = snapshot_with(&[("b-1", doc)]);
+        let now = Utc.with_ymd_and_hms(2026, 10, 31, 23, 0, 0).unwrap();
+        let k = key(&snap, "k-1", serde_json::json!({}));
+        let Verdict::Exceeded(r) = gate_at(&snap, now, false).key_verdict(&k) else {
+            panic!()
+        };
+        assert_eq!(r.limit_usd.as_deref(), Some("10.00"));
+        assert_eq!(r.spent_usd.as_deref(), Some("10.50"));
+        assert_eq!(r.period_resets_at.as_deref(), Some("2026-11-01T00:00:00Z"));
+        assert_eq!(r.retry_after_seconds, Some(3600));
+        assert_eq!(r.gauges().remaining_usd, Some(-0.5));
+    }
+
+    #[test]
+    fn provider_key_budgets_are_judged_per_credential() {
+        let snap = snapshot_with(&[
+            (
+                "b-1",
+                exhausted(
+                    "provider_key",
+                    serde_json::json!({"scope_ref": "pk-out"}),
+                    None,
+                ),
+            ),
+            (
+                "b-2",
+                serde_json::json!({"scope": "provider_key", "scope_ref": "pk-ok", "period": "day"}),
+            ),
+        ]);
+        let now = at(2026, 10, 29, 13);
+        let gate = gate_at(&snap, now, false);
+        assert!(matches!(
+            gate.provider_key_verdict("pk-out"),
+            Verdict::Exceeded(_)
+        ));
+        assert!(matches!(gate.provider_key_verdict("pk-ok"), Verdict::Allow));
+        assert!(matches!(
+            gate.provider_key_verdict("pk-none"),
+            Verdict::Allow
+        ));
+        // A provider_key budget never applies at key level.
+        let k = key(&snap, "k-1", serde_json::json!({}));
+        assert!(matches!(
+            gate_at(&snap, now, true).key_verdict(&k),
+            Verdict::Allow
+        ));
+        let strict = gate_at(&snap, now, true);
+        assert!(matches!(
+            strict.provider_key_verdict("pk-ok"),
+            Verdict::Unverified
+        ));
+        assert!(matches!(
+            strict.provider_key_verdict("pk-none"),
+            Verdict::Allow
+        ));
+    }
 }
