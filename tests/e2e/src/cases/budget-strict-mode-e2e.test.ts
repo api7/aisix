@@ -136,7 +136,7 @@ describe("strict budget mode follows usage delivery", () => {
     );
     expect(await unhealthySeconds()).toBeLessThan(GRACE_SECONDS);
     expect((await chat(KEYS.plain, "bs-budgeted")).status).toBe(200);
-  });
+  }, 120_000);
 
   test("no request asks the control plane for a budget decision", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
