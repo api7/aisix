@@ -103,8 +103,7 @@ pub struct MtlsBundle {
 }
 
 /// Path the DP POSTs a heartbeat to, under `managed.cp_base_url`. The
-/// budget gate derives its own origin by stripping this suffix back
-/// off, and the telemetry worker by swapping it for `/dp/telemetry`.
+/// telemetry worker derives its URL by swapping it for `/dp/telemetry`.
 pub const HEARTBEAT_PATH: &str = "/dp/heartbeat";
 
 /// Build the heartbeat URL from `managed.cp_base_url`.

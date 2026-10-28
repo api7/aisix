@@ -2180,11 +2180,9 @@ fn dpmgr_origin(heartbeat_url: &str) -> &str {
 /// Telemetry URL, derived from the heartbeat URL by swapping the path
 /// suffix so the two stay in lock-step on a `cp_base_url` change.
 ///
-/// Built on `dpmgr_origin` rather than a `replace`, so the two
-/// derivations cannot read one base differently: a replace rewrites
+/// Built on `dpmgr_origin` rather than a `replace`: a replace rewrites
 /// every occurrence, and a base that itself ends in `/dp/heartbeat`
-/// would then yield `…/dp/telemetry/dp/telemetry` while the budget
-/// gate's suffix strip left the origin alone.
+/// would then yield `…/dp/telemetry/dp/telemetry`.
 fn telemetry_url(heartbeat_url: &str) -> String {
     format!(
         "{}{}",
@@ -4033,13 +4031,11 @@ mcp_servers:
         );
     }
 
-    /// All four consumers of `managed.cp_base_url` must read the same
+    /// All three consumers of `managed.cp_base_url` must read the same
     /// origin. Before AISIX-Cloud#1643 only the etcd dial attached a
     /// scheme of its own, so a bare `host:port` connected to etcd — the
-    /// console showed the gateway healthy — while heartbeat, telemetry
-    /// and budget check each concatenated a path onto a value reqwest
-    /// cannot parse, and the budget gate's sticky-deny fallback turned
-    /// every proxied request into a 429.
+    /// console showed the gateway healthy — while heartbeat and telemetry
+    /// each concatenated a path onto a value reqwest cannot parse.
     #[test]
     fn managed_urls_agree_on_a_scheme_less_cp_base_url() {
         let file = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
@@ -4124,8 +4120,8 @@ managed:
     /// uses one), and the three derivations must still agree on it. The
     /// telemetry URL is the one that can drift: derived by rewriting
     /// every `/dp/heartbeat` it finds, a base ending in that path would
-    /// have produced `…/dp/telemetry/dp/telemetry` while the budget
-    /// gate's suffix strip returned the origin untouched.
+    /// have produced `…/dp/telemetry/dp/telemetry` while `dpmgr_origin`
+    /// returned the origin untouched.
     #[test]
     fn managed_urls_agree_on_a_base_carrying_a_path() {
         let hb = heartbeat::heartbeat_url("https://cp.example.com/api");
@@ -4580,7 +4576,7 @@ managed:
                 axum::routing::get(|| async {
                     // An upgrade handler that awaits before answering, as
                     // `/v1/realtime` does whenever authentication has to
-                    // go out (a JWKS fetch, a budget check).
+                    // go out (a JWKS fetch).
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     axum::http::Response::builder()
                         .status(axum::http::StatusCode::SWITCHING_PROTOCOLS)

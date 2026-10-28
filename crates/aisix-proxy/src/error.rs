@@ -96,9 +96,8 @@ pub struct PolicyErrorRef {
 }
 
 /// The structured budget fields that `budget_exceeded` 429s lift from
-/// cp-api's reason. Flattened into `ErrorBody`. Each field is omitted
-/// when absent so a fallback-mode denial (cp-api unreachable, no
-/// structured detail) still serializes cleanly with just a message.
+/// the exhausted budget's reason. Flattened into `ErrorBody`. Each field
+/// is omitted when the reason does not carry it.
 #[derive(Debug, Serialize, Clone)]
 pub struct BudgetErrorFields {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -323,8 +322,8 @@ pub enum ProxyError {
         message: String,
         unavailable: Option<String>,
     },
-    // Carries cp-api's structured reason. Display forwards the cp-api
-    // message verbatim (it's already a complete customer sentence —
+    // Carries the budget document's structured reason. Display forwards
+    // its message verbatim (it's already a complete customer sentence —
     // "<scope> budget '<name>' exceeded ($X/period). Resets …"); the
     // structured fields ride along in the 429 error block via
     // `with_budget` (prd-09b §5.8).
@@ -1565,7 +1564,7 @@ mod tests {
 
     #[test]
     fn openai_envelope_budget_exceeded_carries_structured_fields() {
-        // prd-09b §5.8: the budget_exceeded 429 lifts cp-api's structured
+        // prd-09b §5.8: the budget_exceeded 429 lifts the budget's structured
         // reason into the error block. Pin scope / scope_ref / limit_usd /
         // spent_usd / period so a regression that drops them (the old
         // String-only variant) fails here.

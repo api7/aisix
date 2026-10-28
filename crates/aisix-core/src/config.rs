@@ -430,12 +430,10 @@ const CP_BASE_URL_ENV: &str = "AISIX_MANAGED__CP_BASE_URL";
 ///
 /// The etcd dial strips whatever scheme is there and re-attaches
 /// `https://`, so a scheme-less `host:port` reached etcd and the
-/// console reported the gateway healthy — while the three REST
-/// consumers (heartbeat, telemetry, budget check) concatenated a path
-/// onto a value reqwest cannot parse as a URL, failed at request
-/// build, and logged one WARN per tick. The budget gate's no-cache
-/// fallback is a sticky deny, so every proxied request answered
-/// `429 budget_exceeded` (AISIX-Cloud#1643).
+/// console reported the gateway healthy — while the REST consumers
+/// (heartbeat, telemetry) concatenated a path onto a value reqwest
+/// cannot parse as a URL, failed at request build, and logged one WARN
+/// per tick (AISIX-Cloud#1643).
 ///
 /// The control plane normalises its own copy of this value by the same
 /// rule; keep the two in step.
@@ -3337,16 +3335,14 @@ observability:
         assert!(ObservabilityConfig::default().retired_settings().is_empty());
     }
 
-    /// `managed.cp_base_url` reaches four consumers with two different
+    /// `managed.cp_base_url` reaches three consumers with two different
     /// appetites: the etcd dial strips whatever scheme is there and
-    /// re-attaches `https://`, while heartbeat / telemetry / budget
-    /// concatenate a path onto the value verbatim. A scheme-less
-    /// `host:port` therefore used to dial etcd happily — so the console
-    /// showed the gateway connected — while every REST call failed at
-    /// request build and the budget gate's no-cache fallback turned
-    /// every proxied request into `429 budget_exceeded`
+    /// re-attaches `https://`, while heartbeat / telemetry concatenate a
+    /// path onto the value verbatim. A scheme-less `host:port` therefore
+    /// used to dial etcd happily — so the console showed the gateway
+    /// connected — while every REST call failed at request build
     /// (AISIX-Cloud#1643). Normalising once at load is what keeps the
-    /// four readings identical.
+    /// three readings identical.
     fn load_with_cp_base_url(value: &str) -> Result<Config, BootstrapError> {
         let f = write_yaml(&format!(
             r#"
