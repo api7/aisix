@@ -141,7 +141,7 @@ required on **both** sets. A scriptless `custom` row screens nothing
 either way, so rejecting it is what makes it visible in
 `GET /status/config`'s `rejected[]`.
 
-These come from the eight producers that take a `strict` flag in
+These come from the nine producers that take a `strict` flag in
 `crates/aisix-core/src/models/schema.rs` and are deliberate.
 
 One consequence is registered rather than fixed: the gateway's own Admin
