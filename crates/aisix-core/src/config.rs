@@ -3280,6 +3280,20 @@ observability:
         assert!(ObservabilityConfig::default().retired_settings().is_empty());
     }
 
+    #[test]
+    fn the_shipped_example_configs_carry_no_retired_setting() {
+        for shipped in [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.example.yaml"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.managed.yaml"),
+        ] {
+            let cfg = Config::load_from_path(Some(Path::new(shipped))).unwrap();
+            assert!(
+                cfg.observability.retired_settings().is_empty(),
+                "{shipped} must not ship a retired setting"
+            );
+        }
+    }
+
     /// `managed.cp_base_url` reaches three consumers with two different
     /// appetites: the etcd dial strips whatever scheme is there and
     /// re-attaches `https://`, while heartbeat / telemetry concatenate a
@@ -3702,9 +3716,15 @@ admin:
     /// still carrying either one now fails to load like any other unknown key.
     #[test]
     fn legacy_static_otlp_blocks_are_rejected() {
-        for (block, field) in [
-            ("metrics:\n    otlp:\n      enabled: false", "otlp"),
-            ("tracing:\n    otlp:\n      enabled: false", "tracing"),
+        for (block, expected) in [
+            (
+                "metrics:\n    otlp:\n      enabled: false",
+                "observability.metrics.otlp: unknown field `otlp`",
+            ),
+            (
+                "tracing:\n    otlp:\n      enabled: false",
+                "observability.tracing: unknown field `tracing`",
+            ),
         ] {
             let f = write_yaml(&format!(
                 r#"
@@ -3722,10 +3742,7 @@ observability:
             let err = Config::load_from_path(Some(f.path()))
                 .expect_err("a retired OTLP block must not load")
                 .to_string();
-            assert!(
-                err.contains(&format!("unknown field `{field}`")),
-                "{block}: {err}"
-            );
+            assert!(err.contains(expected), "{block}: {err}");
         }
     }
 
