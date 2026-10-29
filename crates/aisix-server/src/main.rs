@@ -239,8 +239,12 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
     // live resource snapshot, not a boot-time pipeline.
     init_tracing(&cfg.observability).map_err(|e| anyhow::anyhow!("tracing init failed: {e}"))?;
 
-    // Settings that still parse but do nothing. Warned about only now,
-    // because the subscriber above is what makes a warning visible at all.
+    // Keys that name no setting, and setting values that do nothing. Warned
+    // about only now, because the subscriber above is what makes a warning
+    // visible at all.
+    for ignored in cfg.ignored_keys() {
+        tracing::warn!("{ignored}");
+    }
     for retired in cfg.observability.retired_settings() {
         tracing::warn!("{retired}");
     }

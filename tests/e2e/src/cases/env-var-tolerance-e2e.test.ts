@@ -4,9 +4,9 @@ import { spawnApp, type SpawnedApp } from "../harness/index.js";
 // E2E: an `AISIX_*` environment variable the gateway does not recognise
 // must not stop it from starting.
 //
-// The gateway reads `AISIX_<SECTION>__<KEY>` as configuration overrides
-// and its root config struct rejects unknown fields, so anything else
-// prefixed `AISIX_` used to abort the boot with `unknown field`. Two
+// The gateway reads `AISIX_<SECTION>__<KEY>` as configuration overrides,
+// and up to 1.7.x it refused any key it did not know, so anything else
+// prefixed `AISIX_` aborted the boot with `unknown field`. Two
 // environments produce such names without anyone asking for them:
 //
 //   - Kubernetes service links. Every pod in a namespace gets six or seven
@@ -60,6 +60,30 @@ describe("unrecognised AISIX_* environment variables", () => {
       "AISIX_OSS_PORT_9090_TCP_PROTO was not applied as a configuration override",
     );
     expect(log).toContain("enableServiceLinks: false");
+  });
+
+  test("a key the gateway does not know under a real section is ignored and named", async () => {
+    // A misspelled setting and a block a release retired, both under real
+    // sections: they reach the deserializer, which ignores them. Before
+    // 1.8.0 either one stopped the gateway with `unknown field`.
+    app = await spawnApp({
+      resourcesFile: RESOURCES,
+      extraEnv: {
+        AISIX_PROXY__EXPOSE_DEBUG_HEADER: "true",
+        AISIX_OBSERVABILITY__METRICS__OTLP__ENABLED: "false",
+      },
+    });
+
+    const livez = await fetch(`${app.proxyUrl}/livez`);
+    expect(livez.status).toBe(200);
+
+    const log = app.output();
+    expect(log).toContain(
+      "proxy.expose_debug_header (set by AISIX_PROXY__EXPOSE_DEBUG_HEADER) is not a setting this gateway knows and was ignored.",
+    );
+    expect(log).toContain(
+      "observability.metrics.otlp (set by AISIX_OBSERVABILITY__METRICS__OTLP__ENABLED) is not a setting this gateway knows and was ignored.",
+    );
   });
 
   test("AISIX_CONFIG starts the gateway without a --config argument", async () => {

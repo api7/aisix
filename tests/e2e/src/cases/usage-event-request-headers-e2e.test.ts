@@ -10,7 +10,6 @@ import {
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
-  waitForLogLine,
   waitForSlsLog,
   type McpUpstream,
   type MockSls,
@@ -370,80 +369,3 @@ async function waitForSpan(
   }
   throw new Error(`timed out waiting for ${what}`);
 }
-
-describe("observability.usage_event.request_headers is retired", () => {
-  let sls: MockSls | undefined;
-  let upstream: OpenAiUpstream | undefined;
-  let app: SpawnedApp | undefined;
-
-  afterAll(async () => {
-    await app?.exit();
-    await upstream?.close();
-    await sls?.close();
-  });
-
-  test("the 1.6.0 key still boots, warns once naming the exporter field, and records nothing", async (ctx) => {
-    const etcd = new EtcdClient();
-    if (!(await etcd.ping())) return ctx.skip();
-    sls = await startMockSls();
-    upstream = await startOpenAiUpstream();
-    // A list the old validation refused boots too: nothing reads it.
-    app = await spawnApp({
-      usageEventRequestHeaders: ["x-sub-user", "authorization"],
-      logLevel: "warn",
-      extraEnv: {
-        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "LTAI_mock_ak",
-        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock_ak_secret",
-      },
-    });
-    const warning = await waitForLogLine(
-      app,
-      (l) => l.includes("observability.usage_event") && l.includes("observability_exporters"),
-      "the retired-key warning",
-    );
-    expect(warning).toMatch(/WARN/i);
-
-    const seed = new SeedClient(etcd, app.etcdPrefix);
-    await seed.createObservabilityExporter({
-      name: "urh-retired-sls",
-      enabled: true,
-      kind: "aliyun_sls",
-      endpoint: sls.url,
-      project: "aisix-e2e-obs",
-      logstore: "urh-retired",
-      credential_ref: CREDENTIAL_REF,
-    });
-    const pk = await seed.createProviderKey({
-      display_name: "urh-retired-pk",
-      secret: "sk-mock",
-      api_base: `${upstream.baseUrl}/v1`,
-    });
-    await seed.createModel({
-      display_name: MODEL,
-      provider: "openai",
-      model_name: "gpt-4o-mini",
-      provider_key_id: pk.id,
-    });
-    await seed.createApiKey({ key_hash: hash(PLAINTEXT), allowed_models: ["*"] });
-    const proxy = new ProxyClient(app.proxyUrl, PLAINTEXT);
-    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
-
-    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${PLAINTEXT}`,
-        "content-type": "application/json",
-        "x-sub-user": "alice",
-      },
-      body: JSON.stringify(chat()),
-    });
-    expect(res.status).toBe(200);
-    const requestId = res.headers.get("x-aisix-request-id") ?? "";
-    const row = await waitForSlsLog(sls, "urh-retired", (l) => l.get("request_id") === requestId, "row");
-    expect(row.get("request_headers")).toBeUndefined();
-  }, 60_000);
-
-  function chat() {
-    return { model: MODEL, messages: [{ role: "user", content: "hi" }] };
-  }
-});
