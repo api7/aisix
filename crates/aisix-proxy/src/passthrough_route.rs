@@ -1290,14 +1290,11 @@ async fn authenticate(
     };
     match route.auth_mode {
         PassthroughAuthMode::GatewayKey => {
-            // The dedicated gateway-key header, when present, is the only
-            // one read (and an empty one is not a fall-through).
-            let token = match headers.get(crate::auth::GATEWAY_KEY_HEADER) {
-                Some(raw) => crate::auth::gateway_key_header_credential(raw)?,
-                None => bearer_of(headers.get(header::AUTHORIZATION))
-                    .or_else(|| raw_of(headers.get("x-api-key")))
-                    .ok_or(ProxyError::MissingAuth)?,
-            };
+            // Read exactly as `/v1/*` reads it: the first credential header
+            // present decides, never a fall-through to the next.
+            let token = crate::auth::header_credential(headers).unwrap_or(Err(
+                ProxyError::MissingAuth(crate::auth::AUTHORIZATION_LABEL),
+            ))?;
             crate::auth::authenticate_token(state, &token, ctx).await
         }
         PassthroughAuthMode::HeaderKey => {
@@ -1305,7 +1302,12 @@ async fn authenticate(
             let token = headers
                 .get(name)
                 .and_then(|v| v.to_str().ok())
-                .map(|v| v.strip_prefix("Bearer ").unwrap_or(v).trim().to_string())
+                .map(|v| {
+                    aisix_core::forwarded_headers::strip_bearer_scheme(v)
+                        .unwrap_or(v)
+                        .trim()
+                        .to_string()
+                })
                 .filter(|v| !v.is_empty())
                 .ok_or_else(|| ProxyError::MissingRouteAuthHeader(name.to_string()))?;
             crate::auth::authenticate_token(state, &token, ctx).await
@@ -1338,20 +1340,6 @@ async fn authenticate(
             Ok(authed)
         }
     }
-}
-
-fn bearer_of(v: Option<&HeaderValue>) -> Option<String> {
-    let s = v?.to_str().ok()?;
-    let token = s
-        .strip_prefix("Bearer ")
-        .or_else(|| s.strip_prefix("bearer "))?;
-    let token = token.trim();
-    (!token.is_empty()).then(|| token.to_string())
-}
-
-fn raw_of(v: Option<&HeaderValue>) -> Option<String> {
-    let s = v?.to_str().ok()?.trim();
-    (!s.is_empty()).then(|| s.to_string())
 }
 
 /// Route-level source allowlist: unset means unrestricted (the schema
@@ -10758,6 +10746,105 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         let both = br#"{"usage":{"input_tokens":100,"output_tokens":1,"prompt_tokens_details":{"cached_tokens":0},"input_tokens_details":{"cached_tokens":80}}}"#;
         assert_eq!(usage(both).unwrap().cached_prompt_tokens, 80);
         assert_eq!(usage(br#"{"code":"InvalidParameter","message":"x"}"#), None);
+    }
+
+    /// A `gateway_key` route reads the credential exactly as `/v1/*` does:
+    /// the first credential header present decides, an empty or unusable
+    /// one is a 401 naming it, and the Bearer scheme is case-insensitive.
+    #[tokio::test]
+    async fn gateway_key_route_reads_the_credential_like_v1() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&upstream)
+            .await;
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry("http://unused"));
+        snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+        snap.passthrough_routes
+            .insert(inject_route(&upstream.uri()));
+        let app = build_app(snap);
+
+        let send = |pairs: &'static [(&'static str, &'static str)]| {
+            let app = app.clone();
+            async move {
+                let mut req = Request::builder()
+                    .method("GET")
+                    .uri("/passthrough/openai/v1/models");
+                for (name, value) in pairs {
+                    req = req.header(*name, *value);
+                }
+                let resp = app
+                    .oneshot(req.body(axum::body::Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap())
+                        .unwrap_or_default();
+                (
+                    status,
+                    body["error"]["message"].as_str().unwrap_or("").to_string(),
+                )
+            }
+        };
+
+        assert_eq!(send(&[("x-api-key", "sk-caller")]).await.0, StatusCode::OK);
+        // Only the scheme is case-insensitive.
+        for pairs in [
+            &[("authorization", "bearer sk-caller")],
+            &[("authorization", "BEARER sk-caller")],
+        ] {
+            assert_eq!(send(pairs).await.0, StatusCode::OK, "{pairs:?}");
+        }
+        assert_eq!(
+            send(&[("authorization", "Bearer SK-CALLER")]).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        // A present but unusable Authorization never falls through either.
+        for pairs in [
+            &[
+                ("authorization", "Basic dXNlcjpwdw=="),
+                ("x-api-key", "sk-caller"),
+            ],
+            &[("authorization", "Bearer "), ("x-api-key", "sk-caller")],
+        ] {
+            assert_eq!(
+                send(pairs).await,
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "missing or malformed Authorization header".to_string()
+                ),
+                "{pairs:?}"
+            );
+        }
+        assert_eq!(
+            send(&[("authorization", ""), ("x-api-key", "sk-caller")]).await,
+            (
+                StatusCode::UNAUTHORIZED,
+                "missing or malformed Authorization header".to_string()
+            )
+        );
+        assert_eq!(
+            send(&[("x-api-key", "  ")]).await,
+            (
+                StatusCode::UNAUTHORIZED,
+                "missing or malformed x-api-key header".to_string()
+            )
+        );
+        assert_eq!(
+            send(&[
+                ("x-aisix-api-key", ""),
+                ("authorization", "Bearer sk-caller")
+            ])
+            .await,
+            (
+                StatusCode::UNAUTHORIZED,
+                "missing or malformed x-aisix-api-key header".to_string()
+            )
+        );
     }
 
     #[tokio::test]

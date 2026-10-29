@@ -476,6 +476,12 @@ fn deny_key(
 pub(crate) const GATEWAY_KEY_HEADER: &str =
     aisix_core::forwarded_headers::GATEWAY_CREDENTIAL_HEADER;
 
+/// How a `MissingAuth` message spells `Authorization` (display text, not
+/// the lowercase wire name) — also what it names when the request carries
+/// no credential header at all.
+pub(crate) const AUTHORIZATION_LABEL: &str = "Authorization";
+pub(crate) const X_API_KEY_HEADER: &str = "x-api-key";
+
 /// Whether the request OFFERS an inbound gateway credential at all.
 ///
 /// Deliberately wider than [`header_credential`]: a present-but-unusable
@@ -488,15 +494,10 @@ pub(crate) fn credential_offered(parts: &Parts) -> bool {
     [
         GATEWAY_KEY_HEADER,
         axum::http::header::AUTHORIZATION.as_str(),
-        "x-api-key",
+        X_API_KEY_HEADER,
     ]
     .iter()
-    .any(|name| {
-        parts
-            .headers
-            .get(*name)
-            .is_some_and(|v| v.to_str().map_or(true, |s| !s.trim().is_empty()))
-    })
+    .any(|name| parts.headers.contains_key(*name))
 }
 
 /// Whether the caller's gateway credential came from [`GATEWAY_KEY_HEADER`]
@@ -509,8 +510,9 @@ pub(crate) fn admitted_via_gateway_key_header(headers: &axum::http::HeaderMap) -
 /// The caller's gateway credential, read from the request headers by
 /// precedence: [`GATEWAY_KEY_HEADER`] when the header is present, else
 /// `Authorization: Bearer`, else `x-api-key`. The first header present
-/// decides — an empty or malformed one is `MissingAuth`, never a
-/// fall-through to the next. `None` when none of the three is present.
+/// decides — an empty or malformed one is `MissingAuth` naming that
+/// header, never a fall-through to the next. `None` when none of the three
+/// is present.
 pub(crate) fn header_credential(
     headers: &axum::http::HeaderMap,
 ) -> Option<Result<String, ProxyError>> {
@@ -519,14 +521,18 @@ pub(crate) fn header_credential(
     }
     if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
         let Ok(s) = auth.to_str() else {
-            return Some(Err(ProxyError::MissingAuth));
+            return Some(Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)));
         };
-        return Some(match s.strip_prefix("Bearer ").map(str::trim) {
-            Some(rest) if !rest.is_empty() => Ok(rest.to_string()),
-            _ => Err(ProxyError::MissingAuth),
-        });
+        return Some(
+            match aisix_core::forwarded_headers::strip_bearer_scheme(s).map(str::trim) {
+                Some(rest) if !rest.is_empty() => Ok(rest.to_string()),
+                _ => Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)),
+            },
+        );
     }
-    headers.get("x-api-key").map(raw_credential)
+    headers
+        .get(X_API_KEY_HEADER)
+        .map(|raw| raw_credential(raw, X_API_KEY_HEADER))
 }
 
 /// The credential in [`GATEWAY_KEY_HEADER`]: the key itself, or the key
@@ -534,28 +540,30 @@ pub(crate) fn header_credential(
 pub(crate) fn gateway_key_header_credential(
     raw: &axum::http::HeaderValue,
 ) -> Result<String, ProxyError> {
-    let value = raw_credential(raw)?;
-    match value
-        .strip_prefix("Bearer ")
-        .or_else(|| value.strip_prefix("bearer "))
-        .map(str::trim)
-    {
-        Some("") => Err(ProxyError::MissingAuth),
+    let value = raw_credential(raw, GATEWAY_KEY_HEADER)?;
+    match aisix_core::forwarded_headers::strip_bearer_scheme(&value).map(str::trim) {
+        Some("") => Err(ProxyError::MissingAuth(GATEWAY_KEY_HEADER)),
         Some(key) => Ok(key.to_string()),
         None => Ok(value),
     }
 }
 
-fn raw_credential(raw: &axum::http::HeaderValue) -> Result<String, ProxyError> {
-    let s = raw.to_str().map_err(|_| ProxyError::MissingAuth)?.trim();
+fn raw_credential(
+    raw: &axum::http::HeaderValue,
+    header: &'static str,
+) -> Result<String, ProxyError> {
+    let s = raw
+        .to_str()
+        .map_err(|_| ProxyError::MissingAuth(header))?
+        .trim();
     if s.is_empty() {
-        return Err(ProxyError::MissingAuth);
+        return Err(ProxyError::MissingAuth(header));
     }
     Ok(s.to_string())
 }
 
 fn extract_bearer(parts: &Parts) -> Result<String, ProxyError> {
-    header_credential(&parts.headers).unwrap_or(Err(ProxyError::MissingAuth))
+    header_credential(&parts.headers).unwrap_or(Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)))
 }
 
 #[cfg(test)]
@@ -784,6 +792,14 @@ mod tests {
         req.into_parts().0
     }
 
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (name, value) in pairs {
+            h.insert(*name, HeaderValue::from_static(value));
+        }
+        h
+    }
+
     #[test]
     fn extract_bearer_happy_path() {
         let mut h = HeaderMap::new();
@@ -805,13 +821,6 @@ mod tests {
 
     #[test]
     fn the_gateway_key_header_wins_and_never_falls_through() {
-        let headers = |pairs: &[(&'static str, &'static str)]| {
-            let mut h = HeaderMap::new();
-            for (name, value) in pairs {
-                h.insert(*name, HeaderValue::from_static(value));
-            }
-            h
-        };
         let both = headers(&[
             ("x-aisix-api-key", "sk-gateway"),
             ("authorization", "Bearer upstream-token"),
@@ -830,7 +839,7 @@ mod tests {
         ]);
         assert!(matches!(
             extract_bearer(&parts_with(empty.clone())),
-            Err(ProxyError::MissingAuth)
+            Err(ProxyError::MissingAuth(_))
         ));
         assert!(credential_offered(&parts_with(headers(&[(
             "x-aisix-api-key",
@@ -849,7 +858,7 @@ mod tests {
         let parts = parts_with(HeaderMap::new());
         assert!(matches!(
             extract_bearer(&parts),
-            Err(ProxyError::MissingAuth)
+            Err(ProxyError::MissingAuth(_))
         ));
     }
 
@@ -863,7 +872,7 @@ mod tests {
         let parts = parts_with(h);
         assert!(matches!(
             extract_bearer(&parts),
-            Err(ProxyError::MissingAuth)
+            Err(ProxyError::MissingAuth(_))
         ));
     }
 
@@ -871,30 +880,59 @@ mod tests {
     fn credential_offered_covers_unusable_credentials() {
         // Absent → not offered: the anonymous path may serve these.
         assert!(!credential_offered(&parts_with(HeaderMap::new())));
-        let mut empty = HeaderMap::new();
-        empty.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("   "),
-        );
-        assert!(!credential_offered(&parts_with(empty)));
 
-        // Present but unusable → offered: must fail, never downgrade.
-        for (name, value) in [
-            (axum::http::header::AUTHORIZATION.as_str(), "Bearer sk-abc"),
-            (axum::http::header::AUTHORIZATION.as_str(), "Bearer   "),
-            (
-                axum::http::header::AUTHORIZATION.as_str(),
-                "Basic dXNlcjpwdw==",
-            ),
-            ("x-api-key", "sk-abc"),
+        // Present but unusable → offered: must fail, never downgrade. An
+        // empty or whitespace-only value is one of those.
+        for name in [
+            GATEWAY_KEY_HEADER,
+            axum::http::header::AUTHORIZATION.as_str(),
+            X_API_KEY_HEADER,
         ] {
-            let mut h = HeaderMap::new();
-            h.insert(name, HeaderValue::from_str(value).unwrap());
-            assert!(
-                credential_offered(&parts_with(h)),
-                "{name}: {value:?} must count as an offered credential"
-            );
+            for value in ["", "   ", "Bearer   ", "Basic dXNlcjpwdw==", "sk-abc"] {
+                let mut h = HeaderMap::new();
+                h.insert(name, HeaderValue::from_str(value).unwrap());
+                assert!(
+                    credential_offered(&parts_with(h)),
+                    "{name}: {value:?} must count as an offered credential"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn the_bearer_scheme_is_case_insensitive() {
+        for value in ["bearer sk-abc", "BEARER sk-abc", "bEaReR sk-abc"] {
+            assert_eq!(
+                extract_bearer(&parts_with(headers(&[("authorization", value)]))).unwrap(),
+                "sk-abc"
+            );
+            let key = headers(&[("x-aisix-api-key", value)]);
+            assert_eq!(extract_bearer(&parts_with(key)).unwrap(), "sk-abc");
+        }
+    }
+
+    #[test]
+    fn missing_auth_names_the_header_that_failed() {
+        let message = |pairs: &[(&'static str, &'static str)]| {
+            extract_bearer(&parts_with(headers(pairs)))
+                .unwrap_err()
+                .to_string()
+        };
+        let authorization = "missing or malformed Authorization header";
+        assert_eq!(message(&[]), authorization);
+        assert_eq!(message(&[("authorization", "")]), authorization);
+        assert_eq!(message(&[("authorization", "Basic abc")]), authorization);
+        assert_eq!(
+            message(&[
+                ("x-aisix-api-key", ""),
+                ("authorization", "Bearer sk-valid")
+            ]),
+            "missing or malformed x-aisix-api-key header"
+        );
+        assert_eq!(
+            message(&[("x-api-key", "  ")]),
+            "missing or malformed x-api-key header"
+        );
     }
 
     #[test]
@@ -907,7 +945,7 @@ mod tests {
         let parts = parts_with(h);
         assert!(matches!(
             extract_bearer(&parts),
-            Err(ProxyError::MissingAuth)
+            Err(ProxyError::MissingAuth(_))
         ));
     }
 }

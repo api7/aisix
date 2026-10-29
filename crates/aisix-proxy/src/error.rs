@@ -163,8 +163,10 @@ impl ErrorEnvelope {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
-    #[error("missing or malformed Authorization header")]
-    MissingAuth,
+    /// No usable gateway credential. Carries the credential header that
+    /// failed, so the message points at the header to fix.
+    #[error("missing or malformed {0} header")]
+    MissingAuth(&'static str),
     /// A `header_key` passthrough route saw no gateway key in its configured
     /// header. Named separately from [`ProxyError::MissingAuth`] because on
     /// these routes `Authorization` deliberately carries the caller's own
@@ -458,7 +460,7 @@ impl ProxyError {
     pub fn status(&self) -> StatusCode {
         match self {
             ProxyError::MissingRouteAuthHeader(_)
-            | ProxyError::MissingAuth
+            | ProxyError::MissingAuth(_)
             | ProxyError::InvalidApiKey
             | ProxyError::ApiKeyExpired
             | ProxyError::ApiKeyDisabled
@@ -503,7 +505,7 @@ impl ProxyError {
     pub fn kind(&self) -> &'static str {
         match self {
             ProxyError::MissingRouteAuthHeader(_)
-            | ProxyError::MissingAuth
+            | ProxyError::MissingAuth(_)
             | ProxyError::InvalidApiKey
             | ProxyError::ApiKeyExpired
             | ProxyError::ApiKeyDisabled
@@ -784,7 +786,7 @@ impl ProxyError {
     /// fault, not a credential judgment.
     fn auth_challenge(&self) -> Option<AuthChallenge> {
         match self {
-            ProxyError::MissingAuth => Some(AuthChallenge::MissingCredentials),
+            ProxyError::MissingAuth(_) => Some(AuthChallenge::MissingCredentials),
             ProxyError::InvalidApiKey
             | ProxyError::ApiKeyExpired
             | ProxyError::ApiKeyDisabled
@@ -1186,7 +1188,7 @@ mod tests {
 
     #[test]
     fn missing_auth_maps_to_401_invalid_api_key() {
-        let e = ProxyError::MissingAuth;
+        let e = ProxyError::MissingAuth("Authorization");
         assert_eq!(e.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(e.kind(), "invalid_api_key");
     }
@@ -1213,7 +1215,7 @@ mod tests {
     #[test]
     fn auth_challenge_classification_covers_exactly_the_curable_failures() {
         assert!(matches!(
-            ProxyError::MissingAuth.auth_challenge(),
+            ProxyError::MissingAuth("Authorization").auth_challenge(),
             Some(AuthChallenge::MissingCredentials)
         ));
         for e in [
@@ -1265,7 +1267,7 @@ mod tests {
 
     #[tokio::test]
     async fn into_response_attaches_the_challenge_extension() {
-        let resp = ProxyError::MissingAuth.into_response();
+        let resp = ProxyError::MissingAuth("Authorization").into_response();
         assert!(matches!(
             resp.extensions().get::<AuthChallenge>(),
             Some(AuthChallenge::MissingCredentials)
@@ -1482,7 +1484,7 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_envelope_401_maps_to_authentication_error() {
-        let err = ProxyError::MissingAuth;
+        let err = ProxyError::MissingAuth("Authorization");
         let resp = err.into_anthropic_response();
         assert_anthropic_envelope(resp, StatusCode::UNAUTHORIZED, "authentication_error").await;
     }
