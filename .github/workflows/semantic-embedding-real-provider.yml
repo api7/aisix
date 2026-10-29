@@ -68,7 +68,7 @@ jobs:
           version: 11
       - name: install e2e harness
         working-directory: tests/e2e
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
       - name: typecheck e2e harness and real-provider smoke
         working-directory: tests/e2e
         run: pnpm exec tsc --noEmit
