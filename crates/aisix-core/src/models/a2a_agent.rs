@@ -224,6 +224,21 @@ pub fn a2a_agent_credential_coupling() -> Value {
 mod tests {
     use super::*;
 
+    /// `\s` in the name pattern is the ECMA-262 class, so every Unicode space
+    /// separator is rejected, on the write path and on load alike.
+    #[test]
+    fn name_rejects_unicode_whitespace_strict_and_lenient() {
+        use crate::models::schema::{validate_a2a_agent, validate_a2a_agent_lenient};
+        for ws in [
+            '\u{a0}', '\u{1680}', '\u{2000}', '\u{2003}', '\u{200a}', '\u{2028}', '\u{2029}',
+            '\u{202f}', '\u{205f}', '\u{3000}', '\u{feff}',
+        ] {
+            let doc = json!({"name": format!("a{ws}b"), "url": "https://x/a2a"});
+            validate_a2a_agent(&doc).expect_err(&format!("strict must reject {ws:?}"));
+            validate_a2a_agent_lenient(&doc).expect_err(&format!("lenient must reject {ws:?}"));
+        }
+    }
+
     #[test]
     fn schema_pins_each_a2a_obligation_individually() {
         // Every excluded character is pinned, under both accepted spellings, so
