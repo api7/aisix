@@ -204,6 +204,13 @@ describe("memory observability", () => {
     await writeFile(join(dumpDir, OTHER_HOST_DUMP), "x");
     app = await spawnApp({
       threadPerCore: true,
+      // The default 2 MiB sampling interval leaves a freshly started test
+      // gateway with a handful of live samples, and about one profile in
+      // ten held only std's runtime-init allocation, with no gateway frame
+      // at all. 64 KiB gives ~70 samples, ~60 of them under gateway code.
+      // The baked-in `prof:true,prof_active:true` still comes from the
+      // binary; this only overrides the interval.
+      extraEnv: { _RJEM_MALLOC_CONF: "lg_prof_sample:16" },
       heapProfiling: {
         // Thresholds any running process is past: all three fire on the
         // first check, and `keep` leaves two of the three files.
