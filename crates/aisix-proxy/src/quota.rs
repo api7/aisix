@@ -502,7 +502,7 @@ fn refresh_remaining(
         .unwrap_or(crate::request_metrics::UNKNOWN)
         .to_owned();
     let model = crate::usage_attr::metric_model_label(snapshot, &model_rl.name).into_owned();
-    tokio::spawn(async move {
+    let refresh = async move {
         if let Some(status) = limiter.peek(&api_key_id, &key_limits).await {
             metrics.set_rate_limit_remaining(
                 &api_key_id,
@@ -512,7 +512,11 @@ fn refresh_remaining(
                 status.tpm_remaining(),
             );
         }
-    });
+    };
+    tokio::spawn(tracing::Instrument::instrument(
+        refresh,
+        tracing::Span::current(),
+    ));
 }
 
 /// Apply budget + multi-layer rate-limit checks for one MCP `tools/call`

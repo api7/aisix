@@ -945,13 +945,17 @@ describe("every proxy route emits every per-request metric family", () => {
       }
       case "deployment":
         return d("aisix_deployment_requests_total", { model: row.model ?? "" });
-      case "ratelimit_remaining":
-        // A gauge: present for the caller and the row's model after the drive.
-        return after.some(
-          (s) => s.name === "aisix_ratelimit_remaining_requests" && s.labels.model === row.model,
-        )
-          ? 1
-          : 0;
+      case "ratelimit_remaining": {
+        // A gauge persists after its first write, and rows share models, so
+        // it counts only when this drive wrote it: new, or a different
+        // value (every reservation lowers the remaining count).
+        const gauge = (samples: MetricSample[]) =>
+          samples.find(
+            (s) => s.name === "aisix_ratelimit_remaining_requests" && s.labels.model === row.model,
+          )?.value;
+        const now = gauge(after);
+        return now !== undefined && now !== gauge(before) ? 1 : 0;
+      }
     }
   }
 
