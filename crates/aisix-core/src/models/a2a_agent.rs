@@ -234,9 +234,17 @@ mod tests {
             '\u{202f}', '\u{205f}', '\u{3000}', '\u{feff}',
         ] {
             let doc = json!({"name": format!("a{ws}b"), "url": "https://x/a2a"});
-            validate_a2a_agent(&doc).expect_err(&format!("strict must reject {ws:?}"));
-            validate_a2a_agent_lenient(&doc).expect_err(&format!("lenient must reject {ws:?}"));
+            let strict = validate_a2a_agent(&doc).expect_err(&format!("strict must reject {ws:?}"));
+            let lenient =
+                validate_a2a_agent_lenient(&doc).expect_err(&format!("lenient must reject {ws:?}"));
+            assert_eq!(
+                (strict.path.as_str(), lenient.path.as_str()),
+                ("/name", "/name")
+            );
         }
+        let control = json!({"name": "ab", "url": "https://x/a2a"});
+        validate_a2a_agent(&control).expect("control name passes strict");
+        validate_a2a_agent_lenient(&control).expect("control name passes lenient");
     }
 
     #[test]

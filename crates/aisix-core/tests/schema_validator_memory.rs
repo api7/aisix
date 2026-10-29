@@ -5,6 +5,9 @@
 //! resource load and never dropped, so whatever they hold is a fixed cost
 //! of every gateway. A validator library that inlines a fresh copy of each
 //! `$ref` target held over 100 MiB here; this pins the live size.
+//!
+//! The counter sees every allocation in the process, so this file holds
+//! exactly one test: a second one would run in parallel and skew it.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -43,9 +46,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-/// Both validator sets together. They measure a few MiB; the bound leaves
-/// room for new resources without admitting a per-`$ref` copy again.
-const MAX_LIVE_BYTES: isize = 32 * 1024 * 1024;
+/// Both validator sets together. They measure about 4 MiB; the bound leaves
+/// room for new resources while catching a partial return of per-`$ref` copies.
+const MAX_LIVE_BYTES: isize = 8 * 1024 * 1024;
 
 #[test]
 fn compiled_validators_stay_small() {
