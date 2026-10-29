@@ -569,14 +569,7 @@ async function spawnPointedAtDeadEtcd(): Promise<MinimalApp> {
       log_level: "warn",
       metrics: {
         prometheus: { enabled: true, path: "/metrics", addr: `127.0.0.1:${metricsPort}` },
-        // Retired blocks, kept here on purpose: they were placeholders no
-        // code ever read and are gone from the shipped example files, but
-        // configs copied from those files still carry them. This is the
-        // one spec that asks a real binary to boot such a config, so the
-        // tombstones stay exercised (AISIX-Cloud#1380).
-        otlp: { enabled: false, endpoint: "http://127.0.0.1:4317" },
       },
-      tracing: { otlp: { enabled: false, endpoint: "http://127.0.0.1:4317", sample_ratio: 1 } },
     },
     cache: { backend: "memory" },
   };
