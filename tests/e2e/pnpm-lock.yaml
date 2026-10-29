@@ -5,7 +5,7 @@ settings:
   excludeLinksFromLockfile: false
 
 overrides:
-  zod: 4.6.7
+  zod: ^4.6.6
 
 importers:
 
