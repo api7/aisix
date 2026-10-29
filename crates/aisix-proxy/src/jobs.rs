@@ -1977,11 +1977,6 @@ fn maybe_attribute_batch(
     let request_headers = client.request_headers.clone();
     let model_id = target.model_entry.id.clone();
     let display_name = target.display_name().to_string();
-    let provider_label = target.provider_label().to_string();
-    let client_type = state
-        .client_classifier
-        .classify(&client.user_agent)
-        .to_string();
     // Resolved before the spawn, off the live snapshot, through the same
     // index `least_cost` ranks with: `pricing_key` first, inline `cost`
     // second. The completed batch is priced at what the model costs when
@@ -2009,8 +2004,6 @@ fn maybe_attribute_batch(
             &request_headers,
             &model_id,
             &display_name,
-            &provider_label,
-            &client_type,
             cost.as_ref(),
             &pk_id,
             &secret,
@@ -2045,8 +2038,6 @@ async fn attribute_batch_usage(
     request_headers: &std::collections::BTreeMap<String, String>,
     model_id: &str,
     display_name: &str,
-    provider_label: &str,
-    client_type: &str,
     cost: Option<&aisix_core::models::model::ModelCost>,
     pk_id: &str,
     secret: &str,
@@ -2198,35 +2189,6 @@ async fn attribute_batch_usage(
             crate::operation::BATCH_COMPLETION.handler,
             event.clone(),
             crate::usage_attr::usage_event_labels(&usage_model, &pk),
-        );
-        // Labelled like the batch routes' own request series, under the
-        // route the batch was submitted to.
-        let metric_caller = crate::request_metrics::Caller::from_api_key_id(&snap, api_key_id);
-        crate::request_metrics::record_usage(
-            state,
-            "/v1/batches",
-            metric_caller.as_caller(),
-            // `upstream_model` stays a placeholder: the slices are keyed on
-            // the `model` the provider wrote into each output line, which no
-            // configured row bounds (#451).
-            crate::request_metrics::Upstream {
-                provider: provider_label,
-                model: display_name,
-                pk: pk.labels(),
-                ..Default::default()
-            },
-            crate::request_metrics::Tokens {
-                input: event.prompt_tokens,
-                output: event.completion_tokens,
-                total: if event.total_tokens > 0 {
-                    event.total_tokens
-                } else {
-                    event.prompt_tokens.saturating_add(event.completion_tokens)
-                },
-                cached: event.cached_prompt_tokens,
-                client_type,
-                ..Default::default()
-            },
         );
         // A background poll attributes usage after the fact — there is no
         // live request and therefore no trace bundle; the exporter falls

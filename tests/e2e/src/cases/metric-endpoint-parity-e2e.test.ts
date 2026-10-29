@@ -696,13 +696,14 @@ describe("every proxy route emits every per-request metric family", () => {
       drive: async () => void (await expectCall("/v1/batches", { headers: jobsModel })),
     },
     {
-      // Retrieving a completed batch attributes its output's tokens, which
-      // are recorded under the route the batch was submitted to.
+      // Retrieving a completed batch files its usage events, but its tokens
+      // stay out of the token families: nothing makes that attribution
+      // exactly-once across gateway replicas or restarts.
       route: "/v1/batches/:id",
       name: "batch get (completed)",
       endpoint: "/v1/batches/:id",
       model: "par-jobs",
-      families: [...REQUEST, "e2e_upstream", "deployment", "ratelimit_remaining", "tokens"],
+      families: [...REQUEST, "e2e_upstream", "deployment", "ratelimit_remaining"],
       drive: async () => void (await expectCall(`/v1/batches/${jobs.batchId}`)),
     },
     {
@@ -935,11 +936,9 @@ describe("every proxy route emits every per-request metric family", () => {
           d("aisix_llm_time_to_first_token_seconds_count", { ...ep, side: "upstream" }),
         );
       case "tokens": {
-        // Completed-batch usage lands under the route that took the batch.
-        const tokenEp = row.name.startsWith("batch get") ? "/v1/batches" : row.endpoint;
         const model = { model: row.model ?? "" };
         return Math.min(
-          d("aisix_llm_input_tokens_total", { endpoint: tokenEp }),
+          d("aisix_llm_input_tokens_total", ep),
           d("aisix_tokens_consumed_total", model),
           d("aisix_llm_tokens_by_client_total", model),
         );
