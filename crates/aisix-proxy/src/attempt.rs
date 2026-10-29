@@ -512,7 +512,7 @@ pub(crate) const GUARDRAIL_BLOCK_CLASS: &str = "content_filter";
 /// upstream wrote.
 pub(crate) fn gateway_error_message(err: &ProxyError) -> String {
     let gateway_text = match err {
-        ProxyError::MissingAuth
+        ProxyError::MissingAuth(_)
         | ProxyError::MissingRouteAuthHeader(_)
         | ProxyError::InvalidApiKey
         | ProxyError::ApiKeyExpired
@@ -574,7 +574,7 @@ pub(crate) fn attempt_reached_upstream(err: &ProxyError) -> bool {
     match err {
         ProxyError::Bridge(be) => be.reached_upstream(),
         ProxyError::ContentFiltered { .. } => true,
-        ProxyError::MissingAuth
+        ProxyError::MissingAuth(_)
         | ProxyError::MissingRouteAuthHeader(_)
         | ProxyError::InvalidApiKey
         | ProxyError::ApiKeyExpired

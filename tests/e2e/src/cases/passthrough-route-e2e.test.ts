@@ -48,6 +48,8 @@ const CALLER_PLAINTEXT = "sk-ptr-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
+const CRED_PLAINTEXT = "sk-ptr-e2e-cred";
+const CRED_KEY_HASH = createHash("sha256").update(CRED_PLAINTEXT).digest("hex");
 const STREAM_LIMITED_PLAINTEXT = "sk-ptr-e2e-stream-limit";
 const STREAM_LIMITED_KEY_HASH = createHash("sha256")
   .update(STREAM_LIMITED_PLAINTEXT)
@@ -214,6 +216,102 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     expect(JSON.parse(hit!.body) as Record<string, unknown>).toMatchObject({
       arbitrary_unknown_field: "must-pass-through-untouched",
     });
+  });
+
+  test("gateway_key credential reads like /v1: case-insensitive Bearer, no fall-through", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    const upstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "chatcmpl-ptr-cred",
+        object: "chat.completion",
+        created: 0,
+        model: "gpt-4o-mini",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "ok" },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
+    });
+    upstreams.push(upstream);
+    const pk = await seed.createProviderKey({
+      display_name: "ptr-cred-pk",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "ptr-cred-model",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+    });
+    await seed.createPassthroughRoute({
+      name: "ptr-cred-tunnel",
+      path_prefix: "/passthrough/ptr-cred",
+      target_url: `${upstream.baseUrl}/v1`,
+      provider_key_id: pk.id,
+    });
+    // Seeded last: its authenticating implies the model and route landed.
+    await seed.createApiKey({
+      key_hash: CRED_KEY_HASH,
+      allowed_models: ["*"],
+      allowed_routes: ["*"],
+    });
+    const probe = new ProxyClient(app.proxyUrl, CRED_PLAINTEXT);
+    await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
+
+    const chat = (path: string, headers: Record<string, string>) =>
+      fetch(`${app!.proxyUrl}${path}`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "ptr-cred-model",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+    const ROUTE = "/passthrough/ptr-cred/chat/completions";
+    const V1 = "/v1/chat/completions";
+
+    // RFC 7235: the auth scheme name is case-insensitive; the key is not.
+    for (const path of [ROUTE, V1]) {
+      for (const scheme of ["Bearer", "bearer", "BEARER"]) {
+        const res = await chat(path, { authorization: `${scheme} ${CRED_PLAINTEXT}` });
+        expect(res.status, `${path} with ${scheme}`).toBe(200);
+        await res.text();
+      }
+      const upper = await chat(path, {
+        authorization: `Bearer ${CRED_PLAINTEXT.toUpperCase()}`,
+      });
+      expect(upper.status, `${path} with an upper-cased key`).toBe(401);
+      await upper.text();
+    }
+
+    // A present but unusable Authorization is a 401 naming it, never a
+    // fall-through to a valid x-api-key — on the route as on /v1.
+    for (const path of [ROUTE, V1]) {
+      for (const authorization of ["Basic dXNlcjpwdw==", "Bearer"]) {
+        const res = await chat(path, { authorization, "x-api-key": CRED_PLAINTEXT });
+        expect(res.status, `${path} with ${authorization}`).toBe(401);
+        const body = (await res.json()) as { error?: { message?: string } };
+        expect(body.error?.message).toBe("missing or malformed Authorization header");
+      }
+    }
+
+    // The migration path: the gateway key in x-aisix-api-key leaves
+    // Authorization to whatever the caller needs it for.
+    const migrated = await chat(ROUTE, {
+      "x-aisix-api-key": CRED_PLAINTEXT,
+      authorization: "Basic dXNlcjpwdw==",
+    });
+    expect(migrated.status).toBe(200);
+    await migrated.text();
   });
 
   test("anthropic inject shape: x-api-key + anthropic-version, no Bearer", async (ctx) => {

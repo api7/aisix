@@ -581,7 +581,7 @@ async fn authenticate(
             }
         }
     }
-    Err(ProxyError::MissingAuth)
+    Err(ProxyError::MissingAuth(crate::auth::AUTHORIZATION_LABEL))
 }
 
 fn to_ws_scheme(url: &str) -> Result<String, ProxyError> {

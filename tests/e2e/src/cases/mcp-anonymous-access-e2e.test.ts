@@ -27,7 +27,8 @@ import {
 //     principal's own grant is `*`;
 //   - an unlisted-but-registered server is indistinguishable from an unknown
 //     one (401, never 404);
-//   - a credential that is offered and fails NEVER downgrades to anonymous;
+//   - a credential that is offered and fails NEVER downgrades to anonymous,
+//     and an empty credential header is an offered one;
 //   - a valid credential keeps its own identity and wider reach on the same
 //     entries.
 
@@ -35,6 +36,8 @@ const KEY_WILD = "sk-anon-e2e-wild";
 const ANON_PRINCIPAL_SECRET = `sk-anon-e2e-principal-${randomUUID()}`;
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+
+type Credential = string | Record<string, string> | undefined;
 
 interface RpcReply {
   status: number;
@@ -57,17 +60,22 @@ describe("mcp anonymous access e2e", () => {
   let seed: SeedClient;
   const settingsId = randomUUID();
 
-  /** POST a JSON-RPC body; `token` omitted means no credential at all. */
+  /**
+   * POST a JSON-RPC body. A string `token` rides `Authorization: Bearer`, an
+   * object is sent as the credential headers verbatim, and `undefined` means
+   * no credential at all.
+   */
   const post = async (
     path: string,
-    token: string | undefined,
+    token: Credential,
     body: unknown,
   ): Promise<RpcReply> => {
     const headers: Record<string, string> = {
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
     };
-    if (token !== undefined) headers.authorization = `Bearer ${token}`;
+    if (typeof token === "string") headers.authorization = `Bearer ${token}`;
+    else if (token) Object.assign(headers, token);
     const res = await fetch(`${app!.proxyUrl}${path}`, {
       method: "POST",
       headers,
@@ -85,7 +93,7 @@ describe("mcp anonymous access e2e", () => {
 
   const initialize = async (
     path: string,
-    token: string | undefined,
+    token: Credential,
   ): Promise<number> => {
     const init = await post(path, token, {
       jsonrpc: "2.0",
@@ -108,7 +116,7 @@ describe("mcp anonymous access e2e", () => {
 
   const listToolNames = async (
     path: string,
-    token: string | undefined,
+    token: Credential,
   ): Promise<{ status: number; names?: string[] }> => {
     const status = await initialize(path, token);
     if (status !== 200) return { status };
@@ -262,6 +270,72 @@ describe("mcp anonymous access e2e", () => {
       expect(await initialize("/mcp/docs", bad)).toBe(401);
       expect(await initialize("/mcp", bad)).toBe(401);
     }
+  });
+
+  test("an empty credential header is offered, never anonymous", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    // A caller that sent a credential header, even an empty one, tried to
+    // authenticate: serving it as the anonymous principal would hand it a
+    // grant it did not ask for.
+    // (fetch trims header values, and HTTP drops a field's surrounding
+    // whitespace anyway, so a whitespace-only value arrives as this one.)
+    for (const name of ["x-aisix-api-key", "authorization", "x-api-key"]) {
+      for (const path of ["/mcp/docs", "/mcp"]) {
+        expect(
+          await initialize(path, { [name]: "" }),
+          `${path} with an empty ${name}`,
+        ).toBe(401);
+      }
+    }
+  });
+
+  test("an empty x-aisix-api-key is a 401 naming it, despite a valid Authorization", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    const creds = { "x-aisix-api-key": "", authorization: `Bearer ${KEY_WILD}` };
+    for (const res of [
+      await fetch(`${app.proxyUrl}/mcp/docs`, {
+        method: "POST",
+        headers: {
+          ...creds,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+      }),
+      await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { ...creds, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "any",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      }),
+    ]) {
+      expect(res.status).toBe(401);
+      const body = (await res.json()) as { error?: { message?: string } };
+      expect(body.error?.message).toContain("x-aisix-api-key");
+      expect(body.error?.message).not.toContain("Authorization");
+    }
+  });
+
+  test("a valid x-aisix-api-key authenticates as its own key", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    const listed = await listToolNames("/mcp", { "x-aisix-api-key": KEY_WILD });
+    expect(listed.status).toBe(200);
+    // The key's own reach, not the anonymous principal's capped one.
+    expect(listed.names).toEqual([
+      "docs__echo",
+      "docs__reverse",
+      "kb__echo",
+      "kb__reverse",
+    ]);
+    const models = await fetch(`${app.proxyUrl}/v1/models`, {
+      headers: { "x-aisix-api-key": KEY_WILD },
+    });
+    expect(models.status).toBe(200);
   });
 
   test("a valid credential keeps its own identity and reach", async (ctx) => {
