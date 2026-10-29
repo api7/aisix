@@ -445,7 +445,7 @@ pub fn validate(validator: &Validator, value: &Value) -> Result<(), SchemaError>
     let mut errors = validator.iter_errors(value);
     if let Some(err) = errors.next() {
         return Err(SchemaError {
-            path: err.instance_path.to_string(),
+            path: err.instance_path().to_string(),
             // Mask instance values in the message. Validation errors flow
             // into logs, the rejection buffer surfaced upstream, and admin
             // 400 bodies — and resource documents carry credentials. The
