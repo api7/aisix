@@ -433,6 +433,68 @@ pub(crate) fn record_in_tier(
     status: u16,
     elapsed: Duration,
 ) {
+    let e2e = E2eSides::for_request(&state.snapshot.load());
+    record_bounded(state, endpoint, llm, caller, upstream, status, elapsed, e2e);
+}
+
+/// [`record`] for a request answered before anything was dispatched — a
+/// refusal, a discovery document — whose end-to-end latency can only have
+/// a `downstream` side.
+pub(crate) fn record_undispatched(
+    state: &ProxyState,
+    endpoint: &'static str,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    elapsed: Duration,
+) {
+    record_bounded(
+        state,
+        endpoint,
+        is_llm_endpoint(endpoint),
+        caller,
+        upstream,
+        status,
+        elapsed,
+        E2eSides::DownstreamOnly,
+    );
+}
+
+/// [`record`] for a response whose body is relayed after this call
+/// returns (`/v1/videos/:id/content`): the request families are recorded
+/// now, at the head, and the `downstream` end-to-end observation when the
+/// body relay ends, under the head's status.
+pub(crate) fn record_spanning_body(
+    state: &ProxyState,
+    endpoint: &'static str,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    started: std::time::Instant,
+) {
+    record_bounded(
+        state,
+        endpoint,
+        is_llm_endpoint(endpoint),
+        caller,
+        upstream,
+        status,
+        started.elapsed(),
+        E2eSides::AtBodyEnd(started),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_bounded(
+    state: &ProxyState,
+    endpoint: &'static str,
+    llm: bool,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    elapsed: Duration,
+    e2e: E2eSides,
+) {
     // Emit-chokepoint label bounding (#451 class): success paths hand in
     // the caller's requested string, which for a wildcard-served alias
     // is caller-minted — collapse it to the configured row's name here
@@ -453,39 +515,7 @@ pub(crate) fn record_in_tier(
         upstream,
         status,
         elapsed,
-        E2eSides::for_request(&snap),
-    );
-}
-
-/// [`record`] for a response whose body is relayed after this call
-/// returns (`/v1/videos/:id/content`): the request families are recorded
-/// now, at the head, and the `downstream` end-to-end observation when the
-/// body relay ends.
-pub(crate) fn record_spanning_body(
-    state: &ProxyState,
-    endpoint: &'static str,
-    caller: Caller<'_>,
-    upstream: Upstream<'_>,
-    status: u16,
-    started: std::time::Instant,
-) {
-    let snap = state.snapshot.load();
-    let (model, upstream_model) =
-        crate::usage_attr::metric_model_label_pair(&snap, upstream.model, upstream.upstream_model);
-    let upstream = Upstream {
-        model: model.as_ref(),
-        upstream_model: upstream_model.as_ref(),
-        ..upstream
-    };
-    emit(
-        &state.metrics,
-        endpoint,
-        is_llm_endpoint(endpoint),
-        caller,
-        upstream,
-        status,
-        started.elapsed(),
-        E2eSides::AtBodyEnd(started),
+        e2e,
     );
 }
 

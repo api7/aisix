@@ -800,11 +800,10 @@ async fn run_session(
     let mut upstream_response_headers = std::collections::BTreeMap::new();
     let upstream = match connect_upstream(upstream_request).await {
         Ok((ws, resp)) => {
-            crate::attempt::RoutingTelemetry::record_deployment(
-                &state,
-                &model_entry.id,
-                resp.status().as_u16(),
-            );
+            // A completed upgrade answers `101`, which is a success; the
+            // deployment families classify by HTTP outcome, so it counts as
+            // a `200`.
+            crate::attempt::RoutingTelemetry::record_deployment(&state, &model_entry.id, 200);
             let names = crate::client_ip::exported_header_names(&state.snapshot.load(), true);
             if !names.is_empty() {
                 upstream_response_headers =

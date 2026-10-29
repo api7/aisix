@@ -403,6 +403,11 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         _ if path.starts_with("/v1/batches/") => "/v1/batches/:id",
         _ if path.starts_with("/v1/fine_tuning/jobs/") => "/v1/fine_tuning/jobs/:id",
         _ if path.starts_with("/mcp/") => "/mcp/{server}",
+        // The agent card is discovery, not an agent call: its own series,
+        // so card fetches do not count as (or time) `/a2a` traffic.
+        _ if path.starts_with("/a2a/") && path.ends_with("/.well-known/agent-card.json") => {
+            "/a2a/{agent}/.well-known/agent-card.json"
+        }
         _ if path.starts_with("/a2a/") => "/a2a",
         // Any path-prefix route an operator claims under this namespace
         // labels as the passthrough_route family; unclaimed paths reach
@@ -421,7 +426,7 @@ fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
         "anthropic"
     } else if endpoint == "/mcp" || endpoint == "/mcp/{server}" {
         "mcp"
-    } else if endpoint == "/a2a" {
+    } else if endpoint == "/a2a" || endpoint == "/a2a/{agent}/.well-known/agent-card.json" {
         "a2a"
     } else if endpoint == "/v1/realtime" {
         "realtime"

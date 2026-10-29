@@ -796,7 +796,7 @@ describe("every proxy route emits every per-request metric family", () => {
     {
       route: "/a2a/:agent/.well-known/agent-card.json",
       name: "a2a agent card",
-      endpoint: "/a2a",
+      endpoint: "/a2a/{agent}/.well-known/agent-card.json",
       families: [...REQUEST],
       drive: async () => void (await expectCall("/a2a/par-agent/.well-known/agent-card.json")),
     },
@@ -850,7 +850,7 @@ describe("every proxy route emits every per-request metric family", () => {
     ["POST", "/mcp", "/mcp"],
     ["POST", "/mcp/alpha", "/mcp/{server}"],
     ["POST", "/a2a/par-agent", "/a2a"],
-    ["GET", "/a2a/par-agent/.well-known/agent-card.json", "/a2a"],
+    ["GET", "/a2a/par-agent/.well-known/agent-card.json", "/a2a/{agent}/.well-known/agent-card.json"],
   ];
 
   beforeAll(async () => {

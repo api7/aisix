@@ -390,7 +390,7 @@ pub const M_OTLP_FANOUT_FAILURES_TOTAL: &str = "aisix_otlp_fanout_failures_total
 ///   non-streaming requests and failures, at stream completion for
 ///   committed streams (the whole stream, NOT the time-to-first-byte the
 ///   summary series record), and at the end of the body relay for
-///   `/v1/videos/:id/content`. A stream the client cancels mid-flight still
+///   `/v1/videos/:id/content` (under the status of its response head). A stream the client cancels mid-flight still
 ///   observes once, with the status the request ended on (`499`) and the
 ///   duration up to the abort. Cache hits and requests that failed before
 ///   reaching an upstream observe this side too. Every proxy route that

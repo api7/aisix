@@ -471,7 +471,7 @@ pub(crate) async fn enforce(
 ) -> Result<MultiReservation, ProxyError> {
     crate::budget::enforce_key(state, snapshot, auth)?;
     let reserved = reserve_layers(state, snapshot, auth, model_rl, None).await;
-    refresh_remaining(state, snapshot, auth, model_rl).await;
+    refresh_remaining(state, snapshot, auth, model_rl);
     reserved
 }
 
@@ -479,7 +479,7 @@ pub(crate) async fn enforce(
 /// key from its window as this gate left it — the one point every model
 /// route reserves through. A route that resolved no model (MCP, A2A, a
 /// video poll) has no `model` to label the gauge with and leaves it alone.
-async fn refresh_remaining(
+fn refresh_remaining(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
@@ -492,16 +492,27 @@ async fn refresh_remaining(
     if key_limits.is_unrestricted() {
         return;
     }
-    if let Some(status) = state.limiter.peek(&auth.entry.id, &key_limits).await {
-        state.metrics.set_rate_limit_remaining(
-            &auth.entry.id,
-            auth.api_key_name()
-                .unwrap_or(crate::request_metrics::UNKNOWN),
-            &crate::usage_attr::metric_model_label(snapshot, &model_rl.name),
-            status.rpm_remaining(),
-            status.tpm_remaining(),
-        );
-    }
+    // Off the request's path: on a shared store the peek is a round trip,
+    // and a gauge has no reason to delay the upstream call.
+    let limiter = state.limiter.clone();
+    let metrics = state.metrics.clone();
+    let api_key_id = auth.entry.id.clone();
+    let api_key_name = auth
+        .api_key_name()
+        .unwrap_or(crate::request_metrics::UNKNOWN)
+        .to_owned();
+    let model = crate::usage_attr::metric_model_label(snapshot, &model_rl.name).into_owned();
+    tokio::spawn(async move {
+        if let Some(status) = limiter.peek(&api_key_id, &key_limits).await {
+            metrics.set_rate_limit_remaining(
+                &api_key_id,
+                &api_key_name,
+                &model,
+                status.rpm_remaining(),
+                status.tpm_remaining(),
+            );
+        }
+    });
 }
 
 /// Apply budget + multi-layer rate-limit checks for one MCP `tools/call`
@@ -546,7 +557,7 @@ pub(crate) async fn enforce_rate_limit(
 ) -> Result<MultiReservation, ProxyError> {
     let reserved = reserve_layers(state, snapshot, auth, model_rl, None).await;
     if reserved.is_err() {
-        refresh_remaining(state, snapshot, auth, model_rl).await;
+        refresh_remaining(state, snapshot, auth, model_rl);
     }
     reserved
 }

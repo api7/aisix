@@ -220,7 +220,7 @@ fn record_denial_metrics(
     started: std::time::Instant,
     err: &ProxyError,
 ) {
-    crate::request_metrics::record(
+    crate::request_metrics::record_undispatched(
         state,
         // The raw path is caller-controlled; only the route template may
         // become a label (#451).

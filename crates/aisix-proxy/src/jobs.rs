@@ -2214,7 +2214,11 @@ async fn attribute_batch_usage(
             crate::request_metrics::Tokens {
                 input: event.prompt_tokens,
                 output: event.completion_tokens,
-                total: event.prompt_tokens.saturating_add(event.completion_tokens),
+                total: if event.total_tokens > 0 {
+                    event.total_tokens
+                } else {
+                    event.prompt_tokens.saturating_add(event.completion_tokens)
+                },
                 cached: event.cached_prompt_tokens,
                 client_type,
                 ..Default::default()

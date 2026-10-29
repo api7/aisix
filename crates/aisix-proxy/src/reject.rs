@@ -98,7 +98,7 @@ pub(crate) fn reject_before_dispatch(
     // `request_metrics` keys the LLM-vs-proxy split off the result, so a 413
     // on /v1/chat/completions lands in the same families as the
     // model-not-found the handler itself records.
-    crate::request_metrics::record(
+    crate::request_metrics::record_undispatched(
         state,
         crate::normalize_endpoint_label(path),
         crate::request_metrics::Caller::unattributed(api_key_id),
@@ -168,7 +168,7 @@ pub(crate) fn record_undispatched(
     status: u16,
     started: Instant,
 ) {
-    crate::request_metrics::record(
+    crate::request_metrics::record_undispatched(
         state,
         crate::normalize_endpoint_label(path),
         caller,
