@@ -36,7 +36,10 @@ import {
 //   - v2 LOCAL keeps the socket address;
 //   - the header's source is the peer `x-forwarded-for` trust is judged
 //     on: untrusted → XFF ignored, trusted → XFF walked;
-//   - a header from a peer outside the list closes the connection.
+//   - a header from a peer outside the list closes the connection;
+//   - on a dual-stack `[::]` listener an IPv4 client is the IPv4 address
+//     (not `::ffff:a.b.c.d`), so an IPv4 `trusted_proxies` entry matches
+//     it and it is reported as plain IPv4.
 
 const CALLER_PLAINTEXT = "sk-proxy-protocol-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -165,6 +168,8 @@ describe("PROXY protocol e2e (AISIX-Cloud#1915): the header's source is the clie
   let trusted: SpawnedApp | undefined;
   // Default `trusted_proxies`: nobody may send a header.
   let untrusted: SpawnedApp | undefined;
+  // Dual-stack `[::]` listener trusting the IPv4 loopback.
+  let dualStack: SpawnedApp | undefined;
   let plainPort = 0;
   let tlsPort = 0;
 
@@ -259,13 +264,20 @@ describe("PROXY protocol e2e (AISIX-Cloud#1915): the header's source is the clie
     plainPort = portOf(trusted.proxyUrls[0]);
     tlsPort = portOf(trusted.proxyUrls[1]);
     untrusted = await spawnApp({ extraEnv: slsEnv });
+    dualStack = await spawnApp({
+      realIp: { trusted_proxies: ["127.0.0.1/32"], recursive: true },
+      proxyListeners: [{ host: "::" }],
+      extraEnv: slsEnv,
+    });
     await seed(trusted);
     await seed(untrusted);
+    await seed(dualStack);
   }, 90_000);
 
   afterAll(async () => {
     await trusted?.exit();
     await untrusted?.exit();
+    await dualStack?.exit();
     await upstream?.close();
     await sls?.close();
     if (dir) await rm(dir, { recursive: true, force: true });
@@ -395,5 +407,24 @@ describe("PROXY protocol e2e (AISIX-Cloud#1915): the header's source is the clie
       marker: "pp-untrusted-plain",
     });
     expect(served.status).toBe(200);
+  });
+
+  test("an IPv4 client on a dual-stack listener is matched and reported as IPv4", async (ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    const port = portOf(dualStack!.proxyUrl);
+    const forwarded = await rawChat(port, Buffer.alloc(0), {
+      model: OPEN_MODEL,
+      marker: "pp-dual-xff",
+      headers: { "x-forwarded-for": "203.0.113.21" },
+    });
+    expect(forwarded.status).toBe(200);
+    expect((await usageFor(forwarded)).get("client_source_ip")).toBe("203.0.113.21");
+
+    const direct = await rawChat(port, Buffer.alloc(0), {
+      model: OPEN_MODEL,
+      marker: "pp-dual-direct",
+    });
+    expect(direct.status).toBe(200);
+    expect((await usageFor(direct)).get("client_source_ip")).toBe("127.0.0.1");
   });
 });

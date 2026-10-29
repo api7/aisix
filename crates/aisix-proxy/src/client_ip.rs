@@ -56,7 +56,9 @@ pub fn resolve_client_ip(
     trusted: &[IpNet],
     recursive: bool,
 ) -> IpAddr {
-    let is_trusted = |ip: &IpAddr| trusted.iter().any(|n| n.contains(ip));
+    // An IPv4 address written in its IPv4-mapped IPv6 form is the same
+    // address, and an IPv4 CIDR has to match it.
+    let is_trusted = |ip: &IpAddr| trusted.iter().any(|n| n.contains(&ip.to_canonical()));
     // nginx only rewrites $remote_addr when the connection itself comes
     // from a trusted proxy. An untrusted peer IS the client.
     if !is_trusted(&peer) {
@@ -427,6 +429,17 @@ mod tests {
         let fwd = [ip("1.2.3.4")];
         let trusted = nets(&["10.0.0.0/8"]);
         assert_eq!(resolve_client_ip(peer, &fwd, &trusted, true), peer);
+    }
+
+    #[test]
+    fn an_ipv4_mapped_forwarded_entry_matches_an_ipv4_cidr() {
+        let peer = ip("10.0.0.1");
+        let fwd = [ip("203.0.113.7"), ip("::ffff:10.0.0.2")];
+        let trusted = nets(&["10.0.0.0/8"]);
+        assert_eq!(
+            resolve_client_ip(peer, &fwd, &trusted, true),
+            ip("203.0.113.7")
+        );
     }
 
     #[test]

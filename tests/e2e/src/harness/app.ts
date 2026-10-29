@@ -74,7 +74,11 @@ export interface AppOverrides {
    * plaintext listener would leave the harness probing a port nothing
    * serves plain HTTP on.
    */
-  proxyListeners?: Array<{ tls?: { cert_file: string; key_file: string } }>;
+  proxyListeners?: Array<{
+    tls?: { cert_file: string; key_file: string };
+    /** Bind host; defaults to `127.0.0.1`. `::` binds dual-stack, still reached at 127.0.0.1. */
+    host?: string;
+  }>;
   /**
    * `proxy.request_body_limit_bytes`. A dedicated override (like
    * `realIp`) because `extra` replaces whole top-level blocks and the
@@ -436,7 +440,9 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       ...(listenerSpecs
         ? {
             listeners: listenerSpecs.map((listener, i) => ({
-              addr: `127.0.0.1:${listenerPorts[i]}`,
+              addr: listener.host?.includes(":")
+                ? `[${listener.host}]:${listenerPorts[i]}`
+                : `${listener.host ?? "127.0.0.1"}:${listenerPorts[i]}`,
               ...(listener.tls ? { tls: listener.tls } : {}),
             })),
           }

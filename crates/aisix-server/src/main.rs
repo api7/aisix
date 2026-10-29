@@ -2585,6 +2585,15 @@ async fn sniff_downstream_version<I: tokio::io::AsyncRead + Unpin>(
     Ok((version, Rewind::new(head[..filled].to_vec(), stream)))
 }
 
+/// A dual-stack (`[::]`) listener reports an IPv4 client as
+/// `::ffff:a.b.c.d`, which no IPv4 CIDR contains. Every consumer of the
+/// connection's peer — `trusted_proxies`, `allowed_cidrs`, source
+/// allowlists, hash routing, the reported client address — reads it
+/// through `ConnectInfo`, so it is normalised once, here.
+fn canonical_peer(peer: std::net::SocketAddr) -> std::net::SocketAddr {
+    std::net::SocketAddr::new(peer.ip().to_canonical(), peer.port())
+}
+
 /// The peers allowed to open a proxy-listener connection with a PROXY
 /// header: `proxy.real_ip.trusted_proxies`. Only the proxy listeners carry
 /// one; the admin, metrics and debug listeners never read a header.
@@ -2979,7 +2988,7 @@ async fn accept_loop(
         };
 
         let (stream, peer) = match accepted {
-            Ok(accepted) => accepted,
+            Ok((stream, peer)) => (stream, canonical_peer(peer)),
             // Transient: fd exhaustion, or a peer that vanished between
             // the SYN and the accept. Backing off keeps a listener that
             // cannot accept from spinning a core.
@@ -3059,7 +3068,7 @@ async fn accept_loop(
                 None => (peer, Rewind::new(Vec::new(), stream)),
                 Some(trusted) => {
                     match read_proxy_header(stream, peer, &trusted, idle_timeout, label).await {
-                        Some(read) => read,
+                        Some((peer, stream)) => (canonical_peer(peer), stream),
                         None => return,
                     }
                 }

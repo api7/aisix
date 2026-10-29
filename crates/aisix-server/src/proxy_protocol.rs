@@ -101,10 +101,7 @@ pub(crate) async fn read<S: AsyncRead + Unpin>(
         buf.extend_from_slice(&chunk[..n]);
     };
 
-    // A dual-stack listener reports an IPv4 balancer as `::ffff:a.b.c.d`,
-    // which an IPv4 CIDR never contains.
-    let socket_ip = socket_peer.ip().to_canonical();
-    if !trusted.iter().any(|net| net.contains(&socket_ip)) {
+    if !trusted.iter().any(|net| net.contains(&socket_peer.ip())) {
         return Err(Refused::Untrusted);
     }
 
@@ -425,12 +422,6 @@ mod tests {
         assert_eq!(Some(peer), src("203.0.113.7:51234"));
         assert_eq!(rest, b"GET / HTTP/1.1\r\n");
 
-        let mapped: SocketAddr = "[::ffff:10.1.2.3]:5000".parse().unwrap();
-        let (peer, _) = read(&mut wire.as_slice(), mapped, &trusted, None)
-            .await
-            .expect("a dual-stack listener's view of a trusted IPv4 peer");
-        assert_eq!(Some(peer), src("203.0.113.7:51234"));
-
         let stranger: SocketAddr = "192.0.2.1:5000".parse().unwrap();
         assert!(matches!(
             read(&mut wire.as_slice(), stranger, &trusted, None).await,
@@ -460,6 +451,43 @@ mod tests {
         assert!(matches!(
             read(&mut &wire[..wire.len() - 2], peer, &trusted, None).await,
             Err(Refused::Malformed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_header_split_across_reads_is_reassembled() {
+        use tokio::io::AsyncWriteExt;
+
+        let trusted: Vec<IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        let peer: SocketAddr = "10.1.2.3:5000".parse().unwrap();
+        let mut wire = v2(1, 0x11, &v4_block(&[]));
+        wire.extend_from_slice(b"GET");
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let writer = tokio::spawn(async move {
+            for byte in wire {
+                client.write_all(&[byte]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            client
+        });
+        let (got, rest) = read(&mut server, peer, &trusted, None).await.unwrap();
+        let _client = writer.await.unwrap();
+        assert_eq!(Some(got), src("203.0.113.7:51234"));
+        assert!(b"GET".starts_with(&rest), "{rest:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_header_that_stalls_midway_is_malformed() {
+        use tokio::io::AsyncWriteExt;
+
+        let trusted: Vec<IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        let peer: SocketAddr = "10.1.2.3:5000".parse().unwrap();
+        let wire = v2(1, 0x11, &v4_block(&[]));
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(&wire[..14]).await.unwrap();
+        assert!(matches!(
+            read(&mut server, peer, &trusted, Some(Duration::from_secs(5))).await,
+            Err(Refused::Malformed("timed out inside the header"))
         ));
     }
 }
