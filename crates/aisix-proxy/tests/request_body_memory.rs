@@ -37,6 +37,8 @@ use tower::ServiceExt;
 struct CountingAllocator;
 
 static LIVE: AtomicIsize = AtomicIsize::new(0);
+/// The highest `LIVE` has been since it was last reset.
+static PEAK: AtomicIsize = AtomicIsize::new(0);
 
 thread_local! {
     /// Set on the mock upstream's own threads: its connection buffers are
@@ -46,7 +48,8 @@ thread_local! {
 
 fn count(delta: isize) {
     if !UNCOUNTED.with(Cell::get) {
-        LIVE.fetch_add(delta, Ordering::Relaxed);
+        let now = LIVE.fetch_add(delta, Ordering::Relaxed) + delta;
+        PEAK.fetch_max(now, Ordering::Relaxed);
     }
 }
 
@@ -471,19 +474,23 @@ fn embeddings_body((images, image_bytes): (usize, usize)) -> String {
 
 /// Send `body` to `path` and, once `requests` upstream calls have arrived
 /// and are being withheld, return the live-heap growth since before the
-/// body existed, together with the body length.
+/// body existed and its highest point up to then, together with the body
+/// length.
 async fn held_while_pending(
     app: &Router,
     upstream: &mut HeldUpstream,
     path: &str,
     (passed, requests): (usize, usize),
     make_body: impl FnOnce() -> String,
-) -> (isize, usize) {
+) -> (isize, isize, usize) {
     upstream.hold.send_replace(true);
     upstream.pass.store(passed, Ordering::SeqCst);
     let before = live();
     let body = make_body();
     let body_len = body.len();
+    // Building the body is the test's own cost; the peak starts from the
+    // finished body, which the gateway then receives.
+    PEAK.store(live(), Ordering::Relaxed);
     let req = Request::builder()
         .method("POST")
         .uri(path)
@@ -506,6 +513,7 @@ async fn held_while_pending(
     // Let anything transient from the send settle before sampling.
     tokio::time::sleep(Duration::from_millis(200)).await;
     let held = live() - before;
+    let peak = PEAK.load(Ordering::Relaxed) - before;
 
     upstream.hold.send_replace(false);
     let resp = call.await.unwrap().unwrap();
@@ -514,23 +522,33 @@ async fn held_while_pending(
     // Later calls of the same request (an ensemble's judge) answered
     // without being held; drain their receipts.
     while upstream.received.try_recv().is_ok() {}
-    (held, body_len)
+    (held, peak, body_len)
 }
 
-/// Bytes held per byte of request body: the large request's growth less
-/// the small one's, over the difference in their lengths.
-async fn in_flight_multiplier(app: &Router, upstream: &mut HeldUpstream, family: &Family) -> f64 {
-    let (small_held, small_len) =
+/// Bytes held, and at most alive, per byte of request body: the large
+/// request's growth less the small one's, over the difference in their
+/// lengths.
+async fn in_flight_multiplier(
+    app: &Router,
+    upstream: &mut HeldUpstream,
+    family: &Family,
+) -> (f64, f64) {
+    let (small_held, small_peak, small_len) =
         held_while_pending(app, upstream, family.path, family.calls(), || {
             (family.body)(SMALL)
         })
         .await;
-    let (large_held, large_len) =
+    let (large_held, large_peak, large_len) =
         held_while_pending(app, upstream, family.path, family.calls(), || {
             (family.body)(LARGE)
         })
         .await;
-    (large_held - small_held) as f64 / (large_len - small_len) as f64
+    let per_byte =
+        |large: isize, small: isize| (large - small) as f64 / (large_len - small_len) as f64;
+    (
+        per_byte(large_held, small_held),
+        per_byte(large_peak, small_peak),
+    )
 }
 
 struct Family {
@@ -543,6 +561,9 @@ struct Family {
     /// Calls answered before the measured ones are made (an ensemble's
     /// panel, when the judge is measured).
     passed: usize,
+    /// Bound on the highest point while the request is sent, where one is
+    /// enforced.
+    peak: Option<f64>,
 }
 
 impl Family {
@@ -553,6 +574,7 @@ impl Family {
             body,
             requests: 1,
             passed: 0,
+            peak: None,
         }
     }
 
@@ -623,7 +645,13 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
             messages_body,
         ),
         // Served natively by the OpenAI upstream, likewise built by the route.
-        Family::new("responses passthrough", "/v1/responses", responses_body),
+        // Only `model` changes on the way out, so the outbound body is
+        // serialized from the parsed request as it stands, not from a copy:
+        // the parsed request plus its wire body is the highest point too.
+        Family {
+            peak: Some(2.0 + MARGIN),
+            ..Family::new("responses passthrough", "/v1/responses", responses_body)
+        },
         Family::new(
             "responses -> anthropic (bridged)",
             "/v1/responses",
@@ -645,20 +673,27 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
 
     let mut report = Vec::new();
     for family in &families {
-        let m = in_flight_multiplier(&app, &mut upstream, family).await;
+        let (m, peak) = in_flight_multiplier(&app, &mut upstream, family).await;
         eprintln!(
-            "{}: {m:.4}x request body held while upstream is pending (limit {:.1}x)",
+            "{}: {m:.4}x request body held while upstream is pending (limit {:.1}x), peak {peak:.4}x",
             family.name,
             family.limit()
         );
-        report.push((family, m));
+        report.push((family, m, peak));
     }
-    for (family, m) in report {
+    for (family, m, peak) in report {
         assert!(
             m <= family.limit(),
             "{} held {m:.2}x the request body while waiting on the upstream (limit {:.1}x)",
             family.name,
             family.limit()
         );
+        if let Some(limit) = family.peak {
+            assert!(
+                peak <= limit,
+                "{} peaked at {peak:.2}x the request body while it was sent (limit {limit:.1}x)",
+                family.name
+            );
+        }
     }
 }

@@ -24,6 +24,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::StreamExt;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -1211,6 +1212,46 @@ fn responses_value_text(v: &Value) -> String {
     }
 }
 
+/// Whether this attempt's outbound body differs from the caller's by more
+/// than the `model` value: a thought signature to strip from `input`, or
+/// any of the provider key's `request.*` body overrides.
+fn body_rewrite_needed(
+    fields: &serde_json::Map<String, Value>,
+    pk: &aisix_core::ProviderKey,
+) -> bool {
+    fields
+        .get("input")
+        .is_some_and(aisix_gateway::tool_calls::body_has_thought_signatures)
+        || pk.request.as_ref().is_some_and(|r| {
+            !r.param_renames.is_empty()
+                || r.param_constraints.is_some()
+                || !r.default_body_fields.is_empty()
+        })
+}
+
+/// The caller's request object with only `model` replaced, serialized
+/// field by field in the object's own order — the same bytes as cloning
+/// the object, rewriting `model` and serializing the clone.
+struct ModelRenamed<'a> {
+    fields: &'a serde_json::Map<String, Value>,
+    model: &'a str,
+}
+
+impl serde::Serialize for ModelRenamed<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.fields.len()))?;
+        for (key, value) in self.fields {
+            if key == "model" {
+                map.serialize_entry(key, self.model)?;
+            } else {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
+}
+
 /// Dispatch one concrete target's Responses-API passthrough. The caller
 /// has already confirmed the target serves `/v1/responses` natively
 /// ([`crate::dispatch::serves_natively`]) — which its vendor id implies
@@ -1283,38 +1324,65 @@ async fn responses_to_target(
     // so a `Value` copy alive across the await would be a third copy of the
     // request (see `crate::util::outbound_json`).
     let (body_bytes, is_stream) = {
-        let mut body = crate::effort_mapping::responses_request(body, model).into_owned();
-
-        // Rewrite model field to upstream name.
-        if let Some(m) = body.get_mut("model") {
-            *m = Value::String(upstream_model.clone());
-        }
-        // A Gemini thought signature riding in a call id is for Gemini only.
-        if let Some(input) = body.get_mut("input") {
-            aisix_gateway::tool_calls::strip_thought_signatures_in_body(input);
-        }
-
-        // Apply the PK's `request.*` overrides to the outbound body, matching the
-        // OpenAI bridge's chat() path and the /v1/messages passthrough. The
-        // verbatim /v1/responses path builds the request directly (bypassing the
-        // Hub), so without this the override pipeline silently no-ops for Codex
-        // traffic (AISIX-Cloud#867 follow-up). Apply order: renames → constraints
-        // → defaults; each is a no-op when its configured map is empty.
-        if let Some(r) = pk_entry.value.request.as_ref() {
-            aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
-            if let Some(constraints) = &r.param_constraints {
-                aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
+        let mapped = crate::effort_mapping::responses_request(body, model);
+        // The common case only renames `model`: serialize the caller's body
+        // with that one field swapped instead of deep-cloning it first, which
+        // would be a second whole parsed request alive at the peak.
+        let only_model_renamed = match &mapped {
+            Cow::Borrowed(Value::Object(fields))
+                if !body_rewrite_needed(fields, &pk_entry.value) =>
+            {
+                Some(fields)
             }
-            aisix_provider_openai::overrides::apply_default_body_fields(
-                &mut body,
-                &r.default_body_fields,
-            );
+            _ => None,
+        };
+        if let Some(fields) = only_model_renamed {
+            let wire = ModelRenamed {
+                fields,
+                model: &upstream_model,
+            };
+            let is_stream = fields
+                .get("stream")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            (crate::util::outbound_json(&wire)?, is_stream)
+        } else {
+            let mut body = mapped.into_owned();
+
+            // Rewrite model field to upstream name.
+            if let Some(m) = body.get_mut("model") {
+                *m = Value::String(upstream_model.clone());
+            }
+            // A Gemini thought signature riding in a call id is for Gemini only.
+            if let Some(input) = body.get_mut("input") {
+                aisix_gateway::tool_calls::strip_thought_signatures_in_body(input);
+            }
+
+            // Apply the PK's `request.*` overrides to the outbound body, matching the
+            // OpenAI bridge's chat() path and the /v1/messages passthrough. The
+            // verbatim /v1/responses path builds the request directly (bypassing the
+            // Hub), so without this the override pipeline silently no-ops for Codex
+            // traffic (AISIX-Cloud#867 follow-up). Apply order: renames → constraints
+            // → defaults; each is a no-op when its configured map is empty.
+            if let Some(r) = pk_entry.value.request.as_ref() {
+                aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
+                if let Some(constraints) = &r.param_constraints {
+                    aisix_provider_openai::overrides::apply_param_constraints(
+                        &mut body,
+                        constraints,
+                    );
+                }
+                aisix_provider_openai::overrides::apply_default_body_fields(
+                    &mut body,
+                    &r.default_body_fields,
+                );
+            }
+            let is_stream = body
+                .get("stream")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            (crate::util::outbound_json(&body)?, is_stream)
         }
-        let is_stream = body
-            .get("stream")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        (crate::util::outbound_json(&body)?, is_stream)
     };
 
     let url = aisix_gateway::url_cache::cached_endpoint_url(
@@ -2013,12 +2081,13 @@ async fn responses_to_target(
         let eos_scan = (aisix_guardrails::Guardrail::runs_on_output(chain)
             && released_ttft_ms.is_none())
         .then(|| EosOutputScan::new(Arc::clone(&chain_arc), upstream_model.clone()));
-        // Token-estimation fallback context (AISIX-Cloud#1074): the request
-        // body is cloned because the closure runs at end-of-stream Drop.
-        // Tokenized only if the upstream never reports usage.
+        // Token-estimation fallback context (AISIX-Cloud#1074): the closure
+        // runs at end-of-stream Drop, so it keeps the wire bytes (a shared
+        // `Bytes`, no copy) and parses them only if the upstream never
+        // reports usage.
         let estimator_c = crate::token_estimate::Estimator::new(
             &upstream_model,
-            crate::token_estimate::PromptInput::Responses(crate::util::outbound_value(&body_bytes)),
+            crate::token_estimate::PromptInput::ResponsesWire(body_bytes.clone()),
         );
         let parsed_stream = build_responses_passthrough_stream(
             body_stream,
@@ -4352,6 +4421,61 @@ fn emit_access_log(
 
 #[cfg(test)]
 mod tests {
+    /// Serializing the borrowed request with only `model` swapped gives the
+    /// same bytes as cloning it, rewriting `model` and serializing the clone.
+    #[test]
+    fn model_renamed_matches_clone_and_rewrite() {
+        for body in [
+            serde_json::json!({
+                "stream": true, "model": "alias", "input": [{"role": "user", "content": "hi"}],
+                "tools": [], "metadata": {"model": "kept"}
+            }),
+            serde_json::json!({"model": null, "input": "quote: \" / slash: \\ / Unicode: 猫"}),
+            serde_json::json!({"input": "no model field", "metadata": {"model": 42}}),
+        ] {
+            let fields = body.as_object().unwrap();
+            let mut cloned = body.clone();
+            if let Some(model) = cloned.get_mut("model") {
+                *model = serde_json::Value::String("upstream\"猫".into());
+            }
+            assert_eq!(
+                serde_json::to_vec(&super::ModelRenamed {
+                    fields,
+                    model: "upstream\"猫"
+                })
+                .unwrap(),
+                serde_json::to_vec(&cloned).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn model_rename_fast_path_keeps_every_body_rewrite() {
+        use serde_json::json;
+        let fields = json!({"input": "hi"}).as_object().unwrap().clone();
+        for (request, rewrite) in [
+            (json!(null), false),
+            (json!({}), false),
+            (json!({"default_headers": {"x-custom": "kept"}}), false),
+            (
+                json!({"param_renames": {"max_output_tokens": "max_tokens"}}),
+                true,
+            ),
+            (json!({"param_constraints": {}}), true),
+            (json!({"default_body_fields": {"store": false}}), true),
+        ] {
+            let pk = serde_json::from_value(json!({
+                "display_name": "upstream", "api_key": "", "request": request
+            }))
+            .unwrap();
+            assert_eq!(super::body_rewrite_needed(&fields, &pk), rewrite);
+        }
+        let fields = json!({"input": [{"type": "function_call", "call_id": "c__thought__sig"}]});
+        assert!(super::body_rewrite_needed(
+            fields.as_object().unwrap(),
+            &serde_json::from_value(json!({"display_name": "upstream", "api_key": ""})).unwrap()
+        ));
+    }
 
     /// The two ways a Responses-API stream reports a failure in-band are
     /// both read as an upstream error — the `error` event in its flat and

@@ -80,6 +80,21 @@ pub fn chat_without_thought_signatures(req: Cow<'_, ChatFormat>) -> Cow<'_, Chat
     Cow::Owned(req)
 }
 
+/// Whether [`strip_thought_signatures_in_body`] would change `body`: some
+/// tool-call id in it carries a signature. Lets a caller that only holds
+/// the body borrowed skip copying it when there is nothing to strip.
+pub fn body_has_thought_signatures(body: &Value) -> bool {
+    match body {
+        Value::Object(obj) => obj.iter().any(|(key, value)| match (key.as_str(), value) {
+            ("id" | "call_id" | "tool_call_id" | "tool_use_id", _) => has_signature(Some(value)),
+            ("arguments", _) | ("input", Value::Object(_)) => false,
+            _ => body_has_thought_signatures(value),
+        }),
+        Value::Array(items) => items.iter().any(body_has_thought_signatures),
+        _ => false,
+    }
+}
+
 /// Reduce every tool-call id in a raw request body (Anthropic Messages
 /// `tool_use.id` / `tool_result.tool_use_id`, Responses `call_id`, chat
 /// `tool_calls[].id` / `tool_call_id`) to its base id, wherever it sits.
@@ -385,7 +400,9 @@ mod tests {
             ]}],
             "input": [{"type": "function_call", "call_id": "call_b__thought__eHl6"}]
         });
+        assert!(body_has_thought_signatures(&body));
         strip_thought_signatures_in_body(&mut body);
+        assert!(!body_has_thought_signatures(&body));
         assert_eq!(body["messages"][0]["content"][0]["id"], "call_a");
         assert_eq!(
             body["messages"][0]["content"][0]["input"]["id"],
@@ -397,6 +414,19 @@ mod tests {
         );
         assert_eq!(body["messages"][1]["content"][0]["tool_use_id"], "call_a");
         assert_eq!(body["input"][0]["call_id"], "call_b");
+    }
+
+    /// The check looks where the strip rewrites and nowhere else: a
+    /// signature-looking value inside a call's own arguments or in prose
+    /// does not count.
+    #[test]
+    fn signature_check_ignores_arguments_and_prose() {
+        let body = json!({"input": [
+            {"type": "function_call", "call_id": "call_b", "arguments": "{\"id\":\"x__thought__y\"}"},
+            {"type": "tool_use", "id": "call_c", "input": {"id": "x__thought__y"}},
+            {"type": "message", "content": [{"type": "input_text", "text": "id__thought__"}]}
+        ]});
+        assert!(!body_has_thought_signatures(&body));
     }
 
     #[test]

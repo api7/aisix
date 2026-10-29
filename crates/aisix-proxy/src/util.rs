@@ -6,8 +6,8 @@
 /// response head — outlive it; see [`aisix_gateway::json_body`]. A reader
 /// that needs the outbound form after the upstream answered uses
 /// [`outbound_text`] / [`outbound_value`] instead of a kept copy.
-pub(crate) fn outbound_json(
-    body: &serde_json::Value,
+pub(crate) fn outbound_json<T: serde::Serialize + ?Sized>(
+    body: &T,
 ) -> Result<bytes::Bytes, crate::error::ProxyError> {
     aisix_gateway::json_body(body).map_err(|e| {
         crate::error::ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
