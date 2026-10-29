@@ -241,9 +241,17 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
 
     // Keys that name no setting, and setting values that do nothing. Warned
     // about only now, because the subscriber above is what makes a warning
-    // visible at all.
+    // visible at all. An ignored key is reported whatever the log level: it
+    // is a misspelled setting as often as a retired one, and that is
+    // visible nowhere else — so when the level filters WARN out, it goes
+    // straight to stderr instead.
+    let warn_enabled = tracing::enabled!(tracing::Level::WARN);
     for ignored in cfg.ignored_keys() {
-        tracing::warn!("{ignored}");
+        if warn_enabled {
+            tracing::warn!("{ignored}");
+        } else {
+            eprintln!("WARN {ignored}");
+        }
     }
     for retired in cfg.observability.retired_settings() {
         tracing::warn!("{retired}");

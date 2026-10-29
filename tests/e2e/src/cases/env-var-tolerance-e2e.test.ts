@@ -86,6 +86,22 @@ describe("unrecognised AISIX_* environment variables", () => {
     );
   });
 
+  test("an ignored key is reported even when the log level hides warnings", async () => {
+    // A misspelled setting is not applied, and this line is the only place
+    // that says so — it cannot depend on the operator logging at WARN.
+    app = await spawnApp({
+      resourcesFile: RESOURCES,
+      logLevel: "error",
+      extraEnv: { AISIX_ADMIN__TSL: "on" },
+    });
+
+    const livez = await fetch(`${app.proxyUrl}/livez`);
+    expect(livez.status).toBe(200);
+    expect(app.output()).toContain(
+      "admin.tsl (set by AISIX_ADMIN__TSL) is not a setting this gateway knows and was ignored.",
+    );
+  });
+
   test("AISIX_CONFIG starts the gateway without a --config argument", async () => {
     app = await spawnApp({ resourcesFile: RESOURCES, configViaEnv: true });
 
