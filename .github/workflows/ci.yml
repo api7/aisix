@@ -454,30 +454,27 @@ jobs:
           node-version: 22
       - uses: pnpm/action-setup@v6
         with:
-          # Matches the pnpm developers run locally.
+          # CI pins pnpm 11 (lockfile format v9); generate
+          # tests/e2e/pnpm-lock.yaml with a pnpm that keeps that format.
           version: 11
-      - name: check harness exists
-        id: harness
+      - name: require the e2e harness
+        # pnpm exits 0 in a directory that has pnpm-workspace.yaml but no
+        # package.json, so a missing harness must be caught here.
         run: |
-          if [ -f tests/e2e/package.json ]; then
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::tests/e2e harness not present yet — skipping"
+          if [ ! -f tests/e2e/package.json ]; then
+            echo "::error::tests/e2e/package.json is missing"
+            exit 1
           fi
       - name: e2e install
-        if: steps.harness.outputs.present == 'true'
         working-directory: tests/e2e
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
       # vitest strips types without checking them, so a type error in a
       # case (e.g. a `test.each` callback expecting a context vitest never
       # passes) would otherwise only surface when that branch runs.
       - name: e2e typecheck
-        if: steps.harness.outputs.present == 'true'
         working-directory: tests/e2e
         run: pnpm exec tsc --noEmit
       - name: run e2e
-        if: steps.harness.outputs.present == 'true'
         working-directory: tests/e2e
         # Read by the harness, which writes it into every spawned
         # gateway's `proxy.thread_per_core`. The binary's own default is
