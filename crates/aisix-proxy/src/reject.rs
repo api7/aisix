@@ -157,6 +157,27 @@ pub(crate) fn emit_unrouted_access_log(
     });
 }
 
+/// Count a request answered without dispatch (`/v1/models`, the A2A agent
+/// card, the OAuth discovery documents) in the request families. Nothing
+/// upstream was resolved, so only the route, the caller and the outcome are
+/// labelled.
+pub(crate) fn record_undispatched(
+    state: &ProxyState,
+    path: &str,
+    caller: crate::request_metrics::Caller<'_>,
+    status: u16,
+    started: Instant,
+) {
+    crate::request_metrics::record(
+        state,
+        crate::normalize_endpoint_label(path),
+        caller,
+        crate::request_metrics::Upstream::default(),
+        status,
+        started.elapsed(),
+    );
+}
+
 /// The router's answer to a known path with a method it does not serve.
 /// axum's own 405 (it still adds `Allow`), plus the request's access-log
 /// line, which the built-in fallback never wrote.

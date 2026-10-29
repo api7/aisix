@@ -7165,61 +7165,38 @@ impl RouteTelemetry {
         )
         .into_owned();
         let llm_tier = self.metering.llm_tier();
+        let upstream = crate::request_metrics::Upstream {
+            provider: &self.provider_label,
+            model: if llm_tier {
+                &usage_model
+            } else {
+                PASSTHROUGH_MODEL_LABEL
+            },
+            pk: pk.labels(),
+            stream: self.streaming,
+            ..Default::default()
+        };
         crate::request_metrics::record_in_tier(
             &self.state,
             ENDPOINT_LABEL,
             llm_tier,
             caller.as_caller(),
-            crate::request_metrics::Upstream {
-                provider: &self.provider_label,
-                model: if llm_tier {
-                    &usage_model
-                } else {
-                    PASSTHROUGH_MODEL_LABEL
-                },
-                pk: pk.labels(),
-                stream: self.streaming,
-                ..Default::default()
-            },
+            upstream,
             self.status,
             elapsed,
         );
-
-        if llm_tier {
-            let upstream = || crate::request_metrics::Upstream {
-                provider: &self.provider_label,
-                model: &usage_model,
-                pk: pk.labels(),
-                stream: self.streaming,
-                ..Default::default()
-            };
-            // The latency families each typed endpoint records: end-to-end
-            // latency on the three that time it (chat, Anthropic messages,
-            // responses), and time to first token on any streamed reply.
-            if matches!(
-                self.metering,
-                Metering::Chat | Metering::Anthropic | Metering::Responses
-            ) {
-                crate::request_metrics::record_e2e_latency(
-                    &self.state,
-                    ENDPOINT_LABEL,
-                    caller.as_caller(),
-                    upstream(),
-                    self.status,
-                    elapsed,
-                );
-            }
-            if self.streaming && self.upstream_ttft_ms > 0 {
-                crate::request_metrics::record_stream_ttft(
-                    &self.state,
-                    ENDPOINT_LABEL,
-                    caller.as_caller(),
-                    upstream(),
-                    self.status,
-                    Duration::from_millis(u64::from(self.upstream_ttft_ms)),
-                    Duration::from_millis(u64::from(self.downstream_first_ms.unwrap_or(0))),
-                );
-            }
+        // An opaque relay times its first frame too, so it reports time to
+        // first byte like an identified stream does.
+        if self.streaming && self.upstream_ttft_ms > 0 {
+            crate::request_metrics::record_stream_ttft(
+                &self.state,
+                ENDPOINT_LABEL,
+                caller.as_caller(),
+                upstream,
+                self.status,
+                Duration::from_millis(u64::from(self.upstream_ttft_ms)),
+                Duration::from_millis(u64::from(self.downstream_first_ms.unwrap_or(0))),
+            );
         }
 
         let mut event = aisix_obs::UsageEvent {
@@ -7278,7 +7255,7 @@ impl RouteTelemetry {
             // resolves no Model, so `model` is the caller's body alias
             // bounded the way the usage event's label is (an unregistered
             // name folds to `unresolved`), and there is no dispatched
-            // upstream model to name. No spend: a route prices nothing.
+            // upstream model to name.
             crate::request_metrics::record_usage(
                 &self.state,
                 ENDPOINT_LABEL,
@@ -7302,7 +7279,6 @@ impl RouteTelemetry {
                     cached: usage.cached_prompt_tokens,
                     cache_read: usage.cache_read_tokens,
                     cache_creation: usage.cache_creation_tokens,
-                    spend_usd: 0.0,
                     client_type: self
                         .state
                         .client_classifier

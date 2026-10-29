@@ -86,6 +86,11 @@ struct A2aCall {
     guardrail_audit: crate::usage_attr::GuardrailAudit,
     /// `UsageEvent::request_headers`, captured off the inbound request.
     request_headers: std::collections::BTreeMap<String, String>,
+    /// When the gateway received the request — the origin of the
+    /// caller-side time to first event.
+    request_started: Instant,
+    /// The normalised inbound client, for the by-client token series.
+    client_type: String,
 }
 
 /// The words exchanged on one A2A call.
@@ -115,6 +120,9 @@ struct A2aStreamProgress {
     /// one arrives — a stream that opens and produces nothing never sets it,
     /// and no figure is invented for it.
     ttfb: Option<Duration>,
+    /// Time from the gateway receiving the request to that first event being
+    /// handed to the caller.
+    downstream_ttfb: Option<Duration>,
     /// Events relayed downstream.
     event_count: u32,
     /// Set when the upstream stream ends — exhausted or faulted. Still false
@@ -162,16 +170,18 @@ pub async fn a2a_endpoint(
     // the caller's team / user labels (the handle is an `Arc` clone).
     let caller_auth = auth.clone();
 
-    let response = dispatch(auth, &agent, &state, request, &request_id, trace).await;
+    let response = dispatch(auth, &agent, &state, request, &request_id, trace, started).await;
 
     let elapsed = started.elapsed();
     let status = response.status().as_u16();
+    let streamed = crate::attribution::stream_owns_access_log();
     let a2a_upstream = crate::request_metrics::Upstream {
         provider: "a2a",
         model: A2A_MODEL_LABEL,
+        stream: streamed,
         ..Default::default()
     };
-    if crate::attribution::stream_owns_access_log() {
+    if streamed {
         // A streamed call ends when the agent's last event is relayed or
         // the caller walks away, both of which are below this frame and
         // minutes away. Park the line; `StreamUsageOnDrop` writes it beside
@@ -248,6 +258,7 @@ async fn dispatch(
     request: Request,
     request_id: &str,
     trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    request_started: Instant,
 ) -> Response {
     // Resolve the agent from the live snapshot. A disabled agent is treated as
     // absent — not served, same as a missing one.
@@ -334,6 +345,17 @@ async fn dispatch(
         guardrail_monitor_hits: Vec::new(),
         guardrail_audit: None,
         request_headers,
+        request_started,
+        client_type: state
+            .client_classifier
+            .classify(
+                parts
+                    .headers
+                    .get(axum::http::header::USER_AGENT)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default(),
+            )
+            .to_string(),
     };
     // Read before the upstream is contacted, so a call that never lands still
     // records which task the caller was asking about.
@@ -636,6 +658,12 @@ async fn dispatch_stream(
                         // stamp TTFT, so the two figures answer the same
                         // question.
                         guard.call.stream.ttfb.get_or_insert_with(|| started.elapsed());
+                        let request_started = guard.call.request_started;
+                        guard
+                            .call
+                            .stream
+                            .downstream_ttfb
+                            .get_or_insert_with(|| request_started.elapsed());
                     }
                     // Forwarding the terminal event IS the end of the
                     // response, and it has to be recorded BEFORE the yield:
@@ -706,6 +734,13 @@ pub async fn a2a_agent_card(
             .map(|r| r.0 .0.as_str())
             .unwrap_or_default(),
         Some(&auth.entry.id),
+        response.status().as_u16(),
+        started,
+    );
+    crate::reject::record_undispatched(
+        &state,
+        uri.path(),
+        crate::request_metrics::Caller::new(&auth),
         response.status().as_u16(),
         started,
     );
@@ -1019,23 +1054,6 @@ fn emit_a2a_usage(
         ..Default::default()
     };
     crate::usage_attr::apply_caller_identity(&mut event, auth.jwt.as_ref(), &auth.caller());
-    // The client-perceived duration of the call. Recorded here rather than at
-    // the stream's drop guard so the unary, quota-rejected and failed-to-open
-    // paths are in the sample too — a streaming-only series would report
-    // `/a2a` as having no failures at all.
-    crate::request_metrics::record_e2e_latency_downstream_only(
-        state,
-        "/a2a",
-        crate::request_metrics::Caller::new(auth),
-        crate::request_metrics::Upstream {
-            provider: "a2a",
-            model: A2A_MODEL_LABEL,
-            stream: is_streaming_operation(call.operation),
-            ..Default::default()
-        },
-        status_code,
-        latency,
-    );
     // The `aisix_a2a_*` family rides on the same chokepoint as the usage
     // event, so a path that accounts for a call cannot skip metering it.
     state.metrics.record_a2a_call(
@@ -1050,6 +1068,44 @@ fn emit_a2a_usage(
             task_state: call.facts.task_state,
         },
     );
+    let caller = crate::request_metrics::Caller::new(auth);
+    let upstream = crate::request_metrics::Upstream {
+        provider: "a2a",
+        model: A2A_MODEL_LABEL,
+        stream: call.stream.ttfb.is_some(),
+        ..Default::default()
+    };
+    if let (Some(upstream_ttfb), Some(downstream_ttfb)) =
+        (call.stream.ttfb, call.stream.downstream_ttfb)
+    {
+        crate::request_metrics::record_stream_ttft(
+            state,
+            "/a2a",
+            caller,
+            upstream,
+            status_code,
+            upstream_ttfb,
+            downstream_ttfb,
+        );
+    }
+    // The gateway's own count of the words, flagged `usage_estimated` on the
+    // event — recorded like any estimated count chat records, and only for a
+    // call the agent actually received.
+    if dispatched {
+        crate::request_metrics::record_usage(
+            state,
+            "/a2a",
+            caller,
+            upstream,
+            crate::request_metrics::Tokens {
+                input: prompt_tokens,
+                output: completion_tokens,
+                total: prompt_tokens.saturating_add(completion_tokens),
+                client_type: &call.client_type,
+                ..Default::default()
+            },
+        );
+    }
     // As with MCP: an agent call has no model and no ProviderKey, so the
     // attribution labels are the placeholder (AISIX-Cloud#1317).
     // Opt-in content capture, on the same terms as every other endpoint: only

@@ -71,6 +71,13 @@ pub async fn list_models(
         response.status().as_u16(),
         started,
     );
+    crate::reject::record_undispatched(
+        &state,
+        "/v1/models",
+        crate::request_metrics::Caller::new(&auth),
+        response.status().as_u16(),
+        started,
+    );
     response
 }
 

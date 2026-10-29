@@ -145,10 +145,7 @@ impl RoutingTelemetry {
     /// caller.
     pub fn record(&mut self, state: &crate::state::ProxyState, rec: AttemptRecord) {
         if rec.dispatched {
-            state.runtime_status.record_deployment_attempt(
-                &rec.target_model_id,
-                RequestOutcome::from_status(rec.status),
-            );
+            Self::record_deployment(state, &rec.target_model_id, rec.status);
         }
         if rec.kind == "fallback" {
             state.metrics.record_routing_fallback(
@@ -169,6 +166,17 @@ impl RoutingTelemetry {
         // only when the handler runs; exactly one of the two ever fires.
         crate::attribution::note_attempt_settled(&rec);
         self.attempts.push(rec);
+    }
+
+    /// The `aisix_deployment_*` half of [`Self::record`], for the surfaces
+    /// that call one direct model outside a routing loop and so keep no
+    /// attempt list (`/v1/realtime`, the jobs routes, the video follow-up
+    /// routes). Call it once per upstream call that was dispatched, with the
+    /// status the upstream answered or the error's status.
+    pub fn record_deployment(state: &crate::state::ProxyState, model_id: &str, status: u16) {
+        state
+            .runtime_status
+            .record_deployment_attempt(model_id, RequestOutcome::from_status(status));
     }
 
     /// Classify the next attempt against `target.display_name` and advance

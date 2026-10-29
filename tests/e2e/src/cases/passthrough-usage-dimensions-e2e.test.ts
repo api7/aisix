@@ -825,8 +825,9 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
       const deltas = tokenDeltas(before, after);
       expect(deltas.requests).toBe(0);
       expect(deltas.input).toBe(0);
-      // A streamed reply, but not an LLM protocol: no LLM latency either.
-      expect(latencyDeltas(before, after)).toEqual({ ttft: 0, requestTtft: 0, e2e: 0 });
+      // A streamed reply is timed whatever its protocol: an opaque relay
+      // reports its first frame and its end-to-end latency like any route.
+      expect(latencyDeltas(before, after)).toEqual({ ttft: 1, requestTtft: 1, e2e: 1 });
     }
 
     // OpenAI embeddings and image generation are identified from their

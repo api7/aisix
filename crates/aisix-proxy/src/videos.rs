@@ -1143,7 +1143,7 @@ async fn provider_call(
         "/v1/videos",
         |e| retry_permit(&method, e),
         || {
-            provider_call_once(
+            let call = provider_call_once(
                 state,
                 target,
                 method.clone(),
@@ -1151,11 +1151,31 @@ async fn provider_call(
                 body,
                 request_id,
                 timeout,
-            )
+            );
+            async move {
+                let result = call.await;
+                note_deployment(state, target, result.as_ref().map(|_| 200));
+                result
+            }
         },
     )
     .await
     .map_err(ProxyError::Bridge)
+}
+
+/// One follow-up round-trip's `aisix_deployment_*` sample; the submit is
+/// counted by its routing loop instead.
+fn note_deployment(
+    state: &ProxyState,
+    target: &VideoTarget,
+    outcome: Result<u16, &aisix_gateway::BridgeError>,
+) {
+    let status = match outcome {
+        Ok(status) => status,
+        Err(e) if e.reached_upstream() => e.http_status(),
+        Err(_) => return,
+    };
+    crate::attempt::RoutingTelemetry::record_deployment(state, &target.model_entry.id, status);
 }
 
 /// Whether a failed round-trip may be replayed (same target or, on the
@@ -1359,10 +1379,12 @@ async fn proxy_content(
     };
     let resp = crate::stream_timeout::send_with_deadline(builder, stream_budget, started)
         .await
+        .inspect_err(|e| note_deployment(state, target, Err(e)))
         .map_err(&note)
         .map_err(ProxyError::Bridge)?;
 
     let status = resp.status();
+    note_deployment(state, target, Ok(status.as_u16()));
     if !status.is_success() {
         // Status checked BEFORE any body is constructed: an expired /
         // not-ready content URL must surface as a typed error envelope, never
@@ -1556,17 +1578,30 @@ impl Telemetry<'_> {
         } else {
             crate::attribution::emit_access_log(line);
         }
-        crate::request_metrics::record(
-            self.state,
-            self.endpoint,
-            crate::request_metrics::Caller::new(self.auth),
-            crate::request_metrics::Upstream {
-                provider,
-                ..last_target.upstream(model_label, false, routing.fallback_count() > 0)
-            },
-            status,
-            elapsed,
-        );
+        let caller = crate::request_metrics::Caller::new(self.auth);
+        let upstream = crate::request_metrics::Upstream {
+            provider,
+            ..last_target.upstream(model_label, false, routing.fallback_count() > 0)
+        };
+        if self.duration_spans_body {
+            crate::request_metrics::record_spanning_body(
+                self.state,
+                self.endpoint,
+                caller,
+                upstream,
+                status,
+                self.started,
+            );
+        } else {
+            crate::request_metrics::record(
+                self.state,
+                self.endpoint,
+                caller,
+                upstream,
+                status,
+                elapsed,
+            );
+        }
     }
 }
 

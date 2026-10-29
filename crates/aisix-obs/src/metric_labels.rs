@@ -277,7 +277,6 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
         extra = &["policy_name"]
     ),
     metric!(M_TOKENS_CONSUMED, &["provider", "model"]),
-    metric!(M_LLM_SPEND_MICRO_USD_TOTAL, USAGE, extra = CALLER_NAMES),
     metric!(M_LLM_INPUT_TOKENS_TOTAL, USAGE, extra = CALLER_NAMES),
     metric!(M_LLM_OUTPUT_TOKENS_TOTAL, USAGE, extra = CALLER_NAMES),
     metric!(M_LLM_TOTAL_TOKENS_TOTAL, USAGE, extra = CALLER_NAMES),

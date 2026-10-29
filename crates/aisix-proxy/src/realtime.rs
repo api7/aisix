@@ -800,6 +800,11 @@ async fn run_session(
     let mut upstream_response_headers = std::collections::BTreeMap::new();
     let upstream = match connect_upstream(upstream_request).await {
         Ok((ws, resp)) => {
+            crate::attempt::RoutingTelemetry::record_deployment(
+                &state,
+                &model_entry.id,
+                resp.status().as_u16(),
+            );
             let names = crate::client_ip::exported_header_names(&state.snapshot.load(), true);
             if !names.is_empty() {
                 upstream_response_headers =
@@ -809,6 +814,8 @@ async fn run_session(
         }
         Err(e) => {
             tracing::warn!(error = %e, model = %requested_model, "realtime upstream connect failed");
+            // The same 502 the request families record for this failure.
+            crate::attempt::RoutingTelemetry::record_deployment(&state, &model_entry.id, 502);
             let _ = client_tx
                 .send(AxMessage::Text(
                     serde_json::json!({
@@ -1219,9 +1226,7 @@ async fn run_session(
         /* dispatched */ true,
     );
     // A realtime session bills real tokens against a real model, and this is
-    // the only place that knows the session's totals. Its cost is resolved
-    // here too, unlike the other endpoints, so it is the one non-chat surface
-    // that also feeds `aisix_llm_spend_micro_usd_total`.
+    // the only place that knows the session's totals.
     crate::request_metrics::record_usage(
         &state,
         "/v1/realtime",
@@ -1245,7 +1250,6 @@ async fn run_session(
             cached: usage.cached_tokens.min(u32::MAX as u64) as u32,
             cache_read: 0,
             cache_creation: 0,
-            spend_usd: event.cost_usd,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );

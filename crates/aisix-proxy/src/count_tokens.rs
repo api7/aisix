@@ -1070,8 +1070,8 @@ async fn platform_count_tokens(
 /// goes on to issue the real `/v1/messages` call.
 ///
 /// No `request_metrics::record_usage` call for the same reason — the
-/// `aisix_llm_*_tokens_total` families are token/spend families, and this
-/// route contributes neither. The request families already carry the call
+/// `aisix_llm_*_tokens_total` families count consumed tokens, and this
+/// route consumes none. The request families already carry the call
 /// (`request_metrics::record`, above), and `aisix_usage_events_emitted_total`
 /// counts this event under `handler="count_tokens"`.
 #[allow(clippy::too_many_arguments)]

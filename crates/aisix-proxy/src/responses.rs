@@ -379,24 +379,6 @@ pub async fn responses(
             // `response.completed` event. `usage_handled_by_stream` guards
             // against a double-emit; `usage` is `None` on that path.
             if !success.usage_handled_by_stream {
-                // SLO e2e histogram (AISIX-Cloud#1011): recorded even when
-                // the upstream response carried no parseable usage block —
-                // latency observation must not depend on token accounting.
-                crate::request_metrics::record_e2e_latency(
-                    &state,
-                    "/v1/responses",
-                    crate::request_metrics::Caller::new(&auth),
-                    crate::request_metrics::Upstream {
-                        provider: &success.provider,
-                        model: &model_name,
-                        upstream_model: &success.upstream_model,
-                        pk: pk.labels(),
-                        stream: stream_requested,
-                        ..Default::default()
-                    },
-                    terminal_status,
-                    elapsed,
-                );
                 if let Some(mut usage) = success.usage {
                     // Non-streaming: the caller waited for the complete
                     // response, which is exactly the request clock. Streamed
@@ -488,18 +470,6 @@ pub async fn responses(
             // real provider landed on `provider="unknown"` while the same
             // key's successes landed on the real one.
             crate::request_metrics::record(
-                &state,
-                "/v1/responses",
-                crate::request_metrics::Caller::new(&auth),
-                last_target.upstream(
-                    metric_model.as_ref(),
-                    stream_requested,
-                    routing.fallback_count() > 0,
-                ),
-                status,
-                elapsed,
-            );
-            crate::request_metrics::record_e2e_latency(
                 &state,
                 "/v1/responses",
                 crate::request_metrics::Caller::new(&auth),
@@ -2107,8 +2077,7 @@ async fn responses_to_target(
                     }
                     _ => None,
                 };
-                let (elapsed, attempt_elapsed) =
-                    crate::request_metrics::stream_end_elapsed(started, attempt_started);
+                let attempt_elapsed = attempt_started.elapsed();
                 // A stream the consumer abandoned mid-flight is reported as
                 // 499. An upstream failure after the headers — a transport
                 // error, a read timeout, an in-band `error` or
@@ -2116,24 +2085,8 @@ async fn responses_to_target(
                 // status and error.
                 let terminal_status =
                     crate::attempt::stream_status(usage.reached_end, usage.failure.as_ref());
-                // SLO e2e histogram: full stream duration (verbatim path).
                 let snap_c = state_c.snapshot.load();
                 let pk_c = ResolvedPk::resolve(&snap_c, &provider_key_id_c);
-                crate::request_metrics::record_e2e_latency(
-                    &state_c,
-                    "/v1/responses",
-                    metric_caller.as_caller(),
-                    crate::request_metrics::Upstream {
-                        provider: &provider_c,
-                        model: &metric_model,
-                        upstream_model: &metric_upstream_model,
-                        pk: pk_c.labels(),
-                        stream: true,
-                        ..Default::default()
-                    },
-                    terminal_status,
-                    elapsed,
-                );
                 // Live-forward path: no output masking possible (a masking
                 // guardrail holds back → buffered branch; a monitor-mode one
                 // suppresses its masks), so only the input-side counts apply.
@@ -2159,8 +2112,8 @@ async fn responses_to_target(
                     // emitted however the stream ended — only its outcome
                     // differs.
                     terminal_status,
-                    // Attempt-scoped, unlike the e2e histogram above: any
-                    // failed attempt before this one emitted its own event.
+                    // Attempt-scoped: any failed attempt before this one
+                    // emitted its own event.
                     attempt_elapsed,
                     &usage,
                     &client_c,
@@ -2704,27 +2657,9 @@ async fn responses_cross_provider_to_target(
                     ),
                     _ => None,
                 };
-                let (elapsed, attempt_elapsed) =
-                    crate::request_metrics::stream_end_elapsed(started, attempt_started);
-                // SLO e2e histogram: full stream duration (bridge path).
-                // Blocked streams keep this guard's 422 status.
+                let attempt_elapsed = attempt_started.elapsed();
                 let snap_c = state_c.snapshot.load();
                 let pk_c = ResolvedPk::resolve(&snap_c, &provider_key_id_c);
-                crate::request_metrics::record_e2e_latency(
-                    &state_c,
-                    "/v1/responses",
-                    metric_caller.as_caller(),
-                    crate::request_metrics::Upstream {
-                        provider: &provider_c,
-                        model: &metric_model,
-                        upstream_model: &metric_upstream_model,
-                        pk: pk_c.labels(),
-                        stream: true,
-                        ..Default::default()
-                    },
-                    status,
-                    elapsed,
-                );
                 // A stream can outlive several config generations, so the
                 // end-of-stream emit reads a FRESH snapshot rather than the
                 // one the request started on (#941).
@@ -4166,7 +4101,6 @@ fn emit_usage_event(
             cached: usage.cached_prompt_tokens,
             cache_read: usage.cache_read_tokens,
             cache_creation: usage.cache_creation_tokens,
-            spend_usd: 0.0,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );

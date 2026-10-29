@@ -24,7 +24,10 @@
 //! `aisix_proxy_client_cancelled_requests_total` alone.
 //!
 //! Time to first token is `aisix_request_ttft_seconds`; the SLO view of the same
-//! whole-request duration is `aisix_request_e2e_latency_seconds`.
+//! whole-request duration is `aisix_request_e2e_latency_seconds`, whose
+//! `downstream` side is recorded by the same emit as the request families
+//! (every route but `/v1/realtime`), so a route that counts its requests
+//! cannot leave it out.
 //!
 //! Three families ride on a single call:
 //!
@@ -47,7 +50,7 @@
 //! up in the legacy series.
 //!
 //! [`record_usage`] is the companion emit for what the request consumed —
-//! the token and spend families, which had the same coverage problem, in
+//! the token families, which had the same coverage problem, in
 //! three different shapes (see its own docs).
 //!
 //! Handlers call [`record`] and [`record_usage`] instead of touching
@@ -450,18 +453,88 @@ pub(crate) fn record_in_tier(
         upstream,
         status,
         elapsed,
+        E2eSides::for_request(&snap),
     );
 }
 
+/// [`record`] for a response whose body is relayed after this call
+/// returns (`/v1/videos/:id/content`): the request families are recorded
+/// now, at the head, and the `downstream` end-to-end observation when the
+/// body relay ends.
+pub(crate) fn record_spanning_body(
+    state: &ProxyState,
+    endpoint: &'static str,
+    caller: Caller<'_>,
+    upstream: Upstream<'_>,
+    status: u16,
+    started: std::time::Instant,
+) {
+    let snap = state.snapshot.load();
+    let (model, upstream_model) =
+        crate::usage_attr::metric_model_label_pair(&snap, upstream.model, upstream.upstream_model);
+    let upstream = Upstream {
+        model: model.as_ref(),
+        upstream_model: upstream_model.as_ref(),
+        ..upstream
+    };
+    emit(
+        &state.metrics,
+        endpoint,
+        is_llm_endpoint(endpoint),
+        caller,
+        upstream,
+        status,
+        started.elapsed(),
+        E2eSides::AtBodyEnd(started),
+    );
+}
+
+/// Which sides of `aisix_request_e2e_latency_seconds` a recorded request
+/// observes.
+#[derive(Clone, Copy)]
+enum E2eSides {
+    /// `downstream` now, and `upstream` once the request's terminal attempt
+    /// is known to have been dispatched (see [`record_e2e_downstream`]).
+    Both,
+    /// An ensemble's response comes from no single attempt — its terminal
+    /// event is the judge's own call, only the last step — so it has no
+    /// upstream side to observe, on any path.
+    DownstreamOnly,
+    /// `downstream` when the response body relay ends, timed from this
+    /// instant; nothing upstream (the route files no usage event).
+    AtBodyEnd(std::time::Instant),
+}
+
+impl E2eSides {
+    fn for_request(snap: &AisixSnapshot) -> Self {
+        if crate::attribution::current().is_some_and(|r| is_ensemble(snap, &r.requested_model)) {
+            Self::DownstreamOnly
+        } else {
+            Self::Both
+        }
+    }
+}
+
+/// Endpoints that record the request families but not the end-to-end
+/// latency histogram: a `/v1/realtime` request is a WebSocket session, which
+/// has no request/response round trip to time.
+const NO_E2E_ENDPOINTS: &[&str] = &["/v1/realtime"];
+
 /// Write one request's samples. `upstream` must already be bounded.
+///
+/// Every request family AND the end-to-end latency histogram are written
+/// here, so a route that records its requests cannot skip the latency
+/// one.
+#[allow(clippy::too_many_arguments)]
 fn emit(
-    metrics: &aisix_obs::Metrics,
+    metrics: &std::sync::Arc<aisix_obs::Metrics>,
     endpoint: &'static str,
     llm: bool,
     caller: Caller<'_>,
     upstream: Upstream<'_>,
     status: u16,
     elapsed: Duration,
+    e2e: E2eSides,
 ) {
     let outcome = RequestOutcome::from_status(status);
     metrics.record_request(upstream.provider, upstream.model, status, outcome, elapsed);
@@ -495,6 +568,21 @@ fn emit(
         metrics.record_proxy_and_llm_request(labels, elapsed);
     } else {
         metrics.record_proxy_request(labels, elapsed);
+    }
+    if NO_E2E_ENDPOINTS.contains(&endpoint) {
+        return;
+    }
+    let latency = latency_labels(endpoint, caller, upstream, status);
+    match e2e {
+        E2eSides::Both => record_e2e_downstream(metrics, latency, elapsed),
+        E2eSides::DownstreamOnly => {
+            metrics.record_request_e2e_latency(latency, LatencySide::Downstream, elapsed)
+        }
+        E2eSides::AtBodyEnd(started) => crate::attribution::note_e2e_at_body_end(
+            metrics.clone(),
+            OwnedLatencyLabels::from(latency),
+            started,
+        ),
     }
 }
 
@@ -530,6 +618,9 @@ pub(crate) struct PendingRequestMetrics {
     is_fallback: bool,
     /// The request clock: a stream's duration is the whole stream.
     started: std::time::Instant,
+    /// Decided against the request's own attribution cell when the stream
+    /// starts; see [`E2eSides`].
+    e2e: E2eSides,
 }
 
 impl PendingRequestMetrics {
@@ -561,6 +652,7 @@ impl PendingRequestMetrics {
             stream: upstream.stream,
             is_fallback: upstream.is_fallback,
             started,
+            e2e: E2eSides::for_request(&snap),
         }
     }
 
@@ -586,68 +678,14 @@ impl PendingRequestMetrics {
             upstream,
             status,
             self.started.elapsed(),
+            self.e2e,
         );
     }
 }
 
-/// Stream callbacks must capture bounded model labels from their dispatch
-/// snapshot: the model row may be gone by the time the stream ends.
-///
-/// Records the `downstream` side and arranges the `upstream` one — see
-/// [`record_e2e_downstream`]. `/a2a` calls [`record_e2e_latency_downstream_only`].
-pub(crate) fn record_e2e_latency(
-    state: &ProxyState,
-    endpoint: &'static str,
-    caller: Caller<'_>,
-    upstream: Upstream<'_>,
-    status: u16,
-    elapsed: Duration,
-) {
-    record_e2e_latency_as(state, endpoint, caller, upstream, status, elapsed, true);
-}
-
-/// [`record_e2e_latency`] for a route with no model dispatch to time on its
-/// own: `/a2a` observes the `downstream` side alone.
-pub(crate) fn record_e2e_latency_downstream_only(
-    state: &ProxyState,
-    endpoint: &'static str,
-    caller: Caller<'_>,
-    upstream: Upstream<'_>,
-    status: u16,
-    elapsed: Duration,
-) {
-    record_e2e_latency_as(state, endpoint, caller, upstream, status, elapsed, false);
-}
-
-fn record_e2e_latency_as(
-    state: &ProxyState,
-    endpoint: &'static str,
-    caller: Caller<'_>,
-    upstream: Upstream<'_>,
-    status: u16,
-    elapsed: Duration,
-    with_upstream: bool,
-) {
-    let snap = state.snapshot.load();
-    with_latency_labels(&snap, endpoint, caller, upstream, status, |labels| {
-        // An ensemble's response comes from no single attempt — its terminal
-        // event is the judge's own call, only the last step — so it has no
-        // upstream side to observe, on any path.
-        let ensemble =
-            crate::attribution::current().is_some_and(|r| is_ensemble(&snap, &r.requested_model));
-        if with_upstream && !ensemble {
-            record_e2e_downstream(&state.metrics, labels, elapsed);
-        } else {
-            state
-                .metrics
-                .record_request_e2e_latency(labels, LatencySide::Downstream, elapsed);
-        }
-    });
-}
-
 /// Record a streamed response's time to first token — both sides, on
 /// `aisix_request_ttft_seconds` and `aisix_llm_time_to_first_token_seconds`
-/// — under the same bounded labels [`record_e2e_latency`] uses.
+/// — under the same bounded labels the end-to-end latency histogram uses.
 pub(crate) fn record_stream_ttft(
     state: &ProxyState,
     endpoint: &'static str,
@@ -677,9 +715,28 @@ fn with_latency_labels(
 ) {
     let (model, upstream_model) =
         crate::usage_attr::metric_model_label_pair(snap, upstream.model, upstream.upstream_model);
-    let labels = aisix_obs::LatencyLabels {
+    f(latency_labels(
         endpoint,
-        model: model.as_ref(),
+        caller,
+        Upstream {
+            model: model.as_ref(),
+            upstream_model: upstream_model.as_ref(),
+            ..upstream
+        },
+        status,
+    ));
+}
+
+/// The latency families' labels for an already-bounded `upstream`.
+fn latency_labels<'a>(
+    endpoint: &'static str,
+    caller: Caller<'a>,
+    upstream: Upstream<'a>,
+    status: u16,
+) -> aisix_obs::LatencyLabels<'a> {
+    aisix_obs::LatencyLabels {
+        endpoint,
+        model: upstream.model,
         provider: upstream.provider,
         status,
         streaming: upstream.stream,
@@ -688,8 +745,8 @@ fn with_latency_labels(
             inbound_protocol: crate::inbound_protocol_for_endpoint(endpoint),
             upstream_protocol: upstream.pk.protocol(),
             provider: upstream.provider,
-            model: model.as_ref(),
-            upstream_model: upstream_model.as_ref(),
+            model: upstream.model,
+            upstream_model: upstream.upstream_model,
             provider_key_id: upstream.pk.id(),
             provider_key_name: upstream.pk.name(),
             api_key_id: caller.api_key_id,
@@ -699,8 +756,7 @@ fn with_latency_labels(
             user_id: caller.user_id,
             user_name: caller.user_name,
         },
-    };
-    f(labels);
+    }
 }
 
 /// Observe a request's `downstream` end-to-end latency, and note its labels
@@ -720,22 +776,6 @@ pub(crate) fn record_e2e_downstream(
         OwnedLatencyLabels::from(labels),
         elapsed,
     );
-}
-
-/// A finished stream's request and attempt durations, both read at one
-/// instant. Read apart, the attempt's clock — taken after the request's
-/// `downstream` observation — would count the gateway's own bookkeeping in
-/// between, and the `upstream` side could come out longer than the
-/// `downstream` side that contains it.
-pub(crate) fn stream_end_elapsed(
-    started: std::time::Instant,
-    attempt_started: std::time::Instant,
-) -> (Duration, Duration) {
-    let now = std::time::Instant::now();
-    (
-        now.saturating_duration_since(started),
-        now.saturating_duration_since(attempt_started),
-    )
 }
 
 /// An owned [`aisix_obs::LatencyLabels`], held on the request's cell
@@ -834,18 +874,17 @@ pub(crate) struct Tokens<'a> {
     pub cached: u32,
     pub cache_read: u32,
     pub cache_creation: u32,
-    pub spend_usd: f64,
     /// Normalised inbound client for the by-client series
     /// (`state.client_classifier.classify(&client.user_agent)`).
     pub client_type: &'a str,
 }
 
-/// Terminal token/spend emit, shared by every handler — the companion to
+/// Terminal token emit, shared by every handler — the companion to
 /// [`record`].
 ///
 /// Three families ride along, and each had a DIFFERENT endpoint coverage
-/// before AISIX-Cloud#1234's follow-up: the `aisix_llm_*_tokens_total` and
-/// `aisix_llm_spend_micro_usd_total` families were chat and messages only,
+/// before AISIX-Cloud#1234's follow-up: the `aisix_llm_*_tokens_total`
+/// families were chat and messages only,
 /// `aisix_llm_tokens_by_client_total` was chat, messages and responses, and
 /// the legacy `aisix_tokens_consumed_total` was chat ALONE. A gateway that
 /// billed a customer for `/v1/embeddings` reported none of those tokens.
@@ -897,7 +936,6 @@ pub(crate) fn record_usage(
             cached_input_tokens: tokens.cached,
             cache_read_input_tokens: tokens.cache_read,
             cache_creation_input_tokens: tokens.cache_creation,
-            spend_usd: tokens.spend_usd,
         },
     );
     // Deliberately NOT keyed on the labels above: this family is
@@ -1006,6 +1044,10 @@ mod tests {
     /// are what force a new endpoint's `endpoint` label and LLM-vs-proxy
     /// tier to be decided rather than defaulted.
     const ROUTES: &[&str] = &[
+        "/v1/models",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+        "/a2a/some-agent/.well-known/agent-card.json",
         "/v1/chat/completions",
         "/v1/completions",
         "/v1/embeddings",

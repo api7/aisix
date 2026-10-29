@@ -982,7 +982,6 @@ fn emit_usage_event(
             cached: 0,
             cache_read: 0,
             cache_creation: 0,
-            spend_usd: 0.0,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );

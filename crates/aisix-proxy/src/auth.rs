@@ -205,9 +205,35 @@ where
         let result = extract_authenticated_key(parts, state).await;
         if let Err(err) = &result {
             emit_denial_access_log(parts, started, err);
+            record_denial_metrics(&ProxyState::from_ref(state), parts, started, err);
         }
         result
     }
+}
+
+/// Count a request the extractor refused in the request families, as every
+/// other refusal is: without it a 401 / 403 on a typed route existed in the
+/// access log and nowhere in `aisix_proxy_*` / `aisix_llm_*`.
+fn record_denial_metrics(
+    state: &ProxyState,
+    parts: &Parts,
+    started: std::time::Instant,
+    err: &ProxyError,
+) {
+    crate::request_metrics::record(
+        state,
+        // The raw path is caller-controlled; only the route template may
+        // become a label (#451).
+        crate::normalize_endpoint_label(parts.uri.path()),
+        crate::request_metrics::Caller::unattributed(None),
+        crate::request_metrics::Upstream {
+            provider: crate::request_metrics::UNKNOWN,
+            model: crate::usage_attr::UNRESOLVED_MODEL_LABEL,
+            ..Default::default()
+        },
+        err.status().as_u16(),
+        started.elapsed(),
+    );
 }
 
 /// Write the access-log line for a request the extractor refused.
