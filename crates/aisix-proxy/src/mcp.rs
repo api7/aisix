@@ -2504,12 +2504,21 @@ mod tests {
         let router = router_with(snapshot_with_anonymous(
             serde_json::json!({ "servers": ["docs"], "aggregate_entry": true }),
         ));
-        for bad in ["Bearer sk-not-a-real-key", "Basic dXNlcjpwdw==", "Bearer "] {
+        let mut offered: Vec<(&str, &str)> =
+            ["Bearer sk-not-a-real-key", "Basic dXNlcjpwdw==", "Bearer "]
+                .into_iter()
+                .map(|bad| ("authorization", bad))
+                .collect();
+        // An empty credential header is an offered one too, whichever slot.
+        for name in ["x-aisix-api-key", "authorization", "x-api-key"] {
+            offered.push((name, ""));
+            offered.push((name, "   "));
+        }
+        for (name, bad) in offered {
             let mut request = from_ip(initialize_request(None), "10.1.2.3");
-            request.headers_mut().insert(
-                axum::http::header::AUTHORIZATION,
-                axum::http::HeaderValue::from_str(bad).unwrap(),
-            );
+            request
+                .headers_mut()
+                .insert(name, axum::http::HeaderValue::from_str(bad).unwrap());
             let response = router
                 .clone()
                 .oneshot(request)
@@ -2518,7 +2527,7 @@ mod tests {
             assert_eq!(
                 response.status(),
                 StatusCode::UNAUTHORIZED,
-                "{bad:?} must be rejected, not served anonymously"
+                "{name}: {bad:?} must be rejected, not served anonymously"
             );
         }
     }
