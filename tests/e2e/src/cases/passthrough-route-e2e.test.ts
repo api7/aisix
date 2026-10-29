@@ -48,6 +48,8 @@ const CALLER_PLAINTEXT = "sk-ptr-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
+const CRED_PLAINTEXT = "sk-ptr-e2e-cred";
+const CRED_KEY_HASH = createHash("sha256").update(CRED_PLAINTEXT).digest("hex");
 const STREAM_LIMITED_PLAINTEXT = "sk-ptr-e2e-stream-limit";
 const STREAM_LIMITED_KEY_HASH = createHash("sha256")
   .update(STREAM_LIMITED_PLAINTEXT)
@@ -256,6 +258,14 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
       target_url: `${upstream.baseUrl}/v1`,
       provider_key_id: pk.id,
     });
+    // Seeded last: its authenticating implies the model and route landed.
+    await seed.createApiKey({
+      key_hash: CRED_KEY_HASH,
+      allowed_models: ["*"],
+      allowed_routes: ["*"],
+    });
+    const probe = new ProxyClient(app.proxyUrl, CRED_PLAINTEXT);
+    await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
 
     const chat = (path: string, headers: Record<string, string>) =>
       fetch(`${app!.proxyUrl}${path}`, {
@@ -269,24 +279,15 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     const ROUTE = "/passthrough/ptr-cred/chat/completions";
     const V1 = "/v1/chat/completions";
 
-    await waitConfigPropagation(async () => {
-      const [r, v] = await Promise.all([
-        chat(ROUTE, { authorization: `Bearer ${CALLER_PLAINTEXT}` }),
-        chat(V1, { authorization: `Bearer ${CALLER_PLAINTEXT}` }),
-      ]);
-      await Promise.all([r.text(), v.text()]);
-      return r.status === 200 && v.status === 200;
-    });
-
     // RFC 7235: the auth scheme name is case-insensitive; the key is not.
     for (const path of [ROUTE, V1]) {
-      for (const scheme of ["bearer", "BEARER"]) {
-        const res = await chat(path, { authorization: `${scheme} ${CALLER_PLAINTEXT}` });
+      for (const scheme of ["Bearer", "bearer", "BEARER"]) {
+        const res = await chat(path, { authorization: `${scheme} ${CRED_PLAINTEXT}` });
         expect(res.status, `${path} with ${scheme}`).toBe(200);
         await res.text();
       }
       const upper = await chat(path, {
-        authorization: `Bearer ${CALLER_PLAINTEXT.toUpperCase()}`,
+        authorization: `Bearer ${CRED_PLAINTEXT.toUpperCase()}`,
       });
       expect(upper.status, `${path} with an upper-cased key`).toBe(401);
       await upper.text();
@@ -296,7 +297,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     // fall-through to a valid x-api-key — on the route as on /v1.
     for (const path of [ROUTE, V1]) {
       for (const authorization of ["Basic dXNlcjpwdw==", "Bearer"]) {
-        const res = await chat(path, { authorization, "x-api-key": CALLER_PLAINTEXT });
+        const res = await chat(path, { authorization, "x-api-key": CRED_PLAINTEXT });
         expect(res.status, `${path} with ${authorization}`).toBe(401);
         const body = (await res.json()) as { error?: { message?: string } };
         expect(body.error?.message).toBe("missing or malformed Authorization header");
@@ -306,7 +307,7 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     // The migration path: the gateway key in x-aisix-api-key leaves
     // Authorization to whatever the caller needs it for.
     const migrated = await chat(ROUTE, {
-      "x-aisix-api-key": CALLER_PLAINTEXT,
+      "x-aisix-api-key": CRED_PLAINTEXT,
       authorization: "Basic dXNlcjpwdw==",
     });
     expect(migrated.status).toBe(200);
