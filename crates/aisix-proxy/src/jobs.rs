@@ -2206,9 +2206,13 @@ async fn attribute_batch_usage(
             state,
             "/v1/batches",
             metric_caller.as_caller(),
+            // `upstream_model` stays a placeholder: the slices are keyed on
+            // the `model` the provider wrote into each output line, which no
+            // configured row bounds (#451).
             crate::request_metrics::Upstream {
                 provider: provider_label,
                 model: display_name,
+                pk: pk.labels(),
                 ..Default::default()
             },
             crate::request_metrics::Tokens {
