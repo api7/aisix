@@ -30,9 +30,14 @@ use std::time::Duration;
 use crate::error::BootstrapError;
 
 /// Root config struct. Construct via [`Config::load_from_path`].
+///
+/// No struct in this tree denies unknown fields: the loader ignores them and
+/// reports each through `serde_ignored`, which cannot see inside
+/// serde-buffered content. A field read through an untagged enum or
+/// `#[serde(flatten)]` must report its own unknown keys the way
+/// [`deserialize_seq_or_json_string`] does, or a typo there goes unreported.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Dynamic-resource source A: etcd. Required unless `resources_file`
     /// selects the file source below; the two are mutually exclusive.
@@ -105,11 +110,15 @@ pub struct Config {
     /// config-rs via the `AISIX_` prefix.
     #[serde(default)]
     pub bedrock_endpoint_url: Option<String>,
+    /// Keys the loaded file or environment carried that name no setting:
+    /// the dotted path, and the `AISIX_*` variable that set it, if one did.
+    /// See [`Config::ignored_keys`].
+    #[serde(skip)]
+    ignored_keys: Vec<(String, Option<String>)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
 pub struct EtcdConfig {
     pub endpoints: Vec<String>,
     /// Base namespace shared by every aisix DP. v2 used the bare
@@ -202,7 +211,6 @@ pub struct EtcdConfig {
 /// cert-subject-alt-name to match against.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
 pub struct EtcdTlsConfig {
     /// PEM-encoded CA bundle used to verify the etcd server cert.
     pub ca_cert_file: String,
@@ -228,7 +236,7 @@ pub struct EtcdTlsConfig {
 /// [`EtcdTlsConfig`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct ManagedConfig {
     pub enabled: bool,
 
@@ -684,7 +692,6 @@ impl EtcdConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     /// The single proxy listener's address — the shorthand form, and the
     /// only one until `listeners` was added. Required either way: the
@@ -724,10 +731,11 @@ pub struct ProxyConfig {
     /// `AISIX_PROXY__LISTENERS='[{"addr":"0.0.0.0:3443","tls":{"cert_file":"/c.pem","key_file":"/k.pem"}},{"addr":"0.0.0.0:3000"}]'`.
     #[serde(default, deserialize_with = "deserialize_proxy_listeners")]
     pub listeners: Vec<ProxyListener>,
-    /// Real-client-IP resolution from forwarded headers (#492). Default
-    /// trusts nothing, so the logged source IP is always the immediate
-    /// TCP peer. Configure `trusted_proxies` when the gateway sits behind
-    /// an L7 LB / ingress that sets `x-forwarded-for`.
+    /// Real-client-IP resolution from forwarded headers (#492) and PROXY
+    /// protocol headers (AISIX-Cloud#1915). Default trusts nothing, so the
+    /// logged source IP is always the immediate TCP peer. Configure
+    /// `trusted_proxies` when the gateway sits behind an L7 LB / ingress
+    /// that sets `x-forwarded-for`, or an L4 LB that sends a PROXY header.
     #[serde(default)]
     pub real_ip: RealIpConfig,
     /// Which inbound headers a caller may hand the gateway its own
@@ -833,7 +841,6 @@ impl ProxyConfig {
 /// One entry-level URL rewrite rule (see [`ProxyConfig::url_rewrites`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
 pub struct UrlRewriteRule {
     /// Optional name, used in logs when the rule fires.
     #[serde(default)]
@@ -868,32 +875,82 @@ pub struct UrlRewriteRule {
 /// express a list of structs. So every sequence field needs one of the two —
 /// this for `Vec<Struct>`, a `with_list_parse_key` registration for
 /// `Vec<String>` / `Vec<f64>` — or it is unreachable from the environment.
-/// `field` names the setting in the error, so a malformed JSON string says
-/// which one it came from.
-fn deserialize_seq_or_json_string<'de, D, T>(
-    deserializer: D,
-    field: &str,
-) -> Result<Vec<T>, D::Error>
+///
+/// `key` is the field's dotted path. A structured sequence is read element
+/// by element through the caller's deserializer, so the loader's
+/// `serde_ignored` pass sees the elements' unknown keys itself. A JSON
+/// string is parsed here, out of that pass's sight, so its unknown keys are
+/// collected into [`NESTED_IGNORED_KEYS`] under `key`; its last segment names
+/// the setting in a parse error.
+fn deserialize_seq_or_json_string<'de, D, T>(deserializer: D, key: &str) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::de::DeserializeOwned,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum SeqOrJsonString<T> {
-        Seq(Vec<T>),
-        JsonString(String),
+    struct SeqOrJsonString<'k, T> {
+        key: &'k str,
+        element: std::marker::PhantomData<T>,
     }
-    match SeqOrJsonString::<T>::deserialize(deserializer)? {
-        SeqOrJsonString::Seq(rules) => Ok(rules),
-        SeqOrJsonString::JsonString(raw) => {
+
+    impl<'de, T: serde::de::DeserializeOwned> serde::de::Visitor<'de> for SeqOrJsonString<'_, T> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a list, or a JSON array in a string")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
+            let mut items = Vec::new();
+            while let Some(item) = seq.next_element()? {
+                items.push(item);
+            }
+            Ok(items)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, raw: &str) -> Result<Vec<T>, E> {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
                 return Ok(Vec::new());
             }
-            serde_json::from_str(trimmed)
-                .map_err(|e| serde::de::Error::custom(format!("{field} JSON string: {e}")))
+            let key = self.key;
+            let field = key.rsplit('.').next().unwrap_or(key);
+            serde_ignored::deserialize(&mut serde_json::Deserializer::from_str(trimmed), |path| {
+                let path = format!("{key}{}", dotted_path(&path));
+                NESTED_IGNORED_KEYS.with(|keys| keys.borrow_mut().push(path));
+            })
+            .map_err(|e| E::custom(format!("{field} JSON string: {e}")))
         }
+    }
+
+    deserializer.deserialize_any(SeqOrJsonString {
+        key,
+        element: std::marker::PhantomData,
+    })
+}
+
+thread_local! {
+    /// Unknown keys found inside a [`deserialize_seq_or_json_string`] JSON
+    /// string during the current load on this thread; cleared and drained by
+    /// [`Config::deserialize_sources`].
+    static NESTED_IGNORED_KEYS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `serde_ignored`'s path as the dotted key an operator writes:
+/// `proxy.tls.bogus`, `proxy.url_rewrites[0].bogus`. Its own `Display`
+/// spells an `Option` hop as `?` and an index as a segment.
+fn dotted_path(path: &serde_ignored::Path<'_>) -> String {
+    use serde_ignored::Path;
+    match path {
+        Path::Root => String::new(),
+        Path::Seq { parent, index } => format!("{}[{index}]", dotted_path(parent)),
+        Path::Map { parent, key } => match dotted_path(parent) {
+            parent if parent.is_empty() => key.clone(),
+            parent => format!("{parent}.{key}"),
+        },
+        Path::Some { parent }
+        | Path::NewtypeStruct { parent }
+        | Path::NewtypeVariant { parent } => dotted_path(parent),
     }
 }
 
@@ -901,21 +958,21 @@ fn deserialize_url_rewrites<'de, D>(deserializer: D) -> Result<Vec<UrlRewriteRul
 where
     D: serde::Deserializer<'de>,
 {
-    deserialize_seq_or_json_string(deserializer, "url_rewrites")
+    deserialize_seq_or_json_string(deserializer, "proxy.url_rewrites")
 }
 
 fn deserialize_proxy_listeners<'de, D>(deserializer: D) -> Result<Vec<ProxyListener>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    deserialize_seq_or_json_string(deserializer, "listeners")
+    deserialize_seq_or_json_string(deserializer, "proxy.listeners")
 }
 
 fn deserialize_client_type_rules<'de, D>(deserializer: D) -> Result<Vec<ClientTypeRule>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    deserialize_seq_or_json_string(deserializer, "client_type_rules")
+    deserialize_seq_or_json_string(deserializer, "observability.metrics.client_type_rules")
 }
 
 /// Reject a rewrite template that references capture groups its pattern
@@ -986,12 +1043,18 @@ fn validate_rewrite_template_refs(regex: &regex::Regex, template: &str) -> Resul
 /// header, trusting only addresses inside `trusted_proxies`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct RealIpConfig {
     /// Trusted upstream proxy CIDRs (e.g. `["10.0.0.0/8", "127.0.0.1/32"]`).
     /// When the immediate TCP peer matches one of these, the configured
     /// forwarded header is trusted and walked to find the real client.
     /// Empty (the default) = trust nothing → always log the TCP peer.
+    ///
+    /// A peer in this list may also open a proxy-listener connection with a
+    /// PROXY protocol v1/v2 header; its source address then replaces the
+    /// TCP peer everywhere the peer is read, including the check above. A
+    /// header from any other peer closes the connection. There is no switch:
+    /// a connection without a header is served as before.
     pub trusted_proxies: Vec<String>,
     /// nginx `real_ip_recursive`. When true, walk the forwarded header
     /// right-to-left skipping every trusted address; the first untrusted
@@ -1068,7 +1131,7 @@ pub const CREDENTIAL_HEADERS: &[&str] = &[
 /// already carry, instead of maintaining a second mapping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct RequestIdConfig {
     /// Inbound headers consulted, in order; the first one carrying an
     /// acceptable value wins. An unacceptable or absent value falls back
@@ -1130,7 +1193,6 @@ impl RequestIdConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     /// When `false`, the admin listener is not bound even in standalone
     /// (etcd or file) mode. The proxy and the metrics/status listener are
@@ -1177,7 +1239,6 @@ impl Default for AdminConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     pub cert_file: String,
     pub key_file: String,
@@ -1186,7 +1247,6 @@ pub struct TlsConfig {
 /// One entry of [`ProxyConfig::listeners`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
 pub struct ProxyListener {
     /// Socket address this listener binds, e.g. `0.0.0.0:3000`.
     pub addr: String,
@@ -1198,7 +1258,7 @@ pub struct ProxyListener {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct ObservabilityConfig {
     #[serde(default = "ObservabilityConfig::default_service_name")]
     pub service_name: String,
@@ -1209,32 +1269,10 @@ pub struct ObservabilityConfig {
     #[serde(default = "ObservabilityConfig::default_access_log")]
     pub access_log: bool,
     pub metrics: MetricsConfig,
-    /// Retired; see [`TracingConfig`]. `Option` on purpose: serde cannot
-    /// otherwise tell a config that omits the block from one that wrote it
-    /// out with default values, and the boot warning has to fire only for
-    /// the operator who actually carries it.
-    pub tracing: Option<TracingConfig>,
     /// The diagnostics listener serving `GET /debug/pprof/heap`.
     pub debug: DebugListenerConfig,
     /// Heap-profile dumps written without anyone asking for them.
     pub heap_profiling: HeapProfilingConfig,
-    /// Retired; see [`UsageEventConfig`]. `Option` for the same reason as
-    /// `tracing`.
-    pub usage_event: Option<UsageEventConfig>,
-}
-
-/// Tombstone: `observability.usage_event` is consumed and ignored, and
-/// warned about at boot ([`ObservabilityConfig::retired_settings`]). Which
-/// request headers an export records is now chosen per exporter, by the
-/// `request_headers` field of each `observability_exporters` entry, and no
-/// header value is sent to the control plane any more. The block stays
-/// parseable only so a config written against 1.6.0 still loads. Do not
-/// read it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
-pub struct UsageEventConfig {
-    pub request_headers: Vec<String>,
 }
 
 /// `observability.debug` — a listener for diagnostics that must never be
@@ -1247,7 +1285,7 @@ pub struct UsageEventConfig {
 /// (two gateways sharing a host network) must not stop traffic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct DebugListenerConfig {
     pub enabled: bool,
     pub addr: String,
@@ -1271,7 +1309,7 @@ impl Default for DebugListenerConfig {
 /// `_RJEM_MALLOC_CONF` environment variable, not here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct HeapProfilingConfig {
     pub auto_dump: AutoDumpConfig,
 }
@@ -1281,7 +1319,7 @@ pub struct HeapProfilingConfig {
 /// evidence of a growth survives the OOM kill that usually follows it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct AutoDumpConfig {
     pub enabled: bool,
     /// Fractions of the memory limit (the cgroup limit, or the host's
@@ -1314,38 +1352,21 @@ impl Default for ObservabilityConfig {
             log_level: Self::default_log_level(),
             access_log: Self::default_access_log(),
             metrics: MetricsConfig::default(),
-            tracing: None,
             debug: DebugListenerConfig::default(),
             heap_profiling: HeapProfilingConfig::default(),
-            usage_event: None,
         }
     }
 }
 
 impl ObservabilityConfig {
-    /// Messages for settings that are still parsed but do nothing, one per
-    /// key the operator actually wrote. The bootstrap warns with these once
-    /// at startup: the config keeps loading, but "I configured it and saw
-    /// no complaint" must not read as "it is working" (AISIX-Cloud#1380).
+    /// Messages for setting values that are accepted but do nothing, one per
+    /// value the operator actually wrote. The bootstrap warns with these
+    /// once at startup: the config keeps loading, but "I configured it and
+    /// saw no complaint" must not read as "it is working". A retired *key*
+    /// needs no entry here — it is an unknown key, reported by
+    /// [`Config::ignored_keys`].
     pub fn retired_settings(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
-        if self.tracing.is_some() {
-            out.push(
-                "observability.tracing.otlp is set but does nothing: this gateway has \
-                 never had a built-in OTLP tracer, and the block has been removed from \
-                 the shipped example configs. Delete it. Traces are exported by an \
-                 `observability_exporters` entry with kind = otlp_http, declared in \
-                 your resources file or configured in AISIX Enterprise or AISIX Cloud.",
-            );
-        }
-        if self.metrics.otlp.is_some() {
-            out.push(
-                "observability.metrics.otlp is set but does nothing: this gateway does \
-                 not push OTLP metrics, and the block has been removed from the shipped \
-                 example configs. Delete it. Metrics are served on the Prometheus \
-                 endpoint at observability.metrics.prometheus.addr.",
-            );
-        }
         if self
             .metrics
             .labels
@@ -1356,16 +1377,6 @@ impl ObservabilityConfig {
                 "observability.metrics.labels names aisix_llm_spend_micro_usd_total, which \
                  this gateway no longer emits; the entry is ignored. Delete it. Spend is the \
                  cost the control plane records for each request.",
-            );
-        }
-        if self.usage_event.is_some() {
-            out.push(
-                "observability.usage_event is set but does nothing: request headers are \
-                 no longer recorded on every usage event, and the block has been removed \
-                 from the shipped example configs. Delete it. List the headers to export \
-                 in the `request_headers` field of each `observability_exporters` entry \
-                 instead, declared in your resources file or configured in AISIX \
-                 Enterprise or AISIX Cloud.",
             );
         }
         out
@@ -1391,7 +1402,7 @@ pub const RETIRED_METRIC_FAMILIES: &[&str] = &["aisix_llm_spend_micro_usd_total"
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct MetricsConfig {
     pub prometheus: PrometheusConfig,
     /// Complete label selections by metric family name. An omitted family
@@ -1401,9 +1412,6 @@ pub struct MetricsConfig {
     /// Environment variables accept the whole map as one JSON object.
     #[serde(default, deserialize_with = "deserialize_metric_labels")]
     pub labels: std::collections::BTreeMap<String, Vec<String>>,
-    /// Retired; see [`OtlpConfig`]. `Option` for the same reason as
-    /// [`ObservabilityConfig::tracing`].
-    pub otlp: Option<OtlpConfig>,
     /// Operator-defined User-Agent → `client_type` mapping rules
     /// (AISIX-Cloud#1045), consulted BEFORE the built-in allowlist so a
     /// deployment can classify in-house tools (or re-bucket a built-in
@@ -1453,7 +1461,7 @@ where
 /// recorded series are not comparable across the change.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct HistogramBucketsConfig {
     /// `aisix_request_e2e_latency_seconds`
     pub request_e2e_latency: Option<Vec<f64>>,
@@ -1477,7 +1485,6 @@ pub struct HistogramBucketsConfig {
 /// by the rule count.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
 pub struct ClientTypeRule {
     pub pattern: String,
     pub client: String,
@@ -1485,7 +1492,7 @@ pub struct ClientTypeRule {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct PrometheusConfig {
     pub enabled: bool,
     pub path: String,
@@ -1511,56 +1518,6 @@ impl Default for PrometheusConfig {
     }
 }
 
-/// Tombstone: `observability.metrics.otlp` is consumed and ignored, and
-/// warned about at boot ([`ObservabilityConfig::retired_settings`]). The
-/// gateway has never pushed OTLP metrics — the block was a placeholder no
-/// code ever read (AISIX-Cloud#1380). It is gone from the shipped example
-/// files and stays parseable only so a config written against them still
-/// loads; `ObservabilityConfig` denies unknown fields, so deleting the
-/// field would stop those gateways booting over a setting that did
-/// nothing. Do not read it. AISIX-Cloud#1071 tracks the real feature,
-/// which will arrive under its own configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
-pub struct OtlpConfig {
-    pub enabled: bool,
-    pub endpoint: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
-pub struct TracingConfig {
-    pub otlp: OtlpTracingConfig,
-}
-
-/// Tombstone: `observability.tracing.otlp` is consumed and ignored, and
-/// warned about at boot ([`ObservabilityConfig::retired_settings`]). Trace
-/// export is an `observability_exporters` entry with `kind = otlp_http`,
-/// resolved from the live resource snapshot — never a startup switch. The
-/// block was a placeholder no code ever read (AISIX-Cloud#1380); it is
-/// gone from the shipped example files and stays parseable only so a
-/// config written against them still loads. Do not read it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
-pub struct OtlpTracingConfig {
-    pub enabled: bool,
-    pub endpoint: Option<String>,
-    pub sample_ratio: f64,
-}
-
-impl Default for OtlpTracingConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            endpoint: None,
-            sample_ratio: 1.0,
-        }
-    }
-}
-
 /// Boot-level cache backend availability (#519 B.8).
 ///
 /// The in-process memory cache is always built; the redis cache is
@@ -1574,7 +1531,7 @@ impl Default for OtlpTracingConfig {
 /// `redis` block is rejected at boot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct CacheConfig {
     pub backend: CacheBackend,
     pub redis: Option<RedisConnConfig>,
@@ -1635,7 +1592,7 @@ pub enum RedisMode {
 /// quietly outranks it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct RedisConnConfig {
     pub mode: RedisMode,
     /// Single-node URL. Required when `mode = single`.
@@ -1772,7 +1729,7 @@ impl RedisConnConfig {
 /// `aisix:rl:`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct RateLimitConfig {
     pub backend: RateLimitBackend,
     pub redis: Option<RedisConnConfig>,
@@ -1817,7 +1774,7 @@ pub enum RateLimitBackend {
 /// Every duration accepts `0` to disable that individual knob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct UpstreamConfig {
     /// Deployment-wide default for `Model.timeout`: the end-to-end deadline
     /// in milliseconds for non-streaming upstream calls (and the fallback
@@ -1884,7 +1841,7 @@ pub struct UpstreamConfig {
 /// names with `api_base`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct BedrockUpstreamConfig {
     /// Base URL of Bedrock Mantle, where `/v1/messages/count_tokens` for a
     /// Claude model is counted when `bedrock-runtime`'s CountTokens refuses
@@ -1907,7 +1864,7 @@ pub struct BedrockUpstreamConfig {
 /// [`OutboundConfig::ssrf_protection`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct MediaFetchConfig {
     /// `false` refuses a media URL the target upstream cannot read with a
     /// 400 instead of downloading it.
@@ -1933,7 +1890,7 @@ impl Default for MediaFetchConfig {
 /// governed by it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct OutboundConfig {
     /// Server-side request forgery protection — see
     /// [`SsrfProtectionConfig`].
@@ -1952,7 +1909,7 @@ pub struct OutboundConfig {
 /// again itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct SsrfProtectionConfig {
     /// `false` turns the address check off entirely: the request is an
     /// ordinary fetch and `allowed_hosts` is ignored.
@@ -2015,7 +1972,7 @@ impl Default for UpstreamConfig {
 /// peer class, which is what `ca_file` is for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct OutboundTlsConfig {
     /// Path to a PEM file holding one or more certificates to trust as
     /// issuers, for upstreams whose certificate is signed by a private
@@ -2081,7 +2038,7 @@ pub const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 6_000_000;
 /// client-side idle timeout must stay below the next node's server-side one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct DownstreamConfig {
     /// How long an accepted connection may sit idle — response fully
     /// written, no next request started — before the gateway closes it.
@@ -2132,7 +2089,7 @@ impl Default for DownstreamConfig {
 /// the only hard bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct ShutdownConfig {
     /// Minimum seconds to keep accepting new connections after the
     /// shutdown signal, while `/readyz` already answers 503.
@@ -2163,9 +2120,9 @@ impl Default for ShutdownConfig {
 /// Every top-level setting of [`Config`], spelled as the environment
 /// source sees it — `AISIX_` stripped and lowercased.
 ///
-/// A variable outside this set, and without the `__` that marks a nested
-/// key, is not a setting at all and is dropped by [`EnvOverrides`] rather
-/// than handed to a root struct that rejects unknown fields.
+/// A variable whose first segment is outside this set is not a setting at
+/// all and is dropped by [`EnvOverrides`], with a warning that names what
+/// injects such variables, rather than reported as an ignored key.
 /// `config_top_level_keys_match_the_struct` fails the build when a field
 /// is added or renamed without this list following.
 const TOP_LEVEL_ENV_KEYS: [&str; 13] = [
@@ -2234,7 +2191,8 @@ impl EnvOverrides {
             // Judged on the FIRST segment, not on whether the key is
             // nested at all. A key whose head names a real section was
             // meant as a setting, so it keeps reaching the deserializer
-            // typo and all (`AISIX_PROXY__BOGUS` still fails the boot);
+            // typo and all (`AISIX_PROXY__BOGUS` is reported as an
+            // ignored key);
             // a key whose head names nothing cannot be one however deeply
             // it is spelled. Nesting is `__`, but config-rs also treats a
             // literal `.` as a path separator, so both split the head.
@@ -2242,8 +2200,8 @@ impl EnvOverrides {
             // Service names may contain consecutive hyphens, and kubelet
             // folds each to `_` — so `aisix-oss--x` injects
             // `AISIX_OSS__X_SERVICE_HOST`, which reads as nested and is
-            // exactly what a contains-`__` test would wave through into a
-            // failed boot. The residue is a Service named for a section
+            // exactly what a contains-`__` test would wave through to the
+            // deserializer. The residue is a Service named for a section
             // (`aisix-proxy--x`), which is indistinguishable from an
             // operator's typo and is treated as one.
             let head = key
@@ -2298,7 +2256,6 @@ const ENV_LIST_PARSE_KEYS: &[&str] = &[
     "observability.metrics.buckets.guardrail_latency",
     "observability.metrics.buckets.a2a_ttfb",
     "observability.heap_profiling.auto_dump.thresholds",
-    "observability.usage_event.request_headers",
     "cache.redis.nodes",
     "cache.redis.sentinels",
     "ratelimit.redis.nodes",
@@ -2325,6 +2282,23 @@ fn env_var_setting<'a>(names: &'a [String], key: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
+/// The `AISIX_*` variable among `names` that set a key inside `key`
+/// (`AISIX_OBSERVABILITY__METRICS__OTLP__ENABLED` inside the ignored block
+/// `observability.metrics.otlp`) — the converse of [`env_var_setting`].
+fn env_var_within<'a>(names: &'a [String], key: &str) -> Option<&'a str> {
+    names
+        .iter()
+        .find(|name| {
+            let lowered = name.to_lowercase();
+            lowered.strip_prefix("aisix_").is_some_and(|set| {
+                set.replace("__", ".")
+                    .strip_prefix(key)
+                    .is_some_and(|rest| rest.starts_with(['.', '[']))
+            })
+        })
+        .map(String::as_str)
+}
+
 impl Config {
     /// Warnings about `AISIX_*` environment variables that name no
     /// setting and were left out of the load.
@@ -2336,30 +2310,78 @@ impl Config {
         EnvOverrides::from_env().warnings
     }
 
+    /// One warning per key the file or an `AISIX_*` variable carried that
+    /// names no setting — a typo, or a key a newer or older release
+    /// defines. Such a key is ignored rather than failing the load, so a
+    /// config that still carries a retired key keeps booting. Emitted by
+    /// the binary at WARN for the same reason as
+    /// [`Config::ignored_env_overrides`].
+    pub fn ignored_keys(&self) -> Vec<String> {
+        self.ignored_keys
+            .iter()
+            .map(|(key, var)| {
+                let source = var
+                    .as_deref()
+                    .map(|var| format!(" (set by {var})"))
+                    .unwrap_or_default();
+                format!(
+                    "{key}{source} is not a setting this gateway knows and was ignored. \
+                     Check its spelling, or delete it if it was retired."
+                )
+            })
+            .collect()
+    }
+
+    /// A load error, extended with the keys the load had ignored by then
+    /// (a type error can stop it before later keys are read): a misspelled
+    /// key is usually what left the required or valid setting missing that
+    /// the error is about, and the ignored-key warnings are only logged for
+    /// a configuration that loads.
+    fn with_ignored_keys(
+        err: BootstrapError,
+        ignored: &[(String, Option<String>)],
+    ) -> BootstrapError {
+        match err {
+            BootstrapError::Config(msg) if !ignored.is_empty() => {
+                let keys: Vec<&str> = ignored.iter().map(|(key, _)| key.as_str()).collect();
+                BootstrapError::Config(format!(
+                    "{msg} (also ignored, as no setting this gateway knows: {})",
+                    keys.join(", ")
+                ))
+            }
+            other => other,
+        }
+    }
+
     /// Load + merge + validate.
     ///
     /// - If `path` is Some, the file is loaded (format inferred from extension).
     /// - Env vars prefixed `AISIX_` override anything in the file:
     ///   `AISIX_<SECTION>__<KEY>` for a nested setting, `AISIX_<KEY>` for a
     ///   top-level one. A variable matching neither is not a setting — it is
-    ///   ignored and reported by [`Config::ignored_env_overrides`], because
-    ///   an environment the gateway does not control injects them (a
-    ///   Kubernetes Service named `aisix-*` contributes seven per pod) and
-    ///   the root struct rejects unknown fields.
+    ///   ignored and reported by [`Config::ignored_env_overrides`], with a
+    ///   remedy specific to what injects them (a Kubernetes Service named
+    ///   `aisix-*` contributes seven per pod).
+    /// - A key that names no setting, in the file or under a real section
+    ///   of the environment, is ignored and reported by
+    ///   [`Config::ignored_keys`].
     /// - Basic invariants are checked (non-empty etcd endpoints, at least one
     ///   admin key, bind addresses parse).
     pub fn load_from_path(path: Option<&Path>) -> Result<Self, BootstrapError> {
         let mut cfg = Self::deserialize_sources(path)?;
-
-        if let Some(raw_base) = cfg.managed.cp_base_url.as_deref() {
-            cfg.managed.cp_base_url = Some(normalise_cp_base_url(raw_base)?);
-        }
-        if let Some(raw_endpoint) = cfg.managed.cp_etcd_endpoint.as_deref() {
-            cfg.managed.cp_etcd_endpoint = Some(normalise_cp_etcd_endpoint(raw_endpoint)?);
-        }
-
-        cfg.validate()?;
+        cfg.normalise_and_validate()
+            .map_err(|err| Self::with_ignored_keys(err, &cfg.ignored_keys))?;
         Ok(cfg)
+    }
+
+    fn normalise_and_validate(&mut self) -> Result<(), BootstrapError> {
+        if let Some(raw_base) = self.managed.cp_base_url.as_deref() {
+            self.managed.cp_base_url = Some(normalise_cp_base_url(raw_base)?);
+        }
+        if let Some(raw_endpoint) = self.managed.cp_etcd_endpoint.as_deref() {
+            self.managed.cp_etcd_endpoint = Some(normalise_cp_etcd_endpoint(raw_endpoint)?);
+        }
+        self.validate()
     }
 
     /// File + env merge and deserialization, without normalisation or
@@ -2408,7 +2430,23 @@ impl Config {
             .build()
             .map_err(|e| BootstrapError::Config(format!("build: {e}")))?;
 
-        serde_path_to_error::deserialize(raw).map_err(|e| {
+        NESTED_IGNORED_KEYS.with(|keys| keys.borrow_mut().clear());
+        let mut ignored = Vec::new();
+        let result: Result<Self, _> =
+            serde_path_to_error::deserialize(serde_ignored::Deserializer::new(raw, &mut |path| {
+                ignored.push(dotted_path(&path))
+            }));
+        ignored.extend(NESTED_IGNORED_KEYS.with(|keys| std::mem::take(&mut *keys.borrow_mut())));
+        let ignored: Vec<(String, Option<String>)> = ignored
+            .into_iter()
+            .map(|key| {
+                let var = env_var_setting(&env_names, &key)
+                    .or_else(|| env_var_within(&env_names, &key))
+                    .map(str::to_owned);
+                (key, var)
+            })
+            .collect();
+        let cfg = result.map_err(|e| {
             let key = e.path().to_string();
             BootstrapError::Config(match key.as_str() {
                 "." => format!("deserialize: {}", e.inner()),
@@ -2417,7 +2455,10 @@ impl Config {
                     None => format!("deserialize: {key}: {}", e.inner()),
                 },
             })
-        })
+        });
+        let mut cfg = cfg.map_err(|err| Self::with_ignored_keys(err, &ignored))?;
+        cfg.ignored_keys = ignored;
+        Ok(cfg)
     }
 
     fn validate(&self) -> Result<(), BootstrapError> {
@@ -2770,10 +2811,9 @@ admin:
     fn service_link_env_vars_are_ignored_instead_of_aborting_startup() {
         // Kubernetes injects a variable per Service per port into every
         // pod in the namespace, and a Service whose name starts with
-        // `aisix` produces `AISIX_*` names. None of them is a setting, and
-        // the root struct rejects unknown fields — so before this filter
-        // existed, deploying the gateway beside an `aisix-oss` Service
-        // made it exit at boot with `unknown field`.
+        // `aisix` produces `AISIX_*` names. None of them is a setting, so
+        // they are dropped with a warning that names the pod-spec remedy
+        // rather than reported as ignored keys.
         let injected: Vec<(&str, &str)> = SERVICE_LINK_ENV
             .iter()
             .chain(HYPHENATED_SERVICE_LINK_ENV.iter())
@@ -2805,25 +2845,52 @@ admin:
     }
 
     #[test]
-    fn a_nested_unknown_env_var_still_aborts_startup() {
-        // The filter drops only names that cannot be settings. An operator
-        // who spelled out a section meant a setting, so their typo still
-        // fails the boot rather than being silently ignored — the same
-        // strictness the config file gets.
+    fn a_nested_unknown_env_var_is_ignored_with_a_warning() {
+        // A variable under a real section reaches the deserializer like a
+        // file key does, and an unknown one is ignored the same way: the
+        // gateway boots, and the warning names the key and the variable.
         if !in_child_with_env(
-            "a_nested_unknown_env_var_still_aborts_startup",
+            "a_nested_unknown_env_var_is_ignored_with_a_warning",
             "TEST_ENV_NESTED_UNKNOWN_CHILD",
-            &[("AISIX_PROXY__BOGUS", "1")],
+            &[
+                ("AISIX_PROXY__EXPOSE_DEBUG_HEADER", "true"),
+                ("AISIX_OBSERVABILITY__METRICS__OTLP__ENABLED", "false"),
+                (
+                    "AISIX_OBSERVABILITY__USAGE_EVENT__REQUEST_HEADERS",
+                    "x-sub-user",
+                ),
+            ],
         ) {
             return;
         }
 
         let f = write_yaml(ENV_TEST_CONFIG);
-        let err = Config::load_from_path(Some(f.path())).unwrap_err();
-        assert!(
-            err.to_string().contains("bogus"),
-            "error should name the field: {err}",
-        );
+        let cfg = Config::load_from_path(Some(f.path())).expect("unknown keys must not abort");
+        assert!(!cfg.proxy.expose_debug_headers);
+        let mut warnings = cfg.ignored_keys().to_vec();
+        warnings.sort();
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        for (key, var) in [
+            (
+                "observability.metrics.otlp",
+                "AISIX_OBSERVABILITY__METRICS__OTLP__ENABLED",
+            ),
+            (
+                "observability.usage_event",
+                "AISIX_OBSERVABILITY__USAGE_EVENT__REQUEST_HEADERS",
+            ),
+            (
+                "proxy.expose_debug_header",
+                "AISIX_PROXY__EXPOSE_DEBUG_HEADER",
+            ),
+        ] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.starts_with(&format!("{key} (set by {var}) is not a setting"))),
+                "no warning names {key}: {warnings:?}",
+            );
+        }
         assert!(Config::ignored_env_overrides().is_empty());
     }
 
@@ -2922,24 +2989,17 @@ admin:
         // in the env-only deployments (the chart) that have no other way
         // to set it.
         //
-        // The expected set is taken from serde rather than restated here:
-        // `deny_unknown_fields` reports every field it would have
-        // accepted, so adding or renaming one moves this list.
-        let err = serde_json::from_str::<Config>(r#"{"not-a-config-field":0}"#)
-            .expect_err("the root struct rejects unknown fields");
-        let message = err.to_string();
-        let listed = message
-            .split_once("expected one of ")
-            .unwrap_or_else(|| panic!("unexpected serde error shape: {message}"))
-            .1;
-        // Backtick-delimited, so the trailing " at line 1 column N" the
-        // error carries is outside every pair and never read as a field.
-        let mut expected: Vec<&str> = listed.split('`').skip(1).step_by(2).collect();
+        // The expected set is taken from the derived schema rather than
+        // restated here, so adding or renaming a field moves this list.
+        let schema = serde_json::to_value(schemars::schema_for!(Config)).unwrap();
+        let mut expected: Vec<&str> = schema["properties"]
+            .as_object()
+            .expect("the root schema lists its properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
         expected.sort_unstable();
-        assert!(
-            expected.contains(&"proxy"),
-            "field list did not parse out of: {message}",
-        );
+        assert!(expected.contains(&"proxy"), "{expected:?}");
 
         let mut have = TOP_LEVEL_ENV_KEYS.to_vec();
         have.sort_unstable();
@@ -3314,44 +3374,23 @@ admin:
         }
     }
 
-    fn load_with_usage_event_headers(list: &str) -> Result<Config, BootstrapError> {
-        let f = write_yaml(&format!(
-            r#"
-etcd:
-  endpoints: ["http://127.0.0.1:2379"]
-  prefix: "/aisix"
-proxy:
-  addr: "0.0.0.0:3000"
-admin:
-  addr: "127.0.0.1:3001"
-  admin_keys: ["k1"]
-observability:
-  usage_event:
-    request_headers: {list}
-"#
-        ));
-        Config::load_from_path(Some(f.path()))
-    }
-
-    /// The 1.6.0 key still loads — including a list the old validation
-    /// refused, since it no longer feeds anything — and boot warns once,
-    /// pointing at the exporter field that replaced it. Omitting the block
-    /// warns about nothing.
     #[test]
-    fn usage_event_request_headers_is_a_tombstone_that_warns() {
-        for list in [
-            r#"["x-sub-user", "x-department"]"#,
-            "[]",
-            r#"["authorization"]"#,
+    fn the_shipped_example_configs_carry_only_live_settings() {
+        for shipped in [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.example.yaml"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.managed.yaml"),
         ] {
-            let cfg = load_with_usage_event_headers(list).unwrap();
-            let warnings = cfg.observability.retired_settings();
-            assert_eq!(warnings.len(), 1, "{list}");
-            assert!(warnings[0].contains("observability.usage_event"));
-            assert!(warnings[0].contains("observability_exporters"));
+            let cfg = Config::load_from_path(Some(Path::new(shipped))).unwrap();
+            assert!(
+                cfg.observability.retired_settings().is_empty(),
+                "{shipped} must not ship a retired setting"
+            );
+            assert!(
+                cfg.ignored_keys().is_empty(),
+                "{shipped}: {:?}",
+                cfg.ignored_keys()
+            );
         }
-        assert!(ObservabilityConfig::default().usage_event.is_none());
-        assert!(ObservabilityConfig::default().retired_settings().is_empty());
     }
 
     /// `managed.cp_base_url` reaches three consumers with two different
@@ -3771,102 +3810,102 @@ admin:
         );
     }
 
-    /// The two static OTLP blocks were placeholders no code ever read, and
-    /// are gone from the shipped example files (AISIX-Cloud#1380). They
-    /// stay parseable because `ObservabilityConfig` denies unknown fields:
-    /// dropping them would stop every gateway whose config still carries
-    /// the copied-in block — almost all of them, and all of them disabled.
-    /// Loading is not silent, though: boot warns for each key written.
+    /// A key that names no setting — a typo, or a block a release retired —
+    /// loads with a warning naming its full path instead of failing the
+    /// boot. Covers every depth: inside an optional block, inside an
+    /// element of a list of structs (whose untagged deserializer buffers
+    /// its input), and in that list's env-style JSON-string form.
     #[test]
-    fn legacy_static_otlp_blocks_load_and_are_warned_about() {
+    fn unknown_keys_are_ignored_and_named() {
         let f = write_yaml(
             r#"
 etcd:
   endpoints: ["http://127.0.0.1:2379"]
-  prefix: "/aisix"
 proxy:
   addr: "0.0.0.0:3000"
+  expose_debug_header: true
+  tls:
+    cert_file: "/c.pem"
+    key_file: "/k.pem"
+    bogus: 1
+  url_rewrites:
+    - match: "^/a$"
+      rewrite: "/b"
+      bogus: 1
 admin:
   addr: "127.0.0.1:3001"
   admin_keys: ["k1"]
 observability:
   metrics:
     otlp:
-      enabled: true
+      enabled: false
       endpoint: "http://127.0.0.1:4317"
-  tracing:
-    otlp:
-      enabled: true
-      endpoint: "http://127.0.0.1:4317"
-      sample_ratio: 1.0
-"#,
-        );
-        let cfg =
-            Config::load_from_path(Some(f.path())).expect("a config carrying the old blocks loads");
-        let warnings = cfg.observability.retired_settings();
-        assert_eq!(warnings.len(), 2, "both keys must be named: {warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("otlp_http")));
-        assert!(warnings
-            .iter()
-            .any(|w| w.contains("observability.metrics.prometheus.addr")));
-    }
-
-    /// The warning must fire on the block being *written*, not on it being
-    /// enabled — a copied-in `enabled: false` is exactly the config the
-    /// operator should delete, and is what almost everyone carries.
-    #[test]
-    fn a_disabled_legacy_otlp_block_is_still_warned_about() {
-        let f = write_yaml(
-            r#"
-etcd:
-  endpoints: ["http://127.0.0.1:2379"]
-proxy:
-  addr: "0.0.0.0:3000"
-admin:
-  addr: "127.0.0.1:3001"
-  admin_keys: ["k1"]
-observability:
+    client_type_rules: '[{"pattern": "^x/", "client": "x", "bogus": 1}]'
   tracing:
     otlp:
       enabled: false
+  usage_event:
+    request_headers: ["x-sub-user"]
+not_a_section:
+  a: 1
 "#,
         );
-        let cfg = Config::load_from_path(Some(f.path())).unwrap();
-        assert_eq!(cfg.observability.retired_settings().len(), 1);
+        let cfg = Config::load_from_path(Some(f.path())).expect("unknown keys must not abort");
+        assert!(!cfg.proxy.expose_debug_headers);
+        assert_eq!(cfg.proxy.url_rewrites.len(), 1);
+        assert_eq!(cfg.observability.metrics.client_type_rules.len(), 1);
+
+        let warnings = cfg.ignored_keys();
+        let mut keys: Vec<&str> = warnings
+            .iter()
+            .map(|w| w.split_once(' ').unwrap().0)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "not_a_section",
+                "observability.metrics.client_type_rules[0].bogus",
+                "observability.metrics.otlp",
+                "observability.tracing",
+                "observability.usage_event",
+                "proxy.expose_debug_header",
+                "proxy.tls.bogus",
+                "proxy.url_rewrites[0].bogus",
+            ],
+        );
+        assert!(
+            cfg.ignored_keys()[0].ends_with("Check its spelling, or delete it if it was retired.")
+        );
     }
 
-    /// ...and stays quiet for a config that never had them, including the
-    /// shipped example files, which no longer carry the blocks at all.
+    /// A misspelled key usually IS the cause of the load error that follows
+    /// (the required setting it was meant to be is missing), and ignored-key
+    /// warnings are only logged for a config that loads — so the error names
+    /// it.
     #[test]
-    fn a_config_without_the_legacy_blocks_warns_about_nothing() {
-        let f = write_yaml(
-            r#"
-etcd:
-  endpoints: ["http://127.0.0.1:2379"]
-proxy:
-  addr: "0.0.0.0:3000"
-admin:
-  addr: "127.0.0.1:3001"
-  admin_keys: ["k1"]
-observability:
-  metrics:
-    prometheus:
-      enabled: true
-      path: "/metrics"
-      addr: "0.0.0.0:9090"
-"#,
-        );
-        let cfg = Config::load_from_path(Some(f.path())).unwrap();
-        assert!(cfg.observability.retired_settings().is_empty());
-
-        for shipped in [
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.example.yaml"),
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.managed.yaml"),
+    fn a_load_error_names_the_keys_it_ignored() {
+        for (body, ignored) in [
+            (
+                "proxy:\n  adress: \"0.0.0.0:3000\"\nadmin:\n  admin_keys: [\"k1\"]",
+                "proxy.adress",
+            ),
+            (
+                "proxy:\n  addr: \"0.0.0.0:3000\"\nadmin:\n  admin_key: [\"k1\"]",
+                "admin.admin_key",
+            ),
         ] {
-            let cfg = Config::load_from_path(Some(Path::new(shipped))).unwrap();
+            let f = write_yaml(&format!(
+                "etcd:\n  endpoints: [\"http://127.0.0.1:2379\"]\n{body}\n"
+            ));
+            let err = Config::load_from_path(Some(f.path()))
+                .unwrap_err()
+                .to_string();
             assert!(
-                cfg.observability.retired_settings().is_empty(),
-                "{shipped} must not ship a retired setting"
+                err.contains(&format!(
+                    "also ignored, as no setting this gateway knows: {ignored})"
+                )),
+                "{err}"
             );
         }
     }
@@ -4209,13 +4248,6 @@ admin:
         assert_eq!(
             cfg.proxy.request_id.accept_headers,
             vec!["x-aisix-request-id".to_string(), "x-request-id".to_string()],
-        );
-        assert_eq!(
-            cfg.observability
-                .usage_event
-                .as_ref()
-                .map(|u| u.request_headers.clone()),
-            Some(vec!["x-sub-user".to_string(), "x-department".to_string()]),
         );
         assert_eq!(cfg.proxy.url_rewrites.len(), 1);
         assert_eq!(cfg.proxy.listeners.len(), 2);
@@ -5316,19 +5348,7 @@ observability:
             "managed": {},
         }))
         .expect("defaults must deserialize");
-        let mut expected = serde_json::to_value(&cfg).unwrap();
-        // Retired keys (`ObservabilityConfig::retired_settings`) are left out
-        // so the chart does not advertise a setting that does nothing.
-        expected["observability"]["metrics"]
-            .as_object_mut()
-            .unwrap()
-            .remove("otlp");
-        for retired in ["tracing", "usage_event"] {
-            expected["observability"]
-                .as_object_mut()
-                .unwrap()
-                .remove(retired);
-        }
+        let expected = serde_json::to_value(&cfg).unwrap();
         let expected = serde_json::json!({
             "defaults": expected,
             "optional_blocks": optional_blocks(&expected),
@@ -5590,24 +5610,6 @@ ratelimit:
     }
 
     #[test]
-    fn rejects_unknown_fields() {
-        let f = write_yaml(
-            r#"
-etcd:
-  endpoints: ["http://localhost:2379"]
-proxy:
-  addr: "0.0.0.0:3000"
-admin:
-  addr: "127.0.0.1:3001"
-  admin_keys: ["k1"]
-bogus_field: 1
-"#,
-        );
-        let err = Config::load_from_path(Some(f.path())).unwrap_err();
-        assert!(err.to_string().contains("bogus_field"));
-    }
-
-    #[test]
     fn managed_mode_lets_admin_fields_be_omitted() {
         // A managed-mode config is the minimum connected-gateway
         // shape: etcd + tls + proxy + managed.enabled = true. Admin
@@ -5735,7 +5737,7 @@ managed:
     }
 
     #[test]
-    fn rejects_legacy_registration_token_field() {
+    fn the_legacy_registration_token_field_is_ignored_with_a_warning() {
         let f = write_yaml(
             r#"
 etcd:
@@ -5750,11 +5752,9 @@ managed:
   registration_token: "unused"
 "#,
         );
-        let err = Config::load_from_path(Some(f.path())).unwrap_err();
-        assert!(
-            err.to_string().contains("registration_token"),
-            "expected unknown legacy field error, got {err}",
-        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.ignored_keys().len(), 1);
+        assert!(cfg.ignored_keys()[0].starts_with("managed.registration_token is not a setting"));
     }
 
     #[test]
@@ -5780,7 +5780,7 @@ admin:
     fn bedrock_endpoint_url_round_trips_through_yaml() {
         // Operators set this when pointing the DP at LocalStack /
         // fakecloud / a Bedrock-compatible mock; pin that the field
-        // makes it through `deny_unknown_fields` and back out.
+        // makes it through the loader and back out.
         let f = write_yaml(
             r#"
 etcd:

@@ -12,9 +12,11 @@ const BIN_PATH =
   process.env.AISIX_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "aisix");
 
 // A startup config the gateway cannot deserialize stops the boot, and the
-// error has to say where the bad key is: its full dotted path, and for the
-// env form the variable that set it. Black-box: the contract is what an
-// operator reads from a process that refused to start.
+// error has to say where the bad value is: its full dotted path, and for the
+// env form the variable that set it. A key the gateway does not know does
+// not stop it: it is named in a warning, and in the error of a load that
+// fails for another reason. Black-box: the contract is what an operator
+// reads from the process.
 
 /** Boot with `extra` merged into a minimal config; return exit code and output. */
 async function boot(
@@ -59,31 +61,48 @@ async function boot(
 }
 
 describe("a startup config error names the key it is about", () => {
-  test("a bad nested key in the file is named by its full path", async () => {
+  test("a bad nested value in the file is named by its full path", async () => {
+    const { code, logs } = await boot({
+      upstream: { media_fetch: { max_bytes: "lots" } },
+    });
+    expect(code).toBe(1);
+    expect(logs).toContain("upstream.media_fetch.max_bytes");
+  });
+
+  test("a bad nested value from the environment names the variable too", async () => {
+    const { code, logs } = await boot({}, { AISIX_SHUTDOWN__MIN_DRAIN_SECS: "soon" });
+    expect(code).toBe(1);
+    expect(logs).toContain("shutdown.min_drain_secs (set by AISIX_SHUTDOWN__MIN_DRAIN_SECS)");
+  });
+
+  test("a load error also names the keys it ignored", async () => {
+    // The misspelling is usually the cause: `adress` is why the required
+    // `proxy.addr` is missing.
+    const { code, logs } = await boot({ proxy: { adress: "127.0.0.1:0" } });
+    expect(code).toBe(1);
+    expect(logs).toContain("also ignored, as no setting this gateway knows: proxy.adress");
+  });
+});
+
+describe("a key the gateway does not know is ignored and named", () => {
+  // Before 1.8.0 each of these stopped the boot with `unknown field`. The
+  // gateway now keeps running (here: retrying the dead etcd endpoint until
+  // the harness timeout stops it) and names the key.
+  test("a removed nested key in the file is named by its full path", async () => {
     const { code, logs } = await boot({
       upstream: { media_fetch: { allowed_hosts: ["media.qa"] } },
     });
-    expect(code).toBe(1);
-    expect(logs).toContain("upstream.media_fetch.allowed_hosts");
+    expect(code).not.toBe(1);
+    expect(logs).toContain(
+      "upstream.media_fetch.allowed_hosts is not a setting this gateway knows and was ignored.",
+    );
   });
 
-  test("a bad nested key from the environment names the variable too", async () => {
-    const { code, logs } = await boot(
-      {},
-      { AISIX_SHUTDOWN__BOGUS: "1" },
+  test("an unknown nested key from the environment names the variable too", async () => {
+    const { code, logs } = await boot({}, { AISIX_SHUTDOWN__BOGUS: "1" });
+    expect(code).not.toBe(1);
+    expect(logs).toContain(
+      "shutdown.bogus (set by AISIX_SHUTDOWN__BOGUS) is not a setting this gateway knows and was ignored.",
     );
-    expect(code).toBe(1);
-    expect(logs).toContain("shutdown.bogus");
-    expect(logs).toContain("AISIX_SHUTDOWN__BOGUS");
-  });
-
-  test("the env form of a removed nested key names the variable and the path", async () => {
-    const { code, logs } = await boot(
-      {},
-      { AISIX_UPSTREAM__MEDIA_FETCH__ALLOWED_HOSTS: "media.qa" },
-    );
-    expect(code).toBe(1);
-    expect(logs).toContain("upstream.media_fetch.allowed_hosts");
-    expect(logs).toContain("AISIX_UPSTREAM__MEDIA_FETCH__ALLOWED_HOSTS");
   });
 });

@@ -172,7 +172,9 @@ fn http_version_label(version: axum::http::Version) -> &'static str {
 /// reason and with the same reach — the access log, the per-attempt
 /// `provider call completed` line, and every diagnostic in between:
 ///
-/// - `peer`, the accepted socket's remote address INCLUDING its port. It
+/// - `peer`, the accepted socket's remote address INCLUDING its port — or,
+///   when a trusted peer opened the connection with a PROXY protocol
+///   header, the source address that header names. It
 ///   is deliberately not the resolved client IP that
 ///   [`ClientContext::source_ip`](crate::client_ip::ClientContext) already
 ///   carries: that one answers "who is the caller", follows
