@@ -14,7 +14,6 @@ import {
 // counters, the token families had the same gap in three different shapes:
 //
 //   aisix_llm_{input,output,total}_tokens_total  chat + messages
-//   aisix_llm_spend_micro_usd_total              chat + messages
 //   aisix_llm_tokens_by_client_total             chat + messages + responses
 //   aisix_tokens_consumed_total (legacy)         chat ALONE
 //

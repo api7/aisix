@@ -6,11 +6,12 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   SeedClient,
-  scrapeMetrics,
   spawnApp,
+  startMockSls,
   startOpenAiUpstream,
-  sumMetric,
   waitConfigPropagation,
+  waitForSlsLog,
+  type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -421,7 +422,8 @@ describe("global pricing e2e: usage events price through the same chain", () => 
   // on the data plane rather than leaving it to the control plane, so it
   // is where a divergence between "what least_cost ranks by" and "what
   // the usage event bills" would show up. Nine input and four output
-  // tokens against 1.0/2.0 per 1K is 0.017 USD — 17000 micro-USD.
+  // tokens against 1.0/2.0 per 1K is 0.017 USD, read off the usage event
+  // the session exports.
   const INPUT_TOKENS = 9;
   const OUTPUT_TOKENS = 4;
   const CALLER = "sk-global-pricing-realtime-caller";
@@ -431,7 +433,10 @@ describe("global pricing e2e: usage events price through the same chain", () => 
   let seed: SeedClient | undefined;
   let global: SeedClient | undefined;
   let upstream: Awaited<ReturnType<typeof startRealtimeUpstream>> | undefined;
+  let sls: MockSls | undefined;
   let etcdReachable = false;
+  const CREDENTIAL_REF = "mock";
+  const LOGSTORE = "global-pricing-realtime";
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -439,9 +444,25 @@ describe("global pricing e2e: usage events price through the same chain", () => 
     if (!etcdReachable) return;
 
     upstream = await startRealtimeUpstream(INPUT_TOKENS, OUTPUT_TOKENS);
-    app = await spawnApp();
+    sls = await startMockSls();
+    app = await spawnApp({
+      extraEnv: {
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-secret",
+      },
+    });
     seed = new SeedClient(etcd, app.etcdPrefix);
     global = new SeedClient(etcd, `${app.etcdPrefix}/global`);
+    await seed.createObservabilityExporter({
+      name: "global-pricing-realtime-sls",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: "aisix-e2e-obs",
+      logstore: LOGSTORE,
+      credential_ref: CREDENTIAL_REF,
+      content_mode: "metadata_only",
+    });
 
     await global.createPricing({ key: "vendor/rt", input_per_1k: 1.0, output_per_1k: 2.0 });
     const pk = await seed.createProviderKey({
@@ -450,7 +471,7 @@ describe("global pricing e2e: usage events price through the same chain", () => 
       api_base: `http://127.0.0.1:${upstream.port}/v1`,
     });
     // Priced by the catalog. The inline `cost` is deliberately absent, so
-    // a spend counter that moves at all proves the reference resolved.
+    // a non-zero cost on the event proves the reference resolved.
     await seed.createModel({
       display_name: "rt-catalog",
       provider: "openai",
@@ -473,6 +494,7 @@ describe("global pricing e2e: usage events price through the same chain", () => 
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
+    await sls?.close();
   });
 
   /** One realtime session against `model`; resolves when it closes. */
@@ -496,12 +518,15 @@ describe("global pricing e2e: usage events price through the same chain", () => 
     });
   }
 
-  async function spendFor(model: string): Promise<number> {
-    return sumMetric(
-      await scrapeMetrics(app!.metricsUrl),
-      "aisix_llm_spend_micro_usd_total",
-      (labels) => labels.model === model,
+  /** The `cost_usd` of the usage event `model`'s session exported. */
+  async function costFor(model: string): Promise<number> {
+    const row = await waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (log) => log.get("requested_model") === model,
+      `the usage row of the ${model} session`,
     );
+    return Number(row.get("cost_usd"));
   }
 
   test("a realtime session bills at the pricing document's rate", async (ctx) => {
@@ -519,11 +544,9 @@ describe("global pricing e2e: usage events price through the same chain", () => 
       return ids.includes("rt-catalog") && ids.includes("rt-inline");
     });
 
-    const before = await spendFor("rt-catalog");
     await runSession("rt-catalog");
     // The usage event is emitted as the session tears down.
-    await waitConfigPropagation(async () => (await spendFor("rt-catalog")) > before);
-    expect(Math.round((await spendFor("rt-catalog")) - before)).toBe(17000);
+    expect(await costFor("rt-catalog")).toBeCloseTo(0.017, 9);
   });
 
   test("without a pricing document the session bills at the model's inline cost", async (ctx) => {
@@ -531,9 +554,7 @@ describe("global pricing e2e: usage events price through the same chain", () => 
       ctx.skip();
       return;
     }
-    const before = await spendFor("rt-inline");
     await runSession("rt-inline");
-    await waitConfigPropagation(async () => (await spendFor("rt-inline")) > before);
-    expect(Math.round((await spendFor("rt-inline")) - before)).toBe(17000);
+    expect(await costFor("rt-inline")).toBeCloseTo(0.017, 9);
   });
 });
