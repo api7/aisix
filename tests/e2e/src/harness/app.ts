@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { connect } from "node:net";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -398,6 +399,8 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   );
   const debugBinaryDefault = overrides.debug === "binary-default";
   const debugAddr = debugBinaryDefault ? "127.0.0.1:9091" : `127.0.0.1:${debugPort}`;
+  const debugEnabled =
+    debugBinaryDefault || ((overrides.debug as { enabled?: boolean } | undefined)?.enabled ?? true);
   const adminKey = overrides.adminKey ?? `admin-${randomUUID()}`;
   const etcdPrefix = overrides.etcdPrefix ?? `/aisix-e2e-${randomUUID()}`;
 
@@ -469,7 +472,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
         ? {}
         : {
             debug: {
-              enabled: (overrides.debug as { enabled?: boolean } | undefined)?.enabled ?? true,
+              enabled: debugEnabled,
               addr: debugAddr,
             },
           }),
@@ -597,6 +600,10 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
                 ),
               ]
             : []),
+          // The debug listener binds in a task of its own, after the others
+          // may already answer. A TCP connect, not a profile request: a
+          // request would take a dump and move the dump counters under test.
+          ...(debugEnabled ? [waitForTcp(debugAddr, READY_TIMEOUT_MS)] : []),
         ]),
         exitedEarly,
       ]);
@@ -668,6 +675,26 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       await terminate(child);
     },
   };
+}
+
+async function waitForTcp(addr: string, timeoutMs: number): Promise<void> {
+  const [host, port] = [addr.slice(0, addr.lastIndexOf(":")), Number(addr.slice(addr.lastIndexOf(":") + 1))];
+  const deadline = Date.now() + timeoutMs;
+  let lastErr = "no attempt";
+  while (Date.now() < deadline) {
+    const err = await new Promise<string | undefined>((resolve) => {
+      const sock = connect({ host, port });
+      sock.once("connect", () => {
+        sock.destroy();
+        resolve(undefined);
+      });
+      sock.once("error", (e: NodeJS.ErrnoException) => resolve(e.code ?? e.message));
+    });
+    if (err === undefined) return;
+    lastErr = err;
+    await sleep(100);
+  }
+  throw new Error(`timed out waiting for a TCP connection to ${addr}: ${lastErr}`);
 }
 
 async function waitForReady(url: string, timeoutMs: number, bearer?: string): Promise<void> {

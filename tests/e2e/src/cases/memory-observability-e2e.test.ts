@@ -353,23 +353,30 @@ describe("memory observability", () => {
 
   test("GET /debug/pprof/heap returns a symbolized gzipped pprof", async (ctx) => {
     if (!ready(ctx)) return;
-    const before = await scrapeMetrics(app!.metricsUrl);
-    const res = await fetch(`${app!.debugUrl}/debug/pprof/heap`);
-    expect(res.status).toBe(200);
-    const body = Buffer.from(await res.arrayBuffer());
-    expect(body.subarray(0, 2)).toEqual(Buffer.from([0x1f, 0x8b]));
-    const profile = readProfile(gunzipSync(body));
-    expect(profile.sampleTypes).toContain("inuse_space");
-    expect(profile.functions.length).toBeGreaterThan(0);
-    expect(
-      profile.functions.some((f) => /^aisix_[a-z_]+::/.test(f)),
-      `no gateway function among ${profile.functions.length} names`,
-    ).toBe(true);
-    const after = await scrapeMetrics(app!.metricsUrl);
-    expect(
-      sumMetric(after, "aisix_heap_profile_dumps_total", { trigger: "manual", result: "ok" }) -
-        sumMetric(before, "aisix_heap_profile_dumps_total", { trigger: "manual", result: "ok" }),
-    ).toBe(1);
+    // At the default 2 MiB interval a freshly started gateway may have no
+    // sampled allocation under gateway code at all; sample densely here.
+    const dense = await spawnApp({ threadPerCore: true, extraEnv: { _RJEM_MALLOC_CONF: "lg_prof_sample:16" } });
+    try {
+      const before = await scrapeMetrics(dense.metricsUrl);
+      const res = await fetch(`${dense.debugUrl}/debug/pprof/heap`);
+      expect(res.status).toBe(200);
+      const body = Buffer.from(await res.arrayBuffer());
+      expect(body.subarray(0, 2)).toEqual(Buffer.from([0x1f, 0x8b]));
+      const profile = readProfile(gunzipSync(body));
+      expect(profile.sampleTypes).toContain("inuse_space");
+      expect(profile.functions.length).toBeGreaterThan(0);
+      expect(
+        profile.functions.some((f) => /^aisix_[a-z_]+::/.test(f)),
+        `no gateway function among ${profile.functions.length} names`,
+      ).toBe(true);
+      const after = await scrapeMetrics(dense.metricsUrl);
+      expect(
+        sumMetric(after, "aisix_heap_profile_dumps_total", { trigger: "manual", result: "ok" }) -
+          sumMetric(before, "aisix_heap_profile_dumps_total", { trigger: "manual", result: "ok" }),
+      ).toBe(1);
+    } finally {
+      await dense.exit();
+    }
   });
 
   test("a heap profile requested while one is being taken is refused with 429", async (ctx) => {
