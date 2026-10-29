@@ -514,6 +514,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "ipnet",
  "rcgen",
  "reqwest 0.12.28",
  "rustls",

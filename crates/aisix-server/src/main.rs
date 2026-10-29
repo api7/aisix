@@ -75,6 +75,7 @@ mod cert_bundle;
 mod export;
 mod heartbeat;
 mod managed_bundle;
+mod proxy_protocol;
 mod telemetry;
 
 use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore, FileManagedStore};
@@ -1401,6 +1402,9 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         &cfg.observability.heap_profiling.auto_dump,
         (*metrics).clone(),
     );
+    // The same parsed list `proxy.real_ip` judges forwarded headers by, so
+    // the two trust decisions cannot drift apart.
+    let proxy_protocol_trust: ProxyProtocolTrust = proxy_state.real_ip.trusted.clone().into();
     let proxy_router = aisix_proxy::build_router(proxy_state);
 
     let background_check_task = tokio::spawn(async move {
@@ -1678,6 +1682,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             "proxy",
             proxy_workers,
             Some(proxy_drain),
+            Some(proxy_protocol_trust),
         )
         .await
     };
@@ -2480,6 +2485,11 @@ impl<I: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Rewind<I> {
             let n = (me.prefix.len() - me.replayed).min(buf.remaining());
             buf.put_slice(&me.prefix[me.replayed..me.replayed + n]);
             me.replayed += n;
+            if me.replayed == me.prefix.len() {
+                // Held for the connection's lifetime otherwise.
+                me.prefix = Vec::new();
+                me.replayed = 0;
+            }
             return std::task::Poll::Ready(Ok(()));
         }
         std::pin::Pin::new(&mut me.inner).poll_read(cx, buf)
@@ -2531,10 +2541,10 @@ impl<I: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Rewind<I> {
 /// keeps the answer to itself.
 ///
 /// A TLS listener never reaches here — ALPN has already answered.
-async fn sniff_downstream_version(
-    mut stream: tokio::net::TcpStream,
+async fn sniff_downstream_version<I: tokio::io::AsyncRead + Unpin>(
+    mut stream: I,
     first_bytes_timeout: Option<Duration>,
-) -> std::io::Result<(Downstream, Rewind<tokio::net::TcpStream>)> {
+) -> std::io::Result<(Downstream, Rewind<I>)> {
     use tokio::io::AsyncReadExt;
 
     const PREFACE_HEAD: &[u8] = b"PRI ";
@@ -2573,6 +2583,59 @@ async fn sniff_downstream_version(
         Downstream::Http1
     };
     Ok((version, Rewind::new(head[..filled].to_vec(), stream)))
+}
+
+/// A dual-stack (`[::]`) listener reports an IPv4 client as
+/// `::ffff:a.b.c.d`, which no IPv4 CIDR contains. Every consumer of the
+/// connection's peer — `trusted_proxies`, `allowed_cidrs`, source
+/// allowlists, hash routing, the reported client address — reads it
+/// through `ConnectInfo`, so it is normalised once, here.
+fn canonical_peer(peer: std::net::SocketAddr) -> std::net::SocketAddr {
+    std::net::SocketAddr::new(peer.ip().to_canonical(), peer.port())
+}
+
+/// The peers allowed to open a proxy-listener connection with a PROXY
+/// header: `proxy.real_ip.trusted_proxies`. Only the proxy listeners carry
+/// one; the admin, metrics and debug listeners never read a header.
+type ProxyProtocolTrust = std::sync::Arc<[ipnet::IpNet]>;
+
+/// Read the PROXY header a connection may open with, bounded by the same
+/// first-bytes window as the version sniff. Returns the peer to attribute
+/// the connection to and the stream positioned at the byte after the
+/// header, or `None` once the connection has been refused and logged.
+async fn read_proxy_header(
+    mut stream: tokio::net::TcpStream,
+    socket_peer: std::net::SocketAddr,
+    trusted: &[ipnet::IpNet],
+    timeout: Option<Duration>,
+    label: &'static str,
+) -> Option<(std::net::SocketAddr, Rewind<tokio::net::TcpStream>)> {
+    let read = proxy_protocol::read(&mut stream, socket_peer, trusted, timeout).await;
+    match read {
+        Ok((peer, replay)) => Some((peer, Rewind::new(replay, stream))),
+        Err(proxy_protocol::Refused::Untrusted) => {
+            tracing::warn!(
+                label,
+                peer = %socket_peer,
+                "PROXY protocol header from a peer outside proxy.real_ip.trusted_proxies; \
+                 closing the connection"
+            );
+            None
+        }
+        Err(proxy_protocol::Refused::Malformed(reason)) => {
+            tracing::warn!(
+                label,
+                peer = %socket_peer,
+                reason,
+                "malformed PROXY protocol header; closing the connection"
+            );
+            None
+        }
+        Err(proxy_protocol::Refused::Io(e)) => {
+            tracing::debug!(label, error = %e, "reading the connection's first bytes failed");
+            None
+        }
+    }
 }
 
 /// How often the boot path repeats the "still waiting for a configuration"
@@ -2695,6 +2758,7 @@ async fn serve_http(
         label,
         workers,
         drain,
+        None,
     )
     .await
 }
@@ -2724,6 +2788,7 @@ async fn serve_listeners(
     label: &'static str,
     workers: Option<usize>,
     drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
+    proxy_protocol: Option<ProxyProtocolTrust>,
 ) -> anyhow::Result<()> {
     // Resolved before binding so a bad cert path still fails with the
     // same error it always did, before a port is taken.
@@ -2747,6 +2812,7 @@ async fn serve_listeners(
             label,
             workers,
             drain,
+            proxy_protocol,
         )
         .await;
     }
@@ -2777,6 +2843,7 @@ async fn serve_listeners(
             shutdown.clone(),
             label,
             drain.clone(),
+            proxy_protocol.clone(),
         ));
     }
     join_listeners(serving, label).await
@@ -2865,6 +2932,7 @@ async fn accept_loop(
     mut shutdown: ShutdownWatch,
     label: &'static str,
     drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
+    proxy_protocol: Option<ProxyProtocolTrust>,
 ) -> anyhow::Result<()> {
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
@@ -2874,9 +2942,10 @@ async fn accept_loop(
         if tls.is_some() { "https" } else { "http" },
     )));
 
-    // ConnectInfo<SocketAddr> exposes the TCP peer to the proxy's real-ip
-    // resolver (#492). Harmless for the admin listener, which ignores it.
-    let mut make_service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    // ConnectInfo<SocketAddr> exposes the TCP peer — or the client a
+    // trusted PROXY header names — to the proxy's real-ip resolver (#492).
+    // Harmless for the admin listener, which ignores it.
+    let make_service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
 
     // Close an accepted HTTP/1.1 connection that sits idle for
     // `idle_timeout`. hyper arms this timer only when it is waiting for a
@@ -2919,7 +2988,7 @@ async fn accept_loop(
         };
 
         let (stream, peer) = match accepted {
-            Ok(accepted) => accepted,
+            Ok((stream, peer)) => (stream, canonical_peer(peer)),
             // Transient: fd exhaustion, or a peer that vanished between
             // the SYN and the accept. Backing off keeps a listener that
             // cannot accept from spinning a core.
@@ -2949,20 +3018,6 @@ async fn accept_loop(
             tracing::debug!(label, error = %e, "TCP_NODELAY failed; dropping connection");
             continue;
         }
-
-        // `SocketAddr` is `Connected` both for a bare peer address and
-        // for axum's own `IncomingStream`, so the target type has to be
-        // named or the make-service call is ambiguous.
-        std::future::poll_fn(|cx| {
-            tower::Service::<std::net::SocketAddr>::poll_ready(&mut make_service, cx)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("{label} make_service not ready: {e}"))?;
-        let service =
-            match tower::Service::<std::net::SocketAddr>::call(&mut make_service, peer).await {
-                Ok(service) => service,
-                Err(never) => match never {},
-            };
 
         // Accepting is the only place either fact is observable, and
         // during a drain they are what separates work the gateway had
@@ -2997,12 +3052,39 @@ async fn accept_loop(
         let http1 = http1.clone();
         let http2 = http2.clone();
         let tls = tls.clone();
+        let make_service = make_service.clone();
+        let proxy_protocol = proxy_protocol.clone();
         tokio::spawn(async move {
             let _alive = alive;
             let _counted = counted;
-            // The TLS handshake and the version read both wait on the
-            // peer, so they belong to the connection's own task: a client
-            // that stalls in either must not hold up the accept loop.
+            // The PROXY header, the TLS handshake and the version read all
+            // wait on the peer, so they belong to the connection's own
+            // task: a client that stalls in any must not hold up the
+            // accept loop.
+            // One first-bytes window covers the PROXY header and the
+            // version sniff together, not one each.
+            let first_bytes_deadline = idle_timeout.map(|d| tokio::time::Instant::now() + d);
+            let (peer, stream) = match proxy_protocol {
+                None => (peer, Rewind::new(Vec::new(), stream)),
+                Some(trusted) => {
+                    match read_proxy_header(stream, peer, &trusted, idle_timeout, label).await {
+                        Some((peer, stream)) => (canonical_peer(peer), stream),
+                        None => return,
+                    }
+                }
+            };
+            // `SocketAddr` is `Connected` both for a bare peer address and
+            // for axum's own `IncomingStream`, so the target type has to be
+            // named or the make-service call is ambiguous.
+            let service = match tower::ServiceExt::<std::net::SocketAddr>::oneshot(
+                make_service,
+                peer,
+            )
+            .await
+            {
+                Ok(service) => service,
+                Err(never) => match never {},
+            };
             match tls {
                 Some(tls) => match tls.accept(stream).await {
                     Ok(stream) => {
@@ -3015,7 +3097,13 @@ async fn accept_loop(
                     }
                     Err(e) => tracing::debug!(label, error = %e, "TLS handshake failed"),
                 },
-                None => match sniff_downstream_version(stream, idle_timeout).await {
+                None => match sniff_downstream_version(
+                    stream,
+                    first_bytes_deadline
+                        .map(|at| at.saturating_duration_since(tokio::time::Instant::now())),
+                )
+                .await
+                {
                     Ok((version, stream)) => {
                         serve_connection(stream, version, service, &http1, &http2, shutdown, label)
                             .await;
@@ -3217,6 +3305,7 @@ async fn serve_http_tpc(
     label: &'static str,
     workers: usize,
     drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
+    proxy_protocol: Option<ProxyProtocolTrust>,
 ) -> anyhow::Result<()> {
     // An address someone else already holds has to stay a loud boot
     // failure. Every socket on a `SO_REUSEPORT` address has to set the
@@ -3266,6 +3355,7 @@ async fn serve_http_tpc(
         // the drain heartbeat reports the listener as a whole rather than
         // whichever worker happened to accept.
         let drain = drain.clone();
+        let proxy_protocol = proxy_protocol.clone();
         std::thread::Builder::new()
             // Names the mode in `ps -T` / `top -H`: `tpc-N` here,
             // tokio's own `tokio-rt-worker` on the shared runtime.
@@ -3284,6 +3374,7 @@ async fn serve_http_tpc(
                     label,
                     worker,
                     drain,
+                    proxy_protocol,
                     all_served,
                 ));
             })?;
@@ -3357,6 +3448,7 @@ fn run_tpc_worker(
     label: &'static str,
     worker: usize,
     drain: Option<std::sync::Arc<aisix_proxy::LivezState>>,
+    proxy_protocol: Option<ProxyProtocolTrust>,
     all_served: std::sync::Arc<tokio::sync::Barrier>,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -3393,6 +3485,7 @@ fn run_tpc_worker(
                 shutdown.clone(),
                 label,
                 drain.clone(),
+                proxy_protocol.clone(),
             ));
         }
         let served = join_listeners(serving, label).await;
@@ -4609,6 +4702,7 @@ managed:
             },
             "test",
             None,
+            None,
         ));
         DrainHarness {
             addr,
@@ -4979,6 +5073,7 @@ managed:
             },
             "test",
             Some(livez.clone()),
+            None,
         ));
 
         let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");

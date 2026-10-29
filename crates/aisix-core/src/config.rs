@@ -731,10 +731,11 @@ pub struct ProxyConfig {
     /// `AISIX_PROXY__LISTENERS='[{"addr":"0.0.0.0:3443","tls":{"cert_file":"/c.pem","key_file":"/k.pem"}},{"addr":"0.0.0.0:3000"}]'`.
     #[serde(default, deserialize_with = "deserialize_proxy_listeners")]
     pub listeners: Vec<ProxyListener>,
-    /// Real-client-IP resolution from forwarded headers (#492). Default
-    /// trusts nothing, so the logged source IP is always the immediate
-    /// TCP peer. Configure `trusted_proxies` when the gateway sits behind
-    /// an L7 LB / ingress that sets `x-forwarded-for`.
+    /// Real-client-IP resolution from forwarded headers (#492) and PROXY
+    /// protocol headers (AISIX-Cloud#1915). Default trusts nothing, so the
+    /// logged source IP is always the immediate TCP peer. Configure
+    /// `trusted_proxies` when the gateway sits behind an L7 LB / ingress
+    /// that sets `x-forwarded-for`, or an L4 LB that sends a PROXY header.
     #[serde(default)]
     pub real_ip: RealIpConfig,
     /// Which inbound headers a caller may hand the gateway its own
@@ -1048,6 +1049,12 @@ pub struct RealIpConfig {
     /// When the immediate TCP peer matches one of these, the configured
     /// forwarded header is trusted and walked to find the real client.
     /// Empty (the default) = trust nothing → always log the TCP peer.
+    ///
+    /// A peer in this list may also open a proxy-listener connection with a
+    /// PROXY protocol v1/v2 header; its source address then replaces the
+    /// TCP peer everywhere the peer is read, including the check above. A
+    /// header from any other peer closes the connection. There is no switch:
+    /// a connection without a header is served as before.
     pub trusted_proxies: Vec<String>,
     /// nginx `real_ip_recursive`. When true, walk the forwarded header
     /// right-to-left skipping every trusted address; the first untrusted

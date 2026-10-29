@@ -34,6 +34,7 @@ hyper.workspace = true
 # Unused in code; carries the h2 floor the drain's GOAWAY depends on.
 h2.workspace = true
 tokio-rustls.workspace = true
+ipnet.workspace = true
 tower.workspace = true
 rustls-pemfile.workspace = true
 rustls.workspace = true
