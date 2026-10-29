@@ -330,6 +330,13 @@ pub(crate) async fn protected_resource_metadata(
         response.status().as_u16(),
         started,
     );
+    crate::reject::record_undispatched(
+        &state,
+        uri.path(),
+        crate::request_metrics::Caller::unattributed(None),
+        response.status().as_u16(),
+        started,
+    );
     response
 }
 

@@ -373,6 +373,8 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/livez" => "/livez",
         "/readyz" => "/readyz",
         "/v1/models" => "/v1/models",
+        "/.well-known/oauth-protected-resource" => "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp" => "/.well-known/oauth-protected-resource/mcp",
         "/v1/chat/completions" => "/v1/chat/completions",
         "/v1/completions" => "/v1/completions",
         "/v1/embeddings" => "/v1/embeddings",
@@ -401,6 +403,11 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         _ if path.starts_with("/v1/batches/") => "/v1/batches/:id",
         _ if path.starts_with("/v1/fine_tuning/jobs/") => "/v1/fine_tuning/jobs/:id",
         _ if path.starts_with("/mcp/") => "/mcp/{server}",
+        // The agent card is discovery, not an agent call: its own series,
+        // so card fetches do not count as (or time) `/a2a` traffic.
+        _ if path.starts_with("/a2a/") && path.ends_with("/.well-known/agent-card.json") => {
+            "/a2a/{agent}/.well-known/agent-card.json"
+        }
         _ if path.starts_with("/a2a/") => "/a2a",
         // Any path-prefix route an operator claims under this namespace
         // labels as the passthrough_route family; unclaimed paths reach
@@ -419,7 +426,7 @@ fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
         "anthropic"
     } else if endpoint == "/mcp" || endpoint == "/mcp/{server}" {
         "mcp"
-    } else if endpoint == "/a2a" {
+    } else if endpoint == "/a2a" || endpoint == "/a2a/{agent}/.well-known/agent-card.json" {
         "a2a"
     } else if endpoint == "/v1/realtime" {
         "realtime"
@@ -9313,6 +9320,59 @@ data: [DONE]\n\n",
         assert_eq!(event.attempt_kind, "initial");
         assert_eq!(event.operation, "chat");
         assert!(rx.try_recv().is_err(), "one request, one row");
+    }
+
+    /// The request families of a stream dropped before its first poll are
+    /// recorded from the cancel guard's `Drop`, outside the request's own
+    /// task — and the end-to-end latency rides that same emit. Both of its
+    /// sides must survive it: `downstream` for the request, and `upstream`
+    /// for the attempt that had already answered, which the guard's
+    /// terminal event reports as dispatched.
+    #[tokio::test]
+    async fn a_stream_dropped_before_its_first_poll_records_both_e2e_sides() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(sse_chat_response())
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_routing_group("smart", &[("m-primary", "primary", &upstream.uri())]);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let metrics = state.metrics.clone();
+        let app = build_router(state);
+
+        let mut req = cancellable_chat_request("smart");
+        *req.body_mut() = Body::from(
+            serde_json::json!({
+                "model": "smart",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            })
+            .to_string(),
+        );
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop_body_unpolled(response);
+        assert_body_phase_cancel(&next_event(&mut rx).await);
+
+        let rendered = metrics.render();
+        for side in ["downstream", "upstream"] {
+            assert!(
+                rendered.lines().any(|l| {
+                    l.starts_with("aisix_request_e2e_latency_seconds_count{")
+                        && l.contains("endpoint=\"/v1/chat/completions\"")
+                        && l.contains(&format!("side=\"{side}\""))
+                        && l.contains("status_class=\"4xx\"")
+                }),
+                "no {side} e2e sample for the abandoned stream:\n{rendered}"
+            );
+        }
     }
 
     /// The same window on a second family, reached through a different

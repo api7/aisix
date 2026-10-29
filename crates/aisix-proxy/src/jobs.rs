@@ -416,13 +416,19 @@ async fn send_upstream(
     if sent.is_err() {
         crate::attribution::note_upstream_wait_end(false);
     }
+    let note_deployment = |status: u16| {
+        crate::attempt::RoutingTelemetry::record_deployment(state, &target.model_entry.id, status)
+    };
     let resp = sent
         .map_err(|e| {
+            let err =
+                aisix_gateway::BridgeError::Transport(aisix_gateway::transport_error_message(&e));
+            note_deployment(err.http_status());
             crate::cooldown::note_failure(
                 &state.runtime_status,
                 &target.model_entry.id,
                 target.model_entry.value.cooldown.as_ref(),
-                aisix_gateway::BridgeError::Transport(aisix_gateway::transport_error_message(&e)),
+                err,
             )
         })
         .map_err(ProxyError::Bridge)?;
@@ -434,14 +440,17 @@ async fn send_upstream(
     crate::attribution::note_upstream_wait_end(bytes.is_ok());
     let bytes = bytes
         .map_err(|e| {
+            let err = aisix_gateway::BridgeError::UpstreamDecode(e.to_string());
+            note_deployment(err.http_status());
             crate::cooldown::note_failure(
                 &state.runtime_status,
                 &target.model_entry.id,
                 target.model_entry.value.cooldown.as_ref(),
-                aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+                err,
             )
         })
         .map_err(ProxyError::Bridge)?;
+    note_deployment(status.as_u16());
 
     Ok((
         StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),

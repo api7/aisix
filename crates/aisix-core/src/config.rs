@@ -1346,6 +1346,18 @@ impl ObservabilityConfig {
                  endpoint at observability.metrics.prometheus.addr.",
             );
         }
+        if self
+            .metrics
+            .labels
+            .keys()
+            .any(|name| RETIRED_METRIC_FAMILIES.contains(&name.as_str()))
+        {
+            out.push(
+                "observability.metrics.labels names aisix_llm_spend_micro_usd_total, which \
+                 this gateway no longer emits; the entry is ignored. Delete it. Spend is the \
+                 cost the control plane records for each request.",
+            );
+        }
         if self.usage_event.is_some() {
             out.push(
                 "observability.usage_event is set but does nothing: request headers are \
@@ -1369,6 +1381,13 @@ impl ObservabilityConfig {
         true
     }
 }
+
+/// Metric families the gateway no longer emits whose name an
+/// `observability.metrics.labels` entry may still carry: accepted and
+/// ignored, and warned about at boot
+/// ([`ObservabilityConfig::retired_settings`]), so a config written for an
+/// older gateway still loads. Any other unknown family name fails boot.
+pub const RETIRED_METRIC_FAMILIES: &[&str] = &["aisix_llm_spend_micro_usd_total"];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
@@ -3850,6 +3869,33 @@ observability:
                 "{shipped} must not ship a retired setting"
             );
         }
+    }
+
+    /// A labels entry for a family the gateway no longer emits loads and is
+    /// warned about, rather than stopping a gateway configured for an older
+    /// release from booting.
+    #[test]
+    fn a_labels_entry_for_a_retired_metric_family_loads_and_warns() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+observability:
+  metrics:
+    labels:
+      aisix_llm_spend_micro_usd_total: [endpoint, model]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        let warnings = cfg.observability.retired_settings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("aisix_llm_spend_micro_usd_total"));
+        assert!(warnings[0].contains("control plane"));
     }
 
     #[test]

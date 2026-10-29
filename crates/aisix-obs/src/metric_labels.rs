@@ -277,7 +277,6 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
         extra = &["policy_name"]
     ),
     metric!(M_TOKENS_CONSUMED, &["provider", "model"]),
-    metric!(M_LLM_SPEND_MICRO_USD_TOTAL, USAGE, extra = CALLER_NAMES),
     metric!(M_LLM_INPUT_TOKENS_TOTAL, USAGE, extra = CALLER_NAMES),
     metric!(M_LLM_OUTPUT_TOKENS_TOTAL, USAGE, extra = CALLER_NAMES),
     metric!(M_LLM_TOTAL_TOKENS_TOTAL, USAGE, extra = CALLER_NAMES),
@@ -532,6 +531,9 @@ pub struct LabelSelection {
 impl LabelSelection {
     pub fn compile(config: &BTreeMap<String, Vec<String>>) -> Result<Self, String> {
         for (name, labels) in config {
+            if aisix_core::config::RETIRED_METRIC_FAMILIES.contains(&name.as_str()) {
+                continue;
+            }
             let definition = METRIC_DEFINITIONS
                 .iter()
                 .find(|metric| metric.name == name)
@@ -926,6 +928,22 @@ mod tests {
         assert_eq!(
             sample(&out, M_CONFIG_RELOAD_FAILURES_TOTAL),
             vec!["aisix_config_reload_failures_total 9"]
+        );
+    }
+
+    /// A family the gateway no longer emits is accepted and ignored, so a
+    /// config written for an older gateway still boots; any other unknown
+    /// name still fails.
+    #[test]
+    fn a_retired_family_is_ignored_and_an_unknown_one_still_fails() {
+        let retired = selection("aisix_llm_spend_micro_usd_total", &["endpoint"]);
+        let metrics = Metrics::new_with_labels("env", &HistogramBuckets::default(), &retired)
+            .expect("a retired family must not fail boot");
+        assert!(!metrics.render().contains("aisix_llm_spend_micro_usd_total"));
+        assert!(
+            LabelSelection::compile(&selection("aisix_no_such_family", &["endpoint"]))
+                .unwrap_err()
+                .contains("unknown metric family")
         );
     }
 

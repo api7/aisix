@@ -45,7 +45,6 @@ pub const M_REQUESTS_TOTAL: &str = "aisix_requests_total";
 pub const M_REQUEST_DURATION: &str = "aisix_request_duration_seconds";
 pub const M_RATELIMIT_REJECTIONS: &str = "aisix_ratelimit_rejections_total";
 pub const M_TOKENS_CONSUMED: &str = "aisix_tokens_consumed_total";
-pub const M_LLM_SPEND_MICRO_USD_TOTAL: &str = "aisix_llm_spend_micro_usd_total";
 pub const M_LLM_INPUT_TOKENS_TOTAL: &str = "aisix_llm_input_tokens_total";
 pub const M_LLM_OUTPUT_TOKENS_TOTAL: &str = "aisix_llm_output_tokens_total";
 pub const M_LLM_TOTAL_TOKENS_TOTAL: &str = "aisix_llm_total_tokens_total";
@@ -390,10 +389,13 @@ pub const M_OTLP_FANOUT_FAILURES_TOTAL: &str = "aisix_otlp_fanout_failures_total
 ///   per request from the gateway receiving it — at handler return for
 ///   non-streaming requests and failures, at stream completion for
 ///   committed streams (the whole stream, NOT the time-to-first-byte the
-///   summary series record). A stream the client cancels mid-flight still
-///   observes once, with the committed status (2xx) and the duration up to
-///   the abort. Cache hits and requests that failed before reaching an
-///   upstream observe this side too.
+///   summary series record), and at the end of the body relay for
+///   `/v1/videos/:id/content` (under the status of its response head). A stream the client cancels mid-flight still
+///   observes once, with the status the request ended on (`499`) and the
+///   duration up to the abort. Cache hits and requests that failed before
+///   reaching an upstream observe this side too. Every proxy route that
+///   records the request families observes it, except `/v1/realtime`,
+///   whose WebSocket session has no request/response round trip to time.
 /// - `upstream`: how long the upstream took on the attempt that produced
 ///   the response returned to the client — from that attempt's start until
 ///   the upstream settled (response fully received; for a stream, the
@@ -403,9 +405,9 @@ pub const M_OTLP_FANOUT_FAILURES_TOTAL: &str = "aisix_otlp_fanout_failures_total
 ///   in an upstream error or timeout): a cache hit or a request that
 ///   failed before dispatch observes `downstream` only. Earlier failed
 ///   attempts and retry backoff are not observed on their own; they stay
-///   inside the `downstream` figure. `/a2a` and ensemble models, whose
-///   response comes from no single upstream attempt, observe `downstream`
-///   only.
+///   inside the `downstream` figure. On `/a2a` the attempt is the one
+///   call to the upstream agent. Ensemble models, whose response comes
+///   from no single upstream attempt, observe `downstream` only.
 ///
 /// Both observations of one request carry identical labels apart from
 /// `side`. Gateways before `side` existed recorded the `downstream`
@@ -953,8 +955,8 @@ struct RequestSeriesHandles {
     llm_duration: OnceLock<metrics::Histogram>,
 }
 
-/// Usage dimensions are registered independently so a zero-valued token or
-/// spend field does not create an otherwise absent Prometheus series.
+/// Usage dimensions are registered independently so a zero-valued token
+/// field does not create an otherwise absent Prometheus series.
 #[derive(Default)]
 struct UsageSeriesHandles {
     input_tokens: OnceLock<metrics::Counter>,
@@ -963,7 +965,6 @@ struct UsageSeriesHandles {
     cached_input_tokens: OnceLock<metrics::Counter>,
     cache_read_input_tokens: OnceLock<metrics::Counter>,
     cache_creation_input_tokens: OnceLock<metrics::Counter>,
-    spend_micro_usd: OnceLock<metrics::Counter>,
 }
 
 // ── Per-worker handle cache ────────────────────────────────────────────────
@@ -2393,7 +2394,7 @@ impl Metrics {
         });
     }
 
-    /// The terminal token + spend emit for one request.
+    /// The terminal token emit for one request.
     ///
     /// The three prompt-cache counters (AISIX-Cloud#1404) are recorded
     /// ALONGSIDE `input_tokens` / `total_tokens`, never folded into
@@ -2402,14 +2403,12 @@ impl Metrics {
     /// caller supplies each field exactly as the upstream reported it —
     /// see [`LlmUsage`] for which accounting shape each one carries.
     pub fn record_llm_usage(&self, labels: UsageLabels<'_>, usage: LlmUsage) {
-        let spend_micro_usd = usage.spend_micro_usd();
         if usage.input_tokens == 0
             && usage.output_tokens == 0
             && usage.total_tokens == 0
             && usage.cached_input_tokens == 0
             && usage.cache_read_input_tokens == 0
             && usage.cache_creation_input_tokens == 0
-            && spend_micro_usd.is_none()
         {
             return;
         }
@@ -2449,12 +2448,6 @@ impl Metrics {
                     labels.counter(M_LLM_CACHE_CREATION_INPUT_TOKENS_TOTAL)
                 })
                 .increment(u64::from(usage.cache_creation_input_tokens));
-            }
-            if let Some(value) = spend_micro_usd {
-                self.init_handle(&handles.spend_micro_usd, || {
-                    labels.counter(M_LLM_SPEND_MICRO_USD_TOTAL)
-                })
-                .increment(value);
             }
         });
     }
@@ -3579,17 +3572,6 @@ pub struct LlmUsage {
     /// Input tokens written into the upstream's prompt cache. See
     /// [`M_LLM_CACHE_CREATION_INPUT_TOKENS_TOTAL`].
     pub cache_creation_input_tokens: u32,
-    pub spend_usd: f64,
-}
-
-impl LlmUsage {
-    fn spend_micro_usd(self) -> Option<u64> {
-        if !self.spend_usd.is_finite() || self.spend_usd <= 0.0 {
-            return None;
-        }
-        let micro_usd = (self.spend_usd * 1_000_000.0).round();
-        (micro_usd > 0.0).then_some(micro_usd as u64)
-    }
 }
 
 /// The attribution dimensions `aisix_usage_events_emitted_total` and
@@ -4489,7 +4471,6 @@ mod tests {
                 cached_input_tokens: 3,
                 cache_read_input_tokens: 800,
                 cache_creation_input_tokens: 200,
-                spend_usd: 0.001,
             },
         );
         m.record_time_to_first_token(
@@ -4512,7 +4493,6 @@ mod tests {
         assert!(rendered.contains(M_LLM_INPUT_TOKENS_TOTAL));
         assert!(rendered.contains(M_LLM_OUTPUT_TOKENS_TOTAL));
         assert!(rendered.contains(M_LLM_TOTAL_TOKENS_TOTAL));
-        assert!(rendered.contains(M_LLM_SPEND_MICRO_USD_TOTAL));
         assert!(rendered.contains(M_LLM_REQUEST_DURATION));
         assert!(rendered.contains(M_LLM_TTFT));
         assert!(rendered.contains("endpoint=\"/v1/chat/completions\""));
@@ -6407,11 +6387,7 @@ mod tests {
                 && line.contains("model=\"cached-usage-model\"")
                 && line.ends_with(" 5")
         }));
-        for absent in [
-            M_LLM_OUTPUT_TOKENS_TOTAL,
-            M_LLM_TOTAL_TOKENS_TOTAL,
-            M_LLM_SPEND_MICRO_USD_TOTAL,
-        ] {
+        for absent in [M_LLM_OUTPUT_TOKENS_TOTAL, M_LLM_TOTAL_TOKENS_TOTAL] {
             assert!(
                 !rendered.contains(absent),
                 "a zero-valued usage dimension must not register {absent}"
@@ -6423,7 +6399,6 @@ mod tests {
             LlmUsage {
                 output_tokens: 7,
                 total_tokens: 7,
-                spend_usd: 0.001,
                 ..LlmUsage::default()
             },
         );
@@ -6437,7 +6412,6 @@ mod tests {
             (M_LLM_INPUT_TOKENS_TOTAL, 5),
             (M_LLM_OUTPUT_TOKENS_TOTAL, 7),
             (M_LLM_TOTAL_TOKENS_TOTAL, 7),
-            (M_LLM_SPEND_MICRO_USD_TOTAL, 1000),
         ] {
             assert!(
                 rendered.lines().any(|line| {
@@ -6468,7 +6442,6 @@ mod tests {
                             input_tokens: 1,
                             output_tokens: 2,
                             total_tokens: 3,
-                            spend_usd: 0.000001,
                             ..Default::default()
                         },
                     );
@@ -6485,7 +6458,6 @@ mod tests {
             (M_LLM_INPUT_TOKENS_TOTAL, THREADS),
             (M_LLM_OUTPUT_TOKENS_TOTAL, THREADS * 2),
             (M_LLM_TOTAL_TOKENS_TOTAL, THREADS * 3),
-            (M_LLM_SPEND_MICRO_USD_TOTAL, THREADS),
         ] {
             assert!(
                 rendered

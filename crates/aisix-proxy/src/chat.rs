@@ -478,18 +478,6 @@ pub async fn chat_completions(
                 status,
                 elapsed,
             );
-            crate::request_metrics::record_e2e_latency(
-                &state,
-                "/v1/chat/completions",
-                crate::request_metrics::Caller::new(&auth),
-                last_target.upstream(
-                    metric_model.as_ref(),
-                    req.is_streaming(),
-                    routing.fallback_count() > 0,
-                ),
-                status,
-                elapsed,
-            );
             emit_access_log(
                 method,
                 path,
@@ -2477,36 +2465,8 @@ async fn dispatch(
                         cached: comp.cached_prompt_tokens,
                         cache_read: comp.cache_read_tokens,
                         cache_creation: comp.cache_creation_tokens,
-                        spend_usd: 0.0,
                         client_type: &client_type_for_metrics,
                     },
-                );
-                crate::request_metrics::record_e2e_downstream(
-                    &metrics_for_stream,
-                    LatencyLabels {
-                        endpoint: "/v1/chat/completions",
-                        model: &bounded_model_for_metrics,
-                        provider: &provider_for_metrics,
-                        status: terminal_status,
-                        streaming: true,
-                        details: UsageLabels {
-                            endpoint: "/v1/chat/completions",
-                            inbound_protocol: "openai",
-                            upstream_protocol: pk.labels().protocol(),
-                            provider: &provider_for_metrics,
-                            model: &bounded_model_for_metrics,
-                            upstream_model: &bounded_upstream_for_metrics,
-                            provider_key_id: pk.labels().id(),
-                            provider_key_name: pk.labels().name(),
-                            api_key_id: &api_key_id_for_telem,
-                            api_key_name: api_key_name_for_metrics.as_deref().unwrap_or("unknown"),
-                            team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
-                            team_name: team_name_for_metrics.as_deref().unwrap_or("unknown"),
-                            user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
-                            user_name: user_name_for_metrics.as_deref().unwrap_or("unknown"),
-                        },
-                    },
-                    started.elapsed(),
                 );
                 metrics_for_stream.record_ttft(
                     LatencyLabels {
@@ -4777,26 +4737,6 @@ fn record_success(
             None
         }
     };
-    // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only here —
-    // `elapsed` for a stream is time-to-response-start; the stream's
-    // on_complete records the full duration instead.
-    if !stream {
-        crate::request_metrics::record_e2e_latency(
-            state,
-            "/v1/chat/completions",
-            caller,
-            crate::request_metrics::Upstream {
-                provider,
-                model,
-                upstream_model: &s.upstream_model,
-                pk: pk.labels(),
-                stream: false,
-                ..Default::default()
-            },
-            status,
-            elapsed,
-        );
-    }
     // Non-streaming path only; streaming tokens arrive in the SSE
     // on_complete and are recorded there. All-zero is a no-op, which is what
     // the streaming branch reaching here produces.
@@ -4820,7 +4760,6 @@ fn record_success(
             cached: s.cached_prompt_tokens,
             cache_read: s.cache_read_tokens,
             cache_creation: s.cache_creation_tokens,
-            spend_usd: s.cost_usd,
             client_type,
         },
     );
@@ -5663,7 +5602,6 @@ struct EnsembleCharge {
     bounded_model: String,
     metric_caller: crate::request_metrics::Owned,
     client: ClientContext,
-    started: Instant,
 }
 
 impl EnsembleCharge {
@@ -5685,7 +5623,6 @@ impl EnsembleCharge {
                 &rows.api_key_id,
             ),
             client: rows.client.clone(),
-            started: rows.started,
         }
     }
 
@@ -5746,7 +5683,6 @@ impl EnsembleCharge {
                 cached: aggregate_cached,
                 cache_read: aggregate_cache_read,
                 cache_creation: aggregate_cache_creation,
-                spend_usd: 0.0,
                 client_type: state.client_classifier.classify(&self.client.user_agent),
             },
         );
@@ -5781,16 +5717,8 @@ impl EnsembleCharge {
             streaming: true,
             details,
         };
-        // SLO histograms (AISIX-Cloud#1011): the handler's record_success is
-        // stream-gated, so the ensemble stream records its e2e/TTFT here
-        // like the plain streaming path. `downstream` only: no one attempt
-        // produced an ensemble's response, so there is no upstream side to
-        // observe.
-        state.metrics.record_request_e2e_latency(
-            labels,
-            aisix_obs::LatencySide::Downstream,
-            self.started.elapsed(),
-        );
+        // The end-to-end histogram rides the parked request metrics
+        // (`request_metrics`, `downstream` only for an ensemble).
         state.metrics.record_ttft(
             labels,
             Duration::from_millis(u64::from(comp.upstream_ttft_ms)),
@@ -5820,7 +5748,6 @@ impl EnsembleCharge {
                 cached: self.usage.cached_prompt_tokens,
                 cache_read: self.usage.cache_read_tokens,
                 cache_creation: self.usage.cache_creation_tokens,
-                spend_usd: 0.0,
                 client_type: self
                     .state
                     .client_classifier

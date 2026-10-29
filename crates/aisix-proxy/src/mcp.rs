@@ -188,8 +188,8 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
     // decision depends on which entry was addressed: a no-credential
     // request may be served anonymously on an entry configured for it
     // (AISIX-Cloud#1313). Every rejection comes from the extractor call in
-    // `resolve_caller`, which writes its access-log line; no request
-    // metric is recorded for it, as on every other extractor-denied route.
+    // `resolve_caller`, which writes its access-log line and request
+    // metrics, as on every other extractor-denied route.
     let (mut parts, body) = request.into_parts();
     let caller = match resolve_caller(&state, &mut parts, scope.as_deref()).await {
         Ok(caller) => caller,

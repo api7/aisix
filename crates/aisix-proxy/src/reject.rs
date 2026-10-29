@@ -98,7 +98,7 @@ pub(crate) fn reject_before_dispatch(
     // `request_metrics` keys the LLM-vs-proxy split off the result, so a 413
     // on /v1/chat/completions lands in the same families as the
     // model-not-found the handler itself records.
-    crate::request_metrics::record(
+    crate::request_metrics::record_undispatched(
         state,
         crate::normalize_endpoint_label(path),
         crate::request_metrics::Caller::unattributed(api_key_id),
@@ -155,6 +155,27 @@ pub(crate) fn emit_unrouted_access_log(
         request_body_bytes: None,
         response_body_bytes: None,
     });
+}
+
+/// Count a request answered without dispatch (`/v1/models`, the A2A agent
+/// card, the OAuth discovery documents) in the request families. Nothing
+/// upstream was resolved, so only the route, the caller and the outcome are
+/// labelled.
+pub(crate) fn record_undispatched(
+    state: &ProxyState,
+    path: &str,
+    caller: crate::request_metrics::Caller<'_>,
+    status: u16,
+    started: Instant,
+) {
+    crate::request_metrics::record_undispatched(
+        state,
+        crate::normalize_endpoint_label(path),
+        caller,
+        crate::request_metrics::Upstream::default(),
+        status,
+        started.elapsed(),
+    );
 }
 
 /// The router's answer to a known path with a method it does not serve.

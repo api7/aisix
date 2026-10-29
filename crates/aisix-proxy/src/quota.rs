@@ -470,7 +470,53 @@ pub(crate) async fn enforce(
     model_rl: Option<&ModelRateLimit>,
 ) -> Result<MultiReservation, ProxyError> {
     crate::budget::enforce_key(state, snapshot, auth)?;
-    reserve_layers(state, snapshot, auth, model_rl, None).await
+    let reserved = reserve_layers(state, snapshot, auth, model_rl, None).await;
+    refresh_remaining(state, snapshot, auth, model_rl);
+    reserved
+}
+
+/// Refresh `aisix_ratelimit_remaining_{requests,tokens}` for the caller's
+/// key from its window as this gate left it — the one point every model
+/// route reserves through. A route that resolved no model (MCP, A2A, a
+/// video poll) has no `model` to label the gauge with and leaves it alone.
+fn refresh_remaining(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    model_rl: Option<&ModelRateLimit>,
+) {
+    let Some(model_rl) = model_rl else {
+        return;
+    };
+    let key_limits = auth.key().rate_limit.clone().unwrap_or_default();
+    if key_limits.is_unrestricted() {
+        return;
+    }
+    // Off the request's path: on a shared store the peek is a round trip,
+    // and a gauge has no reason to delay the upstream call.
+    let limiter = state.limiter.clone();
+    let metrics = state.metrics.clone();
+    let api_key_id = auth.entry.id.clone();
+    let api_key_name = auth
+        .api_key_name()
+        .unwrap_or(crate::request_metrics::UNKNOWN)
+        .to_owned();
+    let model = crate::usage_attr::metric_model_label(snapshot, &model_rl.name).into_owned();
+    let refresh = async move {
+        if let Some(status) = limiter.peek(&api_key_id, &key_limits).await {
+            metrics.set_rate_limit_remaining(
+                &api_key_id,
+                &api_key_name,
+                &model,
+                status.rpm_remaining(),
+                status.tpm_remaining(),
+            );
+        }
+    };
+    tokio::spawn(tracing::Instrument::instrument(
+        refresh,
+        tracing::Span::current(),
+    ));
 }
 
 /// Apply budget + multi-layer rate-limit checks for one MCP `tools/call`
@@ -504,13 +550,20 @@ pub(crate) fn budget_labels(auth: &AuthenticatedKey) -> aisix_obs::BudgetLabels<
 
 /// Rate-limit-only enforcement (no budget check). Used by `chat.rs`
 /// which handles budget separately.
+///
+/// Refreshes the remaining-quota gauges only on a rejection: `chat.rs`
+/// refreshes them itself once the request's tokens are committed.
 pub(crate) async fn enforce_rate_limit(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
 ) -> Result<MultiReservation, ProxyError> {
-    reserve_layers(state, snapshot, auth, model_rl, None).await
+    let reserved = reserve_layers(state, snapshot, auth, model_rl, None).await;
+    if reserved.is_err() {
+        refresh_remaining(state, snapshot, auth, model_rl);
+    }
+    reserved
 }
 
 /// Reserve ONLY the model-scoped layers for one model, identified by its

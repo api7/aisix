@@ -456,6 +456,12 @@ struct Cell {
     )>,
     /// See [`note_terminal_upstream`].
     terminal_upstream: Option<Duration>,
+    /// See [`note_e2e_at_body_end`].
+    body_end_e2e: Option<(
+        Arc<aisix_obs::Metrics>,
+        crate::request_metrics::OwnedLatencyLabels,
+        Instant,
+    )>,
     /// See [`note_semantic_decision`].
     semantic: Option<aisix_obs::SemanticAccessLog>,
     /// See [`note_terminal_event`]: `(status, error_class, error_message)`
@@ -897,9 +903,17 @@ impl RequestAttribution {
         }
         let sizes = self.body_sizes(cell.head_written);
         let span = cell.request_span.clone();
+        let body_end_e2e = cell.body_end_e2e.take();
         drop(cell);
         if let Some(line) = line {
             write_line(line, sizes, span);
+        }
+        if let Some((metrics, labels, started)) = body_end_e2e {
+            metrics.record_request_e2e_latency(
+                labels.as_labels(),
+                aisix_obs::LatencySide::Downstream,
+                started.elapsed(),
+            );
         }
     }
 
@@ -1462,6 +1476,34 @@ pub(crate) fn note_e2e_downstream(
     downstream: Duration,
 ) {
     record_e2e_upstream(|cell| cell.e2e_labels = Some((metrics, labels, downstream)));
+}
+
+/// Hold the request's `downstream` end-to-end observation until its response
+/// body relay ends ([`RequestAttribution::finish`]), timed from `started`.
+/// For a route that relays an open-ended body after its handler returned
+/// and files no terminal usage event to park on. Recorded at once outside a
+/// request scope, where nothing would ever finish it.
+pub(crate) fn note_e2e_at_body_end(
+    metrics: Arc<aisix_obs::Metrics>,
+    labels: crate::request_metrics::OwnedLatencyLabels,
+    started: Instant,
+) {
+    let mut pending = Some((metrics, labels));
+    let _ = CURRENT.try_with(|a| {
+        let mut cell = a.lock();
+        if !cell.finished && cell.request_span.is_some() {
+            if let Some((metrics, labels)) = pending.take() {
+                cell.body_end_e2e = Some((metrics, labels, started));
+            }
+        }
+    });
+    if let Some((metrics, labels)) = pending {
+        metrics.record_request_e2e_latency(
+            labels.as_labels(),
+            aisix_obs::LatencySide::Downstream,
+            started.elapsed(),
+        );
+    }
 }
 
 /// Note the failure, the provider's id and the token counts the request's

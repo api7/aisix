@@ -247,25 +247,6 @@ pub async fn messages(
                     elapsed,
                 );
             }
-            // SLO e2e histogram (AISIX-Cloud#1011): non-streaming only —
-            // a stream records its full duration at completion instead.
-            if !stream_requested {
-                crate::request_metrics::record_e2e_latency(
-                    &state,
-                    "/v1/messages",
-                    crate::request_metrics::Caller::new(&auth),
-                    crate::request_metrics::Upstream {
-                        provider: &provider_label,
-                        model: &model_name,
-                        upstream_model: &upstream_model,
-                        pk: pk.labels(),
-                        stream: false,
-                        ..Default::default()
-                    },
-                    status,
-                    elapsed,
-                );
-            }
             // Per #655: one zero-token UsageEvent per failed attempt that
             // preceded the winner (non-streaming failover). No-op for a
             // first-try success and for the single-attempt streaming path.
@@ -373,18 +354,6 @@ pub async fn messages(
             // real provider landed on `provider="unknown"` while the same
             // key's successes landed on the real one.
             crate::request_metrics::record(
-                &state,
-                "/v1/messages",
-                crate::request_metrics::Caller::new(&auth),
-                last_target.upstream(
-                    metric_model.as_ref(),
-                    stream_requested,
-                    routing.fallback_count() > 0,
-                ),
-                status,
-                elapsed,
-            );
-            crate::request_metrics::record_e2e_latency(
                 &state,
                 "/v1/messages",
                 crate::request_metrics::Caller::new(&auth),
@@ -1716,8 +1685,7 @@ async fn anthropic_passthrough_dispatch(
                     upstream_ttft_ms: usage.upstream_ttft_ms,
                     downstream_latency_ms: usage.downstream_latency_ms,
                 };
-                let (elapsed, attempt_elapsed) =
-                    crate::request_metrics::stream_end_elapsed(started, attempt_started);
+                let attempt_elapsed = attempt_started.elapsed();
                 let terminal_status = anthropic_stream_status(
                     usage.reached_end,
                     usage.guardrail_blocked,
@@ -1725,21 +1693,6 @@ async fn anthropic_passthrough_dispatch(
                 );
                 let snap_c = state_c.snapshot.load();
                 let pk_c = crate::usage_attr::ResolvedPk::resolve(&snap_c, &provider_key_id_c);
-                crate::request_metrics::record_e2e_latency(
-                    &state_c,
-                    "/v1/messages",
-                    metric_caller.as_caller(),
-                    crate::request_metrics::Upstream {
-                        provider: &provider_c,
-                        model: &metric_model,
-                        upstream_model: &metric_upstream_model,
-                        pk: pk_c.labels(),
-                        stream: true,
-                        ..Default::default()
-                    },
-                    terminal_status,
-                    elapsed,
-                );
                 // A stream can outlive several config generations, so the
                 // end-of-stream emit reads a FRESH snapshot rather than the
                 // one the request started on (#941).
@@ -1774,8 +1727,8 @@ async fn anthropic_passthrough_dispatch(
                     // error, a read timeout, an in-band `error` event — is
                     // recorded as that failure's status and error.
                     terminal_status,
-                    // Attempt-scoped, unlike the e2e histogram above: any
-                    // failed attempt before this one emitted its own event.
+                    // Attempt-scoped: any failed attempt before this one
+                    // emitted its own event.
                     attempt_elapsed,
                     metrics,
                     &client_ctx_c,
@@ -2511,7 +2464,6 @@ async fn cross_provider_dispatch(
         let metric_caller = caller.clone();
         let metric_model = metric_model.into_owned();
         let metric_upstream_model = metric_upstream_model.into_owned();
-        let started_for_telem = started;
         let attempt_started_for_telem = attempt_started;
         // #492: log the same client IP/UA on streamed responses.
         let client_for_telem = client.clone();
@@ -2610,10 +2562,7 @@ async fn cross_provider_dispatch(
                     upstream_ttft_ms: comp.upstream_ttft_ms,
                     downstream_latency_ms: comp.downstream_latency_ms,
                 };
-                let (elapsed, attempt_elapsed) = crate::request_metrics::stream_end_elapsed(
-                    started_for_telem,
-                    attempt_started_for_telem,
-                );
+                let attempt_elapsed = attempt_started_for_telem.elapsed();
                 let terminal_status = anthropic_stream_status(
                     comp.reached_end,
                     comp.guardrail_blocked,
@@ -2622,21 +2571,6 @@ async fn cross_provider_dispatch(
                 let snap_telem = state_for_telem.snapshot.load();
                 let pk_telem =
                     crate::usage_attr::ResolvedPk::resolve(&snap_telem, &provider_key_id_for_telem);
-                crate::request_metrics::record_e2e_latency(
-                    &state_for_telem,
-                    "/v1/messages",
-                    metric_caller.as_caller(),
-                    crate::request_metrics::Upstream {
-                        provider: &provider_for_telem,
-                        model: &metric_model,
-                        upstream_model: &metric_upstream_model,
-                        pk: pk_telem.labels(),
-                        stream: true,
-                        ..Default::default()
-                    },
-                    terminal_status,
-                    elapsed,
-                );
                 // Fresh snapshot at stream end — see the passthrough path.
                 emit_anthropic_usage_event(
                     &state_for_telem,
@@ -3753,7 +3687,6 @@ fn emit_anthropic_usage_event(
             cached: metrics.cached_prompt_tokens,
             cache_read: metrics.cache_read_tokens,
             cache_creation: metrics.cache_creation_tokens,
-            spend_usd: 0.0,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );

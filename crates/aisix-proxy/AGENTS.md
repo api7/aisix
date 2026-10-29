@@ -244,8 +244,8 @@ telemetry, so the two can't drift apart):
   Auth already ran here, so pass the key id.
 
 Authentication denials are the one early exit that writes its own line: the
-`AuthenticatedKey` extractor emits it on every `Err` it returns, so a handler
-must not emit again for an auth failure (`/v1/messages` re-renders the error,
+`AuthenticatedKey` extractor emits it, and records the request metrics, on
+every `Err` it returns, so a handler must not emit again for an auth failure (`/v1/messages` re-renders the error,
 it does not log it). A surface that authenticates without the extractor
 (`/v1/realtime`, passthrough routes) writes its line in its own error arm.
 
@@ -341,6 +341,27 @@ if you stop there:
 3. The `ROUTES` table in `request_metrics`' tests — the only thing that makes
    (1) and (2) fail loudly. It is a hand-maintained list of every route; a route
    missing from it is a route the tests cannot check.
+4. The route table in `tests/e2e/src/cases/metric-endpoint-parity-e2e.test.ts`
+   — see the next section.
+
+## Every client-facing route emits every per-request metric family
+
+A per-request family — the request families, `aisix_request_e2e_latency_seconds`,
+the TTFT pair, the token families, `aisix_deployment_*`,
+`aisix_ratelimit_remaining_*` — is emitted on every client-facing proxy route,
+unless the quantity it measures does not exist there (no stream, no time to
+first token; no model call, no deployment). A route that skips a family for
+any other reason is a bug, however it is labelled.
+
+Record through the shared emit, never per handler:
+`request_metrics::record` / `record_in_tier` / `PendingRequestMetrics` for the
+request families and the `downstream` end-to-end side; `usage_attr::emit_usage`
+for the `upstream` side; `request_metrics::record_usage` for tokens;
+`RoutingTelemetry::record` (or `record_deployment` outside a routing loop) for
+deployments; `quota::enforce` for the remaining-quota gauges.
+
+`metric-endpoint-parity-e2e.test.ts` holds one row per route with the families
+it must emit; a new route, or a family a route cannot have, is declared there.
 
 ## A per-model gate must say whether it binds the requested entry or each target
 

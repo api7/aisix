@@ -14,7 +14,6 @@ import {
 // counters, the token families had the same gap in three different shapes:
 //
 //   aisix_llm_{input,output,total}_tokens_total  chat + messages
-//   aisix_llm_spend_micro_usd_total              chat + messages
 //   aisix_llm_tokens_by_client_total             chat + messages + responses
 //   aisix_tokens_consumed_total (legacy)         chat ALONE
 //
@@ -181,13 +180,17 @@ describe("token metrics endpoint coverage e2e", () => {
     // Both families are keyed on the same Caller/Upstream pair, so a join on
     // endpoint+model+provider+api_key_id has to match — that is the whole
     // point of sharing the label structs.
-    const req = seriesFor(text, "aisix_llm_requests_total", "/v1/responses")[0];
+    // The successful request's series: the readiness probe's 401s before
+    // the key propagated are counted too, unattributed.
+    const req = seriesFor(text, "aisix_llm_requests_total", "/v1/responses").find((l) =>
+      l.includes('status="200"'),
+    );
     const tok = seriesFor(text, "aisix_llm_input_tokens_total", "/v1/responses")[0];
     expect(req).toBeDefined();
     expect(tok).toBeDefined();
     for (const label of ["provider", "model", "upstream_model", "api_key_id", "team_id", "user_id"]) {
       expect(labelOf(tok, label), `${label} differs between the families`).toBe(
-        labelOf(req, label),
+        labelOf(req!, label),
       );
     }
   }, 30_000);

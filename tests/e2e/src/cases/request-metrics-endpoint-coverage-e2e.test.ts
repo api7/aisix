@@ -123,7 +123,7 @@ describe("request metrics endpoint coverage e2e", () => {
       text,
       "aisix_llm_requests_total",
       "/v1/responses",
-    )[0];
+    ).find((l) => l.includes('status="200"'));
     expect(line).toContain('inbound_protocol="openai"');
     expect(line).toContain('provider="openai"');
     expect(line).toContain('upstream_model="gpt-4o-mini"');

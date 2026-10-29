@@ -184,7 +184,9 @@ describe("request latency labels survive buffering and configuration reloads", (
     for (const response of responses) {
       expect(response.status, await response.text()).toBe(200);
     }
-    await expect.poll(async () => sumMetric(await scrapeMetrics(app.metricsUrl), `${E2E}_count`, { side: "downstream" })).toBe(contexts.length);
+    // Only the streams: the readiness probes and the 401s after the key is
+    // deleted are timed too, unstreamed.
+    await expect.poll(async () => sumMetric(await scrapeMetrics(app.metricsUrl), `${E2E}_count`, { side: "downstream", streaming: "true" })).toBe(contexts.length);
     const samples = await scrapeMetrics(app.metricsUrl);
     for (const [index, context] of contexts.entries()) {
       // Each metric observes a request once per `side`, and both sides keep

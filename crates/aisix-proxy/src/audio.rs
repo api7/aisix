@@ -873,6 +873,9 @@ struct StreamedTranscript {
     terminal: Option<String>,
     /// False when the caller disconnected before the upstream ended.
     reached_end: bool,
+    /// When the first upstream frame arrived — relayed to the caller at the
+    /// same moment, the frames being forwarded verbatim.
+    first_frame: Option<std::time::Instant>,
     /// The upstream failure that ended the stream after its `200` went out:
     /// a transport error, a read timeout, or an in-band error envelope.
     failure: Option<crate::attempt::StreamFailure>,
@@ -1030,6 +1033,12 @@ where
         ));
         futures::pin_mut!(upstream);
         while let Some(item) = upstream.next().await {
+            if matches!(&item, Ok(bytes) if !bytes.is_empty()) {
+                guard
+                    .observed()
+                    .first_frame
+                    .get_or_insert_with(std::time::Instant::now);
+            }
             if let (Ok(bytes), Some(d)) = (&item, decoder.as_mut()) {
                 // Side-channel parse over a copy of the frames; `item` is
                 // yielded below untouched.
@@ -1730,6 +1739,30 @@ async fn multipart_dispatch(
                         w.latency_ms = crate::attempt::ms_since(attempt_started);
                         w
                     });
+                    let status = crate::attempt::stream_status(
+                        outcome.reached_end,
+                        outcome.failure.as_ref(),
+                    );
+                    if let Some(first_frame) = outcome.first_frame {
+                        let caller =
+                            crate::request_metrics::Caller::from_api_key_id(&snap, &api_key_id_c);
+                        crate::request_metrics::record_stream_ttft(
+                            &state_c,
+                            retry_endpoint_label,
+                            caller.as_caller(),
+                            crate::request_metrics::Upstream {
+                                provider: &provider_c,
+                                model: &model_name_c,
+                                upstream_model: &upstream_model_c,
+                                pk: pk.labels(),
+                                stream: true,
+                                ..Default::default()
+                            },
+                            status,
+                            first_frame.saturating_duration_since(attempt_started),
+                            first_frame.saturating_duration_since(dispatch_started),
+                        );
+                    }
                     emit_usage_event(
                         &state_c,
                         &snap,
@@ -1748,10 +1781,7 @@ async fn multipart_dispatch(
                         // failure's status, matching the other streaming
                         // surfaces — the upstream work still happened, so
                         // the event is emitted either way.
-                        crate::attempt::stream_status(
-                            outcome.reached_end,
-                            outcome.failure.as_ref(),
-                        ),
+                        status,
                         dispatch_started.elapsed(),
                         &usage,
                         duration_seconds,
@@ -2803,7 +2833,6 @@ fn emit_usage_event(
             cached: 0,
             cache_read: 0,
             cache_creation: 0,
-            spend_usd: 0.0,
             client_type: state.client_classifier.classify(&client.user_agent),
         },
     );
