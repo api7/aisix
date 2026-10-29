@@ -2325,7 +2325,8 @@ impl Config {
             .collect()
     }
 
-    /// A load error, extended with the keys the load ignored: a misspelled
+    /// A load error, extended with the keys the load had ignored by then
+    /// (a type error can stop it before later keys are read): a misspelled
     /// key is usually what left the required or valid setting missing that
     /// the error is about, and the ignored-key warnings are only logged for
     /// a configuration that loads.
