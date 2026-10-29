@@ -30,6 +30,12 @@ use std::time::Duration;
 use crate::error::BootstrapError;
 
 /// Root config struct. Construct via [`Config::load_from_path`].
+///
+/// No struct in this tree denies unknown fields: the loader ignores them and
+/// reports each through `serde_ignored`, which cannot see inside
+/// serde-buffered content. A field read through an untagged enum or
+/// `#[serde(flatten)]` must report its own unknown keys the way
+/// [`deserialize_seq_or_json_string`] does, or a typo there goes unreported.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 pub struct Config {
@@ -104,10 +110,11 @@ pub struct Config {
     /// config-rs via the `AISIX_` prefix.
     #[serde(default)]
     pub bedrock_endpoint_url: Option<String>,
-    /// Keys the loaded file or environment carried that name no setting,
-    /// as dotted paths. See [`Config::ignored_keys`].
+    /// Keys the loaded file or environment carried that name no setting:
+    /// the dotted path, and the `AISIX_*` variable that set it, if one did.
+    /// See [`Config::ignored_keys`].
     #[serde(skip)]
-    ignored_keys: Vec<String>,
+    ignored_keys: Vec<(String, Option<String>)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -867,52 +874,62 @@ pub struct UrlRewriteRule {
 /// express a list of structs. So every sequence field needs one of the two —
 /// this for `Vec<Struct>`, a `with_list_parse_key` registration for
 /// `Vec<String>` / `Vec<f64>` — or it is unreachable from the environment.
-/// `field` names the setting in the error, so a malformed JSON string says
-/// which one it came from.
 ///
-/// `key` is the field's dotted path. The untagged enum buffers its input,
-/// which hides the elements' unknown keys from the loader's
-/// `serde_ignored` pass, so they are collected here, element by element,
-/// into [`NESTED_IGNORED_KEYS`].
+/// `key` is the field's dotted path. A structured sequence is read element
+/// by element through the caller's deserializer, so the loader's
+/// `serde_ignored` pass sees the elements' unknown keys itself. A JSON
+/// string is parsed here, out of that pass's sight, so its unknown keys are
+/// collected into [`NESTED_IGNORED_KEYS`] under `key`; its last segment names
+/// the setting in a parse error.
 fn deserialize_seq_or_json_string<'de, D, T>(deserializer: D, key: &str) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::de::DeserializeOwned,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum SeqOrJsonString {
-        Seq(Vec<serde_json::Value>),
-        JsonString(String),
+    struct SeqOrJsonString<'k, T> {
+        key: &'k str,
+        element: std::marker::PhantomData<T>,
     }
-    let field = key.rsplit('.').next().unwrap_or(key);
-    let items = match SeqOrJsonString::deserialize(deserializer)? {
-        SeqOrJsonString::Seq(items) => items,
-        SeqOrJsonString::JsonString(raw) => {
+
+    impl<'de, T: serde::de::DeserializeOwned> serde::de::Visitor<'de> for SeqOrJsonString<'_, T> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a list, or a JSON array in a string")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
+            let mut items = Vec::new();
+            while let Some(item) = seq.next_element()? {
+                items.push(item);
+            }
+            Ok(items)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, raw: &str) -> Result<Vec<T>, E> {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
                 return Ok(Vec::new());
             }
-            serde_json::from_str(trimmed)
-                .map_err(|e| serde::de::Error::custom(format!("{field} JSON string: {e}")))?
-        }
-    };
-    items
-        .into_iter()
-        .enumerate()
-        .map(|(index, item)| {
-            serde_ignored::deserialize(item, |path| {
-                let path = format!("{key}[{index}].{}", dotted_path(&path));
+            let key = self.key;
+            let field = key.rsplit('.').next().unwrap_or(key);
+            serde_ignored::deserialize(&mut serde_json::Deserializer::from_str(trimmed), |path| {
+                let path = format!("{key}{}", dotted_path(&path));
                 NESTED_IGNORED_KEYS.with(|keys| keys.borrow_mut().push(path));
             })
-            .map_err(|e| serde::de::Error::custom(format!("{field}[{index}]: {e}")))
-        })
-        .collect()
+            .map_err(|e| E::custom(format!("{field} JSON string: {e}")))
+        }
+    }
+
+    deserializer.deserialize_any(SeqOrJsonString {
+        key,
+        element: std::marker::PhantomData,
+    })
 }
 
 thread_local! {
-    /// Unknown keys found inside elements of a [`deserialize_seq_or_json_string`]
-    /// field during the current load on this thread; drained by
+    /// Unknown keys found inside a [`deserialize_seq_or_json_string`] JSON
+    /// string during the current load on this thread; cleared and drained by
     /// [`Config::deserialize_sources`].
     static NESTED_IGNORED_KEYS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -2292,8 +2309,40 @@ impl Config {
     /// config that still carries a retired key keeps booting. Emitted by
     /// the binary at WARN for the same reason as
     /// [`Config::ignored_env_overrides`].
-    pub fn ignored_keys(&self) -> &[String] {
-        &self.ignored_keys
+    pub fn ignored_keys(&self) -> Vec<String> {
+        self.ignored_keys
+            .iter()
+            .map(|(key, var)| {
+                let source = var
+                    .as_deref()
+                    .map(|var| format!(" (set by {var})"))
+                    .unwrap_or_default();
+                format!(
+                    "{key}{source} is not a setting this gateway knows and was ignored. \
+                     Check its spelling, or delete it if it was retired."
+                )
+            })
+            .collect()
+    }
+
+    /// A load error, extended with the keys the load ignored: a misspelled
+    /// key is usually what left the required or valid setting missing that
+    /// the error is about, and the ignored-key warnings are only logged for
+    /// a configuration that loads.
+    fn with_ignored_keys(
+        err: BootstrapError,
+        ignored: &[(String, Option<String>)],
+    ) -> BootstrapError {
+        match err {
+            BootstrapError::Config(msg) if !ignored.is_empty() => {
+                let keys: Vec<&str> = ignored.iter().map(|(key, _)| key.as_str()).collect();
+                BootstrapError::Config(format!(
+                    "{msg} (also ignored, as no setting this gateway knows: {})",
+                    keys.join(", ")
+                ))
+            }
+            other => other,
+        }
     }
 
     /// Load + merge + validate.
@@ -2312,16 +2361,19 @@ impl Config {
     ///   admin key, bind addresses parse).
     pub fn load_from_path(path: Option<&Path>) -> Result<Self, BootstrapError> {
         let mut cfg = Self::deserialize_sources(path)?;
-
-        if let Some(raw_base) = cfg.managed.cp_base_url.as_deref() {
-            cfg.managed.cp_base_url = Some(normalise_cp_base_url(raw_base)?);
-        }
-        if let Some(raw_endpoint) = cfg.managed.cp_etcd_endpoint.as_deref() {
-            cfg.managed.cp_etcd_endpoint = Some(normalise_cp_etcd_endpoint(raw_endpoint)?);
-        }
-
-        cfg.validate()?;
+        cfg.normalise_and_validate()
+            .map_err(|err| Self::with_ignored_keys(err, &cfg.ignored_keys))?;
         Ok(cfg)
+    }
+
+    fn normalise_and_validate(&mut self) -> Result<(), BootstrapError> {
+        if let Some(raw_base) = self.managed.cp_base_url.as_deref() {
+            self.managed.cp_base_url = Some(normalise_cp_base_url(raw_base)?);
+        }
+        if let Some(raw_endpoint) = self.managed.cp_etcd_endpoint.as_deref() {
+            self.managed.cp_etcd_endpoint = Some(normalise_cp_etcd_endpoint(raw_endpoint)?);
+        }
+        self.validate()
     }
 
     /// File + env merge and deserialization, without normalisation or
@@ -2377,7 +2429,16 @@ impl Config {
                 ignored.push(dotted_path(&path))
             }));
         ignored.extend(NESTED_IGNORED_KEYS.with(|keys| std::mem::take(&mut *keys.borrow_mut())));
-        let mut cfg = result.map_err(|e| {
+        let ignored: Vec<(String, Option<String>)> = ignored
+            .into_iter()
+            .map(|key| {
+                let var = env_var_setting(&env_names, &key)
+                    .or_else(|| env_var_within(&env_names, &key))
+                    .map(str::to_owned);
+                (key, var)
+            })
+            .collect();
+        let cfg = result.map_err(|e| {
             let key = e.path().to_string();
             BootstrapError::Config(match key.as_str() {
                 "." => format!("deserialize: {}", e.inner()),
@@ -2386,22 +2447,9 @@ impl Config {
                     None => format!("deserialize: {key}: {}", e.inner()),
                 },
             })
-        })?;
-        cfg.ignored_keys = ignored
-            .into_iter()
-            .map(|key| {
-                let source = match env_var_setting(&env_names, &key)
-                    .or_else(|| env_var_within(&env_names, &key))
-                {
-                    Some(var) => format!(" (set by {var})"),
-                    None => String::new(),
-                };
-                format!(
-                    "{key}{source} is not a setting this gateway knows and was ignored. \
-                     Check its spelling, or delete it if it was retired."
-                )
-            })
-            .collect();
+        });
+        let mut cfg = cfg.map_err(|err| Self::with_ignored_keys(err, &ignored))?;
+        cfg.ignored_keys = ignored;
         Ok(cfg)
     }
 
@@ -3799,8 +3847,8 @@ not_a_section:
         assert_eq!(cfg.proxy.url_rewrites.len(), 1);
         assert_eq!(cfg.observability.metrics.client_type_rules.len(), 1);
 
-        let mut keys: Vec<&str> = cfg
-            .ignored_keys()
+        let warnings = cfg.ignored_keys();
+        let mut keys: Vec<&str> = warnings
             .iter()
             .map(|w| w.split_once(' ').unwrap().0)
             .collect();
@@ -3821,6 +3869,37 @@ not_a_section:
         assert!(
             cfg.ignored_keys()[0].ends_with("Check its spelling, or delete it if it was retired.")
         );
+    }
+
+    /// A misspelled key usually IS the cause of the load error that follows
+    /// (the required setting it was meant to be is missing), and ignored-key
+    /// warnings are only logged for a config that loads — so the error names
+    /// it.
+    #[test]
+    fn a_load_error_names_the_keys_it_ignored() {
+        for (body, ignored) in [
+            (
+                "proxy:\n  adress: \"0.0.0.0:3000\"\nadmin:\n  admin_keys: [\"k1\"]",
+                "proxy.adress",
+            ),
+            (
+                "proxy:\n  addr: \"0.0.0.0:3000\"\nadmin:\n  admin_key: [\"k1\"]",
+                "admin.admin_key",
+            ),
+        ] {
+            let f = write_yaml(&format!(
+                "etcd:\n  endpoints: [\"http://127.0.0.1:2379\"]\n{body}\n"
+            ));
+            let err = Config::load_from_path(Some(f.path()))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!(
+                    "also ignored, as no setting this gateway knows: {ignored})"
+                )),
+                "{err}"
+            );
+        }
     }
 
     /// A labels entry for a family the gateway no longer emits loads and is
