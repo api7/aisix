@@ -123,7 +123,11 @@ async function rawChat(
     const chunks: Buffer[] = [];
     let stream: Socket = tcp;
     const finish = () => resolve(Buffer.concat(chunks));
+    const connectFailed = (e: Error) => reject(e);
+    tcp.once("error", connectFailed);
     tcp.once("connect", () => {
+      tcp.off("error", connectFailed);
+      tcp.on("error", finish);
       if (preamble.length > 0) tcp.write(preamble);
       if (opts.tls) {
         stream = tlsConnect({ socket: tcp, rejectUnauthorized: false });
@@ -137,7 +141,6 @@ async function rawChat(
       // A refused connection is a reset or a TLS failure, not a test error.
       stream.once("error", finish);
     });
-    tcp.once("error", (e) => (chunks.length ? finish() : reject(e)));
     setTimeout(() => reject(new Error("raw request timed out")), 15_000).unref();
   });
 
