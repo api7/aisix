@@ -1341,17 +1341,17 @@ async fn authenticate(
 /// `Authorization: Bearer`, else `x-api-key`. An empty `Authorization` is an
 /// offered credential and never falls through to `x-api-key`.
 fn legacy_gateway_credential(headers: &HeaderMap) -> Result<String, ProxyError> {
-    use crate::auth::{AUTHORIZATION_HEADER, X_API_KEY_HEADER};
+    use crate::auth::{AUTHORIZATION_LABEL, X_API_KEY_HEADER};
     let authorization = headers.get(header::AUTHORIZATION);
     if let Some(token) = bearer_of(authorization) {
         return Ok(token);
     }
     if authorization.is_some_and(|v| v.as_bytes().trim_ascii().is_empty()) {
-        return Err(ProxyError::MissingAuth(AUTHORIZATION_HEADER));
+        return Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL));
     }
     match headers.get(X_API_KEY_HEADER) {
         Some(raw) => raw_of(Some(raw)).ok_or(ProxyError::MissingAuth(X_API_KEY_HEADER)),
-        None => Err(ProxyError::MissingAuth(AUTHORIZATION_HEADER)),
+        None => Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)),
     }
 }
 

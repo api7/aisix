@@ -476,9 +476,10 @@ fn deny_key(
 pub(crate) const GATEWAY_KEY_HEADER: &str =
     aisix_core::forwarded_headers::GATEWAY_CREDENTIAL_HEADER;
 
-/// How a `MissingAuth` names `Authorization` — also the header it names
-/// when the request carries no credential header at all.
-pub(crate) const AUTHORIZATION_HEADER: &str = "Authorization";
+/// How a `MissingAuth` message spells `Authorization` (display text, not
+/// the lowercase wire name) — also what it names when the request carries
+/// no credential header at all.
+pub(crate) const AUTHORIZATION_LABEL: &str = "Authorization";
 pub(crate) const X_API_KEY_HEADER: &str = "x-api-key";
 
 /// Whether the request OFFERS an inbound gateway credential at all.
@@ -520,11 +521,11 @@ pub(crate) fn header_credential(
     }
     if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
         let Ok(s) = auth.to_str() else {
-            return Some(Err(ProxyError::MissingAuth(AUTHORIZATION_HEADER)));
+            return Some(Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)));
         };
         return Some(match s.strip_prefix("Bearer ").map(str::trim) {
             Some(rest) if !rest.is_empty() => Ok(rest.to_string()),
-            _ => Err(ProxyError::MissingAuth(AUTHORIZATION_HEADER)),
+            _ => Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)),
         });
     }
     headers
@@ -564,7 +565,7 @@ fn raw_credential(
 }
 
 fn extract_bearer(parts: &Parts) -> Result<String, ProxyError> {
-    header_credential(&parts.headers).unwrap_or(Err(ProxyError::MissingAuth(AUTHORIZATION_HEADER)))
+    header_credential(&parts.headers).unwrap_or(Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)))
 }
 
 #[cfg(test)]

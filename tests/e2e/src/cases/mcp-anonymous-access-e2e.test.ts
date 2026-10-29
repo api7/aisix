@@ -278,14 +278,14 @@ describe("mcp anonymous access e2e", () => {
     // A caller that sent a credential header, even an empty one, tried to
     // authenticate: serving it as the anonymous principal would hand it a
     // grant it did not ask for.
+    // (fetch trims header values, and HTTP drops a field's surrounding
+    // whitespace anyway, so a whitespace-only value arrives as this one.)
     for (const name of ["x-aisix-api-key", "authorization", "x-api-key"]) {
-      for (const value of ["", "   "]) {
-        for (const path of ["/mcp/docs", "/mcp"]) {
-          expect(
-            await initialize(path, { [name]: value }),
-            `${path} with ${name}: ${JSON.stringify(value)}`,
-          ).toBe(401);
-        }
+      for (const path of ["/mcp/docs", "/mcp"]) {
+        expect(
+          await initialize(path, { [name]: "" }),
+          `${path} with an empty ${name}`,
+        ).toBe(401);
       }
     }
   });
