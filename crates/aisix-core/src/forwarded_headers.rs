@@ -78,6 +78,17 @@ pub const GATEWAY_HEADER_PREFIX: &str = "x-aisix-";
 /// slot is refused for capture or as a request-id source.
 pub const GATEWAY_CREDENTIAL_HEADER: &str = "x-aisix-api-key";
 
+/// The credential behind a `Bearer` authentication scheme, matching the
+/// scheme name case-insensitively (RFC 7235 §2.1) and the credential as
+/// written. `None` when `value` does not start with `Bearer `.
+pub fn strip_bearer_scheme(value: &str) -> Option<&str> {
+    const SCHEME: &str = "bearer ";
+    value
+        .get(..SCHEME.len())
+        .filter(|scheme| scheme.eq_ignore_ascii_case(SCHEME))
+        .map(|_| &value[SCHEME.len()..])
+}
+
 /// Client headers never forwarded by a surface that REBUILDS the outbound
 /// message, on top of [`NON_FORWARDABLE_HEADERS`].
 ///
@@ -287,6 +298,23 @@ pub fn resolve_forwarded_client_headers(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive_and_the_token_is_not() {
+        for v in [
+            "Bearer sk-AbC",
+            "bearer sk-AbC",
+            "BEARER sk-AbC",
+            "bEaReR sk-AbC",
+        ] {
+            assert_eq!(strip_bearer_scheme(v), Some("sk-AbC"), "{v}");
+        }
+        for v in ["Basic sk-AbC", "Bearer", "Bearersk-AbC", "", "Bé"] {
+            assert_eq!(strip_bearer_scheme(v), None, "{v}");
+        }
+        assert_eq!(strip_bearer_scheme("Bearer "), Some(""));
+    }
+
     use super::*;
 
     fn map(pairs: &[(&str, &str)]) -> HeaderMap {

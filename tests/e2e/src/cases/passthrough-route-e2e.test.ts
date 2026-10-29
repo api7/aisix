@@ -216,6 +216,103 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     });
   });
 
+  test("gateway_key credential reads like /v1: case-insensitive Bearer, no fall-through", async (ctx) => {
+    if (!etcdReachable || !app || !seed) {
+      ctx.skip();
+      return;
+    }
+
+    const upstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "chatcmpl-ptr-cred",
+        object: "chat.completion",
+        created: 0,
+        model: "gpt-4o-mini",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "ok" },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
+    });
+    upstreams.push(upstream);
+    const pk = await seed.createProviderKey({
+      display_name: "ptr-cred-pk",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "ptr-cred-model",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+    });
+    await seed.createPassthroughRoute({
+      name: "ptr-cred-tunnel",
+      path_prefix: "/passthrough/ptr-cred",
+      target_url: `${upstream.baseUrl}/v1`,
+      provider_key_id: pk.id,
+    });
+
+    const chat = (path: string, headers: Record<string, string>) =>
+      fetch(`${app!.proxyUrl}${path}`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "ptr-cred-model",
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+    const ROUTE = "/passthrough/ptr-cred/chat/completions";
+    const V1 = "/v1/chat/completions";
+
+    await waitConfigPropagation(async () => {
+      const [r, v] = await Promise.all([
+        chat(ROUTE, { authorization: `Bearer ${CALLER_PLAINTEXT}` }),
+        chat(V1, { authorization: `Bearer ${CALLER_PLAINTEXT}` }),
+      ]);
+      await Promise.all([r.text(), v.text()]);
+      return r.status === 200 && v.status === 200;
+    });
+
+    // RFC 7235: the auth scheme name is case-insensitive; the key is not.
+    for (const path of [ROUTE, V1]) {
+      for (const scheme of ["bearer", "BEARER"]) {
+        const res = await chat(path, { authorization: `${scheme} ${CALLER_PLAINTEXT}` });
+        expect(res.status, `${path} with ${scheme}`).toBe(200);
+        await res.text();
+      }
+      const upper = await chat(path, {
+        authorization: `Bearer ${CALLER_PLAINTEXT.toUpperCase()}`,
+      });
+      expect(upper.status, `${path} with an upper-cased key`).toBe(401);
+      await upper.text();
+    }
+
+    // A present but unusable Authorization is a 401 naming it, never a
+    // fall-through to a valid x-api-key — on the route as on /v1.
+    for (const path of [ROUTE, V1]) {
+      for (const authorization of ["Basic dXNlcjpwdw==", "Bearer"]) {
+        const res = await chat(path, { authorization, "x-api-key": CALLER_PLAINTEXT });
+        expect(res.status, `${path} with ${authorization}`).toBe(401);
+        const body = (await res.json()) as { error?: { message?: string } };
+        expect(body.error?.message).toBe("missing or malformed Authorization header");
+      }
+    }
+
+    // The migration path: the gateway key in x-aisix-api-key leaves
+    // Authorization to whatever the caller needs it for.
+    const migrated = await chat(ROUTE, {
+      "x-aisix-api-key": CALLER_PLAINTEXT,
+      authorization: "Basic dXNlcjpwdw==",
+    });
+    expect(migrated.status).toBe(200);
+    await migrated.text();
+  });
+
   test("anthropic inject shape: x-api-key + anthropic-version, no Bearer", async (ctx) => {
     if (!etcdReachable || !app || !seed) {
       ctx.skip();

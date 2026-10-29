@@ -1290,12 +1290,11 @@ async fn authenticate(
     };
     match route.auth_mode {
         PassthroughAuthMode::GatewayKey => {
-            // The dedicated gateway-key header, when present, is the only
-            // one read (and an empty one is not a fall-through).
-            let token = match headers.get(crate::auth::GATEWAY_KEY_HEADER) {
-                Some(raw) => crate::auth::gateway_key_header_credential(raw)?,
-                None => legacy_gateway_credential(headers)?,
-            };
+            // Read exactly as `/v1/*` reads it: the first credential header
+            // present decides, never a fall-through to the next.
+            let token = crate::auth::header_credential(headers).unwrap_or(Err(
+                ProxyError::MissingAuth(crate::auth::AUTHORIZATION_LABEL),
+            ))?;
             crate::auth::authenticate_token(state, &token, ctx).await
         }
         PassthroughAuthMode::HeaderKey => {
@@ -1303,7 +1302,12 @@ async fn authenticate(
             let token = headers
                 .get(name)
                 .and_then(|v| v.to_str().ok())
-                .map(|v| v.strip_prefix("Bearer ").unwrap_or(v).trim().to_string())
+                .map(|v| {
+                    aisix_core::forwarded_headers::strip_bearer_scheme(v)
+                        .unwrap_or(v)
+                        .trim()
+                        .to_string()
+                })
                 .filter(|v| !v.is_empty())
                 .ok_or_else(|| ProxyError::MissingRouteAuthHeader(name.to_string()))?;
             crate::auth::authenticate_token(state, &token, ctx).await
@@ -1336,37 +1340,6 @@ async fn authenticate(
             Ok(authed)
         }
     }
-}
-
-/// `Authorization: Bearer`, else `x-api-key`. An empty `Authorization` is an
-/// offered credential and never falls through to `x-api-key`.
-fn legacy_gateway_credential(headers: &HeaderMap) -> Result<String, ProxyError> {
-    use crate::auth::{AUTHORIZATION_LABEL, X_API_KEY_HEADER};
-    let authorization = headers.get(header::AUTHORIZATION);
-    if let Some(token) = bearer_of(authorization) {
-        return Ok(token);
-    }
-    if authorization.is_some_and(|v| v.as_bytes().trim_ascii().is_empty()) {
-        return Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL));
-    }
-    match headers.get(X_API_KEY_HEADER) {
-        Some(raw) => raw_of(Some(raw)).ok_or(ProxyError::MissingAuth(X_API_KEY_HEADER)),
-        None => Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)),
-    }
-}
-
-fn bearer_of(v: Option<&HeaderValue>) -> Option<String> {
-    let s = v?.to_str().ok()?;
-    let token = s
-        .strip_prefix("Bearer ")
-        .or_else(|| s.strip_prefix("bearer "))?;
-    let token = token.trim();
-    (!token.is_empty()).then(|| token.to_string())
-}
-
-fn raw_of(v: Option<&HeaderValue>) -> Option<String> {
-    let s = v?.to_str().ok()?.trim();
-    (!s.is_empty()).then(|| s.to_string())
 }
 
 /// Route-level source allowlist: unset means unrestricted (the schema
@@ -10775,10 +10748,11 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         assert_eq!(usage(br#"{"code":"InvalidParameter","message":"x"}"#), None);
     }
 
-    /// An empty credential header is offered-and-invalid: it never falls
-    /// through to the next header, and the 401 names the header that failed.
+    /// A `gateway_key` route reads the credential exactly as `/v1/*` does:
+    /// the first credential header present decides, an empty or unusable
+    /// one is a 401 naming it, and the Bearer scheme is case-insensitive.
     #[tokio::test]
-    async fn gateway_key_route_rejects_an_empty_credential_header() {
+    async fn gateway_key_route_reads_the_credential_like_v1() {
         let upstream = MockServer::builder().start().await;
         Mock::given(wm_method("GET"))
             .and(wm_path("/v1/models"))
@@ -10818,6 +10792,34 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         };
 
         assert_eq!(send(&[("x-api-key", "sk-caller")]).await.0, StatusCode::OK);
+        // Only the scheme is case-insensitive.
+        for pairs in [
+            &[("authorization", "bearer sk-caller")],
+            &[("authorization", "BEARER sk-caller")],
+        ] {
+            assert_eq!(send(pairs).await.0, StatusCode::OK, "{pairs:?}");
+        }
+        assert_eq!(
+            send(&[("authorization", "Bearer SK-CALLER")]).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        // A present but unusable Authorization never falls through either.
+        for pairs in [
+            &[
+                ("authorization", "Basic dXNlcjpwdw=="),
+                ("x-api-key", "sk-caller"),
+            ],
+            &[("authorization", "Bearer "), ("x-api-key", "sk-caller")],
+        ] {
+            assert_eq!(
+                send(pairs).await,
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "missing or malformed Authorization header".to_string()
+                ),
+                "{pairs:?}"
+            );
+        }
         assert_eq!(
             send(&[("authorization", ""), ("x-api-key", "sk-caller")]).await,
             (

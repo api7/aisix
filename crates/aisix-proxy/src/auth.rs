@@ -523,10 +523,12 @@ pub(crate) fn header_credential(
         let Ok(s) = auth.to_str() else {
             return Some(Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)));
         };
-        return Some(match s.strip_prefix("Bearer ").map(str::trim) {
-            Some(rest) if !rest.is_empty() => Ok(rest.to_string()),
-            _ => Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)),
-        });
+        return Some(
+            match aisix_core::forwarded_headers::strip_bearer_scheme(s).map(str::trim) {
+                Some(rest) if !rest.is_empty() => Ok(rest.to_string()),
+                _ => Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)),
+            },
+        );
     }
     headers
         .get(X_API_KEY_HEADER)
@@ -539,11 +541,7 @@ pub(crate) fn gateway_key_header_credential(
     raw: &axum::http::HeaderValue,
 ) -> Result<String, ProxyError> {
     let value = raw_credential(raw, GATEWAY_KEY_HEADER)?;
-    match value
-        .strip_prefix("Bearer ")
-        .or_else(|| value.strip_prefix("bearer "))
-        .map(str::trim)
-    {
+    match aisix_core::forwarded_headers::strip_bearer_scheme(&value).map(str::trim) {
         Some("") => Err(ProxyError::MissingAuth(GATEWAY_KEY_HEADER)),
         Some(key) => Ok(key.to_string()),
         None => Ok(value),
@@ -898,6 +896,18 @@ mod tests {
                     "{name}: {value:?} must count as an offered credential"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_bearer_scheme_is_case_insensitive() {
+        for value in ["bearer sk-abc", "BEARER sk-abc", "bEaReR sk-abc"] {
+            assert_eq!(
+                extract_bearer(&parts_with(headers(&[("authorization", value)]))).unwrap(),
+                "sk-abc"
+            );
+            let key = headers(&[("x-aisix-api-key", value)]);
+            assert_eq!(extract_bearer(&parts_with(key)).unwrap(), "sk-abc");
         }
     }
 

@@ -51,7 +51,7 @@ pub(crate) fn is_admin_authorized(headers: &axum::http::HeaderMap, admin_keys: &
 fn extract_bearer(headers: &axum::http::HeaderMap) -> Result<String, AdminError> {
     if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
         let s = auth.to_str().map_err(|_| AdminError::Unauthorized)?;
-        if let Some(rest) = s.strip_prefix("Bearer ") {
+        if let Some(rest) = aisix_core::forwarded_headers::strip_bearer_scheme(s) {
             let rest = rest.trim();
             if rest.is_empty() {
                 return Err(AdminError::Unauthorized);
@@ -93,6 +93,21 @@ mod tests {
             extract_bearer(&parts_with(h).headers).unwrap(),
             "admin-secret"
         );
+    }
+
+    #[test]
+    fn extract_bearer_matches_the_scheme_case_insensitively() {
+        for value in ["bearer admin-secret", "BEARER admin-secret"] {
+            let mut h = HeaderMap::new();
+            h.insert(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_static(value),
+            );
+            assert_eq!(
+                extract_bearer(&parts_with(h).headers).unwrap(),
+                "admin-secret"
+            );
+        }
     }
 
     #[test]
