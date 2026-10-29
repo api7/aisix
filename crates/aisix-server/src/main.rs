@@ -1402,6 +1402,9 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         &cfg.observability.heap_profiling.auto_dump,
         (*metrics).clone(),
     );
+    // The same parsed list `proxy.real_ip` judges forwarded headers by, so
+    // the two trust decisions cannot drift apart.
+    let proxy_protocol_trust: ProxyProtocolTrust = proxy_state.real_ip.trusted.clone().into();
     let proxy_router = aisix_proxy::build_router(proxy_state);
 
     let background_check_task = tokio::spawn(async move {
@@ -1652,13 +1655,6 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
     let proxy_drain = livez_state.clone();
-    // Validated at config load, so a parse failure cannot reach here.
-    let proxy_protocol_trust: ProxyProtocolTrust = cfg
-        .proxy
-        .real_ip
-        .parse_trusted()
-        .map_err(|bad| anyhow::anyhow!("proxy.real_ip.trusted_proxies invalid CIDR/IP: {bad}"))?
-        .into();
     let gate_status = config_status.clone();
     let mut gate_cancel = cancel_rx.clone();
     let mut gate_retire = retire_rx.clone();
@@ -2489,6 +2485,11 @@ impl<I: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Rewind<I> {
             let n = (me.prefix.len() - me.replayed).min(buf.remaining());
             buf.put_slice(&me.prefix[me.replayed..me.replayed + n]);
             me.replayed += n;
+            if me.replayed == me.prefix.len() {
+                // Held for the connection's lifetime otherwise.
+                me.prefix = Vec::new();
+                me.replayed = 0;
+            }
             return std::task::Poll::Ready(Ok(()));
         }
         std::pin::Pin::new(&mut me.inner).poll_read(cx, buf)
@@ -3051,6 +3052,9 @@ async fn accept_loop(
             // wait on the peer, so they belong to the connection's own
             // task: a client that stalls in any must not hold up the
             // accept loop.
+            // One first-bytes window covers the PROXY header and the
+            // version sniff together, not one each.
+            let first_bytes_deadline = idle_timeout.map(|d| tokio::time::Instant::now() + d);
             let (peer, stream) = match proxy_protocol {
                 None => (peer, Rewind::new(Vec::new(), stream)),
                 Some(trusted) => {
@@ -3084,7 +3088,13 @@ async fn accept_loop(
                     }
                     Err(e) => tracing::debug!(label, error = %e, "TLS handshake failed"),
                 },
-                None => match sniff_downstream_version(stream, idle_timeout).await {
+                None => match sniff_downstream_version(
+                    stream,
+                    first_bytes_deadline
+                        .map(|at| at.saturating_duration_since(tokio::time::Instant::now())),
+                )
+                .await
+                {
                     Ok((version, stream)) => {
                         serve_connection(stream, version, service, &http1, &http2, shutdown, label)
                             .await;

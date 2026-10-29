@@ -101,7 +101,10 @@ pub(crate) async fn read<S: AsyncRead + Unpin>(
         buf.extend_from_slice(&chunk[..n]);
     };
 
-    if !trusted.iter().any(|net| net.contains(&socket_peer.ip())) {
+    // A dual-stack listener reports an IPv4 balancer as `::ffff:a.b.c.d`,
+    // which an IPv4 CIDR never contains.
+    let socket_ip = socket_peer.ip().to_canonical();
+    if !trusted.iter().any(|net| net.contains(&socket_ip)) {
         return Err(Refused::Untrusted);
     }
 
@@ -421,6 +424,12 @@ mod tests {
             .expect("trusted");
         assert_eq!(Some(peer), src("203.0.113.7:51234"));
         assert_eq!(rest, b"GET / HTTP/1.1\r\n");
+
+        let mapped: SocketAddr = "[::ffff:10.1.2.3]:5000".parse().unwrap();
+        let (peer, _) = read(&mut wire.as_slice(), mapped, &trusted, None)
+            .await
+            .expect("a dual-stack listener's view of a trusted IPv4 peer");
+        assert_eq!(Some(peer), src("203.0.113.7:51234"));
 
         let stranger: SocketAddr = "192.0.2.1:5000".parse().unwrap();
         assert!(matches!(
