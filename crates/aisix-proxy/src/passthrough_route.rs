@@ -4229,8 +4229,7 @@ fn frame_in_band_error(
 }
 
 /// The upstream failure a buffered 2xx body reports in place of an
-/// answer. A Responses body is the response object, whose own `error`
-/// carries it.
+/// answer.
 fn body_in_band_error(
     protocol: PassthroughProtocol,
     body: &[u8],
@@ -4241,7 +4240,7 @@ fn body_in_band_error(
     let value = aisix_gateway::in_band_error_body(body)?;
     match protocol {
         PassthroughProtocol::OpenaiResponses => {
-            aisix_gateway::capture_in_band_error_value(&value, aisix_gateway::UpstreamWire::OpenAI)
+            crate::responses::responses_body_in_band_error(&value)
         }
         _ => chat_in_band_error(&value),
     }

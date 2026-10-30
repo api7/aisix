@@ -116,9 +116,13 @@ const MODELS: Record<string, Seeded> = {
         model: "gpt-4o",
         output: [],
         error: { code: "server_error", message: PROVIDER_MESSAGE },
-        usage: null,
+        usage: { input_tokens: 7, output_tokens: 2, total_tokens: 9 },
       },
     },
+    kind: "responses-native",
+  },
+  "ib-responses-native-bare-ns": {
+    upstream: { nonStreamBody: { error: PROVIDER_ERROR } },
     kind: "responses-native",
   },
   "ib-responses-native-ok-ns": {
@@ -392,12 +396,25 @@ describe("an upstream 200 that reports a failure in its body", () => {
     expect(res.text).toContain("Overloaded right now");
   });
 
-  test("responses (native): a failed response object is a 502 carrying its message", async (ctx) => {
+  test("responses (native): a bare error body is a 502 carrying the provider's message", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
-    const res = await post("/v1/responses", { model: "ib-responses-native-failed-ns", input: "hi" });
+    const res = await post("/v1/responses", { model: "ib-responses-native-bare-ns", input: "hi" });
     expect(res.status).toBe(502);
     expect(res.text).toContain(PROVIDER_MESSAGE);
     expectInBandFailure(await usageRow(res.requestId), "502", PROVIDER_MESSAGE);
+  });
+
+  test("responses (native): a failed response object is relayed as the answer, with its usage", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const res = await post("/v1/responses", { model: "ib-responses-native-failed-ns", input: "hi" });
+    expect(res.status).toBe(200);
+    const body = JSON.parse(res.text);
+    expect(body.status).toBe("failed");
+    expect(body.error.message).toBe(PROVIDER_MESSAGE);
+    const row = await usageRow(res.requestId);
+    expectClean(row);
+    expect(row.get("prompt_tokens")).toBe("7");
+    expect(row.get("completion_tokens")).toBe("2");
   });
 
   test("responses (native): a completed response with a null error is a success", async (ctx) => {
