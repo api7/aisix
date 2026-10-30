@@ -4247,17 +4247,10 @@ fn body_in_band_error(
 }
 
 /// The chat envelope carries Anthropic Messages traffic too, whose in-band
-/// failure is a `type: "error"` event.
+/// failure is a `type: "error"` event read with the Anthropic taxonomy.
 fn chat_in_band_error(value: &serde_json::Value) -> Option<aisix_gateway::BridgeError> {
     if value.get("type").and_then(|t| t.as_str()) == Some("error") {
-        if let Some(body) = value.get("error").and_then(|e| {
-            serde_json::from_value::<aisix_provider_anthropic::wire::AnthropicStreamErrorBody>(
-                e.clone(),
-            )
-            .ok()
-        }) {
-            return Some(aisix_provider_anthropic::wire::stream_error_into_bridge_error(&body));
-        }
+        return aisix_provider_anthropic::wire::body_in_band_error(value);
     }
     aisix_gateway::capture_in_band_error_value(value, aisix_gateway::UpstreamWire::OpenAI)
 }

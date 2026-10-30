@@ -172,6 +172,7 @@ const ROUTE_GUARDED_PREFIX = "/passthrough/ib-guarded";
 const ROUTE_GUARDED_MIXED = "ib-route-guarded-mixed";
 const ROUTE_GUARDED_MIXED_PREFIX = "/passthrough/ib-guarded-mixed";
 const BLOCKED_PHRASE = "a phrase the upstream never says";
+const GUARDED_ERROR_MESSAGE = `${PROVIDER_MESSAGE}: ${BLOCKED_PHRASE}`;
 const ROUTE_EMPTY = "ib-route-empty";
 const ROUTE_EMPTY_PREFIX = "/passthrough/ib-empty";
 
@@ -249,7 +250,12 @@ describe("an upstream 200 that reports a failure in its body", () => {
     );
     for (const [name, prefix, opts] of [
       [ROUTE_NS, ROUTE_NS_PREFIX, { nonStreamBody: { error: PROVIDER_ERROR } }],
-      [ROUTE_GUARDED, ROUTE_GUARDED_PREFIX, { nonStreamBody: { error: PROVIDER_ERROR } }],
+      // The error itself names the blocked phrase: scanning it would block.
+      [
+        ROUTE_GUARDED,
+        ROUTE_GUARDED_PREFIX,
+        { nonStreamBody: { error: { ...PROVIDER_ERROR, message: GUARDED_ERROR_MESSAGE } } },
+      ],
       [
         ROUTE_GUARDED_MIXED,
         ROUTE_GUARDED_MIXED_PREFIX,
@@ -457,7 +463,7 @@ describe("an upstream 200 that reports a failure in its body", () => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
     const res = await post(`${ROUTE_GUARDED_PREFIX}/v1/chat/completions`, chat("qwen/qwen-2.5-7b-instruct", false));
     expect(res.status).toBe(200);
-    expect(JSON.parse(res.text)).toEqual({ error: PROVIDER_ERROR });
+    expect(JSON.parse(res.text)).toEqual({ error: { ...PROVIDER_ERROR, message: GUARDED_ERROR_MESSAGE } });
     const row = await usageRow(res.requestId);
     expectInBandFailure(row, "502", PROVIDER_MESSAGE);
     expect(row.get("guardrail_blocked") ?? "false").toBe("false");
