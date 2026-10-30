@@ -2164,6 +2164,15 @@ async fn responses_to_target(
         let json_body: Value =
             crate::dispatch::json_body_within(upstream_resp, buffered_body_deadline)
                 .await
+                .and_then(|body| {
+                    match aisix_gateway::capture_in_band_error_value(
+                        &body,
+                        aisix_gateway::UpstreamWire::OpenAI,
+                    ) {
+                        Some(err) => Err(err),
+                        None => Ok(body),
+                    }
+                })
                 .map_err(|be| {
                     crate::cooldown::note_failure(
                         &state.runtime_status,

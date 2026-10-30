@@ -2075,7 +2075,13 @@ impl Upstream {
         deadline: Option<std::time::Duration>,
     ) -> Result<Value, aisix_gateway::BridgeError> {
         match self {
-            Self::Http(resp) => crate::dispatch::json_body_within(resp, deadline).await,
+            Self::Http(resp) => {
+                let body = crate::dispatch::json_body_within(resp, deadline).await?;
+                match aisix_provider_anthropic::wire::body_in_band_error(&body) {
+                    Some(err) => Err(err),
+                    None => Ok(body),
+                }
+            }
             Self::Native(aisix_gateway::NativeMessages::Json(v)) => Ok(v),
             Self::Native(aisix_gateway::NativeMessages::Stream(_)) => {
                 unreachable!("a stream takes the SSE branch")

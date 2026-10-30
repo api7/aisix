@@ -1243,6 +1243,11 @@ async fn dispatch(
         }
     }
 
+    if status.is_success() {
+        if let Some(err) = body_in_band_error(protocol, &resp_body) {
+            telemetry.record_failure(&err);
+        }
+    }
     let (usage, tier) = response_usage_and_tier(metering, &resp_body);
     if let Some(u) = usage {
         merge_usage(&mut telemetry.usage, u);
@@ -4207,31 +4212,47 @@ fn frame_in_band_error(
         return None;
     }
     let payload = crate::redact::frame_payload(frame)?;
-    let payload = payload.trim();
-    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(payload.trim()).ok()?;
     match protocol {
-        PassthroughProtocol::Raw => None,
         PassthroughProtocol::OpenaiResponses => crate::responses::responses_in_band_error(&value),
-        // The chat envelope carries Anthropic Messages traffic too, whose
-        // in-band failure is a `type: "error"` event.
-        PassthroughProtocol::OpenaiChat
-        | PassthroughProtocol::AnthropicMessages
-        | PassthroughProtocol::OpenaiCompletions => {
-            if value.get("type").and_then(|t| t.as_str()) == Some("error") {
-                if let Some(body) = value.get("error").and_then(|e| {
-                    serde_json::from_value::<
-                            aisix_provider_anthropic::wire::AnthropicStreamErrorBody,
-                        >(e.clone())
-                        .ok()
-                }) {
-                    return Some(
-                        aisix_provider_anthropic::wire::stream_error_into_bridge_error(&body),
-                    );
-                }
-            }
-            aisix_gateway::capture_in_band_error(payload, aisix_gateway::UpstreamWire::OpenAI)
+        _ => chat_in_band_error(&value),
+    }
+}
+
+/// The upstream failure a buffered 2xx body reports in place of an
+/// answer. A Responses body is the response object, whose own `error`
+/// carries it.
+fn body_in_band_error(
+    protocol: PassthroughProtocol,
+    body: &[u8],
+) -> Option<aisix_gateway::BridgeError> {
+    if matches!(protocol, PassthroughProtocol::Raw) {
+        return None;
+    }
+    aisix_gateway::in_band_error_in_body(body, aisix_gateway::UpstreamWire::OpenAI)?;
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    match protocol {
+        PassthroughProtocol::OpenaiResponses => {
+            aisix_gateway::capture_in_band_error_value(&value, aisix_gateway::UpstreamWire::OpenAI)
+        }
+        _ => chat_in_band_error(&value),
+    }
+}
+
+/// The chat envelope carries Anthropic Messages traffic too, whose in-band
+/// failure is a `type: "error"` event.
+fn chat_in_band_error(value: &serde_json::Value) -> Option<aisix_gateway::BridgeError> {
+    if value.get("type").and_then(|t| t.as_str()) == Some("error") {
+        if let Some(body) = value.get("error").and_then(|e| {
+            serde_json::from_value::<aisix_provider_anthropic::wire::AnthropicStreamErrorBody>(
+                e.clone(),
+            )
+            .ok()
+        }) {
+            return Some(aisix_provider_anthropic::wire::stream_error_into_bridge_error(&body));
         }
     }
+    aisix_gateway::capture_in_band_error_value(value, aisix_gateway::UpstreamWire::OpenAI)
 }
 
 #[cfg(test)]
@@ -6991,7 +7012,8 @@ struct RouteTelemetry {
     streaming: bool,
     /// Bounded error class + message for a failure the relay could not
     /// answer with a status code — an upstream that dies mid-stream, after
-    /// the response head is already on the wire.
+    /// the response head is already on the wire, or a 2xx body relayed as
+    /// sent that reports a failure in-band.
     error_class: String,
     error_message: String,
     /// The status that same failure gets before the response head
@@ -7014,8 +7036,8 @@ struct RouteTelemetry {
 
 impl RouteTelemetry {
     /// Record the upstream failure that ended a streamed relay after its
-    /// head went out. The first one is the cause; later ones do not replace
-    /// it.
+    /// head went out, or that a relayed 2xx body reports in-band. The first
+    /// one is the cause; later ones do not replace it.
     fn record_failure(&mut self, err: &aisix_gateway::BridgeError) {
         if self.failure_status.is_some() {
             return;
@@ -7090,12 +7112,12 @@ impl RouteTelemetry {
         // endpoints do rather than a success the caller never received.
         // One an upstream failure ended records that failure's status
         // instead, unless a guardrail refused it.
-        if self.streaming {
-            match self.failure_status.filter(|_| !self.guardrail_blocked) {
-                Some(status) => self.status = status,
-                None if !self.stream_reached_end => self.status = crate::CLIENT_CLOSED_REQUEST,
-                None => {}
+        match self.failure_status.filter(|_| !self.guardrail_blocked) {
+            Some(status) => self.status = status,
+            None if self.streaming && !self.stream_reached_end => {
+                self.status = crate::CLIENT_CLOSED_REQUEST
             }
+            None => {}
         }
         // Named before the line is written, so the line and the event carry
         // the same class for a stream the caller abandoned.
