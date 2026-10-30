@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -77,7 +77,10 @@ const EMPTY_ERROR_STREAM: OpenAiUpstreamOptions = {
 
 interface Seeded {
   upstream: OpenAiUpstreamOptions;
-  kind: "chat" | "responses-bridge" | "anthropic";
+  /** `chat` and `responses-native` keys declare the upstream's own
+   *  `/v1/responses`; `responses-bridge` ones do not, so that surface is
+   *  translated through chat. */
+  kind: "chat" | "responses-native" | "responses-bridge" | "anthropic";
 }
 
 const MODELS: Record<string, Seeded> = {
@@ -104,6 +107,43 @@ const MODELS: Record<string, Seeded> = {
     },
     kind: "anthropic",
   },
+  "ib-responses-native-failed-ns": {
+    upstream: {
+      nonStreamBody: {
+        id: "resp_failed",
+        object: "response",
+        status: "failed",
+        model: "gpt-4o",
+        output: [],
+        error: { code: "server_error", message: PROVIDER_MESSAGE },
+        usage: null,
+      },
+    },
+    kind: "responses-native",
+  },
+  "ib-responses-native-ok-ns": {
+    upstream: {
+      nonStreamBody: {
+        id: "resp_ok",
+        object: "response",
+        status: "completed",
+        model: "gpt-4o",
+        output: [
+          {
+            type: "message",
+            id: "msg_ok",
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: ANSWER, annotations: [] }],
+          },
+        ],
+        error: null,
+        incomplete_details: null,
+        usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 },
+      },
+    },
+    kind: "responses-native",
+  },
   "ib-chat-empty-error-ns": {
     upstream: {
       nonStreamBody: {
@@ -123,6 +163,8 @@ const MODELS: Record<string, Seeded> = {
 
 const ROUTE_NS = "ib-route-ns";
 const ROUTE_NS_PREFIX = "/passthrough/ib-ns";
+const ROUTE_GUARDED = "ib-route-guarded";
+const ROUTE_GUARDED_PREFIX = "/passthrough/ib-guarded";
 const ROUTE_EMPTY = "ib-route-empty";
 const ROUTE_EMPTY_PREFIX = "/passthrough/ib-empty";
 
@@ -186,8 +228,21 @@ describe("an upstream 200 that reports a failure in its body", () => {
         provider_key_id: pk.id,
       });
     }
+    // An output guardrail on one route: the error body is the provider's
+    // failure, not an answer for it to read.
+    const outputGuard = await seed.createGuardrail(
+      {
+        name: "ib-output-block",
+        enabled: true,
+        hook_point: "output",
+        kind: "keyword",
+        patterns: [{ kind: "literal", value: "a phrase the upstream never says" }],
+      },
+      { attach: false },
+    );
     for (const [name, prefix, opts] of [
       [ROUTE_NS, ROUTE_NS_PREFIX, { nonStreamBody: { error: PROVIDER_ERROR } }],
+      [ROUTE_GUARDED, ROUTE_GUARDED_PREFIX, { nonStreamBody: { error: PROVIDER_ERROR } }],
       [ROUTE_EMPTY, ROUTE_EMPTY_PREFIX, EMPTY_ERROR_STREAM],
     ] as const) {
       const upstream = await startOpenAiUpstream(opts);
@@ -197,12 +252,20 @@ describe("an upstream 200 that reports a failure in its body", () => {
         secret: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
-      await seed.createPassthroughRoute({
+      const route = await seed.createPassthroughRoute({
         name,
         path_prefix: prefix,
         target_url: upstream.baseUrl,
         provider_key_id: pk.id,
       });
+      if (name === ROUTE_GUARDED) {
+        await seed.update("guardrail_attachments", randomUUID(), {
+          guardrail_id: outputGuard.id,
+          scope_type: "passthrough_route",
+          scope_id: route.id,
+          priority: 100,
+        });
+      }
     }
     // Seeded last: the key authenticating implies the whole seed set is in
     // the snapshot.
@@ -311,6 +374,40 @@ describe("an upstream 200 that reports a failure in its body", () => {
     expectInBandFailure(await usageRow(res.requestId), "502", "Overloaded right now");
   });
 
+  test("chat/completions onto an Anthropic upstream: an error body is a failure", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const res = await post("/v1/chat/completions", chat("ib-messages-native-ns", false));
+    expect(res.status).toBe(502);
+    expect(res.text).toContain("Overloaded right now");
+    expectInBandFailure(await usageRow(res.requestId), "502", "Overloaded right now");
+  });
+
+  test("messages/count_tokens: an error body is a failure, not a count", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const res = await post("/v1/messages/count_tokens", {
+      model: "ib-messages-native-ns",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(res.status).toBe(502);
+    expect(res.text).toContain("Overloaded right now");
+  });
+
+  test("responses (native): a failed response object is a 502 carrying its message", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const res = await post("/v1/responses", { model: "ib-responses-native-failed-ns", input: "hi" });
+    expect(res.status).toBe(502);
+    expect(res.text).toContain(PROVIDER_MESSAGE);
+    expectInBandFailure(await usageRow(res.requestId), "502", PROVIDER_MESSAGE);
+  });
+
+  test("responses (native): a completed response with a null error is a success", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const res = await post("/v1/responses", { model: "ib-responses-native-ok-ns", input: "hi" });
+    expect(res.status).toBe(200);
+    expect(res.text).toContain(ANSWER);
+    expectClean(await usageRow(res.requestId));
+  });
+
   test("passthrough route: a relayed error body records the failure", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
     const res = await post(`${ROUTE_NS_PREFIX}/v1/chat/completions`, chat("qwen/qwen-2.5-7b-instruct", false));
@@ -318,6 +415,16 @@ describe("an upstream 200 that reports a failure in its body", () => {
     expect(res.status).toBe(200);
     expect(JSON.parse(res.text)).toEqual({ error: PROVIDER_ERROR });
     expectInBandFailure(await usageRow(res.requestId), "502", PROVIDER_MESSAGE);
+  });
+
+  test("passthrough route behind an output guardrail: the error body is the provider's failure", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const res = await post(`${ROUTE_GUARDED_PREFIX}/v1/chat/completions`, chat("qwen/qwen-2.5-7b-instruct", false));
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.text)).toEqual({ error: PROVIDER_ERROR });
+    const row = await usageRow(res.requestId);
+    expectInBandFailure(row, "502", PROVIDER_MESSAGE);
+    expect(row.get("guardrail_blocked") ?? "false").toBe("false");
   });
 
   // ── An `error` that reports nothing ────────────────────────────────

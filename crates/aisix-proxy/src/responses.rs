@@ -3319,8 +3319,8 @@ pub(crate) fn responses_in_band_error(event: &Value) -> Option<aisix_gateway::Br
         _ => return None,
     };
     Some(
-        aisix_gateway::capture_in_band_error(
-            &serde_json::json!({ "error": error }).to_string(),
+        aisix_gateway::capture_in_band_error_value(
+            &serde_json::json!({ "error": error }),
             aisix_gateway::UpstreamWire::OpenAI,
         )
         .unwrap_or_else(|| aisix_gateway::BridgeError::UpstreamInBand {

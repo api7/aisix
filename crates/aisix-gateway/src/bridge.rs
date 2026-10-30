@@ -641,12 +641,23 @@ pub fn capture_in_band_error(payload: &str, wire: UpstreamWire) -> Option<Bridge
 /// skipped unless the body mentions an `"error"` key, so a success body
 /// costs one substring scan.
 pub fn in_band_error_in_body(body: &[u8], wire: UpstreamWire) -> Option<BridgeError> {
+    capture_in_band_error_value(&in_band_error_body(body)?, wire)
+}
+
+/// The parsed 2xx body, when its top-level `error` reports a failure by
+/// [`in_band_error_reported`] — for a caller that reads the envelope with
+/// its own wire's taxonomy. The parse is skipped unless the body mentions
+/// an `"error"` key.
+pub fn in_band_error_body(body: &[u8]) -> Option<serde_json::Value> {
     const KEY: &[u8] = b"\"error\"";
     if !body.windows(KEY.len()).any(|w| w == KEY) {
         return None;
     }
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    capture_in_band_error_value(&value, wire)
+    value
+        .get("error")
+        .is_some_and(in_band_error_reported)
+        .then_some(value)
 }
 
 /// Read a 2xx body and decode it as the success shape `T`, unless it

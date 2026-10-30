@@ -1163,7 +1163,21 @@ async fn dispatch(
     // Output guardrails govern generated successful answers. A provider's
     // non-success body is its error contract, so preserve its status, headers,
     // and bytes instead of replacing a 4xx/5xx with a local guardrail 422.
-    if status.is_success() && !bypass_uninspectable_output && output_guardrail_active {
+    // A 2xx body that reports a failure in-band is the provider's error,
+    // relayed as sent like a non-success one: recorded, not scanned.
+    let in_band = if status.is_success() {
+        body_in_band_error(protocol, &resp_body)
+    } else {
+        None
+    };
+    if let Some(err) = &in_band {
+        telemetry.record_failure(err);
+    }
+    if status.is_success()
+        && in_band.is_none()
+        && !bypass_uninspectable_output
+        && output_guardrail_active
+    {
         let text = match try_buffered_response_guardrail_text(protocol, &resp_body) {
             Ok(text) => Some(text),
             Err(err)
@@ -1243,11 +1257,6 @@ async fn dispatch(
         }
     }
 
-    if status.is_success() {
-        if let Some(err) = body_in_band_error(protocol, &resp_body) {
-            telemetry.record_failure(&err);
-        }
-    }
     let (usage, tier) = response_usage_and_tier(metering, &resp_body);
     if let Some(u) = usage {
         merge_usage(&mut telemetry.usage, u);
@@ -4229,8 +4238,7 @@ fn body_in_band_error(
     if matches!(protocol, PassthroughProtocol::Raw) {
         return None;
     }
-    aisix_gateway::in_band_error_in_body(body, aisix_gateway::UpstreamWire::OpenAI)?;
-    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let value = aisix_gateway::in_band_error_body(body)?;
     match protocol {
         PassthroughProtocol::OpenaiResponses => {
             aisix_gateway::capture_in_band_error_value(&value, aisix_gateway::UpstreamWire::OpenAI)

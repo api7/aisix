@@ -2262,6 +2262,25 @@ pub fn body_in_band_error(body: &serde_json::Value) -> Option<BridgeError> {
     aisix_gateway::capture_in_band_error_value(body, aisix_gateway::UpstreamWire::Anthropic)
 }
 
+/// Read a 2xx Anthropic-wire body and decode it as the success shape `T`,
+/// unless it reports a failure ([`body_in_band_error`]), which is returned
+/// instead.
+pub async fn decode_success_body<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+) -> Result<T, BridgeError> {
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+    if let Some(err) = aisix_gateway::in_band_error_body(&body)
+        .as_ref()
+        .and_then(body_in_band_error)
+    {
+        return Err(err);
+    }
+    serde_json::from_slice(&body).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
+}
+
 /// Convert an in-band `event: error` body into the typed
 /// [`BridgeError::UpstreamInBand`]. Shared by the Anthropic bridge and
 /// the Vertex Claude (`:streamRawPredict`) path — both speak the

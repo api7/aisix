@@ -427,19 +427,7 @@ impl Bridge for AnthropicBridge {
                 return Err(map_http_error(status, resp).await);
             }
 
-            let body = resp
-                .bytes()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            if let Some(err) =
-                aisix_gateway::in_band_error_in_body(&body, aisix_gateway::UpstreamWire::Anthropic)
-                    .and_then(|_| serde_json::from_slice(&body).ok())
-                    .and_then(|v: serde_json::Value| crate::wire::body_in_band_error(&v))
-            {
-                return Err(err);
-            }
-            let parsed: AnthropicResponse = serde_json::from_slice(&body)
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            let parsed: AnthropicResponse = crate::wire::decode_success_body(resp).await?;
             let mut chat = response_into_chat_response(parsed);
             if synthetic_json_tool {
                 unwrap_json_tool_call(&mut chat);
