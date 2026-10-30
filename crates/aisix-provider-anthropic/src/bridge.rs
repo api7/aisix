@@ -427,10 +427,7 @@ impl Bridge for AnthropicBridge {
                 return Err(map_http_error(status, resp).await);
             }
 
-            let parsed: AnthropicResponse = resp
-                .json()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            let parsed: AnthropicResponse = crate::wire::decode_success_body(resp).await?;
             let mut chat = response_into_chat_response(parsed);
             if synthetic_json_tool {
                 unwrap_json_tool_call(&mut chat);

@@ -795,10 +795,9 @@ impl Bridge for AzureOpenAiBridge {
             // `#[serde(default)]` on optional fields and does NOT set
             // `deny_unknown_fields`, so the extension fields pass
             // through transparently without breaking deserialization.
-            let parsed: OpenAiResponse = resp
-                .json()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            let parsed: OpenAiResponse =
+                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::AzureOpenAI)
+                    .await?;
             Ok(response_into_chat_response(parsed))
         })
         .await

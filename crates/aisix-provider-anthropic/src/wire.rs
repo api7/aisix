@@ -2244,6 +2244,43 @@ pub fn anthropic_error_kind_status(kind: Option<&str>) -> Option<u16> {
     }
 }
 
+/// The failure a 2xx Anthropic-wire body reports in place of a message
+/// (`{"type":"error","error":{...}}`), when its `error` reports one by the
+/// shared rule ([`aisix_gateway::in_band_error_reported`]). An error that
+/// names an Anthropic error type reads through that taxonomy; any other
+/// (an aggregator's `{"code":502,"message":…}`) through the generic probe.
+pub fn body_in_band_error(body: &serde_json::Value) -> Option<BridgeError> {
+    let error = body.get("error")?;
+    if !aisix_gateway::in_band_error_reported(error) {
+        return None;
+    }
+    if error.get("type").is_some_and(serde_json::Value::is_string) {
+        if let Ok(parsed) = serde_json::from_value::<AnthropicStreamErrorBody>(error.clone()) {
+            return Some(stream_error_into_bridge_error(&parsed));
+        }
+    }
+    aisix_gateway::capture_in_band_error_value(body, aisix_gateway::UpstreamWire::Anthropic)
+}
+
+/// Read a 2xx Anthropic-wire body and decode it as the success shape `T`,
+/// unless it reports a failure ([`body_in_band_error`]), which is returned
+/// instead.
+pub async fn decode_success_body<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+) -> Result<T, BridgeError> {
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+    if let Some(err) = aisix_gateway::in_band_error_body(&body)
+        .as_ref()
+        .and_then(body_in_band_error)
+    {
+        return Err(err);
+    }
+    serde_json::from_slice(&body).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
+}
+
 /// Convert an in-band `event: error` body into the typed
 /// [`BridgeError::UpstreamInBand`]. Shared by the Anthropic bridge and
 /// the Vertex Claude (`:streamRawPredict`) path — both speak the

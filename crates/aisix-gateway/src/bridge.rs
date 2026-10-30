@@ -589,12 +589,33 @@ pub fn upstream_error_message(body: &[u8]) -> String {
     truncate_lossy(&message, MAX_UPSTREAM_ERROR_MESSAGE_BYTES)
 }
 
-/// Probe one SSE `data:` payload for a provider in-band error envelope
-/// (`{"error": {...}}` or `{"error": "..."}`) and capture it as a
-/// [`BridgeError::UpstreamInBand`]. Returns `None` when the payload is
-/// not an error envelope — callers fall back to their decode-error
-/// path, so a genuinely malformed frame still surfaces as
-/// [`BridgeError::UpstreamDecode`].
+/// Whether a top-level `error` value reports a failure: a non-empty
+/// string, or an object with a non-empty `message` or a non-null `code`.
+/// `null`, `{}`, `""` and an object carrying neither field do not — some
+/// OpenAI-compatible servers send an empty `error` beside a successful
+/// answer. The one rule every in-band probe applies, whether or not the
+/// payload also carries `choices`.
+pub fn in_band_error_reported(error: &serde_json::Value) -> bool {
+    match error {
+        serde_json::Value::String(s) => !s.is_empty(),
+        serde_json::Value::Object(obj) => {
+            let message = match obj.get("message") {
+                None | Some(serde_json::Value::Null) => false,
+                Some(serde_json::Value::String(s)) => !s.is_empty(),
+                Some(_) => true,
+            };
+            message || obj.get("code").is_some_and(|c| !c.is_null())
+        }
+        _ => false,
+    }
+}
+
+/// Probe one SSE `data:` payload, or a whole 2xx body, for a provider
+/// in-band error envelope (`{"error": {...}}` or `{"error": "..."}`) and
+/// capture it as a [`BridgeError::UpstreamInBand`]. Returns `None` when the
+/// payload carries no `error` that [`in_band_error_reported`] accepts —
+/// callers fall back to their decode path, so a genuinely malformed frame
+/// still surfaces as [`BridgeError::UpstreamDecode`].
 ///
 /// Field handling is tolerant across the OpenAI-compatible family and
 /// Google's error shape:
@@ -602,64 +623,100 @@ pub fn upstream_error_message(body: &[u8]) -> String {
 ///   `kind`; absent that, Google's `error.status` gRPC token
 ///   (`UNAVAILABLE`, `RESOURCE_EXHAUSTED`, …) does, so the per-wire
 ///   translation tables in `error_translate` apply either way.
-/// - `error.code` may be a JSON number (Google) or a string (OpenAI).
-///   A numeric value in 400..=599 — either form — becomes the embedded
-///   `status`; a non-numeric string stays in the view's `code`.
-/// - a bare-string `error` value becomes the message (LiteLLM accepts
-///   this form from OpenAI-compatible aggregators; so do we).
+/// - `error.code` may be a JSON number (Google, OpenRouter) or a string
+///   (OpenAI). A numeric value in 400..=599 — either form — becomes the
+///   embedded `status`; a non-numeric string stays in the view's `code`.
+/// - a bare-string `error` value becomes the message (OpenAI-compatible
+///   aggregators send this form).
 ///
 /// All captured strings are truncated at
 /// [`MAX_UPSTREAM_ERROR_MESSAGE_BYTES`], same as
 /// [`capture_upstream_error_http`].
 pub fn capture_in_band_error(payload: &str, wire: UpstreamWire) -> Option<BridgeError> {
-    #[derive(serde::Deserialize)]
-    struct Outer {
-        error: ErrorField,
-    }
-    #[derive(serde::Deserialize)]
-    #[serde(untagged)]
-    enum ErrorField {
-        Obj(Inner),
-        Str(String),
-    }
-    #[derive(serde::Deserialize)]
-    struct Inner {
-        message: Option<String>,
-        #[serde(rename = "type")]
-        kind: Option<String>,
-        code: Option<serde_json::Value>,
-        param: Option<String>,
-        status: Option<String>,
-    }
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    capture_in_band_error_value(&value, wire)
+}
 
+/// [`capture_in_band_error`] over a whole 2xx response body. The parse is
+/// skipped unless the body mentions an `"error"` key, so a success body
+/// costs one substring scan.
+pub fn in_band_error_in_body(body: &[u8], wire: UpstreamWire) -> Option<BridgeError> {
+    capture_in_band_error_value(&in_band_error_body(body)?, wire)
+}
+
+/// The parsed 2xx body, when its top-level `error` reports a failure by
+/// [`in_band_error_reported`] — for a caller that reads the envelope with
+/// its own wire's taxonomy. The parse is skipped unless the body mentions
+/// an `"error"` key.
+pub fn in_band_error_body(body: &[u8]) -> Option<serde_json::Value> {
+    const KEY: &[u8] = b"\"error\"";
+    if !body.windows(KEY.len()).any(|w| w == KEY) {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value
+        .get("error")
+        .is_some_and(in_band_error_reported)
+        .then_some(value)
+}
+
+/// Read a 2xx body and decode it as the success shape `T`, unless it
+/// reports an in-band error ([`in_band_error_in_body`]), which is returned
+/// instead. A body that is neither is [`BridgeError::UpstreamDecode`].
+pub async fn decode_success_body<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+    wire: UpstreamWire,
+) -> Result<T, BridgeError> {
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+    if let Some(err) = in_band_error_in_body(&body, wire) {
+        return Err(err);
+    }
+    serde_json::from_slice(&body).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
+}
+
+/// [`capture_in_band_error`] over an already-parsed payload.
+pub fn capture_in_band_error_value(
+    value: &serde_json::Value,
+    wire: UpstreamWire,
+) -> Option<BridgeError> {
+    let error = value.get("error")?;
+    if !in_band_error_reported(error) {
+        return None;
+    }
     let cap = MAX_UPSTREAM_ERROR_MESSAGE_BYTES;
-    let outer: Outer = serde_json::from_str(payload).ok()?;
-    let (status, message, parsed) = match outer.error {
-        ErrorField::Str(s) => (None, truncate_lossy(&s, cap), None),
-        ErrorField::Obj(inner) => {
-            let numeric_status = match &inner.code {
+    let text = |v: Option<&serde_json::Value>| match v {
+        Some(serde_json::Value::String(s)) => Some(truncate_lossy(s, cap)),
+        _ => None,
+    };
+    let (status, message, parsed) = match error {
+        serde_json::Value::String(s) => (None, truncate_lossy(s, cap), None),
+        inner => {
+            let code = inner.get("code");
+            let numeric_status = match code {
                 Some(serde_json::Value::Number(n)) => n.as_u64(),
                 Some(serde_json::Value::String(s)) => s.parse::<u64>().ok(),
                 _ => None,
             }
             .and_then(|n| u16::try_from(n).ok())
             .filter(|n| (400..=599).contains(n));
-            let code_str = match &inner.code {
-                Some(serde_json::Value::String(s)) if numeric_status.is_none() => {
-                    Some(truncate_lossy(s, cap))
-                }
-                _ => None,
+            let message = match inner.get("message") {
+                Some(serde_json::Value::String(s)) => Some(truncate_lossy(s, cap)),
+                Some(serde_json::Value::Null) | None => None,
+                Some(other) => Some(truncate_lossy(&other.to_string(), cap)),
             };
             let view = UpstreamErrorView {
-                kind: inner.kind.or(inner.status).map(|k| truncate_lossy(&k, cap)),
-                message: inner.message.as_deref().map(|m| truncate_lossy(m, cap)),
-                code: code_str,
-                param: inner.param.map(|p| truncate_lossy(&p, cap)),
+                kind: text(inner.get("type")).or_else(|| text(inner.get("status"))),
+                message,
+                code: text(code).filter(|_| numeric_status.is_none()),
+                param: text(inner.get("param")),
             };
             let message = view
                 .message
                 .clone()
-                .unwrap_or_else(|| truncate_lossy(payload, cap));
+                .unwrap_or_else(|| truncate_lossy(&error.to_string(), cap));
             (numeric_status, message, Some(Box::new(view)))
         }
     };
@@ -1223,6 +1280,34 @@ mod tests {
             e,
             BridgeError::UpstreamInBand { status: None, .. }
         ));
+    }
+
+    #[test]
+    fn in_band_probe_ignores_an_error_that_reports_nothing() {
+        for payload in [
+            r#"{"error":null}"#,
+            r#"{"error":{}}"#,
+            r#"{"error":""}"#,
+            r#"{"error":{"message":"","code":null,"type":"x"}}"#,
+            r#"{"id":"c","choices":[{"index":0}],"error":{}}"#,
+        ] {
+            assert!(
+                capture_in_band_error(payload, UpstreamWire::OpenAI).is_none(),
+                "{payload}"
+            );
+            assert!(in_band_error_in_body(payload.as_bytes(), UpstreamWire::OpenAI).is_none());
+        }
+        // A code alone, or a message beside answers, still reports one.
+        for payload in [
+            r#"{"error":{"code":502}}"#,
+            r#"{"id":"c","choices":[],"error":{"code":502,"message":"down"}}"#,
+            r#"{"choices":[{"index":0}],"error":{"message":"down"}}"#,
+        ] {
+            assert!(
+                in_band_error_in_body(payload.as_bytes(), UpstreamWire::OpenAI).is_some(),
+                "{payload}"
+            );
+        }
     }
 
     #[test]

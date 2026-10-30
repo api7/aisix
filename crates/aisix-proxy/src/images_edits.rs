@@ -678,6 +678,17 @@ async fn dispatch(
                         // body that doesn't parse is a failed answer that
                         // was still served, so it is neither retried nor
                         // failed over.
+                        if let Some(err) = aisix_gateway::in_band_error_in_body(
+                            &body_bytes,
+                            aisix_gateway::UpstreamWire::OpenAI,
+                        ) {
+                            return Err(crate::cooldown::note_failure(
+                                tracker,
+                                model_id,
+                                cooldown_cfg,
+                                err,
+                            ));
+                        }
                         serde_json::from_slice::<Value>(&body_bytes).map_err(|e| {
                             crate::cooldown::note_failure(
                                 tracker,

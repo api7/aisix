@@ -571,10 +571,9 @@ impl Bridge for OpenAiBridge {
             }
             let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
 
-            let parsed: OpenAiResponse = resp
-                .json()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            let parsed: OpenAiResponse =
+                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::OpenAI)
+                    .await?;
             Ok(response_into_chat_response(parsed).with_fallback_service_tier(header_tier))
         })
         .await
@@ -626,10 +625,9 @@ impl Bridge for OpenAiBridge {
                 return Err(map_http_error(status, resp).await);
             }
 
-            let parsed: OpenAiEmbedResponse = resp
-                .json()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            let parsed: OpenAiEmbedResponse =
+                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::OpenAI)
+                    .await?;
             Ok(embed_response_into(parsed))
         })
         .await
@@ -690,9 +688,7 @@ impl Bridge for OpenAiBridge {
                 return Err(map_http_error(status, resp).await);
             }
 
-            resp.json::<serde_json::Value>()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
+            aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::OpenAI).await
         })
         .await
     }
@@ -752,9 +748,7 @@ impl Bridge for OpenAiBridge {
                 return Err(map_http_error(status, resp).await);
             }
 
-            resp.json::<serde_json::Value>()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
+            aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::OpenAI).await
         })
         .await
     }

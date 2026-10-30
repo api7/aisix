@@ -457,9 +457,7 @@ pub(crate) async fn chat(
     // The body read gets what is left of the one budget, not a fresh one.
     let left = deadline.map(|d| d.saturating_sub(started.elapsed()));
     let parsed: OpenAiResponse = with_deadline(left, started, async {
-        resp.json()
-            .await
-            .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
+        aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::OpenAI).await
     })
     .await?;
     let mut chat = response_into_chat_response(parsed);

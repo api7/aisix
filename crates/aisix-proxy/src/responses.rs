@@ -2164,6 +2164,10 @@ async fn responses_to_target(
         let json_body: Value =
             crate::dispatch::json_body_within(upstream_resp, buffered_body_deadline)
                 .await
+                .and_then(|body| match responses_body_in_band_error(&body) {
+                    Some(err) => Err(err),
+                    None => Ok(body),
+                })
                 .map_err(|be| {
                     crate::cooldown::note_failure(
                         &state.runtime_status,
@@ -3310,8 +3314,8 @@ pub(crate) fn responses_in_band_error(event: &Value) -> Option<aisix_gateway::Br
         _ => return None,
     };
     Some(
-        aisix_gateway::capture_in_band_error(
-            &serde_json::json!({ "error": error }).to_string(),
+        aisix_gateway::capture_in_band_error_value(
+            &serde_json::json!({ "error": error }),
             aisix_gateway::UpstreamWire::OpenAI,
         )
         .unwrap_or_else(|| aisix_gateway::BridgeError::UpstreamInBand {
@@ -3321,6 +3325,16 @@ pub(crate) fn responses_in_band_error(event: &Value) -> Option<aisix_gateway::Br
             wire: aisix_gateway::UpstreamWire::OpenAI,
         }),
     )
+}
+
+/// The failure a buffered 2xx Responses body reports in place of an answer:
+/// a bare error envelope. A response object is the answer even when its own
+/// `error` is set (`status: "failed"`) and is relayed as sent.
+pub(crate) fn responses_body_in_band_error(body: &Value) -> Option<aisix_gateway::BridgeError> {
+    if body.get("object").and_then(Value::as_str) == Some("response") {
+        return None;
+    }
+    aisix_gateway::capture_in_band_error_value(body, aisix_gateway::UpstreamWire::OpenAI)
 }
 
 /// Streamed output-text accumulator for content-capturing exporters

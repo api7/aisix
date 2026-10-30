@@ -938,9 +938,6 @@ async fn count_tokens_to_target(
         return Err(ProxyError::Bridge(err));
     }
 
-    state.health.record_success(&model.display_name);
-    state.runtime_status.mark_healthy(model_id);
-
     // Forward the `{"input_tokens": <int>}` response body verbatim — the
     // gateway adds nothing to the token-counting contract.
     let upstream_headers = upstream_resp.headers().clone();
@@ -956,6 +953,20 @@ async fn count_tokens_to_target(
             )
         })
         .map_err(ProxyError::Bridge)?;
+    if let Some(err) = aisix_gateway::in_band_error_body(&body_bytes)
+        .as_ref()
+        .and_then(aisix_provider_anthropic::wire::body_in_band_error)
+    {
+        return Err(ProxyError::Bridge(crate::cooldown::note_failure(
+            &state.runtime_status,
+            model_id,
+            model.cooldown.as_ref(),
+            err,
+        )));
+    }
+
+    state.health.record_success(&model.display_name);
+    state.runtime_status.mark_healthy(model_id);
 
     let mut resp = axum::response::Response::new(axum::body::Body::from(body_bytes));
     if let Some(ct) = upstream_headers.get("content-type") {
