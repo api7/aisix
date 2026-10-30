@@ -29,6 +29,12 @@
 # DELETE fails it. A plan that would empty a package is refused (GitHub will
 # not delete a package's last version).
 #
+# GitHub's package API answers a 5xx now and then. Every listing and DELETE is
+# retried up to GH_ATTEMPTS times with doubling backoff on a 5xx or a
+# connection error; a listing restarts from its first page. A DELETE answered
+# 404 counts as done: a retried DELETE can land after an earlier attempt
+# already removed the version.
+#
 # Usage: GH_TOKEN=... scripts/ghcr-retention.sh [--dry-run]
 set -euo pipefail
 export LC_ALL=C
@@ -40,6 +46,8 @@ CI_TEST_MAX_AGE_DAYS="${CI_TEST_MAX_AGE_DAYS:-3}"
 ORPHAN_MIN_AGE_DAYS="${ORPHAN_MIN_AGE_DAYS:-1}"
 MAX_DELETES="${MAX_DELETES:-300}"
 DELETE_INTERVAL="${DELETE_INTERVAL:-1}"
+GH_ATTEMPTS="${GH_ATTEMPTS:-4}"
+GH_RETRY_DELAY="${GH_RETRY_DELAY:-5}"
 dry_run=false
 case "${1:-}" in
   "") ;;
@@ -54,13 +62,33 @@ orphan_cutoff=$(date -u -d "${ORPHAN_MIN_AGE_DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-gh api rate_limit --jq '.resources.core | "API rate limit: \(.remaining)/\(.limit) remaining"'
+# A 5xx, or no HTTP status at all (the request never got an answer).
+retryable() { grep -qE 'HTTP 50[0234]\b' <<<"$1" || ! grep -qE 'HTTP [0-9]{3}' <<<"$1"; }
+
+# gh api for reads: prints stdout of the attempt that succeeded only.
+gh_read() {
+  local attempt=1 delay=$GH_RETRY_DELAY what
+  for what; do [ "${what#-}" = "$what" ] && break; done
+  until gh api "$@" > "$work/gh.out" 2> "$work/gh.err"; do
+    if [ "$attempt" -ge "$GH_ATTEMPTS" ] || ! retryable "$(cat "$work/gh.err")"; then
+      cat "$work/gh.err" >&2
+      return 1
+    fi
+    echo "::warning::gh api $what failed ($(tail -n1 "$work/gh.err")), attempt $attempt of $GH_ATTEMPTS; retrying in ${delay}s" >&2
+    sleep "$delay"
+    attempt=$((attempt + 1))
+    delay=$((delay * 2))
+  done
+  cat "$work/gh.out"
+}
+
+gh_read rate_limit --jq '.resources.core | "API rate limit: \(.remaining)/\(.limit) remaining"'
 
 package_of() { echo "orgs/${1%%/*}/packages/container/${1#*/}"; }
 
 # id, digest, created_at, comma-joined tags
 list_versions() {
-  gh api --paginate "$(package_of "$1")/versions?per_page=100" \
+  gh_read --paginate "$(package_of "$1")/versions?per_page=100" \
     --jq '.[] | [.id, .name, .created_at, (.metadata.container.tags | join(","))] | @tsv' \
     | sort -u -t$'\t' -k1,1
 }
@@ -68,9 +96,9 @@ list_versions() {
 registry_token() {
   local url="https://ghcr.io/token?scope=repository:$1:pull&service=ghcr.io"
   if [ -n "${GH_TOKEN:-}" ]; then
-    curl -fsS -u "x:${GH_TOKEN}" "$url" | jq -r .token
+    curl -fsS --retry 3 --retry-all-errors -u "x:${GH_TOKEN}" "$url" | jq -r .token
   else
-    curl -fsS "$url" | jq -r .token
+    curl -fsS --retry 3 --retry-all-errors "$url" | jq -r .token
   fi
 }
 
@@ -117,20 +145,31 @@ export -f manifest children_of index_children attribute_signature
 # Returns 2 when GitHub rate-limited the DELETE; exits on any other failure.
 delete_version() {
   local image=$1 kind=$2 id=$3 digest=$4 created=$5 tags=$6 out status
+  local attempt=1 delay=$GH_RETRY_DELAY done_as=$verb
   if ! $dry_run; then
     sleep "$DELETE_INTERVAL"
-    if ! out=$(gh api -i -X DELETE "$(package_of "$image")/versions/$id" 2>&1); then
+    until out=$(gh api -i -X DELETE "$(package_of "$image")/versions/$id" 2>&1); do
       status=$(sed -n '1s|^HTTP/[0-9.]* \([0-9]*\).*|\1|p' <<<"$out")
+      if [ "$status" = 404 ]; then
+        done_as='already gone (HTTP 404):'
+        break
+      fi
       if [ "$status" = 429 ] || { [ "$status" = 403 ] && grep -qiE '^x-ratelimit-remaining: 0|rate limit' <<<"$out"; }; then
         echo "::warning::rate limited (HTTP $status) deleting $kind $id from ghcr.io/$image; stopping here, the next run continues"
         return 2
       fi
-      echo "::error::DELETE of $kind $id from ghcr.io/$image failed (HTTP ${status:-unknown})"
-      printf '%s\n' "$out" >&2
-      exit 1
-    fi
+      if [ "$attempt" -ge "$GH_ATTEMPTS" ] || ! retryable "${status:+HTTP $status}"; then
+        echo "::error::DELETE of $kind $id from ghcr.io/$image failed (HTTP ${status:-unknown})"
+        printf '%s\n' "$out" >&2
+        exit 1
+      fi
+      echo "::warning::DELETE of $kind $id from ghcr.io/$image failed (HTTP ${status:-unknown}), attempt $attempt of $GH_ATTEMPTS; retrying in ${delay}s"
+      sleep "$delay"
+      attempt=$((attempt + 1))
+      delay=$((delay * 2))
+    done
   fi
-  echo "$verb $kind $id $digest (created $created${tags:+, tags $tags})"
+  echo "$done_as $kind $id $digest (created $created${tags:+, tags $tags})"
 }
 
 : > "$work/deleted_digests"

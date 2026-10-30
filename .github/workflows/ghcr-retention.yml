@@ -28,6 +28,7 @@ on:
     paths:
       - .github/workflows/ghcr-retention.yml
       - scripts/ghcr-retention.sh
+      - scripts/ghcr-retention-test.sh
 
 # Read-only by default: the pull_request dry run runs the PR's own copy of
 # the script, so only the scheduled/dispatched job may delete.
@@ -47,6 +48,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
+      - name: Check retry and failure handling against a stubbed API
+        run: scripts/ghcr-retention-test.sh
       - name: List versions past retention
         env:
           GH_TOKEN: ${{ github.token }}
