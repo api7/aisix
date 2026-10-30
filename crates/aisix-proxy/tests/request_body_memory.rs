@@ -147,7 +147,10 @@ fn start_upstream() -> HeldUpstream {
                     };
                     let stream = async_stream::stream! {
                         yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(first.as_bytes()));
-                        let _ = stream_held.wait_for(|holding| !*holding).await;
+                        stream_held
+                            .wait_for(|holding| !*holding)
+                            .await
+                            .expect("stream hold control channel closed");
                         yield Ok(bytes::Bytes::from_static(last.as_bytes()));
                     };
                     axum::response::Response::builder()
@@ -659,9 +662,13 @@ async fn held_while_streaming(
     let held = live() - before;
     let peak = PEAK.load(Ordering::Relaxed) - before;
     upstream.stream_hold.send_replace(false);
-    while let Some(chunk) = stream.next().await {
-        chunk.unwrap();
-    }
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while let Some(chunk) = stream.next().await {
+            chunk.unwrap();
+        }
+    })
+    .await
+    .expect("stream did not end within 60 s of releasing the hold");
     upstream.streaming.store(false, Ordering::SeqCst);
     (held, peak, len)
 }

@@ -234,13 +234,21 @@ async fn responses_preserves_model_only_wire_and_body_overrides() {
     preserves_wire_and_overrides(responses()).await;
 }
 
-#[tokio::test]
-async fn messages_strips_signed_tool_ids_without_touching_tool_arguments() {
-    let endpoint = messages();
+async fn assert_signed_tool_ids_stripped(endpoint: Endpoint) {
     let body = r#"{"max_tokens":64,"messages":[{"content":[{"id":"call_1__thought__eHl6","input":{"id":"argument__thought__keep"},"name":"lookup","type":"tool_use"}],"role":"assistant"},{"content":[{"content":"done","tool_use_id":"call_1__thought__eHl6","type":"tool_result"}],"role":"user"}],"model":"client-model"}"#;
     let received = forward(&endpoint, body, json!({})).await;
     let expected = body
         .replace("call_1__thought__eHl6", "call_1")
         .replace(MODEL_ALIAS, endpoint.upstream_model);
-    assert_eq!(received, expected);
+    assert_eq!(received, expected, "{} signed tool ids", endpoint.path);
+}
+
+#[tokio::test]
+async fn messages_strips_signed_tool_ids_without_touching_tool_arguments() {
+    assert_signed_tool_ids_stripped(messages()).await;
+}
+
+#[tokio::test]
+async fn count_tokens_strips_signed_tool_ids_without_touching_tool_arguments() {
+    assert_signed_tool_ids_stripped(count_tokens()).await;
 }
