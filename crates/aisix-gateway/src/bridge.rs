@@ -716,7 +716,7 @@ pub fn capture_in_band_error_value(
             let message = view
                 .message
                 .clone()
-                .unwrap_or_else(|| truncate_lossy(&value.to_string(), cap));
+                .unwrap_or_else(|| truncate_lossy(&error.to_string(), cap));
             (numeric_status, message, Some(Box::new(view)))
         }
     };
