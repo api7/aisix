@@ -15,7 +15,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -97,6 +97,8 @@ struct HeldUpstream {
     base: String,
     received: mpsc::UnboundedReceiver<usize>,
     hold: watch::Sender<bool>,
+    streaming: Arc<AtomicBool>,
+    stream_hold: watch::Sender<bool>,
     /// How many of the next calls are answered at once, without being
     /// held or reported — the calls a request makes before the one being
     /// measured.
@@ -106,12 +108,17 @@ struct HeldUpstream {
 fn start_upstream() -> HeldUpstream {
     let (tx, received) = mpsc::unbounded_channel();
     let (hold, held) = watch::channel(true);
+    let (stream_hold, stream_held) = watch::channel(true);
+    let streaming = Arc::new(AtomicBool::new(false));
     let pass = Arc::new(AtomicUsize::new(0));
     let app = Router::new().fallback({
         let pass = pass.clone();
+        let streaming = streaming.clone();
         move |req: Request<Body>| {
             let tx = tx.clone();
             let mut held = held.clone();
+            let mut stream_held = stream_held.clone();
+            let streaming = streaming.clone();
             let pass = pass.clone();
             async move {
                 let path = req.uri().path().to_string();
@@ -132,7 +139,22 @@ fn start_upstream() -> HeldUpstream {
                     let _ = tx.send(n);
                     let _ = held.wait_for(|holding| !*holding).await;
                 }
-                if sse {
+                if streaming.load(Ordering::SeqCst) {
+                    let (first, last) = if path.ends_with("/messages") {
+                        (SSE_MESSAGES_START, SSE_MESSAGES_END)
+                    } else {
+                        (SSE_RESPONSES_START, SSE_RESPONSES_END)
+                    };
+                    let stream = async_stream::stream! {
+                        yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(first.as_bytes()));
+                        let _ = stream_held.wait_for(|holding| !*holding).await;
+                        yield Ok(bytes::Bytes::from_static(last.as_bytes()));
+                    };
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                } else if sse {
                     axum::response::Response::builder()
                         .header("content-type", "text/event-stream")
                         .body(Body::from(SSE_CHAT_RESPONSE))
@@ -161,9 +183,31 @@ fn start_upstream() -> HeldUpstream {
         base: format!("http://{addr}"),
         received,
         hold,
+        streaming,
+        stream_hold,
         pass,
     }
 }
+
+const SSE_RESPONSES_START: &str = concat!(
+    "event: response.created\ndata: {\"type\":\"response.created\",",
+    "\"response\":{\"id\":\"resp_stream\",\"status\":\"in_progress\"}}\n\n",
+);
+const SSE_RESPONSES_END: &str = concat!(
+    "event: response.completed\ndata: {\"type\":\"response.completed\",",
+    "\"response\":{\"id\":\"resp_stream\",\"status\":\"completed\",",
+    "\"output\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n",
+);
+const SSE_MESSAGES_START: &str = concat!(
+    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{",
+    "\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],",
+    "\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+);
+const SSE_MESSAGES_END: &str = concat!(
+    "event: message_delta\ndata: {\"type\":\"message_delta\",",
+    "\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+);
 
 const SSE_CHAT_RESPONSE: &str = concat!(
     "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",",
@@ -221,7 +265,7 @@ fn upstream_response(path: &str) -> serde_json::Value {
     }
 }
 
-fn snapshot(api_base: &str) -> AisixSnapshot {
+fn snapshot(api_base: &str, capture_content: bool) -> AisixSnapshot {
     let snap = AisixSnapshot::new();
     for (pk_id, provider) in [(PK_ID, "openai"), (ANTHROPIC_PK_ID, "anthropic")] {
         let pk: aisix_core::ProviderKey = serde_json::from_str(&format!(
@@ -247,6 +291,7 @@ fn snapshot(api_base: &str) -> AisixSnapshot {
             ANTHROPIC_PK_ID,
         ),
         ("model-rerank", "reranker", "openai", "rerank-v3", PK_ID),
+        ("model-speech", "speaker", "openai", "tts-1", PK_ID),
         ("model-chat-b", "vision-b", "openai", "gpt-4o-mini", PK_ID),
     ] {
         let model: Model = serde_json::from_str(&format!(
@@ -256,7 +301,7 @@ fn snapshot(api_base: &str) -> AisixSnapshot {
         snap.models.insert(ResourceEntry::new(id, model, 1));
     }
     let key: ApiKey = serde_json::from_str(&format!(
-        r#"{{"key_hash":"{}","allowed_models":["vision","embedder","claude","reranker","effort","panel"]}}"#,
+        r#"{{"key_hash":"{}","allowed_models":["vision","embedder","claude","reranker","speaker","effort","panel"]}}"#,
         ApiKey::hash_bearer("sk-caller")
     ))
     .unwrap();
@@ -281,12 +326,14 @@ fn snapshot(api_base: &str) -> AisixSnapshot {
         r#"{"name":"capture","enabled":true,"kind":"otlp_http","endpoint":"http://127.0.0.1:9/v1/traces","content_mode":"full","content_max_bytes":1048576}"#,
     )
     .unwrap();
-    snap.observability_exporters
-        .insert(ResourceEntry::new("exporter-1", exporter, 1));
+    if capture_content {
+        snap.observability_exporters
+            .insert(ResourceEntry::new("exporter-1", exporter, 1));
+    }
     snap
 }
 
-fn router(api_base: &str) -> Router {
+fn router(api_base: &str, capture_content: bool) -> Router {
     let hub = Arc::new(Hub::new());
     hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
     hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
@@ -303,7 +350,12 @@ fn router(api_base: &str) -> Router {
         workers: None,
     };
     build_router(
-        ProxyState::new(SnapshotHandle::new(snapshot(api_base)), hub, &cfg).without_cache(),
+        ProxyState::new(
+            SnapshotHandle::new(snapshot(api_base, capture_content)),
+            hub,
+            &cfg,
+        )
+        .without_cache(),
     )
 }
 
@@ -467,6 +519,11 @@ fn rerank_body((documents, document_bytes): (usize, usize)) -> String {
         .to_string()
 }
 
+fn speech_body((parts, part_bytes): (usize, usize)) -> String {
+    let input: String = (0..parts).map(|i| base64_blob(part_bytes, i)).collect();
+    serde_json::json!({"model": "speaker", "input": input, "voice": "alloy"}).to_string()
+}
+
 fn embeddings_body((images, image_bytes): (usize, usize)) -> String {
     let input: Vec<String> = (0..images).map(|i| base64_blob(image_bytes, i)).collect();
     serde_json::json!({"model": "embedder", "input": input}).to_string()
@@ -551,6 +608,64 @@ async fn in_flight_multiplier(
     )
 }
 
+/// Unlike the send-window measurement, return the response headers and
+/// read its first event, but keep the upstream terminal event withheld.
+/// This includes estimator construction in the peak and its whole-stream
+/// retained input in the held count.
+async fn held_while_streaming(
+    app: &Router,
+    upstream: &mut HeldUpstream,
+    family: &Family,
+    size: (usize, usize),
+) -> (isize, isize, usize) {
+    upstream.hold.send_replace(true);
+    upstream.stream_hold.send_replace(true);
+    upstream.streaming.store(true, Ordering::SeqCst);
+    let before = live();
+    let mut body = (family.body)(size);
+    assert_eq!(body.pop(), Some('}'));
+    body.push_str(",\"stream\":true}");
+    let len = body.len();
+    PEAK.store(live(), Ordering::Relaxed);
+    let request = Request::builder()
+        .method("POST")
+        .uri(family.path)
+        .header("authorization", "Bearer sk-caller")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let call = tokio::spawn(app.clone().oneshot(request));
+    let received = tokio::time::timeout(Duration::from_secs(60), upstream.received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(received >= len / 2);
+    upstream.hold.send_replace(false);
+    let response = tokio::time::timeout(Duration::from_secs(60), call)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{}", family.name);
+    let mut stream = response.into_body().into_data_stream();
+    let first = tokio::time::timeout(Duration::from_secs(60), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(std::str::from_utf8(&first).unwrap().contains("data:"));
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let held = live() - before;
+    let peak = PEAK.load(Ordering::Relaxed) - before;
+    upstream.stream_hold.send_replace(false);
+    while let Some(chunk) = stream.next().await {
+        chunk.unwrap();
+    }
+    upstream.streaming.store(false, Ordering::SeqCst);
+    (held, peak, len)
+}
+
 struct Family {
     name: &'static str,
     path: &'static str,
@@ -564,6 +679,9 @@ struct Family {
     /// Bound on the highest point while the request is sent, where one is
     /// enforced.
     peak: Option<f64>,
+    /// Full prompt capture has its own copies before sending or during a
+    /// stream. Disable it only where measuring the send/estimator copy.
+    capture_content: bool,
 }
 
 impl Family {
@@ -575,6 +693,7 @@ impl Family {
             requests: 1,
             passed: 0,
             peak: None,
+            capture_content: true,
         }
     }
 
@@ -592,7 +711,8 @@ impl Family {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
     let mut upstream = start_upstream();
-    let app = router(&upstream.base);
+    let app = router(&upstream.base, true);
+    let uncaptured_app = router(&upstream.base, false);
 
     // Bound per family: the parsed request the handler keeps for retry,
     // fail-over and Model Group routing, plus the wire body reqwest holds
@@ -633,17 +753,23 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
         Family::new("embeddings", "/v1/embeddings", embeddings_body),
         // Relayed to an Anthropic upstream as-is: the route builds the
         // outbound body itself rather than through a provider bridge.
-        Family::new("messages passthrough", "/v1/messages", messages_body),
+        Family {
+            peak: Some(2.0 + MARGIN),
+            ..Family::new("messages passthrough", "/v1/messages", messages_body)
+        },
         Family::new(
             "messages -> openai (bridged)",
             "/v1/messages",
             messages_to_openai_body,
         ),
-        Family::new(
-            "count_tokens passthrough",
-            "/v1/messages/count_tokens",
-            messages_body,
-        ),
+        Family {
+            peak: Some(2.0 + MARGIN),
+            ..Family::new(
+                "count_tokens passthrough",
+                "/v1/messages/count_tokens",
+                messages_body,
+            )
+        },
         // Served natively by the OpenAI upstream, likewise built by the route.
         // Only `model` changes on the way out, so the outbound body is
         // serialized from the parsed request as it stands, not from a copy:
@@ -657,23 +783,50 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
             "/v1/responses",
             responses_to_anthropic_body,
         ),
-        // Each attempt rewrites its own copy of the body for its target.
-        Family::new("rerank", "/v1/rerank", rerank_body),
+        Family {
+            peak: Some(2.0 + MARGIN),
+            ..Family::new("rerank", "/v1/rerank", rerank_body)
+        },
+        Family {
+            // Serializing one large string grows the wire buffer to ~2x;
+            // a full Value clone would add another 1x above this bound.
+            peak: Some(3.0 + MARGIN),
+            capture_content: false,
+            ..Family::new(
+                "speech (no content capture)",
+                "/v1/audio/speech",
+                speech_body,
+            )
+        },
     ];
 
     // Warm lazily-initialised statics (TLS roots, regexes, metric
     // registries, the pooled upstream connections) so they are not charged
     // to a measurement.
     for family in &families {
-        held_while_pending(&app, &mut upstream, family.path, family.calls(), || {
-            (family.body)(SMALL)
-        })
+        let family_app = if family.capture_content {
+            &app
+        } else {
+            &uncaptured_app
+        };
+        held_while_pending(
+            family_app,
+            &mut upstream,
+            family.path,
+            family.calls(),
+            || (family.body)(SMALL),
+        )
         .await;
     }
 
     let mut report = Vec::new();
     for family in &families {
-        let (m, peak) = in_flight_multiplier(&app, &mut upstream, family).await;
+        let family_app = if family.capture_content {
+            &app
+        } else {
+            &uncaptured_app
+        };
+        let (m, peak) = in_flight_multiplier(family_app, &mut upstream, family).await;
         eprintln!(
             "{}: {m:.4}x request body held while upstream is pending (limit {:.1}x), peak {peak:.4}x",
             family.name,
@@ -681,6 +834,30 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
         );
         report.push((family, m, peak));
     }
+    let streaming_families = [
+        Family::new("responses stream", "/v1/responses", responses_body),
+        Family::new("messages stream", "/v1/messages", messages_body),
+    ];
+    let mut stream_failures = Vec::new();
+    for family in &streaming_families {
+        // Prompt capture retains its own full string; these cases isolate
+        // the token estimator's retained input with capture disabled.
+        held_while_streaming(&uncaptured_app, &mut upstream, family, SMALL).await;
+        let (small, small_peak, small_len) =
+            held_while_streaming(&uncaptured_app, &mut upstream, family, SMALL).await;
+        let (large, large_peak, large_len) =
+            held_while_streaming(&uncaptured_app, &mut upstream, family, LARGE).await;
+        let held = (large - small) as f64 / (large_len - small_len) as f64;
+        let peak = (large_peak - small_peak) as f64 / (large_len - small_len) as f64;
+        eprintln!(
+            "{}: {held:.4}x held during stream (limit 1.1x), peak {peak:.4}x (limit 2.1x)",
+            family.name
+        );
+        if held > 1.0 + MARGIN || peak > 2.0 + MARGIN {
+            stream_failures.push(format!("{}: held {held:.4}x, peak {peak:.4}x", family.name));
+        }
+    }
+    assert!(stream_failures.is_empty(), "{}", stream_failures.join("; "));
     for (family, m, peak) in report {
         assert!(
             m <= family.limit(),

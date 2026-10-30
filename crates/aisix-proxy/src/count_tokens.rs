@@ -804,40 +804,57 @@ async fn count_tokens_to_target(
         // cross-provider bridge needs has no consumer here.
         let (mapped, _) =
             crate::effort_mapping::anthropic_native_request(body.as_ref(), model, false);
-        let mut body = match mapped {
-            std::borrow::Cow::Owned(mapped) => mapped,
-            std::borrow::Cow::Borrowed(_) => body.into_owned(),
+        let body = match mapped {
+            std::borrow::Cow::Owned(mapped) => std::borrow::Cow::Owned(mapped),
+            std::borrow::Cow::Borrowed(_) => body,
         };
-
-        // Rewrite the `model` field to the upstream value, exactly as the
-        // /v1/messages passthrough does — the caller speaks the gateway's
-        // display name; the upstream expects its own id.
-        if let Some(m) = body.get_mut("model") {
-            *m = Value::String(upstream_model.clone());
-        }
-        // A Gemini thought signature riding in a tool id is for Gemini only.
-        if let Some(messages) = body.get_mut("messages") {
-            aisix_gateway::tool_calls::strip_thought_signatures_in_body(messages);
-        }
-
-        // Apply the PK's `request.*` override block to the outbound body,
-        // identically to the /v1/messages passthrough — count_tokens shares
-        // the same Anthropic ProviderKey, so operator-configured renames /
-        // constraints / defaults must reach this sibling route too. Apply
-        // order matches §5: renames → constraints → defaults; each is a
-        // no-op when its configured map is empty.
-        if let Some(r) = pk_entry.value.request.as_ref() {
-            aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
-            if let Some(constraints) = &r.param_constraints {
-                aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
+        let only_model_renamed = match &body {
+            std::borrow::Cow::Borrowed(body) => {
+                crate::util::model_only_fields(body, &pk_entry.value, Some("messages"))
             }
-            aisix_provider_openai::overrides::apply_default_body_fields(
-                &mut body,
-                &r.default_body_fields,
-            );
-        }
+            _ => None,
+        };
+        if let Some(fields) = only_model_renamed {
+            crate::util::outbound_json(&crate::util::ModelRenamed {
+                fields,
+                model: &upstream_model,
+            })?
+        } else {
+            let mut body = body.into_owned();
 
-        crate::util::outbound_json(&body)?
+            // Rewrite the `model` field to the upstream value, exactly as the
+            // /v1/messages passthrough does — the caller speaks the gateway's
+            // display name; the upstream expects its own id.
+            if let Some(m) = body.get_mut("model") {
+                *m = Value::String(upstream_model.clone());
+            }
+            // A Gemini thought signature riding in a tool id is for Gemini only.
+            if let Some(messages) = body.get_mut("messages") {
+                aisix_gateway::tool_calls::strip_thought_signatures_in_body(messages);
+            }
+
+            // Apply the PK's `request.*` override block to the outbound body,
+            // identically to the /v1/messages passthrough — count_tokens shares
+            // the same Anthropic ProviderKey, so operator-configured renames /
+            // constraints / defaults must reach this sibling route too. Apply
+            // order matches §5: renames → constraints → defaults; each is a
+            // no-op when its configured map is empty.
+            if let Some(r) = pk_entry.value.request.as_ref() {
+                aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
+                if let Some(constraints) = &r.param_constraints {
+                    aisix_provider_openai::overrides::apply_param_constraints(
+                        &mut body,
+                        constraints,
+                    );
+                }
+                aisix_provider_openai::overrides::apply_default_body_fields(
+                    &mut body,
+                    &r.default_body_fields,
+                );
+            }
+
+            crate::util::outbound_json(&body)?
+        }
     };
 
     // `build_anthropic_url` tolerates an api_base with or without `/v1` (the

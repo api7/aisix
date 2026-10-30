@@ -2226,7 +2226,14 @@ async fn speech_dispatch(
 
             // This attempt's body exists only as its wire bytes past this block
             // (see `crate::util::outbound_json`).
-            let body = {
+            let body = if let Some(fields) =
+                crate::util::model_only_fields(base_body, &pk_entry.value, None)
+            {
+                crate::util::outbound_json(&crate::util::ModelRenamed {
+                    fields,
+                    model: &upstream_model,
+                })?
+            } else {
                 let mut attempt_body = base_body.clone();
                 let body = &mut attempt_body;
                 // Rewrite model field.

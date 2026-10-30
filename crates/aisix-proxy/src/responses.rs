@@ -1212,46 +1212,6 @@ fn responses_value_text(v: &Value) -> String {
     }
 }
 
-/// Whether this attempt's outbound body differs from the caller's by more
-/// than the `model` value: a thought signature to strip from `input`, or
-/// any of the provider key's `request.*` body overrides.
-fn body_rewrite_needed(
-    fields: &serde_json::Map<String, Value>,
-    pk: &aisix_core::ProviderKey,
-) -> bool {
-    fields
-        .get("input")
-        .is_some_and(aisix_gateway::tool_calls::body_has_thought_signatures)
-        || pk.request.as_ref().is_some_and(|r| {
-            !r.param_renames.is_empty()
-                || r.param_constraints.is_some()
-                || !r.default_body_fields.is_empty()
-        })
-}
-
-/// The caller's request object with only `model` replaced, serialized
-/// field by field in the object's own order — the same bytes as cloning
-/// the object, rewriting `model` and serializing the clone.
-struct ModelRenamed<'a> {
-    fields: &'a serde_json::Map<String, Value>,
-    model: &'a str,
-}
-
-impl serde::Serialize for ModelRenamed<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(self.fields.len()))?;
-        for (key, value) in self.fields {
-            if key == "model" {
-                map.serialize_entry(key, self.model)?;
-            } else {
-                map.serialize_entry(key, value)?;
-            }
-        }
-        map.end()
-    }
-}
-
 /// Dispatch one concrete target's Responses-API passthrough. The caller
 /// has already confirmed the target serves `/v1/responses` natively
 /// ([`crate::dispatch::serves_natively`]) — which its vendor id implies
@@ -1329,15 +1289,13 @@ async fn responses_to_target(
         // with that one field swapped instead of deep-cloning it first, which
         // would be a second whole parsed request alive at the peak.
         let only_model_renamed = match &mapped {
-            Cow::Borrowed(Value::Object(fields))
-                if !body_rewrite_needed(fields, &pk_entry.value) =>
-            {
-                Some(fields)
+            Cow::Borrowed(body) => {
+                crate::util::model_only_fields(body, &pk_entry.value, Some("input"))
             }
             _ => None,
         };
         if let Some(fields) = only_model_renamed {
-            let wire = ModelRenamed {
+            let wire = crate::util::ModelRenamed {
                 fields,
                 model: &upstream_model,
             };
@@ -4439,7 +4397,7 @@ mod tests {
                 *model = serde_json::Value::String("upstream\"猫".into());
             }
             assert_eq!(
-                serde_json::to_vec(&super::ModelRenamed {
+                serde_json::to_vec(&crate::util::ModelRenamed {
                     fields,
                     model: "upstream\"猫"
                 })
@@ -4452,7 +4410,7 @@ mod tests {
     #[test]
     fn model_rename_fast_path_keeps_every_body_rewrite() {
         use serde_json::json;
-        let fields = json!({"input": "hi"}).as_object().unwrap().clone();
+        let body = json!({"input": "hi"});
         for (request, rewrite) in [
             (json!(null), false),
             (json!({}), false),
@@ -4468,13 +4426,19 @@ mod tests {
                 "display_name": "upstream", "api_key": "", "request": request
             }))
             .unwrap();
-            assert_eq!(super::body_rewrite_needed(&fields, &pk), rewrite);
+            assert_eq!(
+                crate::util::model_only_fields(&body, &pk, Some("input")).is_none(),
+                rewrite
+            );
         }
         let fields = json!({"input": [{"type": "function_call", "call_id": "c__thought__sig"}]});
-        assert!(super::body_rewrite_needed(
-            fields.as_object().unwrap(),
-            &serde_json::from_value(json!({"display_name": "upstream", "api_key": ""})).unwrap()
-        ));
+        let pk =
+            serde_json::from_value(json!({"display_name": "upstream", "api_key": ""})).unwrap();
+        assert!(crate::util::model_only_fields(&fields, &pk, Some("input")).is_none());
+        let messages = json!({"messages": [{"type": "tool_use", "id": "c__thought__sig"}]});
+        assert!(crate::util::model_only_fields(&messages, &pk, Some("messages")).is_none());
+        assert!(crate::util::model_only_fields(&messages, &pk, None).is_some());
+        assert!(crate::util::model_only_fields(&json!([]), &pk, None).is_none());
     }
 
     /// The two ways a Responses-API stream reports a failure in-band are

@@ -110,6 +110,8 @@ pub enum PromptInput {
     /// runs: a stream that keeps its estimator to the end would otherwise
     /// hold a second parsed copy of the request for its whole lifetime.
     ResponsesWire(bytes::Bytes),
+    /// Outbound `/v1/messages` bytes with the same deferred parsing.
+    AnthropicWire(bytes::Bytes),
 }
 
 /// Prompt shape + the model name that selects the tokenizer encoding.
@@ -143,6 +145,9 @@ impl Estimator {
             PromptInput::Responses(body) => count_responses_prompt(bpe, body),
             PromptInput::ResponsesWire(wire) => {
                 count_responses_prompt(bpe, &crate::util::outbound_value(wire))
+            }
+            PromptInput::AnthropicWire(wire) => {
+                count_anthropic_prompt(bpe, &crate::util::outbound_value(wire))
             }
         }
     }
@@ -1220,7 +1225,13 @@ mod tests {
                 ]}
             ]
         });
+        let wire_bytes = serde_json::to_vec(&body).unwrap();
         let est = Estimator::new("claude-sonnet-4-5", PromptInput::Anthropic(body));
+        let wire = Estimator::new(
+            "claude-sonnet-4-5",
+            PromptInput::AnthropicWire(wire_bytes.into()),
+        );
+        assert_eq!(wire.count_prompt(), est.count_prompt());
         let m = |s: &str| count_text("claude-sonnet-4-5", s);
         let expected = (TOKENS_PER_MESSAGE + m("system") + m("Be helpful"))
             + (TOKENS_PER_MESSAGE + m("user") + m("Hello"))
