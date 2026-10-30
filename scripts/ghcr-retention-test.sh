@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Runs ghcr-retention.sh against stubbed `gh` and `curl` to check how it
 # survives GitHub API failures: a 5xx or connection error on a listing or a
-# DELETE is retried, a DELETE answered 404 counts as done, anything else (or a
-# 5xx that outlasts the attempts) fails the run.
+# DELETE is retried, a retried DELETE answered 404 counts as done, anything
+# else (a first-attempt 404, or a 5xx that outlasts the attempts) fails the run.
 #
 # Fixture: ghcr.io/t/img holds five main builds (MAIN_KEEP=3 deletes the two
 # oldest, ids 1 and 2), ghcr.io/t/notary holds a signature for each of them
@@ -49,8 +49,11 @@ case "$answer" in
     $headers && printf 'HTTP/2.0 204 No Content\r\n\r\n'
     cat "$body"; exit 0 ;;
   conn)
+    # A paginated listing has printed its earlier pages before a later one fails.
+    $headers || head -n1 "$body"
     echo "Get \"https://api.github.com/x\": read tcp 10.0.0.1:443: connection reset by peer" >&2; exit 1 ;;
   *)
+    $headers || head -n1 "$body"
     $headers && printf 'HTTP/2.0 %s Error\r\nContent-Type: application/json\r\n\r\n{"message":"Error"}' "$answer"
     echo "gh: Error (HTTP $answer)" >&2; exit 1 ;;
 esac
@@ -117,6 +120,7 @@ run list-502-exhausted 1 - list-img="502 503 504"
 run delete-502-then-ok 0 "101 1 1 102 2" delete-1=502
 run delete-502-then-404 0 "101 101 1 102 2" delete-101="502 404"
 grep -q 'already gone (HTTP 404): signature 101' "$root/delete-502-then-404/out" || { echo "FAIL delete-502-then-404: 404 not reported as already gone"; fail=1; }
+run delete-404-first-attempt-fails 1 "101" delete-101=404
 run delete-conn-then-ok 0 "101 1 102 102 2" delete-102=conn
 run delete-502-exhausted 1 "101 101 101" delete-101="502 502 502"
 run delete-403-not-retried 1 "101" delete-101=403

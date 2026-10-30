@@ -31,9 +31,9 @@
 #
 # GitHub's package API answers a 5xx now and then. Every listing and DELETE is
 # retried up to GH_ATTEMPTS times with doubling backoff on a 5xx or a
-# connection error; a listing restarts from its first page. A DELETE answered
-# 404 counts as done: a retried DELETE can land after an earlier attempt
-# already removed the version.
+# connection error; a listing restarts from its first page. A retried DELETE
+# answered 404 counts as done: an earlier attempt can have removed the version
+# server-side. A 404 on the first attempt still fails the run.
 #
 # Usage: GH_TOKEN=... scripts/ghcr-retention.sh [--dry-run]
 set -euo pipefail
@@ -54,7 +54,9 @@ case "${1:-}" in
   --dry-run) dry_run=true ;;
   *) echo "usage: $0 [--dry-run]" >&2; exit 2 ;;
 esac
-[[ $MAX_DELETES =~ ^[0-9]+$ ]] || { echo "MAX_DELETES must be a whole number, got '$MAX_DELETES'" >&2; exit 2; }
+for n in MAX_DELETES GH_ATTEMPTS GH_RETRY_DELAY; do
+  [[ ${!n} =~ ^[0-9]+$ ]] || { echo "$n must be a whole number, got '${!n}'" >&2; exit 2; }
+done
 verb=$($dry_run && echo 'would delete' || echo 'deleted')
 
 ci_cutoff=$(date -u -d "${CI_TEST_MAX_AGE_DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)
@@ -79,6 +81,7 @@ gh_read() {
     attempt=$((attempt + 1))
     delay=$((delay * 2))
   done
+  cat "$work/gh.err" >&2
   cat "$work/gh.out"
 }
 
@@ -150,7 +153,7 @@ delete_version() {
     sleep "$DELETE_INTERVAL"
     until out=$(gh api -i -X DELETE "$(package_of "$image")/versions/$id" 2>&1); do
       status=$(sed -n '1s|^HTTP/[0-9.]* \([0-9]*\).*|\1|p' <<<"$out")
-      if [ "$status" = 404 ]; then
+      if [ "$status" = 404 ] && [ "$attempt" -gt 1 ]; then
         done_as='already gone (HTTP 404):'
         break
       fi
