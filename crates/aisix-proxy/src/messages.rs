@@ -1236,53 +1236,77 @@ async fn anthropic_passthrough_dispatch(
     // format with no object schema injects nothing and goes out as sent.
     let mut synthetic_json = false;
     let (body_bytes, is_stream, platform_body) = {
-        let mut body = body.into_owned();
-        if platform.is_some() && needs_synthetic_structured_output(&body, model) {
-            synthetic_json = aisix_provider_anthropic::json_tool::inject(&mut body);
-        }
-
-        // Rewrite the `model` field to the upstream value.
-        if let Some(m) = body.get_mut("model") {
-            *m = Value::String(upstream_model.clone());
-        }
-        // A Gemini thought signature riding in a tool id is for Gemini only.
-        if let Some(messages) = body.get_mut("messages") {
-            aisix_gateway::tool_calls::strip_thought_signatures_in_body(messages);
-        }
-
-        // Apply the PK's `request.*` override block to the outbound
-        // body. Mirrors the OpenAI dispatch path's `prepare_outbound_body`
-        // in `crates/aisix-provider-openai/src/bridge.rs:317-323`. The
-        // OpenAI bridge applies the same primitives via the Hub dispatch,
-        // but the Anthropic-passthrough path bypasses the Hub and builds
-        // the request directly here — without this block the override
-        // pipeline silently no-ops on `/v1/messages` (issue #302 §5
-        // contract; tracked as ai-gateway#335 for the gap-as-shipped).
-        //
-        // Apply order matches §5: renames → constraints → defaults. Each
-        // primitive is a no-op when its configured map is empty.
-        if let Some(r) = pk_value.request.as_ref() {
-            aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
-            if let Some(constraints) = &r.param_constraints {
-                aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
+        let only_model_renamed = match &body {
+            std::borrow::Cow::Borrowed(body) if platform.is_none() => {
+                crate::util::model_only_fields(body, pk_value, Some("messages"))
             }
-            aisix_provider_openai::overrides::apply_default_body_fields(
-                &mut body,
-                &r.default_body_fields,
-            );
+            _ => None,
+        };
+        if let Some(fields) = only_model_renamed {
+            let is_stream = fields
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            (
+                crate::util::outbound_json(&crate::util::ModelRenamed {
+                    fields,
+                    model: &upstream_model,
+                })?,
+                is_stream,
+                None,
+            )
+        } else {
+            let mut body = body.into_owned();
+            if platform.is_some() && needs_synthetic_structured_output(&body, model) {
+                synthetic_json = aisix_provider_anthropic::json_tool::inject(&mut body);
+            }
+
+            // Rewrite the `model` field to the upstream value.
+            if let Some(m) = body.get_mut("model") {
+                *m = Value::String(upstream_model.clone());
+            }
+            // A Gemini thought signature riding in a tool id is for Gemini only.
+            if let Some(messages) = body.get_mut("messages") {
+                aisix_gateway::tool_calls::strip_thought_signatures_in_body(messages);
+            }
+
+            // Apply the PK's `request.*` override block to the outbound
+            // body. Mirrors the OpenAI dispatch path's `prepare_outbound_body`
+            // in `crates/aisix-provider-openai/src/bridge.rs:317-323`. The
+            // OpenAI bridge applies the same primitives via the Hub dispatch,
+            // but the Anthropic-passthrough path bypasses the Hub and builds
+            // the request directly here — without this block the override
+            // pipeline silently no-ops on `/v1/messages` (issue #302 §5
+            // contract; tracked as ai-gateway#335 for the gap-as-shipped).
+            //
+            // Apply order matches §5: renames → constraints → defaults. Each
+            // primitive is a no-op when its configured map is empty.
+            if let Some(r) = pk_value.request.as_ref() {
+                aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
+                if let Some(constraints) = &r.param_constraints {
+                    aisix_provider_openai::overrides::apply_param_constraints(
+                        &mut body,
+                        constraints,
+                    );
+                }
+                aisix_provider_openai::overrides::apply_default_body_fields(
+                    &mut body,
+                    &r.default_body_fields,
+                );
+            }
+            // Check if the request wants streaming.
+            let is_stream = body
+                .get("stream")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if synthetic_json && is_stream {
+                body["stream"] = Value::Bool(false);
+            }
+            let bytes = crate::util::outbound_json(&body)?;
+            // A platform bridge adapts the body itself, so it takes the value
+            // rather than parsing the bytes back.
+            (bytes, is_stream, platform.is_some().then_some(body))
         }
-        // Check if the request wants streaming.
-        let is_stream = body
-            .get("stream")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if synthetic_json && is_stream {
-            body["stream"] = Value::Bool(false);
-        }
-        let bytes = crate::util::outbound_json(&body)?;
-        // A platform bridge adapts the body itself, so it takes the value
-        // rather than parsing the bytes back.
-        (bytes, is_stream, platform.is_some().then_some(body))
     };
     let upstream_streams = is_stream && !synthetic_json;
 
@@ -1628,7 +1652,7 @@ async fn anthropic_passthrough_dispatch(
         // Tokenized only if the upstream never reports usage.
         let estimator = crate::token_estimate::Estimator::new(
             &upstream_model,
-            crate::token_estimate::PromptInput::Anthropic(crate::util::outbound_value(&body_bytes)),
+            crate::token_estimate::PromptInput::AnthropicWire(body_bytes.clone()),
         );
         let parsed_stream = build_anthropic_passthrough_stream(
             body_stream,
