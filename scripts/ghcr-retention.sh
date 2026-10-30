@@ -55,7 +55,8 @@ case "${1:-}" in
   *) echo "usage: $0 [--dry-run]" >&2; exit 2 ;;
 esac
 for n in MAX_DELETES GH_ATTEMPTS GH_RETRY_DELAY; do
-  [[ ${!n} =~ ^[0-9]+$ ]] || { echo "$n must be a whole number, got '${!n}'" >&2; exit 2; }
+  [[ ${!n} =~ ^[0-9]{1,9}$ ]] || { echo "$n must be a whole number below 10^9, got '${!n}'" >&2; exit 2; }
+  printf -v "$n" '%d' "$((10#${!n}))"
 done
 verb=$($dry_run && echo 'would delete' || echo 'deleted')
 
