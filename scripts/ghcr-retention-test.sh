@@ -49,11 +49,12 @@ case "$answer" in
     $headers && printf 'HTTP/2.0 204 No Content\r\n\r\n'
     cat "$body"; exit 0 ;;
   conn)
-    # A paginated listing has printed its earlier pages before a later one fails.
-    $headers || head -n1 "$body"
+    # A paginated listing has printed its earlier pages before a later one
+    # fails; those rows are not in the listing that later succeeds.
+    $headers || cat "$FIXTURE/$pkg.leak"
     echo "Get \"https://api.github.com/x\": read tcp 10.0.0.1:443: connection reset by peer" >&2; exit 1 ;;
   *)
-    $headers || head -n1 "$body"
+    $headers || cat "$FIXTURE/$pkg.leak"
     $headers && printf 'HTTP/2.0 %s Error\r\nContent-Type: application/json\r\n\r\n{"message":"Error"}' "$answer"
     echo "gh: Error (HTTP $answer)" >&2; exit 1 ;;
 esac
@@ -93,6 +94,10 @@ run() {
     done
     printf '200\tsha256:%064d\t%s\tsomething-else\n' 999 "$old"
   } > "$FIXTURE/notary.tsv"
+  # Rows a failed listing prints. Each would add a DELETE if it leaked into
+  # the plan: an older main build, and another signature of image 1.
+  printf '50\t%s\t%s\tsha-50\n' "$(digest 50)" "$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ)" > "$FIXTURE/img.leak"
+  printf '150\tsha256:%064d\t%s\tsha256-%064d.sig\n' 950 "$old" 1 > "$FIXTURE/notary.leak"
   for q; do tr ' ' '\n' <<<"${q#*=}" > "$FIXTURE/${q%%=*}"; done
   PATH="$root/bin:$PATH" IMAGES=t/img NOTARY_IMAGE=t/notary MAIN_KEEP=3 \
     DELETE_INTERVAL=0 GH_RETRY_DELAY=0 GH_ATTEMPTS=3 GH_TOKEN=x \
