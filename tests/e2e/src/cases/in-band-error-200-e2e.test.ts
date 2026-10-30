@@ -169,6 +169,9 @@ const ROUTE_NS = "ib-route-ns";
 const ROUTE_NS_PREFIX = "/passthrough/ib-ns";
 const ROUTE_GUARDED = "ib-route-guarded";
 const ROUTE_GUARDED_PREFIX = "/passthrough/ib-guarded";
+const ROUTE_GUARDED_MIXED = "ib-route-guarded-mixed";
+const ROUTE_GUARDED_MIXED_PREFIX = "/passthrough/ib-guarded-mixed";
+const BLOCKED_PHRASE = "a phrase the upstream never says";
 const ROUTE_EMPTY = "ib-route-empty";
 const ROUTE_EMPTY_PREFIX = "/passthrough/ib-empty";
 
@@ -240,13 +243,29 @@ describe("an upstream 200 that reports a failure in its body", () => {
         enabled: true,
         hook_point: "output",
         kind: "keyword",
-        patterns: [{ kind: "literal", value: "a phrase the upstream never says" }],
+        patterns: [{ kind: "literal", value: BLOCKED_PHRASE }],
       },
       { attach: false },
     );
     for (const [name, prefix, opts] of [
       [ROUTE_NS, ROUTE_NS_PREFIX, { nonStreamBody: { error: PROVIDER_ERROR } }],
       [ROUTE_GUARDED, ROUTE_GUARDED_PREFIX, { nonStreamBody: { error: PROVIDER_ERROR } }],
+      [
+        ROUTE_GUARDED_MIXED,
+        ROUTE_GUARDED_MIXED_PREFIX,
+        {
+          nonStreamBody: {
+            id: "chatcmpl-mixed",
+            object: "chat.completion",
+            created: 1_700_000_000,
+            model: "relay-mini",
+            choices: [
+              { index: 0, message: { role: "assistant", content: BLOCKED_PHRASE }, finish_reason: "stop" },
+            ],
+            error: PROVIDER_ERROR,
+          },
+        },
+      ],
       [ROUTE_EMPTY, ROUTE_EMPTY_PREFIX, EMPTY_ERROR_STREAM],
     ] as const) {
       const upstream = await startOpenAiUpstream(opts);
@@ -262,7 +281,7 @@ describe("an upstream 200 that reports a failure in its body", () => {
         target_url: upstream.baseUrl,
         provider_key_id: pk.id,
       });
-      if (name === ROUTE_GUARDED) {
+      if (name === ROUTE_GUARDED || name === ROUTE_GUARDED_MIXED) {
         await seed.update("guardrail_attachments", randomUUID(), {
           guardrail_id: outputGuard.id,
           scope_type: "passthrough_route",
@@ -442,6 +461,16 @@ describe("an upstream 200 that reports a failure in its body", () => {
     const row = await usageRow(res.requestId);
     expectInBandFailure(row, "502", PROVIDER_MESSAGE);
     expect(row.get("guardrail_blocked") ?? "false").toBe("false");
+  });
+
+  test("passthrough route behind an output guardrail: answer text beside an error is still scanned", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    const res = await post(
+      `${ROUTE_GUARDED_MIXED_PREFIX}/v1/chat/completions`,
+      chat("qwen/qwen-2.5-7b-instruct", false),
+    );
+    expect(res.status).toBe(422);
+    expect(res.text).not.toContain(BLOCKED_PHRASE);
   });
 
   // ── An `error` that reports nothing ────────────────────────────────

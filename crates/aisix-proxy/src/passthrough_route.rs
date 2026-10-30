@@ -1164,7 +1164,7 @@ async fn dispatch(
     // non-success body is its error contract, so preserve its status, headers,
     // and bytes instead of replacing a 4xx/5xx with a local guardrail 422.
     // A 2xx body that reports a failure in-band is the provider's error,
-    // relayed as sent like a non-success one: recorded, not scanned.
+    // relayed as sent like a non-success one, and recorded as a failure.
     let in_band = if status.is_success() {
         body_in_band_error(protocol, &resp_body)
     } else {
@@ -1173,13 +1173,13 @@ async fn dispatch(
     if let Some(err) = &in_band {
         telemetry.record_failure(err);
     }
-    if status.is_success()
-        && in_band.is_none()
-        && !bypass_uninspectable_output
-        && output_guardrail_active
-    {
+    if status.is_success() && !bypass_uninspectable_output && output_guardrail_active {
         let text = match try_buffered_response_guardrail_text(protocol, &resp_body) {
             Ok(text) => Some(text),
+            // An error body with no answer in it is the provider's failure,
+            // not an answer the guardrail could not read. One that carries
+            // answer text beside its error is still scanned.
+            Err(_) if in_band.is_some() => None,
             Err(err)
                 if !aisix_guardrails::Guardrail::refuses_unevaluable_output(&resolved_chain) =>
             {
