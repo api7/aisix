@@ -14,9 +14,11 @@ import {
 } from "../harness/index.js";
 
 // A chat, messages or responses answer always carries an id. A Gemini answer's
-// is its `responseId`, one value across a stream; an upstream that reports none
-// (Gemini without the field, Bedrock Converse) gets one from the gateway, which
-// is not mistaken for the provider's in the usage event.
+// is its `responseId`; an upstream that reports none (Gemini without the field,
+// Bedrock Converse) gets one from the gateway, which is not mistaken for the
+// provider's in the usage event. On a chat stream the upstream's first id holds
+// from the frame that reports it on, and empty frames ahead of it share one
+// generated id.
 
 const CALLER = "sk-response-id-never-empty";
 const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
@@ -37,6 +39,24 @@ const GEMINI_MODELS: Record<string, Array<string | undefined>> = {
   "gemini-without-id": [undefined, undefined, undefined],
   "gemini-late-id": [undefined, RESPONSE_ID, RESPONSE_ID],
 };
+
+/** An OpenAI-shape stream whose frames report these ids, in order. */
+const OPENAI_FRAME_IDS = ["", "", "up-first", "", "up-other"];
+const OPENAI_STREAM = OPENAI_FRAME_IDS.map((id, i) =>
+  JSON.stringify({
+    id,
+    object: "chat.completion.chunk",
+    created: 1_700_000_000,
+    model: "gpt-4o-mini",
+    choices: [
+      {
+        index: 0,
+        delta: i === 0 ? { role: "assistant", content: "o" } : { content: "k" },
+        finish_reason: i === OPENAI_FRAME_IDS.length - 1 ? "stop" : null,
+      },
+    ],
+  }),
+);
 
 const CONVERSE_REPLY = {
   output: { message: { role: "assistant", content: [{ text: "ok" }] } },
@@ -74,6 +94,11 @@ describe("response ids", () => {
       req.resume();
       req.on("end", () => {
         const path = (req.url ?? "").split("?")[0];
+        if (path.endsWith("/chat/completions")) {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.end(`${OPENAI_STREAM.map((f) => `data: ${f}\n\n`).join("")}data: [DONE]\n\n`);
+          return;
+        }
         if (path.includes("/model/")) {
           if (path.endsWith("/converse-stream")) {
             res.writeHead(200, { "content-type": "application/vnd.amazon.eventstream" });
@@ -139,6 +164,17 @@ describe("response ids", () => {
       provider: "bedrock",
       model_name: "us.amazon.nova-lite-v1:0",
       provider_key_id: bedrock.id,
+    });
+    const openai = await seed.createProviderKey({
+      display_name: "id-openai-pk",
+      secret: "sk-mock",
+      api_base: `${base}/v1`,
+    });
+    await seed.createModel({
+      display_name: "openai-late-id",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: openai.id,
     });
     // Seeded last: this key authenticating implies the whole seed set landed.
     await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"] });
@@ -236,11 +272,26 @@ describe("response ids", () => {
     });
   });
 
-  test("a responseId first seen after the stream began does not change its id", async (ctx) => {
+  test("Gemini: frames ahead of a late responseId share a generated id, then it holds", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const { raw, requestId } = await chat("gemini-late-id", true);
-    expect(chatStreamId(raw)).toMatch(/^chatcmpl-[0-9a-f]{32}$/);
-    expect(await providerRequestId(requestId), "the upstream's id is still recorded").toBe(RESPONSE_ID);
+    const ids = sseData(raw).map((f) => f.id);
+    const leading = ids.filter((id) => id !== RESPONSE_ID);
+    expect(new Set(leading).size, "one generated id ahead of the upstream's").toBe(1);
+    expect(leading[0]).toMatch(/^chatcmpl-[0-9a-f]{32}$/);
+    expect(ids.slice(0, leading.length)).toEqual(leading);
+    expect(ids.slice(leading.length).length, "frames carry the upstream's id").toBeGreaterThan(0);
+    expect(await providerRequestId(requestId), "the upstream's id is recorded").toBe(RESPONSE_ID);
+  });
+
+  test("the upstream's first id holds whatever later frames report", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const ids = sseData((await chat("openai-late-id", true)).raw).map((f) => f.id);
+    // One frame per upstream frame: two empty, then "up-first", "", "up-other".
+    expect(ids).toHaveLength(OPENAI_FRAME_IDS.length);
+    expect(ids[0]).toMatch(/^chatcmpl-[0-9a-f]{32}$/);
+    expect(ids[1]).toBe(ids[0]);
+    expect(ids.slice(2)).toEqual(["up-first", "up-first", "up-first"]);
   });
 
   describe.each(["gemini-with-id", "gemini-without-id", "converse-nova"])("%s on the other streams", (model) => {

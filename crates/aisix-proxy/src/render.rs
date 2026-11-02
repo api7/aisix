@@ -302,23 +302,26 @@ fn generated_completion_id() -> String {
     format!("chatcmpl-{}", uuid::Uuid::new_v4().simple())
 }
 
-/// The one id a stream's frames carry: the first frame's, or a generated one
-/// when that frame has none. It is minted here rather than in a provider bridge
-/// because `ChatChunk::id` also feeds the usage event's `provider_request_id`,
-/// which must stay the upstream's own.
+/// The id a stream's frames carry: the first id the upstream reports, from that
+/// frame on, whatever later frames say. Empty frames ahead of it share one
+/// generated id, and so does a whole stream with no upstream id. A generated id
+/// is minted here rather than in a provider bridge because `ChatChunk::id` also
+/// feeds the usage event's `provider_request_id`, which must stay the upstream's
+/// own.
 #[derive(Default)]
-pub(crate) struct StreamId(Option<String>);
+pub(crate) struct StreamId {
+    upstream: Option<String>,
+    generated: Option<String>,
+}
 
 impl StreamId {
     pub(crate) fn stamp(&mut self, id: &mut String) {
-        match &self.0 {
-            Some(stream_id) => id.clone_from(stream_id),
-            None => {
-                if id.is_empty() {
-                    *id = generated_completion_id();
-                }
-                self.0 = Some(id.clone());
-            }
+        if let Some(upstream) = &self.upstream {
+            id.clone_from(upstream);
+        } else if id.is_empty() {
+            id.clone_from(self.generated.get_or_insert_with(generated_completion_id));
+        } else {
+            self.upstream = Some(id.clone());
         }
     }
 }
