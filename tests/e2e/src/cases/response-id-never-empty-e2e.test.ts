@@ -238,7 +238,9 @@ describe("response ids", () => {
 
   test("a responseId first seen after the stream began does not change its id", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
-    expect(chatStreamId((await chat("gemini-late-id", true)).raw)).toMatch(/^chatcmpl-[0-9a-f]{32}$/);
+    const { raw, requestId } = await chat("gemini-late-id", true);
+    expect(chatStreamId(raw)).toMatch(/^chatcmpl-[0-9a-f]{32}$/);
+    expect(await providerRequestId(requestId), "the upstream's id is still recorded").toBe(RESPONSE_ID);
   });
 
   describe.each(["gemini-with-id", "gemini-without-id", "converse-nova"])("%s on the other streams", (model) => {

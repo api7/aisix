@@ -1979,8 +1979,7 @@ struct GeminiStreamState {
     choices: std::collections::BTreeMap<u32, GeminiStreamChoice>,
     /// The last tier the stream reported, stamped on every chunk.
     service_tier: Option<ServiceTier>,
-    /// The id every chunk carries: fixed by the first frame that emits one,
-    /// empty when that frame had no `responseId`, so a stream keeps one id.
+    /// The first `responseId` the stream reported, stamped on every chunk.
     response_id: Option<String>,
 }
 
@@ -2032,10 +2031,9 @@ fn gemini_chunk_into_chat_chunks(
     {
         state.service_tier = Some(tier);
     }
-    let response_id = state
-        .response_id
-        .clone()
-        .unwrap_or_else(|| raw.response_id.take().unwrap_or_default());
+    if state.response_id.is_none() {
+        state.response_id = raw.response_id.take().filter(|id| !id.is_empty());
+    }
     let blocked = raw.prompt_blocked();
     let candidates = raw.indexed_candidates();
     let mut usage = raw
@@ -2046,7 +2044,7 @@ fn gemini_chunk_into_chat_chunks(
     let chunk = |choice_index: u32, delta: ChatDelta, state: &GeminiStreamState| ChatChunk {
         choice_index,
         logprobs: None,
-        id: response_id.clone(),
+        id: state.response_id.clone().unwrap_or_default(),
         model: upstream_id.to_string(),
         delta,
         finish_reason: None,
@@ -2160,9 +2158,6 @@ fn gemini_chunk_into_chat_chunks(
                 ..chunk(0, ChatDelta::default(), state)
             }),
         }
-    }
-    if !chunks.is_empty() {
-        state.response_id = Some(response_id);
     }
     chunks
 }

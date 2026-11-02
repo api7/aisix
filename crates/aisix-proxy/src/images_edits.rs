@@ -442,7 +442,7 @@ async fn dispatch(
     // Content capture (#700): the image/mask bytes are NOT captured — a
     // binary field is represented by its sha256, text fields verbatim
     // POST-redaction (the audio convention); the response side is the
-    // full image JSON (the generations convention).
+    // image JSON with its base64 replaced (the generations convention).
     let content_cap = content_capture_cap(
         snapshot
             .observability_exporters
@@ -748,7 +748,7 @@ async fn dispatch(
     let captured_content = match (&captured_prompt, content_cap) {
         (Some(prompt), Some(cap)) => Some(CapturedContent::new(
             prompt,
-            &aisix_obs::sink::image_response_for_capture(&resp_json),
+            &crate::images::captured_image_response(&resp_json),
             cap as usize,
         )),
         _ => None,

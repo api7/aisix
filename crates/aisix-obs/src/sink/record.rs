@@ -202,8 +202,10 @@ impl CapturedContent {
     /// exporter requested. `truncated` is set if either was cut here; a
     /// per-exporter `SinkContent` ORs in its own (smaller) cap.
     ///
-    /// The prompt's base64 media is omitted first, so no exporter path can
-    /// carry it and a large attachment alone never pushes a prompt over the cap.
+    /// The prompt's base64 media is omitted first, so no structured or flat
+    /// field can carry it and a large attachment alone never pushes a prompt
+    /// over the cap. A prompt that is not JSON has no fields to recognise and is
+    /// only truncated.
     pub fn new(prompt: &str, response: &str, max_bytes: usize) -> Self {
         let prompt = omit_base64_media_in_json(prompt);
         let (prompt, p_cut) = truncate_content(&prompt, max_bytes);
