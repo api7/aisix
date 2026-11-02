@@ -1637,7 +1637,7 @@ describe("Vertex Gemini: generated images on chat completions", () => {
       const from = sls!.requests.length;
       // A prompt over the capture cap is exported as the raw request JSON, cut
       // down string by string. An image this small survives that cut, so only
-      // taking it out of the captured request keeps it from the exporter.
+      // omitting it from the captured request keeps it from the exporter.
       const padding = "x".repeat(256 * 1024);
       const history = (name: string) => [
         { role: "user", content: "draw" },
@@ -1666,7 +1666,7 @@ describe("Vertex Gemini: generated images on chat completions", () => {
       for (const [name, count] of [["whole", 1], ["stream", 1], ["hit", 2], ["failed", 1]] as const) {
         await expect.poll(() => rows(name).length, { timeout: 10_000, message: name }).toBeGreaterThanOrEqual(count);
         for (const row of rows(name)) {
-          expect(row.get("prompt"), name).toContain("[images omitted]");
+          expect(row.get("prompt"), name).toContain("[aisix: base64 data uri omitted,");
         }
       }
       const captured = decodedTextFor(sls!, LOGSTORE, from);

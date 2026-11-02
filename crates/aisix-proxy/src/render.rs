@@ -298,6 +298,34 @@ pub struct RenderedDelta {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+fn generated_completion_id() -> String {
+    format!("chatcmpl-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// The id a stream's frames carry: the first id the upstream reports, from that
+/// frame on, whatever later frames say. Empty frames ahead of it share one
+/// generated id, and so does a whole stream with no upstream id. A generated id
+/// is minted here rather than in a provider bridge because `ChatChunk::id` also
+/// feeds the usage event's `provider_request_id`, which must stay the upstream's
+/// own.
+#[derive(Default)]
+pub(crate) struct StreamId {
+    upstream: Option<String>,
+    generated: Option<String>,
+}
+
+impl StreamId {
+    pub(crate) fn stamp(&mut self, id: &mut String) {
+        if let Some(upstream) = &self.upstream {
+            id.clone_from(upstream);
+        } else if id.is_empty() {
+            id.clone_from(self.generated.get_or_insert_with(generated_completion_id));
+        } else {
+            self.upstream = Some(id.clone());
+        }
+    }
+}
+
 pub fn render_response(
     created_unix_ts: i64,
     resp: ChatResponse,
@@ -307,7 +335,11 @@ pub fn render_response(
     // `claude-3-5-sonnet-20241022`, etc.). The wire-level contract is
     // to echo the customer's requested name — see module-level docs.
     ChatCompletion {
-        id: resp.id,
+        id: if resp.id.is_empty() {
+            generated_completion_id()
+        } else {
+            resp.id
+        },
         object: "chat.completion",
         created: created_unix_ts,
         model: client_facing_model.to_string(),
