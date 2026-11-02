@@ -2655,19 +2655,21 @@ fn gemini_user_parts(
 }
 
 /// An assistant turn's generated `images`, the part shape the same turn's
-/// response carried them in. A non-array `images` has no slot on this wire.
+/// response carried them in. Media downloads cover user turns only and are
+/// counted per use, so these never draw on them.
 fn gemini_replayed_image_parts(
     m: &ChatMessage,
     index: usize,
-    fetched: &FetchedMedia,
 ) -> Result<Vec<GeminiPart>, BridgeError> {
-    if m.role != Role::Assistant {
-        return Ok(Vec::new());
-    }
-    let images = m.extra.get("images").and_then(serde_json::Value::as_array);
+    let images = match m.extra.get("images") {
+        Some(images) if m.role == Role::Assistant && !images.is_null() => images,
+        _ => return Ok(Vec::new()),
+    };
+    let images = images.as_array().ok_or_else(|| {
+        BridgeError::InvalidRequest(format!("messages[{index}].images must be an array"))
+    })?;
     images
-        .into_iter()
-        .flatten()
+        .iter()
         .enumerate()
         .map(|(i, image)| {
             let invalid = |reason: String| {
@@ -2675,7 +2677,7 @@ fn gemini_replayed_image_parts(
             };
             match parse_part(image).map_err(invalid)? {
                 ContentPart::Media(media) if media.kind == MediaKind::Image => {
-                    gemini_media_part(&media, fetched)
+                    gemini_media_part(&media, &FetchedMedia::default())
                         .map(GeminiPart::Raw)
                         .map_err(invalid)
                 }
@@ -2798,7 +2800,7 @@ fn build_gemini_request_with(
     let mut tool_responses: Vec<GeminiPart> = Vec::new();
     let mut prior_tool_calls: Vec<&serde_json::Value> = Vec::new();
     for (index, m) in req.messages.iter().enumerate() {
-        let replayed_images = gemini_replayed_image_parts(m, index, fetched)?;
+        let replayed_images = gemini_replayed_image_parts(m, index)?;
         // `generateContent` has no slot for replayed reasoning; a turn that
         // holds only that would become an empty `model` turn.
         if m.is_reasoning_only() && replayed_images.is_empty() {

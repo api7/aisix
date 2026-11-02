@@ -2977,6 +2977,10 @@ fn build_anthropic_sse_stream(
                     if let (Some((max_hold, fail_open)), false) = (hold_policy, released) {
                         // Hold-back: withhold the chunk until the end-of-
                         // stream scan clears it.
+                        // This protocol discards generated images, so they
+                        // are neither held nor counted against the hold.
+                        let mut chunk = chunk;
+                        chunk.delta.extra.remove("images");
                         let raw = crate::held_content::chat_chunk_raw(&chunk);
                         held_bytes.hold(crate::held_content::chat_delta(&chunk.delta), raw);
                         held_chunk_bytes.add(raw);

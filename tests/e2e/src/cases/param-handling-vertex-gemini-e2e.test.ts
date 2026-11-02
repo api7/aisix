@@ -1453,6 +1453,29 @@ describe("Vertex Gemini: generated images on chat completions", () => {
     });
     expect(res.status).toBe(400);
     expect(JSON.parse(res.text).error.message).toContain("messages[1].images[0]");
+
+    // Media downloads cover user turns; an http URL here is not fetched.
+    const unfetched = await post("/v1/chat/completions", {
+      model: "img",
+      messages: [
+        { role: "user", content: "draw" },
+        { role: "assistant", content: "x", images: [{ type: "image_url", image_url: { url: "http://example.com/a.png" } }] },
+        { role: "user", content: "again" },
+      ],
+    });
+    expect(unfetched.status).toBe(400);
+    expect(JSON.parse(unfetched.text).error.message).toContain("messages[1].images[0]");
+
+    const notAnArray = await post("/v1/chat/completions", {
+      model: "img",
+      messages: [
+        { role: "user", content: "draw" },
+        { role: "assistant", content: "x", images: "oops" },
+        { role: "user", content: "again" },
+      ],
+    });
+    expect(notAnArray.status).toBe(400);
+    expect(JSON.parse(notAnArray.text).error.message).toContain("messages[1].images");
     expect(received.length).toBe(before);
   });
 
@@ -1630,6 +1653,14 @@ describe("Vertex Gemini: generated images on chat completions", () => {
       // The stream ran to its protocol's own end.
       expect(streamed.text).toContain(path === "/v1/messages" ? "message_stop" : "response.completed");
     }
+
+    // A held stream does not trip its bound on an image it was going to discard.
+    useAnswer([{ text: answer }, inline(image("discarded", 1024 * 1024))]);
+    const held = await post(path, { model: "img-tight-cap", ...request, stream: true });
+    expect(held.status, held.text.slice(0, 500)).toBe(200);
+    expect(held.text).not.toContain("event: error");
+    expect(held.text).not.toContain(MARKER);
+    expect(held.text).toContain(answer);
   });
 
   test("images from an OpenAI-compatible upstream pass through chat unchanged", async (ctx) => {

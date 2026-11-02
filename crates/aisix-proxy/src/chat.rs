@@ -6519,8 +6519,9 @@ where
                 // Hold-back: withhold this chunk until its window (or the
                 // whole response) scans clean.
                 let chunk_content = crate::held_content::chat_delta(&chunk.delta);
-                let chunk_bounded_raw = crate::held_content::chat_chunk_bounded_raw(&chunk);
-                pending_bytes.add(crate::held_content::chat_chunk_raw(&chunk));
+                let chunk_raw = crate::held_content::chat_chunk_raw(&chunk);
+                let chunk_images_raw = crate::held_content::chat_chunk_images_raw(&chunk);
+                pending_bytes.add(chunk_raw);
                 pending.push(chunk);
                 match &stream_policy {
                     aisix_guardrails::StreamOutputPolicy::Window {
@@ -6623,7 +6624,7 @@ where
                         max_buffer_bytes,
                         on_exceeded_fail_open,
                     } => {
-                        held.hold(chunk_content, chunk_bounded_raw);
+                        held.hold(chunk_content, chunk_raw.saturating_sub(chunk_images_raw));
                         if held.exceeds(*max_buffer_bytes) {
                             if *on_exceeded_fail_open {
                                 // Fail-open overflow releases the held
