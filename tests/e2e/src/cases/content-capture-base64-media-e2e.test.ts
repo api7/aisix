@@ -31,6 +31,8 @@ const KIND_SERVER = 2;
 const MARKER = "aW1hZ2VwYXlsb2FkbWFya2Vy";
 const SMALL = MARKER.repeat(4);
 const LARGE = MARKER.repeat(16 * 1024);
+// Past the size at which the gateway stops waiting for a stream frame to end.
+const OVERSIZED = MARKER.repeat(64 * 1024);
 const dataUri = (payload: string) => `data:image/png;base64,${payload}`;
 const placeholder = (bytes: number) => `[aisix: base64 data uri omitted, ${bytes} bytes]`;
 const imagePart = (bytes: number) => ({
@@ -152,6 +154,24 @@ describe("base64 images under content_mode full", () => {
       req.on("data", (c: Buffer) => chunks.push(c));
       req.on("end", () => {
         const path = (req.url ?? "").split("?")[0];
+        if (path.endsWith("/pt/buffered")) {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify(IMAGE_BODY));
+          return;
+        }
+        if (path.endsWith("/pt/stream") || path.endsWith("/pt/stream-oversized")) {
+          const payload = path.endsWith("/pt/stream") ? SMALL : OVERSIZED;
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          void (async () => {
+            const frame = `data: ${JSON.stringify({ type: "image_generation.completed", b64_json: payload })}\n\n`;
+            for (let at = 0; at < frame.length; at += 64 * 1024) {
+              res.write(frame.slice(at, at + 64 * 1024));
+              await new Promise((r) => setImmediate(r));
+            }
+            res.end();
+          })();
+          return;
+        }
         if (path.endsWith("/images/generations") || path.endsWith("/images/edits")) {
           res.writeHead(200, { "content-type": "application/json" });
           res.end(JSON.stringify(IMAGE_BODY));
@@ -217,8 +237,9 @@ describe("base64 images under content_mode full", () => {
     await seed.createModel({ display_name: "cap-openai", provider: "openai", model_name: "gpt-4o-mini", provider_key_id: openai.id });
     await seed.createModel({ display_name: "cap-bridged", provider: "openai", model_name: "gpt-4o-mini", provider_key_id: bridged.id });
     await seed.createModel({ display_name: "cap-anthropic", provider: "anthropic", model_name: "claude-sonnet-4-5", provider_key_id: anthropic.id });
+    await seed.createPassthroughRoute({ name: "cap-pt", path_prefix: "/cap-pt", target_url: base, provider_key_id: openai.id });
     // Seeded last: this key authenticating implies the whole seed set landed.
-    await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"] });
+    await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"], allowed_routes: ["*"] });
     await waitConfigPropagation(async () => {
       const res = await fetch(`${app!.proxyUrl}/v1/models`, { headers: { authorization: `Bearer ${CALLER}` } });
       await res.text();
@@ -428,6 +449,61 @@ describe("base64 images under content_mode full", () => {
     expect(inputMessages(row, span)[0].parts).toEqual([
       { type: "input_file", filename: "a.pdf", file_data: `data:application/pdf;base64,${placeholder(pdf.length)}` },
     ]);
+  });
+
+  describe("passthrough routes", () => {
+    const route = (suffix: string, body: unknown) =>
+      fetch(`${app!.proxyUrl}/cap-pt/pt/${suffix}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${CALLER}`, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    const row = (res: Response) => {
+      const requestId = res.headers.get("x-aisix-request-id") ?? "";
+      expect(requestId).not.toBe("");
+      return waitForSlsLog(sls!, LOGSTORE, (l) => l.get("request_id") === requestId, "SLS row");
+    };
+    const expectNoPayload = (log: Map<string, string>) =>
+      expect(JSON.stringify([...log.entries()]).includes(MARKER), "payload in the SLS row").toBe(false);
+
+    test("a request body's media and a buffered image answer are omitted", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const res = await route("buffered", {
+        contents: [{ parts: [{ inlineData: { mimeType: "image/png", data: SMALL } }, { text: "hello" }] }],
+        image: dataUri(SMALL),
+      });
+      const answer = await res.text();
+      expect(res.status, answer.slice(0, 500)).toBe(200);
+      expect(JSON.parse(answer).data[0].b64_json).toBe(SMALL);
+      const log = await row(res);
+      expectNoPayload(log);
+      const prompt = JSON.parse(log.get("prompt") ?? "null");
+      expect(prompt.contents[0].parts).toEqual([
+        { inlineData: { mimeType: "image/png", data: placeholder(SMALL.length) } },
+        { text: "hello" },
+      ]);
+      expect(prompt.image).toBe(`data:image/png;base64,${placeholder(uriBytes(SMALL))}`);
+      expect(JSON.parse(log.get("response") ?? "null").data).toEqual([
+        { b64_json: placeholder(SMALL.length), revised_prompt: "a small cat" },
+      ]);
+    });
+
+    test.each([
+      ["stream", SMALL, { describe: "a cat", stream: true }],
+      ["stream-oversized", OVERSIZED, { describe: "a cat", stream: true }],
+      // The same frame on a route that reads the stream as a known protocol.
+      ["stream-oversized", OVERSIZED, { prompt: "a cat", stream: true }],
+    ])("a streamed image answer is omitted: %s %j", async (suffix, payload, body) => {
+      if (!etcdReachable || !app) return;
+      const res = await route(suffix, body);
+      const answer = await res.text();
+      expect(res.status, answer.slice(0, 500)).toBe(200);
+      // Only the export changes: the caller receives every byte.
+      expect(answer).toContain(payload);
+      const log = await row(res);
+      expectNoPayload(log);
+      if ("describe" in body) expect(log.get("response")).toContain("[aisix: base64 data uri omitted, ");
+    });
   });
 
   describe("image endpoints", () => {

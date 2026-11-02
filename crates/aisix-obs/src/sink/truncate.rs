@@ -189,7 +189,8 @@ fn base64_omitted(original_bytes: usize) -> String {
 /// `file_data` stays: a base64 data URI anywhere; `source.data` of a `type: base64`
 /// source on an `image` / `document` block; `input_audio.data` of an `input_audio`
 /// part; `file_data` of an `input_file` part or a `file` object; `inlineData.data`
-/// beside a mime type; `source.bytes` of an `image` / `document` / `video` object;
+/// beside a mime type; `source.bytes` of an `image` / `document` / `video` / `audio`
+/// object;
 /// a replayed `image_generation_call`'s `result`; and the image APIs' `b64_json`,
 /// `partial_image_b64` and `bytesBase64Encoded`.
 pub fn omit_base64_media(v: &mut Value) -> bool {
@@ -233,7 +234,7 @@ pub fn omit_base64_media(v: &mut Value) -> bool {
                     {
                         child.get_mut("data").is_some_and(omit_bare_base64)
                     }
-                    "image" | "document" | "video" => child
+                    "image" | "document" | "video" | "audio" => child
                         .get_mut("source")
                         .and_then(|source| source.get_mut("bytes"))
                         .is_some_and(omit_bare_base64),
@@ -290,14 +291,32 @@ const MEDIA_NEEDLES: [&str; 10] = [
     "image_generation_call",
 ];
 
-/// [`omit_base64_media`] over serialized content. Text that is not JSON, or
-/// holds no base64 media, comes back untouched, byte for byte.
+/// What marks media in JSON that does not parse, such as a stream frame cut
+/// partway through a payload: everything from the first of these on is dropped.
+const CUT_MEDIA_MARKERS: [&str; 9] = [
+    ";base64,",
+    "\"b64_json\"",
+    "\"partial_image_b64\"",
+    "\"bytesBase64Encoded\"",
+    "\"input_audio\"",
+    "\"file_data\"",
+    "\"inlineData\"",
+    "\"inline_data\"",
+    "\"image_generation_call\"",
+];
+
+/// [`omit_base64_media`] over serialized content. Content that holds no base64
+/// media comes back untouched, byte for byte. Text that does not parse has no
+/// fields to walk, so it is cut at the first media marker it shows.
 pub fn omit_base64_media_in_json(s: &str) -> Cow<'_, str> {
     if !MEDIA_NEEDLES.iter().any(|needle| s.contains(needle)) {
         return Cow::Borrowed(s);
     }
     let Ok(mut root) = serde_json::from_str::<Value>(s) else {
-        return Cow::Borrowed(s);
+        return match CUT_MEDIA_MARKERS.iter().filter_map(|m| s.find(m)).min() {
+            Some(at) => Cow::Owned(format!("{}{}", &s[..at], base64_omitted(s.len() - at))),
+            None => Cow::Borrowed(s),
+        };
     };
     if !omit_base64_media(&mut root) {
         return Cow::Borrowed(s);
@@ -528,6 +547,23 @@ mod tests {
             "not json, mentions base64",
         ] {
             assert!(matches!(omit_base64_media_in_json(s), Cow::Borrowed(b) if b == s));
+        }
+    }
+
+    #[test]
+    fn json_cut_partway_through_a_payload_is_cut_at_the_media_marker() {
+        for (cut, kept) in [
+            (r#"{"type":"x","b64_json":"QUJDQUJD"#, r#"{"type":"x","#),
+            (
+                r#"{"url":"data:image/png;base64,QUJDQUJD"#,
+                r#"{"url":"data:image/png"#,
+            ),
+            (r#"{"inlineData":{"data":"QUJD"#, "{"),
+        ] {
+            let out = omit_base64_media_in_json(cut);
+            assert!(out.starts_with(kept), "{out}");
+            assert!(out.contains(BASE64_OMITTED_PREFIX), "{out}");
+            assert!(!out.contains("QUJD"), "{out}");
         }
     }
 

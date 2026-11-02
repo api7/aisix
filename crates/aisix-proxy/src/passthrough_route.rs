@@ -5900,14 +5900,24 @@ fn frame_parts_and_tier(
 /// the provider's JSON source representation even though the guardrail scans
 /// decoded string values from that same frame.
 fn frame_capture_text(protocol: PassthroughProtocol, frame: &[u8], scan: &str) -> String {
-    if !matches!(protocol, PassthroughProtocol::Raw) {
-        return scan.to_string();
-    }
-    crate::redact::frame_payload(frame)
+    let payload = crate::redact::frame_payload(frame)
         .map(|payload| payload.trim().to_owned())
-        .filter(|payload| !payload.is_empty() && payload != "[DONE]")
-        .map(|payload| aisix_obs::sink::omit_base64_media_in_json(&payload).into_owned())
-        .unwrap_or_else(|| scan.to_string())
+        .filter(|payload| !payload.is_empty() && payload != "[DONE]");
+    let Some(payload) = payload else {
+        return scan.to_string();
+    };
+    let omitted = aisix_obs::sink::omit_base64_media_in_json(&payload);
+    if matches!(protocol, PassthroughProtocol::Raw) {
+        return omitted.into_owned();
+    }
+    // A frame cut partway through a payload has no answer to extract: what the
+    // scan holds for it is the frame's own text, base64 included.
+    let cut = matches!(omitted, std::borrow::Cow::Owned(_))
+        && serde_json::from_str::<serde::de::IgnoredAny>(&payload).is_err();
+    if cut {
+        return omitted.into_owned();
+    }
+    scan.to_string()
 }
 
 /// The SSE error frame appended when an output guardrail blocks mid-relay,
@@ -11242,6 +11252,15 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         let captured = frame_capture_text(PassthroughProtocol::Raw, frame, "");
         assert!(captured.contains("omitted"), "{captured}");
         assert!(!captured.contains("QUJD"), "{captured}");
+        let cut = b"data: {\"type\":\"image_generation.completed\",\"b64_json\":\"QUJD";
+        for protocol in [
+            PassthroughProtocol::Raw,
+            PassthroughProtocol::OpenaiCompletions,
+        ] {
+            let captured = frame_capture_text(protocol, cut, "QUJD");
+            assert!(captured.contains("omitted"), "{captured}");
+            assert!(!captured.contains("QUJD"), "{captured}");
+        }
     }
 
     #[test]
