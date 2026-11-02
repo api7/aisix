@@ -276,11 +276,10 @@ fn omit_bare_base64(v: &mut Value) -> bool {
     true
 }
 
-/// Text serialized content must contain for [`omit_base64_media`] to find
-/// anything, so content with no media is not parsed on the request path.
-const MEDIA_NEEDLES: [&str; 10] = [
+/// Text serialized content must contain, in any case, for [`omit_base64_media`]
+/// to find anything, so content with no media is not parsed on the request path.
+const MEDIA_NEEDLES: [&str; 9] = [
     "base64",
-    "Base64",
     "b64",
     "\"bytes\"",
     "input_audio",
@@ -308,15 +307,30 @@ const CUT_MEDIA_MARKERS: [&str; 11] = [
     "\"image_generation_call\"",
 ];
 
+/// Where ASCII `needle` first occurs in `s`, in any case. An ASCII match always
+/// starts on a character boundary.
+fn find_ignore_ascii_case(s: &str, needle: &str) -> Option<usize> {
+    s.as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 /// [`omit_base64_media`] over serialized content. Content that holds no base64
 /// media comes back untouched, byte for byte. Text that does not parse has no
 /// fields to walk, so it is cut at the first media marker it shows.
 pub fn omit_base64_media_in_json(s: &str) -> Cow<'_, str> {
-    if !MEDIA_NEEDLES.iter().any(|needle| s.contains(needle)) {
+    if !MEDIA_NEEDLES
+        .iter()
+        .any(|needle| find_ignore_ascii_case(s, needle).is_some())
+    {
         return Cow::Borrowed(s);
     }
     let Ok(mut root) = serde_json::from_str::<Value>(s) else {
-        return match CUT_MEDIA_MARKERS.iter().filter_map(|m| s.find(m)).min() {
+        return match CUT_MEDIA_MARKERS
+            .iter()
+            .filter_map(|marker| find_ignore_ascii_case(s, marker))
+            .min()
+        {
             Some(at) => Cow::Owned(format!("{}{}", &s[..at], base64_omitted(s.len() - at))),
             None => Cow::Borrowed(s),
         };
@@ -563,6 +577,10 @@ mod tests {
             ),
             (r#"{"inlineData":{"data":"QUJD"#, "{"),
             (
+                r#"{"url":"data:image/png;BASE64,QUJDQUJD"#,
+                r#"{"url":"data:image/png"#,
+            ),
+            (
                 r#"{"source":{"type":"base64","data":"QUJD"#,
                 r#"{"source":{"type":"#,
             ),
@@ -602,6 +620,7 @@ mod tests {
             r#"{"partial_image_b64": "QUJD"}"#,
             r#"{"bytesBase64Encoded": "QUJD"}"#,
             r#"{"u": "data:image/png;base64,QUJD"}"#,
+            r#"{"u": "data:image/png;BASE64,QUJD"}"#,
         ] {
             assert!(
                 omit_base64_media_in_json(s).contains("[aisix: base64 data uri omitted, "),

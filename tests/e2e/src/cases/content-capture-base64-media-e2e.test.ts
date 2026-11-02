@@ -458,13 +458,12 @@ describe("base64 media under content_mode full", () => {
         headers: { authorization: `Bearer ${CALLER}`, "content-type": "application/json" },
         body: JSON.stringify(body),
       });
-    const row = (res: Response) => {
+    /** The request's SLS row; `records` holds it and the spans to no payload. */
+    const row = async (res: Response) => {
       const requestId = res.headers.get("x-aisix-request-id") ?? "";
       expect(requestId).not.toBe("");
-      return waitForSlsLog(sls!, LOGSTORE, (l) => l.get("request_id") === requestId, "SLS row");
+      return (await records(requestId)).row;
     };
-    const expectNoPayload = (log: Map<string, string>) =>
-      expect(JSON.stringify([...log.entries()]).includes(MARKER), "payload in the SLS row").toBe(false);
 
     test("a request body's media and a buffered image answer are omitted", async (ctx) => {
       if (!etcdReachable || !app) return ctx.skip();
@@ -476,7 +475,6 @@ describe("base64 media under content_mode full", () => {
       expect(res.status, answer.slice(0, 500)).toBe(200);
       expect(JSON.parse(answer).data[0].b64_json).toBe(SMALL);
       const log = await row(res);
-      expectNoPayload(log);
       const prompt = JSON.parse(log.get("prompt") ?? "null");
       expect(prompt.contents[0].parts).toEqual([
         { inlineData: { mimeType: "image/png", data: placeholder(SMALL.length) } },
@@ -501,7 +499,6 @@ describe("base64 media under content_mode full", () => {
       // Only the export changes: the caller receives every byte.
       expect(answer).toContain(payload);
       const log = await row(res);
-      expectNoPayload(log);
       if ("describe" in body) expect(log.get("response")).toContain("[aisix: base64 data uri omitted, ");
     });
   });
