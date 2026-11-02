@@ -1899,7 +1899,7 @@ async fn multipart_dispatch(
                 resolved_chain.record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
             }
         }
-        if refusal.is_none() && !scan.text.is_empty() {
+        if refusal.is_none() {
             let synth = ChatResponse {
                 logprobs: None,
                 more_choices: Vec::new(),

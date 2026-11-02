@@ -3057,7 +3057,8 @@ fn build_anthropic_sse_stream(
         // assistant text and, on a block, emit a terminal Anthropic
         // `error` event instead of completing the stream cleanly.
         if let (Some(chain), false) = (output_guardrail.as_ref(), released) {
-            if !content_text.is_empty() || !tool_call_fragments.is_empty() {
+            // Consulted with no text as well: a `custom` row decides for itself.
+            {
                 let mut message =
                     aisix_gateway::ChatMessage::assistant(std::mem::take(&mut content_text));
                 if !tool_call_fragments.is_empty() {
@@ -4587,7 +4588,8 @@ where
                 }
                 text.push_str(payload);
             }
-            if !text.is_empty() {
+            // Consulted with no text as well: a `custom` row decides for itself.
+            {
                 let synth = aisix_gateway::ChatResponse { logprobs: None, more_choices: Vec::new(),
                     id: String::new(),
                     model: model_label.clone(),

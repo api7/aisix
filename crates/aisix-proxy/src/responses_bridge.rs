@@ -2769,7 +2769,8 @@ pub fn build_responses_bridge_stream(
         // frame rather than withheld bytes, mirroring the chat surface's
         // EndOfStreamCheck behavior.
         let (text, tool_calls) = encoder.assembled_assistant_message();
-        if !text.is_empty() || !tool_calls.is_empty() {
+        // Consulted with no text as well: a `custom` row decides for itself.
+        {
             // Live mode has no held frames for the segment pass to walk —
             // offer the flattened text as one segment so monitor-mode
             // segment moderators still record their observations.

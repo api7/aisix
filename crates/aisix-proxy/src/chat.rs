@@ -6755,9 +6755,8 @@ where
                     } else {
                         format!("{content_part}\n{tc_part}")
                     };
-                    let blocked = if final_text.is_empty() {
-                        false
-                    } else {
+                    // Consulted with no text as well: a `custom` row decides for itself.
+                    let blocked = {
                         let synthesized = {
                             let comp = guard.comp();
                             aisix_gateway::ChatResponse { logprobs: None, more_choices: Vec::new(),

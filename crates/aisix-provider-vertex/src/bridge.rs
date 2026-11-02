@@ -3088,9 +3088,9 @@ struct GeminiMessageParts {
 }
 
 /// A candidate's parts → the turn's text, its reasoning (`thought: true`
-/// parts, as sent), its OpenAI-shape `tool_calls` (no `index`) and its
-/// generated images, each in part order. An interim `thought: true` image
-/// is not final output and is left out.
+/// text parts, as sent), its OpenAI-shape `tool_calls` (no `index`) and its
+/// generated images (interim `thought: true` ones included), each in part
+/// order.
 fn gemini_parts_into_message(content: GeminiResponseContent) -> GeminiMessageParts {
     let mut out = GeminiMessageParts::default();
     for part in content.parts {
@@ -3108,7 +3108,7 @@ fn gemini_parts_into_message(content: GeminiResponseContent) -> GeminiMessagePar
             ));
         }
         if let Some(inline) = part.inline_data {
-            if !part.thought && inline.mime_type.starts_with("image/") {
+            if inline.mime_type.starts_with("image/") {
                 out.images.push(inline);
             }
         }
@@ -3361,7 +3361,8 @@ fn finish_with_tool_calls(reason: Option<&str>) -> FinishReason {
 /// - `STOP` → `FinishReason::Stop`
 /// - `MAX_TOKENS` → `FinishReason::Length`
 /// - `SAFETY` / `RECITATION` / `BLOCKLIST` / `PROHIBITED_CONTENT` /
-///   `SPII` / `IMAGE_SAFETY` / `LANGUAGE` → `FinishReason::ContentFilter`
+///   `SPII` / `IMAGE_SAFETY` / `IMAGE_PROHIBITED_CONTENT` / `IMAGE_RECITATION`
+///   / `IMAGE_OTHER` / `NO_IMAGE` / `LANGUAGE` → `FinishReason::ContentFilter`
 /// - `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` / `OTHER` /
 ///   `FINISH_REASON_UNSPECIFIED` / unknown → `FinishReason::Stop`
 ///
@@ -3379,6 +3380,10 @@ fn map_gemini_finish_reason(reason: Option<&str>) -> FinishReason {
         | Some("PROHIBITED_CONTENT")
         | Some("SPII")
         | Some("IMAGE_SAFETY")
+        | Some("IMAGE_PROHIBITED_CONTENT")
+        | Some("IMAGE_RECITATION")
+        | Some("IMAGE_OTHER")
+        | Some("NO_IMAGE")
         | Some("LANGUAGE") => FinishReason::ContentFilter,
         _ => FinishReason::Stop,
     }

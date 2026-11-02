@@ -1056,8 +1056,9 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
 // An image model answers `:generateContent` with `inlineData` parts. Chat
 // Completions returns them as `images` beside the text, in the shape other
 // image-capable OpenAI-compatible upstreams use; the other two client protocols
-// keep only the text. The parts mirror what a real image model returned: a
-// thought, an interim thought image and a signed final image.
+// keep only the text. The parts mirror what `gemini-nano-banana-2.1` returned: a
+// thought, an unsigned interim thought image, more thought, a signed text part
+// and the signed final image.
 describe("Vertex Gemini: generated images on chat completions", () => {
   // Every image payload carries a marker, so a leak of any of them is greppable
   // wherever it lands.
@@ -1075,23 +1076,31 @@ describe("Vertex Gemini: generated images on chat completions", () => {
   });
 
   const USAGE_METADATA = { promptTokenCount: 5, candidatesTokenCount: 1290, totalTokenCount: 1295 };
-  const reply = (parts: unknown[], usageMetadata: unknown = USAGE_METADATA) => ({
-    candidates: [{ content: { role: "model", parts }, finishReason: "STOP" }],
+  const reply = (parts: unknown[], usageMetadata: unknown, finishReason: string) => ({
+    candidates: [{ content: { role: "model", parts }, finishReason }],
     usageMetadata,
   });
   const THOUGHT_TEXT = { text: "Sketching it out.", thought: true };
+  const MORE_THOUGHT = { text: " Refining it.", thought: true };
+  const SIGNATURE_PART = "c2ln".repeat(50);
   const FULL_PARTS = [
     THOUGHT_TEXT,
     { ...inline(THOUGHT_IMAGE), thought: true },
-    { text: "Here it is." },
-    { ...inline(IMAGE_A), thoughtSignature: "c2ln".repeat(50) },
-    inline(IMAGE_B, "image/jpeg"),
+    MORE_THOUGHT,
+    { text: "Here it is.", thoughtSignature: SIGNATURE_PART },
+    { ...inline(IMAGE_A, "image/jpeg"), thoughtSignature: SIGNATURE_PART },
     inline("QVVESU8=", "audio/wav"),
   ];
-  // The same answer, one part per frame, the way a stream delivers it.
-  const framesOf = (parts: unknown[], usageMetadata: unknown = USAGE_METADATA) => [
+  const FULL_IMAGES = [entry(THOUGHT_IMAGE, 0), entry(IMAGE_A, 1, "image/jpeg")];
+  // The same answer the way a stream delivers it: one part per frame, then a
+  // last frame with empty text, the finish reason and usage. An answer refused
+  // outright has no parts in either form.
+  const framesOf = (parts: unknown[], usageMetadata: unknown, finishReason: string) => [
     ...parts.map((part) => ({ candidates: [{ content: { role: "model", parts: [part] } }] })),
-    { candidates: [{ content: { role: "model", parts: [] }, finishReason: "STOP" }], usageMetadata },
+    {
+      candidates: [{ content: { role: "model", parts: parts.length > 0 ? [{ text: "" }] : [] }, finishReason }],
+      usageMetadata,
+    },
   ];
 
   const CAPTURE_CREDENTIAL = "imgmock";
@@ -1108,11 +1117,13 @@ describe("Vertex Gemini: generated images on chat completions", () => {
   const received: Received[] = [];
   let parts: unknown[] = FULL_PARTS;
   let usageMetadata: unknown = USAGE_METADATA;
+  let finishReason = "STOP";
   let unique = 0;
 
-  const useAnswer = (next: unknown[], usage: unknown = USAGE_METADATA) => {
+  const useAnswer = (next: unknown[], usage: unknown = USAGE_METADATA, finish = "STOP") => {
     parts = next;
     usageMetadata = usage;
+    finishReason = finish;
   };
   const say = (content: string = `prompt-${++unique}`) => [{ role: "user", content }];
 
@@ -1166,11 +1177,11 @@ describe("Vertex Gemini: generated images on chat completions", () => {
         res.statusCode = 200;
         if (r.path.endsWith(":streamGenerateContent")) {
           res.setHeader("content-type", "text/event-stream");
-          res.end(framesOf(parts, usageMetadata).map((f) => `data: ${JSON.stringify(f)}\r\n\r\n`).join(""));
+          res.end(framesOf(parts, usageMetadata, finishReason).map((f) => `data: ${JSON.stringify(f)}\r\n\r\n`).join(""));
           return;
         }
         res.setHeader("content-type", "application/json");
-        res.end(JSON.stringify(reply(parts, usageMetadata)));
+        res.end(JSON.stringify(reply(parts, usageMetadata, finishReason)));
       });
     });
     await new Promise<void>((resolve) => upstream!.listen(0, "127.0.0.1", resolve));
@@ -1236,6 +1247,7 @@ describe("Vertex Gemini: generated images on chat completions", () => {
     const blocked = await model("img-keyword");
     const masked = await model("img-pii");
     const tight = await model("img-tight-cap");
+    const custom = await model("img-custom-block");
     for (const [display_name, compatible] of [
       ["or-img", openAiCompatible],
       ["or-img-stream", openAiCompatibleStream],
@@ -1270,6 +1282,15 @@ describe("Vertex Gemini: generated images on chat completions", () => {
       hook_point: "output",
       kind: "pii",
       detectors: [{ type: "email", action: "mask" }],
+    });
+    await scoped(custom.id, {
+      name: "img-custom-block",
+      enabled: true,
+      hook_point: "output",
+      kind: "custom",
+      output_fail_open: false,
+      timeout_ms: 5000,
+      script: `export function checkOutput() { return { action: "block" }; }`,
     });
     // Its raw-byte bound is far below the image the case below sends.
     await scoped(tight.id, {
@@ -1327,13 +1348,13 @@ describe("Vertex Gemini: generated images on chat completions", () => {
     await otlp?.close();
   });
 
-  test("a whole response carries its final images in order, never in content", async (ctx) => {
+  test("a whole response carries thought and final images in order, never in content", async (ctx) => {
     if (!ready(ctx)) return;
     useAnswer(FULL_PARTS);
     const message = await chat({ model: "img", messages: say() });
     expect(message.content).toBe("Here it is.");
-    expect(message.reasoning_content).toBe(THOUGHT_TEXT.text);
-    expect(message.images).toEqual([entry(IMAGE_A, 0), entry(IMAGE_B, 1, "image/jpeg")]);
+    expect(message.reasoning_content).toBe(THOUGHT_TEXT.text + MORE_THOUGHT.text);
+    expect(message.images).toEqual(FULL_IMAGES);
     expect(JSON.stringify(message)).not.toContain("QVVESU8=");
   });
 
@@ -1343,8 +1364,8 @@ describe("Vertex Gemini: generated images on chat completions", () => {
     const out = await chatStream({ model: "img", messages: say() });
     expect(out.roles).toEqual(["assistant"]);
     expect(out.content).toBe("Here it is.");
-    expect(out.reasoning).toBe(THOUGHT_TEXT.text);
-    expect(out.images).toEqual([entry(IMAGE_A, 0), entry(IMAGE_B, 1, "image/jpeg")]);
+    expect(out.reasoning).toBe(THOUGHT_TEXT.text + MORE_THOUGHT.text);
+    expect(out.images).toEqual(FULL_IMAGES);
     expect(out.finish).toEqual(["stop"]);
     expect(out.raw).not.toContain("QVVESU8=");
   });
@@ -1363,17 +1384,61 @@ describe("Vertex Gemini: generated images on chat completions", () => {
     expect(out.finish).toEqual(["stop"]);
   });
 
-  test("a thought image alone yields no images at all", async (ctx) => {
+  test("a thought image alone is returned like any other", async (ctx) => {
     if (!ready(ctx)) return;
-    useAnswer([THOUGHT_TEXT, { ...inline(THOUGHT_IMAGE), thought: true }, { text: "no picture" }]);
+    useAnswer([THOUGHT_TEXT, { ...inline(THOUGHT_IMAGE), thought: true }, { text: "a sketch" }]);
     const message = await chat({ model: "img", messages: say() });
-    expect(message.content).toBe("no picture");
-    expect(message).not.toHaveProperty("images");
+    expect(message.content).toBe("a sketch");
+    expect(message.reasoning_content).toBe(THOUGHT_TEXT.text);
+    expect(message.images).toEqual([entry(THOUGHT_IMAGE, 0)]);
 
     const out = await chatStream({ model: "img", messages: say() });
-    expect(out.content).toBe("no picture");
+    expect(out.content).toBe("a sketch");
+    expect(out.images).toEqual([entry(THOUGHT_IMAGE, 0)]);
+  });
+
+  test.for([
+    "IMAGE_SAFETY",
+    "IMAGE_PROHIBITED_CONTENT",
+    "IMAGE_RECITATION",
+    "IMAGE_OTHER",
+    "NO_IMAGE",
+  ])("%s with no parts finishes as content_filter", async (reason, ctx) => {
+    if (!ready(ctx)) return;
+    useAnswer([], USAGE_METADATA, reason);
+    const message = await post("/v1/chat/completions", { model: "img", messages: say() });
+    expect(message.status, message.text.slice(0, 500)).toBe(200);
+    const choice = JSON.parse(message.text).choices[0];
+    expect(choice.finish_reason).toBe("content_filter");
+    expect(choice.message).not.toHaveProperty("images");
+
+    const out = await chatStream({ model: "img", messages: say() });
+    expect(out.raw).not.toContain("event: error");
+    expect(out.finish).toEqual(["content_filter"]);
     expect(out.images).toEqual([]);
-    expect(out.raw).not.toContain(MARKER);
+  });
+
+  test("a refused image reaches the other two protocols as a refusal", async (ctx) => {
+    if (!ready(ctx)) return;
+    useAnswer([], USAGE_METADATA, "IMAGE_RECITATION");
+    const messages = await post("/v1/messages", { model: "img", max_tokens: 100, messages: HI });
+    expect(messages.status, messages.text.slice(0, 500)).toBe(200);
+    expect(JSON.parse(messages.text).stop_reason).toBe("refusal");
+    const messagesStream = await post("/v1/messages", { model: "img", max_tokens: 100, messages: HI, stream: true });
+    expect(messagesStream.status).toBe(200);
+    expect(messagesStream.text).not.toContain("event: error");
+    expect(messagesStream.text).toContain('"stop_reason":"refusal"');
+    expect(messagesStream.text).toContain("message_stop");
+
+    const responses = await post("/v1/responses", { model: "img", input: "hi" });
+    expect(responses.status, responses.text.slice(0, 500)).toBe(200);
+    const body = JSON.parse(responses.text);
+    expect(body.status).toBe("incomplete");
+    expect(body.incomplete_details.reason).toBe("content_filter");
+    const responsesStream = await post("/v1/responses", { model: "img", input: "hi", stream: true });
+    expect(responsesStream.status).toBe(200);
+    expect(responsesStream.text).toContain("response.incomplete");
+    expect(responsesStream.text).toContain('"reason":"content_filter"');
   });
 
   test("a multi-megabyte image survives both paths byte for byte", async (ctx) => {
@@ -1489,6 +1554,23 @@ describe("Vertex Gemini: generated images on chat completions", () => {
         const out = await chatStream({ model, messages: say() });
         expect(out.raw, model).not.toContain("event: error");
         expect(out.images, model).toEqual([entry(IMAGE_A, 0)]);
+      }
+    });
+
+    test("a script that blocks unconditionally decides an image-only answer", async (ctx) => {
+      if (!ready(ctx)) return;
+      useAnswer([inline(IMAGE_A)]);
+      const whole = await post("/v1/chat/completions", { model: "img-custom-block", messages: say() });
+      expect(whole.status).toBe(422);
+      expect(whole.text).not.toContain(MARKER);
+      for (const [path, body] of [
+        ["/v1/chat/completions", { messages: say() }],
+        ["/v1/messages", { max_tokens: 100, messages: say() }],
+        ["/v1/responses", { input: "hi" }],
+      ] as const) {
+        const res = await post(path, { model: "img-custom-block", ...body, stream: true });
+        expect(res.text, path).toContain("blocked by content policy");
+        expect(res.text, path).not.toContain(MARKER);
       }
     });
 
