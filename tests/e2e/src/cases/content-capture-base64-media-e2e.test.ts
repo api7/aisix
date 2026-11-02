@@ -1,13 +1,15 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   SeedClient,
   spawnApp,
+  startMcpUpstream,
   startMockSls,
   waitConfigPropagation,
   waitForSlsLog,
+  type McpUpstream,
   type MockSls,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -54,6 +56,32 @@ const CHAT_STREAM = [
   { ...CHAT_BODY, object: "chat.completion.chunk", usage: undefined, choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }] },
   { ...CHAT_BODY, object: "chat.completion.chunk", usage: undefined, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
 ];
+// One of each media carrier an MCP tool result has, beside text that must stay.
+const MCP_TEXT = `tool output, a payload named in prose stays: ${SMALL.slice(0, 8)}`;
+const mcpResult = (image: string) => ({
+  content: [
+    { type: "text", text: MCP_TEXT },
+    { type: "image", data: image, mimeType: "image/png" },
+    { type: "audio", data: SMALL, mimeType: "audio/wav" },
+    { type: "resource", resource: { uri: "file:///a.pdf", mimeType: "application/pdf", blob: SMALL } },
+    { type: "resource", resource: { uri: "file:///a.log", mimeType: "text/plain", text: "a log line" } },
+    { type: "resource_link", uri: "file:///b.png", name: "b.png" },
+    { type: "text", text: dataUri(SMALL) },
+  ],
+  structuredContent: { thumbnail: dataUri(SMALL), width: 16 },
+});
+const mcpResultExported = (image: string) => ({
+  content: [
+    { type: "text", text: MCP_TEXT },
+    { type: "image", data: placeholder(image.length), mimeType: "image/png" },
+    { type: "audio", data: placeholder(SMALL.length), mimeType: "audio/wav" },
+    { type: "resource", resource: { uri: "file:///a.pdf", mimeType: "application/pdf", blob: placeholder(SMALL.length) } },
+    { type: "resource", resource: { uri: "file:///a.log", mimeType: "text/plain", text: "a log line" } },
+    { type: "resource_link", uri: "file:///b.png", name: "b.png" },
+    { type: "text", text: `data:image/png;base64,${placeholder(uriBytes(SMALL))}` },
+  ],
+  structuredContent: { thumbnail: `data:image/png;base64,${placeholder(uriBytes(SMALL))}`, width: 16 },
+});
 const IMAGE_BODY = {
   created: 1_700_000_000,
   data: [{ b64_json: SMALL, revised_prompt: "a small cat" }],
@@ -142,6 +170,8 @@ describe("base64 media under content_mode full", () => {
   let upstream: Server | undefined;
   let sls: MockSls | undefined;
   let otlp: MockOtlp | undefined;
+  let mcp: McpUpstream | undefined;
+  let mcpLarge: McpUpstream | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
@@ -199,6 +229,8 @@ describe("base64 media under content_mode full", () => {
 
     sls = await startMockSls();
     otlp = await startMockOtlp();
+    mcp = await startMcpUpstream("media", { mediaResult: mcpResult(SMALL) });
+    mcpLarge = await startMcpUpstream("large", { mediaResult: mcpResult(LARGE) });
     app = await spawnApp({
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "LTAI_mock_ak",
@@ -238,8 +270,15 @@ describe("base64 media under content_mode full", () => {
     await seed.createModel({ display_name: "cap-bridged", provider: "openai", model_name: "gpt-4o-mini", provider_key_id: bridged.id });
     await seed.createModel({ display_name: "cap-anthropic", provider: "anthropic", model_name: "claude-sonnet-4-5", provider_key_id: anthropic.id });
     await seed.createPassthroughRoute({ name: "cap-pt", path_prefix: "/cap-pt", target_url: base, provider_key_id: openai.id });
+    await seed.update("mcp_servers", randomUUID(), { display_name: "media", url: mcp.url, enabled: true });
+    await seed.update("mcp_servers", randomUUID(), { display_name: "large", url: mcpLarge.url, enabled: true });
     // Seeded last: this key authenticating implies the whole seed set landed.
-    await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"], allowed_routes: ["*"] });
+    await seed.createApiKey({
+      key_hash: CALLER_HASH,
+      allowed_models: ["*"],
+      allowed_routes: ["*"],
+      mcp_access: { allow: ["*"] },
+    });
     await waitConfigPropagation(async () => {
       const res = await fetch(`${app!.proxyUrl}/v1/models`, { headers: { authorization: `Bearer ${CALLER}` } });
       await res.text();
@@ -251,6 +290,8 @@ describe("base64 media under content_mode full", () => {
     await app?.exit();
     await otlp?.close();
     await sls?.close();
+    await mcp?.close();
+    await mcpLarge?.close();
     await new Promise<void>((resolve) => (upstream ? upstream.close(() => resolve()) : resolve()));
   });
 
@@ -449,6 +490,72 @@ describe("base64 media under content_mode full", () => {
     expect(inputMessages(row, span)[0].parts).toEqual([
       { type: "input_file", filename: "a.pdf", file_data: `data:application/pdf;base64,${placeholder(pdf.length)}` },
     ]);
+  });
+
+  describe("MCP tool results", () => {
+    async function callTool(server: string, args: Record<string, unknown>) {
+      const res = await fetch(`${app!.proxyUrl}/mcp/${server}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER}`,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "media", arguments: args },
+        }),
+      });
+      const text = await res.text();
+      expect(res.status, text.slice(0, 500)).toBe(200);
+      return { reply: JSON.parse(text), requestId: res.headers.get("x-aisix-request-id") ?? "" };
+    }
+
+    /** The call's exported arguments and result, with no payload anywhere in its records. */
+    async function exported(requestId: string) {
+      expect(requestId).not.toBe("");
+      const row = await waitForSlsLog(sls!, LOGSTORE, (l) => l.get("request_id") === requestId, "SLS row");
+      const mine = () => otlp!.spans.filter((s) => s.attributes["aisix.request_id"] === requestId);
+      await expect.poll(() => mine().some((s) => "gen_ai.tool.call.result" in s.attributes), { timeout: 15_000 }).toBe(true);
+      expect(JSON.stringify([...row.entries()]).includes(MARKER), "payload in the SLS row").toBe(false);
+      expect(JSON.stringify(mine()).includes(MARKER), "payload in a span").toBe(false);
+      const span = mine().find((s) => "gen_ai.tool.call.result" in s.attributes)!;
+      const result = JSON.parse(row.get("response") ?? "null");
+      expect(JSON.parse(String(span.attributes["gen_ai.tool.call.result"]))).toEqual(result);
+      return { args: JSON.parse(row.get("prompt") ?? "null"), result };
+    }
+
+    test("image, audio, resource blob and data URIs keep their blocks, not their payloads", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const { reply, requestId } = await callTool("media", { image: dataUri(SMALL) });
+      // Only the export changes: the caller receives every payload.
+      expect(reply.result.content).toEqual(mcpResult(SMALL).content);
+      expect(reply.result.structuredContent).toEqual(mcpResult(SMALL).structuredContent);
+      const { args, result } = await exported(requestId);
+      expect(result.content).toEqual(mcpResultExported(SMALL).content);
+      expect(result.structuredContent).toEqual(mcpResultExported(SMALL).structuredContent);
+      expect(args).toEqual({ image: `data:image/png;base64,${placeholder(uriBytes(SMALL))}` });
+    });
+
+    test("an image over the content cap keeps every block", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      expect(LARGE.length).toBeGreaterThan(CONTENT_MAX_BYTES);
+      const { reply, requestId } = await callTool("large", {});
+      expect(reply.result.content[1].data).toBe(LARGE);
+      const { result } = await exported(requestId);
+      expect(result.content).toEqual(mcpResultExported(LARGE).content);
+    });
+
+    test("a result reporting a tool error is omitted the same way", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const { reply, requestId } = await callTool("media", { failed: true });
+      expect(reply.result.isError).toBe(true);
+      const { result } = await exported(requestId);
+      expect(result.isError).toBe(true);
+      expect(result.content).toEqual(mcpResultExported(SMALL).content);
+    });
   });
 
   describe("passthrough routes", () => {
