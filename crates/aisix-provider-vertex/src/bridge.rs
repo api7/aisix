@@ -2471,12 +2471,12 @@ fn gemini_stop_sequences(req: &ChatFormat) -> Result<Option<serde_json::Value>, 
 /// A tier the model has no setting for, and every tier on an older model,
 /// is dropped.
 ///
-/// A caller that asked for thinking on 2.5 or later also gets
-/// `includeThoughts`, on its own when no setting applies; Gemini returns no
-/// thought parts without it. A caller that sent nothing, an empty value or
-/// `none` does not, and neither does a budget of 0, which turns thinking off:
-/// that request and its response stay as they would be with no reasoning
-/// support.
+/// A caller that asked for its thoughts ([`ChatFormat::thoughts_requested`])
+/// on 2.5 or later also gets `includeThoughts`, on its own when no setting
+/// applies; Gemini returns no thought parts without it. An effort written by
+/// anyone else does not ask, so that request and its response stay as they
+/// would be with no reasoning support, and neither does a request whose
+/// effective setting turns thinking off (`none`, a budget of 0).
 fn gemini_thinking_config(
     req: &ChatFormat,
     upstream_model: &str,
@@ -2517,10 +2517,9 @@ fn gemini_thinking_config(
     } else {
         return Ok(None);
     }
-    let asked = req.thinking_budget_tokens.is_some()
-        || effort.is_some_and(|effort| !matches!(effort, "" | "none"));
-    let thinking_off = config.get("thinkingBudget").and_then(|b| b.as_u64()) == Some(0);
-    if asked && !thinking_off {
+    let thinking_off =
+        effort == Some("none") || config.get("thinkingBudget").and_then(|b| b.as_u64()) == Some(0);
+    if req.thoughts_requested && !thinking_off {
         config.insert("includeThoughts".into(), true.into());
     }
     Ok((!config.is_empty()).then_some(serde_json::Value::Object(config)))
@@ -4011,11 +4010,17 @@ mod tests {
 
     #[test]
     fn reasoning_effort_becomes_each_generation_s_thinking_setting() {
-        let thinking = |effort: &str, model: &str| {
-            gemini_body(serde_json::json!({"reasoning_effort": effort}), model)
+        let asking = |effort: &str, model: &str, thoughts_requested: bool| {
+            let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+            req.extra
+                .insert("reasoning_effort".into(), serde_json::json!(effort));
+            req.thoughts_requested = thoughts_requested;
+            serde_json::to_value(build_gemini_request(&req, model).unwrap())
+                .unwrap()
                 .pointer("/generationConfig/thinkingConfig")
                 .cloned()
         };
+        let thinking = |effort: &str, model: &str| asking(effort, model, true);
         for (effort, level) in [
             ("minimal", "MINIMAL"),
             ("low", "LOW"),
@@ -4059,10 +4064,18 @@ mod tests {
         // 2.5 Pro cannot turn thinking off.
         assert_eq!(thinking("none", "gemini-2.5-pro"), None);
         assert_eq!(thinking("high", "gemini-2.0-flash"), None);
-        assert_eq!(thinking("", "gemini-2.5-flash"), None);
-        assert_eq!(thinking("", "gemini-3-flash-preview"), None);
+        // An effort the caller did not send sets the depth and asks for nothing.
+        assert_eq!(
+            asking("high", "gemini-3-flash-preview", false),
+            Some(serde_json::json!({"thinkingLevel": "HIGH"}))
+        );
+        assert_eq!(
+            asking("high", "gemini-2.5-flash", false),
+            Some(serde_json::json!({"thinkingBudget": 24576}))
+        );
         // A budget of 0 turns thinking off, whatever else the caller sent.
         let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        req.thoughts_requested = true;
         req.thinking_budget_tokens = Some(0);
         let body =
             serde_json::to_value(build_gemini_request(&req, "gemini-2.5-flash").unwrap()).unwrap();
@@ -4083,6 +4096,7 @@ mod tests {
         let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
         req.extra
             .insert("reasoning_effort".into(), serde_json::json!("medium"));
+        req.thoughts_requested = true;
         req.thinking_budget_tokens = Some(3000);
         let body =
             serde_json::to_value(build_gemini_request(&req, "gemini-2.5-flash").unwrap()).unwrap();

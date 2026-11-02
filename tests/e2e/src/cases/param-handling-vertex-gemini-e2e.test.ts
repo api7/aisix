@@ -429,6 +429,24 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
     for (const [alias, name] of models) {
       await seed.createModel({ display_name: alias, provider: "google", model_name: name, provider_key_id: pk.id });
     }
+    // An operator's effort_mapping writes or removes the effort; it never asks
+    // for the caller's thoughts.
+    for (const [alias, name, effort_mapping] of [
+      ["pg-3-default-high", "gemini-3-flash-preview", { "": "high" }],
+      ["pg-25-default-high", "gemini-2.5-flash", { "": "high" }],
+      ["pg-3-remove", "gemini-3-flash-preview", { "*": null }],
+      ["pg-25-remove", "gemini-2.5-flash", { "*": null }],
+      ["pg-3-map-none", "gemini-3-flash-preview", { "*": "none" }],
+      ["pg-25-map-none", "gemini-2.5-flash", { "*": "none" }],
+    ] as const) {
+      await seed.createModel({
+        display_name: alias,
+        provider: "google",
+        model_name: name,
+        provider_key_id: pk.id,
+        effort_mapping,
+      });
+    }
     await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"] });
     await waitConfigPropagation(async () => {
       const res = await fetch(`${app!.proxyUrl}/v1/models`, { headers: { authorization: `Bearer ${CALLER}` } });
@@ -519,6 +537,10 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
     ["enabled budget", { thinking: { type: "enabled", budget_tokens: 3000 } }, { thinkingLevel: "MEDIUM", includeThoughts: true }],
     ["adaptive", { thinking: { type: "adaptive" } }, { thinkingLevel: "HIGH", includeThoughts: true }],
     ["adaptive with an effort", { thinking: { type: "adaptive" }, output_config: { effort: "low" } }, { thinkingLevel: "LOW", includeThoughts: true }],
+    ["adaptive with summarized display", { thinking: { type: "adaptive", display: "summarized" } }, { thinkingLevel: "HIGH", includeThoughts: true }],
+    ["adaptive with omitted display", { thinking: { type: "adaptive", display: "omitted" } }, { thinkingLevel: "HIGH" }],
+    ["enabled with omitted display", { thinking: { type: "enabled", budget_tokens: 3000, display: "omitted" } }, { thinkingLevel: "MEDIUM" }],
+    ["output_config.effort alone", { output_config: { effort: "high" } }, { thinkingLevel: "HIGH" }],
     ["disabled", { thinking: { type: "disabled" } }, undefined],
     ["disabled with an effort", { thinking: { type: "disabled" }, output_config: { effort: "high" } }, undefined],
     ["nothing", {}, undefined],
@@ -536,6 +558,9 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
     for (const [extra, expected] of [
       [{ thinking: { type: "disabled" } }, { thinkingBudget: 0 }],
       [{ thinking: { type: "enabled", budget_tokens: 0 } }, { thinkingBudget: 0 }],
+      [{ thinking: { type: "enabled", budget_tokens: 3000, display: "omitted" } }, { thinkingBudget: 3000 }],
+      [{ thinking: { type: "adaptive", display: "omitted" } }, { thinkingBudget: 24576 }],
+      [{ output_config: { effort: "high" } }, { thinkingBudget: 24576 }],
       [{}, undefined],
     ] as const) {
       const { result, sent } = await capture(() =>
@@ -559,6 +584,74 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
     const { result, sent } = await capture(() => post("/v1/responses", { model, input: "hi", ...extra }));
     expect(result.status, result.text).toBe(200);
     expect(sent[0].body.generationConfig?.thinkingConfig).toEqual(expected);
+  });
+
+  test("/v1/messages adaptive thinking asks for thoughts on 2.5", async (ctx) => {
+    if (skip(ctx)) return;
+    const { result, sent } = await capture(() =>
+      post("/v1/messages", { model: "pg-25-flash", max_tokens: 4096, messages: HI, thinking: { type: "adaptive" } }),
+    );
+    expect(result.status, result.text).toBe(200);
+    expect(sent[0].body.generationConfig.thinkingConfig).toEqual({ thinkingBudget: 24576, includeThoughts: true });
+  });
+
+  test("/v1/messages with an enabled budget the mapping removes still asks", async (ctx) => {
+    if (skip(ctx)) return;
+    const { result, sent } = await capture(() =>
+      post("/v1/messages", {
+        model: "pg-25-remove",
+        max_tokens: 4096,
+        messages: HI,
+        thinking: { type: "enabled", budget_tokens: 3000 },
+        output_config: { effort: "high" },
+      }),
+    );
+    expect(result.status, result.text).toBe(200);
+    expect(sent[0].body.generationConfig.thinkingConfig).toEqual({ includeThoughts: true });
+  });
+
+  const REQUEST_ON: Array<[string, (model: string, extra: Record<string, unknown>) => [string, Record<string, unknown>]]> = [
+    ["/v1/chat/completions", (model, extra) => ["/v1/chat/completions", { model, messages: HI, ...extra }]],
+    ["/v1/messages", (model, extra) => ["/v1/messages", { model, max_tokens: 4096, messages: HI, ...extra }]],
+    ["/v1/responses", (model, extra) => ["/v1/responses", { model, input: "hi", ...extra }]],
+  ];
+  // Each carries an effort of the caller's for the mapping to act on.
+  const ASKS: Record<string, Record<string, unknown>> = {
+    "/v1/chat/completions": { reasoning_effort: "high" },
+    "/v1/messages": { thinking: { type: "adaptive" }, output_config: { effort: "high" } },
+    "/v1/responses": { reasoning: { effort: "high" } },
+  };
+
+  describe.each(REQUEST_ON)("effort_mapping on %s", (name, request) => {
+    test.for<[string, unknown]>([
+      ["pg-3-default-high", { thinkingLevel: "HIGH" }],
+      ["pg-25-default-high", { thinkingBudget: 24576 }],
+    ])("a %s default writes the effort for a caller that sent nothing, and no includeThoughts", async ([model, expected], ctx) => {
+      if (skip(ctx)) return;
+      const [path, body] = request(model, {});
+      const { result, sent } = await capture(() => post(path, body));
+      expect(result.status, result.text).toBe(200);
+      expect(sent[0].body.generationConfig?.thinkingConfig).toEqual(expected);
+    });
+
+    test.for(["pg-3-remove", "pg-25-remove"])("%s removing the effort of a caller that asked leaves includeThoughts alone", async (model, ctx) => {
+      if (skip(ctx)) return;
+      const [path, body] = request(model, ASKS[name]);
+      const { result, sent } = await capture(() => post(path, body));
+      expect(result.status, result.text).toBe(200);
+      expect(sent[0].body.generationConfig?.thinkingConfig).toEqual({ includeThoughts: true });
+    });
+
+    test.for<[string, unknown]>([
+      ["pg-3-map-none", undefined],
+      ["pg-25-map-none", { thinkingBudget: 0 }],
+    ])("%s mapping the effort to none sends no includeThoughts", async ([model, expected], ctx) => {
+      if (skip(ctx)) return;
+      const [path, body] = request(model, ASKS[name]);
+      const { result, sent } = await capture(() => post(path, body));
+      expect(result.status, result.text).toBe(200);
+      expect(sent[0].body.generationConfig?.thinkingConfig).toEqual(expected);
+    });
   });
 
   test("/v1/chat/completions with no reasoning_effort sends no thinking setting", async (ctx) => {

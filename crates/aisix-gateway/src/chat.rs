@@ -524,6 +524,21 @@ pub struct ChatFormat {
     /// tier back to one.
     #[serde(skip)]
     pub thinking_budget_tokens: Option<u64>,
+    /// Whether the caller's own request asked to see the model's thoughts,
+    /// decided by each inbound protocol before `effort_mapping` runs. Unlike
+    /// `extra.reasoning_effort`, which an operator's mapping or a
+    /// `/v1/messages` caller's `output_config.effort` can also write, it says
+    /// who asked, for a target that returns thoughts only on request.
+    #[serde(skip)]
+    pub thoughts_requested: bool,
+}
+
+/// Whether a `reasoning_effort` or `reasoning.effort` value, as the caller
+/// sent it, asks for thinking.
+pub fn effort_asks_for_thoughts(effort: Option<&Value>) -> bool {
+    effort
+        .and_then(Value::as_str)
+        .is_some_and(|effort| !matches!(effort, "" | "none"))
 }
 
 impl ChatFormat {
@@ -539,6 +554,7 @@ impl ChatFormat {
             gateway_strict_schema: false,
             top_k: None,
             thinking_budget_tokens: None,
+            thoughts_requested: false,
         }
     }
 
@@ -1769,6 +1785,7 @@ mod tests {
             gateway_strict_schema: false,
             top_k: None,
             thinking_budget_tokens: None,
+            thoughts_requested: false,
             model: "my-gpt4".into(),
             messages: vec![
                 ChatMessage::system("you are helpful"),
