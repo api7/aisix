@@ -622,13 +622,23 @@ pub(crate) async fn token(
     let (mut parts, body) = request.into_parts();
     let auth = match AuthenticatedKey::from_request_parts(&mut parts, &state).await {
         Ok(auth) => auth,
-        Err(_) => {
+        Err(err) => {
             crate::attribution::note_unmetered_route();
-            return oauth_error(
-                StatusCode::UNAUTHORIZED,
-                "invalid_client",
-                "send a valid gateway credential in x-aisix-api-key or Authorization",
-            );
+            // `invalid_client` tells a client to discard its registration, so
+            // it is not for a gateway that merely cannot judge the credential.
+            return if err.status().is_server_error() {
+                oauth_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "temporarily_unavailable",
+                    "the gateway could not verify the credential right now",
+                )
+            } else {
+                oauth_error(
+                    err.status(),
+                    "invalid_client",
+                    "send a valid gateway credential in x-aisix-api-key or Authorization",
+                )
+            };
         }
     };
     let request = Request::from_parts(parts, body);

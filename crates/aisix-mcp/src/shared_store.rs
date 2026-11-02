@@ -124,9 +124,11 @@ pub async fn consume(
     Ok(Some(stored.value))
 }
 
-/// Past this many live entries a write answers [`StoreError::OverQuota`]: the
-/// sign-in endpoints write before anyone has authenticated.
-const MEMORY_STORE_MAX_ENTRIES: usize = 50_000;
+/// Past this many live entries in one namespace a write answers
+/// [`StoreError::OverQuota`]. Per namespace because the sign-in endpoints write
+/// flows before anyone has authenticated, and a flood of those must not take
+/// the room that signed-in users' tokens and leases need.
+const MEMORY_STORE_MAX_ENTRIES_PER_NAMESPACE: usize = 20_000;
 
 /// The backend for a gateway with no dp-manager. Its contents live in this
 /// process alone: a restart loses every sign-in, and replicas do not share
@@ -138,7 +140,7 @@ pub struct MemoryStore {
 
 #[derive(Default)]
 struct MemoryState {
-    entries: HashMap<(String, String), MemoryEntry>,
+    namespaces: HashMap<String, HashMap<String, MemoryEntry>>,
     next_version: i64,
 }
 
@@ -159,8 +161,9 @@ impl SharedStore for MemoryStore {
     async fn get(&self, namespace: &str, key: &str) -> Result<Option<StoredValue>, StoreError> {
         let state = self.state();
         Ok(state
-            .entries
-            .get(&(namespace.to_owned(), key.to_owned()))
+            .namespaces
+            .get(namespace)
+            .and_then(|entries| entries.get(key))
             .filter(|entry| entry.expires_at > Instant::now())
             .map(|entry| StoredValue {
                 value: entry.value.clone(),
@@ -178,11 +181,14 @@ impl SharedStore for MemoryStore {
         condition: PutCondition,
     ) -> Result<i64, StoreError> {
         let mut state = self.state();
+        let MemoryState {
+            namespaces,
+            next_version,
+        } = &mut *state;
         let now = Instant::now();
-        let id = (namespace.to_owned(), key.to_owned());
-        let live = state
-            .entries
-            .get(&id)
+        let entries = namespaces.entry(namespace.to_owned()).or_default();
+        let live = entries
+            .get(key)
             .filter(|entry| entry.expires_at > now)
             .map(|entry| entry.version);
         let holds = match condition {
@@ -192,23 +198,22 @@ impl SharedStore for MemoryStore {
         if !holds {
             return Err(StoreError::PreconditionFailed);
         }
-        if live.is_none() && state.entries.len() >= MEMORY_STORE_MAX_ENTRIES {
-            state.entries.retain(|_, entry| entry.expires_at > now);
-            if state.entries.len() >= MEMORY_STORE_MAX_ENTRIES {
+        if live.is_none() && entries.len() >= MEMORY_STORE_MAX_ENTRIES_PER_NAMESPACE {
+            entries.retain(|_, entry| entry.expires_at > now);
+            if entries.len() >= MEMORY_STORE_MAX_ENTRIES_PER_NAMESPACE {
                 return Err(StoreError::OverQuota);
             }
         }
-        state.next_version += 1;
-        let version = state.next_version;
-        state.entries.insert(
-            id,
+        *next_version += 1;
+        entries.insert(
+            key.to_owned(),
             MemoryEntry {
                 value,
-                version,
+                version: *next_version,
                 expires_at: now + ttl,
             },
         );
-        Ok(version)
+        Ok(*next_version)
     }
 
     async fn delete(
@@ -218,13 +223,11 @@ impl SharedStore for MemoryStore {
         if_version: Option<i64>,
     ) -> Result<(), StoreError> {
         let mut state = self.state();
-        let id = (namespace.to_owned(), key.to_owned());
-        let matches = match if_version {
-            Some(version) => state.entries.get(&id).map(|e| e.version) == Some(version),
-            None => true,
-        };
-        if matches {
-            state.entries.remove(&id);
+        if let Some(entries) = state.namespaces.get_mut(namespace) {
+            let matches = if_version.is_none_or(|v| entries.get(key).map(|e| e.version) == Some(v));
+            if matches {
+                entries.remove(key);
+            }
         }
         Ok(())
     }
@@ -300,6 +303,34 @@ mod tests {
             .unwrap();
         assert!(store.get("ns", "k").await.unwrap().is_none());
         create(&store, "k", "b").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_full_namespace_leaves_the_others_writable() {
+        let store = MemoryStore::default();
+        let put = |ns: &'static str, key: String| {
+            let store = &store;
+            async move {
+                store
+                    .put(
+                        ns,
+                        &key,
+                        Vec::new(),
+                        TTL,
+                        &BTreeMap::new(),
+                        PutCondition::CreateOnly,
+                    )
+                    .await
+            }
+        };
+        for i in 0..MEMORY_STORE_MAX_ENTRIES_PER_NAMESPACE {
+            put("flows", i.to_string()).await.unwrap();
+        }
+        assert_eq!(
+            put("flows", "one-more".to_owned()).await,
+            Err(StoreError::OverQuota)
+        );
+        put("tokens", "k".to_owned()).await.unwrap();
     }
 
     #[tokio::test]

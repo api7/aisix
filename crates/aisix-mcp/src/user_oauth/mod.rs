@@ -38,6 +38,9 @@ const CLIENT_TTL: Duration = Duration::from_secs(365 * 24 * 3600);
 const FLOW_TTL: Duration = Duration::from_secs(600);
 const CODE_TTL: Duration = Duration::from_secs(120);
 const LEASE_TTL: Duration = Duration::from_secs(60);
+/// How far ahead of its lease's expiry a refresh stops waiting, leaving time
+/// to store what it got.
+const LEASE_MARGIN: Duration = Duration::from_secs(5);
 
 /// A token with less than this left is refreshed before it is used.
 const REFRESH_SKEW_SECS: i64 = 60;
@@ -261,7 +264,13 @@ impl UserOAuthManager {
             self.remember(&key, &record);
             return Ok(record.access_token);
         }
-        self.refresh(server, subject, None).await
+        match self.refresh(server, subject, None).await {
+            // Whatever stopped the refresh, this token has not expired yet.
+            Err(UserOAuthFailure::Unavailable) if !record.expired(unix_now()) => {
+                Ok(record.access_token)
+            }
+            outcome => outcome,
+        }
     }
 
     /// The upstream rejected `rejected`: return the token to try next, which
@@ -378,16 +387,19 @@ impl UserOAuthManager {
         rejected: Option<String>,
     ) -> Result<String, UserOAuthFailure> {
         let key = digest(&[&server.id, subject.id()]);
+        // Keyed on the token being replaced too: a caller holding a rejected
+        // token cannot share the outcome of a proactive refresh, which may
+        // hand that very token back. The lease still lets only one through.
+        let flight_key = digest(&[&key, rejected.as_deref().unwrap_or_default()]);
         let flight = self
             .inflight
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .entry(key.clone())
+            .entry(flight_key.clone())
             .or_insert_with(|| {
                 let manager = Arc::clone(self);
                 let server = server.clone();
                 let subject = subject.clone();
-                let key = key.clone();
                 let task = tokio::spawn(async move {
                     let outcome = manager
                         .refresh_under_lease(&server, &subject, &key, rejected)
@@ -396,7 +408,7 @@ impl UserOAuthManager {
                         .inflight
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .remove(&key);
+                        .remove(&flight_key);
                     outcome
                 });
                 async move { task.await.unwrap_or(Err(UserOAuthFailure::Unavailable)) }
@@ -404,7 +416,11 @@ impl UserOAuthManager {
                     .shared()
             })
             .clone();
-        flight.await
+        // The caller stops waiting at the server's timeout. The refresh itself
+        // runs on, so that what it obtains is stored for the next request.
+        tokio::time::timeout(server.timeout, flight)
+            .await
+            .unwrap_or(Err(UserOAuthFailure::Unavailable))
     }
 
     /// One refresh per `(server, subject)` across gateways: the holder of the
@@ -428,6 +444,7 @@ impl UserOAuthManager {
                 PutCondition::CreateOnly,
             )
             .await;
+        let lease_taken = Instant::now();
         let lease = match lease {
             Ok(version) => version,
             Err(StoreError::PreconditionFailed) => {
@@ -438,7 +455,7 @@ impl UserOAuthManager {
             Err(_) => return Err(UserOAuthFailure::Unavailable),
         };
         let outcome = self
-            .refresh_holding_lease(server, subject, key, rejected.as_deref())
+            .refresh_holding_lease(server, subject, key, rejected.as_deref(), lease_taken)
             .await;
         // Expires on its own if this fails.
         let _ = self.store.delete(NS_LEASE, key, Some(lease)).await;
@@ -484,6 +501,7 @@ impl UserOAuthManager {
         subject: &UserSubject,
         key: &str,
         rejected: Option<&str>,
+        lease_taken: Instant,
     ) -> Result<String, UserOAuthFailure> {
         let stored = self
             .store
@@ -536,7 +554,15 @@ impl UserOAuthManager {
             form.push(("redirect_uri", redirect_uri.clone()));
         }
         flow::add_client(&mut form, server, record.registered_client.as_ref());
-        let issued = match flow::token_request(server, &token_endpoint, &form).await {
+        // A refresh outliving its lease would let another gateway spend the
+        // same rotating token, so the request ends before the lease does.
+        let Some(budget) = (lease_taken + LEASE_TTL - LEASE_MARGIN)
+            .checked_duration_since(Instant::now())
+            .map(|left| left.min(server.timeout))
+        else {
+            return fallback.ok_or(UserOAuthFailure::Unavailable);
+        };
+        let issued = match flow::token_request(server, &token_endpoint, &form, budget).await {
             flow::TokenOutcome::Issued(issued) => issued,
             flow::TokenOutcome::Rejected(code)
                 if DEFINITIVE_REFRESH_ERRORS.contains(&code.as_str()) =>
@@ -726,6 +752,106 @@ mod tests {
             manager.access_token(&server(), &subject).await,
             Err(UserOAuthFailure::AuthorizationRequired)
         );
+    }
+
+    /// A store that refuses leases only: the read still works.
+    struct NoLeases(MemoryStore);
+
+    #[async_trait]
+    impl SharedStore for NoLeases {
+        async fn get(&self, ns: &str, key: &str) -> Result<Option<StoredValue>, StoreError> {
+            self.0.get(ns, key).await
+        }
+        async fn put(
+            &self,
+            ns: &str,
+            key: &str,
+            value: Vec<u8>,
+            ttl: Duration,
+            labels: &BTreeMap<&str, &str>,
+            condition: PutCondition,
+        ) -> Result<i64, StoreError> {
+            if ns == NS_LEASE {
+                return Err(StoreError::OverQuota);
+            }
+            self.0.put(ns, key, value, ttl, labels, condition).await
+        }
+        async fn delete(&self, ns: &str, key: &str, v: Option<i64>) -> Result<(), StoreError> {
+            self.0.delete(ns, key, v).await
+        }
+    }
+
+    async fn store_token(store: &dyn SharedStore, access_token: &str, expires_in: i64) {
+        let record = TokenRecord {
+            access_token: access_token.to_owned(),
+            refresh_token: Some("r".to_owned()),
+            expires_at: Some(unix_now() + expires_in),
+            resource: None,
+            registered_client: None,
+            redirect_uri: None,
+        };
+        store
+            .put(
+                NS_TOKEN,
+                &digest(&["server-id", UserSubject::member("u").id()]),
+                serde_json::to_vec(&record).unwrap(),
+                TOKEN_TTL,
+                &BTreeMap::new(),
+                PutCondition::CreateOnly,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_valid_token_survives_a_refresh_that_could_not_start() {
+        let store = Arc::new(NoLeases(MemoryStore::default()));
+        store_token(store.as_ref(), "still-good", 45).await;
+        let manager = Arc::new(UserOAuthManager::new(store.clone()));
+        let subject = UserSubject::member("u");
+        assert_eq!(
+            manager.access_token(&server(), &subject).await.as_deref(),
+            Ok("still-good")
+        );
+    }
+
+    /// Joining a proactive refresh would hand back the token just rejected,
+    /// and the caller would then delete a record whose refresh token works.
+    #[tokio::test]
+    async fn a_rejected_token_does_not_come_back_from_a_proactive_refresh() {
+        let store = Arc::new(MemoryStore::default());
+        store_token(store.as_ref(), "x", 45).await;
+        let manager = Arc::new(UserOAuthManager::new(store.clone()));
+        let subject = UserSubject::member("u");
+        let row: McpServer = serde_json::from_value(serde_json::json!({
+            "name": "s",
+            "url": "https://upstream.example/mcp",
+            "auth_type": "oauth2_authorization_code",
+            "client_id": "c",
+            "token_url": "https://idp.example/token",
+            "timeout_ms": 300,
+        }))
+        .unwrap();
+        let server = UserOAuthServer::new("server-id", &row);
+
+        // Hold the lease, as a slow proactive refresh would.
+        store
+            .put(
+                NS_LEASE,
+                &digest(&["server-id", subject.id()]),
+                b"1".to_vec(),
+                LEASE_TTL,
+                &BTreeMap::new(),
+                PutCondition::CreateOnly,
+            )
+            .await
+            .unwrap();
+        let (proactive, rejected) = tokio::join!(
+            manager.access_token(&server, &subject),
+            manager.refresh_rejected(&server, &subject, "x"),
+        );
+        assert_eq!(proactive.as_deref(), Ok("x"));
+        assert_eq!(rejected, Err(UserOAuthFailure::Unavailable));
     }
 
     #[test]

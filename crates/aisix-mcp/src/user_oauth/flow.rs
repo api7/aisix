@@ -157,18 +157,14 @@ pub(super) async fn token_request(
     server: &UserOAuthServer,
     token_endpoint: &str,
     form: &[(&str, String)],
+    timeout: std::time::Duration,
 ) -> TokenOutcome {
-    let response = match send(
-        &server.name,
-        token_endpoint,
-        server.timeout,
-        |client, url| {
-            client
-                .post(url)
-                .header("accept", "application/json")
-                .form(form)
-        },
-    )
+    let response = match send(&server.name, token_endpoint, timeout, |client, url| {
+        client
+            .post(url)
+            .header("accept", "application/json")
+            .form(form)
+    })
     .await
     {
         Ok(response) => response,
@@ -403,8 +399,14 @@ impl UserOAuthManager {
             form.push(("resource", resource.clone()));
         }
         add_client(&mut form, server, code.registered_client.as_ref());
-        let issued = match token_request(server, &token_endpoint, &form).await {
+        let issued = match token_request(server, &token_endpoint, &form, server.timeout).await {
             TokenOutcome::Issued(issued) => issued,
+            // The gateway's own registration, which no new sign-in can fix.
+            TokenOutcome::Rejected(error) if error == "invalid_client" => {
+                tracing::warn!(target: "aisix::mcp_oauth", server = %server.name,
+                    "the upstream refused the gateway's OAuth client");
+                return Err(RedeemError::Misconfigured);
+            }
             TokenOutcome::Rejected(error) => {
                 tracing::warn!(target: "aisix::mcp_oauth", server = %server.name, %error,
                     "the upstream refused a sign-in's authorization code");

@@ -91,7 +91,10 @@ impl DiscoveryCache {
                 }
             }
         }
-        let endpoints = discover(server).await?;
+        // One budget for however many documents it takes to find them.
+        let endpoints = tokio::time::timeout(server.timeout, discover(server))
+            .await
+            .map_err(|_| UserOAuthFailure::Unavailable)??;
         self.entries
             .lock()
             .unwrap_or_else(|p| p.into_inner())
