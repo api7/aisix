@@ -3140,7 +3140,11 @@ fn parse_inbound(
             && thinking
                 .and_then(|t| t.get("display"))
                 .and_then(Value::as_str)
-                != Some("omitted");
+                != Some("omitted")
+            && thinking
+                .and_then(|t| t.get("budget_tokens"))
+                .and_then(Value::as_u64)
+                != Some(0);
         if thinking_type == Some("enabled") {
             if let Some(v) = thinking
                 .and_then(|t| t.get("budget_tokens"))

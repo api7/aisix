@@ -2476,7 +2476,7 @@ fn gemini_stop_sequences(req: &ChatFormat) -> Result<Option<serde_json::Value>, 
 /// applies; Gemini returns no thought parts without it. An effort written by
 /// anyone else does not ask, so that request and its response stay as they
 /// would be with no reasoning support, and neither does a request whose
-/// effective setting turns thinking off (`none`, a budget of 0).
+/// effective setting turns thinking off (`none`).
 fn gemini_thinking_config(
     req: &ChatFormat,
     upstream_model: &str,
@@ -2517,9 +2517,7 @@ fn gemini_thinking_config(
     } else {
         return Ok(None);
     }
-    let thinking_off =
-        effort == Some("none") || config.get("thinkingBudget").and_then(|b| b.as_u64()) == Some(0);
-    if req.thoughts_requested && !thinking_off {
+    if req.thoughts_requested && effort != Some("none") {
         config.insert("includeThoughts".into(), true.into());
     }
     Ok((!config.is_empty()).then_some(serde_json::Value::Object(config)))
@@ -4072,16 +4070,6 @@ mod tests {
         assert_eq!(
             asking("high", "gemini-2.5-flash", false),
             Some(serde_json::json!({"thinkingBudget": 24576}))
-        );
-        // A budget of 0 turns thinking off, whatever else the caller sent.
-        let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
-        req.thoughts_requested = true;
-        req.thinking_budget_tokens = Some(0);
-        let body =
-            serde_json::to_value(build_gemini_request(&req, "gemini-2.5-flash").unwrap()).unwrap();
-        assert_eq!(
-            body["generationConfig"]["thinkingConfig"],
-            serde_json::json!({"thinkingBudget": 0})
         );
         // A caller that sent nothing gets no thinking setting at all.
         for model in ["gemini-2.5-flash", "gemini-3-flash-preview"] {

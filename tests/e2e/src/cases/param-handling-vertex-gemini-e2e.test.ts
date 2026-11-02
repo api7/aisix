@@ -541,6 +541,7 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
     ["adaptive with omitted display", { thinking: { type: "adaptive", display: "omitted" } }, { thinkingLevel: "HIGH" }],
     ["enabled with omitted display", { thinking: { type: "enabled", budget_tokens: 3000, display: "omitted" } }, { thinkingLevel: "MEDIUM" }],
     ["output_config.effort alone", { output_config: { effort: "high" } }, { thinkingLevel: "HIGH" }],
+    ["enabled with a budget of 0", { thinking: { type: "enabled", budget_tokens: 0 } }, { thinkingLevel: "MINIMAL" }],
     ["disabled", { thinking: { type: "disabled" } }, undefined],
     ["disabled with an effort", { thinking: { type: "disabled" }, output_config: { effort: "high" } }, undefined],
     ["nothing", {}, undefined],
@@ -578,6 +579,7 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
     ["pg-3-flash", { reasoning: { effort: "none" } }, undefined],
     ["pg-25-flash", {}, undefined],
     ["pg-3-flash", {}, undefined],
+    ["pg-3-flash", { reasoning: { summary: "auto" } }, undefined],
     ["pg-20-flash", { reasoning: { effort: "high" } }, undefined],
   ])("/v1/responses on %s with %j", async ([model, extra, expected], ctx) => {
     if (skip(ctx)) return;
@@ -593,6 +595,21 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
     );
     expect(result.status, result.text).toBe(200);
     expect(sent[0].body.generationConfig.thinkingConfig).toEqual({ thinkingBudget: 24576, includeThoughts: true });
+  });
+
+  test("/v1/messages with a budget of 0 stays off when the mapping removes the effort", async (ctx) => {
+    if (skip(ctx)) return;
+    const { result, sent } = await capture(() =>
+      post("/v1/messages", {
+        model: "pg-25-remove",
+        max_tokens: 4096,
+        messages: HI,
+        thinking: { type: "enabled", budget_tokens: 0 },
+        output_config: { effort: "high" },
+      }),
+    );
+    expect(result.status, result.text).toBe(200);
+    expect(sent[0].body.generationConfig?.thinkingConfig).toBeUndefined();
   });
 
   test("/v1/messages with an enabled budget the mapping removes still asks", async (ctx) => {
@@ -623,6 +640,14 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
   };
 
   describe.each(REQUEST_ON)("effort_mapping on %s", (name, request) => {
+    test("a streaming caller that asked sends includeThoughts too", async (ctx) => {
+      if (skip(ctx)) return;
+      const [path, body] = request("pg-3-flash", ASKS[name]);
+      const { result, sent } = await capture(() => post(path, { ...body, stream: true }));
+      expect(result.status, result.text).toBe(200);
+      expect(sent[0].body.generationConfig.thinkingConfig.includeThoughts).toBe(true);
+    });
+
     test.for<[string, unknown]>([
       ["pg-3-default-high", { thinkingLevel: "HIGH" }],
       ["pg-25-default-high", { thinkingBudget: 24576 }],
