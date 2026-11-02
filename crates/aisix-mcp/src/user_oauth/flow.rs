@@ -434,7 +434,7 @@ impl UserOAuthManager {
         subject: &UserSubject,
         record: &TokenRecord,
     ) -> Result<(), RedeemError> {
-        let key = digest(&[&server.id, subject.id()]);
+        let key = super::token_key(server, subject);
         let value = serde_json::to_vec(record).expect("token record serializes");
         let labels = TokenLabels::new(server, subject);
         for _ in 0..STORE_TOKEN_ATTEMPTS {

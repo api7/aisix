@@ -522,6 +522,34 @@ describe("per-user OAuth to an upstream MCP server", () => {
     expect(landed.searchParams.get("code")).toBeNull();
   });
 
+  test("moving a server's address asks its users to sign in rather than sending their tokens there", async () => {
+    if (!etcdReachable) return;
+    const original = await upstream();
+    const moved = await upstream();
+    const id = randomUUID();
+    const row = (target: OAuthMcpUpstream) => ({
+      name: "moving",
+      type: "mcp",
+      url: target.mcpUrl,
+      auth_type: "oauth2_authorization_code",
+    });
+    await stack.seed.update("mcp_servers", id, row(original));
+    await waitConfigPropagation(
+      async () => (await fetch(`${stack.base}/.well-known/oauth-protected-resource/mcp/moving`)).status === 200,
+    );
+    original.user = "alice";
+    const { client } = await signIn(url("moving"), key(ALICE));
+    expect(await whoami(client)).toBe("alice");
+    await client.close();
+
+    await stack.seed.update("mcp_servers", id, row(moved));
+    await waitConfigPropagation(async () => (await mcpPost(url("moving"), key(ALICE))).status === 401);
+    const res = await mcpPost(url("moving"), key(ALICE), { jsonrpc: "2.0", id: 2, method: "tools/list" });
+    expect(res.status).toBe(401);
+    expect(moved.mcpAuthorizations).toEqual([]);
+    expect(moved.tokenRequests).toEqual([]);
+  });
+
   test("a token request with no valid credential is an OAuth client error", async () => {
     if (!etcdReachable) return;
     for (const headers of [{}, key("sk-oauth-nobody")]) {

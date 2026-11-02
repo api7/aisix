@@ -197,6 +197,19 @@ fn digest(parts: &[&str]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Where `subject`'s record for `server` is kept. The upstream's address is part
+/// of it, so moving a server's `url` or `token_url` leaves the old record out of
+/// reach: those users sign in again rather than having their tokens sent to the
+/// new host. Purging the orphans is the store owner's cleanup.
+fn token_key(server: &UserOAuthServer, subject: &UserSubject) -> String {
+    digest(&[
+        &server.id,
+        &server.url,
+        server.token_url.as_deref().unwrap_or_default(),
+        subject.id(),
+    ])
+}
+
 /// An unguessable URL-safe value for a flow state or an authorization code.
 fn random_token() -> String {
     use rand::RngCore;
@@ -235,7 +248,7 @@ impl UserOAuthManager {
         server: &UserOAuthServer,
         subject: &UserSubject,
     ) -> Result<String, UserOAuthFailure> {
-        let key = digest(&[&server.id, subject.id()]);
+        let key = token_key(server, subject);
         let cached = self.cached(&key);
         if let Some((token, true)) = &cached {
             return Ok(token.clone());
@@ -281,7 +294,7 @@ impl UserOAuthManager {
         subject: &UserSubject,
         rejected: &str,
     ) -> Result<String, UserOAuthFailure> {
-        self.evict(&digest(&[&server.id, subject.id()]));
+        self.evict(&token_key(server, subject));
         self.refresh(server, subject, Some(rejected.to_owned()))
             .await
     }
@@ -295,7 +308,7 @@ impl UserOAuthManager {
         subject: &UserSubject,
         rejected: &str,
     ) {
-        let key = digest(&[&server.id, subject.id()]);
+        let key = token_key(server, subject);
         self.evict(&key);
         if let Ok(Some(stored)) = self.store.get(NS_TOKEN, &key).await {
             if decode_token(&stored).is_some_and(|record| record.access_token == rejected) {
@@ -311,7 +324,7 @@ impl UserOAuthManager {
         server: &UserOAuthServer,
         subject: &UserSubject,
     ) -> Result<(), UserOAuthFailure> {
-        let key = digest(&[&server.id, subject.id()]);
+        let key = token_key(server, subject);
         self.evict(&key);
         self.store
             .delete(NS_TOKEN, &key, None)
@@ -386,7 +399,7 @@ impl UserOAuthManager {
         subject: &UserSubject,
         rejected: Option<String>,
     ) -> Result<String, UserOAuthFailure> {
-        let key = digest(&[&server.id, subject.id()]);
+        let key = token_key(server, subject);
         // Keyed on the token being replaced too: a caller holding a rejected
         // token cannot share the outcome of a proactive refresh, which may
         // hand that very token back. The lease still lets only one through.
@@ -716,7 +729,7 @@ mod tests {
 
     /// A copy this gateway read so long ago that it should prefer the store.
     fn stale_copy(manager: &UserOAuthManager, expires_at: Option<i64>) {
-        let key = digest(&["server-id", UserSubject::member("u").id()]);
+        let key = token_key(&server(), &UserSubject::member("u"));
         manager.cache.lock().unwrap().insert(
             key,
             CachedToken {
@@ -781,7 +794,12 @@ mod tests {
         }
     }
 
-    async fn store_token(store: &dyn SharedStore, access_token: &str, expires_in: i64) {
+    async fn store_token(
+        store: &dyn SharedStore,
+        server: &UserOAuthServer,
+        access_token: &str,
+        expires_in: i64,
+    ) {
         let record = TokenRecord {
             access_token: access_token.to_owned(),
             refresh_token: Some("r".to_owned()),
@@ -793,7 +811,7 @@ mod tests {
         store
             .put(
                 NS_TOKEN,
-                &digest(&["server-id", UserSubject::member("u").id()]),
+                &token_key(server, &UserSubject::member("u")),
                 serde_json::to_vec(&record).unwrap(),
                 TOKEN_TTL,
                 &BTreeMap::new(),
@@ -806,7 +824,7 @@ mod tests {
     #[tokio::test]
     async fn a_valid_token_survives_a_refresh_that_could_not_start() {
         let store = Arc::new(NoLeases(MemoryStore::default()));
-        store_token(store.as_ref(), "still-good", 45).await;
+        store_token(store.as_ref(), &server(), "still-good", 45).await;
         let manager = Arc::new(UserOAuthManager::new(store.clone()));
         let subject = UserSubject::member("u");
         assert_eq!(
@@ -820,7 +838,6 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_token_does_not_come_back_from_a_proactive_refresh() {
         let store = Arc::new(MemoryStore::default());
-        store_token(store.as_ref(), "x", 45).await;
         let manager = Arc::new(UserOAuthManager::new(store.clone()));
         let subject = UserSubject::member("u");
         let row: McpServer = serde_json::from_value(serde_json::json!({
@@ -833,12 +850,13 @@ mod tests {
         }))
         .unwrap();
         let server = UserOAuthServer::new("server-id", &row);
+        store_token(store.as_ref(), &server, "x", 45).await;
 
         // Hold the lease, as a slow proactive refresh would.
         store
             .put(
                 NS_LEASE,
-                &digest(&["server-id", subject.id()]),
+                &token_key(&server, &subject),
                 b"1".to_vec(),
                 LEASE_TTL,
                 &BTreeMap::new(),
@@ -852,6 +870,54 @@ mod tests {
         );
         assert_eq!(proactive.as_deref(), Ok("x"));
         assert_eq!(rejected, Err(UserOAuthFailure::Unavailable));
+    }
+
+    /// Moving a server must not send its users' tokens to the new address.
+    #[tokio::test]
+    async fn a_moved_upstream_cannot_reach_the_old_record() {
+        let store = Arc::new(MemoryStore::default());
+        let manager = Arc::new(UserOAuthManager::new(store.clone()));
+        let subject = UserSubject::member("u");
+        let with = |url: &str, token_url: Option<&str>| {
+            let row: McpServer = serde_json::from_value(serde_json::json!({
+                "name": "s",
+                "url": url,
+                "auth_type": "oauth2_authorization_code",
+                "token_url": token_url,
+            }))
+            .unwrap();
+            UserOAuthServer::new("server-id", &row)
+        };
+        let original = with(
+            "https://upstream.example/mcp",
+            Some("https://idp.example/token"),
+        );
+        store_token(store.as_ref(), &original, "t", 3600).await;
+        assert_eq!(
+            manager.access_token(&original, &subject).await.as_deref(),
+            Ok("t")
+        );
+        for moved in [
+            with(
+                "https://other.example/mcp",
+                Some("https://idp.example/token"),
+            ),
+            with(
+                "https://upstream.example/mcp",
+                Some("https://other.example/token"),
+            ),
+            with("https://upstream.example/mcp", None),
+        ] {
+            assert_eq!(
+                manager.access_token(&moved, &subject).await,
+                Err(UserOAuthFailure::AuthorizationRequired),
+            );
+        }
+        // Nor does it disturb the record for the address it was issued for.
+        assert_eq!(
+            manager.access_token(&original, &subject).await.as_deref(),
+            Ok("t")
+        );
     }
 
     #[test]
