@@ -186,6 +186,8 @@ describe("mcp_auth_settings.resource_url with a path prefix", () => {
   test("a path that only looks like it ends in /mcp keeps discovery dormant, with one warning", async () => {
     if (!etcdReachable) return;
     const probe = `${app!.proxyUrl}/mcp`;
+    // Start active, or the first wait for "dormant" would pass before the row lands.
+    await configure(probe, true);
     for (const path of [`${PREFIX}/foo-mcp`, `${PREFIX}/mcp/`, `${PREFIX}/mcp/x`]) {
       await configure(`${front!.url}${path}`, false);
       const res = await mcpPost(probe);
