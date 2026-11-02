@@ -274,6 +274,41 @@ describe("output guardrails decide a response with no text", () => {
     await seed.attachGuardrailToModel(rows.monitor.id as string, failedModel.id as string);
     models.push("responses-native-failed");
 
+    // Blocks only on empty text, on windows the last text chunk exactly fills.
+    const emptyOnly = await seed.createGuardrail(
+      {
+        name: "textless-window",
+        enabled: true,
+        hook_point: "output",
+        ...custom,
+        script: `export function checkOutput(ctx) { return { action: ctx.text === "" ? "block" : "none" }; }`,
+        stream_processing_mode: "window",
+        window_size: 4,
+        window_overlap_size: 0,
+      },
+      { attach: false },
+    );
+    for (const [display, frames] of [
+      ["window-exact", [chatChunk({ role: "assistant" }, null), chatChunk({ content: "abcd" }, null), chatChunk({}, "stop"), "[DONE]"]],
+      ["window-textless", chatFrames],
+    ] as const) {
+      const upstream = await startOpenAiUpstream({ streamEvents: [...frames] });
+      upstreams.push(upstream);
+      const pk = await seed.createProviderKey({
+        display_name: `${display}-pk`,
+        secret: "sk-mock",
+        api_base: `${upstream.baseUrl}/v1`,
+      });
+      const model = await seed.createModel({
+        display_name: display,
+        provider: "openai",
+        model_name: "gpt-4o-mini",
+        provider_key_id: pk.id,
+      });
+      await seed.attachGuardrailToModel(emptyOnly.id as string, model.id as string);
+      models.push(display);
+    }
+
     // Seeded last: its key authenticating implies the whole seed is live.
     await seed.createApiKey({ key_hash: hash(CALLER), allowed_models: models });
     await waitConfigPropagation(
@@ -285,6 +320,26 @@ describe("output guardrails decide a response with no text", () => {
     await app?.exit();
     await sls?.close();
     await Promise.all(upstreams.map((u) => u.close()));
+  });
+
+  test("a window that already released the text is not a response with no text", async (ctx) => {
+    if (!app) return ctx.skip();
+    const released = await json(app.proxyUrl, "/v1/chat/completions", {
+      model: "window-exact",
+      stream: true,
+      messages: HI,
+    });
+    const body = await released.text();
+    expect(body).toContain("abcd");
+    expect(body).toContain("[DONE]");
+    expect(body).not.toContain(REFUSAL);
+
+    const textless = await json(app.proxyUrl, "/v1/chat/completions", {
+      model: "window-textless",
+      stream: true,
+      messages: HI,
+    });
+    expect(await textless.text()).toContain(REFUSAL);
   });
 
   test("an in-band upstream error on a held stream stays the upstream's error", async (ctx) => {

@@ -6173,6 +6173,9 @@ where
             .map(|ctx| ctx.chain.stream_output_policy())
             .unwrap_or_default();
         let hold_back = stream_policy.holds_back();
+        // A window already judged and released the text, so an empty final
+        // scan does not mean the response generated none.
+        let mut window_scanned = false;
         let mut window_tool_calls_cap = match stream_policy {
             aisix_guardrails::StreamOutputPolicy::Window { .. } => stream_policy.hold_cap(),
             _ => None,
@@ -6619,6 +6622,7 @@ where
                                 // the whole buffer and re-scan every
                                 // subsequent token (cost/latency guard).
                                 window_buf.keep_tails(*overlap_chars, *size_chars);
+                                window_scanned = true;
                             }
                         }
                     }
@@ -6758,7 +6762,9 @@ where
                         format!("{content_part}\n{tc_part}")
                     };
                     // Consulted with no text as well: a `custom` row decides for itself.
-                    let blocked = {
+                    let blocked = if final_text.is_empty() && window_scanned {
+                        false
+                    } else {
                         let synthesized = {
                             let comp = guard.comp();
                             aisix_gateway::ChatResponse { logprobs: None, more_choices: Vec::new(),
