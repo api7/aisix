@@ -301,7 +301,7 @@ const MEDIA_NEEDLES: [&str; 12] = [
     "inlineData",
     "inline_data",
     "image_generation_call",
-    "mimeType",
+    "\"mimeType\"",
     "\"blob\"",
 ];
 
