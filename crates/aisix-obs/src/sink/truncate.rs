@@ -292,9 +292,12 @@ const MEDIA_NEEDLES: [&str; 10] = [
 ];
 
 /// What marks media in JSON that does not parse, such as a stream frame cut
-/// partway through a payload: everything from the first of these on is dropped.
-const CUT_MEDIA_MARKERS: [&str; 9] = [
+/// partway through a payload or a body nested past the parser's depth limit:
+/// everything from the first of these on is dropped.
+const CUT_MEDIA_MARKERS: [&str; 11] = [
     ";base64,",
+    "\"base64\"",
+    "\"bytes\"",
     "\"b64_json\"",
     "\"partial_image_b64\"",
     "\"bytesBase64Encoded\"",
@@ -559,12 +562,29 @@ mod tests {
                 r#"{"url":"data:image/png"#,
             ),
             (r#"{"inlineData":{"data":"QUJD"#, "{"),
+            (
+                r#"{"source":{"type":"base64","data":"QUJD"#,
+                r#"{"source":{"type":"#,
+            ),
         ] {
             let out = omit_base64_media_in_json(cut);
             assert!(out.starts_with(kept), "{out}");
             assert!(out.contains(BASE64_OMITTED_PREFIX), "{out}");
             assert!(!out.contains("QUJD"), "{out}");
         }
+    }
+
+    #[test]
+    fn a_body_nested_past_the_parser_limit_still_loses_its_payload() {
+        let depth = 300;
+        let body = format!(
+            "{}\"data:image/png;base64,QUJD\"{}",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        assert!(serde_json::from_str::<Value>(&body).is_err());
+        let out = omit_base64_media_in_json(&body);
+        assert!(!out.contains("QUJD"), "{out}");
     }
 
     #[test]
