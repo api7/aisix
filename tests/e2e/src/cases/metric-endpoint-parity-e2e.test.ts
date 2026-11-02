@@ -773,6 +773,27 @@ describe("every proxy route emits every per-request metric family", () => {
       families: [...REQUEST],
       drive: async () => void (await expectCall("/.well-known/oauth-protected-resource/mcp", {}, 404)),
     },
+    // The sign-in surface of a per-user OAuth server. `alpha` does not run
+    // that flow, so these answer 404; a sign-in callback with no state is a 400.
+    ...(
+      [
+        ["/.well-known/oauth-protected-resource/mcp/:server", "/.well-known/oauth-protected-resource/mcp/{server}", "/.well-known/oauth-protected-resource/mcp/alpha", "GET", 404],
+        ["/.well-known/oauth-authorization-server/mcp/:server", "/.well-known/oauth-authorization-server/mcp/{server}", "/.well-known/oauth-authorization-server/mcp/alpha", "GET", 404],
+        ["/mcp/:server/.well-known/openid-configuration", "/mcp/{server}/.well-known/openid-configuration", "/mcp/alpha/.well-known/openid-configuration", "GET", 404],
+        ["/mcp/:server/.well-known/jwks.json", "/mcp/{server}/.well-known/jwks.json", "/mcp/alpha/.well-known/jwks.json", "GET", 404],
+        ["/mcp/:server/oauth/register", "/mcp/{server}/oauth/register", "/mcp/alpha/oauth/register", "POST", 404],
+        ["/mcp/:server/oauth/authorize", "/mcp/{server}/oauth/authorize", "/mcp/alpha/oauth/authorize", "GET", 404],
+        ["/mcp/:server/oauth/token", "/mcp/{server}/oauth/token", "/mcp/alpha/oauth/token", "POST", 404],
+        ["/mcp/:server/oauth/credential", "/mcp/{server}/oauth/credential", "/mcp/alpha/oauth/credential", "DELETE", 404],
+        ["/mcp-oauth/callback", "/mcp-oauth/callback", "/mcp-oauth/callback", "GET", 400],
+      ] as const
+    ).map(([route, endpoint, path, method, status]) => ({
+      route,
+      name: `${method} ${route}`,
+      endpoint,
+      families: [...REQUEST],
+      drive: async () => void (await expectCall(path, { method }, status)),
+    })),
     // MCP: a tool call, no model and no token usage.
     { route: "/mcp", name: "mcp tools/call", endpoint: "/mcp", families: [...REQUEST, "e2e_upstream"], drive: () => mcpToolCall("/mcp") },
     { route: "/mcp/", name: "mcp/ tools/call", endpoint: "/mcp", families: [...REQUEST, "e2e_upstream"], drive: () => mcpToolCall("/mcp/") },
