@@ -2411,8 +2411,10 @@ async fn responses_cross_provider_to_target(
     // operator-facing name so the bridge re-resolves the upstream id via
     // `ctx.model.upstream_model()` exactly like chat.rs.
     let outbound_body = crate::effort_mapping::responses_request(body, model);
-    let chat =
+    let mut chat =
         crate::responses_bridge::responses_request_to_chat(requested_model, outbound_body.as_ref());
+    chat.thoughts_requested =
+        aisix_gateway::chat::effort_asks_for_thoughts(body.pointer("/reasoning/effort"));
     // A rewritten body is a whole-request copy; the translation above is
     // all this attempt needs from it.
     drop(outbound_body);

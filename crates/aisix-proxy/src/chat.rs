@@ -122,6 +122,8 @@ pub async fn chat_completions(
             );
         }
     };
+    req.thoughts_requested =
+        aisix_gateway::chat::effort_asks_for_thoughts(req.extra.get("reasoning_effort"));
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
     let model_name = req.model.clone();

@@ -1996,11 +1996,11 @@ impl GeminiStreamState {
 /// [`ChatChunk`] sequence. Every candidate (`n > 1` streams several per
 /// frame, keyed by `index`) yields up to TWO chunks for its choice:
 ///
-/// 1. **Role chunk** (only on the choice's first emission carrying text
-///    or a tool call) — sets `delta.role = Role::Assistant` so downstream
+/// 1. **Role chunk** (only on the choice's first emission carrying text,
+///    reasoning or a tool call) — sets `delta.role = Role::Assistant` so downstream
 ///    consumers know this is an assistant turn. Mirrors OpenAI's
 ///    "first-chunk-is-role" wire convention.
-/// 2. **Content / terminal chunk** — carries the text delta, its
+/// 2. **Content / terminal chunk** — carries the text and reasoning deltas,
 ///    `logprobs`, any `functionCall` parts as complete `tool_calls` deltas
 ///    (Gemini streams each call whole, never split across chunks; each gets
 ///    the next `index` of its choice), and, on the final upstream chunk, the
@@ -2065,7 +2065,11 @@ fn gemini_chunk_into_chat_chunks(
     }
     for (index, c) in candidates {
         let logprobs = gemini_logprobs(c.logprobs_result.as_ref());
-        let (text, tool_calls) = c.content.map(gemini_parts_into_message).unwrap_or_default();
+        let GeminiMessageParts {
+            text,
+            reasoning,
+            tool_calls,
+        } = c.content.map(gemini_parts_into_message).unwrap_or_default();
         // Distinguish "no finishReason field" from "finishReason: STOP".
         // The non-stream path collapses both to FinishReason::Stop (since
         // ChatResponse always carries a finish_reason); on the stream
@@ -2083,7 +2087,8 @@ fn gemini_chunk_into_chat_chunks(
                 map_gemini_finish_reason(Some(s))
             }
         });
-        let emit_role = !choice.emitted_role && (!text.is_empty() || !tool_calls.is_empty());
+        let emit_role = !choice.emitted_role
+            && (!text.is_empty() || !reasoning.is_empty() || !tool_calls.is_empty());
         if emit_role {
             choice.emitted_role = true;
         }
@@ -2098,10 +2103,12 @@ fn gemini_chunk_into_chat_chunks(
         if emit_role {
             chunks.push(chunk(index, role(), state));
         }
-        // Content / terminal chunk — emit when there's text, a tool call,
-        // logprobs or a finishReason, so the terminal-state chunk lands
+        // Content / terminal chunk — emit when there's text, reasoning, a
+        // tool call, logprobs or a finishReason, so a thought-only frame
+        // reaches the client as it arrives and the terminal-state chunk lands
         // even when its content is empty.
         if !text.is_empty()
+            || !reasoning.is_empty()
             || !tool_calls.is_empty()
             || logprobs.is_some()
             || finish_reason.is_some()
@@ -2110,6 +2117,7 @@ fn gemini_chunk_into_chat_chunks(
                 index,
                 ChatDelta {
                     content: (!text.is_empty()).then_some(text),
+                    reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
                     tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
                     ..Default::default()
                 },
@@ -2462,6 +2470,13 @@ fn gemini_stop_sequences(req: &ChatFormat) -> Result<Option<serde_json::Value>, 
 /// (<https://cloud.google.com/vertex-ai/generative-ai/docs/thinking>).
 /// A tier the model has no setting for, and every tier on an older model,
 /// is dropped.
+///
+/// A caller that asked for its thoughts ([`ChatFormat::thoughts_requested`])
+/// on 2.5 or later also gets `includeThoughts`, on its own when no setting
+/// applies; Gemini returns no thought parts without it. An effort written by
+/// anyone else does not ask, so that request and its response stay as they
+/// would be with no reasoning support, and neither does a request whose
+/// effective setting turns thinking off (`none`).
 fn gemini_thinking_config(
     req: &ChatFormat,
     upstream_model: &str,
@@ -2475,28 +2490,37 @@ fn gemini_thinking_config(
             ))
         }
     };
+    let mut config = serde_json::Map::new();
     if gemini_3_or_newer(upstream_model) {
         let level = match effort {
-            Some("minimal") => "MINIMAL",
-            Some("low") => "LOW",
-            Some("medium") => "MEDIUM",
-            Some("high") => "HIGH",
-            _ => return Ok(None),
+            Some("minimal") => Some("MINIMAL"),
+            Some("low") => Some("LOW"),
+            Some("medium") => Some("MEDIUM"),
+            Some("high") => Some("HIGH"),
+            _ => None,
         };
-        return Ok(Some(serde_json::json!({ "thinkingLevel": level })));
-    }
-    if !gemini_2_5(upstream_model) {
+        if let Some(level) = level {
+            config.insert("thinkingLevel".into(), level.into());
+        }
+    } else if gemini_2_5(upstream_model) {
+        let budget = match (req.thinking_budget_tokens, effort) {
+            (Some(budget), _) => Some(budget),
+            (None, Some("minimal" | "low")) => Some(1024),
+            (None, Some("medium")) => Some(8192),
+            (None, Some("high")) => Some(24576),
+            (None, Some("none")) if !gemini_model_name(upstream_model).contains("-pro") => Some(0),
+            _ => None,
+        };
+        if let Some(budget) = budget {
+            config.insert("thinkingBudget".into(), budget.into());
+        }
+    } else {
         return Ok(None);
     }
-    let budget = match (req.thinking_budget_tokens, effort) {
-        (Some(budget), _) => budget,
-        (None, Some("minimal" | "low")) => 1024,
-        (None, Some("medium")) => 8192,
-        (None, Some("high")) => 24576,
-        (None, Some("none")) if !gemini_model_name(upstream_model).contains("-pro") => 0,
-        _ => return Ok(None),
-    };
-    Ok(Some(serde_json::json!({ "thinkingBudget": budget })))
+    if req.thoughts_requested && effort != Some("none") {
+        config.insert("includeThoughts".into(), true.into());
+    }
+    Ok((!config.is_empty()).then_some(serde_json::Value::Object(config)))
 }
 
 /// Read the generation off a Gemini model name: `2` from
@@ -2962,25 +2986,38 @@ struct GeminiResponsePart {
     function_call: Option<GeminiFunctionCall>,
     #[serde(default, rename = "thoughtSignature")]
     thought_signature: Option<String>,
+    #[serde(default)]
+    thought: bool,
 }
 
-/// A candidate's parts → the turn's text and its OpenAI-shape
-/// `tool_calls` (no `index`), in part order.
-fn gemini_parts_into_message(content: GeminiResponseContent) -> (String, Vec<serde_json::Value>) {
-    let mut text = String::new();
-    let mut tool_calls = Vec::new();
+#[derive(Debug, Default)]
+struct GeminiMessageParts {
+    text: String,
+    reasoning: String,
+    tool_calls: Vec<serde_json::Value>,
+}
+
+/// A candidate's parts → the turn's text, its reasoning (`thought: true`
+/// parts, as sent) and its OpenAI-shape `tool_calls` (no `index`), each in
+/// part order.
+fn gemini_parts_into_message(content: GeminiResponseContent) -> GeminiMessageParts {
+    let mut out = GeminiMessageParts::default();
     for part in content.parts {
         if let Some(t) = part.text {
-            text.push_str(&t);
+            if part.thought {
+                out.reasoning.push_str(&t);
+            } else {
+                out.text.push_str(&t);
+            }
         }
         if let Some(call) = part.function_call {
-            tool_calls.push(tool_call_from_function_call(
+            out.tool_calls.push(tool_call_from_function_call(
                 &call,
                 part.thought_signature.as_deref(),
             ));
         }
     }
-    (text, tool_calls)
+    out
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3157,8 +3194,17 @@ fn gemini_response_into_chat_response(
 
 fn gemini_candidate_into_choice(index: u32, c: GeminiCandidate) -> ChatChoice {
     let logprobs = gemini_logprobs(c.logprobs_result.as_ref());
-    let (text, tool_calls) = c.content.map(gemini_parts_into_message).unwrap_or_default();
+    let GeminiMessageParts {
+        text,
+        reasoning,
+        tool_calls,
+    } = c.content.map(gemini_parts_into_message).unwrap_or_default();
     let mut message = ChatMessage::assistant(text);
+    if !reasoning.is_empty() {
+        message
+            .extra
+            .insert("reasoning_content".into(), reasoning.into());
+    }
     let finish_reason = if tool_calls.is_empty() {
         map_gemini_finish_reason(c.finish_reason.as_deref())
     } else {
@@ -3962,11 +4008,17 @@ mod tests {
 
     #[test]
     fn reasoning_effort_becomes_each_generation_s_thinking_setting() {
-        let thinking = |effort: &str, model: &str| {
-            gemini_body(serde_json::json!({"reasoning_effort": effort}), model)
+        let asking = |effort: &str, model: &str, thoughts_requested: bool| {
+            let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+            req.extra
+                .insert("reasoning_effort".into(), serde_json::json!(effort));
+            req.thoughts_requested = thoughts_requested;
+            serde_json::to_value(build_gemini_request(&req, model).unwrap())
+                .unwrap()
                 .pointer("/generationConfig/thinkingConfig")
                 .cloned()
         };
+        let thinking = |effort: &str, model: &str| asking(effort, model, true);
         for (effort, level) in [
             ("minimal", "MINIMAL"),
             ("low", "LOW"),
@@ -3975,10 +4027,19 @@ mod tests {
         ] {
             assert_eq!(
                 thinking(effort, "gemini-3-flash-preview"),
-                Some(serde_json::json!({"thinkingLevel": level}))
+                Some(serde_json::json!({"thinkingLevel": level, "includeThoughts": true}))
             );
         }
         assert_eq!(thinking("none", "gemini-3-pro-preview"), None);
+        // A tier with no setting still asked for thinking.
+        assert_eq!(
+            thinking("max", "gemini-3-pro-preview"),
+            Some(serde_json::json!({"includeThoughts": true}))
+        );
+        assert_eq!(
+            thinking("max", "gemini-2.5-flash"),
+            Some(serde_json::json!({"includeThoughts": true}))
+        );
         for (effort, budget) in [
             ("minimal", 1024),
             ("low", 1024),
@@ -3987,7 +4048,7 @@ mod tests {
         ] {
             assert_eq!(
                 thinking(effort, "gemini-2.5-pro"),
-                Some(serde_json::json!({"thinkingBudget": budget}))
+                Some(serde_json::json!({"thinkingBudget": budget, "includeThoughts": true}))
             );
         }
         assert_eq!(
@@ -4001,17 +4062,35 @@ mod tests {
         // 2.5 Pro cannot turn thinking off.
         assert_eq!(thinking("none", "gemini-2.5-pro"), None);
         assert_eq!(thinking("high", "gemini-2.0-flash"), None);
+        // An effort the caller did not send sets the depth and asks for nothing.
+        assert_eq!(
+            asking("high", "gemini-3-flash-preview", false),
+            Some(serde_json::json!({"thinkingLevel": "HIGH"}))
+        );
+        assert_eq!(
+            asking("high", "gemini-2.5-flash", false),
+            Some(serde_json::json!({"thinkingBudget": 24576}))
+        );
+        // A caller that sent nothing gets no thinking setting at all.
+        for model in ["gemini-2.5-flash", "gemini-3-flash-preview"] {
+            assert_eq!(
+                gemini_body(serde_json::json!({}), model)
+                    .pointer("/generationConfig/thinkingConfig"),
+                None
+            );
+        }
 
         // A `/v1/messages` caller's exact budget wins over its bucketed tier.
         let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
         req.extra
             .insert("reasoning_effort".into(), serde_json::json!("medium"));
+        req.thoughts_requested = true;
         req.thinking_budget_tokens = Some(3000);
         let body =
             serde_json::to_value(build_gemini_request(&req, "gemini-2.5-flash").unwrap()).unwrap();
         assert_eq!(
             body["generationConfig"]["thinkingConfig"],
-            serde_json::json!({"thinkingBudget": 3000})
+            serde_json::json!({"thinkingBudget": 3000, "includeThoughts": true})
         );
     }
 
