@@ -152,6 +152,11 @@ struct TokenRecord {
     /// `client_id` takes precedence over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     registered_client: Option<RegisteredClient>,
+    /// The `redirect_uri` of the sign-in, repeated on a refresh: Jira Data
+    /// Center documents it there, and RFC 6749 §3.2 has every other token
+    /// endpoint ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    redirect_uri: Option<String>,
 }
 
 fn unix_now() -> i64 {
@@ -527,6 +532,9 @@ impl UserOAuthManager {
         if let Some(resource) = &record.resource {
             form.push(("resource", resource.clone()));
         }
+        if let Some(redirect_uri) = &record.redirect_uri {
+            form.push(("redirect_uri", redirect_uri.clone()));
+        }
         flow::add_client(&mut form, server, record.registered_client.as_ref());
         let issued = match flow::token_request(server, &token_endpoint, &form).await {
             flow::TokenOutcome::Issued(issued) => issued,
@@ -559,6 +567,7 @@ impl UserOAuthManager {
             expires_at: issued.expires_at,
             resource: record.resource,
             registered_client: record.registered_client,
+            redirect_uri: record.redirect_uri,
         };
         let value = serde_json::to_vec(&refreshed).expect("token record serializes");
         let label_values = TokenLabels::new(server, subject);
@@ -636,5 +645,95 @@ impl<'a> TokenLabels<'a> {
             labels.insert("member_id", member);
         }
         labels
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared_store::{MemoryStore, StoredValue};
+    use async_trait::async_trait;
+
+    /// A store whose every call fails, as one in an outage does.
+    struct DownStore;
+
+    #[async_trait]
+    impl SharedStore for DownStore {
+        async fn get(&self, _: &str, _: &str) -> Result<Option<StoredValue>, StoreError> {
+            Err(StoreError::Unavailable)
+        }
+        async fn put(
+            &self,
+            _: &str,
+            _: &str,
+            _: Vec<u8>,
+            _: Duration,
+            _: &BTreeMap<&str, &str>,
+            _: PutCondition,
+        ) -> Result<i64, StoreError> {
+            Err(StoreError::Unavailable)
+        }
+        async fn delete(&self, _: &str, _: &str, _: Option<i64>) -> Result<(), StoreError> {
+            Err(StoreError::Unavailable)
+        }
+    }
+
+    fn server() -> UserOAuthServer {
+        let row: McpServer = serde_json::from_value(serde_json::json!({
+            "name": "s",
+            "url": "https://upstream.example/mcp",
+            "auth_type": "oauth2_authorization_code",
+        }))
+        .unwrap();
+        UserOAuthServer::new("server-id", &row)
+    }
+
+    /// A copy this gateway read so long ago that it should prefer the store.
+    fn stale_copy(manager: &UserOAuthManager, expires_at: Option<i64>) {
+        let key = digest(&["server-id", UserSubject::member("u").id()]);
+        manager.cache.lock().unwrap().insert(
+            key,
+            CachedToken {
+                access_token: "cached".to_owned(),
+                expires_at,
+                read_store_after: Instant::now(),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn an_outage_is_survived_by_a_copy_past_its_window_while_it_is_valid() {
+        let manager = Arc::new(UserOAuthManager::new(Arc::new(DownStore)));
+        let subject = UserSubject::member("u");
+        stale_copy(&manager, Some(unix_now() + 30));
+        assert_eq!(
+            manager.access_token(&server(), &subject).await.as_deref(),
+            Ok("cached")
+        );
+        stale_copy(&manager, Some(unix_now() - 1));
+        assert_eq!(
+            manager.access_token(&server(), &subject).await,
+            Err(UserOAuthFailure::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn past_its_window_a_copy_loses_to_a_store_that_no_longer_has_it() {
+        let manager = Arc::new(UserOAuthManager::new(Arc::new(MemoryStore::default())));
+        let subject = UserSubject::member("u");
+        stale_copy(&manager, Some(unix_now() + 3600));
+        assert_eq!(
+            manager.access_token(&server(), &subject).await,
+            Err(UserOAuthFailure::AuthorizationRequired)
+        );
+    }
+
+    #[test]
+    fn a_record_from_another_version_still_reads() {
+        let stored = StoredValue {
+            value: br#"{"access_token":"a","added_later":{"x":1}}"#.to_vec(),
+            version: 1,
+        };
+        assert_eq!(decode_token(&stored).unwrap().access_token, "a");
     }
 }

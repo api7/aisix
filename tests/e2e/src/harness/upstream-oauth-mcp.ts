@@ -16,6 +16,10 @@ export interface OAuthMcpUpstreamOptions {
   staticClient?: { id: string; secret: string };
   /** Issue no refresh tokens at all. */
   noRefreshTokens?: boolean;
+  /** Serve `/authorize` and `/token` under this path, as Jira Data Center does. */
+  oauthPathPrefix?: string;
+  /** Refuse a refresh that does not repeat `redirect_uri`, as Jira documents it. */
+  refreshNeedsRedirectUri?: boolean;
 }
 
 interface IssuedCode {
@@ -49,6 +53,10 @@ export class OAuthMcpUpstream {
   refreshAnswer: { status: number; error: string } | "ok" = "ok";
   /** Reject every access token, whatever it is. */
   rejectEveryToken = false;
+  /** Method and path of every request, in arrival order. */
+  requestsSeen: string[] = [];
+  /** Query string of every token request: a credential belongs in the body. */
+  tokenRequestQueries: string[] = [];
   /** Delay before answering a refresh grant, for overlapping requests. */
   refreshDelayMs = 0;
 
@@ -106,7 +114,9 @@ export class OAuthMcpUpstream {
     const url = new URL(req.url ?? "/", this.url);
     const json = (status: number, body: unknown) =>
       res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
-    switch (`${req.method} ${url.pathname}`) {
+    this.requestsSeen.push(`${req.method} ${url.pathname}`);
+    const oauthPrefix = this.options.oauthPathPrefix ?? "";
+    switch (`${req.method} ${url.pathname.startsWith(oauthPrefix) ? url.pathname.slice(oauthPrefix.length) : url.pathname}`) {
       case "GET /.well-known/oauth-protected-resource/mcp":
         if (!this.options.discovery) return void json(404, {});
         return void json(200, {
@@ -129,6 +139,7 @@ export class OAuthMcpUpstream {
       case "GET /authorize":
         return this.authorize(url, res, json);
       case "POST /token":
+        this.tokenRequestQueries.push(url.search);
         return this.token(req, json);
       case "POST /mcp":
         return this.mcp(req, res);
@@ -213,6 +224,9 @@ export class OAuthMcpUpstream {
     }
     if (form.grant_type === "refresh_token") {
       if (this.refreshDelayMs > 0) await new Promise((r) => setTimeout(r, this.refreshDelayMs));
+      if (this.options.refreshNeedsRedirectUri && !form.redirect_uri) {
+        return json(400, { error: "invalid_request" });
+      }
       if (this.refreshAnswer !== "ok") {
         return json(this.refreshAnswer.status, { error: this.refreshAnswer.error });
       }
@@ -234,7 +248,9 @@ export class OAuthMcpUpstream {
       res
         .writeHead(401, {
           "content-type": "application/json",
-          "www-authenticate": `Bearer resource_metadata="${this.url}/.well-known/oauth-protected-resource/mcp"`,
+          "www-authenticate": this.options.discovery
+            ? `Bearer resource_metadata="${this.url}/.well-known/oauth-protected-resource/mcp"`
+            : "Bearer",
         })
         .end(JSON.stringify({ error: "invalid_token" }));
       return;

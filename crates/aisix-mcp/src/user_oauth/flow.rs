@@ -396,7 +396,7 @@ impl UserOAuthManager {
         let mut form = vec![
             ("grant_type", "authorization_code".to_owned()),
             ("code", code.upstream_code),
-            ("redirect_uri", code.upstream_redirect_uri),
+            ("redirect_uri", code.upstream_redirect_uri.clone()),
             ("code_verifier", request.code_verifier.to_owned()),
         ];
         if let Some(resource) = &code.resource {
@@ -419,6 +419,7 @@ impl UserOAuthManager {
             expires_at: issued.expires_at,
             resource: code.resource,
             registered_client: code.registered_client,
+            redirect_uri: Some(code.upstream_redirect_uri),
         };
         self.store_signed_in(server, subject, &record).await
     }

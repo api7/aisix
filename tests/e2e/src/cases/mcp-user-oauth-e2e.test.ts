@@ -139,6 +139,7 @@ describe("per-user OAuth to an upstream MCP server", () => {
   let aggregatedB: OAuthMcpUpstream;
   let selfRevoke: OAuthMcpUpstream;
   let noRefresh: OAuthMcpUpstream;
+  let jira: OAuthMcpUpstream;
 
   // `alice` and `bob` are members; `ALICE2` is another key of alice's.
   const ALICE = "sk-oauth-alice";
@@ -168,6 +169,14 @@ describe("per-user OAuth to an upstream MCP server", () => {
     aggregatedB = await upstream();
     selfRevoke = await upstream();
     noRefresh = await upstream({ noRefreshTokens: true });
+    jira = await upstream({
+      discovery: false,
+      registration: false,
+      expiresIn: 7200,
+      oauthPathPrefix: "/jira/rest/oauth2/latest",
+      refreshNeedsRedirectUri: true,
+      staticClient: { id: "jira-client", secret: "jira-secret" },
+    });
 
     await addServer(stack, "main", main, { forward_client_headers: ["authorization"] });
     await addServer(stack, "shortlived", shortLived);
@@ -179,6 +188,13 @@ describe("per-user OAuth to an upstream MCP server", () => {
       authorization_url: `${staticClient.url}/authorize`,
       token_url: `${staticClient.url}/token`,
       scopes: ["tools:read"],
+    });
+    await addServer(stack, "jira", jira, {
+      client_id: "jira-client",
+      secret: "jira-secret",
+      authorization_url: `${jira.url}/jira/rest/oauth2/latest/authorize`,
+      token_url: `${jira.url}/jira/rest/oauth2/latest/token`,
+      scopes: ["READ"],
     });
     await addServer(stack, "registering", registering);
     await addServer(stack, "aggregateda", aggregatedA);
@@ -590,6 +606,56 @@ describe("per-user OAuth to an upstream MCP server", () => {
     const exchange = staticClient.tokenRequests.at(-1)!;
     expect(exchange.client_id).toBe("configured-client");
     expect(exchange.client_secret).toBe("configured-secret");
+  });
+
+  test("a pre-registered client on an upstream publishing no metadata needs none of it", async () => {
+    if (!etcdReachable) return;
+    jira.user = "alice";
+    const { state, client } = await signIn(url("jira"), key(ALICE));
+    expect(await whoami(client)).toBe("alice");
+
+    const authorization = jira.authorizeRequests.at(-1)!;
+    expect(authorization.client_id).toBe("jira-client");
+    expect(authorization.scope).toBe("READ");
+    expect(authorization.code_challenge_method).toBe("S256");
+    expect(authorization.code_challenge).toBe(
+      createHash("sha256").update(state.verifier).digest("base64url"),
+    );
+    expect(authorization).not.toHaveProperty("resource");
+
+    // PKCE is verified upstream, against the client's verifier; the secret
+    // travels in the POST body and nowhere else.
+    const exchange = jira.tokenRequests.at(-1)!;
+    expect(exchange.grant_type).toBe("authorization_code");
+    expect(exchange.code_verifier).toBe(state.verifier);
+    expect(exchange.client_secret).toBe("jira-secret");
+    expect(exchange).not.toHaveProperty("resource");
+    expect(jira.tokenRequestQueries.at(-1)).toBe("");
+
+    // Nothing was asked of it but the two endpoints and the MCP server.
+    expect(jira.requestsSeen.filter((r) => r.includes(".well-known"))).toEqual([]);
+    expect(jira.requestsSeen).not.toContain("GET /mcp");
+    expect(jira.registrations).toHaveLength(0);
+
+    // A refresh invalidates what it replaces, and carries the same client.
+    jira.revokeAccessTokens("alice");
+    expect(await whoami(client)).toBe("alice");
+    const refresh = jira.refreshGrants().at(-1)!;
+    expect(refresh.refresh_token).toMatch(/^rt-alice-/);
+    expect(refresh.client_id).toBe("jira-client");
+    expect(refresh.client_secret).toBe("jira-secret");
+    expect(refresh.redirect_uri).toBe(`${stack.base}/mcp-oauth/callback`);
+    expect(refresh).not.toHaveProperty("resource");
+    expect(refresh).not.toHaveProperty("scope");
+
+    // The rotated token is the one that works next.
+    jira.revokeAccessTokens("alice");
+    expect(await whoami(client)).toBe("alice");
+    const spent = jira.refreshGrants().map((f) => f.refresh_token);
+    expect(new Set(spent).size).toBe(2);
+    expect(jira.tokenRequests.every((f) => !(f.scope ?? "").includes("offline_access"))).toBe(true);
+    expect(authorization.scope).not.toContain("offline_access");
+    await client.close();
   });
 
   test("without a client id the gateway registers once, as a public client, for everyone", async () => {
