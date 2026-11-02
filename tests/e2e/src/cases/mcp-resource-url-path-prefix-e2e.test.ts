@@ -53,7 +53,10 @@ async function startPrefixStrippingProxy(prefix: string, target: URL): Promise<F
         upstreamRes.pipe(res);
       },
     );
-    upstream.on("error", () => res.writeHead(502).end());
+    upstream.on("error", () => {
+      if (res.headersSent) res.destroy();
+      else res.writeHead(502).end();
+    });
     req.pipe(upstream);
   });
   await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
@@ -101,7 +104,7 @@ describe("mcp_auth_settings.resource_url with a path prefix", () => {
 
     idp = await startMockIdp();
     upstream = await startMcpUpstream("prefixed");
-    app = await spawnApp();
+    app = await spawnApp({ logLevel: "info" });
     front = await startPrefixStrippingProxy(PREFIX, new URL(app.proxyUrl));
     seed = new SeedClient(etcd, app.etcdPrefix);
     await seed.createOidcProvider({
@@ -120,12 +123,17 @@ describe("mcp_auth_settings.resource_url with a path prefix", () => {
     await idp?.close();
   });
 
-  /** Point the row at `resourceUrl` and wait for `probeUrl` to show `challenge`. */
-  const configure = async (resourceUrl: string, probeUrl: string, challenge: string | null) => {
+  /**
+   * Point the row at `resourceUrl` and wait for the gateway to apply it, read
+   * off the metadata document rather than the challenge the tests assert on:
+   * a gateway publishing `resourceUrl`, or nothing at all for an invalid one.
+   */
+  const configure = async (resourceUrl: string, valid: boolean) => {
     await seed!.update("mcp_auth_settings", settingsId, { resource_url: resourceUrl });
     await waitConfigPropagation(async () => {
-      const res = await mcpPost(probeUrl);
-      return res.headers.get("www-authenticate") === challenge;
+      const res = await fetch(`${app!.proxyUrl}/.well-known/oauth-protected-resource/mcp`);
+      if (!valid) return res.status === 404;
+      return res.ok && ((await res.json()) as { resource: string }).resource === resourceUrl;
     });
   };
 
@@ -134,7 +142,7 @@ describe("mcp_auth_settings.resource_url with a path prefix", () => {
     const resource = `${front!.url}${PREFIX}/mcp`;
     const metadata = `${front!.url}${PREFIX}/.well-known/oauth-protected-resource/mcp`;
     const challenge = `Bearer resource_metadata="${metadata}"`;
-    await configure(resource, resource, challenge);
+    await configure(resource, true);
 
     for (const endpoint of [resource, `${resource}/${SERVER}`]) {
       const missing = await mcpPost(endpoint);
@@ -162,7 +170,7 @@ describe("mcp_auth_settings.resource_url with a path prefix", () => {
     const resource = `${app!.proxyUrl}/mcp`;
     const metadata = `${app!.proxyUrl}/.well-known/oauth-protected-resource/mcp`;
     const challenge = `Bearer resource_metadata="${metadata}"`;
-    await configure(resource, resource, challenge);
+    await configure(resource, true);
 
     for (const endpoint of [resource, `${resource}/${SERVER}`]) {
       const res = await mcpPost(endpoint);
@@ -178,21 +186,21 @@ describe("mcp_auth_settings.resource_url with a path prefix", () => {
   test("a path that only looks like it ends in /mcp keeps discovery dormant, with one warning", async () => {
     if (!etcdReachable) return;
     const probe = `${app!.proxyUrl}/mcp`;
-    const active = `Bearer resource_metadata="${app!.proxyUrl}/.well-known/oauth-protected-resource/mcp"`;
     for (const path of [`${PREFIX}/foo-mcp`, `${PREFIX}/mcp/`, `${PREFIX}/mcp/x`]) {
-      await configure(`${front!.url}${path}`, probe, null);
-      expect((await mcpPost(probe)).status, path).toBe(401);
-      expect((await fetch(`${app!.proxyUrl}/.well-known/oauth-protected-resource/mcp`)).status, path).toBe(404);
+      await configure(`${front!.url}${path}`, false);
+      const res = await mcpPost(probe);
+      expect(res.status, path).toBe(401);
+      expect(res.headers.get("www-authenticate"), path).toBeNull();
       // Back to a valid URL, so the next value's wait cannot pass on this one.
-      await configure(probe, probe, active);
+      await configure(probe, true);
     }
 
-    await waitForLogLine(
-      app!,
-      (line) => line.includes("mcp_auth_settings.resource_url") && line.includes("ending in /mcp"),
-      "the dormant-surface warning",
-    );
-    const warnings = app!.output().split("\n").filter((l) => l.includes("mcp_auth_settings.resource_url"));
-    expect(warnings).toHaveLength(1);
+    const isWarning = (line: string) => line.includes("OAuth discovery surface stays dormant");
+    expect(await waitForLogLine(app!, isWarning, "the dormant-surface warning")).toContain("ending in /mcp");
+    // This request's access-log line follows anything the requests above
+    // queued, so a repeat of the warning would already be readable below it.
+    const barrier = (await mcpPost(probe)).headers.get("x-aisix-request-id");
+    await waitForLogLine(app!, (line) => line.includes(`request_id="${barrier}"`), "the barrier request's access log");
+    expect(app!.output().split("\n").filter(isWarning)).toHaveLength(1);
   });
 });
