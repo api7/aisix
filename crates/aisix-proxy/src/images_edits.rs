@@ -748,7 +748,7 @@ async fn dispatch(
     let captured_content = match (&captured_prompt, content_cap) {
         (Some(prompt), Some(cap)) => Some(CapturedContent::new(
             prompt,
-            &serde_json::to_string(&resp_json).unwrap_or_default(),
+            &aisix_obs::sink::image_response_for_capture(&resp_json),
             cap as usize,
         )),
         _ => None,

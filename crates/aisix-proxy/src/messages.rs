@@ -2774,7 +2774,10 @@ async fn cross_provider_dispatch(
     // Capture the prompt (the Anthropic request body) + assembled assistant
     // text for content-capturing exporters (gated); threaded to `fan_out` via
     // `DispatchOutcome`, never to the CP sink.
-    let json = chat_response_into_anthropic_json(&resp, model_name);
+    let mut json = chat_response_into_anthropic_json(&resp, model_name);
+    if resp.id.is_empty() {
+        json["id"] = format!("msg_{}", Uuid::new_v4().simple()).into();
+    }
     let captured_content = content_capture_cap(
         snapshot
             .observability_exporters

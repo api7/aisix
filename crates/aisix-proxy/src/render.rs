@@ -298,6 +298,26 @@ pub struct RenderedDelta {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+fn generated_completion_id() -> String {
+    format!("chatcmpl-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// The id a stream's frames carry when the upstream left one out. It is minted
+/// here rather than in a provider bridge because `ChatChunk::id` also feeds the
+/// usage event's `provider_request_id`, which must stay the upstream's own.
+#[derive(Default)]
+pub(crate) struct StreamId(Option<String>);
+
+impl StreamId {
+    pub(crate) fn stamp(&mut self, id: &mut String) {
+        if id.is_empty() {
+            id.clone_from(self.0.get_or_insert_with(generated_completion_id));
+        } else if self.0.is_none() {
+            self.0 = Some(id.clone());
+        }
+    }
+}
+
 pub fn render_response(
     created_unix_ts: i64,
     resp: ChatResponse,
@@ -307,7 +327,11 @@ pub fn render_response(
     // `claude-3-5-sonnet-20241022`, etc.). The wire-level contract is
     // to echo the customer's requested name — see module-level docs.
     ChatCompletion {
-        id: resp.id,
+        id: if resp.id.is_empty() {
+            generated_completion_id()
+        } else {
+            resp.id
+        },
         object: "chat.completion",
         created: created_unix_ts,
         model: client_facing_model.to_string(),

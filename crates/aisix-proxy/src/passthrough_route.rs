@@ -3580,7 +3580,11 @@ fn response_visible_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
 /// Captures preserve the existing typed visible-content contract; guardrail
 /// scanning may include additional raw fields that are forwarded downstream.
 fn response_capture_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
-    response_visible_text(protocol, body)
+    let text = response_visible_text(protocol, body);
+    match aisix_obs::sink::image_response_text_for_capture(&text) {
+        std::borrow::Cow::Borrowed(_) => text,
+        std::borrow::Cow::Owned(omitted) => omitted,
+    }
 }
 
 /// Every token dimension a passthrough exchange can report, mirroring the
@@ -5897,6 +5901,7 @@ fn frame_capture_text(protocol: PassthroughProtocol, frame: &[u8], scan: &str) -
     crate::redact::frame_payload(frame)
         .map(|payload| payload.trim().to_owned())
         .filter(|payload| !payload.is_empty() && payload != "[DONE]")
+        .map(|payload| aisix_obs::sink::image_response_text_for_capture(&payload).into_owned())
         .unwrap_or_else(|| scan.to_string())
 }
 
@@ -11207,6 +11212,24 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         assert_eq!(frames[0].bytes, b"12345");
         assert!(frames[0].overflowed);
         assert!(s.take_rest().is_empty());
+    }
+
+    #[test]
+    fn captured_image_answers_carry_no_b64_json() {
+        let body = br#"{"created":1,"data":[{"b64_json":"QUJD","revised_prompt":"a cat"}]}"#;
+        for protocol in [
+            PassthroughProtocol::Raw,
+            PassthroughProtocol::OpenaiChat,
+            PassthroughProtocol::OpenaiResponses,
+        ] {
+            let captured = response_capture_text(protocol, body);
+            assert!(!captured.contains("QUJD"), "{captured}");
+            assert!(captured.contains("a cat"), "{captured}");
+        }
+        let frame = b"data: {\"type\":\"image_generation.completed\",\"b64_json\":\"QUJD\"}\n\n";
+        let captured = frame_capture_text(PassthroughProtocol::Raw, frame, "");
+        assert!(captured.contains("omitted"), "{captured}");
+        assert!(!captured.contains("QUJD"), "{captured}");
     }
 
     #[test]

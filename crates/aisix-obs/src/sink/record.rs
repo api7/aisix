@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use super::truncate::truncate_content;
+use super::truncate::{omit_base64_media_in_json, truncate_content};
 use crate::usage::UsageEvent;
 
 /// Current canonical event schema version, emitted on every [`SinkRecord`]
@@ -201,8 +201,12 @@ impl CapturedContent {
     /// bound the held buffer at the largest cap any content-capturing
     /// exporter requested. `truncated` is set if either was cut here; a
     /// per-exporter `SinkContent` ORs in its own (smaller) cap.
+    ///
+    /// The prompt's base64 media is omitted first, so no exporter path can
+    /// carry it and a large attachment alone never pushes a prompt over the cap.
     pub fn new(prompt: &str, response: &str, max_bytes: usize) -> Self {
-        let (prompt, p_cut) = truncate_content(prompt, max_bytes);
+        let prompt = omit_base64_media_in_json(prompt);
+        let (prompt, p_cut) = truncate_content(&prompt, max_bytes);
         let (response, r_cut) = truncate_content(response, max_bytes);
         Self {
             prompt: prompt.into_owned(),

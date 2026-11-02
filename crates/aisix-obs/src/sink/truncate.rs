@@ -9,7 +9,8 @@
 //!
 //! - long string values keep a prefix plus an inline
 //!   `...[aisix: truncated, N bytes total]` marker inside the string;
-//! - base64 data URIs collapse to a compact placeholder;
+//! - base64 data URIs collapse to a compact placeholder (base64 media in a
+//!   captured prompt already did, whatever its size: [`omit_base64_media`]);
 //! - long arrays keep head+tail samples around an
 //!   `{"_aisix_truncated": true, "omitted_items": N}` placeholder element;
 //! - objects keep every key so the shape stays navigable.
@@ -171,6 +172,145 @@ fn placeholder_omitted(v: &Value) -> Option<u64> {
         .then(|| v.get("omitted_items").and_then(|n| n.as_u64()).unwrap_or(1))
 }
 
+const BASE64_OMITTED_PREFIX: &str = "[aisix: base64 data uri omitted,";
+
+fn base64_omitted(original_bytes: usize) -> String {
+    format!("{BASE64_OMITTED_PREFIX} {original_bytes} bytes]")
+}
+
+/// Replace every base64 media payload under `v` with the omitted-payload
+/// placeholder, whatever its type and size; returns whether anything changed.
+/// A data URI keeps its head (`data:image/png;base64,`), and a bare payload's
+/// siblings stay, so the mime type survives beside the placeholder. Running
+/// this twice keeps the original count.
+///
+/// Recognised by exact form or known field, never by what a string looks like:
+/// a base64 data URI anywhere; `source.data` of a `type: base64` source (Anthropic)
+/// and `source.bytes` (Converse); `input_audio.data`; `file_data`; `inlineData.data`
+/// (Gemini); and a replayed Responses `image_generation_call`'s `result`.
+pub fn omit_base64_media(v: &mut Value) -> bool {
+    match v {
+        Value::String(s) => omit_data_uri(s),
+        Value::Array(items) => items
+            .iter_mut()
+            .fold(false, |changed, item| omit_base64_media(item) | changed),
+        Value::Object(map) => {
+            let mut changed = false;
+            if map.get("type").and_then(Value::as_str) == Some("image_generation_call") {
+                changed |= map.get_mut("result").is_some_and(omit_bare_base64);
+            }
+            for (key, child) in map.iter_mut() {
+                changed |= match key.as_str() {
+                    "file_data" => omit_bare_base64(child),
+                    "input_audio" | "inlineData" | "inline_data" => {
+                        child.get_mut("data").is_some_and(omit_bare_base64)
+                    }
+                    "source" => {
+                        let base64 = child.get("type").and_then(Value::as_str) == Some("base64");
+                        child
+                            .get_mut(if base64 { "data" } else { "bytes" })
+                            .is_some_and(omit_bare_base64)
+                    }
+                    _ => false,
+                };
+                changed |= omit_base64_media(child);
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn omit_data_uri(s: &mut String) -> bool {
+    if !is_base64_data_uri(s) {
+        return false;
+    }
+    let Some((head, payload)) = s.split_once(',') else {
+        return false;
+    };
+    if payload.starts_with(BASE64_OMITTED_PREFIX) {
+        return false;
+    }
+    *s = format!("{head},{}", base64_omitted(s.len()));
+    true
+}
+
+fn omit_bare_base64(v: &mut Value) -> bool {
+    let Value::String(s) = v else {
+        return false;
+    };
+    if s.is_empty() || s.starts_with(BASE64_OMITTED_PREFIX) || is_base64_data_uri(s) {
+        // A data URI is the general walk's.
+        return false;
+    }
+    *s = base64_omitted(s.len());
+    true
+}
+
+/// Text a prompt must contain for [`omit_base64_media`] to find anything, so a
+/// prompt with no media is not parsed on the request path.
+const MEDIA_NEEDLES: [&str; 6] = [
+    "base64",
+    "\"bytes\"",
+    "input_audio",
+    "file_data",
+    "inline",
+    "image_generation_call",
+];
+
+/// [`omit_base64_media`] over serialized content. Text that is not JSON, or
+/// holds no base64 media, comes back untouched, byte for byte.
+pub(crate) fn omit_base64_media_in_json(s: &str) -> Cow<'_, str> {
+    if !MEDIA_NEEDLES.iter().any(|needle| s.contains(needle)) {
+        return Cow::Borrowed(s);
+    }
+    let Ok(mut root) = serde_json::from_str::<Value>(s) else {
+        return Cow::Borrowed(s);
+    };
+    if !omit_base64_media(&mut root) {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(root.to_string())
+}
+
+/// Replace every `b64_json` an image API answer carries with the placeholder.
+fn omit_b64_json(v: &mut Value) {
+    match v {
+        Value::Array(items) => items.iter_mut().for_each(omit_b64_json),
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if key == "b64_json" {
+                    omit_bare_base64(child);
+                } else {
+                    omit_b64_json(child);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// An image API response as an exporter's captured response: `b64_json` is the
+/// placeholder, every other field as the upstream sent it.
+pub fn image_response_for_capture(response: &Value) -> String {
+    let mut response = response.clone();
+    omit_b64_json(&mut response);
+    response.to_string()
+}
+
+/// [`image_response_for_capture`] over a response of unknown kind, as a
+/// passthrough route captures it: anything without a `b64_json` comes back
+/// untouched, byte for byte.
+pub fn image_response_text_for_capture(s: &str) -> Cow<'_, str> {
+    if !s.contains("b64_json") {
+        return Cow::Borrowed(s);
+    }
+    match serde_json::from_str::<Value>(s) {
+        Ok(response) => Cow::Owned(image_response_for_capture(&response)),
+        Err(_) => Cow::Borrowed(s),
+    }
+}
+
 /// Cap one string value. Base64 data URIs carry no information a log
 /// reader can use, so they collapse to a placeholder (detection is exact
 /// — bare base64 is left alone rather than guessed at); text keeps a
@@ -180,7 +320,11 @@ fn shrink_string(s: &str, cap: usize) -> String {
         return s.to_owned();
     }
     if is_base64_data_uri(s) {
-        return format!("[aisix: base64 data uri omitted, {} bytes]", s.len());
+        return match s.split_once(',') {
+            // Omitted at capture: the count there is the original's.
+            Some((_, payload)) if payload.starts_with(BASE64_OMITTED_PREFIX) => payload.to_owned(),
+            _ => base64_omitted(s.len()),
+        };
     }
     let (prefix, _) = truncate_on_char_boundary(s, cap);
     let marked = format!("{prefix}...[aisix: truncated, {} bytes total]", s.len());
@@ -299,6 +443,142 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("[aisix: truncated,"));
+    }
+
+    #[test]
+    fn base64_media_is_omitted_whatever_its_type_and_size_and_only_once() {
+        let uri = format!("data:image/png;base64,{}", "A".repeat(8));
+        let pdf = format!("data:application/pdf;base64,{}", "A".repeat(8));
+        let omitted = |n: usize| format!("[aisix: base64 data uri omitted, {n} bytes]");
+        let mut v = json!({"messages": [
+            {"type": "image_url", "image_url": {"url": uri}},
+            {"type": "image_url", "image_url": {"url": "data:;base64,QUJD"}},
+            {"type": "input_image", "image_url": uri},
+            {"images": [{"type": "image_url", "image_url": {"url": uri}}]},
+            {"type": "tool_result", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}
+            ]},
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "QUJD"}},
+            {"type": "image_generation_call", "result": "QUJD"},
+            {"type": "input_audio", "input_audio": {"data": "QUJD", "format": "wav"}},
+            {"type": "file", "file": {"file_data": pdf, "filename": "a.pdf"}},
+            {"type": "input_file", "file_data": "QUJD"},
+            {"inlineData": {"mimeType": "image/png", "data": "QUJD"}},
+            {"image": {"format": "png", "source": {"bytes": "QUJD"}}},
+        ]});
+        assert!(omit_base64_media(&mut v));
+        let once = v.clone();
+        assert!(!omit_base64_media(&mut v), "a second pass finds nothing");
+        assert_eq!(v, once);
+
+        let m = &v["messages"];
+        let kept = format!("data:image/png;base64,{}", omitted(uri.len()));
+        assert_eq!(m[0]["image_url"]["url"], kept);
+        assert_eq!(
+            m[1]["image_url"]["url"],
+            format!("data:;base64,{}", omitted(17))
+        );
+        assert_eq!(m[2]["image_url"], kept);
+        assert_eq!(m[3]["images"][0]["image_url"]["url"], kept);
+        let source = &m[4]["content"][0]["source"];
+        assert_eq!(source["media_type"], "image/png");
+        assert_eq!(source["data"], omitted(4));
+        assert_eq!(m[5]["source"]["media_type"], "application/pdf");
+        assert_eq!(m[5]["source"]["data"], omitted(4));
+        assert_eq!(m[6]["result"], omitted(4));
+        assert_eq!(m[7]["input_audio"]["data"], omitted(4));
+        assert_eq!(m[7]["input_audio"]["format"], "wav");
+        assert_eq!(
+            m[8]["file"]["file_data"],
+            format!("data:application/pdf;base64,{}", omitted(pdf.len()))
+        );
+        assert_eq!(m[8]["file"]["filename"], "a.pdf");
+        assert_eq!(m[9]["file_data"], omitted(4));
+        assert_eq!(m[10]["inlineData"]["data"], omitted(4));
+        assert_eq!(m[11]["image"]["source"]["bytes"], omitted(4));
+    }
+
+    #[test]
+    fn urls_and_ordinary_fields_are_not_base64_media() {
+        let mut v = json!({
+            "a": {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+            "b": {"type": "image_url", "image_url": {"url": "data:image/svg+xml,<svg/>"}},
+            "c": {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+            "d": {"type": "text", "text": "QUJDQUJDQUJDQUJDQUJD"},
+            "e": {"data": "QUJDQUJDQUJDQUJDQUJD", "result": "QUJD"},
+        });
+        let before = v.clone();
+        assert!(!omit_base64_media(&mut v));
+        assert_eq!(v, before);
+    }
+
+    #[test]
+    fn serialized_content_without_base64_media_comes_back_byte_identical() {
+        for s in [
+            r#"{ "z": 1, "a": "no media" }"#,
+            r#"{ "z": 1, "a": "mentions base64" }"#,
+            "not json, mentions base64",
+        ] {
+            assert!(matches!(omit_base64_media_in_json(s), Cow::Borrowed(b) if b == s));
+        }
+    }
+
+    #[test]
+    fn every_recognised_field_passes_the_needle_scan() {
+        for s in [
+            r#"{"x": {"source": {"bytes": "QUJD"}}}"#,
+            r#"{"input_audio": {"data": "QUJD"}}"#,
+            r#"{"file_data": "QUJD"}"#,
+            r#"{"inlineData": {"data": "QUJD"}}"#,
+            r#"{"inline_data": {"data": "QUJD"}}"#,
+            r#"{"type": "image_generation_call", "result": "QUJD"}"#,
+            r#"{"source": {"type": "base64", "data": "QUJD"}}"#,
+            r#"{"u": "data:image/png;base64,QUJD"}"#,
+        ] {
+            assert!(
+                omit_base64_media_in_json(s).contains("[aisix: base64 data uri omitted, "),
+                "{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_response_capture_omits_only_b64_json() {
+        let response = json!({"created": 1, "output_format": "png", "data": [
+            {"b64_json": "QUJD", "revised_prompt": "a cat"},
+            {"url": "https://example.com/a.png"},
+        ]});
+        let captured: Value = serde_json::from_str(&image_response_for_capture(&response)).unwrap();
+        assert_eq!(
+            captured,
+            json!({"created": 1, "output_format": "png", "data": [
+                {"b64_json": "[aisix: base64 data uri omitted, 4 bytes]", "revised_prompt": "a cat"},
+                {"url": "https://example.com/a.png"},
+            ]})
+        );
+    }
+
+    #[test]
+    fn passthrough_response_text_omits_b64_json_and_nothing_else() {
+        let frame = r#"{"type":"image_generation.completed","b64_json":"QUJD"}"#;
+        let captured: Value =
+            serde_json::from_str(&image_response_text_for_capture(frame)).unwrap();
+        assert_eq!(
+            captured["b64_json"],
+            "[aisix: base64 data uri omitted, 4 bytes]"
+        );
+        for s in [r#"{ "text": "no images" }"#, "plain text naming b64_json"] {
+            assert!(matches!(image_response_text_for_capture(s), Cow::Borrowed(b) if b == s));
+        }
+    }
+
+    #[test]
+    fn the_tightest_rung_keeps_the_original_count_of_an_omitted_image() {
+        let scrubbed = "data:image/png;base64,[aisix: base64 data uri omitted, 123456 bytes]";
+        assert_eq!(
+            shrink_string(scrubbed, 32),
+            "[aisix: base64 data uri omitted, 123456 bytes]"
+        );
     }
 
     #[test]

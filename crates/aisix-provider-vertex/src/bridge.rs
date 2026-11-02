@@ -1979,6 +1979,9 @@ struct GeminiStreamState {
     choices: std::collections::BTreeMap<u32, GeminiStreamChoice>,
     /// The last tier the stream reported, stamped on every chunk.
     service_tier: Option<ServiceTier>,
+    /// The id every chunk carries: fixed by the first frame that emits one,
+    /// empty when that frame had no `responseId`, so a stream keeps one id.
+    response_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -2029,6 +2032,10 @@ fn gemini_chunk_into_chat_chunks(
     {
         state.service_tier = Some(tier);
     }
+    let response_id = state
+        .response_id
+        .clone()
+        .unwrap_or_else(|| raw.response_id.take().unwrap_or_default());
     let blocked = raw.prompt_blocked();
     let candidates = raw.indexed_candidates();
     let mut usage = raw
@@ -2039,7 +2046,7 @@ fn gemini_chunk_into_chat_chunks(
     let chunk = |choice_index: u32, delta: ChatDelta, state: &GeminiStreamState| ChatChunk {
         choice_index,
         logprobs: None,
-        id: String::new(),
+        id: response_id.clone(),
         model: upstream_id.to_string(),
         delta,
         finish_reason: None,
@@ -2153,6 +2160,9 @@ fn gemini_chunk_into_chat_chunks(
                 ..chunk(0, ChatDelta::default(), state)
             }),
         }
+    }
+    if !chunks.is_empty() {
+        state.response_id = Some(response_id);
     }
     chunks
 }
@@ -2967,6 +2977,8 @@ struct GeminiGenerateContentResponse {
     /// Set, with no candidates, when the prompt itself was blocked.
     #[serde(default, rename = "promptFeedback")]
     prompt_feedback: Option<GeminiPromptFeedback>,
+    #[serde(default, rename = "responseId")]
+    response_id: Option<String>,
 }
 
 impl GeminiGenerateContentResponse {
@@ -3300,7 +3312,7 @@ fn gemini_response_into_chat_response(
     ChatResponse {
         logprobs: first.logprobs,
         more_choices,
-        id: String::new(), // Gemini doesn't return a request id in the body
+        id: raw.response_id.unwrap_or_default(),
         model: upstream_id.to_string(),
         message: first.message,
         finish_reason: first.finish_reason,
