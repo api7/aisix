@@ -1999,7 +1999,7 @@ impl GeminiStreamState {
 /// frame, keyed by `index`) yields up to TWO chunks for its choice:
 ///
 /// 1. **Role chunk** (only on the choice's first emission carrying text,
-///    reasoning, a tool call or an image) — sets `delta.role = Role::Assistant` so downstream
+///    reasoning, a tool call, an image or a finish reason) — sets `delta.role = Role::Assistant` so downstream
 ///    consumers know this is an assistant turn. Mirrors OpenAI's
 ///    "first-chunk-is-role" wire convention.
 /// 2. **Content / terminal chunk** — carries the text and reasoning deltas,
@@ -2096,7 +2096,8 @@ fn gemini_chunk_into_chat_chunks(
             && (!text.is_empty()
                 || !reasoning.is_empty()
                 || !tool_calls.is_empty()
-                || !images.is_empty());
+                || !images.is_empty()
+                || c.finish_reason.is_some());
         if emit_role {
             choice.emitted_role = true;
         }
@@ -2847,6 +2848,7 @@ fn build_gemini_request_with(
                         // A pure tool-call turn has `content: null` and
                         // no text part.
                         m.text()
+                            .filter(|text| !text.is_empty())
                             .map(GeminiPart::text)
                             .into_iter()
                             .chain(replayed_images)

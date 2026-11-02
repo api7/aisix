@@ -1414,6 +1414,7 @@ describe("Vertex Gemini: generated images on chat completions", () => {
 
     const out = await chatStream({ model: "img", messages: say() });
     expect(out.raw).not.toContain("event: error");
+    expect(out.roles).toEqual(["assistant"]);
     expect(out.finish).toEqual(["content_filter"]);
     expect(out.images).toEqual([]);
   });
@@ -1487,7 +1488,7 @@ describe("Vertex Gemini: generated images on chat completions", () => {
       { role: "user", content: "and again" },
       { role: "assistant", content: "", reasoning_content: "thinking", images: [entry(IMAGE_B, 0, "image/jpeg")] },
       { role: "user", content: "one more" },
-      { role: "assistant", content: null, images: [entry(IMAGE_A, 0)], tool_calls: [call] },
+      { role: "assistant", content: "", images: [entry(IMAGE_A, 0)], tool_calls: [call] },
       { role: "tool", tool_call_id: "call_1", content: "12:00" },
     ];
     for (const stream of [false, true]) {

@@ -87,6 +87,15 @@ const transcribe = (proxyUrl: string, model: string, stream: boolean) => {
   });
 };
 const HI = [{ role: "user", content: "hi" }];
+const TERMINAL: Record<string, string> = {
+  chat: "[DONE]",
+  "messages-native": "message_stop",
+  "messages-bridge": "message_stop",
+  "responses-native": "response.completed",
+  "responses-bridge": "response.completed",
+  "transcription-stream": "transcript.text.done",
+  transcription: '"text"',
+};
 
 interface Route {
   name: string;
@@ -217,6 +226,54 @@ describe("output guardrails decide a response with no text", () => {
         models.push(display);
       }
     }
+    const failing = await startOpenAiUpstream({
+      rawStreamFrames: [
+        `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "busy" } })}\n\n`,
+      ],
+    });
+    upstreams.push(failing);
+    const failingPk = await seed.createProviderKey({
+      display_name: "messages-native-failed-pk",
+      secret: "sk-mock",
+      api_base: failing.baseUrl,
+    });
+    const failingModel = await seed.createModel({
+      display_name: "messages-native-failed",
+      provider: "anthropic",
+      model_name: "claude-3-5-haiku-20241022",
+      provider_key_id: failingPk.id,
+    });
+    await seed.attachGuardrailToModel(rows.block.id as string, failingModel.id as string);
+    models.push("messages-native-failed");
+
+    const failedResponses = await startOpenAiUpstream({
+      streamEvents: [
+        JSON.stringify({ type: "response.created", response: { id: "resp_failed" } }),
+        JSON.stringify({
+          type: "response.failed",
+          response: {
+            id: "resp_failed",
+            status: "failed",
+            error: { code: "server_error", message: "upstream broke" },
+          },
+        }),
+      ],
+    });
+    upstreams.push(failedResponses);
+    const failedPk = await seed.createProviderKey({
+      display_name: "responses-native-failed-pk",
+      secret: "sk-mock",
+      api_base: `${failedResponses.baseUrl}/v1`,
+    });
+    const failedModel = await seed.createModel({
+      display_name: "responses-native-failed",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: failedPk.id,
+    });
+    await seed.attachGuardrailToModel(rows.monitor.id as string, failedModel.id as string);
+    models.push("responses-native-failed");
+
     // Seeded last: its key authenticating implies the whole seed is live.
     await seed.createApiKey({ key_hash: hash(CALLER), allowed_models: models });
     await waitConfigPropagation(
@@ -228,6 +285,33 @@ describe("output guardrails decide a response with no text", () => {
     await app?.exit();
     await sls?.close();
     await Promise.all(upstreams.map((u) => u.close()));
+  });
+
+  test("an in-band upstream error on a held stream stays the upstream's error", async (ctx) => {
+    if (!app) return ctx.skip();
+    const res = await json(app.proxyUrl, "/v1/messages", {
+      model: "messages-native-failed",
+      stream: true,
+      max_tokens: 64,
+      messages: HI,
+    });
+    const body = await res.text();
+    expect(body).toContain("overloaded_error");
+    expect(body).not.toContain(REFUSAL);
+  });
+
+  test("a stream the upstream failed is no verdict for a monitor-mode script", async (ctx) => {
+    if (!app || !sls) return ctx.skip();
+    const model = "responses-native-failed";
+    const res = await json(app.proxyUrl, "/v1/responses", { model, stream: true, input: "hi" });
+    expect(await res.text()).toContain("response.failed");
+    const event = await waitForSlsLog(
+      sls,
+      LOGSTORE,
+      (log) => log.get("requested_model") === model,
+      `usage event for ${model}`,
+    );
+    expect(event.get("guardrail_monitor_hits") ?? "[]").toBe("[]");
   });
 
   for (const route of ENFORCED) {
@@ -244,7 +328,9 @@ describe("output guardrails decide a response with no text", () => {
       if (!app) return ctx.skip();
       const res = await route.send(app.proxyUrl, `${route.name}-keyword`);
       expect(res.status).toBe(200);
-      expect(await res.text()).not.toContain(REFUSAL);
+      const body = await res.text();
+      expect(body).not.toContain(REFUSAL);
+      expect(body).toContain(TERMINAL[route.name]);
     });
 
     test(`${route.name}: a monitor-mode script records its verdict`, async (ctx) => {

@@ -2770,125 +2770,123 @@ pub fn build_responses_bridge_stream(
         // EndOfStreamCheck behavior.
         let (text, tool_calls) = encoder.assembled_assistant_message();
         // Consulted with no text as well: a `custom` row decides for itself.
-        {
-            // Live mode has no held frames for the segment pass to walk —
-            // offer the flattened text as one segment so monitor-mode
-            // segment moderators still record their observations.
-            let live_seg_text = (!buffering).then(|| text.clone());
-            let mut message = aisix_gateway::ChatMessage::assistant(text);
-            if !tool_calls.is_empty() {
-                message.extra.insert("tool_calls".to_string(), Value::Array(tool_calls));
-            }
-            let synth = ChatResponse { logprobs: None, more_choices: Vec::new(),
-                id: String::new(),
-                model: model_label.clone(),
-                message,
-                finish_reason: FinishReason::Stop,
-                usage: UsageStats::new(0, 0),
-                service_tier: None,
-            };
-            let (verdict, hits) =
-                aisix_guardrails::Guardrail::check_output_non_segment_observed(
-                    chain.as_ref(),
-                    &synth,
-                )
-                .await;
-            guard.comp().monitor_hits.extend(hits);
-            // Segment pass over the held SSE frames: one Bedrock call; an
-            // ANONYMIZE disposition rewrites the held bytes (#932 bedrock
-            // follow-up).
-            let mut seg_counts = crate::redact::RedactionCounts::new();
-            let mut seg_hits = Vec::new();
-            let mut joined: Vec<u8> = Vec::with_capacity(held.iter().map(bytes::Bytes::len).sum());
-            for b in &held {
-                joined.extend_from_slice(b);
-            }
-            let mut seg_rewrote = false;
-            // Live-forward: the local kinds judge the assembled message the
-            // way the buffered walk would split it — the text, and each
-            // tool call's arguments — not the flattened text (#1027).
-            let live_local = live_seg_text.as_ref().map(|_| {
-                let mut probe = synth.clone();
-                crate::redact::collect_segments(|g| {
-                    let _ = crate::redact::redact_chat_response(g, &mut probe);
-                })
-            });
-            let verdict = crate::redact::moderate_body_local_given(
+        // Live mode has no held frames for the segment pass to walk —
+        // offer the flattened text as one segment so monitor-mode
+        // segment moderators still record their observations.
+        let live_seg_text = (!buffering).then(|| text.clone());
+        let mut message = aisix_gateway::ChatMessage::assistant(text);
+        if !tool_calls.is_empty() {
+            message.extra.insert("tool_calls".to_string(), Value::Array(tool_calls));
+        }
+        let synth = ChatResponse { logprobs: None, more_choices: Vec::new(),
+            id: String::new(),
+            model: model_label.clone(),
+            message,
+            finish_reason: FinishReason::Stop,
+            usage: UsageStats::new(0, 0),
+            service_tier: None,
+        };
+        let (verdict, hits) =
+            aisix_guardrails::Guardrail::check_output_non_segment_observed(
                 chain.as_ref(),
-                crate::redact::Direction::Output,
-                None,
-                verdict,
-                &mut seg_counts,
-                &mut seg_hits,
-                live_local,
-                |g| match live_seg_text.as_deref() {
-                    // Live-forward: observation only — nothing to rewrite.
-                    Some(t) => {
-                        let _ = g.redact_output_text(t);
-                        crate::redact::RedactionCounts::new()
-                    }
-                    None => match crate::redact::redact_responses_sse(g, &joined) {
-                        Some((rewritten, counts)) => {
-                            joined = rewritten;
-                            seg_rewrote = true;
-                            counts
-                        }
-                        None => crate::redact::RedactionCounts::new(),
-                    },
-                },
+                &synth,
             )
             .await;
-            guard.comp().monitor_hits.extend(seg_hits);
-            // `buffering` gate: only the hold-back walk can actually rewrite
-            // wire bytes — the live walk is read-only, so a masked outcome
-            // there (unreachable today) must not clobber the capture with a
-            // rebuild from the empty `joined`.
-            if buffering && !seg_counts.is_empty() {
-                // Bedrock masked the held bytes — rebuild the content-
-                // capture accumulator from the masked text channels,
-                // keeping the original soft cap (#932 × AISIX-Cloud#947).
-                if let Some(cap) = content_cap {
-                    let mut rebuilt = crate::redact::responses_sse_text(&joined);
-                    let mut cut = (cap as usize).min(rebuilt.len());
-                    while cut < rebuilt.len() && !rebuilt.is_char_boundary(cut) {
-                        cut += 1;
-                    }
-                    rebuilt.truncate(cut);
-                    guard.comp().response_text = rebuilt;
+        guard.comp().monitor_hits.extend(hits);
+        // Segment pass over the held SSE frames: one Bedrock call; an
+        // ANONYMIZE disposition rewrites the held bytes (#932 bedrock
+        // follow-up).
+        let mut seg_counts = crate::redact::RedactionCounts::new();
+        let mut seg_hits = Vec::new();
+        let mut joined: Vec<u8> = Vec::with_capacity(held.iter().map(bytes::Bytes::len).sum());
+        for b in &held {
+            joined.extend_from_slice(b);
+        }
+        let mut seg_rewrote = false;
+        // Live-forward: the local kinds judge the assembled message the
+        // way the buffered walk would split it — the text, and each
+        // tool call's arguments — not the flattened text (#1027).
+        let live_local = live_seg_text.as_ref().map(|_| {
+            let mut probe = synth.clone();
+            crate::redact::collect_segments(|g| {
+                let _ = crate::redact::redact_chat_response(g, &mut probe);
+            })
+        });
+        let verdict = crate::redact::moderate_body_local_given(
+            chain.as_ref(),
+            crate::redact::Direction::Output,
+            None,
+            verdict,
+            &mut seg_counts,
+            &mut seg_hits,
+            live_local,
+            |g| match live_seg_text.as_deref() {
+                // Live-forward: observation only — nothing to rewrite.
+                Some(t) => {
+                    let _ = g.redact_output_text(t);
+                    crate::redact::RedactionCounts::new()
                 }
-                crate::redact::merge_counts(
-                    &mut guard.comp().redacted_entity_counts,
-                    seg_counts,
-                );
+                None => match crate::redact::redact_responses_sse(g, &joined) {
+                    Some((rewritten, counts)) => {
+                        joined = rewritten;
+                        seg_rewrote = true;
+                        counts
+                    }
+                    None => crate::redact::RedactionCounts::new(),
+                },
+            },
+        )
+        .await;
+        guard.comp().monitor_hits.extend(seg_hits);
+        // `buffering` gate: only the hold-back walk can actually rewrite
+        // wire bytes — the live walk is read-only, so a masked outcome
+        // there (unreachable today) must not clobber the capture with a
+        // rebuild from the empty `joined`.
+        if buffering && !seg_counts.is_empty() {
+            // Bedrock masked the held bytes — rebuild the content-
+            // capture accumulator from the masked text channels,
+            // keeping the original soft cap (#932 × AISIX-Cloud#947).
+            if let Some(cap) = content_cap {
+                let mut rebuilt = crate::redact::responses_sse_text(&joined);
+                let mut cut = (cap as usize).min(rebuilt.len());
+                while cut < rebuilt.len() && !rebuilt.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                rebuilt.truncate(cut);
+                guard.comp().response_text = rebuilt;
             }
-            if let aisix_guardrails::GuardrailVerdict::Block {
-                reason,
-                guardrail_name,
-                unavailable,
-            } = verdict {
-                tracing::warn!(
-                    guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
-                    guardrail_hook = "output",
-                    model = %model_label,
-                    reason = %reason,
-                    "guardrail blocked streaming /v1/responses (cross-provider) response",
-                );
-                guard.comp().record_refusal(guardrail_name.as_deref(), unavailable.as_deref());
-                // On the live-forward path the terminal event is already on
-                // the wire; the error frame is all that can follow it.
-                let terminal_sent = !buffering && encoder.is_finished();
-                yield Ok(guardrail_failure_frames(
-                    &mut encoder,
-                    sent_downstream,
-                    terminal_sent,
-                    guardrail_name.as_deref(),
-                    unavailable.as_deref(),
-                ));
-                return;
-            }
-            if seg_rewrote {
-                held = vec![bytes::Bytes::from(joined)];
-            }
+            crate::redact::merge_counts(
+                &mut guard.comp().redacted_entity_counts,
+                seg_counts,
+            );
+        }
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+            unavailable,
+        } = verdict {
+            tracing::warn!(
+                guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
+                guardrail_hook = "output",
+                model = %model_label,
+                reason = %reason,
+                "guardrail blocked streaming /v1/responses (cross-provider) response",
+            );
+            guard.comp().record_refusal(guardrail_name.as_deref(), unavailable.as_deref());
+            // On the live-forward path the terminal event is already on
+            // the wire; the error frame is all that can follow it.
+            let terminal_sent = !buffering && encoder.is_finished();
+            yield Ok(guardrail_failure_frames(
+                &mut encoder,
+                sent_downstream,
+                terminal_sent,
+                guardrail_name.as_deref(),
+                unavailable.as_deref(),
+            ));
+            return;
+        }
+        if seg_rewrote {
+            held = vec![bytes::Bytes::from(joined)];
         }
         // Passed (#932): mask the held SSE frames (channel reassembly)
         // before release, then hand them to the client.

@@ -6520,7 +6520,9 @@ where
                 // whole response) scans clean.
                 let chunk_content = crate::held_content::chat_delta(&chunk.delta);
                 let chunk_raw = crate::held_content::chat_chunk_raw(&chunk);
-                let chunk_images_raw = crate::held_content::chat_chunk_images_raw(&chunk);
+                let chunk_images_raw = matches!(stream_policy, aisix_guardrails::StreamOutputPolicy::BufferFull { .. })
+                    .then(|| crate::held_content::chat_chunk_images_raw(&chunk))
+                    .unwrap_or_default();
                 pending_bytes.add(chunk_raw);
                 pending.push(chunk);
                 match &stream_policy {
