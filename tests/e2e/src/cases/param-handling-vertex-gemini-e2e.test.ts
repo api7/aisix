@@ -1,7 +1,21 @@
 import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { EtcdClient, SeedClient, spawnApp, waitConfigPropagation, type SpawnedApp } from "../harness/index.js";
+import {
+  decodedTextFor,
+  EtcdClient,
+  SeedClient,
+  slsLogsFor,
+  spawnApp,
+  startMockSls,
+  startOpenAiUpstream,
+  waitConfigPropagation,
+  waitForSlsLog,
+  type MockSls,
+  type OpenAiUpstream,
+  type SpawnedApp,
+} from "../harness/index.js";
+import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 
 // Vertex's native Gemini wire (`:generateContent` / `:streamGenerateContent`)
 // handles each request field by Gemini's contract. OpenAI sampling fields reach
@@ -1036,5 +1050,712 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
     const { result, sent } = await capture(() => chat({ model: "pg-25-flash", messages: HI, tools: [NOW], tool_choice: null }));
     expect(result.status, result.text).toBe(200);
     expect(sent[0].body.toolConfig).toBeUndefined();
+  });
+});
+
+// An image model answers `:generateContent` with `inlineData` parts. Chat
+// Completions returns them as `images` beside the text, in the shape other
+// image-capable OpenAI-compatible upstreams use; the other two client protocols
+// keep only the text. The parts mirror what `gemini-nano-banana-2.1` returned: a
+// thought, an unsigned interim thought image, more thought, a signed text part
+// and the signed final image.
+describe("Vertex Gemini: generated images on chat completions", () => {
+  // Every image payload carries a marker, so a leak of any of them is greppable
+  // wherever it lands.
+  const MARKER = "SU1BR0VNQVJLRVI";
+  const image = (id: string, bytes = 256) =>
+    `${MARKER}${id}`.padEnd(Math.ceil((bytes * 4) / 3 / 4) * 4, "A");
+  const IMAGE_A = image("a");
+  const IMAGE_B = image("b");
+  const THOUGHT_IMAGE = image("thoughtimage");
+  const inline = (data: string, mimeType = "image/png") => ({ inlineData: { mimeType, data } });
+  const entry = (data: string, index: number, mime = "image/png") => ({
+    type: "image_url",
+    image_url: { url: `data:${mime};base64,${data}`, detail: "auto" },
+    index,
+  });
+
+  const USAGE_METADATA = { promptTokenCount: 5, candidatesTokenCount: 1290, totalTokenCount: 1295 };
+  const reply = (parts: unknown[], usageMetadata: unknown, finishReason: string) => ({
+    candidates: [{ content: { role: "model", parts }, finishReason }],
+    usageMetadata,
+  });
+  const THOUGHT_TEXT = { text: "Sketching it out.", thought: true };
+  const MORE_THOUGHT = { text: " Refining it.", thought: true };
+  const SIGNATURE_PART = "c2ln".repeat(50);
+  const FULL_PARTS = [
+    THOUGHT_TEXT,
+    { ...inline(THOUGHT_IMAGE), thought: true },
+    MORE_THOUGHT,
+    { text: "Here it is.", thoughtSignature: SIGNATURE_PART },
+    { ...inline(IMAGE_A, "image/jpeg"), thoughtSignature: SIGNATURE_PART },
+    inline("QVVESU8=", "audio/wav"),
+  ];
+  const FULL_IMAGES = [entry(THOUGHT_IMAGE, 0), entry(IMAGE_A, 1, "image/jpeg")];
+  // The same answer the way a stream delivers it: one part per frame, then a
+  // last frame with empty text, the finish reason and usage. An answer refused
+  // outright has no parts in either form.
+  const framesOf = (parts: unknown[], usageMetadata: unknown, finishReason: string) => [
+    ...parts.map((part) => ({ candidates: [{ content: { role: "model", parts: [part] } }] })),
+    {
+      candidates: [{ content: { role: "model", parts: parts.length > 0 ? [{ text: "" }] : [] }, finishReason }],
+      usageMetadata,
+    },
+  ];
+
+  const CAPTURE_CREDENTIAL = "imgmock";
+  const LOGSTORE = "image-events";
+  const MASKED_EMAIL = "someone@example.com";
+  const BLOCKED_WORD = "forbidden-word";
+
+  let app: SpawnedApp | undefined;
+  let upstream: Server | undefined;
+  let openAiCompatible: OpenAiUpstream | undefined;
+  let openAiCompatibleStream: OpenAiUpstream | undefined;
+  let sls: MockSls | undefined;
+  let otlp: MockOtlp | undefined;
+  const received: Received[] = [];
+  let parts: unknown[] = FULL_PARTS;
+  let usageMetadata: unknown = USAGE_METADATA;
+  let finishReason = "STOP";
+  let unique = 0;
+
+  const useAnswer = (next: unknown[], usage: unknown = USAGE_METADATA, finish = "STOP") => {
+    parts = next;
+    usageMetadata = usage;
+    finishReason = finish;
+  };
+  const say = (content: string = `prompt-${++unique}`) => [{ role: "user", content }];
+
+  async function post(path: string, body: Record<string, unknown>) {
+    const res = await fetch(`${app!.proxyUrl}${path}`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, headers: res.headers, text: await res.text() };
+  }
+  const chat = async (body: Record<string, unknown>) => {
+    const res = await post("/v1/chat/completions", body);
+    expect(res.status, res.text.slice(0, 500)).toBe(200);
+    return JSON.parse(res.text).choices[0].message;
+  };
+  const chatStream = async (body: Record<string, unknown>) => {
+    const res = await post("/v1/chat/completions", { ...body, stream: true });
+    expect(res.status, res.text.slice(0, 500)).toBe(200);
+    const events = sseEvents(res.text);
+    const deltas = events.map((e) => e.choices?.[0]?.delta ?? {});
+    return {
+      raw: res.text,
+      events,
+      roles: deltas.map((d) => d.role).filter(Boolean),
+      content: deltas.map((d) => d.content ?? "").join(""),
+      reasoning: deltas.map((d) => d.reasoning_content ?? "").join(""),
+      images: deltas.flatMap((d) => d.images ?? []),
+      finish: events.map((e) => e.choices?.[0]?.finish_reason).filter(Boolean),
+    };
+  };
+  const ready = (ctx: { skip: () => void }) => {
+    if (!app) ctx.skip();
+    return app !== undefined;
+  };
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    if (!(await etcd.ping())) return;
+
+    upstream = createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        const r: Received = {
+          path: (req.url ?? "/").split("?")[0],
+          headers: req.headers,
+          body: JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"),
+        };
+        received.push(r);
+        res.statusCode = 200;
+        if (r.path.endsWith(":streamGenerateContent")) {
+          res.setHeader("content-type", "text/event-stream");
+          res.end(framesOf(parts, usageMetadata, finishReason).map((f) => `data: ${JSON.stringify(f)}\r\n\r\n`).join(""));
+          return;
+        }
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify(reply(parts, usageMetadata, finishReason)));
+      });
+    });
+    await new Promise<void>((resolve) => upstream!.listen(0, "127.0.0.1", resolve));
+    const addr = upstream.address();
+    if (addr === null || typeof addr === "string") throw new Error("no port");
+
+    const openRouterImage = { type: "image_url", image_url: { url: `data:image/png;base64,${IMAGE_A}` }, index: 3 };
+    openAiCompatible = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "or-1",
+        object: "chat.completion",
+        created: 1_700_000_000,
+        model: "or-model",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "from upstream", images: [openRouterImage] },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+      },
+    });
+    openAiCompatibleStream = await startOpenAiUpstream({
+      streamEvents: [
+        JSON.stringify({
+          id: "or-1",
+          object: "chat.completion.chunk",
+          model: "or-model",
+          choices: [{ index: 0, delta: { role: "assistant", images: [openRouterImage] } }],
+        }),
+        JSON.stringify({
+          id: "or-1",
+          object: "chat.completion.chunk",
+          model: "or-model",
+          choices: [{ index: 0, delta: { content: "from upstream" }, finish_reason: "stop" }],
+        }),
+        "[DONE]",
+      ],
+    });
+    sls = await startMockSls();
+    otlp = await startMockOtlp();
+
+    app = await spawnApp({
+      exposeDebugHeaders: true,
+      logLevel: "debug",
+      extraEnv: {
+        [`SLS_CRED_${CAPTURE_CREDENTIAL.toUpperCase()}_AK_ID`]: "mock-akid",
+        [`SLS_CRED_${CAPTURE_CREDENTIAL.toUpperCase()}_AK_SECRET`]: "mock-secret",
+      },
+    });
+    const seed = new SeedClient(etcd, app.etcdPrefix);
+    const pk = await seed.createProviderKey({
+      display_name: "vertex-images-pk",
+      provider: "google",
+      adapter: "vertex",
+      secret: JSON.stringify({ access_token: "ya29.images", project: "proj-images", region: "us-central1" }),
+      api_base: `http://127.0.0.1:${addr.port}`,
+    });
+    const model = (display_name: string) =>
+      seed.createModel({ display_name, provider: "google", model_name: "gemini-image-e2e", provider_key_id: pk.id });
+    await model("img");
+    const blocked = await model("img-keyword");
+    const masked = await model("img-pii");
+    const tight = await model("img-tight-cap");
+    const custom = await model("img-custom-block");
+    for (const [display_name, compatible] of [
+      ["or-img", openAiCompatible],
+      ["or-img-stream", openAiCompatibleStream],
+    ] as const) {
+      const orPk = await seed.createProviderKey({
+        display_name: `${display_name}-pk`,
+        secret: "sk-mock",
+        api_base: `${compatible.baseUrl}/v1`,
+      });
+      await seed.createModel({
+        display_name,
+        provider: "openai",
+        model_name: "or-model",
+        provider_key_id: orPk.id,
+      });
+    }
+
+    const scoped = async (modelId: string, row: Record<string, unknown>) => {
+      const guardrail = await seed.createGuardrail(row, { attach: false });
+      await seed.attachGuardrailToModel(guardrail.id, modelId);
+    };
+    await scoped(blocked.id, {
+      name: "img-keyword-output",
+      enabled: true,
+      hook_point: "output",
+      kind: "keyword",
+      patterns: [{ kind: "literal", value: BLOCKED_WORD }],
+    });
+    await scoped(masked.id, {
+      name: "img-pii-output",
+      enabled: true,
+      hook_point: "output",
+      kind: "pii",
+      detectors: [{ type: "email", action: "mask" }],
+    });
+    await scoped(custom.id, {
+      name: "img-custom-block",
+      enabled: true,
+      hook_point: "output",
+      kind: "custom",
+      output_fail_open: false,
+      timeout_ms: 5000,
+      script: `export function checkOutput() { return { action: "block" }; }`,
+    });
+    // Its raw-byte bound is far below the image the case below sends.
+    await scoped(tight.id, {
+      name: "img-pii-tight",
+      enabled: true,
+      hook_point: "output",
+      kind: "pii",
+      detectors: [{ type: "email", action: "mask" }],
+      max_buffer_bytes: 1024,
+      on_buffer_exceeded: "fail_closed",
+    });
+
+    await seed.createCachePolicy({ name: "img-cache", enabled: true, applies_to: "all" });
+    await seed.createObservabilityExporter({
+      name: "img-sls-full",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: "aisix-e2e-images",
+      logstore: LOGSTORE,
+      credential_ref: CAPTURE_CREDENTIAL,
+      content_mode: "full",
+    });
+    await seed.createObservabilityExporter({
+      name: "img-otlp-full",
+      enabled: true,
+      kind: "otlp_http",
+      endpoint: otlp.url,
+      content_mode: "full",
+    });
+    await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"] });
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: HEADERS,
+        body: JSON.stringify({ model: "or-img", messages: say("warm-up") }),
+      });
+      await res.text();
+      return res.status === 200;
+    });
+    await waitConfigPropagation(async () => {
+      useAnswer([{ text: BLOCKED_WORD }]);
+      const res = await post("/v1/chat/completions", { model: "img-keyword", messages: say() });
+      useAnswer(FULL_PARTS);
+      return res.status === 422;
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    await app?.exit();
+    await new Promise<void>((resolve) => (upstream ? upstream.close(() => resolve()) : resolve()));
+    await openAiCompatible?.close();
+    await openAiCompatibleStream?.close();
+    await sls?.close();
+    await otlp?.close();
+  });
+
+  test("a whole response carries thought and final images in order, never in content", async (ctx) => {
+    if (!ready(ctx)) return;
+    useAnswer(FULL_PARTS);
+    const message = await chat({ model: "img", messages: say() });
+    expect(message.content).toBe("Here it is.");
+    expect(message.reasoning_content).toBe(THOUGHT_TEXT.text + MORE_THOUGHT.text);
+    expect(message.images).toEqual(FULL_IMAGES);
+    expect(JSON.stringify(message)).not.toContain("QVVESU8=");
+  });
+
+  test("a stream numbers its images across frames and leaves them out of content", async (ctx) => {
+    if (!ready(ctx)) return;
+    useAnswer(FULL_PARTS);
+    const out = await chatStream({ model: "img", messages: say() });
+    expect(out.roles).toEqual(["assistant"]);
+    expect(out.content).toBe("Here it is.");
+    expect(out.reasoning).toBe(THOUGHT_TEXT.text + MORE_THOUGHT.text);
+    expect(out.images).toEqual(FULL_IMAGES);
+    expect(out.finish).toEqual(["stop"]);
+    expect(out.raw).not.toContain("QVVESU8=");
+  });
+
+  test("an image-only answer arrives with empty content", async (ctx) => {
+    if (!ready(ctx)) return;
+    useAnswer([inline(IMAGE_A)]);
+    const message = await chat({ model: "img", messages: say() });
+    expect(message.content ?? "").toBe("");
+    expect(message.images).toEqual([entry(IMAGE_A, 0)]);
+
+    const out = await chatStream({ model: "img", messages: say() });
+    expect(out.roles).toEqual(["assistant"]);
+    expect(out.content).toBe("");
+    expect(out.images).toEqual([entry(IMAGE_A, 0)]);
+    expect(out.finish).toEqual(["stop"]);
+  });
+
+  test("a thought image alone is returned like any other", async (ctx) => {
+    if (!ready(ctx)) return;
+    useAnswer([THOUGHT_TEXT, { ...inline(THOUGHT_IMAGE), thought: true }, { text: "a sketch" }]);
+    const message = await chat({ model: "img", messages: say() });
+    expect(message.content).toBe("a sketch");
+    expect(message.reasoning_content).toBe(THOUGHT_TEXT.text);
+    expect(message.images).toEqual([entry(THOUGHT_IMAGE, 0)]);
+
+    const out = await chatStream({ model: "img", messages: say() });
+    expect(out.content).toBe("a sketch");
+    expect(out.images).toEqual([entry(THOUGHT_IMAGE, 0)]);
+  });
+
+  test.for([
+    "IMAGE_SAFETY",
+    "IMAGE_PROHIBITED_CONTENT",
+    "IMAGE_RECITATION",
+    "IMAGE_OTHER",
+    "NO_IMAGE",
+  ])("%s with no parts finishes as content_filter", async (reason, ctx) => {
+    if (!ready(ctx)) return;
+    useAnswer([], USAGE_METADATA, reason);
+    const message = await post("/v1/chat/completions", { model: "img", messages: say() });
+    expect(message.status, message.text.slice(0, 500)).toBe(200);
+    const choice = JSON.parse(message.text).choices[0];
+    expect(choice.finish_reason).toBe("content_filter");
+    expect(choice.message).not.toHaveProperty("images");
+
+    const out = await chatStream({ model: "img", messages: say() });
+    expect(out.raw).not.toContain("event: error");
+    expect(out.roles).toEqual(["assistant"]);
+    expect(out.finish).toEqual(["content_filter"]);
+    expect(out.images).toEqual([]);
+  });
+
+  test("a refused image reaches the other two protocols as a refusal", async (ctx) => {
+    if (!ready(ctx)) return;
+    useAnswer([], USAGE_METADATA, "IMAGE_RECITATION");
+    const messages = await post("/v1/messages", { model: "img", max_tokens: 100, messages: HI });
+    expect(messages.status, messages.text.slice(0, 500)).toBe(200);
+    expect(JSON.parse(messages.text).stop_reason).toBe("refusal");
+    const messagesStream = await post("/v1/messages", { model: "img", max_tokens: 100, messages: HI, stream: true });
+    expect(messagesStream.status).toBe(200);
+    expect(messagesStream.text).not.toContain("event: error");
+    expect(messagesStream.text).toContain('"stop_reason":"refusal"');
+    expect(messagesStream.text).toContain("message_stop");
+
+    const responses = await post("/v1/responses", { model: "img", input: "hi" });
+    expect(responses.status, responses.text.slice(0, 500)).toBe(200);
+    const body = JSON.parse(responses.text);
+    expect(body.status).toBe("incomplete");
+    expect(body.incomplete_details.reason).toBe("content_filter");
+    const responsesStream = await post("/v1/responses", { model: "img", input: "hi", stream: true });
+    expect(responsesStream.status).toBe(200);
+    expect(responsesStream.text).toContain("response.incomplete");
+    expect(responsesStream.text).toContain('"reason":"content_filter"');
+  });
+
+  test("a multi-megabyte image survives both paths byte for byte", async (ctx) => {
+    if (!ready(ctx)) return;
+    const big = image("big", 6 * 1024 * 1024);
+    useAnswer([{ text: "large" }, inline(big)]);
+    const message = await chat({ model: "img", messages: say() });
+    expect(message.images[0].image_url.url === `data:image/png;base64,${big}`).toBe(true);
+
+    const out = await chatStream({ model: "img", messages: say() });
+    expect(out.content).toBe("large");
+    expect(out.images).toHaveLength(1);
+    expect(out.images[0].image_url.url === `data:image/png;base64,${big}`).toBe(true);
+  }, 60_000);
+
+  test("modalities reach responseModalities upper-cased, and only when sent", async (ctx) => {
+    if (!ready(ctx)) return;
+    useAnswer([{ text: "ok" }]);
+    for (const stream of [false, true]) {
+      received.length = 0;
+      const first = await post("/v1/chat/completions", {
+        model: "img",
+        messages: say(),
+        stream,
+        modalities: ["text", "image"],
+      });
+      expect(first.status).toBe(200);
+      expect(received.at(-1)!.body.generationConfig.responseModalities, `stream=${stream}`).toEqual(["TEXT", "IMAGE"]);
+
+      const second = await post("/v1/chat/completions", { model: "img", messages: say(), stream });
+      expect(second.status).toBe(200);
+      expect(received.at(-1)!.body.generationConfig?.responseModalities, `stream=${stream}`).toBeUndefined();
+    }
+  });
+
+  test("assistant images in history go back as inlineData parts, unsigned", async (ctx) => {
+    if (!ready(ctx)) return;
+    useAnswer([{ text: "ok" }]);
+    const images = [entry(IMAGE_A, 0), entry(IMAGE_B, 1, "image/jpeg")];
+    const call = { id: "call_1", type: "function", function: { name: "now", arguments: "{}" } };
+    const history = [
+      { role: "user", content: "draw" },
+      { role: "assistant", content: "Here it is.", images },
+      { role: "user", content: "again" },
+      { role: "assistant", content: "", images: [entry(IMAGE_A, 0)] },
+      { role: "user", content: "and again" },
+      { role: "assistant", content: "", reasoning_content: "thinking", images: [entry(IMAGE_B, 0, "image/jpeg")] },
+      { role: "user", content: "one more" },
+      { role: "assistant", content: "", images: [entry(IMAGE_A, 0)], tool_calls: [call] },
+      { role: "tool", tool_call_id: "call_1", content: "12:00" },
+    ];
+    for (const stream of [false, true]) {
+      received.length = 0;
+      const res = await post("/v1/chat/completions", { model: "img", messages: history, stream, tools: [NOW] });
+      expect(res.status, res.text.slice(0, 500)).toBe(200);
+      const turns = received.at(-1)!.body.contents.filter((c: any) => c.role === "model");
+      const a = inline(IMAGE_A);
+      const b = inline(IMAGE_B, "image/jpeg");
+      expect(turns[0].parts, `stream=${stream}`).toEqual([{ text: "Here it is." }, a, b]);
+      expect(turns[1].parts, `stream=${stream}`).toEqual([a]);
+      expect(turns[2].parts, `stream=${stream}`).toEqual([b]);
+      expect(turns[3].parts[0], `stream=${stream}`).toEqual(a);
+      expect(turns[3].parts[1].functionCall.name, `stream=${stream}`).toBe("now");
+    }
+  });
+
+  test("an assistant image that cannot be written is refused naming it", async (ctx) => {
+    if (!ready(ctx)) return;
+    const before = received.length;
+    const res = await post("/v1/chat/completions", {
+      model: "img",
+      messages: [
+        { role: "user", content: "draw" },
+        { role: "assistant", content: "x", images: [{ type: "image_url", image_url: {} }] },
+        { role: "user", content: "again" },
+      ],
+    });
+    expect(res.status).toBe(400);
+    expect(JSON.parse(res.text).error.message).toContain("messages[1].images[0]");
+
+    // Media downloads cover user turns; an http URL here is not fetched.
+    const unfetched = await post("/v1/chat/completions", {
+      model: "img",
+      messages: [
+        { role: "user", content: "draw" },
+        { role: "assistant", content: "x", images: [{ type: "image_url", image_url: { url: "http://example.com/a.png" } }] },
+        { role: "user", content: "again" },
+      ],
+    });
+    expect(unfetched.status).toBe(400);
+    expect(JSON.parse(unfetched.text).error.message).toContain("messages[1].images[0]");
+
+    const notAnArray = await post("/v1/chat/completions", {
+      model: "img",
+      messages: [
+        { role: "user", content: "draw" },
+        { role: "assistant", content: "x", images: "oops" },
+        { role: "user", content: "again" },
+      ],
+    });
+    expect(notAnArray.status).toBe(400);
+    expect(JSON.parse(notAnArray.text).error.message).toContain("messages[1].images");
+    expect(received.length).toBe(before);
+  });
+
+  describe("output guardrails", () => {
+    test("do not stand between an image-only answer and the client", async (ctx) => {
+      if (!ready(ctx)) return;
+      useAnswer([inline(IMAGE_A)]);
+      for (const model of ["img-keyword", "img-pii"]) {
+        const message = await chat({ model, messages: say() });
+        expect(message.images, model).toEqual([entry(IMAGE_A, 0)]);
+        const out = await chatStream({ model, messages: say() });
+        expect(out.raw, model).not.toContain("event: error");
+        expect(out.images, model).toEqual([entry(IMAGE_A, 0)]);
+      }
+    });
+
+    test("a script that blocks unconditionally decides an image-only answer", async (ctx) => {
+      if (!ready(ctx)) return;
+      useAnswer([inline(IMAGE_A)]);
+      const whole = await post("/v1/chat/completions", { model: "img-custom-block", messages: say() });
+      expect(whole.status).toBe(422);
+      expect(whole.text).not.toContain(MARKER);
+      for (const [path, body] of [
+        ["/v1/chat/completions", { messages: say() }],
+        ["/v1/messages", { max_tokens: 100, messages: say() }],
+        ["/v1/responses", { input: "hi" }],
+      ] as const) {
+        const res = await post(path, { model: "img-custom-block", ...body, stream: true });
+        expect(res.text, path).toContain("blocked by content policy");
+        expect(res.text, path).not.toContain(MARKER);
+      }
+    });
+
+    test("do not read the image: a blocked word inside its bytes passes", async (ctx) => {
+      if (!ready(ctx)) return;
+      const data = image(`${BLOCKED_WORD}`);
+      useAnswer([{ text: "clean" }, inline(data)]);
+      const message = await chat({ model: "img-keyword", messages: say() });
+      expect(message.images).toEqual([entry(data, 0)]);
+      const out = await chatStream({ model: "img-keyword", messages: say() });
+      expect(out.raw).not.toContain("event: error");
+      expect(out.images).toEqual([entry(data, 0)]);
+    });
+
+    test("still block on the text beside an image", async (ctx) => {
+      if (!ready(ctx)) return;
+      useAnswer([{ text: `has ${BLOCKED_WORD}` }, inline(IMAGE_A)]);
+      const whole = await post("/v1/chat/completions", { model: "img-keyword", messages: say() });
+      expect(whole.status).toBe(422);
+      expect(whole.text).not.toContain(MARKER);
+
+      const res = await post("/v1/chat/completions", { model: "img-keyword", messages: say(), stream: true });
+      expect(res.text).toContain("event: error");
+      expect(res.text).not.toContain(BLOCKED_WORD);
+      expect(res.text).not.toContain(MARKER);
+    });
+
+    test("still mask the text beside an image and leave the image alone", async (ctx) => {
+      if (!ready(ctx)) return;
+      useAnswer([{ text: `mail ${MASKED_EMAIL}` }, inline(IMAGE_A)]);
+      const message = await chat({ model: "img-pii", messages: say() });
+      expect(message.content).not.toContain(MASKED_EMAIL);
+      expect(message.content).toContain("mail ");
+      expect(message.images).toEqual([entry(IMAGE_A, 0)]);
+
+      const out = await chatStream({ model: "img-pii", messages: say() });
+      expect(out.content).not.toContain(MASKED_EMAIL);
+      expect(out.content).toContain("mail ");
+      expect(out.images).toEqual([entry(IMAGE_A, 0)]);
+    });
+
+    test("do not trip the hold-back bound on an image's size", async (ctx) => {
+      if (!ready(ctx)) return;
+      // 128 x max_buffer_bytes is what a held stream may keep in raw bytes.
+      const large = image("capped", 1024 * 1024);
+      useAnswer([{ text: "short" }, inline(large)]);
+      const out = await chatStream({ model: "img-tight-cap", messages: say() });
+      expect(out.raw.includes("event: error")).toBe(false);
+      expect(out.content).toBe("short");
+      expect(out.images).toHaveLength(1);
+    });
+  });
+
+  describe("content capture", () => {
+    const capturedInput = (log: Map<string, string>) => log.get("input_messages") ?? log.get("prompt") ?? "";
+    const capturedRow = (marker: string) =>
+      waitForSlsLog(sls!, LOGSTORE, (l) => capturedInput(l).includes(marker), marker);
+
+    test("no exporter, log or event receives image data", async (ctx) => {
+      if (!ready(ctx)) return;
+      const tag = `capture-${++unique}`;
+      const answer = `capture-answer-${unique}`;
+      const from = sls!.requests.length;
+      // A prompt over the capture cap is exported as the raw request JSON, cut
+      // down string by string. An image this small survives that cut, so only
+      // taking it out of the captured request keeps it from the exporter.
+      const padding = "x".repeat(256 * 1024);
+      const history = (name: string) => [
+        { role: "user", content: "draw" },
+        { role: "assistant", content: "before", images: [entry(IMAGE_B, 0)] },
+        { role: "user", content: `${tag}-${name} ${padding}` },
+      ];
+      const rows = (name: string) =>
+        slsLogsFor(sls!, LOGSTORE, from).filter((l) => (l.get("prompt") ?? "").includes(`${tag}-${name}`));
+
+      useAnswer([{ text: answer }, inline(IMAGE_A)]);
+      await chat({ model: "img", messages: history("whole") });
+      await chatStream({ model: "img", messages: history("stream") });
+
+      useAnswer([{ text: answer }]);
+      await chat({ model: "img", messages: history("hit") });
+      const hit = await post("/v1/chat/completions", { model: "img", messages: history("hit") });
+      expect(hit.headers.get("x-aisix-cache")).toBe("hit");
+
+      const failed = await post("/v1/chat/completions", {
+        model: "img",
+        messages: history("failed"),
+        tools: [{ type: "web_search" }],
+      });
+      expect(failed.status).toBe(400);
+
+      for (const [name, count] of [["whole", 1], ["stream", 1], ["hit", 2], ["failed", 1]] as const) {
+        await expect.poll(() => rows(name).length, { timeout: 10_000, message: name }).toBeGreaterThanOrEqual(count);
+        for (const row of rows(name)) {
+          expect(row.get("prompt"), name).toContain("[images omitted]");
+        }
+      }
+      const captured = decodedTextFor(sls!, LOGSTORE, from);
+      expect(captured).toContain(answer);
+      expect(captured.includes(MARKER)).toBe(false);
+
+      await expect.poll(() => JSON.stringify(otlp!.spans).includes(`${tag}-failed`), { timeout: 10_000 }).toBe(true);
+      expect(JSON.stringify(otlp!.spans).includes(MARKER)).toBe(false);
+      expect(app!.output().includes(MARKER)).toBe(false);
+    });
+
+    test("with no upstream usage, the estimate counts text only", async (ctx) => {
+      if (!ready(ctx)) return;
+      const prompt = `estimate-prompt-${++unique}`;
+      useAnswer([{ text: "short answer" }, inline(image("estimate", 256 * 1024))], null);
+      const history = (last: string) => [
+        { role: "user", content: "draw" },
+        { role: "assistant", content: "x", images: [entry(image("estimatein", 256 * 1024), 0)] },
+        { role: "user", content: last },
+      ];
+      await chat({ model: "img", messages: history(prompt) });
+      await chatStream({ model: "img", messages: history(`${prompt}-s`) });
+      for (const marker of [prompt, `${prompt}-s`]) {
+        const log = await capturedRow(marker);
+        expect(log.get("usage_estimated"), marker).toBe("true");
+        expect(Number(log.get("completion_tokens")), marker).toBeGreaterThan(0);
+        expect(Number(log.get("completion_tokens")), marker).toBeLessThan(50);
+        expect(Number(log.get("prompt_tokens")), marker).toBeGreaterThan(0);
+        expect(Number(log.get("prompt_tokens")), marker).toBeLessThan(200);
+      }
+    });
+  });
+
+  test("a response with images is not cached, one with text alone is", async (ctx) => {
+    if (!ready(ctx)) return;
+    const cachedAcross = async (messages: unknown[]) => {
+      const first = await post("/v1/chat/completions", { model: "img", messages });
+      expect(first.status).toBe(200);
+      const second = await post("/v1/chat/completions", { model: "img", messages });
+      expect(second.status).toBe(200);
+      return second.headers.get("x-aisix-cache");
+    };
+    useAnswer([{ text: "plain" }]);
+    expect(await cachedAcross(say())).toBe("hit");
+    useAnswer([{ text: "with a picture" }, inline(IMAGE_A)]);
+    expect(await cachedAcross(say())).toBe("miss");
+  });
+
+  test.for([
+    ["/v1/messages", { max_tokens: 100, messages: HI }, "hi from text"],
+    ["/v1/responses", { input: "hi" }, "hi from text"],
+  ] as const)("%s keeps the text and discards the images", async ([path, request, answer], ctx) => {
+    if (!ready(ctx)) return;
+    for (const answerParts of [[{ text: answer }, inline(IMAGE_A), inline(IMAGE_B)], [inline(IMAGE_A)]]) {
+      useAnswer(answerParts);
+      const texted = answerParts.length > 1;
+      const whole = await post(path, { model: "img", ...request });
+      expect(whole.status, whole.text.slice(0, 500)).toBe(200);
+      expect(whole.text).not.toContain(MARKER);
+      expect(whole.text.includes(answer)).toBe(texted);
+
+      const streamed = await post(path, { model: "img", ...request, stream: true });
+      expect(streamed.status, streamed.text.slice(0, 500)).toBe(200);
+      expect(streamed.text).not.toContain(MARKER);
+      expect(streamed.text).not.toContain("event: error");
+      expect(streamed.text.includes(answer)).toBe(texted);
+      // The stream ran to its protocol's own end.
+      expect(streamed.text).toContain(path === "/v1/messages" ? "message_stop" : "response.completed");
+    }
+
+    // A held stream does not trip its bound on an image it was going to discard.
+    useAnswer([{ text: answer }, inline(image("discarded", 1024 * 1024))]);
+    const held = await post(path, { model: "img-tight-cap", ...request, stream: true });
+    expect(held.status, held.text.slice(0, 500)).toBe(200);
+    expect(held.text).not.toContain("event: error");
+    expect(held.text).not.toContain(MARKER);
+    expect(held.text).toContain(answer);
+    expect(held.text).toContain(path === "/v1/messages" ? "message_stop" : "response.completed");
+  });
+
+  test("images from an OpenAI-compatible upstream pass through chat unchanged", async (ctx) => {
+    if (!ready(ctx)) return;
+    const expected = { type: "image_url", image_url: { url: `data:image/png;base64,${IMAGE_A}` }, index: 3 };
+    const message = await chat({ model: "or-img", messages: say() });
+    expect(message.content).toBe("from upstream");
+    expect(message.images).toEqual([expected]);
+
+    const out = await chatStream({ model: "or-img-stream", messages: say() });
+    expect(out.content).toBe("from upstream");
+    expect(out.images).toEqual([expected]);
   });
 });

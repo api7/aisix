@@ -3684,13 +3684,19 @@ where
         // fully-delivered stream.
         let hits = match eos_scan {
             Some(scan) => {
-                let capture = guard.parts().1;
+                let (usage, capture) = guard.parts();
+                let failed = usage.as_ref().is_some_and(|u| u.failure.is_some());
                 let text = capture
                     .as_ref()
                     .map(|c| c.scan_text())
                     .unwrap_or_default();
                 let segments = capture.and_then(|c| c.terminal_segments());
-                scan.observe(&text, segments).await
+                // A failed stream with no text is not a response to judge.
+                if text.is_empty() && failed {
+                    Vec::new()
+                } else {
+                    scan.observe(&text, segments).await
+                }
             }
             None => Vec::new(),
         };

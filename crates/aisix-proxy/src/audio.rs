@@ -1081,8 +1081,11 @@ where
             // on the terminal frame drops this generator here, and the
             // Drop emit must still carry the usage it already parsed.
             let text = guard.observed().text().to_string();
-            let hits = scan.observe(&text, None).await;
-            guard.observed().output_hits = hits;
+            // A failed stream with no text is not a response to judge.
+            if !text.is_empty() || guard.observed().failure.is_none() {
+                let hits = scan.observe(&text, None).await;
+                guard.observed().output_hits = hits;
+            }
         }
         if let Some((f, observed)) = guard.slot.take() {
             f(observed);
@@ -1899,7 +1902,7 @@ async fn multipart_dispatch(
                 resolved_chain.record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
             }
         }
-        if refusal.is_none() && !scan.text.is_empty() {
+        if refusal.is_none() {
             let synth = ChatResponse {
                 logprobs: None,
                 more_choices: Vec::new(),
