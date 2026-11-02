@@ -278,7 +278,9 @@ fn omit_bare_base64(v: &mut Value) -> bool {
 
 /// Text serialized content must contain, in any case, for [`omit_base64_media`]
 /// to find anything, so content with no media is not parsed on the request path.
-const MEDIA_NEEDLES: [&str; 9] = [
+const MEDIA_NEEDLES: [&str; 10] = [
+    // Any JSON escape can spell the rest, so that text has to be parsed.
+    "\\u",
     "base64",
     "b64",
     "\"bytes\"",
@@ -621,6 +623,8 @@ mod tests {
             r#"{"bytesBase64Encoded": "QUJD"}"#,
             r#"{"u": "data:image/png;base64,QUJD"}"#,
             r#"{"u": "data:image/png;BASE64,QUJD"}"#,
+            r#"{"u": "data:image/png;ba\u0073e64,QUJD"}"#,
+            r#"{"\u0062\u0036\u0034_json": "QUJD"}"#,
         ] {
             assert!(
                 omit_base64_media_in_json(s).contains("[aisix: base64 data uri omitted, "),
