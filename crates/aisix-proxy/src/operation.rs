@@ -235,6 +235,42 @@ mod tests {
             "/.well-known/oauth-protected-resource/mcp",
             Emits::Nothing("RFC 9728 discovery; unauthenticated, meters nothing"),
         ),
+        (
+            "/.well-known/oauth-protected-resource/mcp/:server",
+            Emits::Nothing("RFC 9728 discovery of a per-user sign-in; meters nothing"),
+        ),
+        (
+            "/.well-known/oauth-authorization-server/mcp/:server",
+            Emits::Nothing("RFC 8414 discovery of a per-user sign-in; meters nothing"),
+        ),
+        (
+            "/mcp/:server/.well-known/openid-configuration",
+            Emits::Nothing("RFC 8414 discovery of a per-user sign-in; meters nothing"),
+        ),
+        (
+            "/mcp/:server/.well-known/jwks.json",
+            Emits::Nothing("an empty key set; meters nothing"),
+        ),
+        (
+            "/mcp/:server/oauth/register",
+            Emits::Nothing("part of signing in; no tool is called"),
+        ),
+        (
+            "/mcp/:server/oauth/authorize",
+            Emits::Nothing("part of signing in; no tool is called"),
+        ),
+        (
+            "/mcp/:server/oauth/token",
+            Emits::Nothing("part of signing in; no tool is called"),
+        ),
+        (
+            "/mcp/:server/oauth/credential",
+            Emits::Nothing("removes a sign-in; no tool is called"),
+        ),
+        (
+            "/mcp-oauth/callback",
+            Emits::Nothing("part of signing in; no tool is called"),
+        ),
         ("/mcp", Emits::Usage(MCP)),
         ("/mcp/", Emits::Usage(MCP)),
         ("/mcp/:server", Emits::Usage(MCP)),
@@ -415,6 +451,15 @@ mod tests {
         // the label question is answered.
         "/.well-known/oauth-protected-resource",
         "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-protected-resource/mcp/:server",
+        "/.well-known/oauth-authorization-server/mcp/:server",
+        "/mcp/:server/.well-known/openid-configuration",
+        "/mcp/:server/.well-known/jwks.json",
+        "/mcp/:server/oauth/register",
+        "/mcp/:server/oauth/authorize",
+        "/mcp/:server/oauth/token",
+        "/mcp/:server/oauth/credential",
+        "/mcp-oauth/callback",
     ];
 
     #[test]

@@ -77,6 +77,42 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
         Posture::NoUpstreamContent("RFC 9728 metadata served by the gateway itself"),
     ),
     (
+        "/.well-known/oauth-protected-resource/mcp/:server",
+        Posture::NoUpstreamContent("RFC 9728 metadata served by the gateway itself"),
+    ),
+    (
+        "/.well-known/oauth-authorization-server/mcp/:server",
+        Posture::NoUpstreamContent("RFC 8414 metadata served by the gateway itself"),
+    ),
+    (
+        "/mcp/:server/.well-known/openid-configuration",
+        Posture::NoUpstreamContent("RFC 8414 metadata served by the gateway itself"),
+    ),
+    (
+        "/mcp/:server/.well-known/jwks.json",
+        Posture::NoUpstreamContent("an empty key set served by the gateway itself"),
+    ),
+    (
+        "/mcp/:server/oauth/register",
+        Posture::NoUpstreamContent("answers from the request alone; stores nothing"),
+    ),
+    (
+        "/mcp/:server/oauth/authorize",
+        Posture::NoUpstreamContent("a browser redirect carrying OAuth parameters only"),
+    ),
+    (
+        "/mcp/:server/oauth/token",
+        Posture::NoUpstreamContent("exchanges an OAuth code with the upstream; no caller content"),
+    ),
+    (
+        "/mcp/:server/oauth/credential",
+        Posture::NoUpstreamContent("deletes the caller's stored token; contacts no upstream"),
+    ),
+    (
+        "/mcp-oauth/callback",
+        Posture::NoUpstreamContent("a browser redirect carrying OAuth parameters only"),
+    ),
+    (
         "/a2a/:agent/.well-known/agent-card.json",
         Posture::NoUpstreamContent(
             "serves the agent's card with the URL rewritten; no caller body",

@@ -64,6 +64,7 @@ mod jwt;
 mod jwt_index;
 mod mcp;
 mod mcp_auth;
+mod mcp_oauth;
 mod messages;
 mod model_echo;
 mod model_resolve;
@@ -211,6 +212,30 @@ pub fn build_router(state: ProxyState) -> Router {
             "/.well-known/oauth-protected-resource/mcp",
             any(mcp_auth::protected_resource_metadata),
         )
+        // Sign-in surface of `oauth2_authorization_code` MCP servers. Outside
+        // the challenge middleware below: a refused credential here answers
+        // as an OAuth client error, and points at nothing else to discover.
+        .route(
+            "/.well-known/oauth-protected-resource/mcp/:server",
+            get(mcp_oauth::protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server/mcp/:server",
+            get(mcp_oauth::authorization_server),
+        )
+        .route(
+            "/mcp/:server/.well-known/openid-configuration",
+            get(mcp_oauth::authorization_server),
+        )
+        .route("/mcp/:server/.well-known/jwks.json", get(mcp_oauth::jwks))
+        .route("/mcp/:server/oauth/register", post(mcp_oauth::register))
+        .route("/mcp/:server/oauth/authorize", get(mcp_oauth::authorize))
+        .route("/mcp/:server/oauth/token", post(mcp_oauth::token))
+        .route(
+            "/mcp/:server/oauth/credential",
+            axum::routing::delete(mcp_oauth::delete_credential),
+        )
+        .route("/mcp-oauth/callback", get(mcp_oauth::callback))
         // Downstream-facing MCP gateway. Authentication (AISIX API key or,
         // with trust providers configured, an IdP-issued JWT) is enforced
         // inside the handler via the `AuthenticatedKey` extractor.
@@ -402,7 +427,30 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         _ if path.starts_with("/v1/files/") => "/v1/files/:id",
         _ if path.starts_with("/v1/batches/") => "/v1/batches/:id",
         _ if path.starts_with("/v1/fine_tuning/jobs/") => "/v1/fine_tuning/jobs/:id",
-        _ if path.starts_with("/mcp/") => "/mcp/{server}",
+        _ if path.starts_with("/.well-known/oauth-protected-resource/mcp/") => {
+            "/.well-known/oauth-protected-resource/mcp/{server}"
+        }
+        _ if path.starts_with("/.well-known/oauth-authorization-server/mcp/") => {
+            "/.well-known/oauth-authorization-server/mcp/{server}"
+        }
+        "/mcp-oauth/callback" => "/mcp-oauth/callback",
+        _ if path.starts_with("/mcp/") => match path.split('/').nth(3) {
+            None => "/mcp/{server}",
+            Some(".well-known") if path.ends_with("/.well-known/openid-configuration") => {
+                "/mcp/{server}/.well-known/openid-configuration"
+            }
+            Some(".well-known") if path.ends_with("/.well-known/jwks.json") => {
+                "/mcp/{server}/.well-known/jwks.json"
+            }
+            Some("oauth") => match path.rsplit('/').next() {
+                Some("register") => "/mcp/{server}/oauth/register",
+                Some("authorize") => "/mcp/{server}/oauth/authorize",
+                Some("token") => "/mcp/{server}/oauth/token",
+                Some("credential") => "/mcp/{server}/oauth/credential",
+                _ => "other",
+            },
+            Some(_) => "other",
+        },
         // The agent card is discovery, not an agent call: its own series,
         // so card fetches do not count as (or time) `/a2a` traffic.
         _ if path.starts_with("/a2a/") && path.ends_with("/.well-known/agent-card.json") => {
@@ -424,7 +472,10 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
 fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
     if endpoint == "/v1/messages" || endpoint == "/v1/messages/count_tokens" {
         "anthropic"
-    } else if endpoint == "/mcp" || endpoint == "/mcp/{server}" {
+    } else if endpoint == "/mcp"
+        || endpoint.starts_with("/mcp/")
+        || endpoint == "/mcp-oauth/callback"
+    {
         "mcp"
     } else if endpoint == "/a2a" || endpoint == "/a2a/{agent}/.well-known/agent-card.json" {
         "a2a"
@@ -1511,6 +1562,40 @@ mod tests {
         // trailing slash) keeps its own — the exact `"/mcp/"` arm must stay
         // ahead of the `/mcp/` prefix arm.
         assert_eq!(normalize_endpoint_label("/mcp/alpha"), "/mcp/{server}");
+        for (path, label) in [
+            ("/mcp/alpha/oauth/register", "/mcp/{server}/oauth/register"),
+            (
+                "/mcp/alpha/oauth/authorize",
+                "/mcp/{server}/oauth/authorize",
+            ),
+            ("/mcp/alpha/oauth/token", "/mcp/{server}/oauth/token"),
+            (
+                "/mcp/alpha/oauth/credential",
+                "/mcp/{server}/oauth/credential",
+            ),
+            (
+                "/mcp/alpha/.well-known/openid-configuration",
+                "/mcp/{server}/.well-known/openid-configuration",
+            ),
+            (
+                "/mcp/alpha/.well-known/jwks.json",
+                "/mcp/{server}/.well-known/jwks.json",
+            ),
+            (
+                "/.well-known/oauth-protected-resource/mcp/alpha",
+                "/.well-known/oauth-protected-resource/mcp/{server}",
+            ),
+            (
+                "/.well-known/oauth-authorization-server/mcp/alpha",
+                "/.well-known/oauth-authorization-server/mcp/{server}",
+            ),
+            ("/mcp-oauth/callback", "/mcp-oauth/callback"),
+            // A path no route serves stays out of the server's series.
+            ("/mcp/alpha/oauth/nope", "other"),
+            ("/mcp/alpha/anything", "other"),
+        ] {
+            assert_eq!(normalize_endpoint_label(path), label, "{path}");
+        }
         assert_eq!(normalize_endpoint_label("/mcp/unique-xyz"), "/mcp/{server}");
         assert_eq!(normalize_endpoint_label("/mcp"), "/mcp");
         assert_eq!(normalize_endpoint_label("/mcp/"), "/mcp");

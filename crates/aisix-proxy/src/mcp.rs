@@ -335,6 +335,25 @@ async fn dispatch(
                 .into_response();
         }
     }
+    // The server signs in each user, which takes a public address to send
+    // them back to. Nothing a caller does can make up for one missing.
+    let user_oauth_scope = scope.filter(|server| {
+        snapshot
+            .mcp_servers
+            .get_by_name(server)
+            .is_some_and(|entry| {
+                entry.value.auth_type == aisix_core::McpAuthType::OAuth2AuthorizationCode
+            })
+    });
+    if let Some(server) = user_oauth_scope {
+        if crate::mcp_auth::public_base(&snapshot).is_none() {
+            return crate::mcp_oauth::failure_response(
+                &snapshot,
+                server,
+                aisix_mcp::UserOAuthFailure::Misconfigured,
+            );
+        }
+    }
 
     // Buffer the body so the JSON-RPC method can be inspected, then rebuilt for
     // the gateway. The global body-limit layer has already capped the size.
@@ -777,7 +796,7 @@ async fn dispatch(
     // below: only `content-length` was ever rewritten, and that header is
     // never forwarded.
     let client_headers = parts.headers.clone();
-    let caller_credentials = caller_credentials(&auth, &parts.headers);
+    let caller_credentials = caller_credentials(state, &auth, &parts.headers);
     let gateway = match scope {
         // Same snapshot as the resolution above, so the entry is still there.
         Some(server) => match aisix_mcp::McpGateway::from_snapshot_scoped_for_request(
@@ -813,13 +832,20 @@ async fn dispatch(
     // the list, a call to it fails as a tool error), so one server cannot
     // fail the whole surface.
     let token_exchange_failure = gateway.token_exchange_failure();
+    let user_oauth_failure = gateway.user_oauth_failure();
     let opening = matches!(
         peek.as_ref().and_then(|p| p.method.as_deref()),
         Some("initialize" | "server/discover")
     );
-    if scope.is_some() && opening {
-        if let Some(failure) = gateway.preflight_upstream_auth().await {
-            return crate::error::ProxyError::McpTokenExchange(failure).into_response();
+    if opening {
+        if let Some(server) = user_oauth_scope {
+            if let Some(failure) = gateway.preflight_user_oauth().await {
+                return crate::mcp_oauth::failure_response(&snapshot, server, failure);
+            }
+        } else if scope.is_some() {
+            if let Some(failure) = gateway.preflight_upstream_auth().await {
+                return crate::error::ProxyError::McpTokenExchange(failure).into_response();
+            }
         }
     }
     // Cloned out before the gateway is handed to the transport, which clones
@@ -869,6 +895,34 @@ async fn dispatch(
                 // the re-exchange after the upstream rejected a token.
                 /* dispatched */
                 failure.reached_upstream,
+            );
+        }
+        return response;
+    }
+
+    if let (Some(server), Some(failure)) = (user_oauth_scope, user_oauth_failure.get().cloned()) {
+        let response = crate::mcp_oauth::failure_response(&snapshot, server, failure.failure);
+        if is_tool_call {
+            emit_tool_call_usage(
+                state,
+                &snapshot,
+                &auth,
+                request_id,
+                request_headers,
+                &mcp_server,
+                &mcp_tool,
+                response.status().as_u16(),
+                latency,
+                Some(&crate::error::ProxyError::McpUserOAuth {
+                    failure: failure.failure,
+                    server: server.to_owned(),
+                }),
+                monitor_hits,
+                redaction_counts,
+                guardrail_chain.as_ref(),
+                None,
+                trace,
+                /* dispatched */ failure.reached_upstream,
             );
         }
         return response;
@@ -1027,6 +1081,7 @@ async fn dispatch(
 /// else: an API key, an anonymous entry, or an `Authorization` the gateway
 /// did not verify never becomes one.
 fn caller_credentials(
+    state: &ProxyState,
     auth: &AuthenticatedKey,
     headers: &axum::http::HeaderMap,
 ) -> aisix_mcp::CallerCredentials {
@@ -1040,6 +1095,10 @@ fn caller_credentials(
             .jwt
             .as_ref()
             .map(|jwt| std::sync::Arc::clone(&jwt.token)),
+        user_oauth: Some(aisix_mcp::UserOAuthCaller {
+            manager: std::sync::Arc::clone(&state.mcp_oauth),
+            subject: crate::mcp_oauth::caller_subject(auth),
+        }),
     }
 }
 

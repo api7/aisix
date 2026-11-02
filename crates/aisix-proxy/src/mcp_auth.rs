@@ -97,6 +97,17 @@ pub(crate) fn discovery_identity(snapshot: &AisixSnapshot) -> Option<DiscoveryId
     Some(identity)
 }
 
+/// The address clients reach this gateway under: `resource_url` without its
+/// trailing `/mcp`, so any prefix a front gateway routes on stays in place.
+/// `None` without one, without any regard for trust providers: the per-server
+/// sign-in surface does not name them.
+pub(crate) fn public_base(snapshot: &AisixSnapshot) -> Option<String> {
+    let settings = settings_row(snapshot)?;
+    let resource_url = settings.value.resource_url.as_deref()?;
+    validate_resource_url(resource_url)?;
+    resource_url.strip_suffix("/mcp").map(str::to_owned)
+}
+
 /// The environment's `mcp_auth_settings` row, shared by both settings it
 /// carries (OAuth discovery and anonymous access).
 ///
