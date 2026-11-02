@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -35,7 +36,51 @@ export interface MockControlPlane {
   telemetryAnswers: number[];
   /** Every request path seen on the REST surface, in arrival order. */
   calls: string[];
+  /** The `/dp/store/v1` records, by `<namespace>/<key>`. */
+  store: Map<string, StoreRecord>;
+  /** Answer every `/dp/store/v1` request with this status instead of serving it. */
+  storeStatusOverride: number | undefined;
   close(): Promise<void>;
+}
+
+export interface StoreRecord {
+  value: string;
+  version: number;
+  ttlSeconds: number;
+  labels: Record<string, string>;
+}
+
+/** The dp-manager's store API: create-only, compare-and-set, idempotent delete. */
+function serveStore(cp: MockControlPlane, req: IncomingMessage, raw: string, res: ServerResponse): void {
+  const id = (req.url ?? "").slice("/dp/store/v1/".length);
+  const json = (status: number, body?: unknown) =>
+    res.writeHead(status, { "content-type": "application/json" }).end(body === undefined ? undefined : JSON.stringify(body));
+  if (cp.storeStatusOverride !== undefined) return void json(cp.storeStatusOverride, {});
+  const current = cp.store.get(id);
+  const ifMatch = req.headers["if-match"];
+  if (req.method === "GET") {
+    if (current === undefined) return void json(404, {});
+    return void json(200, {
+      value: current.value,
+      version: current.version,
+      expires_at: "2099-01-01T00:00:00Z",
+    });
+  }
+  if (req.method === "DELETE") {
+    if (ifMatch === undefined || current?.version === Number(ifMatch)) cp.store.delete(id);
+    return void json(204);
+  }
+  if (req.method === "PUT") {
+    const createOnly = req.headers["if-none-match"] === "*";
+    if (createOnly === (ifMatch !== undefined)) return void json(400, { error: "exactly one precondition" });
+    const holds = createOnly ? current === undefined : current?.version === Number(ifMatch);
+    if (!holds) return void json(412, {});
+    const body = JSON.parse(raw) as { value: string; ttl_seconds: number; labels: Record<string, string> };
+    const version = (current?.version ?? 0) + 1;
+    cp.store.set(id, { value: body.value, version, ttlSeconds: body.ttl_seconds, labels: body.labels });
+    return void json(200, { version });
+  }
+  json(405, {});
 }
 
 function openssl(args: string[], cwd: string): void {
@@ -97,15 +142,20 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
     telemetryStatus: 200,
     telemetryAnswers: [],
     calls: [],
+    store: new Map(),
+    storeStatusOverride: undefined,
     close: async () => {},
   };
 
   const rest: HttpsServer = createHttpsServer(tlsMaterial, (req, res) => {
     const path = (req.url ?? "").split("?")[0];
     cp.calls.push(path);
-    req.resume();
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => {
-      if (req.method === "POST" && path === "/dp/heartbeat") {
+      if (path.startsWith("/dp/store/v1/")) {
+        serveStore(cp, req, Buffer.concat(chunks).toString("utf8"), res);
+      } else if (req.method === "POST" && path === "/dp/heartbeat") {
         res.writeHead(200, { "content-type": "application/json" });
         res.end("{}");
       } else if (req.method === "POST" && path === "/dp/telemetry") {
