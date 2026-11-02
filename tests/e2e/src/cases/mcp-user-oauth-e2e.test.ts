@@ -151,6 +151,14 @@ describe("per-user OAuth to an upstream MCP server", () => {
 
   const url = (server: string) => `${stack.base}/mcp/${server}`;
 
+  /** `caller` is signed in to `server` as `user`, whatever ran before. */
+  const signedIn = async (target: OAuthMcpUpstream, server: string, caller: string, user: string) => {
+    await fetch(`${url(server)}/oauth/credential`, { method: "DELETE", headers: key(caller) });
+    target.user = user;
+    const { client } = await signIn(url(server), key(caller));
+    await client.close();
+  };
+
   beforeAll(async () => {
     etcdReachable = await new EtcdClient().ping();
     if (!etcdReachable) return;
@@ -334,6 +342,8 @@ describe("per-user OAuth to an upstream MCP server", () => {
 
   test("another client of the same user needs no sign-in, and another user does", async () => {
     if (!etcdReachable) return;
+    await signedIn(main, "main", ALICE, "alice");
+    await fetch(`${url("main")}/oauth/credential`, { method: "DELETE", headers: key(BOB) });
     // Same member, another key, no OAuth configured at all.
     const { client } = await connect(url("main"), key(ALICE2));
     expect(await whoami(client)).toBe("alice");
@@ -350,6 +360,7 @@ describe("per-user OAuth to an upstream MCP server", () => {
 
   test("the client's own Authorization never reaches the upstream, even when forwarding names it", async () => {
     if (!etcdReachable) return;
+    await signedIn(main, "main", ALICE, "alice");
     const before = main.mcpAuthorizations.length;
     const { client } = await connect(url("main"), {
       ...key(ALICE),
@@ -783,6 +794,19 @@ describe("per-user OAuth to an upstream MCP server", () => {
 
   test("each route reports under its own endpoint label", async () => {
     if (!etcdReachable) return;
+    const plainGets = [
+      "/.well-known/oauth-protected-resource/mcp/main",
+      "/.well-known/oauth-authorization-server/mcp/main",
+      "/mcp/main/.well-known/openid-configuration",
+      "/mcp/main/.well-known/jwks.json",
+      "/mcp/main/oauth/authorize",
+      "/mcp-oauth/callback",
+    ];
+    await Promise.all(plainGets.map((path) => fetch(`${stack.base}${path}`, { redirect: "manual" })));
+    await fetch(`${url("main")}/oauth/register`, { method: "POST", body: "{}" });
+    await fetch(`${url("main")}/oauth/token`, { method: "POST", headers: key(BOB) });
+    await fetch(`${url("selfrevoke")}/oauth/credential`, { method: "DELETE", headers: key(NO_USER) });
+    await mcpPost(url("main"), key(NO_USER));
     const samples = await scrapeMetrics(stack.app.metricsUrl);
     const endpoints = new Set(samples.map((s) => s.labels.endpoint));
     for (const endpoint of [

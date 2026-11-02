@@ -347,6 +347,12 @@ async fn dispatch(
     });
     if let Some(server) = user_oauth_scope {
         if crate::mcp_auth::public_base(&snapshot).is_none() {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(target: "aisix::mcp_oauth", server,
+                    "this MCP server signs in each user, which needs a valid resource_url in \
+                     the MCP authentication settings");
+            });
             return crate::mcp_oauth::failure_response(
                 &snapshot,
                 server,

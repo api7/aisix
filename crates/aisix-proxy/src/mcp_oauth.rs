@@ -276,7 +276,12 @@ fn trusted_origin_matches(entry: &str, host: &str, authority: &str) -> bool {
 
 /// Runs a handler with the bookkeeping every route here shares: no usage row
 /// on any outcome, one access-log line, the request families.
-async fn observed<F>(state: &ProxyState, request: Request, handler: F) -> Response
+async fn observed<F>(
+    state: &ProxyState,
+    caller: Option<&AuthenticatedKey>,
+    request: Request,
+    handler: F,
+) -> Response
 where
     F: AsyncFnOnce(&ProxyState, Request) -> Response,
 {
@@ -294,14 +299,17 @@ where
         method.as_str(),
         &path,
         &request_id,
-        None,
+        caller.map(|auth| auth.entry.id.as_str()),
         response.status().as_u16(),
         started,
     );
     crate::reject::record_undispatched(
         state,
         &path,
-        crate::request_metrics::Caller::unattributed(None),
+        caller.map_or(
+            crate::request_metrics::Caller::unattributed(None),
+            crate::request_metrics::Caller::new,
+        ),
         response.status().as_u16(),
         started,
     );
@@ -323,7 +331,7 @@ pub(crate) async fn protected_resource(
     State(state): State<ProxyState>,
     request: Request,
 ) -> Response {
-    observed(&state, request, async |state, request| {
+    observed(&state, None, request, async |state, request| {
         let snapshot = state.snapshot.load();
         let (Some(oauth), Some(base)) = (
             sign_in_server(&snapshot, &server),
@@ -358,7 +366,7 @@ pub(crate) async fn authorization_server(
     State(state): State<ProxyState>,
     request: Request,
 ) -> Response {
-    observed(&state, request, async |state, request| {
+    observed(&state, None, request, async |state, request| {
         let snapshot = state.snapshot.load();
         let (Some(oauth), Some(base)) = (
             sign_in_server(&snapshot, &server),
@@ -395,7 +403,7 @@ pub(crate) async fn jwks(
     State(state): State<ProxyState>,
     request: Request,
 ) -> Response {
-    observed(&state, request, async |state, request| {
+    observed(&state, None, request, async |state, request| {
         if sign_in_server(&state.snapshot.load(), &server).is_none() {
             return StatusCode::NOT_FOUND.into_response();
         }
@@ -412,7 +420,7 @@ pub(crate) async fn register(
     State(state): State<ProxyState>,
     request: Request,
 ) -> Response {
-    observed(&state, request, async |state, request| {
+    observed(&state, None, request, async |state, request| {
         if sign_in_server(&state.snapshot.load(), &server).is_none() {
             return StatusCode::NOT_FOUND.into_response();
         }
@@ -455,7 +463,7 @@ pub(crate) async fn authorize(
     State(state): State<ProxyState>,
     request: Request,
 ) -> Response {
-    observed(&state, request, async |state, request| {
+    observed(&state, None, request, async |state, request| {
         let snapshot = state.snapshot.load();
         let Some(oauth) = sign_in_server(&snapshot, &server) else {
             return StatusCode::NOT_FOUND.into_response();
@@ -548,7 +556,7 @@ pub(crate) async fn authorize(
 /// `GET /mcp-oauth/callback`, where the upstream sends the browser back. The
 /// upstream's code goes no further than this.
 pub(crate) async fn callback(State(state): State<ProxyState>, request: Request) -> Response {
-    observed(&state, request, async |state, request| {
+    observed(&state, None, request, async |state, request| {
         let params = query_params(request.uri());
         let param = |name: &str| params.get(name).map(String::as_str).filter(|v| !v.is_empty());
         let Some(flow_state) = param("state") else {
@@ -642,7 +650,7 @@ pub(crate) async fn token(
         }
     };
     let request = Request::from_parts(parts, body);
-    observed(&state, request, async |state, request| {
+    observed(&state, Some(&auth), request, async |state, request| {
         let Some(oauth) = sign_in_server(&state.snapshot.load(), &server) else {
             return StatusCode::NOT_FOUND.into_response();
         };
@@ -748,7 +756,7 @@ pub(crate) async fn delete_credential(
         }
     };
     let request = Request::from_parts(parts, body);
-    observed(&state, request, async |state, _request| {
+    observed(&state, Some(&auth), request, async |state, _request| {
         let snapshot = state.snapshot.load();
         let Some(oauth) = sign_in_server(&snapshot, &server) else {
             return StatusCode::NOT_FOUND.into_response();

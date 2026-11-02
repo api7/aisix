@@ -912,7 +912,7 @@ fn mcp_user_oauth_message(failure: &aisix_mcp::UserOAuthFailure, server: &str) -
         ),
         aisix_mcp::UserOAuthFailure::Misconfigured => format!(
             "MCP server '{server}' cannot sign in users as configured; an administrator must \
-             set resource_url in the MCP authentication settings and check its OAuth settings"
+             check its OAuth settings and the MCP authentication settings"
         ),
         aisix_mcp::UserOAuthFailure::Unavailable => format!(
             "this user's upstream token for MCP server '{server}' is temporarily unavailable; \
