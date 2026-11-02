@@ -19,6 +19,12 @@ import { EtcdClient, SeedClient, spawnApp, waitConfigPropagation, type SpawnedAp
 
 const CALLER = "sk-param-vertex-gemini";
 const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
+const HEADERS = {
+  authorization: `Bearer ${CALLER}`,
+  "x-api-key": CALLER,
+  "anthropic-version": "2023-06-01",
+  "content-type": "application/json",
+};
 
 type Received = { path: string; headers: IncomingMessage["headers"]; body: any };
 type Reply = { json?: unknown; sse?: unknown[]; holdRestUntil?: Promise<void> };
@@ -302,12 +308,7 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
   async function post(path: string, body: Record<string, unknown>) {
     const res = await fetch(`${app!.proxyUrl}${path}`, {
       method: "POST",
-      headers: {
-        authorization: `Bearer ${CALLER}`,
-        "x-api-key": CALLER,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-      },
+      headers: HEADERS,
       body: JSON.stringify(body),
     });
     return { status: res.status, text: await res.text() };
@@ -340,12 +341,7 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
     try {
       const res = await fetch(`${app!.proxyUrl}${path}`, {
         method: "POST",
-        headers: {
-          authorization: `Bearer ${CALLER}`,
-          "x-api-key": CALLER,
-          "anthropic-version": "2023-06-01",
-          "content-type": "application/json",
-        },
+        headers: HEADERS,
         body: JSON.stringify({ ...body, stream: true }),
       });
       expect(res.status).toBe(200);
@@ -484,6 +480,9 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
       // `none` asks for no thoughts.
       ["pg-25-flash", "none", { thinkingBudget: 0 }],
       ["pg-3-flash", "none", undefined],
+      // An empty value asks for nothing.
+      ["pg-25-flash", "", undefined],
+      ["pg-3-flash", "", undefined],
       // 2.5 Pro cannot turn thinking off, and 2.0 has no thinking setting.
       ["pg-25-pro", "none", undefined],
       ["pg-20-flash", "high", undefined],
@@ -536,6 +535,7 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
     if (skip(ctx)) return;
     for (const [extra, expected] of [
       [{ thinking: { type: "disabled" } }, { thinkingBudget: 0 }],
+      [{ thinking: { type: "enabled", budget_tokens: 0 } }, { thinkingBudget: 0 }],
       [{}, undefined],
     ] as const) {
       const { result, sent } = await capture(() =>
@@ -614,6 +614,32 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
       const res = await withReply(THINKING_REPLY, () => post(surface.path, plain));
       expect(res.status, res.text).toBe(200);
       expect(surface.read(JSON.parse(res.text))).toEqual({ reasoning: THOUGHT, answer: ANSWER, calls: [] });
+
+      const streamed = await withReply(THINKING_REPLY, () => post(surface.path, { ...plain, stream: true }));
+      expect(streamed.status, streamed.text).toBe(200);
+      const out = surface.readStream(streamed.text);
+      expect(out.reasoning).toBe(THOUGHT);
+      expect(out.answer).toBe(ANSWER);
+    });
+
+    test("a turn cut off while thinking returns the thought and no answer", async (ctx) => {
+      if (skip(ctx)) return;
+      const reply = {
+        json: {
+          candidates: [{ content: { role: "model", parts: [THOUGHT_PART] }, finishReason: "MAX_TOKENS" }],
+          usageMetadata: THINKING_USAGE,
+        },
+        sse: [frame([THOUGHT_PART]), frame([{ text: "" }], { finishReason: "MAX_TOKENS" })],
+      };
+      const res = await withReply(reply, () => post(surface.path, surface.request("pg-3-flash")));
+      expect(res.status, res.text).toBe(200);
+      expect(surface.read(JSON.parse(res.text))).toEqual({ reasoning: THOUGHT, answer: "", calls: [] });
+
+      const streamed = await withReply(reply, () => post(surface.path, { ...surface.request("pg-3-flash"), stream: true }));
+      expect(streamed.status, streamed.text).toBe(200);
+      const out = surface.readStream(streamed.text);
+      expect(out.reasoning).toBe(THOUGHT);
+      expect(out.seen).toEqual(["reasoning"]);
     });
 
     test("a frame holding both a thought and answer text renders the thought first", async (ctx) => {
@@ -661,9 +687,8 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
     });
   });
 
-  test.for<[string, string, Record<string, unknown>]>([
+  test.for<[string, Record<string, unknown>]>([
     [
-      "/v1/chat/completions",
       "/v1/chat/completions",
       {
         reasoning_effort: "high",
@@ -676,7 +701,6 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
       },
     ],
     [
-      "/v1/messages",
       "/v1/messages",
       {
         max_tokens: 4096,
@@ -696,7 +720,6 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
     ],
     [
       "/v1/responses",
-      "/v1/responses",
       {
         reasoning: { effort: "high" },
         input: [
@@ -707,7 +730,7 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
         ],
       },
     ],
-  ])("%s: reasoning replayed in history is not sent back to Gemini", async ([, path, body], ctx) => {
+  ])("%s: reasoning replayed in history is not sent back to Gemini", async ([path, body], ctx) => {
     if (skip(ctx)) return;
     const { result, sent } = await capture(() => post(path, { model: "pg-3-flash", ...body }));
     expect(result.status, result.text).toBe(200);

@@ -2473,8 +2473,10 @@ fn gemini_stop_sequences(req: &ChatFormat) -> Result<Option<serde_json::Value>, 
 ///
 /// A caller that asked for thinking on 2.5 or later also gets
 /// `includeThoughts`, on its own when no setting applies; Gemini returns no
-/// thought parts without it. A caller that sent nothing, or `none`, does not:
-/// its request and response stay as they would be with no reasoning support.
+/// thought parts without it. A caller that sent nothing, an empty value or
+/// `none` does not, and neither does a budget of 0, which turns thinking off:
+/// that request and its response stay as they would be with no reasoning
+/// support.
 fn gemini_thinking_config(
     req: &ChatFormat,
     upstream_model: &str,
@@ -2515,7 +2517,10 @@ fn gemini_thinking_config(
     } else {
         return Ok(None);
     }
-    if req.thinking_budget_tokens.is_some() || effort.is_some_and(|effort| effort != "none") {
+    let asked = req.thinking_budget_tokens.is_some()
+        || effort.is_some_and(|effort| !matches!(effort, "" | "none"));
+    let thinking_off = config.get("thinkingBudget").and_then(|b| b.as_u64()) == Some(0);
+    if asked && !thinking_off {
         config.insert("includeThoughts".into(), true.into());
     }
     Ok((!config.is_empty()).then_some(serde_json::Value::Object(config)))
@@ -4054,6 +4059,17 @@ mod tests {
         // 2.5 Pro cannot turn thinking off.
         assert_eq!(thinking("none", "gemini-2.5-pro"), None);
         assert_eq!(thinking("high", "gemini-2.0-flash"), None);
+        assert_eq!(thinking("", "gemini-2.5-flash"), None);
+        assert_eq!(thinking("", "gemini-3-flash-preview"), None);
+        // A budget of 0 turns thinking off, whatever else the caller sent.
+        let mut req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        req.thinking_budget_tokens = Some(0);
+        let body =
+            serde_json::to_value(build_gemini_request(&req, "gemini-2.5-flash").unwrap()).unwrap();
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"],
+            serde_json::json!({"thinkingBudget": 0})
+        );
         // A caller that sent nothing gets no thinking setting at all.
         for model in ["gemini-2.5-flash", "gemini-3-flash-preview"] {
             assert_eq!(
