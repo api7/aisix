@@ -96,9 +96,10 @@ pub struct McpServer {
     pub transport: McpTransport,
 
     /// How the gateway authenticates to the upstream server. A gateway-held
-    /// credential (`bearer`, `api_key`, `oauth2`, `oauth2_token_exchange`) is
-    /// never exposed to the calling client. `oauth_delegate` holds none: the
-    /// caller's own upstream token is relayed instead.
+    /// credential (`bearer`, `api_key`, `oauth2`, `oauth2_token_exchange`,
+    /// `oauth2_authorization_code`) is never exposed to the calling client.
+    /// `oauth_delegate` holds none: the caller's own upstream token is relayed
+    /// instead.
     #[serde(default)]
     pub auth_type: McpAuthType,
 
@@ -107,8 +108,9 @@ pub struct McpServer {
     /// `Authorization: Bearer <secret>`), the API key when `auth_type` is
     /// `api_key` (sent as `x-api-key: <secret>`, or under `api_key_header`
     /// for `type: openapi`), or the OAuth client secret when `auth_type` is
-    /// `oauth2` or `oauth2_token_exchange`. Leave unset when `auth_type` is
-    /// `none` or `oauth_delegate`.
+    /// `oauth2`, `oauth2_token_exchange`, or `oauth2_authorization_code` with
+    /// a `client_id` that has one. Leave unset when `auth_type` is `none` or
+    /// `oauth_delegate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
 
@@ -119,21 +121,49 @@ pub struct McpServer {
     // restructuring) while giving the published schema and every runtime
     // validator one shared definition.
     /// OAuth client identifier the gateway authenticates to `token_url` with.
-    /// Required when `auth_type` is `oauth2` or `oauth2_token_exchange`;
-    /// ignored otherwise.
+    /// Required when `auth_type` is `oauth2` or `oauth2_token_exchange`. For
+    /// `oauth2_authorization_code` it is optional: when omitted, the gateway
+    /// registers itself once with the authorization server as a public client.
+    /// Ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
 
     /// OAuth token endpoint URL where the gateway obtains the upstream access
     /// token, such as `https://auth.example.com/oauth/token`. Required when
-    /// `auth_type` is `oauth2` or `oauth2_token_exchange`; ignored otherwise.
+    /// `auth_type` is `oauth2` or `oauth2_token_exchange`. For
+    /// `oauth2_authorization_code` it is optional: when omitted, it is
+    /// discovered from the upstream server. Ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_url: Option<String>,
+
+    /// OAuth authorization endpoint URL that users are sent to when signing
+    /// in, such as `https://auth.example.com/oauth/authorize`. Used when
+    /// `auth_type` is `oauth2_authorization_code`; when omitted, it is
+    /// discovered from the upstream server. Ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_url: Option<String>,
+
+    /// OAuth dynamic client registration endpoint URL. Used when `auth_type`
+    /// is `oauth2_authorization_code` and `client_id` is omitted; when this is
+    /// omitted too, it is discovered from the upstream server. Ignored
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_url: Option<String>,
+
+    /// Additional origins an MCP client may be redirected back to after
+    /// signing in, when `auth_type` is `oauth2_authorization_code`. Each entry
+    /// is a host, a `host:port`, or a `*.example.com` wildcard that matches
+    /// subdomains only, and applies to `https` redirects. Loopback addresses
+    /// and the gateway's own origin are always accepted. Ignored otherwise.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_redirect_origins: Vec<String>,
 
     /// OAuth scopes to request. Joined with spaces into the `scope` parameter
     /// of the token request. Used when `auth_type` is `oauth2` (optional) or
     /// `oauth2_token_exchange` (required, at least one — for `entra_obo` the
-    /// target API's scope, such as `api://<app-id>/.default`).
+    /// target API's scope, such as `api://<app-id>/.default`). For
+    /// `oauth2_authorization_code` they are requested when signing in unless
+    /// the MCP client asks for its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
 
@@ -172,9 +202,10 @@ pub struct McpServer {
     /// otherwise do with it. Naming the credential slot `auth_type` would
     /// fill — `authorization` for `bearer` and `oauth2`, `api_key_header`
     /// for `api_key` — hands the server the caller's own credential in
-    /// place of the gateway's, never both. `oauth_delegate` and
-    /// `oauth2_token_exchange` own `authorization` themselves, so naming it
-    /// on such a server has no effect. That is what lets an internal
+    /// place of the gateway's, never both. `oauth_delegate`,
+    /// `oauth2_token_exchange` and `oauth2_authorization_code` own
+    /// `authorization` themselves, so naming it on such a server has no
+    /// effect. That is what lets an internal
     /// server that already authorizes on the end user's `Authorization`
     /// keep doing so unchanged. A server that validates the `aud` claim
     /// will reject a token minted for the gateway.
@@ -300,6 +331,17 @@ pub enum McpAuthType {
     /// expiry.
     #[serde(rename = "oauth2_token_exchange")]
     OAuth2TokenExchange,
+    /// Per-user OAuth 2.0 authorization code flow with PKCE, for `type: mcp`
+    /// only. Each user signs in to the upstream authorization server once; the
+    /// gateway keeps the resulting tokens and sends that user's access token
+    /// as `Authorization: Bearer <access_token>`, refreshing it when needed.
+    /// A caller whose gateway credential has no user cannot use such a server.
+    /// The upstream tokens never reach the MCP client, and the client's own
+    /// `Authorization` header is never sent to the server. The public address
+    /// of the sign-in endpoints comes from `resource_url` in the MCP
+    /// authentication settings.
+    #[serde(rename = "oauth2_authorization_code")]
+    OAuth2AuthorizationCode,
 }
 
 /// Token exchange protocol for `auth_type: oauth2_token_exchange`.
@@ -395,6 +437,15 @@ pub fn mcp_server_credential_coupling() -> Value {
                 }
             }
         },
+        // The per-user flow relays an MCP client's sign-in; a REST API behind
+        // `type: openapi` has no such client.
+        {
+            "if": {
+                "properties": { "auth_type": { "const": "oauth2_authorization_code" } },
+                "required": ["auth_type"]
+            },
+            "then": { "properties": { "type": { "const": "mcp" } } }
+        },
         // Note on diagnosability: expressing "not a Swagger 2.0 document" as a
         // schema constraint costs the targeted hint the write path used to emit
         // ("convert the spec to OpenAPI 3.x"). A validator reports the failing
@@ -486,6 +537,52 @@ mod tests {
         validate_mcp_server(&with(json!([]))).expect("an empty list is the default, spelled out");
         validate_mcp_server_lenient(&with(json!(["authorization"])))
             .expect("the read path must not cost the row over a pattern");
+    }
+
+    #[test]
+    fn the_per_user_flow_needs_no_field_but_is_for_mcp_servers_only() {
+        use crate::models::schema::{validate_mcp_server, validate_mcp_server_lenient};
+
+        let minimal = json!({
+            "name": "erp",
+            "url": "https://erp.internal/mcp",
+            "auth_type": "oauth2_authorization_code",
+        });
+        validate_mcp_server(&minimal).expect("every OAuth field is optional");
+        validate_mcp_server_lenient(&minimal).expect("and it loads");
+
+        let server: McpServer = serde_json::from_value(json!({
+            "name": "erp",
+            "url": "https://erp.internal/mcp",
+            "auth_type": "oauth2_authorization_code",
+            "client_id": "c",
+            "secret": "s",
+            "authorization_url": "https://idp.example/authorize",
+            "token_url": "https://idp.example/token",
+            "registration_url": "https://idp.example/register",
+            "scopes": ["read"],
+            "trusted_redirect_origins": ["app.example", "*.example.org"],
+        }))
+        .unwrap();
+        assert_eq!(server.auth_type, McpAuthType::OAuth2AuthorizationCode);
+        validate_mcp_server(&serde_json::to_value(&server).unwrap())
+            .expect("a full configuration round-trips through the strict schema");
+
+        for bad in [json!("not-an-array"), json!([1])] {
+            let mut v = minimal.clone();
+            v["trusted_redirect_origins"] = bad;
+            validate_mcp_server(&v).expect_err("trusted_redirect_origins is a list of strings");
+        }
+
+        let openapi = json!({
+            "name": "erp",
+            "url": "https://erp.internal/api",
+            "type": "openapi",
+            "spec": {"openapi": "3.0.0", "paths": {"/a": {"get": {"operationId": "list_a"}}}},
+            "auth_type": "oauth2_authorization_code",
+        });
+        validate_mcp_server(&openapi).expect_err("no sign-in without an MCP client");
+        validate_mcp_server_lenient(&openapi).expect_err("nor on the read path");
     }
 
     #[test]
@@ -859,6 +956,9 @@ mod tests {
             token_url: None,
             scopes: None,
             token_exchange_profile: None,
+            authorization_url: None,
+            registration_url: None,
+            trusted_redirect_origins: Vec::new(),
             protocol_version: None,
             forward_client_headers: Vec::new(),
             timeout_ms: None,

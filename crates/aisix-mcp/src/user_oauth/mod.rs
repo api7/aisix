@@ -1,0 +1,640 @@
+//! Per-user OAuth for upstream MCP servers (`auth_type:
+//! oauth2_authorization_code`).
+//!
+//! Each user signs in to the upstream authorization server once. The gateway
+//! keeps that user's tokens in a [`SharedStore`] and injects the access token
+//! on every upstream operation; an MCP client only ever holds a placeholder.
+//!
+//! Records written here are read by gateways of other versions, so they
+//! tolerate unknown fields and every field but the one a record exists for
+//! has a default.
+
+mod discovery;
+mod flow;
+mod http;
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use aisix_core::McpServer;
+use futures::future::{BoxFuture, FutureExt, Shared};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::error::UserOAuthFailure;
+use crate::shared_store::{PutCondition, SharedStore, StoreError};
+
+pub use flow::{AuthorizationRequest, CompletedFlow, RedeemError, RedeemRequest};
+
+const NS_TOKEN: &str = "mcp_oauth_token";
+const NS_CLIENT: &str = "mcp_oauth_client";
+const NS_FLOW: &str = "mcp_oauth_flow";
+const NS_CODE: &str = "mcp_oauth_code";
+const NS_LEASE: &str = "mcp_oauth_lease";
+
+const TOKEN_TTL: Duration = Duration::from_secs(365 * 24 * 3600);
+const CLIENT_TTL: Duration = Duration::from_secs(365 * 24 * 3600);
+const FLOW_TTL: Duration = Duration::from_secs(600);
+const CODE_TTL: Duration = Duration::from_secs(120);
+const LEASE_TTL: Duration = Duration::from_secs(60);
+
+/// A token with less than this left is refreshed before it is used.
+const REFRESH_SKEW_SECS: i64 = 60;
+/// How long a stored token is reused here without reading the store, so a
+/// revocation on another gateway takes effect.
+const LOCAL_CACHE_MAX: Duration = Duration::from_secs(300);
+const LOCAL_CACHE_CAPACITY: usize = 10_000;
+/// How often a gateway waiting on another gateway's refresh re-reads the
+/// record.
+const LEASE_POLL: Duration = Duration::from_millis(200);
+
+/// Error codes a token endpoint answers a refresh with when the grant itself
+/// is finished, so only a new sign-in can help. Anything else leaves the
+/// stored record alone.
+const DEFINITIVE_REFRESH_ERRORS: &[&str] =
+    &["invalid_grant", "invalid_token", "unauthorized_client"];
+
+/// Who a stored token belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserSubject {
+    id: String,
+    member_id: Option<String>,
+}
+
+impl UserSubject {
+    pub fn jwt(provider: &str, subject: &str) -> Self {
+        Self {
+            id: format!("jwt:{provider}:{subject}"),
+            member_id: None,
+        }
+    }
+
+    pub fn member(user_id: &str) -> Self {
+        Self {
+            id: format!("member:{user_id}"),
+            member_id: Some(user_id.to_owned()),
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// The OAuth settings of one registered server.
+#[derive(Clone)]
+pub struct UserOAuthServer {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub trusted_redirect_origins: Vec<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    authorization_url: Option<String>,
+    token_url: Option<String>,
+    registration_url: Option<String>,
+    scopes: Vec<String>,
+    timeout: Duration,
+}
+
+fn non_empty(value: &Option<String>) -> Option<String> {
+    value.clone().filter(|v| !v.is_empty())
+}
+
+impl UserOAuthServer {
+    pub fn new(id: &str, server: &McpServer) -> Self {
+        Self {
+            id: id.to_owned(),
+            name: server.name.clone(),
+            url: server.url.clone(),
+            trusted_redirect_origins: server.trusted_redirect_origins.clone(),
+            client_id: non_empty(&server.client_id),
+            client_secret: non_empty(&server.secret),
+            authorization_url: non_empty(&server.authorization_url),
+            token_url: non_empty(&server.token_url),
+            registration_url: non_empty(&server.registration_url),
+            scopes: server.scopes.clone().unwrap_or_default(),
+            timeout: server
+                .timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(crate::bridge::DEFAULT_UPSTREAM_TIMEOUT),
+        }
+    }
+
+    /// Scopes to advertise to MCP clients.
+    pub fn scopes(&self) -> &[String] {
+        &self.scopes
+    }
+}
+
+/// The gateway's OAuth client at the upstream authorization server, when it
+/// got one by registering rather than from configuration.
+#[derive(Clone, Serialize, Deserialize)]
+struct RegisteredClient {
+    client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_secret: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TokenRecord {
+    access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
+    /// Unix seconds. Absent when the token endpoint did not say, in which
+    /// case only the upstream's own `401` ends the token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resource: Option<String>,
+    /// The registered client the tokens were issued to. A configured
+    /// `client_id` takes precedence over it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    registered_client: Option<RegisteredClient>,
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+impl TokenRecord {
+    fn needs_refresh(&self, now: i64) -> bool {
+        self.expires_at
+            .is_some_and(|at| at - now < REFRESH_SKEW_SECS)
+    }
+
+    fn expired(&self, now: i64) -> bool {
+        self.expires_at.is_some_and(|at| at <= now)
+    }
+}
+
+struct CachedToken {
+    access_token: String,
+    /// Unix seconds; when this token stops being usable at all.
+    expires_at: Option<i64>,
+    /// When to stop trusting this copy over the store.
+    read_store_after: Instant,
+}
+
+/// `(server, subject)` for one in-flight refresh and one store key.
+fn digest(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// An unguessable URL-safe value for a flow state or an authorization code.
+fn random_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+type Flight = Shared<BoxFuture<'static, Result<String, UserOAuthFailure>>>;
+
+/// Everything per-user OAuth keeps per process: the store handle, the local
+/// token cache, and the refreshes in flight.
+pub struct UserOAuthManager {
+    store: Arc<dyn SharedStore>,
+    cache: Mutex<HashMap<String, CachedToken>>,
+    inflight: Mutex<HashMap<String, Flight>>,
+    discovery: discovery::DiscoveryCache,
+    registrations: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl UserOAuthManager {
+    pub fn new(store: Arc<dyn SharedStore>) -> Self {
+        Self {
+            store,
+            cache: Mutex::default(),
+            inflight: Mutex::default(),
+            discovery: discovery::DiscoveryCache::default(),
+            registrations: Mutex::default(),
+        }
+    }
+
+    /// `subject`'s access token for `server`, refreshed first when it is
+    /// about to expire.
+    pub async fn access_token(
+        self: &Arc<Self>,
+        server: &UserOAuthServer,
+        subject: &UserSubject,
+    ) -> Result<String, UserOAuthFailure> {
+        let key = digest(&[&server.id, subject.id()]);
+        let cached = self.cached(&key);
+        if let Some((token, true)) = &cached {
+            return Ok(token.clone());
+        }
+        let stored = match self.store.get(NS_TOKEN, &key).await {
+            Ok(stored) => stored,
+            Err(error) => {
+                // A token already in hand keeps working through a storage
+                // outage, past the window that bounds how long it is trusted
+                // over the store: there is no store to prefer.
+                return match cached {
+                    Some((token, _)) => Ok(token),
+                    None => {
+                        tracing::warn!(target: "aisix::mcp_oauth", server = %server.name, %error,
+                            "could not read a user's stored MCP token");
+                        Err(UserOAuthFailure::Unavailable)
+                    }
+                };
+            }
+        };
+        let Some(record) = stored.as_ref().and_then(decode_token) else {
+            self.evict(&key);
+            return Err(UserOAuthFailure::AuthorizationRequired);
+        };
+        if !record.needs_refresh(unix_now()) {
+            self.remember(&key, &record);
+            return Ok(record.access_token);
+        }
+        self.refresh(server, subject, None).await
+    }
+
+    /// The upstream rejected `rejected`: return the token to try next, which
+    /// a refresh produced unless another gateway already replaced it.
+    pub async fn refresh_rejected(
+        self: &Arc<Self>,
+        server: &UserOAuthServer,
+        subject: &UserSubject,
+        rejected: &str,
+    ) -> Result<String, UserOAuthFailure> {
+        self.evict(&digest(&[&server.id, subject.id()]));
+        self.refresh(server, subject, Some(rejected.to_owned()))
+            .await
+    }
+
+    /// The upstream rejected `rejected` even fresh from a refresh, so only a
+    /// new sign-in can help. Leaves a record some other sign-in has replaced
+    /// in the meantime alone.
+    pub async fn discard_rejected(
+        &self,
+        server: &UserOAuthServer,
+        subject: &UserSubject,
+        rejected: &str,
+    ) {
+        let key = digest(&[&server.id, subject.id()]);
+        self.evict(&key);
+        if let Ok(Some(stored)) = self.store.get(NS_TOKEN, &key).await {
+            if decode_token(&stored).is_some_and(|record| record.access_token == rejected) {
+                self.delete_record(server, &key, Some(stored.version)).await;
+            }
+        }
+    }
+
+    /// Remove `subject`'s connection to `server`. This gateway forgets it at
+    /// once; another keeps a cached copy for at most [`LOCAL_CACHE_MAX`].
+    pub async fn disconnect(
+        &self,
+        server: &UserOAuthServer,
+        subject: &UserSubject,
+    ) -> Result<(), UserOAuthFailure> {
+        let key = digest(&[&server.id, subject.id()]);
+        self.evict(&key);
+        self.store
+            .delete(NS_TOKEN, &key, None)
+            .await
+            .map_err(|_| UserOAuthFailure::Unavailable)
+    }
+
+    fn cached(&self, key: &str) -> Option<(String, bool)> {
+        let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = cache.get(key)?;
+        let now = unix_now();
+        if entry.expires_at.is_some_and(|at| at <= now) {
+            return None;
+        }
+        let fresh = entry.read_store_after > Instant::now()
+            && entry
+                .expires_at
+                .is_none_or(|at| at - now >= REFRESH_SKEW_SECS);
+        Some((entry.access_token.clone(), fresh))
+    }
+
+    fn remember(&self, key: &str, record: &TokenRecord) {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.len() >= LOCAL_CACHE_CAPACITY {
+            let now = unix_now();
+            cache.retain(|_, entry| entry.expires_at.is_none_or(|at| at > now));
+            if cache.len() >= LOCAL_CACHE_CAPACITY {
+                let excess: Vec<String> = cache
+                    .keys()
+                    .take(LOCAL_CACHE_CAPACITY / 10)
+                    .cloned()
+                    .collect();
+                for key in excess {
+                    cache.remove(&key);
+                }
+            }
+        }
+        cache.insert(
+            key.to_owned(),
+            CachedToken {
+                access_token: record.access_token.clone(),
+                expires_at: record.expires_at,
+                read_store_after: Instant::now() + LOCAL_CACHE_MAX,
+            },
+        );
+    }
+
+    fn evict(&self, key: &str) {
+        self.cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(key);
+    }
+
+    async fn delete_record(&self, server: &UserOAuthServer, key: &str, version: Option<i64>) {
+        // If this fails the record stays, and the next attempt ends the same
+        // way: a refresh that is rejected again.
+        if let Err(error) = self.store.delete(NS_TOKEN, key, version).await {
+            if error != StoreError::PreconditionFailed {
+                tracing::warn!(target: "aisix::mcp_oauth", server = %server.name, %error,
+                    "could not delete a user's stored MCP token");
+            }
+        }
+    }
+
+    /// One refresh per `(server, subject)` in this process, spawned so that a
+    /// caller going away cannot cut it off between the token endpoint
+    /// rotating the refresh token and the new one being stored.
+    async fn refresh(
+        self: &Arc<Self>,
+        server: &UserOAuthServer,
+        subject: &UserSubject,
+        rejected: Option<String>,
+    ) -> Result<String, UserOAuthFailure> {
+        let key = digest(&[&server.id, subject.id()]);
+        let flight = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(key.clone())
+            .or_insert_with(|| {
+                let manager = Arc::clone(self);
+                let server = server.clone();
+                let subject = subject.clone();
+                let key = key.clone();
+                let task = tokio::spawn(async move {
+                    let outcome = manager
+                        .refresh_under_lease(&server, &subject, &key, rejected)
+                        .await;
+                    manager
+                        .inflight
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&key);
+                    outcome
+                });
+                async move { task.await.unwrap_or(Err(UserOAuthFailure::Unavailable)) }
+                    .boxed()
+                    .shared()
+            })
+            .clone();
+        flight.await
+    }
+
+    /// One refresh per `(server, subject)` across gateways: the holder of the
+    /// lease refreshes, everyone else waits for the record to change.
+    async fn refresh_under_lease(
+        &self,
+        server: &UserOAuthServer,
+        subject: &UserSubject,
+        key: &str,
+        rejected: Option<String>,
+    ) -> Result<String, UserOAuthFailure> {
+        let labels = BTreeMap::from([("mcp_server_id", server.id.as_str())]);
+        let lease = self
+            .store
+            .put(
+                NS_LEASE,
+                key,
+                b"1".to_vec(),
+                LEASE_TTL,
+                &labels,
+                PutCondition::CreateOnly,
+            )
+            .await;
+        let lease = match lease {
+            Ok(version) => version,
+            Err(StoreError::PreconditionFailed) => {
+                return self
+                    .wait_for_refresh(server, key, rejected.as_deref())
+                    .await;
+            }
+            Err(_) => return Err(UserOAuthFailure::Unavailable),
+        };
+        let outcome = self
+            .refresh_holding_lease(server, subject, key, rejected.as_deref())
+            .await;
+        // Expires on its own if this fails.
+        let _ = self.store.delete(NS_LEASE, key, Some(lease)).await;
+        outcome
+    }
+
+    async fn wait_for_refresh(
+        &self,
+        server: &UserOAuthServer,
+        key: &str,
+        rejected: Option<&str>,
+    ) -> Result<String, UserOAuthFailure> {
+        let deadline = Instant::now() + server.timeout;
+        loop {
+            let stored = self
+                .store
+                .get(NS_TOKEN, key)
+                .await
+                .map_err(|_| UserOAuthFailure::Unavailable)?;
+            let Some(record) = stored.as_ref().and_then(decode_token) else {
+                self.evict(key);
+                return Err(UserOAuthFailure::AuthorizationRequired);
+            };
+            // A proactive refresh leaves the old token good for now, so only
+            // an expired one or a rejected one is worth waiting to replace.
+            let settled = match rejected {
+                Some(rejected) => record.access_token != rejected,
+                None => !record.expired(unix_now()),
+            };
+            if settled {
+                return Ok(record.access_token);
+            }
+            if Instant::now() + LEASE_POLL >= deadline {
+                return Err(UserOAuthFailure::Unavailable);
+            }
+            tokio::time::sleep(LEASE_POLL).await;
+        }
+    }
+
+    async fn refresh_holding_lease(
+        &self,
+        server: &UserOAuthServer,
+        subject: &UserSubject,
+        key: &str,
+        rejected: Option<&str>,
+    ) -> Result<String, UserOAuthFailure> {
+        let stored = self
+            .store
+            .get(NS_TOKEN, key)
+            .await
+            .map_err(|_| UserOAuthFailure::Unavailable)?;
+        let Some(stored) = stored else {
+            self.evict(key);
+            return Err(UserOAuthFailure::AuthorizationRequired);
+        };
+        let Some(record) = decode_token(&stored) else {
+            self.evict(key);
+            return Err(UserOAuthFailure::AuthorizationRequired);
+        };
+        let now = unix_now();
+        // Someone else's refresh may have landed before this lease was taken.
+        let needed = match rejected {
+            Some(rejected) => record.access_token == rejected,
+            None => record.needs_refresh(now),
+        };
+        if !needed {
+            self.remember(key, &record);
+            return Ok(record.access_token);
+        }
+        // Past this point a proactive refresh can fall back on the token it
+        // was replacing, for what is left of its life.
+        let fallback =
+            (rejected.is_none() && !record.expired(now)).then(|| record.access_token.clone());
+
+        let Some(refresh_token) = record.refresh_token.clone() else {
+            if let Some(token) = fallback {
+                return Ok(token);
+            }
+            self.evict(key);
+            self.delete_record(server, key, Some(stored.version)).await;
+            return Err(UserOAuthFailure::AuthorizationRequired);
+        };
+        let token_endpoint = match self.discovery.token_endpoint(server).await {
+            Ok(url) => url,
+            Err(failure) => return fallback.ok_or(failure),
+        };
+        let mut form = vec![
+            ("grant_type", "refresh_token".to_owned()),
+            ("refresh_token", refresh_token.clone()),
+        ];
+        if let Some(resource) = &record.resource {
+            form.push(("resource", resource.clone()));
+        }
+        flow::add_client(&mut form, server, record.registered_client.as_ref());
+        let issued = match flow::token_request(server, &token_endpoint, &form).await {
+            flow::TokenOutcome::Issued(issued) => issued,
+            flow::TokenOutcome::Rejected(code)
+                if DEFINITIVE_REFRESH_ERRORS.contains(&code.as_str()) =>
+            {
+                tracing::info!(target: "aisix::mcp_oauth", server = %server.name, error = %code,
+                    "the upstream refused a user's refresh token; the user must sign in again");
+                self.evict(key);
+                self.delete_record(server, key, Some(stored.version)).await;
+                return Err(UserOAuthFailure::AuthorizationRequired);
+            }
+            flow::TokenOutcome::Rejected(code) => {
+                tracing::warn!(target: "aisix::mcp_oauth", server = %server.name, error = %code,
+                    "the upstream refused a token refresh for a reason that says nothing about \
+                     the grant; keeping the stored token");
+                return fallback.ok_or(UserOAuthFailure::Unavailable);
+            }
+            flow::TokenOutcome::Transient => {
+                return fallback.ok_or(UserOAuthFailure::Unavailable);
+            }
+            flow::TokenOutcome::Blocked => {
+                return fallback.ok_or(UserOAuthFailure::Misconfigured);
+            }
+        };
+        let refreshed = TokenRecord {
+            access_token: issued.access_token,
+            // A token endpoint that does not rotate omits it.
+            refresh_token: issued.refresh_token.or(Some(refresh_token)),
+            expires_at: issued.expires_at,
+            resource: record.resource,
+            registered_client: record.registered_client,
+        };
+        let value = serde_json::to_vec(&refreshed).expect("token record serializes");
+        let label_values = TokenLabels::new(server, subject);
+        match self
+            .store
+            .put(
+                NS_TOKEN,
+                key,
+                value,
+                TOKEN_TTL,
+                &label_values.map(),
+                PutCondition::IfVersion(stored.version),
+            )
+            .await
+        {
+            Ok(_) => {
+                self.remember(key, &refreshed);
+                Ok(refreshed.access_token)
+            }
+            // The record moved while this refresh ran: a disconnect, which
+            // must not be undone, or a new sign-in, which is newer than this.
+            Err(StoreError::PreconditionFailed) => {
+                self.evict(key);
+                let current = self
+                    .store
+                    .get(NS_TOKEN, key)
+                    .await
+                    .map_err(|_| UserOAuthFailure::Unavailable)?;
+                match current.as_ref().and_then(decode_token) {
+                    Some(current) => {
+                        self.remember(key, &current);
+                        Ok(current.access_token)
+                    }
+                    None => Err(UserOAuthFailure::AuthorizationRequired),
+                }
+            }
+            // The upstream has already moved on, so this token is the only
+            // working copy. If it rotated the refresh token, the stored one
+            // is dead and the next refresh will send the user to sign in.
+            Err(error) => {
+                tracing::warn!(target: "aisix::mcp_oauth", server = %server.name, %error,
+                    "could not store a user's refreshed MCP token");
+                self.remember(key, &refreshed);
+                Ok(refreshed.access_token)
+            }
+        }
+    }
+}
+
+fn decode_token(stored: &crate::shared_store::StoredValue) -> Option<TokenRecord> {
+    serde_json::from_slice(&stored.value).ok()
+}
+
+/// The labels of a token record, owned here so the borrowed map outlives the
+/// call that takes it.
+struct TokenLabels<'a> {
+    server_id: &'a str,
+    subject: &'a UserSubject,
+}
+
+impl<'a> TokenLabels<'a> {
+    fn new(server: &'a UserOAuthServer, subject: &'a UserSubject) -> Self {
+        Self {
+            server_id: &server.id,
+            subject,
+        }
+    }
+
+    fn map(&self) -> BTreeMap<&str, &str> {
+        let mut labels = BTreeMap::from([
+            ("mcp_server_id", self.server_id),
+            ("subject", self.subject.id()),
+        ]);
+        if let Some(member) = &self.subject.member_id {
+            labels.insert("member_id", member);
+        }
+        labels
+    }
+}

@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use aisix_core::{McpAuthType, McpServer};
 use async_trait::async_trait;
+use futures::future::{BoxFuture, FutureExt};
 use http::{HeaderName, HeaderValue};
 use rmcp::model::{CallToolRequestParams, CallToolResponse, ClientInfo, ProtocolVersion};
 use rmcp::service::{ClientInitializeError, RoleClient, RunningService};
@@ -29,6 +30,7 @@ use rmcp::{ClientLifecycleMode, ClientServiceExt};
 
 use crate::error::McpError;
 use crate::token_exchange::{SubjectToken, TokenExchangeAuth, TokenExchangeConfig};
+use crate::user_oauth::{UserOAuthManager, UserOAuthServer, UserSubject};
 
 /// Default deadline for a single upstream operation (connect / list / call).
 /// rmcp's high-level client sets no request timeout and reqwest has no default
@@ -181,6 +183,41 @@ pub enum McpAuth {
     /// send it as `Authorization: Bearer <access_token>` (see
     /// [`crate::token_exchange`]).
     TokenExchange(TokenExchangeAuth),
+    /// Send the access token the caller obtained by signing in to this server
+    /// as `Authorization: Bearer <access_token>` (see [`crate::user_oauth`]).
+    UserOAuth(UserOAuthAuth),
+}
+
+/// The per-request halves of [`McpAuth::UserOAuth`].
+#[derive(Clone)]
+pub struct UserOAuthAuth {
+    pub(crate) server: UserOAuthServer,
+    pub(crate) caller: Option<UserOAuthCaller>,
+}
+
+/// What a request contributes to [`McpAuth::UserOAuth`]: where tokens are
+/// kept, and whose to use. A caller the gateway could not name a user for has
+/// no `subject`.
+#[derive(Clone)]
+pub struct UserOAuthCaller {
+    pub manager: Arc<UserOAuthManager>,
+    pub subject: Option<UserSubject>,
+}
+
+impl UserOAuthAuth {
+    fn resolved(&self) -> Result<(&Arc<UserOAuthManager>, &UserSubject), McpError> {
+        let caller = self.caller.as_ref();
+        let subject = caller.and_then(|c| c.subject.as_ref());
+        match (caller, subject) {
+            (Some(caller), Some(subject)) => Ok((&caller.manager, subject)),
+            _ => Err(crate::error::UserOAuthFailure::NoSubject.into()),
+        }
+    }
+
+    pub(crate) async fn token(&self) -> Result<String, McpError> {
+        let (manager, subject) = self.resolved()?;
+        Ok(manager.access_token(&self.server, subject).await?)
+    }
 }
 
 /// The calling agent's own credentials, resolved per request by the proxy,
@@ -196,6 +233,9 @@ pub struct CallerCredentials {
     /// this request — the only token an `oauth2_token_exchange` server
     /// exchanges.
     pub subject_token: Option<Arc<str>>,
+    /// The token store and the signed-in user an
+    /// `oauth2_authorization_code` server is called as.
+    pub user_oauth: Option<UserOAuthCaller>,
 }
 
 impl std::fmt::Debug for CallerCredentials {
@@ -211,6 +251,14 @@ impl std::fmt::Debug for CallerCredentials {
             .field(
                 "subject_token",
                 &self.subject_token.as_ref().map(|_| "***redacted***"),
+            )
+            .field(
+                "user_oauth_subject",
+                &self
+                    .user_oauth
+                    .as_ref()
+                    .and_then(|c| c.subject.as_ref())
+                    .map(UserSubject::id),
             )
             .finish()
     }
@@ -260,6 +308,9 @@ impl std::fmt::Debug for McpAuth {
                 .field(&value.as_ref().map(|_| "***redacted***"))
                 .finish(),
             McpAuth::TokenExchange(auth) => f.debug_tuple("TokenExchange").field(auth).finish(),
+            McpAuth::UserOAuth(auth) => {
+                f.debug_tuple("UserOAuth").field(&auth.server.name).finish()
+            }
         }
     }
 }
@@ -386,6 +437,7 @@ impl McpUpstream {
             McpAuth::TokenExchange(auth) => {
                 auth.subject = caller.subject_token.clone().map(SubjectToken);
             }
+            McpAuth::UserOAuth(auth) => auth.caller = caller.user_oauth.clone(),
             _ => {}
         }
         self
@@ -585,6 +637,13 @@ impl RmcpBridge {
                     auth_header = Some(auth.token(deadline).await?);
                 }
             }
+            McpAuth::UserOAuth(auth) => {
+                auth_header = Some(
+                    tokio::time::timeout_at(deadline, auth.token())
+                        .await
+                        .map_err(|_| connect_timed_out())??,
+                );
+            }
         }
         for (name, value) in forwarded {
             custom.insert(name.clone(), value.clone());
@@ -731,6 +790,21 @@ fn init_error_is_unauthorized(error: &ClientInitializeError) -> bool {
     let ClientInitializeError::TransportError { error, .. } = error else {
         return false;
     };
+    transport_error_is_unauthorized(error)
+}
+
+fn request_error(error: rmcp::ServiceError) -> McpError {
+    match &error {
+        rmcp::ServiceError::TransportSend(transport)
+            if transport_error_is_unauthorized(transport) =>
+        {
+            McpError::Unauthorized(error.to_string())
+        }
+        _ => McpError::Request(error.to_string()),
+    }
+}
+
+fn transport_error_is_unauthorized(error: &rmcp::transport::DynamicTransportError) -> bool {
     match error
         .error
         .downcast_ref::<StreamableHttpError<rmcp_reqwest::Error>>()
@@ -751,7 +825,7 @@ impl McpBridge for RmcpBridge {
         let result = tokio::time::timeout(self.timeout, self.running.list_tools(None))
             .await
             .map_err(|_| McpError::Request("upstream tools/list timed out".to_string()))?
-            .map_err(|e| McpError::Request(e.to_string()))?;
+            .map_err(request_error)?;
         Ok(result.tools.into_iter().map(into_mcp_tool).collect())
     }
 
@@ -781,7 +855,7 @@ impl McpBridge for RmcpBridge {
         let response = tokio::time::timeout(self.timeout, self.running.call_tool_once(params))
             .await
             .map_err(|_| McpError::Request("upstream tools/call timed out".to_string()))?
-            .map_err(|e| McpError::Request(e.to_string()))?;
+            .map_err(request_error)?;
         let result = match response {
             CallToolResponse::Complete(result) => result,
             CallToolResponse::InputRequired(_) => {
@@ -879,6 +953,9 @@ pub(crate) fn cleartext_findings(server: &McpServer) -> Vec<(&'static str, Strin
                 token_url.to_string(),
             ));
         }
+        McpAuthType::OAuth2AuthorizationCode if is_cleartext(token_url) => {
+            findings.push(("the users' upstream OAuth tokens", token_url.to_string()));
+        }
         _ => {}
     }
     findings
@@ -960,6 +1037,12 @@ pub fn upstream_from_mcp_server(server: &McpServer) -> McpUpstream {
             config: token_exchange_config(server),
             subject: None,
         }),
+        // The stored server id and the caller are filled per request
+        // (`McpGateway`'s `bridge_for`).
+        McpAuthType::OAuth2AuthorizationCode => McpAuth::UserOAuth(UserOAuthAuth {
+            server: UserOAuthServer::new("", server),
+            caller: None,
+        }),
     };
     let timeout = server
         .timeout_ms
@@ -1020,6 +1103,13 @@ impl EphemeralBridge {
 #[async_trait]
 impl McpBridge for EphemeralBridge {
     async fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
+        if let McpAuth::UserOAuth(auth) = &self.upstream.auth {
+            return self
+                .as_signed_in_user(auth, |bridge| {
+                    async move { bridge.list_tools().await }.boxed()
+                })
+                .await;
+        }
         RmcpBridge::connect(&self.upstream)
             .await?
             .list_tools()
@@ -1031,6 +1121,14 @@ impl McpBridge for EphemeralBridge {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<McpToolResult, McpError> {
+        if let McpAuth::UserOAuth(auth) = &self.upstream.auth {
+            return self
+                .as_signed_in_user(auth, |bridge| {
+                    let arguments = arguments.clone();
+                    async move { bridge.call_tool(name, arguments).await }.boxed()
+                })
+                .await;
+        }
         RmcpBridge::connect(&self.upstream)
             .await?
             .call_tool(name, arguments)
@@ -1048,7 +1146,65 @@ impl McpBridge for EphemeralBridge {
                 .token(tokio::time::Instant::now() + self.upstream.timeout)
                 .await
                 .map(drop),
+            McpAuth::UserOAuth(auth) => auth.token().await.map(drop),
             _ => Ok(()),
+        }
+    }
+}
+
+impl EphemeralBridge {
+    /// Run `operation` with the caller's token. A `401` on an apparently
+    /// valid token earns one forced refresh and one more try; that one being
+    /// refused as well means the token endpoint and the server disagree, and
+    /// only a new sign-in can settle it.
+    ///
+    /// The retry cannot repeat a tool's side effects: a server that answered
+    /// `401` did not run it.
+    async fn as_signed_in_user<'a, T>(
+        &'a self,
+        auth: &'a UserOAuthAuth,
+        operation: impl Fn(RmcpBridge) -> BoxFuture<'a, Result<T, McpError>>,
+    ) -> Result<T, McpError> {
+        let (manager, subject) = auth.resolved()?;
+        let token = auth.token().await?;
+        let attempt = |token: String| {
+            let upstream = McpUpstream {
+                auth: McpAuth::Bearer(token),
+                ..self.upstream.clone()
+            };
+            let operation = &operation;
+            async move {
+                let bridge = RmcpBridge::connect_once(&upstream).await?;
+                operation(bridge).await.map_err(|error| match error {
+                    McpError::Unauthorized(_) => ConnectFailure::Unauthorized(error),
+                    other => ConnectFailure::Other(other),
+                })
+            }
+        };
+        let after_contact = |failure| {
+            McpError::UserOAuth(crate::error::UserOAuthError {
+                failure,
+                reached_upstream: true,
+            })
+        };
+        match attempt(token.clone()).await {
+            Err(ConnectFailure::Unauthorized(_)) => {}
+            other => return other.map_err(ConnectFailure::into_error),
+        }
+        let fresh = manager
+            .refresh_rejected(&auth.server, subject, &token)
+            .await
+            .map_err(after_contact)?;
+        match attempt(fresh.clone()).await {
+            Err(ConnectFailure::Unauthorized(_)) => {
+                manager
+                    .discard_rejected(&auth.server, subject, &fresh)
+                    .await;
+                Err(after_contact(
+                    crate::error::UserOAuthFailure::AuthorizationRequired,
+                ))
+            }
+            other => other.map_err(ConnectFailure::into_error),
         }
     }
 }
@@ -1164,6 +1320,7 @@ mod tests {
         let caller = CallerCredentials {
             delegated_authorization: Some(HeaderValue::from_static("Bearer user-LEAK")),
             subject_token: Some("jwt-LEAK".into()),
+            user_oauth: None,
         };
         let rendered = format!(
             "{oauth:?} {:?} {:?} {upstream:?} {exchange:?} {caller:?} {:?}",
