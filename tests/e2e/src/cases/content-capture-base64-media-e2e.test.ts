@@ -137,7 +137,7 @@ const ENTRIES: Entry[] = [
   { name: "responses bridged", path: "/v1/responses", model: "cap-bridged", body: responsesBody("cap-bridged"), bytes: uriBytes },
 ];
 
-describe("base64 images under content_mode full", () => {
+describe("base64 media under content_mode full", () => {
   let app: SpawnedApp | undefined;
   let upstream: Server | undefined;
   let sls: MockSls | undefined;
@@ -489,11 +489,11 @@ describe("base64 images under content_mode full", () => {
     });
 
     test.each([
-      ["stream", SMALL, { describe: "a cat", stream: true }],
-      ["stream-oversized", OVERSIZED, { describe: "a cat", stream: true }],
+      { name: "small frame", suffix: "stream", payload: SMALL, body: { describe: "a cat", stream: true } },
+      { name: "oversized frame", suffix: "stream-oversized", payload: OVERSIZED, body: { describe: "a cat", stream: true } },
       // The same frame on a route that reads the stream as a known protocol.
-      ["stream-oversized", OVERSIZED, { prompt: "a cat", stream: true }],
-    ])("a streamed image answer is omitted: %s %j", async (suffix, payload, body) => {
+      { name: "oversized frame, known protocol", suffix: "stream-oversized", payload: OVERSIZED, body: { prompt: "a cat", stream: true } },
+    ])("a streamed image answer is omitted: $name", async ({ suffix, payload, body }) => {
       if (!etcdReachable || !app) return;
       const res = await route(suffix, body);
       const answer = await res.text();
