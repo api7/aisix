@@ -553,8 +553,12 @@ describe("per-user OAuth to an upstream MCP server", () => {
     expect(await whoami(client)).toBe("alice");
     await client.close();
 
-    await stack.seed.update("mcp_servers", id, row(moved));
-    await waitConfigPropagation(async () => (await mcpPost(url("moving"), key(ALICE))).status === 401);
+    // The scope is only there to say when the moved row has landed.
+    await stack.seed.update("mcp_servers", id, { ...row(moved), scopes: ["moved"] });
+    await waitConfigPropagation(async () => {
+      const document = await fetch(`${stack.base}/.well-known/oauth-protected-resource/mcp/moving`);
+      return ((await document.json()) as { scopes_supported?: string[] }).scopes_supported?.[0] === "moved";
+    });
     const res = await mcpPost(url("moving"), key(ALICE), { jsonrpc: "2.0", id: 2, method: "tools/list" });
     expect(res.status).toBe(401);
     expect(moved.mcpAuthorizations).toEqual([]);
