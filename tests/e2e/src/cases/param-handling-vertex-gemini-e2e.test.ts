@@ -1661,6 +1661,7 @@ describe("Vertex Gemini: generated images on chat completions", () => {
     expect(held.text).not.toContain("event: error");
     expect(held.text).not.toContain(MARKER);
     expect(held.text).toContain(answer);
+    expect(held.text).toContain(path === "/v1/messages" ? "message_stop" : "response.completed");
   });
 
   test("images from an OpenAI-compatible upstream pass through chat unchanged", async (ctx) => {
