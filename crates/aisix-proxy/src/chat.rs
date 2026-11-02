@@ -4933,25 +4933,6 @@ fn emit_usage_event(
 /// can prevent the stored value from corrupting downstream logs.
 ///
 /// PR #382 audit MEDIUM-3.
-/// The request as an exporter's captured prompt. The generated `images` an
-/// assistant turn replays never reach an exporter: a short placeholder stands
-/// in for the base64.
-pub(crate) fn captured_request_json(req: &ChatFormat) -> String {
-    let has_images = |m: &aisix_gateway::ChatMessage| m.extra.contains_key("images");
-    if !req.messages.iter().any(has_images) {
-        return serde_json::to_string(req).unwrap_or_default();
-    }
-    let mut req = req.clone();
-    for images in req
-        .messages
-        .iter_mut()
-        .filter_map(|m| m.extra.get_mut("images"))
-    {
-        *images = "[images omitted]".into();
-    }
-    serde_json::to_string(&req).unwrap_or_default()
-}
-
 /// The structured output parts of a buffered chat answer, read the way the
 /// caller receives it (`aisix_obs::output`).
 pub(crate) fn chat_message_output(
@@ -4987,6 +4968,25 @@ pub(crate) fn sanitize_tag(s: String) -> String {
         return s;
     }
     s.chars().filter(|c| !c.is_control()).take(256).collect()
+}
+
+/// The request as an exporter's captured prompt. The generated `images` an
+/// assistant turn replays never reach an exporter: a short placeholder stands
+/// in for the base64.
+pub(crate) fn captured_request_json(req: &ChatFormat) -> String {
+    let has_images = |m: &aisix_gateway::ChatMessage| m.extra.contains_key("images");
+    if !req.messages.iter().any(has_images) {
+        return serde_json::to_string(req).unwrap_or_default();
+    }
+    let mut req = req.clone();
+    for images in req
+        .messages
+        .iter_mut()
+        .filter_map(|m| m.extra.get_mut("images"))
+    {
+        *images = "[images omitted]".into();
+    }
+    serde_json::to_string(&req).unwrap_or_default()
 }
 
 /// Provider-detail bundle for `emit_usage_event`. Grouped here so the
