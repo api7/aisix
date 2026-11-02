@@ -48,9 +48,11 @@ pub(crate) struct DiscoveryIdentity {
     /// The canonical `/mcp` resource URI, published verbatim as the PRM
     /// `resource` (never derived from the request Host header).
     pub resource_url: String,
-    /// Absolute URL of the path-insertion PRM endpoint, carried in
-    /// every challenge's `resource_metadata` attribute. Derived from
-    /// `resource_url`'s origin, never from the request.
+    /// Absolute URL of the PRM endpoint, carried in every challenge's
+    /// `resource_metadata` attribute. Derived from `resource_url`'s origin
+    /// and any path prefix in front of its `/mcp`, never from the request:
+    /// the prefix belongs to a front gateway that strips it before the
+    /// request gets here, so the document has to be fetched under it too.
     pub challenge_url: String,
 }
 
@@ -59,7 +61,7 @@ pub(crate) struct DiscoveryIdentity {
 /// provider, or a malformed row).
 ///
 /// A malformed row (unparseable URL, non-http(s) scheme, query or
-/// fragment, path ≠ `/mcp`) and a duplicated singleton both keep the
+/// fragment, path not ending in `/mcp`) and a duplicated singleton both keep the
 /// surface dormant and log one process-wide warning — never per
 /// request. The absent-row state is a legitimate steady state (every
 /// pre-#1143 environment) and logs nothing.
@@ -75,8 +77,8 @@ pub(crate) fn discovery_identity(snapshot: &AisixSnapshot) -> Option<DiscoveryId
         MALFORMED_WARN.call_once(|| {
             tracing::warn!(
                 target: "aisix::mcp_auth",
-                "mcp_auth_settings.resource_url is not an absolute http(s) URL with path \
-                 exactly /mcp and no query or fragment; the OAuth discovery surface \
+                "mcp_auth_settings.resource_url is not an absolute http(s) URL with a path \
+                 ending in /mcp and no query or fragment; the OAuth discovery surface \
                  stays dormant",
             );
         });
@@ -242,9 +244,9 @@ pub(crate) struct AnonymousEntry {
 }
 
 /// Parse and validate the configured resource URL: absolute `http`/
-/// `https`, no query, no fragment, path exactly `/mcp` (the gateway's
-/// fixed MCP route — the CP rejects anything else at write time; this
-/// is defense in depth on the projected row).
+/// `https`, no query, no fragment, path ending in `/mcp` at a segment
+/// boundary. Whatever precedes it is the prefix of a front gateway that
+/// strips it, so the gateway itself still serves its fixed MCP route.
 fn validate_resource_url(resource_url: &str) -> Option<DiscoveryIdentity> {
     let parsed = url::Url::parse(resource_url).ok()?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -253,16 +255,14 @@ fn validate_resource_url(resource_url: &str) -> Option<DiscoveryIdentity> {
     if parsed.query().is_some() || parsed.fragment().is_some() {
         return None;
     }
-    if parsed.path() != "/mcp" {
-        return None;
-    }
+    let prefix = parsed.path().strip_suffix("/mcp")?;
     // `Origin::ascii_serialization` renders `scheme://host[:port]` with
     // default ports elided — exactly the base the well-known routes are
     // reachable under.
     let origin = parsed.origin().ascii_serialization();
     Some(DiscoveryIdentity {
         resource_url: resource_url.to_string(),
-        challenge_url: format!("{origin}/.well-known/oauth-protected-resource/mcp"),
+        challenge_url: format!("{origin}{prefix}/.well-known/oauth-protected-resource/mcp"),
     })
 }
 
@@ -534,6 +534,12 @@ mod tests {
             "https://gw.example.com/mcp?x=1",
             "https://gw.example.com/mcp#frag",
             "https://gw.example.com/",
+            "https://gw.example.com/foo-mcp",
+            "https://gw.example.com/aisix/foo-mcp",
+            "https://gw.example.com/mcp/",
+            "https://gw.example.com/mcp/x",
+            "https://gw.example.com/aisix/mcp/",
+            "https://gw.example.com/MCP",
         ] {
             let snap = AisixSnapshot::new();
             snap.mcp_auth_settings.insert(settings_entry("env-1", bad));
@@ -553,6 +559,28 @@ mod tests {
             identity.challenge_url,
             "https://gw.example.com/.well-known/oauth-protected-resource/mcp"
         );
+    }
+
+    #[test]
+    fn a_path_prefix_in_front_of_mcp_moves_the_challenge_url_under_it() {
+        for (resource_url, challenge_url) in [
+            (
+                "https://gw.example.com/aisix/mcp",
+                "https://gw.example.com/aisix/.well-known/oauth-protected-resource/mcp",
+            ),
+            (
+                "https://gw.example.com/a/b/mcp",
+                "https://gw.example.com/a/b/.well-known/oauth-protected-resource/mcp",
+            ),
+            (
+                "http://gw.internal:8443/aisix/mcp",
+                "http://gw.internal:8443/aisix/.well-known/oauth-protected-resource/mcp",
+            ),
+        ] {
+            let identity = validate_resource_url(resource_url).expect(resource_url);
+            assert_eq!(identity.resource_url, resource_url);
+            assert_eq!(identity.challenge_url, challenge_url);
+        }
     }
 
     #[test]
