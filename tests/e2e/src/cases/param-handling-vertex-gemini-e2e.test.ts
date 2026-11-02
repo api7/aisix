@@ -1526,54 +1526,48 @@ describe("Vertex Gemini: generated images on chat completions", () => {
 
     test("no exporter, log or event receives image data", async (ctx) => {
       if (!ready(ctx)) return;
-      const prompt = `capture-prompt-${++unique}`;
+      const tag = `capture-${++unique}`;
       const answer = `capture-answer-${unique}`;
       const from = sls!.requests.length;
-      useAnswer([{ text: answer }, inline(IMAGE_A)]);
-      // Past the capture cap unless the image is taken out of the captured
-      // request, which is what makes an exporter fall back to the raw JSON.
-      const replayed = { role: "assistant", content: "before", images: [entry(image("replay", 128 * 1024), 0)] };
-      const history = (last: string) => [{ role: "user", content: "draw" }, replayed, { role: "user", content: last }];
+      // A prompt over the capture cap is exported as the raw request JSON, cut
+      // down string by string. An image this small survives that cut, so only
+      // taking it out of the captured request keeps it from the exporter.
+      const padding = "x".repeat(256 * 1024);
+      const history = (name: string) => [
+        { role: "user", content: "draw" },
+        { role: "assistant", content: "before", images: [entry(IMAGE_B, 0)] },
+        { role: "user", content: `${tag}-${name} ${padding}` },
+      ];
+      const rows = (name: string) =>
+        slsLogsFor(sls!, LOGSTORE, from).filter((l) => (l.get("prompt") ?? "").includes(`${tag}-${name}`));
 
-      await chat({ model: "img", messages: history(prompt) });
-      await chatStream({ model: "img", messages: history(`${prompt}-s`) });
-      // Too long to structure, so this one is exported as the raw request JSON.
-      const long = `${prompt}-long ${"x".repeat(128 * 1024)}`;
-      await chat({ model: "img", messages: history(long) });
-      // A cache hit and the failure path capture the request too.
-      const cachedAnswer = [{ text: answer }];
-      useAnswer(cachedAnswer);
-      const cacheFirst = await post("/v1/chat/completions", { model: "img", messages: history(`${prompt}-hit`) });
-      const cacheHit = await post("/v1/chat/completions", { model: "img", messages: history(`${prompt}-hit`) });
-      expect(cacheFirst.status).toBe(200);
-      expect(cacheHit.headers.get("x-aisix-cache")).toBe("hit");
-      useAnswer([]);
+      useAnswer([{ text: answer }, inline(IMAGE_A)]);
+      await chat({ model: "img", messages: history("whole") });
+      await chatStream({ model: "img", messages: history("stream") });
+
+      useAnswer([{ text: answer }]);
+      await chat({ model: "img", messages: history("hit") });
+      const hit = await post("/v1/chat/completions", { model: "img", messages: history("hit") });
+      expect(hit.headers.get("x-aisix-cache")).toBe("hit");
+
       const failed = await post("/v1/chat/completions", {
         model: "img",
-        messages: history(`${prompt}-bad`),
+        messages: history("failed"),
         tools: [{ type: "web_search" }],
       });
       expect(failed.status).toBe(400);
 
-      await capturedRow(prompt);
-      await capturedRow(`${prompt}-s`);
-      await capturedRow(`${prompt}-long`);
-      await expect
-        .poll(() => slsLogsFor(sls!, LOGSTORE, from).filter((l) => capturedInput(l).includes(`${prompt}-hit`)).length, {
-          timeout: 10_000,
-        })
-        .toBe(2);
-      await expect
-        .poll(() => slsLogsFor(sls!, LOGSTORE, from).filter((l) => capturedInput(l).includes(`${prompt}-bad`)).length, {
-          timeout: 10_000,
-        })
-        .toBeGreaterThan(0);
-      await expect.poll(() => decodedTextFor(sls!, LOGSTORE, from), { timeout: 10_000 }).toContain(answer);
+      for (const [name, count] of [["whole", 1], ["stream", 1], ["hit", 2], ["failed", 1]] as const) {
+        await expect.poll(() => rows(name).length, { timeout: 10_000, message: name }).toBeGreaterThanOrEqual(count);
+        for (const row of rows(name)) {
+          expect(row.get("prompt"), name).toContain("[images omitted]");
+        }
+      }
       const captured = decodedTextFor(sls!, LOGSTORE, from);
-      expect(captured).toContain("[images omitted]");
+      expect(captured).toContain(answer);
       expect(captured.includes(MARKER)).toBe(false);
 
-      await expect.poll(() => JSON.stringify(otlp!.spans).includes(prompt), { timeout: 10_000 }).toBe(true);
+      await expect.poll(() => JSON.stringify(otlp!.spans).includes(`${tag}-failed`), { timeout: 10_000 }).toBe(true);
       expect(JSON.stringify(otlp!.spans).includes(MARKER)).toBe(false);
       expect(app!.output().includes(MARKER)).toBe(false);
     });
