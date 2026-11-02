@@ -153,7 +153,8 @@ describe("per-user OAuth to an upstream MCP server", () => {
 
   /** `caller` is signed in to `server` as `user`, whatever ran before. */
   const signedIn = async (target: OAuthMcpUpstream, server: string, caller: string, user: string) => {
-    await fetch(`${url(server)}/oauth/credential`, { method: "DELETE", headers: key(caller) });
+    const reset = await fetch(`${url(server)}/oauth/credential`, { method: "DELETE", headers: key(caller) });
+    expect(reset.status).toBe(204);
     target.user = user;
     const { client } = await signIn(url(server), key(caller));
     await client.close();
@@ -343,7 +344,8 @@ describe("per-user OAuth to an upstream MCP server", () => {
   test("another client of the same user needs no sign-in, and another user does", async () => {
     if (!etcdReachable) return;
     await signedIn(main, "main", ALICE, "alice");
-    await fetch(`${url("main")}/oauth/credential`, { method: "DELETE", headers: key(BOB) });
+    const bobReset = await fetch(`${url("main")}/oauth/credential`, { method: "DELETE", headers: key(BOB) });
+    expect(bobReset.status).toBe(204);
     // Same member, another key, no OAuth configured at all.
     const { client } = await connect(url("main"), key(ALICE2));
     expect(await whoami(client)).toBe("alice");
