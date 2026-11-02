@@ -143,8 +143,8 @@ const ROUTES: Route[] = [
     send: (u, model) => transcribe(u, model, false),
   },
 ];
-// A transcription stream forwards live under an enforcing row as well, so its
-// verdict is exercised through the monitor row alone.
+// An enforcing row sends a transcription stream down the buffered path, which
+// `transcription` covers; only a monitor row reaches its end-of-stream scan.
 const ENFORCED = ROUTES.filter((route) => route.name !== "transcription-stream");
 
 describe("output guardrails decide a response with no text", () => {
