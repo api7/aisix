@@ -192,7 +192,9 @@ fn base64_omitted(original_bytes: usize) -> String {
 /// beside a mime type; `source.bytes` of an `image` / `document` / `video` / `audio`
 /// object;
 /// a replayed `image_generation_call`'s `result`; and the image APIs' `b64_json`,
-/// `partial_image_b64` and `bytesBase64Encoded`.
+/// `partial_image_b64` and `bytesBase64Encoded`; and an MCP content block's
+/// `data` on an `image` / `audio` block beside its `mimeType`, or `resource.blob`
+/// on an embedded `resource`.
 pub fn omit_base64_media(v: &mut Value) -> bool {
     match v {
         Value::String(s) => omit_data_uri(s),
@@ -201,6 +203,15 @@ pub fn omit_base64_media(v: &mut Value) -> bool {
             .fold(false, |changed, item| omit_base64_media(item) | changed),
         Value::Object(map) => {
             let mut changed = match map.get("type").and_then(Value::as_str) {
+                Some("image" | "audio")
+                    if map.contains_key("mimeType") && map.contains_key("data") =>
+                {
+                    map.get_mut("data").is_some_and(omit_bare_base64)
+                }
+                Some("resource") => map
+                    .get_mut("resource")
+                    .and_then(|resource| resource.get_mut("blob"))
+                    .is_some_and(omit_bare_base64),
                 Some("image" | "document") => {
                     let base64 = map
                         .get("source")
@@ -278,7 +289,7 @@ fn omit_bare_base64(v: &mut Value) -> bool {
 
 /// Text serialized content must contain, in any case, for [`omit_base64_media`]
 /// to find anything, so content with no media is not parsed on the request path.
-const MEDIA_NEEDLES: [&str; 10] = [
+const MEDIA_NEEDLES: [&str; 12] = [
     // Any JSON escape can spell the rest, so that text has to be parsed.
     "\\u",
     "base64",
@@ -290,6 +301,8 @@ const MEDIA_NEEDLES: [&str; 10] = [
     "inlineData",
     "inline_data",
     "image_generation_call",
+    "\"mimeType\"",
+    "\"blob\"",
 ];
 
 /// What marks media in JSON that does not parse, such as a stream frame cut
@@ -502,6 +515,9 @@ mod tests {
             {"image": {"format": "png", "source": {"bytes": "QUJD"}}},
             {"b64_json": "QUJD", "revised_prompt": "a cat"},
             {"url": "data:image/png;BASE64,QUJD"},
+            {"type": "image", "data": "QUJD", "mimeType": "image/png"},
+            {"type": "audio", "data": "QUJD", "mimeType": "audio/wav"},
+            {"type": "resource", "resource": {"uri": "file:///a", "blob": "QUJD"}},
         ]});
         assert!(omit_base64_media(&mut v));
         let once = v.clone();
@@ -551,6 +567,10 @@ mod tests {
             "e": {"data": "QUJDQUJDQUJDQUJDQUJD", "result": "QUJD"},
             "f": {"type": "tool_use", "input": {"file_data": "col1,col2", "source": {"bytes": "hi"}}},
             "g": {"args": {"source": {"type": "base64", "data": "plain text"}, "inlineData": {"data": "x"}}},
+            "h": {"type": "image", "data": "QUJD"},
+            "i": {"type": "text", "data": "QUJD", "mimeType": "text/plain"},
+            "j": {"type": "resource", "resource": {"uri": "file:///a", "text": "QUJD"}},
+            "k": {"blob": "QUJD"},
         });
         let before = v.clone();
         assert!(!omit_base64_media(&mut v));
@@ -625,6 +645,8 @@ mod tests {
             r#"{"u": "data:image/png;BASE64,QUJD"}"#,
             r#"{"u": "data:image/png;ba\u0073e64,QUJD"}"#,
             r#"{"\u0062\u0036\u0034_json": "QUJD"}"#,
+            r#"{"type": "image", "data": "QUJD", "mimeType": "image/png"}"#,
+            r#"{"type": "resource", "resource": {"blob": "QUJD"}}"#,
         ] {
             assert!(
                 omit_base64_media_in_json(s).contains("[aisix: base64 data uri omitted, "),
