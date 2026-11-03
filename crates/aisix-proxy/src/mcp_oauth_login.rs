@@ -610,8 +610,11 @@ async fn handle_login_callback(state: &ProxyState, request: Parts) -> Result<Res
             "refused a sign-in");
         refused(denial_text(reason))
     };
-    let principal =
-        session_principal(state, &snapshot, provider, &claims).map_err(|d| deny(d.reason))?;
+    // On what the session will hold, so a sign-in cannot pass and every later
+    // request fail on a claim the session does not keep.
+    let session_claims = crate::jwt::session_claims(&claims);
+    let principal = session_principal(state, &snapshot, provider, &session_claims)
+        .map_err(|d| deny(d.reason))?;
     let acl = aisix_mcp::ToolAcl::resolve(&snapshot, &state.mcp_servers, principal.auth.key());
     if !acl.may_reach_server(&oauth.name, &oauth.id) {
         return Err(deny("mcp_acl_denied"));
@@ -622,7 +625,7 @@ async fn handle_login_callback(state: &ProxyState, request: Parts) -> Result<Res
     let identity = SessionIdentity {
         provider: provider.name.clone(),
         identity: principal.subject,
-        claims: crate::jwt::session_claims(&claims),
+        claims: session_claims,
     };
     connect_upstream(state, &oauth, &base, &keys, flow, identity).await
 }
@@ -960,9 +963,9 @@ pub(crate) async fn authenticate_session(
     };
     // Before anything is read: a name that signs nobody in is no reason to
     // reach the store, and this is reachable with no credential at all.
-    if sign_in_server(&snapshot, server).is_none() {
+    let Some(oauth) = sign_in_server(&snapshot, server) else {
         return Err(refused("session_wrong_server"));
-    }
+    };
     let keys = match state.mcp_oauth.session_keys().await {
         Ok(Some(keys)) => keys,
         Ok(None) => return Err(refused("session_key_absent")),
@@ -977,7 +980,7 @@ pub(crate) async fn authenticate_session(
     let Some(session) = keys.open_access_token(token) else {
         return Err(refused("session_invalid"));
     };
-    if sign_in_server(&snapshot, server).is_none_or(|oauth| oauth.id != session.server) {
+    if oauth.id != session.server {
         return Err(refused("session_wrong_server"));
     }
     let Some(provider) = snapshot

@@ -55,6 +55,20 @@ fn client(route: Route) -> Result<&'static reqwest::Client, HttpFailure> {
     .map_err(|_| HttpFailure::Transport)
 }
 
+/// The client for what an operator chose, built as the JWKS one is.
+fn configured_client() -> Result<&'static reqwest::Client, HttpFailure> {
+    static CONFIGURED: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CONFIGURED
+        .get_or_init(|| {
+            aisix_gateway::client_builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|_| HttpFailure::Transport)
+}
+
 fn blocked(server: &str, url: &Url) -> HttpFailure {
     tracing::warn!(
         target: "aisix::mcp_oauth",
@@ -82,16 +96,14 @@ pub(super) async fn send(
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(HttpFailure::Blocked);
     }
-    let route = match gate {
-        // The ordinary client: no address check, and any environment proxy.
-        Gate::Configured => Route::Proxied,
+    let client = match gate {
+        Gate::Configured => configured_client()?,
         Gate::Ssrf => match ssrf::settings().route(&parsed).await {
-            Ok(route) => route,
+            Ok(route) => client(route)?,
             Err(Refusal::Unresolvable) => return Err(HttpFailure::Transport),
             Err(_) => return Err(blocked(server, &parsed)),
         },
     };
-    let client = client(route)?;
     match build(client, parsed.clone()).timeout(timeout).send().await {
         Ok(response) => Ok(response),
         Err(error) => match Refusal::from_error(&error) {

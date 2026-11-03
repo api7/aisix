@@ -1000,3 +1000,54 @@ describe("per-user OAuth with no public address", () => {
     expect((await fetch(`${stack.app.proxyUrl}/.well-known/oauth-protected-resource/mcp/main`)).status).toBe(404);
   });
 });
+
+describe("per-user OAuth under the SSRF settings", () => {
+  let app: SpawnedApp;
+  let main: OAuthMcpUpstream;
+  let elsewhere: OAuthMcpUpstream;
+  let etcdReachable = false;
+
+  beforeAll(async () => {
+    etcdReachable = await new EtcdClient().ping();
+    if (!etcdReachable) return;
+    app = await spawnApp();
+    elsewhere = await new OAuthMcpUpstream().start();
+    main = await new OAuthMcpUpstream({ advertise: { registrationEndpoint: `${elsewhere.url}/register` } }).start();
+    const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
+    await seed.update("mcp_servers", randomUUID(), {
+      name: "main",
+      type: "mcp",
+      url: main.mcpUrl,
+      auth_type: "oauth2_authorization_code",
+    });
+    await seed.update("mcp_auth_settings", randomUUID(), { resource_url: `${app.proxyUrl}/mcp` });
+    await seed.createApiKey({
+      key_hash: hash("sk-ssrf"),
+      allowed_models: [],
+      mcp_access: { allow: ["*"] },
+      user_id: "alice",
+    });
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app.proxyUrl}/v1/models`, { headers: { authorization: "Bearer sk-ssrf" } });
+      return res.status === 200;
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    await app?.exit();
+    await main?.close();
+    await elsewhere?.close();
+  });
+
+  test("an endpoint a document names on another private address is never contacted, and the client is told", async () => {
+    if (!etcdReachable) return;
+    const res = await fetch(authorizeUrl(`${app.proxyUrl}/mcp/main`), { redirect: "manual" });
+    expect(res.status).toBe(302);
+    const landed = new URL(res.headers.get("location")!);
+    expect(landed.origin).toBe(new URL(REDIRECT).origin);
+    expect(landed.searchParams.get("error")).toBe("server_error");
+    expect(elsewhere.requestsSeen).toHaveLength(0);
+    expect(main.requestsSeen).toContain("GET /.well-known/oauth-authorization-server");
+    expect(main.mcpAuthorizations).toHaveLength(0);
+  });
+});

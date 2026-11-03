@@ -145,7 +145,7 @@ impl UserOAuthServer {
         let origin = |url: &str| reqwest::Url::parse(url).ok().map(|url| url.origin());
         if self.token_url.as_deref() == Some(url)
             || self.registration_url.as_deref() == Some(url)
-            || (origin(url).is_some() && origin(url) == origin(&self.url))
+            || origin(url) == origin(&self.url)
         {
             http::Gate::Configured
         } else {

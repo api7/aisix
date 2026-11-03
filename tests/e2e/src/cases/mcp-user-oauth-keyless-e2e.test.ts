@@ -987,6 +987,22 @@ describe("keyless sessions follow the configuration on the next request", () => 
     expect(await listTools(tokens.access_token)).toContain("whoami");
   });
 
+  test("a claim about the token itself decides nothing, at sign-in as later", async () => {
+    if (!etcdReachable) return;
+    await seed.createClaimMapping({
+      name: "jti-rule",
+      jwt_provider: "corp",
+      priority: 10,
+      match: [{ claim: "jti", op: "exact", values: ["token-id"] }],
+      resolve: { api_key_id: (await ownKey("by-jti")).id },
+    });
+    await settled();
+    provider.claims = { ...claimsOf("uma", "nobody"), jti: "token-id" };
+    const stop = await new Browser().walk(authorizeUrl(url()));
+    expect(stop.kind).toBe("page");
+    if (stop.kind === "page") expect(stop.text).toMatch(/not mapped/);
+  });
+
   test("a disabled or expired key answers as it does to a JWT, and refresh is refused until it is back", async () => {
     if (!etcdReachable) return;
     provider.claims = claimsOf("omar", "lifecycle");
