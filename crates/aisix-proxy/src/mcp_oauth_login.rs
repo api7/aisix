@@ -647,6 +647,7 @@ async fn handle_login_callback(state: &ProxyState, request: Parts) -> Result<Res
     let subject = UserSubject::jwt(
         &provider.name,
         provider.issuer.as_deref(),
+        &provider.identity_claim,
         &principal.subject,
     );
     let identity = SessionIdentity {
@@ -694,7 +695,7 @@ async fn connect_upstream(
     identity: SessionIdentity,
     subject: &UserSubject,
 ) -> Result<Response, Response> {
-    match state.mcp_oauth.access_token(oauth, subject).await {
+    match state.mcp_oauth.stored_access_token(oauth, subject).await {
         Ok(_) => {
             return to_consent(
                 base,
@@ -843,10 +844,36 @@ async fn handle_callback(state: &ProxyState, request: Parts) -> Result<Response,
             ],
         ));
     };
+    // Likewise a claim that moved: this value is what the old claim said, and the
+    // new claim's record of that value is another person's. Without this the code
+    // the flow would go on to issue is refused at the token step anyway, by then
+    // with the credential stored.
+    if crate::jwt::identity_claim(&signed_in.claims, &provider.value)
+        != Some(signed_in.identity.as_str())
+    {
+        state
+            .metrics
+            .record_auth_decision("mcp_oauth_login", false, "session_identity_changed");
+        tracing::warn!(target: "aisix::mcp_oauth", server = %flow.server_name,
+            provider = %signed_in.provider,
+            "the identity claim changed during a sign-in; no upstream credential was stored");
+        return Ok(back_to_client(
+            &base,
+            &flow,
+            &[
+                ("error", "access_denied"),
+                (
+                    "error_description",
+                    "the identity claim changed during the sign-in",
+                ),
+            ],
+        ));
+    }
     let oauth = server_of(&snapshot, &flow).ok_or_else(misconfigured_page)?;
     let subject = UserSubject::jwt(
         &signed_in.provider,
         provider.value.issuer.as_deref(),
+        &provider.value.identity_claim,
         &signed_in.identity,
     );
     state
@@ -1005,6 +1032,7 @@ fn session_principal(
             identity.subject.clone(),
             provider.name.clone(),
             provider.issuer.clone(),
+            provider.identity_claim.clone(),
             identity.claim_mapping,
         ))),
         false,
@@ -1211,9 +1239,10 @@ pub(crate) async fn token(
             let subject = UserSubject::jwt(
                 &identity.provider,
                 provider.value.issuer.as_deref(),
+                &provider.value.identity_claim,
                 &identity.identity,
             );
-            if state.mcp_oauth.access_token(&oauth, &subject).await
+            if state.mcp_oauth.stored_access_token(&oauth, &subject).await
                 == Err(UserOAuthFailure::AuthorizationRequired)
             {
                 return invalid_grant();

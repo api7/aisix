@@ -129,6 +129,7 @@ pub(crate) fn caller_subject(auth: &AuthenticatedKey) -> Option<UserSubject> {
         return Some(UserSubject::jwt(
             &jwt.provider,
             jwt.issuer.as_deref(),
+            &jwt.identity_claim,
             &jwt.subject,
         ));
     }
