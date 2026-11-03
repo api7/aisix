@@ -16,6 +16,7 @@ path = "src/main.rs"
 aisix-core = { path = "../aisix-core" }
 aisix-etcd = { path = "../aisix-etcd" }
 aisix-gateway = { path = "../aisix-gateway" }
+aisix-mcp = { path = "../aisix-mcp" }
 aisix-obs = { path = "../aisix-obs" }
 aisix-proxy = { path = "../aisix-proxy" }
 aisix-guardrails = { path = "../aisix-guardrails" }
@@ -51,6 +52,8 @@ chrono.workspace = true
 tracing.workspace = true
 etcd-client.workspace = true
 reqwest.workspace = true
+async-trait.workspace = true
+base64.workspace = true
 rcgen.workspace = true
 uuid.workspace = true
 hostname.workspace = true

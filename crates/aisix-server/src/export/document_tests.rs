@@ -1492,6 +1492,34 @@ fn a_ceiling_of_only_star_named_servers_blocks_once_with_the_right_advice() {
 }
 
 #[test]
+fn default_export_emits_no_live_oidc_login_client_secret() {
+    let snap = AisixSnapshot::new();
+    snap.oidc_providers.insert(ResourceEntry::new(
+        "op-1",
+        serde_json::from_value(json!({
+            "name": "corp",
+            "issuer": "https://idp.example",
+            "audiences": ["a"],
+            "login": {"client_id": "gw", "client_secret": "login-secret-do-not-leak"},
+        }))
+        .unwrap(),
+        1,
+    ));
+    let doc = build_export_document(&snap, false);
+    let login = &find(&doc, "oidc_providers")[0]["login"];
+    assert_eq!(login["client_id"], json!("gw"));
+    assert_eq!(
+        login["client_secret"],
+        json!("${AISIXSECRET_OIDC_PROVIDER_CORP_CLIENT_SECRET}")
+    );
+    let revealed = build_export_document(&snap, true);
+    assert_eq!(
+        find(&revealed, "oidc_providers")[0]["login"]["client_secret"],
+        json!("login-secret-do-not-leak")
+    );
+}
+
+#[test]
 fn default_export_emits_no_live_oidc_shared_secret() {
     let snap = AisixSnapshot::new();
     snap.oidc_providers.insert(ResourceEntry::new(

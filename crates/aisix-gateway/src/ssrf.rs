@@ -1,5 +1,5 @@
-//! `outbound.ssrf_protection`: whether a request to a URL an API caller
-//! supplied may reach a given address.
+//! `outbound.ssrf_protection`: whether a request to a URL the operator did
+//! not choose may reach a given address.
 //!
 //! On, every address the request connects to must be publicly routable.
 //! A direct connection resolves the name here, checks every address in

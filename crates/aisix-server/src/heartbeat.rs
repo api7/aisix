@@ -541,7 +541,7 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
 /// the presenting identity. Files are read here (not at config-load
 /// time) so an unreadable/rotated bundle surfaces an actionable error
 /// at the same place every other heartbeat error does.
-fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
+pub(crate) fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
     let ca_pem = std::fs::read(&mtls.ca_cert_path)
         .with_context(|| format!("read {}", mtls.ca_cert_path.display()))?;
     let cert_pem = std::fs::read(&mtls.client_cert_path)

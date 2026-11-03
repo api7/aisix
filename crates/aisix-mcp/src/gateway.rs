@@ -50,9 +50,11 @@ use aisix_core::{AisixSnapshot, ResourceEntry};
 
 use crate::bridge::{
     forwarded_client_headers, upstream_from_mcp_server, CallerCredentials, EphemeralBridge,
-    McpBridge,
+    McpAuth, McpBridge,
 };
-use crate::error::{McpError, TokenExchangeError, TokenExchangeFailure};
+use crate::error::{
+    McpError, TokenExchangeError, TokenExchangeFailure, UserOAuthError, UserOAuthFailure,
+};
 use crate::openapi::OpenApiBridge;
 
 /// Separator between an upstream server's registered name and a tool name in
@@ -491,6 +493,9 @@ pub struct McpGateway {
     /// inside a JSON-RPC result, where a client never looks for an
     /// authorization challenge.
     auth_failure: Arc<OnceLock<TokenExchangeError>>,
+    /// The same, for an `oauth2_authorization_code` server: the HTTP status
+    /// is where an MCP client looks for the sign-in challenge.
+    user_oauth_failure: Arc<OnceLock<UserOAuthError>>,
     /// When set, this gateway serves exactly one upstream under its **original**
     /// tool names: `tools/list` strips the `<server>__` namespace prefix and
     /// `tools/call` accepts both the bare and the prefixed form. ACL decisions
@@ -555,6 +560,7 @@ impl McpGateway {
             scoped: None,
             tools_list: Arc::new(OnceLock::new()),
             auth_failure: Arc::new(OnceLock::new()),
+            user_oauth_failure: Arc::new(OnceLock::new()),
         }
     }
 
@@ -584,6 +590,26 @@ impl McpGateway {
         self.auth_failure.clone()
     }
 
+    /// Handle on the first per-user OAuth failure this gateway hit, cloned
+    /// out the same way as [`McpGateway::token_exchange_failure`].
+    pub fn user_oauth_failure(&self) -> Arc<OnceLock<UserOAuthError>> {
+        self.user_oauth_failure.clone()
+    }
+
+    /// Whether the single upstream of a scoped gateway can be called for this
+    /// caller with the token it has, checked before any MCP message is served
+    /// for the same reason as [`McpGateway::preflight_upstream_auth`].
+    pub async fn preflight_user_oauth(&self) -> Option<UserOAuthFailure> {
+        if !self.scoped.as_ref()?.reachable {
+            return None;
+        }
+        let upstream = self.upstreams.first()?;
+        match upstream.bridge.preflight_auth().await {
+            Err(McpError::UserOAuth(error)) => Some(error.failure),
+            _ => None,
+        }
+    }
+
     /// Run, before any MCP message is served, the token exchange the single
     /// upstream of a scoped gateway needs for this caller (an
     /// `oauth2_token_exchange` server). The `initialize` handshake never
@@ -605,8 +631,14 @@ impl McpGateway {
         if self.scoped.as_ref().is_some_and(|scoped| !scoped.reachable) {
             return;
         }
-        if let McpError::TokenExchange(error) = error {
-            let _ = self.auth_failure.set(error.clone());
+        match error {
+            McpError::TokenExchange(error) => {
+                let _ = self.auth_failure.set(error.clone());
+            }
+            McpError::UserOAuth(error) => {
+                let _ = self.user_oauth_failure.set(error.clone());
+            }
+            _ => {}
         }
     }
 
@@ -755,6 +787,21 @@ impl ServerHandler for McpGateway {
                     tracing::debug!(
                         upstream = server,
                         "skipping upstream in tools/list: no verified caller token to exchange"
+                    );
+                }
+                // Likewise a user who has not signed in to this server, on the
+                // aggregated endpoint.
+                Err(
+                    error @ McpError::UserOAuth(UserOAuthError {
+                        failure:
+                            UserOAuthFailure::NoSubject | UserOAuthFailure::AuthorizationRequired,
+                        ..
+                    }),
+                ) => {
+                    self.note_auth_failure(&error);
+                    tracing::debug!(
+                        upstream = server,
+                        "skipping upstream in tools/list: the caller is not signed in to it"
                     );
                 }
                 Err(error) => {
@@ -915,6 +962,9 @@ impl ServerHandler for McpGateway {
                 error = %error,
                 "upstream tools/call failed"
             );
+            if let McpError::UserOAuth(error) = &error {
+                return user_oauth_tool_error(server, error.failure);
+            }
             ErrorData::internal_error(
                 format!("upstream MCP server '{server}' failed to call tool"),
                 None,
@@ -973,6 +1023,31 @@ impl ServerHandler for McpGateway {
     }
 }
 
+/// A `tools/call` that the caller's stored token could not serve, naming what
+/// to do about it. Only the aggregated endpoint's clients read this: the
+/// single-server endpoint answers the failure with an HTTP status.
+fn user_oauth_tool_error(server: &str, failure: UserOAuthFailure) -> ErrorData {
+    let endpoint = format!("/mcp/{server}");
+    let message = match failure {
+        UserOAuthFailure::AuthorizationRequired => format!(
+            "MCP server '{server}' is not connected for this user: connect to {endpoint} \
+             to sign in"
+        ),
+        UserOAuthFailure::NoSubject => format!(
+            "MCP server '{server}' ({endpoint}) signs in each user individually, and this \
+             gateway credential has no user"
+        ),
+        UserOAuthFailure::Misconfigured => {
+            format!("MCP server '{server}' ({endpoint}) cannot sign in users as configured")
+        }
+        UserOAuthFailure::Unavailable => format!(
+            "MCP server '{server}' ({endpoint}): this user's upstream token is temporarily \
+             unavailable"
+        ),
+    };
+    ErrorData::invalid_request(message, None)
+}
+
 /// The bridge to one registered server, carrying this request's forwarded
 /// client headers and caller credentials.
 fn bridge_for(
@@ -984,7 +1059,9 @@ fn bridge_for(
     let mut forwarded = forwarded_client_headers(&entry.value, client_headers);
     if matches!(
         entry.value.auth_type,
-        aisix_core::McpAuthType::OauthDelegate | aisix_core::McpAuthType::OAuth2TokenExchange
+        aisix_core::McpAuthType::OauthDelegate
+            | aisix_core::McpAuthType::OAuth2TokenExchange
+            | aisix_core::McpAuthType::OAuth2AuthorizationCode
     ) {
         // The auth type owns the `authorization` slot: a forwarded copy
         // would relay the caller's `Authorization` even when it was the
@@ -999,9 +1076,12 @@ fn bridge_for(
     };
     match entry.value.server_type {
         McpServerType::Mcp => {
-            let upstream = upstream_from_mcp_server(&entry.value)
+            let mut upstream = upstream_from_mcp_server(&entry.value)
                 .with_forwarded_client_headers(forwarded)
                 .with_caller_credentials(caller);
+            if let McpAuth::UserOAuth(auth) = &mut upstream.auth {
+                auth.server.id.clone_from(&entry.id);
+            }
             Arc::new(EphemeralBridge::new(upstream))
         }
         McpServerType::Openapi => Arc::new(

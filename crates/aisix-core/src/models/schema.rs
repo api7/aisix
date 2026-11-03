@@ -1497,6 +1497,10 @@ pub fn mcp_server_root_schema(strict: bool) -> Value {
                     "oauth2_token_exchange",
                     "OAuth 2.0 token exchange on behalf of the caller",
                 ),
+                (
+                    "oauth2_authorization_code",
+                    "OAuth 2.0 authorization code flow, per user",
+                ),
             ],
         );
         title_single_value_enum_variants(

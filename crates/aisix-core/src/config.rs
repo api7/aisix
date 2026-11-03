@@ -74,7 +74,7 @@ pub struct Config {
     /// see [`UpstreamConfig`].
     #[serde(default)]
     pub upstream: UpstreamConfig,
-    /// Rules for outbound requests to URLs an API caller supplied — see
+    /// Rules for outbound requests to URLs the operator did not choose — see
     /// [`OutboundConfig`].
     #[serde(default)]
     pub outbound: OutboundConfig,
@@ -1883,11 +1883,14 @@ impl Default for MediaFetchConfig {
     }
 }
 
-/// Outbound requests to a URL an API caller supplied, as opposed to one an
-/// operator configured. Today that is the media download
-/// (`upstream.media_fetch`). Configured URLs — a provider key's
-/// `api_base`, guardrail, MCP and A2A endpoints, JWKS, exporters — are not
-/// governed by it.
+/// Outbound requests to a URL neither the operator nor the configured service
+/// chose: the media download (`upstream.media_fetch`), whose URL an API caller
+/// supplied, and an OAuth document or endpoint an MCP server's metadata names on
+/// another authority (scheme, host and port) than the server's `url`. Configured
+/// URLs — a provider key's `api_base`, guardrail, MCP and A2A endpoints, a trust
+/// provider and its discovery document, an MCP server's configured OAuth endpoints
+/// and what it publishes on its own authority, JWKS, exporters — are not governed
+/// by it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(default)]
@@ -1897,13 +1900,15 @@ pub struct OutboundConfig {
     pub ssrf_protection: SsrfProtectionConfig,
 }
 
-/// Keeps a caller-supplied URL from reaching the operator's own network.
+/// Keeps a URL the operator did not choose from reaching the operator's own
+/// network.
 ///
 /// On, every address such a request connects to must be publicly routable
 /// (not loopback, private, link-local, CGNAT, cloud metadata, benchmarking
 /// `198.18.0.0/15`, …). A host name is resolved and every address in the
 /// answer checked; a direct connection goes only to those addresses, and
-/// each redirect hop is checked the same way. When an `HTTP(S)_PROXY`
+/// each redirect hop of a media download is checked the same way (the OAuth
+/// requests follow no redirects). When an `HTTP(S)_PROXY`
 /// applies to the URL, the name is resolved and checked the same way
 /// before the request is handed to the proxy, which then resolves it
 /// again itself.

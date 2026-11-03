@@ -303,8 +303,9 @@ upstream:
   # bedrock:
   #   mantle_endpoint: null
 
-# URLs an API caller supplied (the media download) only reach publicly
-# routable addresses; allowed_hosts (host or host:port) is the exception
+# URLs the operator did not choose (the media download, an OAuth endpoint an
+# MCP server's metadata names on another scheme, host or port than its url) only
+# reach publicly routable addresses; allowed_hosts (host or host:port) is the exception
 # and enabled: false turns the check off. Behind a fake-ip DNS that maps
 # public names into 198.18.0.0/15, list those hosts or turn it off.
 # See config.example.yaml.

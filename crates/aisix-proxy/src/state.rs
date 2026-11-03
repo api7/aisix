@@ -287,6 +287,10 @@ pub struct ProxyStateInner {
     /// server id read it — the tool ACL and the per-server rate limit — so
     /// the two resolve a rename at the same instant.
     pub mcp_servers: Arc<LiveMcpServerIndex>,
+    /// Per-user tokens of `oauth2_authorization_code` MCP servers.
+    /// [`ProxyState::with_mcp_oauth_store`] picks where they are kept; until
+    /// then, this process alone.
+    pub(crate) mcp_oauth: Arc<aisix_mcp::UserOAuthManager>,
     /// The `budgets` documents indexed for the per-request budget gate,
     /// rebuilt only when that table changes.
     pub(crate) budgets: Arc<crate::budget::LiveBudgetIndex>,
@@ -439,6 +443,9 @@ impl ProxyState {
             guardrail_index,
             pricing: Arc::new(LivePricingIndex::new()),
             mcp_servers: Arc::new(LiveMcpServerIndex::new()),
+            mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::new(
+                aisix_mcp::MemoryStore::default(),
+            ))),
             budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
@@ -492,6 +499,9 @@ impl ProxyState {
             guardrail_index,
             pricing: Arc::new(LivePricingIndex::new()),
             mcp_servers: Arc::new(LiveMcpServerIndex::new()),
+            mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::new(
+                aisix_mcp::MemoryStore::default(),
+            ))),
             budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
@@ -559,6 +569,9 @@ impl ProxyState {
             guardrail_index,
             pricing: Arc::new(LivePricingIndex::new()),
             mcp_servers: Arc::new(LiveMcpServerIndex::new()),
+            mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::new(
+                aisix_mcp::MemoryStore::default(),
+            ))),
             budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
             health: Arc::new(HealthTracker::with_flags(bookkeeping_flags)),
             livez: Arc::new(LivezState::new()),
@@ -633,6 +646,13 @@ impl ProxyState {
     /// Attach a CP-side usage telemetry sink. Default is `disabled()`;
     /// the server bootstrap calls this in managed mode after spawning
     /// the sender worker.
+    /// Keep per-user MCP tokens in `store` rather than in this process.
+    pub fn with_mcp_oauth_store(mut self, store: Arc<dyn aisix_mcp::SharedStore>) -> Self {
+        Arc::make_mut(&mut self.inner).mcp_oauth =
+            Arc::new(aisix_mcp::UserOAuthManager::new(store));
+        self
+    }
+
     pub fn with_usage_sink(mut self, sink: UsageSink) -> Self {
         Arc::make_mut(&mut self.inner).usage_sink = sink;
         self
