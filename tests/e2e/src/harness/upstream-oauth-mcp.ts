@@ -16,6 +16,12 @@ export interface OAuthMcpUpstreamOptions {
   staticClient?: { id: string; secret: string };
   /** Issue no refresh tokens at all. */
   noRefreshTokens?: boolean;
+  /**
+   * A refresh ends the access token it replaces as soon as it arrives, and an MCP
+   * request with a token this server does not honour is served as anonymous
+   * rather than refused.
+   */
+  anonymousOnDeadToken?: boolean;
   /** Serve `/authorize` and `/token` under this path, as Jira Data Center does. */
   oauthPathPrefix?: string;
   /** What the metadata documents name, instead of this server's own address. */
@@ -230,6 +236,7 @@ export class OAuthMcpUpstream {
       return verified ? this.issue(code.user, json) : json(400, { error: "invalid_grant" });
     }
     if (form.grant_type === "refresh_token") {
+      if (this.options.anonymousOnDeadToken) this.revokeAccessTokens(this.refreshTokens.get(form.refresh_token) ?? "");
       if (this.refreshDelayMs > 0) await new Promise((r) => setTimeout(r, this.refreshDelayMs));
       if (this.refreshAnswer !== "ok") {
         return json(this.refreshAnswer.status, { error: this.refreshAnswer.error });
@@ -247,7 +254,8 @@ export class OAuthMcpUpstream {
     const authorization = req.headers.authorization;
     this.mcpAuthorizations.push(authorization);
     const token = authorization?.replace(/^Bearer /, "");
-    const user = token === undefined ? undefined : this.accessTokens.get(token);
+    const honoured = token === undefined ? undefined : this.accessTokens.get(token);
+    const user = honoured ?? (this.options.anonymousOnDeadToken ? "anonymous" : undefined);
     if (this.rejectEveryToken || user === undefined) {
       res
         .writeHead(401, {

@@ -30,6 +30,7 @@ describe("per-user OAuth on managed gateways", () => {
   let cp: MockControlPlane;
   let upstream: OAuthMcpUpstream;
   let shortLived: OAuthMcpUpstream;
+  let endsOldToken: OAuthMcpUpstream;
   const apps: SpawnedApp[] = [];
   let etcdReachable = false;
 
@@ -54,6 +55,7 @@ describe("per-user OAuth on managed gateways", () => {
     cp = await startMockControlPlane();
     upstream = await new OAuthMcpUpstream().start();
     shortLived = await new OAuthMcpUpstream({ expiresIn: 30 }).start();
+    endsOldToken = await new OAuthMcpUpstream({ expiresIn: 65, anonymousOnDeadToken: true }).start();
     for (let i = 0; i < 2; i++) {
       const app = await spawnApp({
         extra: {
@@ -74,6 +76,12 @@ describe("per-user OAuth on managed gateways", () => {
         name: "short",
         type: "mcp",
         url: shortLived.mcpUrl,
+        auth_type: "oauth2_authorization_code",
+      });
+      await seed.update("mcp_servers", "33333333-3333-4333-8333-333333333333", {
+        name: "ends-old-token",
+        type: "mcp",
+        url: endsOldToken.mcpUrl,
         auth_type: "oauth2_authorization_code",
       });
       await seed.update("mcp_auth_settings", randomUUID(), { resource_url: `${app.proxyUrl}/mcp` });
@@ -102,6 +110,7 @@ describe("per-user OAuth on managed gateways", () => {
     for (const app of apps) await app.exit();
     await upstream?.close();
     await shortLived?.close();
+    await endsOldToken?.close();
     await cp?.close();
   });
 
@@ -156,6 +165,27 @@ describe("per-user OAuth on managed gateways", () => {
     expect(new Set(spent).size).toBe(spent.length);
     for (const { client } of clients) await client.close();
   });
+
+  test("a refresh that ends the old token leaves no call on either gateway with it", async () => {
+    if (!etcdReachable) return;
+    endsOldToken.user = "bob";
+    const { client } = await signInMcpClient(url(0, "ends-old-token"), key(BOB));
+    await client.close();
+    const clients = await Promise.all(
+      [0, 1, 0, 1, 0, 1, 0, 1].map((i) => connectMcpClient(url(i, "ends-old-token"), key(BOB))),
+    );
+    // Issued for 65 s, so inside the 60 s refresh window from here on.
+    await new Promise((r) => setTimeout(r, 6_000));
+    const grantsBefore = endsOldToken.refreshGrants().length;
+    const requestsBefore = endsOldToken.mcpAuthorizations.length;
+    endsOldToken.refreshDelayMs = 800;
+    const results = await Promise.all(clients.map(({ client }) => whoami(client)));
+    endsOldToken.refreshDelayMs = 0;
+    expect(results).toEqual(Array(8).fill("bob"));
+    expect(endsOldToken.refreshGrants().length - grantsBefore).toBe(1);
+    expect(new Set(endsOldToken.mcpAuthorizations.slice(requestsBefore)).size).toBe(1);
+    for (const { client } of clients) await client.close();
+  }, 30_000);
 
   test("a storage outage keeps a cached token working and never asks for a sign-in", async () => {
     if (!etcdReachable) return;

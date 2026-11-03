@@ -61,6 +61,11 @@ const LOCAL_CACHE_CAPACITY: usize = 10_000;
 /// How often a gateway waiting on another gateway's refresh re-reads the
 /// record.
 const LEASE_POLL: Duration = Duration::from_millis(200);
+/// How long a gateway waits on another gateway's proactive refresh before it
+/// goes back to the token still in the record. The holder's work is one token
+/// request, so running out means it is stuck or gone, and its lease would hold
+/// everyone else off for up to [`LEASE_TTL`].
+const PROACTIVE_WAIT: Duration = Duration::from_secs(5);
 
 /// Error codes a token endpoint answers a refresh with when the grant itself
 /// is finished, so only a new sign-in can help. Anything else leaves the
@@ -260,6 +265,24 @@ pub fn random_token() -> String {
 
 type Flight = Shared<BoxFuture<'static, Result<String, UserOAuthFailure>>>;
 
+/// What a refresh replaces.
+#[derive(Clone)]
+enum Replacing {
+    /// The token in this version of the record, close to expiring.
+    Expiring { version: i64 },
+    /// A token the upstream refused.
+    Rejected(String),
+}
+
+impl Replacing {
+    fn rejected(&self) -> Option<&str> {
+        match self {
+            Self::Expiring { .. } => None,
+            Self::Rejected(token) => Some(token),
+        }
+    }
+}
+
 /// Everything per-user OAuth keeps per process: the store handle, the local
 /// token cache, and the refreshes in flight.
 pub struct UserOAuthManager {
@@ -337,7 +360,10 @@ impl UserOAuthManager {
                 };
             }
         };
-        let Some(record) = stored.as_ref().and_then(decode_token) else {
+        let Some((record, version)) = stored
+            .as_ref()
+            .and_then(|stored| Some((decode_token(stored)?, stored.version)))
+        else {
             self.evict(key);
             return Err(UserOAuthFailure::AuthorizationRequired);
         };
@@ -345,7 +371,10 @@ impl UserOAuthManager {
             self.remember(key, &record);
             return Ok(record.access_token);
         }
-        match self.refresh(server, subject, None).await {
+        match self
+            .refresh(server, subject, Replacing::Expiring { version })
+            .await
+        {
             // Whatever stopped the refresh, this token has not expired yet.
             Err(UserOAuthFailure::Unavailable) if !record.expired(unix_now()) => {
                 Ok(record.access_token)
@@ -363,7 +392,7 @@ impl UserOAuthManager {
         rejected: &str,
     ) -> Result<String, UserOAuthFailure> {
         self.evict(&token_key(server, subject));
-        self.refresh(server, subject, Some(rejected.to_owned()))
+        self.refresh(server, subject, Replacing::Rejected(rejected.to_owned()))
             .await
     }
 
@@ -465,13 +494,13 @@ impl UserOAuthManager {
         self: &Arc<Self>,
         server: &UserOAuthServer,
         subject: &UserSubject,
-        rejected: Option<String>,
+        replacing: Replacing,
     ) -> Result<String, UserOAuthFailure> {
         let key = token_key(server, subject);
         // Keyed on the token being replaced too: a caller holding a rejected
         // token cannot share the outcome of a proactive refresh, which may
         // hand that very token back. The lease still lets only one through.
-        let flight_key = digest(&[&key, rejected.as_deref().unwrap_or_default()]);
+        let flight_key = digest(&[&key, replacing.rejected().unwrap_or_default()]);
         let flight = self
             .inflight
             .lock()
@@ -483,7 +512,7 @@ impl UserOAuthManager {
                 let subject = subject.clone();
                 let task = tokio::spawn(async move {
                     let outcome = manager
-                        .refresh_under_lease(&server, &subject, &key, rejected)
+                        .refresh_under_lease(&server, &subject, &key, replacing)
                         .await;
                     manager
                         .inflight
@@ -511,7 +540,7 @@ impl UserOAuthManager {
         server: &UserOAuthServer,
         subject: &UserSubject,
         key: &str,
-        rejected: Option<String>,
+        replacing: Replacing,
     ) -> Result<String, UserOAuthFailure> {
         let labels = BTreeMap::from([("mcp_server_id", server.id.as_str())]);
         let lease = self
@@ -529,14 +558,12 @@ impl UserOAuthManager {
         let lease = match lease {
             Ok(version) => version,
             Err(StoreError::PreconditionFailed) => {
-                return self
-                    .wait_for_refresh(server, key, rejected.as_deref())
-                    .await;
+                return self.wait_for_refresh(server, key, &replacing).await;
             }
             Err(_) => return Err(UserOAuthFailure::Unavailable),
         };
         let outcome = self
-            .refresh_holding_lease(server, subject, key, rejected.as_deref(), lease_taken)
+            .refresh_holding_lease(server, subject, key, replacing.rejected(), lease_taken)
             .await;
         // Expires on its own if this fails.
         let _ = self.store.delete(NS_LEASE, key, Some(lease)).await;
@@ -547,24 +574,33 @@ impl UserOAuthManager {
         &self,
         server: &UserOAuthServer,
         key: &str,
-        rejected: Option<&str>,
+        replacing: &Replacing,
     ) -> Result<String, UserOAuthFailure> {
-        let deadline = Instant::now() + server.timeout;
+        let started = Instant::now();
+        let deadline = started + server.timeout;
         loop {
             let stored = self
                 .store
                 .get(NS_TOKEN, key)
                 .await
                 .map_err(|_| UserOAuthFailure::Unavailable)?;
-            let Some(record) = stored.as_ref().and_then(decode_token) else {
+            let Some((record, version)) = stored
+                .as_ref()
+                .and_then(|stored| Some((decode_token(stored)?, stored.version)))
+            else {
                 self.evict(key);
                 return Err(UserOAuthFailure::AuthorizationRequired);
             };
-            // A proactive refresh leaves the old token good for now, so only
-            // an expired one or a rejected one is worth waiting to replace.
-            let settled = match rejected {
-                Some(rejected) => record.access_token != rejected,
-                None => !record.expired(unix_now()),
+            let settled = match replacing {
+                Replacing::Rejected(rejected) => record.access_token != *rejected,
+                // An upstream may end the old token the moment it issues the
+                // new one, and answer the dead one with an empty `200` that no
+                // retry can catch. So the old token is only a fallback, for a
+                // holder that does not finish in time.
+                Replacing::Expiring { version: held } => {
+                    !record.expired(unix_now())
+                        && (version != *held || started.elapsed() >= PROACTIVE_WAIT)
+                }
             };
             if settled {
                 return Ok(record.access_token);
@@ -1065,6 +1101,267 @@ mod tests {
         );
         assert_eq!(proactive.as_deref(), Ok("x"));
         assert_eq!(rejected, Err(UserOAuthFailure::Unavailable));
+    }
+
+    /// An authorization server that takes a while to answer and honours only
+    /// the access token it issued last, as one that ends the old token on a
+    /// refresh does.
+    struct RotatingUpstream {
+        token_url: String,
+        valid: Arc<Mutex<String>>,
+        refreshes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RotatingUpstream {
+        async fn start(initial: &str, delay: Duration, expires_in: i64) -> Self {
+            let valid = Arc::new(Mutex::new(initial.to_owned()));
+            let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let app = axum::Router::new().route(
+                "/token",
+                axum::routing::post({
+                    let valid = valid.clone();
+                    let refreshes = refreshes.clone();
+                    move || async move {
+                        let n = 1 + refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(delay).await;
+                        let token = format!("new-{n}");
+                        *valid.lock().unwrap() = token.clone();
+                        axum::Json(serde_json::json!({
+                            "access_token": token,
+                            "refresh_token": format!("r-{n}"),
+                            "token_type": "Bearer",
+                            "expires_in": expires_in,
+                        }))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let token_url = format!("http://{}/token", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await });
+            Self {
+                token_url,
+                valid,
+                refreshes,
+            }
+        }
+
+        fn valid(&self) -> String {
+            self.valid.lock().unwrap().clone()
+        }
+
+        fn refreshes(&self) -> usize {
+            self.refreshes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    fn server_at(token_url: &str, timeout: Duration) -> UserOAuthServer {
+        let row: McpServer = serde_json::from_value(serde_json::json!({
+            "name": "s",
+            "url": "https://upstream.example/mcp",
+            "auth_type": "oauth2_authorization_code",
+            "client_id": "c",
+            "token_url": token_url,
+            "timeout_ms": timeout.as_millis() as u64,
+        }))
+        .unwrap();
+        UserOAuthServer::new("server-id", &row)
+    }
+
+    /// Eight concurrent calls across two gateways on one store, all before
+    /// the upstream has answered the refresh.
+    async fn calls_on_two_gateways(
+        store: Arc<MemoryStore>,
+        server: &UserOAuthServer,
+    ) -> Vec<Result<String, UserOAuthFailure>> {
+        let gateways = [
+            Arc::new(UserOAuthManager::new(store.clone())),
+            Arc::new(UserOAuthManager::new(store)),
+        ];
+        let subject = UserSubject::member("u");
+        futures::future::join_all((0..8).map(|i| {
+            let gateway = gateways[i % 2].clone();
+            let (server, subject) = (server.clone(), subject.clone());
+            async move { gateway.access_token(&server, &subject).await }
+        }))
+        .await
+    }
+
+    #[tokio::test]
+    async fn no_gateway_keeps_the_token_a_refresh_is_ending() {
+        let upstream = RotatingUpstream::start("old", Duration::from_millis(400), 3600).await;
+        let server = server_at(&upstream.token_url, Duration::from_secs(30));
+        let store = Arc::new(MemoryStore::default());
+        store_token(store.as_ref(), &server, "old", 45).await;
+
+        let tokens = calls_on_two_gateways(store, &server).await;
+
+        assert_eq!(upstream.refreshes(), 1);
+        assert_eq!(upstream.valid(), "new-1");
+        assert_eq!(tokens, vec![Ok("new-1".to_owned()); 8]);
+    }
+
+    /// Being inside the skew says nothing here: every token this upstream
+    /// issues is, so only the record changing can end the wait in time.
+    #[tokio::test]
+    async fn a_token_that_lives_inside_the_skew_still_settles_on_the_refresh() {
+        let upstream = RotatingUpstream::start("old", Duration::from_millis(400), 30).await;
+        let server = server_at(&upstream.token_url, Duration::from_secs(30));
+        let store = Arc::new(MemoryStore::default());
+        store_token(store.as_ref(), &server, "old", 30).await;
+
+        let started = Instant::now();
+        let tokens = calls_on_two_gateways(store, &server).await;
+
+        assert!(started.elapsed() < PROACTIVE_WAIT);
+        assert_eq!(upstream.refreshes(), 1);
+        assert_eq!(tokens, vec![Ok("new-1".to_owned()); 8]);
+    }
+
+    /// Take the lease, as another gateway's refresh does.
+    async fn hold_lease(store: &dyn SharedStore, server: &UserOAuthServer) {
+        store
+            .put(
+                NS_LEASE,
+                &token_key(server, &UserSubject::member("u")),
+                b"1".to_vec(),
+                LEASE_TTL,
+                &BTreeMap::new(),
+                PutCondition::CreateOnly,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// What the holder of the lease does when its refresh lands, `after` from now.
+    fn land_refresh(
+        store: Arc<dyn SharedStore>,
+        server: &UserOAuthServer,
+        access_token: &str,
+        after: Duration,
+    ) {
+        let key = token_key(server, &UserSubject::member("u"));
+        let access_token = access_token.to_owned();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            let current = store.get(NS_TOKEN, &key).await.unwrap().unwrap();
+            let record = TokenRecord {
+                access_token,
+                refresh_token: Some("r2".to_owned()),
+                expires_at: Some(unix_now() + 3600),
+                resource: None,
+                registered_client: None,
+                redirect_uri: None,
+            };
+            store
+                .put(
+                    NS_TOKEN,
+                    &key,
+                    serde_json::to_vec(&record).unwrap(),
+                    TOKEN_TTL,
+                    &BTreeMap::new(),
+                    PutCondition::IfVersion(current.version),
+                )
+                .await
+                .unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn a_holder_that_never_finishes_costs_the_bound_and_then_the_old_token_works() {
+        let server = server_at("http://127.0.0.1:9/token", Duration::from_secs(30));
+        let store = Arc::new(MemoryStore::default());
+        store_token(store.as_ref(), &server, "old", 45).await;
+        hold_lease(store.as_ref(), &server).await;
+
+        let started = Instant::now();
+        let token = Arc::new(UserOAuthManager::new(store))
+            .access_token(&server, &UserSubject::member("u"))
+            .await;
+
+        assert_eq!(token.as_deref(), Ok("old"));
+        let waited = started.elapsed();
+        assert!(waited >= PROACTIVE_WAIT, "returned after {waited:?}");
+        assert!(
+            waited < PROACTIVE_WAIT + Duration::from_secs(3),
+            "{waited:?}"
+        );
+    }
+
+    /// An upstream may hand the same access token back with a later expiry.
+    #[tokio::test]
+    async fn a_refresh_that_keeps_the_access_token_still_ends_the_wait() {
+        let server = server_at("http://127.0.0.1:9/token", Duration::from_secs(30));
+        let store = Arc::new(MemoryStore::default());
+        store_token(store.as_ref(), &server, "same", 45).await;
+        hold_lease(store.as_ref(), &server).await;
+        land_refresh(store.clone(), &server, "same", Duration::from_millis(300));
+
+        let started = Instant::now();
+        let token = Arc::new(UserOAuthManager::new(store))
+            .access_token(&server, &UserSubject::member("u"))
+            .await;
+
+        assert_eq!(token.as_deref(), Ok("same"));
+        assert!(started.elapsed() < PROACTIVE_WAIT);
+    }
+
+    /// Once the old token has expired it is no fallback, and the wait is the
+    /// expired case's: the server's timeout, not the short bound.
+    #[tokio::test]
+    async fn a_token_that_expires_during_the_wait_is_waited_on_past_the_bound() {
+        let server = server_at("http://127.0.0.1:9/token", Duration::from_secs(30));
+        let store = Arc::new(MemoryStore::default());
+        store_token(store.as_ref(), &server, "old", 2).await;
+        hold_lease(store.as_ref(), &server).await;
+        land_refresh(
+            store.clone(),
+            &server,
+            "new",
+            PROACTIVE_WAIT + Duration::from_millis(500),
+        );
+
+        let token = Arc::new(UserOAuthManager::new(store))
+            .access_token(&server, &UserSubject::member("u"))
+            .await;
+
+        assert_eq!(token.as_deref(), Ok("new"));
+    }
+
+    #[tokio::test]
+    async fn a_record_deleted_during_the_wait_requires_a_sign_in() {
+        let server = server_at("http://127.0.0.1:9/token", Duration::from_secs(30));
+        let store = Arc::new(MemoryStore::default());
+        store_token(store.as_ref(), &server, "old", 45).await;
+        hold_lease(store.as_ref(), &server).await;
+        let subject = UserSubject::member("u");
+        let manager = Arc::new(UserOAuthManager::new(store.clone()));
+
+        let (token, _) = tokio::join!(manager.access_token(&server, &subject), async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let key = token_key(&server, &subject);
+            store.delete(NS_TOKEN, &key, None).await.unwrap();
+        });
+
+        assert_eq!(token, Err(UserOAuthFailure::AuthorizationRequired));
+    }
+
+    #[tokio::test]
+    async fn a_store_outage_during_the_wait_leaves_the_old_token_working() {
+        let server = server_at("http://127.0.0.1:9/token", Duration::from_secs(30));
+        let store = Arc::new(SwitchableStore::default());
+        store_token(store.as_ref(), &server, "old", 45).await;
+        hold_lease(store.as_ref(), &server).await;
+        let subject = UserSubject::member("u");
+        let manager = Arc::new(UserOAuthManager::new(store.clone()));
+
+        let started = Instant::now();
+        let (token, _) = tokio::join!(manager.access_token(&server, &subject), async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            store.fail(true);
+        });
+
+        assert_eq!(token.as_deref(), Ok("old"));
+        assert!(started.elapsed() < PROACTIVE_WAIT);
     }
 
     #[test]
