@@ -1065,10 +1065,6 @@ impl VideoTarget {
     }
 }
 
-/// Shared resolve → ACL → IP-allowlist → provider gate for a Model on the
-/// videos surface. `acl_name` is the name the caller's key is checked
-/// against (the requested alias on submit, the stored display name on the
-/// GET routes).
 /// A provider `/v1/videos` has no mapping for, and what the 501 says about it.
 struct UnsupportedProvider(String);
 
@@ -1093,6 +1089,10 @@ impl UnsupportedProvider {
     }
 }
 
+/// Shared resolve → ACL → IP-allowlist → provider gate for a Model on the
+/// videos surface. `acl_name` is the name the caller's key is checked
+/// against (the requested alias on submit, the stored display name on the
+/// GET routes).
 fn resolve_video_target(
     snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,

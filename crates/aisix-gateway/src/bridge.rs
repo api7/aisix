@@ -1237,8 +1237,6 @@ pub trait Bridge: Send + Sync + 'static {
 mod tests {
     use super::*;
 
-    /// The wording of a blank message is the error's `Display`, and its
-    /// `message` stays blank for the client's status fallback.
     /// An in-band error with an empty message says so where telemetry reads
     /// it; the stream's error frame keeps what the caller has always been sent.
     #[test]
@@ -1274,6 +1272,8 @@ mod tests {
         assert_eq!(named.stream_frame_message(), named.to_string());
     }
 
+    /// The wording of a blank message is the error's `Display`, and its
+    /// `message` stays blank for the client's status fallback.
     #[test]
     fn upstream_status_display_names_what_a_blank_message_means() {
         for blank in ["", " \n", "\u{1}\u{2028}"] {

@@ -1157,7 +1157,7 @@ pub(crate) fn emit_usage(
         &mut event.error_message,
     );
     // A route names its own failures; this is for the one that did not.
-    if is_failure_row(&event) && event.error_message.is_empty() {
+    if is_failure_row(&event) && event.error_message.trim().is_empty() {
         event.error_message = aisix_obs::request_failed_message(event.status_code);
     }
     let mut upstream_error_body = None;
@@ -1370,6 +1370,7 @@ mod tests {
     /// the chokepoint's own guarantee for one that forgets, read at the sink
     /// every consumer of the event reads.
     #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)]
     async fn emit_usage_names_a_failure_row_nothing_named() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let state = crate::ProxyState::new(
@@ -1392,16 +1393,15 @@ mod tests {
         .with_usage_sink(aisix_obs::UsageSink::new(tx));
         let snap = state.snapshot.load();
         let mut emit = |status_code: u16, class: &str, message: &str| {
+            let mut event = UsageEvent::default();
+            event.status_code = status_code;
+            event.error_class = class.to_string();
+            event.error_message = message.to_string();
             emit_usage(
                 &state,
                 &snap,
                 crate::operation::CHAT,
-                UsageEvent {
-                    status_code,
-                    error_class: class.to_string(),
-                    error_message: message.to_string(),
-                    ..Default::default()
-                },
+                event,
                 usage_event_labels("m", &ResolvedPk::unresolved()),
                 None,
                 None,
@@ -1421,6 +1421,7 @@ mod tests {
             emit(200, "some_class", ""),
             "request failed with status 200"
         );
+        assert_eq!(emit(500, "", " "), "request failed with status 500");
         assert_eq!(emit(502, "some_class", "named"), "named");
         assert_eq!(emit(200, "", ""), "");
     }

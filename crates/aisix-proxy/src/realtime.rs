@@ -170,7 +170,7 @@ fn connect_failure_text(err: &tokio_tungstenite::tungstenite::Error) -> String {
         tokio_tungstenite::tungstenite::Error::Http(response) => {
             let status = response.status().as_u16();
             match complete_handshake_body(response) {
-                Some(body) => crate::attempt::relayed_failure(status, body).1,
+                Some(body) => crate::attempt::relayed_failure(status, &body).1,
                 None => format!("upstream returned HTTP {status} during the realtime handshake"),
             }
         }
@@ -178,27 +178,51 @@ fn connect_failure_text(err: &tokio_tungstenite::tungstenite::Error) -> String {
     }
 }
 
-/// The refused upgrade's body, when it is one. tungstenite hands over the raw
-/// bytes that happened to arrive with the response head and drops the socket:
-/// a later part is lost, and chunked framing is left in. Only a `Content-Length`
-/// they satisfy says they are the whole body.
+/// The refused upgrade's body, when all of it is known to have arrived.
+/// tungstenite hands over the raw bytes that came with the response head and
+/// drops the socket, so a later part is lost and chunked framing is left in.
+/// Only a `Content-Length` they satisfy, or the terminating chunk, says they
+/// are the whole body.
 fn complete_handshake_body(
     response: &tokio_tungstenite::tungstenite::handshake::client::Response,
-) -> Option<&[u8]> {
+) -> Option<std::borrow::Cow<'_, [u8]>> {
     let headers = response.headers();
-    if headers.contains_key(axum::http::header::TRANSFER_ENCODING)
-        || headers.contains_key(axum::http::header::CONTENT_ENCODING)
-    {
+    if headers.contains_key(axum::http::header::CONTENT_ENCODING) {
         return None;
     }
-    let body = response.body().as_deref()?;
-    let declared: usize = headers
-        .get(axum::http::header::CONTENT_LENGTH)?
-        .to_str()
-        .ok()?
-        .parse()
-        .ok()?;
-    (declared == body.len() && !body.iter().all(u8::is_ascii_whitespace)).then_some(body)
+    let raw = response.body().as_deref()?;
+    let body = if headers.contains_key(axum::http::header::TRANSFER_ENCODING) {
+        std::borrow::Cow::Owned(decode_whole_chunked(raw)?)
+    } else {
+        let declared: usize = headers
+            .get(axum::http::header::CONTENT_LENGTH)?
+            .to_str()
+            .ok()?
+            .parse()
+            .ok()?;
+        if declared != raw.len() {
+            return None;
+        }
+        std::borrow::Cow::Borrowed(raw)
+    };
+    (!body.iter().all(u8::is_ascii_whitespace)).then_some(body)
+}
+
+/// The payload of a chunked body, `None` unless it ends in its last chunk.
+fn decode_whole_chunked(mut raw: &[u8]) -> Option<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let line_end = raw.windows(2).position(|w| w == b"\r\n")?;
+        let size = std::str::from_utf8(&raw[..line_end]).ok()?;
+        let size = size.split(';').next()?.trim();
+        let size = usize::from_str_radix(size, 16).ok()?;
+        raw = &raw[line_end + 2..];
+        if size == 0 {
+            return Some(body);
+        }
+        body.extend_from_slice(raw.get(..size)?);
+        raw = raw.get(size..)?.strip_prefix(b"\r\n")?;
+    }
 }
 
 /// Dial the upstream Realtime endpoint under the deployment's outbound
@@ -1566,6 +1590,15 @@ mod tests {
             refused(&[("content-length", &length)], Some(whole)),
             "upstream returned HTTP 400: bad session"
         );
+        let json = String::from_utf8_lossy(whole);
+        let chunked = format!("{:x}\r\n{json}\r\n0\r\n\r\n", whole.len());
+        assert_eq!(
+            refused(
+                &[("transfer-encoding", "chunked")],
+                Some(chunked.as_bytes())
+            ),
+            "upstream returned HTTP 400: bad session"
+        );
         let in_handshake = "upstream returned HTTP 400 during the realtime handshake";
         for (what, headers, body) in [
             (
@@ -1579,9 +1612,14 @@ mod tests {
                 Some(&whole[..]),
             ),
             (
-                "chunk sizes in the text",
+                "a chunked body cut short",
                 vec![("transfer-encoding", "chunked")],
-                Some(&b"23\r\n{\"error\":{\"message\":\"x\"}}\r\n0\r\n\r\n"[..]),
+                Some(&b"23\r\n{\"error\":{\"mess"[..]),
+            ),
+            (
+                "a chunked body with no last chunk",
+                vec![("transfer-encoding", "chunked")],
+                Some(&b"3\r\nabc\r\n"[..]),
             ),
             ("no length to check against", vec![], Some(&whole[..])),
             (

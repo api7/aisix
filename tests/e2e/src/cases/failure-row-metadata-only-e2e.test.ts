@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type Server as HttpServer } from "node:http";
+import { createServer as createTcpServer, type Server as TcpServer } from "node:net";
 import { gzipSync } from "node:zlib";
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 import { WebSocket as WsClient } from "ws";
@@ -38,6 +39,7 @@ describe("failure rows name the failure under metadata_only", () => {
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
   const httpServers: HttpServer[] = [];
+  const tcpServers: TcpServer[] = [];
   const upstreams: OpenAiUpstream[] = [];
   let mcpUpstream: McpUpstream | undefined;
   let etcdReachable = false;
@@ -55,6 +57,17 @@ describe("failure rows name the failure under metadata_only", () => {
       });
     });
     httpServers.push(server);
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  }
+
+  /** An upstream answering in one write, so what arrives with the head is up to the test. */
+  async function rawUpstream(response: string): Promise<string> {
+    const server = createTcpServer((socket) => {
+      socket.once("data", () => socket.write(response, () => socket.destroy()));
+      socket.on("error", () => {});
+    });
+    tcpServers.push(server);
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
     return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   }
@@ -98,19 +111,40 @@ describe("failure rows name the failure under metadata_only", () => {
 
     const failing = await fixedUpstream(500, jsonError);
     await modelAt("meta-jobs-500", `${failing}/v1`);
-    await modelAt("meta-realtime-400", `${await fixedUpstream(400, jsonError)}/v1`);
+    const refusal = (headers: string, body: string) =>
+      rawUpstream(`HTTP/1.1 400 Bad Request\r\n${headers}\r\n\r\n${body}`);
+    const size = Buffer.byteLength(jsonError);
     await modelAt(
-      "meta-realtime-400-sized",
-      `${await fixedUpstream(400, jsonError, {
-        ...JSON_HEADERS,
-        "content-length": String(Buffer.byteLength(jsonError)),
-      })}/v1`,
+      "meta-realtime-sized",
+      `${await refusal(`content-length: ${size}`, jsonError)}/v1`,
+    );
+    await modelAt(
+      "meta-realtime-chunked",
+      `${await refusal("transfer-encoding: chunked", `${size.toString(16)}\r\n${jsonError}\r\n0\r\n\r\n`)}/v1`,
+    );
+    await modelAt(
+      "meta-realtime-late-detail",
+      `${await refusal(`content-length: ${size}`, "")}/v1`,
     );
     await modelAt(
       "meta-in-band-blank",
       `${await fixedUpstream(
         200,
         `data: ${JSON.stringify({ error: { message: "", code: "overloaded" } })}\n\n`,
+        { "content-type": "text/event-stream" },
+      )}/v1`,
+    );
+    await modelAt(
+      "meta-in-band-blank-mid-stream",
+      `${await fixedUpstream(
+        200,
+        `data: ${JSON.stringify({
+          id: "c1",
+          object: "chat.completion.chunk",
+          model: "gpt-4o-mini",
+          choices: [{ index: 0, delta: { role: "assistant", content: "partial" } }],
+        })}\n\n` +
+          `data: ${JSON.stringify({ error: { message: "", code: "overloaded" } })}\n\n`,
         { "content-type": "text/event-stream" },
       )}/v1`,
     );
@@ -213,9 +247,11 @@ describe("failure rows name the failure under metadata_only", () => {
 
   afterAll(async () => {
     await app?.exit();
+    if (etcdReachable) expect(expectFailureRowsNamed(sls!, LOGSTORE)).toBeGreaterThan(0);
     await sls?.close();
     await Promise.all(upstreams.map((u) => u.close()));
     await mcpUpstream?.close();
+    for (const server of tcpServers) server.close();
     await Promise.all(
       httpServers.map((s) => new Promise<void>((r) => s.close(() => r()))),
     );
@@ -367,17 +403,20 @@ describe("failure rows name the failure under metadata_only", () => {
     return row;
   }
 
-  test("realtime: a refusal whose body arrived whole is named with what it said", async (ctx) => {
-    if (!etcdReachable) return ctx.skip();
-    const row = await refusedRealtime("meta-realtime-400-sized");
-    expect(row.get("error_message")).toBe(
-      `transport error: upstream returned HTTP 400: ${SENTINEL}`,
-    );
-  });
+  test.for(["meta-realtime-sized", "meta-realtime-chunked"])(
+    "realtime %s: a refusal whose body arrived whole is named with what it said",
+    async (model, ctx) => {
+      if (!etcdReachable) return ctx.skip();
+      const row = await refusedRealtime(model);
+      expect(row.get("error_message")).toBe(
+        `transport error: upstream returned HTTP 400: ${SENTINEL}`,
+      );
+    },
+  );
 
-  test("realtime: a chunked refusal claims nothing about a body it cannot read", async (ctx) => {
+  test("realtime: a refusal whose detail had not arrived claims nothing about it", async (ctx) => {
     if (!etcdReachable) return ctx.skip();
-    const row = await refusedRealtime("meta-realtime-400");
+    const row = await refusedRealtime("meta-realtime-late-detail");
     expect(row.get("error_message")).toBe(
       "transport error: upstream returned HTTP 400 during the realtime handshake",
     );
@@ -392,6 +431,22 @@ describe("failure rows name the failure under metadata_only", () => {
     });
     const row = await rowOf(r.requestId, "the blank in-band row");
     expect(row.get("error_class")).toBe("upstream_in_band");
+    expect(row.get("error_message")).toBe(
+      "upstream reported an in-band stream error with no message: overloaded",
+    );
+  });
+
+  test("a mid-stream in-band error with an empty message names it on the row, not to the caller", async (ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    const r = await post("/v1/chat/completions", {
+      model: "meta-in-band-blank-mid-stream",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(r.status).toBe(200);
+    expect(r.text).toContain("upstream reported an in-band stream error: ");
+    expect(r.text).not.toContain("with no message");
+    const row = await rowOf(r.requestId, "the mid-stream in-band row");
     expect(row.get("error_message")).toBe(
       "upstream reported an in-band stream error with no message: overloaded",
     );

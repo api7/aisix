@@ -1043,7 +1043,7 @@ async fn dispatch(
     };
 
     if is_tool_call {
-        let (response, transport_refusal) = name_transport_refusal(state, response).await;
+        let (response, transport_refusal) = name_transport_refusal(response).await;
         let capture = capture_cap.map(|cap| {
             tool_call_capture(cap, captured_args.as_deref(), captured_result.as_deref())
         });
@@ -1075,19 +1075,13 @@ async fn dispatch(
 /// naming why, and nothing else carries that to the row. A body rendered in this
 /// process, so reading it delays no one.
 async fn name_transport_refusal(
-    state: &ProxyState,
     response: Response,
 ) -> (Response, Option<crate::error::ProxyError>) {
     if !response.status().is_client_error() {
         return (response, None);
     }
     let (parts, body) = response.into_parts();
-    let bytes = to_bytes(
-        body,
-        crate::error::body_read_cap(state.request_body_limit_bytes),
-    )
-    .await
-    .unwrap_or_default();
+    let bytes = to_bytes(body, usize::MAX).await.unwrap_or_default();
     let detail = aisix_gateway::upstream_error_message(&bytes);
     let refusal = (!detail.trim().is_empty()).then_some(crate::error::ProxyError::Bridge(
         aisix_gateway::BridgeError::InvalidRequest(detail),

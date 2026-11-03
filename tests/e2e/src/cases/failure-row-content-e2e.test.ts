@@ -416,6 +416,11 @@ describe("failure rows carry request and response bodies", () => {
 
   afterAll(async () => {
     await app?.exit();
+    if (etcdReachable) {
+      for (const logstore of [FULL, META, CAPPED]) {
+        expect(expectFailureRowsNamed(sls!, logstore)).toBeGreaterThan(0);
+      }
+    }
     for (const upstream of upstreams) await upstream.close();
     await mcpUpstream?.close();
     for (const server of tcpServers) server.close();
