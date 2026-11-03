@@ -571,7 +571,8 @@ pub(crate) async fn verify_login_id_token(
 
 /// What a session keeps of an ID token: every claim, so that a claim mapping or
 /// bound claim added after sign-in reads the same token a JWT caller would
-/// present, less those that describe the token rather than the person.
+/// present, less those that describe the token rather than the person. `iss`
+/// stays: it is what binds the session to the identity provider that issued it.
 pub(crate) fn session_claims(claims: &serde_json::Value) -> serde_json::Value {
     const ABOUT_THE_TOKEN: [&str; 8] = [
         "exp",
@@ -760,6 +761,7 @@ pub(crate) async fn authenticate_jwt(
         Some(Arc::new(JwtIdentity::new(
             subject,
             prov.name.clone(),
+            prov.issuer.clone(),
             claim_mapping,
             Arc::from(token),
         ))),
@@ -2686,6 +2688,7 @@ mod session_claims_tests {
     #[test]
     fn everything_about_the_person_is_kept_and_nothing_about_the_token() {
         let claims = serde_json::json!({
+            "iss": "https://idp.example.com",
             "sub": "alice",
             "email": "alice@example.com",
             "org": {"team": "x", "exp": 1},
@@ -2695,6 +2698,7 @@ mod session_claims_tests {
         assert_eq!(
             session_claims(&claims),
             serde_json::json!({
+                "iss": "https://idp.example.com",
                 "sub": "alice",
                 "email": "alice@example.com",
                 "org": {"team": "x", "exp": 1},
