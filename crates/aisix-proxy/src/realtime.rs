@@ -1617,6 +1617,11 @@ mod tests {
                 Some(&b"23\r\n{\"error\":{\"mess"[..]),
             ),
             (
+                "a later chunk cut short",
+                vec![("transfer-encoding", "chunked")],
+                Some(&b"3\r\nabc\r\n5\r\nde"[..]),
+            ),
+            (
                 "a chunked body with no last chunk",
                 vec![("transfer-encoding", "chunked")],
                 Some(&b"3\r\nabc\r\n"[..]),
