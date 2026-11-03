@@ -1089,9 +1089,9 @@ async fn name_transport_refusal(
     .await
     .unwrap_or_default();
     let detail = aisix_gateway::upstream_error_message(&bytes);
-    let refusal = (!detail.trim().is_empty()).then(|| {
-        crate::error::ProxyError::Bridge(aisix_gateway::BridgeError::InvalidRequest(detail))
-    });
+    let refusal = (!detail.trim().is_empty()).then_some(crate::error::ProxyError::Bridge(
+        aisix_gateway::BridgeError::InvalidRequest(detail),
+    ));
     (Response::from_parts(parts, Body::from(bytes)), refusal)
 }
 

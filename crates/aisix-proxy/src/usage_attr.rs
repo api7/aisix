@@ -1366,8 +1366,8 @@ fn attach_gateway_embedding_audit(event: &mut UsageEvent) {
 mod tests {
     use super::*;
 
-    /// No route reaches the fallback today: each names its failure. This is
-    /// the chokepoint's own guarantee for the one that forgets, at the sink
+    /// Routes name their failures, so no request drives this fallback. It is
+    /// the chokepoint's own guarantee for one that forgets, read at the sink
     /// every consumer of the event reads.
     #[tokio::test]
     async fn emit_usage_names_a_failure_row_nothing_named() {
