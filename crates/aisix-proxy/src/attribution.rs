@@ -243,6 +243,13 @@ pub(crate) struct CancelContext {
     /// An ensemble's returned sub-calls, while no exit of the request's own
     /// has settled them. See [`crate::chat::PendingEnsemble`].
     pub ensemble: Option<crate::chat::PendingEnsemble>,
+    /// The request body as every failure row of this request reports it; only
+    /// ever set under a full-content export. See
+    /// [`crate::usage_attr::note_failure_request`].
+    pub failure_request: Option<aisix_obs::CapturedContent>,
+    /// What the caller is being sent for this failure. See
+    /// [`crate::usage_attr::note_client_error`].
+    pub client_error_body: Option<String>,
 }
 
 /// A streamed response's access-log line, parked by its handler until the
@@ -764,9 +771,17 @@ impl RequestAttribution {
     }
 
     /// A cell whose upstream responses record `names` for the exporters.
-    pub(crate) fn with_response_headers(names: Vec<String>) -> Self {
+    pub(crate) fn with_response_headers(
+        names: Vec<String>,
+        keeps_error_bodies: bool,
+        request_id: String,
+    ) -> Self {
         Self {
-            response_tap: Arc::new(aisix_gateway::ResponseHeaderTap::new(names)),
+            response_tap: Arc::new(aisix_gateway::ResponseHeaderTap::new(
+                names,
+                keeps_error_bodies,
+                request_id,
+            )),
             ..Self::default()
         }
     }
@@ -1638,6 +1653,23 @@ pub(crate) fn take_attempt_upstream_response(
             a.response_tap.take()
         })
         .unwrap_or_default()
+}
+
+/// See [`CancelContext::failure_request`].
+pub(crate) fn note_failure_request(content: aisix_obs::CapturedContent) {
+    with_cancel(|c| c.failure_request = Some(content));
+}
+
+/// See [`CancelContext::client_error_body`].
+pub(crate) fn note_client_error_body(body: String) {
+    with_cancel(|c| c.client_error_body = Some(body));
+}
+
+/// The noted request body and client error body, for a failure row.
+pub(crate) fn failure_notes() -> (Option<aisix_obs::CapturedContent>, Option<String>) {
+    let mut notes = (None, None);
+    with_cancel(|c| notes = (c.failure_request.clone(), c.client_error_body.clone()));
+    notes
 }
 
 /// The streamed output captured so far, moved out (see

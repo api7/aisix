@@ -349,7 +349,11 @@ pub enum BridgeError {
     /// the structured fields and [`wire`] to produce a client-shape
     /// envelope; `message` is kept around for logs and as a
     /// last-resort fallback if a parsed field is missing.
-    #[error("upstream returned HTTP {status}: {message}")]
+    ///
+    /// `message` also decides the client's envelope (blank falls back to the
+    /// status and reason phrase), so the explanation of a blank one lives in
+    /// the error's `Display` and never in this field.
+    #[error("{}", upstream_status_display(*.status, .message, .read_error.as_deref()))]
     UpstreamStatus {
         status: u16,
         message: String,
@@ -359,6 +363,9 @@ pub enum BridgeError {
         parsed: Option<Box<UpstreamErrorView>>,
         wire: UpstreamWire,
         retry_after: Option<Duration>,
+        /// Why the error response's body could not be read to its end. See
+        /// [`read_body_capped`].
+        read_error: Option<String>,
     },
     /// A 2xx model answer the gateway could not read. Never retried,
     /// failed over or counted toward cooldown: the upstream already served
@@ -470,6 +477,7 @@ impl BridgeError {
             parsed: None,
             wire: UpstreamWire::Unknown,
             retry_after: None,
+            read_error: None,
         }
     }
 
@@ -486,8 +494,63 @@ impl BridgeError {
             parsed: None,
             wire: UpstreamWire::Unknown,
             retry_after,
+            read_error: None,
         }
     }
+
+    /// Record that the error response behind this `UpstreamStatus` could not
+    /// be read. Whatever arrived before the failure is not the upstream's
+    /// message, so the caller gets the status fallback and the fragment stays
+    /// in the telemetry's copy of the body.
+    pub fn with_body_read_error(mut self, reason: Option<String>) -> Self {
+        if let (
+            Self::UpstreamStatus {
+                message,
+                parsed,
+                read_error,
+                ..
+            },
+            Some(reason),
+        ) = (&mut self, reason)
+        {
+            message.clear();
+            if let Some(view) = parsed {
+                view.message = None;
+            }
+            *read_error = Some(reason);
+        }
+        self
+    }
+}
+
+fn upstream_status_display(status: u16, message: &str, read_error: Option<&str>) -> String {
+    match read_error {
+        Some(reason) => {
+            format!("upstream returned HTTP {status}: failed to read response body: {reason}")
+        }
+        None if message.chars().all(|c| c.is_control() || c.is_whitespace()) => {
+            format!("upstream returned HTTP {status} with no error detail in the response")
+        }
+        None => format!("upstream returned HTTP {status}: {message}"),
+    }
+}
+
+/// A non-JSON-aware route's error message: the body text as sent, bounded.
+pub fn bounded_error_text(body: &[u8]) -> String {
+    String::from_utf8_lossy(body).chars().take(1024).collect()
+}
+
+/// Read a non-2xx answer a proxy route holds itself into an `UpstreamStatus`
+/// with no parsed envelope, `message` deriving its text from the body.
+pub async fn upstream_status_from_response(
+    resp: reqwest::Response,
+    message: impl FnOnce(&[u8]) -> String,
+) -> BridgeError {
+    let status = resp.status().as_u16();
+    let retry_after = parse_retry_after(resp.headers());
+    let body = read_body_capped(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    BridgeError::upstream_status_with_retry_after(status, message(&body.bytes), retry_after)
+        .with_body_read_error(body.read_error)
 }
 
 /// Parse the `Retry-After` response header into a Duration.
@@ -532,7 +595,10 @@ pub async fn capture_upstream_error_http(
     parse: impl FnOnce(&[u8]) -> Option<UpstreamErrorView>,
 ) -> BridgeError {
     let retry_after = parse_retry_after(resp.headers());
-    let body = read_body_capped(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    let UpstreamErrorBody {
+        bytes: body,
+        read_error,
+    } = read_body_capped(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
     // Parse the error envelope opportunistically, regardless of the
     // upstream's Content-Type (#543). OpenAI's 401 `invalid_api_key`
     // path (and edge / proxy layers fronting some upstreams) return the
@@ -569,7 +635,9 @@ pub async fn capture_upstream_error_http(
         parsed: parsed.map(Box::new),
         wire,
         retry_after,
+        read_error: None,
     }
+    .with_body_read_error(read_error)
 }
 
 /// The human-readable message of an upstream error body: `error.message`
@@ -728,18 +796,27 @@ pub fn capture_in_band_error_value(
     })
 }
 
-/// Read the response body, stopping after `limit` bytes. Used to bound
-/// upstream-error parsing cost regardless of `Content-Length`. Errors
-/// during read surface as an empty buffer — the caller falls through
-/// to a parse-failure path and emits the generic `upstream_error`
-/// envelope, which matches the pre-fix behaviour for that edge.
+/// An upstream error response's body as far as it could be read.
+pub struct UpstreamErrorBody {
+    pub bytes: bytes::Bytes,
+    /// Why reading stopped early, `None` when the body arrived whole.
+    pub read_error: Option<String>,
+}
+
+/// Read an upstream error response's body, keeping at most `limit` bytes.
+/// Used to bound upstream-error parsing cost regardless of `Content-Length`.
+/// THE read of every non-2xx upstream body: it hands the bytes to the request's
+/// full-content exports ([`crate::response_tap::note_upstream_error_body`])
+/// and logs a failed read.
 ///
 /// Public so non-OpenAI / non-Anthropic bridges (Vertex, Azure) can
 /// enforce the same cap when they need a custom parse path (e.g.
 /// extracting only `kind` from the upstream envelope while suppressing
 /// the `message` for operator-taxonomy redaction).
-pub async fn read_body_capped(resp: reqwest::Response, limit: usize) -> bytes::Bytes {
+pub async fn read_body_capped(resp: reqwest::Response, limit: usize) -> UpstreamErrorBody {
     use futures::StreamExt;
+    let status = resp.status().as_u16();
+    let mut read_error = None;
     let mut buf = bytes::BytesMut::with_capacity(limit.min(16 * 1024));
     let mut stream = resp.bytes_stream();
     // Continue draining the stream past `limit` so the underlying
@@ -750,7 +827,15 @@ pub async fn read_body_capped(resp: reqwest::Response, limit: usize) -> bytes::B
     // error responses. The extra reads only discard bytes; memory
     // stays bounded by `limit`.
     while let Some(chunk) = stream.next().await {
-        let Ok(chunk) = chunk else { break };
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                let reason = crate::upstream_http::transport_error_message(&e);
+                crate::response_tap::warn_error_body_unread(status, &reason);
+                read_error = Some(reason);
+                break;
+            }
+        };
         if buf.len() >= limit {
             continue;
         }
@@ -758,7 +843,9 @@ pub async fn read_body_capped(resp: reqwest::Response, limit: usize) -> bytes::B
         let take = chunk.len().min(remaining);
         buf.extend_from_slice(&chunk[..take]);
     }
-    buf.freeze()
+    let bytes = buf.freeze();
+    crate::response_tap::note_upstream_error_body(&bytes);
+    UpstreamErrorBody { bytes, read_error }
 }
 
 /// Content-Type token starts with `application/json` (RFC 7231 §3.1.1.1
@@ -1077,6 +1164,33 @@ pub trait Bridge: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wording of a blank message is the error's `Display`, and its
+    /// `message` stays blank for the client's status fallback.
+    #[test]
+    fn upstream_status_display_names_what_a_blank_message_means() {
+        for blank in ["", " \n", "\u{1}\u{2028}"] {
+            let err = BridgeError::upstream_status(404, blank);
+            assert_eq!(
+                err.to_string(),
+                "upstream returned HTTP 404 with no error detail in the response"
+            );
+        }
+        let err = BridgeError::upstream_status(502, "fragment")
+            .with_body_read_error(Some("connection reset".into()));
+        assert_eq!(
+            err.to_string(),
+            "upstream returned HTTP 502: failed to read response body: connection reset"
+        );
+        let BridgeError::UpstreamStatus { message, .. } = err else {
+            unreachable!()
+        };
+        assert_eq!(message, "");
+        assert_eq!(
+            BridgeError::upstream_status(400, "bad param").to_string(),
+            "upstream returned HTTP 400: bad param"
+        );
+    }
     use crate::chat::{
         ChatFormat, ChatMessage, ChatResponse, EmbeddingRequest, FinishReason, UsageStats,
     };

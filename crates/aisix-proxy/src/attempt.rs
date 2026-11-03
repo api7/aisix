@@ -876,6 +876,7 @@ mod tests {
             parsed: None,
             wire: UpstreamWire::OpenAI,
             retry_after: None,
+            read_error: None,
         }
     }
 

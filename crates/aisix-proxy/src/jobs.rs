@@ -438,9 +438,19 @@ async fn send_upstream(
     aisix_gateway::note_upstream_response(&headers);
     let bytes = resp.bytes().await;
     crate::attribution::note_upstream_wait_end(bytes.is_ok());
+    if let (false, Ok(body)) = (status.is_success(), &bytes) {
+        aisix_gateway::note_upstream_error_body(body);
+    }
     let bytes = bytes
         .map_err(|e| {
-            let err = aisix_gateway::BridgeError::UpstreamDecode(e.to_string());
+            let err = if status.is_success() {
+                aisix_gateway::BridgeError::UpstreamDecode(e.to_string())
+            } else {
+                let reason = aisix_gateway::transport_error_message(&e);
+                aisix_gateway::warn_error_body_unread(status.as_u16(), &reason);
+                aisix_gateway::BridgeError::upstream_status(status.as_u16(), "")
+                    .with_body_read_error(Some(reason))
+            };
             note_deployment(err.http_status());
             crate::cooldown::note_failure(
                 &state.runtime_status,
@@ -837,6 +847,7 @@ fn finish(
         }
         Err(err) => {
             let status = err.status().as_u16();
+            crate::usage_attr::note_client_error(snapshot, &err);
             emit_access_log(
                 &method,
                 &path,
@@ -963,6 +974,10 @@ pub(crate) async fn create_file(
         let mut form = reqwest::multipart::Form::new();
         let mut form_model: Option<String> = None;
         let mut saw_file = false;
+        // The upload as a failure row reports it: the text fields, with the
+        // file represented by its checksum (the audio convention).
+        let capture = crate::usage_attr::content_cap(&state.snapshot.load()).is_some();
+        let mut captured = serde_json::Map::new();
 
         while let Some(field) = multipart.next_field().await.map_err(|e| {
             crate::error::proxy_error_from_multipart(
@@ -995,6 +1010,13 @@ pub(crate) async fn create_file(
                         "failed to read file field",
                     )
                 })?;
+                if capture {
+                    use sha2::Digest;
+                    captured.insert(
+                        "file_sha256".to_string(),
+                        format!("{:x}", sha2::Sha256::digest(&bytes)).into(),
+                    );
+                }
                 // Over the `Bytes` itself, not a `Vec` copy of the file.
                 let len = bytes.len() as u64;
                 let mut part =
@@ -1015,6 +1037,9 @@ pub(crate) async fn create_file(
                     "malformed multipart field",
                 )
             })?;
+            if capture {
+                captured.insert(name.clone(), v.clone().into());
+            }
             form = form.text(name, v);
         }
 
@@ -1026,6 +1051,7 @@ pub(crate) async fn create_file(
 
         let wanted = form_model.or_else(|| explicit_model(&params, &headers));
         let snapshot = &**snapshot.insert(state.snapshot.load());
+        crate::usage_attr::note_failure_request(snapshot, || Value::Object(captured).to_string());
         let target = resolve_target(snapshot, &auth, wanted.as_deref(), &client)?;
 
         let _reservation = crate::quota::enforce(
@@ -1238,6 +1264,9 @@ pub(crate) async fn create_batch(
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
+    crate::usage_attr::note_failure_request(&snapshot, || {
+        String::from_utf8_lossy(&body).into_owned()
+    });
 
     let result = async {
         let mut req_json: Value = serde_json::from_slice(&body)
@@ -1545,6 +1574,9 @@ pub(crate) async fn create_ft_job(
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
+    crate::usage_attr::note_failure_request(&snapshot, || {
+        String::from_utf8_lossy(&body).into_owned()
+    });
 
     let result = async {
         let mut req_json: Value = serde_json::from_slice(&body)
@@ -1784,6 +1816,11 @@ async fn forward_simple(
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
+    if let Some(body) = &spec.body {
+        crate::usage_attr::note_failure_request(&snapshot, || {
+            String::from_utf8_lossy(body).into_owned()
+        });
+    }
 
     let result = async {
         let embedded = match &spec.id {

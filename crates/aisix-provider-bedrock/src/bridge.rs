@@ -5083,6 +5083,7 @@ mod tests {
                 wire,
                 retry_after,
                 parsed,
+                ..
             } => {
                 assert_eq!(status, 429);
                 assert_eq!(message, "Rate exceeded", "the upstream's own message");

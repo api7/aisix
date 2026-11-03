@@ -292,6 +292,7 @@ pub async fn transcriptions(
             // requested_model is empty; status + error class still identify it.
             // Per #655: one zero-token event per failed upstream attempt,
             // the last of them terminal when every attempt failed.
+            crate::usage_attr::note_client_error(&snapshot, &err);
             let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
             crate::usage_attr::emit_failed_attempts(
                 &state,
@@ -526,6 +527,7 @@ pub async fn translations(
             // extracted on the multipart error path → empty requested_model).
             // Per #655: one zero-token event per failed upstream attempt,
             // the last of them terminal when every attempt failed.
+            crate::usage_attr::note_client_error(&snapshot, &err);
             let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
             crate::usage_attr::emit_failed_attempts(
                 &state,
@@ -787,6 +789,7 @@ pub async fn speech(
             // zero-token event (status + error class).
             // Per #655: one zero-token event per failed upstream attempt,
             // the last of them terminal when every attempt failed.
+            crate::usage_attr::note_client_error(&snapshot, &err);
             let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
             crate::usage_attr::emit_failed_attempts(
                 &state,
@@ -1144,6 +1147,42 @@ fn observe_transcript_events(
 
 /// Collect all multipart fields, resolve the model, swap in the upstream
 /// model id, then rebuild and forward the multipart form.
+/// A multipart request as content capture represents it. See the capture site.
+fn captured_transcription_fields(
+    fields: &[(String, Option<String>, Option<String>, Bytes)],
+) -> String {
+    use sha2::Digest;
+    let mut obj = serde_json::Map::new();
+    // Appends on a repeated name (multipart allows repeats and all are
+    // forwarded) so no field disappears from the export. The filename is
+    // deliberately NOT captured — it is user-controlled text that skips
+    // the redaction path; the checksum alone represents the file,
+    // matching LiteLLM.
+    let mut push = |key: String, value: String| match obj.get_mut(&key) {
+        Some(Value::String(existing)) => {
+            existing.push('\n');
+            existing.push_str(&value);
+        }
+        _ => {
+            obj.insert(key, Value::String(value));
+        }
+    };
+    for (name, _, _, data) in fields {
+        match std::str::from_utf8(data) {
+            Ok(text) if name != "file" => {
+                push(name.clone(), text.to_string());
+            }
+            _ => {
+                push(
+                    format!("{name}_sha256"),
+                    format!("{:x}", sha2::Sha256::digest(data)),
+                );
+            }
+        }
+    }
+    serde_json::to_string(&Value::Object(obj)).unwrap_or_default()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn multipart_dispatch(
     state: &ProxyState,
@@ -1210,6 +1249,7 @@ async fn multipart_dispatch(
     });
 
     let snapshot = &**snapshot_out.insert(state.snapshot.load());
+    crate::usage_attr::note_failure_request(snapshot, || captured_transcription_fields(&fields));
     let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
@@ -1292,6 +1332,17 @@ async fn multipart_dispatch(
                     reason = %reason,
                     "guardrail blocked audio request (prompt field)",
                 );
+                // A blocked request exports what the success path would have sent.
+                if crate::usage_attr::content_cap(snapshot).is_some() {
+                    crate::dispatch::mask_prompt_fields(
+                        &resolved_chain,
+                        &mut fields,
+                        &mut redactions,
+                    );
+                    crate::usage_attr::note_failure_request(snapshot, || {
+                        captured_transcription_fields(&fields)
+                    });
+                }
                 return Err(crate::error::guardrail_block_error(
                     "request",
                     guardrail_name.as_deref(),
@@ -1299,21 +1350,7 @@ async fn multipart_dispatch(
                 ));
             }
         }
-        if aisix_guardrails::Guardrail::redacts_input(&resolved_chain) {
-            for (name, _, _, data) in fields.iter_mut() {
-                if name != "prompt" {
-                    continue;
-                }
-                if let Ok(text) = std::str::from_utf8(data) {
-                    if let Some(r) =
-                        aisix_guardrails::Guardrail::redact_input_text(&resolved_chain, text)
-                    {
-                        *data = Bytes::from(r.text.into_bytes());
-                        crate::redact::merge_counts(&mut redactions, r.counts);
-                    }
-                }
-            }
-        }
+        crate::dispatch::mask_prompt_fields(&resolved_chain, &mut fields, &mut redactions);
     }
 
     // Content capture (#700, LiteLLM parity): the audio bytes are NOT
@@ -1328,38 +1365,10 @@ async fn multipart_dispatch(
             .iter()
             .map(|e| &e.value),
     );
-    let captured_prompt = content_cap.map(|_| {
-        use sha2::Digest;
-        let mut obj = serde_json::Map::new();
-        // Appends on a repeated name (multipart allows repeats and all are
-        // forwarded) so no field disappears from the export. The filename is
-        // deliberately NOT captured — it is user-controlled text that skips
-        // the redaction path; the checksum alone represents the file,
-        // matching LiteLLM.
-        let mut push = |key: String, value: String| match obj.get_mut(&key) {
-            Some(Value::String(existing)) => {
-                existing.push('\n');
-                existing.push_str(&value);
-            }
-            _ => {
-                obj.insert(key, Value::String(value));
-            }
-        };
-        for (name, _, _, data) in &fields {
-            match std::str::from_utf8(data) {
-                Ok(text) if name != "file" => {
-                    push(name.clone(), text.to_string());
-                }
-                _ => {
-                    push(
-                        format!("{name}_sha256"),
-                        format!("{:x}", sha2::Sha256::digest(data)),
-                    );
-                }
-            }
-        }
-        serde_json::to_string(&Value::Object(obj)).unwrap_or_default()
-    });
+    let captured_prompt = content_cap.map(|_| captured_transcription_fields(&fields));
+    if let Some(prompt) = &captured_prompt {
+        crate::usage_attr::note_failure_request(snapshot, || prompt.clone());
+    }
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
@@ -1550,18 +1559,15 @@ async fn multipart_dispatch(
 
                         let status = resp.status();
                         if !status.is_success() {
-                            let s = status.as_u16();
-                            let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-                            let msg = resp.text().await.unwrap_or_default();
                             return Err(crate::cooldown::note_failure(
                                 tracker,
                                 model_id,
                                 cooldown_cfg,
-                                aisix_gateway::BridgeError::upstream_status_with_retry_after(
-                                    s,
-                                    msg.chars().take(1024).collect::<String>(),
-                                    retry_after,
-                                ),
+                                aisix_gateway::upstream_status_from_response(
+                                    resp,
+                                    aisix_gateway::bounded_error_text,
+                                )
+                                .await,
                             ));
                         }
 
@@ -2113,6 +2119,7 @@ async fn speech_dispatch(
     audit_out: &mut crate::usage_attr::GuardrailAudit,
     routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<SpeechDispatchSuccess, ProxyError> {
+    crate::usage_attr::note_failure_request(snapshot, || body.to_string());
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -2167,6 +2174,11 @@ async fn speech_dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/audio/speech request",
             );
+            // A blocked request exports what the success path would have sent.
+            if crate::usage_attr::content_cap(snapshot).is_some() {
+                crate::redact::redact_speech_request(&resolved_chain, &mut body);
+                crate::usage_attr::note_failure_request(snapshot, || body.to_string());
+            }
             return Err(crate::error::guardrail_block_error(
                 "request",
                 guardrail_name.as_deref(),
@@ -2179,6 +2191,7 @@ async fn speech_dispatch(
     // AFTER the block check passes, BEFORE the body is forwarded upstream.
     // Pre-#696 a mask-action detector was a silent no-op here.
     let redactions = crate::redact::redact_speech_request(&resolved_chain, &mut body);
+    crate::usage_attr::note_failure_request(snapshot, || body.to_string());
 
     // Content capture (#700, LiteLLM parity): the post-redaction request
     // body (the `input` text to synthesize) is the prompt; the binary audio
@@ -2345,18 +2358,15 @@ async fn speech_dispatch(
 
                     let status = resp.status();
                     if !status.is_success() {
-                        let s = status.as_u16();
-                        let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-                        let msg = resp.text().await.unwrap_or_default();
                         return Err(crate::cooldown::note_failure(
                             tracker,
                             model_id,
                             cooldown_cfg,
-                            aisix_gateway::BridgeError::upstream_status_with_retry_after(
-                                s,
-                                msg.chars().take(1024).collect::<String>(),
-                                retry_after,
-                            ),
+                            aisix_gateway::upstream_status_from_response(
+                                resp,
+                                aisix_gateway::bounded_error_text,
+                            )
+                            .await,
                         ));
                     }
                     Ok(resp)

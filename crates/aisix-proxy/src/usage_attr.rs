@@ -562,6 +562,95 @@ pub(crate) fn apply_caller_identity(
     event.jwt_claim_mapping = sanitize_tag(jwt.claim_mapping.clone().unwrap_or_default());
 }
 
+/// The content cap the snapshot's enabled exporters ask for, `None` when none
+/// of them runs at `content_mode: full`.
+pub(crate) fn content_cap(snap: &AisixSnapshot) -> Option<u32> {
+    aisix_obs::content_capture_cap(
+        snap.observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &e.value),
+    )
+}
+
+/// Hold the request body every failure row of this request reports, in the
+/// representation the endpoint's success path captures. `prompt` runs only
+/// under a full-content export. Call again once a guardrail has masked the
+/// request: the latest note is the one reported.
+pub(crate) fn note_failure_request(snap: &AisixSnapshot, prompt: impl FnOnce() -> String) {
+    if let Some(cap) = content_cap(snap) {
+        crate::attribution::note_failure_request(aisix_obs::CapturedContent::new(
+            &prompt(),
+            "",
+            cap as usize,
+        ));
+    }
+}
+
+/// Hold the error body the caller is about to be sent, for the terminal
+/// failure row. Only a full-content export reads it.
+pub(crate) fn note_client_error(snap: &AisixSnapshot, err: &ProxyError) {
+    note_client_error_body(snap, || {
+        serde_json::to_string(&err.envelope()).unwrap_or_default()
+    });
+}
+
+/// [`note_client_error`] for a route that does not answer with the OpenAI
+/// envelope.
+pub(crate) fn note_client_error_body(snap: &AisixSnapshot, body: impl FnOnce() -> String) {
+    if content_cap(snap).is_some() {
+        crate::attribution::note_client_error_body(body());
+    }
+}
+
+/// What a failure row exports (AISIX-Cloud#1921): the request body and
+/// the attempt's upstream response body, or, for an attempt no upstream
+/// answered, the gateway's own error body. `None` for any other row, whose
+/// `content` stands as given.
+fn failure_row_content(
+    event: &UsageEvent,
+    content: Option<&aisix_obs::CapturedContent>,
+    upstream_body: Option<&[u8]>,
+    terminal: bool,
+    cap: usize,
+) -> Option<aisix_obs::CapturedContent> {
+    if event.status_code < 400 && event.error_class.is_empty() {
+        return None;
+    }
+    let (noted_request, noted_error) = crate::attribution::failure_notes();
+    let row = match content {
+        Some(c) if !c.prompt.is_empty() => c.clone(),
+        given => {
+            let request = noted_request.or_else(|| given.cloned());
+            request.unwrap_or_else(|| aisix_obs::CapturedContent::new("", "", cap))
+        }
+    };
+    if !row.response.is_empty() {
+        return Some(row);
+    }
+    // A stream that failed mid-way ends with no finish reason, which is what
+    // the structured output field needs: what it delivered goes here instead.
+    let delivered = row
+        .output
+        .as_ref()
+        .and_then(aisix_obs::OutputCapture::parts_json)
+        .map(|parts| serde_json::Value::Array(parts).to_string());
+    let response = match (delivered, upstream_body.filter(|b| !b.is_empty())) {
+        (Some(delivered), _) => delivered,
+        (None, Some(body)) => String::from_utf8_lossy(body).into_owned(),
+        (None, None) => noted_error.filter(|_| terminal).unwrap_or_else(|| {
+            let message = if event.error_message.is_empty() {
+                format!("request failed with status {}", event.status_code)
+            } else {
+                event.error_message.clone()
+            };
+            serde_json::json!({ "error": { "message": message, "type": event.error_class } })
+                .to_string()
+        }),
+    };
+    Some(row.with_response(&response, cap))
+}
+
 /// Emit ONE zero-token `UsageEvent` for a FAILED request on a non-chat handler
 /// (completions / embeddings / rerank / audio / images / passthrough / jobs /
 /// realtime), so the dashboard Logs and budget ledger surface the failure
@@ -1060,8 +1149,10 @@ pub(crate) fn emit_usage(
         &mut event.error_class,
         &mut event.error_message,
     );
+    let mut upstream_error_body = None;
     if dispatched {
         let response = crate::attribution::take_attempt_upstream_response(event.attempt_index);
+        upstream_error_body = response.error_body;
         // A surface that runs detached from the request scope (`/v1/realtime`)
         // read its own off the upgrade response.
         if event.upstream_response_headers.is_empty() {
@@ -1170,6 +1261,17 @@ pub(crate) fn emit_usage(
         },
         other => other,
     };
+    let failure_content = aisix_obs::content_capture_cap(exporters.iter().map(|e| &e.value))
+        .and_then(|cap| {
+            failure_row_content(
+                &event,
+                content,
+                upstream_error_body.as_deref(),
+                terminal,
+                cap as usize,
+            )
+        });
+    let content = failure_content.as_ref().or(content);
     // Export-only span facts: the request-scoped ones the bundle holds, and
     // this event's own upstream, read off the request's snapshot. Only the
     // OTLP encoder reads them, so nothing is resolved without one.

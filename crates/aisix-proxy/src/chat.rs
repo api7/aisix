@@ -245,10 +245,7 @@ pub async fn chat_completions(
                 &client,
                 &applied_guardrails,
                 &success.routing.attempts,
-                // The winner's success event carries the content.
-                /* content_for_last */
-                None,
-                // ...and the terminal trace spans.
+                // The winner's success event carries the terminal trace spans.
                 /* terminal_last */
                 false,
                 &audit,
@@ -515,33 +512,11 @@ pub async fn chat_completions(
             // (AISIX-Cloud#1428).
             let guardrail_blocked = err.is_guardrail_block();
             let model_id_str = resolved_model_id.as_deref().unwrap_or("");
-            // AISIX-Cloud#1013: failed requests carry the (post-mask)
-            // request body so a 4xx/5xx can be triaged from the log alone.
-            // Same opt-in gate and cap as the success path; 401/403 stay
-            // body-less (a 401 here is upstream-auth passthrough — caller
-            // 401s are rejected by the auth extractor before any event
-            // exists) — the body adds nothing to an authorization
-            // failure and callers probing keys shouldn't get their
-            // payloads archived.
-            let mut failure_content = if status == 401 || status == 403 {
-                None
-            } else {
-                content_capture_cap(
-                    snapshot
-                        .observability_exporters
-                        .entries()
-                        .iter()
-                        .map(|e| &e.value),
-                )
-                .map(|cap| CapturedContent::new(&captured_request_json(&req), "", cap as usize))
-            };
-            // When every target failed there is no terminal event below —
-            // the content rides the last failed attempt instead.
-            let content_for_last = if charge.is_none() && !routing.attempts.is_empty() {
-                failure_content.take()
-            } else {
-                None
-            };
+            // Every failure row of this request reports the (post-mask)
+            // request body and, without an upstream answer, this error body
+            // (AISIX-Cloud#1013, #1921).
+            crate::usage_attr::note_failure_request(&snapshot, || captured_request_json(&req));
+            crate::usage_attr::note_client_error(&snapshot, &err);
             // Per #655: emit one zero-token event for each FAILED attempt.
             // `applied_guardrails` (resolved by `dispatch`) is recorded on
             // every attempt so an input-blocked / failed request still
@@ -555,7 +530,6 @@ pub async fn chat_completions(
                 &client,
                 &applied_guardrails,
                 &routing.attempts,
-                content_for_last,
                 // All-failed (no charge): the last failed attempt is the
                 // request's terminal emission. With a charge, the
                 // billed-then-blocked event below is terminal instead.
@@ -644,7 +618,7 @@ pub async fn chat_completions(
                         /* cost_usd */ 0.0,
                         guardrail_blocked,
                         &client,
-                        failure_content.take(),
+                        None,
                         /* terminal */ true,
                         // Billed-then-blocked: the upstream answered.
                         /* dispatched */
@@ -697,7 +671,7 @@ pub async fn chat_completions(
                         /* cost_usd */ 0.0,
                         guardrail_blocked,
                         &client,
-                        failure_content.take(),
+                        None,
                         /* terminal */ true,
                         // Pre-dispatch failure: no upstream was contacted;
                         // `elapsed` is handler time, not an upstream call.
@@ -1670,6 +1644,7 @@ async fn dispatch(
         redactions_out,
         crate::redact::redact_chat_format(resolved_chain.as_ref(), req),
     );
+    crate::usage_attr::note_failure_request(snapshot, || captured_request_json(req));
 
     // Key-level budgets, decided from the pushed budget documents.
     crate::budget::enforce_key(state, snapshot, auth).map_err(&with_model)?;
@@ -5100,12 +5075,6 @@ fn emit_failed_attempts(
     client: &ClientContext,
     applied_guardrails: &[AppliedGuardrail],
     attempts: &[AttemptRecord],
-    // AISIX-Cloud#1013: when every target failed there is no terminal
-    // event, so the captured request body rides the LAST failed attempt —
-    // the one whose status the caller saw. Other attempts (and the
-    // success-path caller) stay content-less to avoid duplicating a large
-    // prompt across N events.
-    mut content_for_last: Option<CapturedContent>,
     // AISIX-Cloud#1279: on the all-failed path the LAST failed attempt's
     // event is the request's terminal emission (there is no other), so it
     // carries the trace's SERVER + logical spans. False on the success
@@ -5117,11 +5086,6 @@ fn emit_failed_attempts(
 ) {
     let last_failed = attempts.iter().rposition(|a| !a.success);
     for (i, rec) in attempts.iter().enumerate().filter(|(_, a)| !a.success) {
-        let content = if Some(i) == last_failed {
-            content_for_last.take()
-        } else {
-            None
-        };
         // Each failed attempt hit its own target, hence its own key.
         let pk = crate::usage_attr::ResolvedPk::resolve(snap, &rec.provider_key_id);
         emit_usage_event(
@@ -5154,7 +5118,7 @@ fn emit_failed_attempts(
             /* cost_usd */ 0.0,
             /* guardrail_blocked */ false,
             client,
-            content,
+            None,
             /* terminal */ terminal_last && Some(i) == last_failed,
             // The record's own network-boundary fact: a rate-limit-refused
             // attempt never reached an upstream.
@@ -5471,7 +5435,6 @@ fn emit_failed_subcall(
             latency_ms: failure.latency_ms,
             dispatched: failure.dispatched,
         }],
-        /* content_for_last */ None,
         /* terminal_last */ false,
         &ctx.audit,
     );

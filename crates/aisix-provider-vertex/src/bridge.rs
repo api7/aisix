@@ -611,8 +611,10 @@ where
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     let retry_after = aisix_gateway::parse_retry_after(resp.headers());
     let is_json = aisix_gateway::response_is_json(&resp);
-    let body =
-        aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    let aisix_gateway::UpstreamErrorBody {
+        bytes: body,
+        read_error,
+    } = aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
     // Skip the serde parse on non-JSON bodies (HTML / text error pages
     // from a fronting WAF or load balancer). Same guard as
     // `capture_upstream_error_http`.
@@ -632,7 +634,9 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
         parsed,
         wire: aisix_gateway::UpstreamWire::Vertex,
         retry_after,
+        read_error: None,
     }
+    .with_body_read_error(read_error)
 }
 
 /// Extract just the `error.status` field (the gRPC canonical code) from

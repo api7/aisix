@@ -23,8 +23,7 @@ import {
 //
 //   1. upstream failure (chat)        → record carries `input_messages`
 //   2. guardrail input block 422      → record carries `input_messages`
-//   3. 403 model-forbidden            → record exists WITHOUT any content
-//      (auth-class failures stay body-less by design)
+//   3. 403 model-forbidden            → record carries `input_messages`
 //   4. /v1/messages upstream failure  → record carries `input_messages`
 //   5. /v1/responses upstream failure → record carries `input_messages`
 //
@@ -166,8 +165,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: okPk.id,
     });
-    // Second hard-failing target so a routing group can fail on BOTH
-    // targets (content must ride the LAST attempt only).
+    // Second hard-failing target so a routing group can fail on BOTH targets.
     await seed.createModel({
       display_name: "failure-content-fail-b",
       provider: "openai",
@@ -185,8 +183,8 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
         ],
       },
     });
-    // Fail-then-recover group: the failed attempt must stay content-less
-    // while the winner's success event carries the prompt.
+    // Fail-then-recover group: both the failed attempt and the winner's
+    // success event carry the prompt.
     await seed.createModel({
       display_name: "failure-content-recover",
       routing: {
@@ -279,10 +277,9 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       (l) => (l.get("input_messages") ?? "").includes(UPSTREAM_FAIL_SENTINEL),
       "failed-upstream chat record with prompt",
     );
-    // It is the FAILED request's record: non-2xx status, no response text.
+    // It is the FAILED request's record: non-2xx status, the upstream's answer.
     expect(Number(log.get("status_code"))).toBeGreaterThanOrEqual(400);
-    // The empty response stays the flat field it always was.
-    expect(log.get("response")).toBe("");
+    expect(log.get("response")).toContain("mock upstream exploded");
     expect(log.has("output_messages")).toBe(false);
     // The request's messages, in the GenAI conventions' shape.
     const input = JSON.parse(log.get("input_messages")!) as Array<{
@@ -310,7 +307,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     expect(log.get("guardrail_blocked")).toBe("true");
   });
 
-  test("403 model-forbidden: the record exists but stays body-less", async (ctx) => {
+  test("403 model-forbidden: the record carries the prompt", async (ctx) => {
     if (!etcdReachable || !app || !sls) {
       ctx.skip();
       return;
@@ -318,7 +315,6 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     const res = await chat("failure-content-offlimits", FORBIDDEN_MODEL_SENTINEL);
     expect(res.status).toBe(403);
 
-    // The 403 event lands in SLS…
     const log = await waitForLog(
       sls,
       (l) =>
@@ -326,14 +322,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
         (l.get("requested_model") ?? "") === "failure-content-offlimits",
       "403 record",
     );
-    // …but carries no content, and the sentinel never reaches the logstore.
-    expect(log.get("prompt")).toBeUndefined();
-    expect(log.get("input_messages")).toBeUndefined();
-    for (const l of logsFor(sls, FULL_LOGSTORE)) {
-      for (const v of l.values()) {
-        expect(v).not.toContain(FORBIDDEN_MODEL_SENTINEL);
-      }
-    }
+    expect(log.get("input_messages")).toContain(FORBIDDEN_MODEL_SENTINEL);
   });
 
   test("/v1/messages upstream failure: the record carries the prompt", async (ctx) => {
@@ -423,7 +412,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     }
   });
 
-  test("all targets failed: exactly one record carries the prompt, on the last attempt", async (ctx) => {
+  test("all targets failed: every attempt's record carries the prompt", async (ctx) => {
     if (!etcdReachable || !app || !sls) {
       ctx.skip();
       return;
@@ -439,25 +428,19 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     const requestId = withPrompt.get("request_id")!;
     expect(requestId).toBeTruthy();
 
-    // Both attempts produced a record…
-    const requestLogs = logsFor(sls, FULL_LOGSTORE).filter(
-      (l) => l.get("request_id") === requestId,
-    );
-    expect(requestLogs.length).toBeGreaterThanOrEqual(2);
-    // …but exactly ONE carries the prompt, and it is the LAST attempt
-    // (the failure the caller actually saw), not the first.
-    const promptBearers = requestLogs.filter((l) =>
-      (l.get("input_messages") ?? "").includes(GROUP_SENTINEL),
-    );
-    expect(promptBearers.length).toBe(1);
-    const maxAttempt = Math.max(
-      ...requestLogs.map((l) => Number(l.get("attempt_index") ?? "0")),
-    );
-    expect(Number(promptBearers[0]!.get("attempt_index"))).toBe(maxAttempt);
-    expect(maxAttempt).toBeGreaterThanOrEqual(1);
+    const deadline = Date.now() + 10_000;
+    const requestLogs = () =>
+      logsFor(sls!, FULL_LOGSTORE).filter((l) => l.get("request_id") === requestId);
+    while (requestLogs().length < 2 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(requestLogs().length).toBeGreaterThanOrEqual(2);
+    for (const log of requestLogs()) {
+      expect(log.get("input_messages")).toContain(GROUP_SENTINEL);
+    }
   });
 
-  test("fallback recovers: failed attempt stays content-less, the success record carries the prompt", async (ctx) => {
+  test("fallback recovers: the failed attempt and the success record both carry the prompt", async (ctx) => {
     if (!etcdReachable || !app || !sls) {
       ctx.skip();
       return;
@@ -473,20 +456,14 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
       "recovered request's success record with prompt",
     );
     const requestId = successLog.get("request_id")!;
-    // The failed first attempt is recorded — without the prompt.
-    const deadline = Date.now() + 10_000;
-    let failedAttempt: Map<string, string> | undefined;
-    while (Date.now() < deadline && !failedAttempt) {
-      failedAttempt = logsFor(sls, FULL_LOGSTORE).find(
-        (l) =>
-          l.get("request_id") === requestId &&
-          Number(l.get("status_code") ?? "0") >= 400,
-      );
-      if (!failedAttempt) await new Promise((r) => setTimeout(r, 100));
-    }
-    expect(failedAttempt, "failed attempt record").toBeDefined();
-    expect(failedAttempt!.get("prompt")).toBeUndefined();
-    expect(failedAttempt!.get("input_messages")).toBeUndefined();
+    const failedAttempt = await waitForLog(
+      sls,
+      (l) =>
+        l.get("request_id") === requestId && Number(l.get("status_code") ?? "0") >= 400,
+      "failed attempt record",
+    );
+    expect(failedAttempt.get("input_messages")).toContain(RECOVER_SENTINEL);
+    expect(failedAttempt.get("response")).toContain("mock upstream exploded");
   });
 
   test("metadata_only exporter never receives any failed-request prompt", async (ctx) => {

@@ -271,6 +271,7 @@ async fn handle(
                 status,
                 elapsed,
             );
+            crate::usage_attr::note_client_error(&snapshot, &err);
             let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
             crate::usage_attr::emit_failed_attempts(
                 &state,
@@ -344,6 +345,7 @@ async fn dispatch(
     doc: &Json,
     routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<Success, ProxyError> {
+    crate::usage_attr::note_failure_request(snapshot, || String::from_utf8_lossy(raw).into_owned());
     if !matches!(doc, Json::Object(_)) {
         return Err(ProxyError::InvalidRequest(
             "request body must be a JSON object".into(),
@@ -540,20 +542,14 @@ async fn dispatch(
                 aisix_gateway::note_upstream_response(upstream_resp.headers());
                 let status = upstream_resp.status();
                 if !status.is_success() {
-                    let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
-                    let error_body = upstream_resp.bytes().await.unwrap_or_default();
                     return Err(ProxyError::Bridge(crate::cooldown::note_failure(
                         tracker,
                         model_id,
                         cooldown_cfg,
-                        aisix_gateway::BridgeError::upstream_status_with_retry_after(
-                            status.as_u16(),
-                            upstream_error_message(&error_body)
-                                .chars()
-                                .take(1024)
-                                .collect::<String>(),
-                            retry_after,
-                        ),
+                        aisix_gateway::upstream_status_from_response(upstream_resp, |body| {
+                            upstream_error_message(body).chars().take(1024).collect()
+                        })
+                        .await,
                     )));
                 }
                 let body_bytes = upstream_resp.bytes().await.map_err(|e| {

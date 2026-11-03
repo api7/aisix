@@ -1014,29 +1014,33 @@ impl ProxyError {
         let status = self.status();
         let retry_after = self.retry_after_secs();
         let rate_limit_detail = self.rate_limit_detail();
-        let kind = anthropic_kind_from_status(status).to_string();
-        let code = match &self {
+        let mut response = (status, Json(self.anthropic_envelope())).into_response();
+        apply_retry_headers(&mut response, retry_after, rate_limit_detail);
+        response
+    }
+
+    /// The body [`Self::into_anthropic_response`] sends.
+    pub(crate) fn anthropic_body(&self) -> String {
+        serde_json::to_string(&self.anthropic_envelope()).unwrap_or_default()
+    }
+
+    fn anthropic_envelope(&self) -> AnthropicErrorEnvelope {
+        let code = match self {
             ProxyError::ContentFiltered { unavailable, .. } => {
                 Some(anthropic_guardrail_code(unavailable.as_deref()))
             }
             _ => None,
         };
-        // Reuse OpenAI envelope only for the SAFE-MESSAGE logic
-        // (the upstream message, translated on a 4xx).
-        // The inner type is overwritten to the Anthropic-canonical
-        // string above.
-        let openai_env = self.envelope();
-        let anth_body = AnthropicErrorEnvelope {
+        AnthropicErrorEnvelope {
             discriminator: "error",
             error: AnthropicErrorBody {
-                kind,
-                message: openai_env.error.message,
+                kind: anthropic_kind_from_status(self.status()).to_string(),
+                // Reuse OpenAI envelope only for the SAFE-MESSAGE logic
+                // (the upstream message, translated on a 4xx).
+                message: self.envelope().error.message,
                 code,
             },
-        };
-        let mut response = (status, Json(anth_body)).into_response();
-        apply_retry_headers(&mut response, retry_after, rate_limit_detail);
-        response
+        }
     }
 }
 

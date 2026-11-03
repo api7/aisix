@@ -344,6 +344,7 @@ pub(crate) async fn realtime(
                 status,
                 started.elapsed(),
             );
+            crate::usage_attr::note_client_error(&snapshot, &err);
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,

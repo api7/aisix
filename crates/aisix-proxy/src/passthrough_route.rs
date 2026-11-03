@@ -376,6 +376,7 @@ pub async fn entry(
                 status,
                 elapsed,
             );
+            crate::usage_attr::note_client_error(&snapshot, &error);
             let mut event = crate::usage_attr::build_error_usage_event(
                 "passthrough",
                 &request_id,
@@ -628,6 +629,9 @@ async fn dispatch(
                     &auth,
                 )
             })?;
+    crate::usage_attr::note_failure_request(snapshot, || {
+        String::from_utf8_lossy(&body_bytes).into_owned()
+    });
 
     // Guardrail chain for this route (+ the caller's key/team/env scopes).
     let guardrail_ctx = aisix_guardrails::RequestContext {
@@ -731,8 +735,7 @@ async fn dispatch(
     }
 
     // Content capture (exporter-gated): the request body text, in the same
-    // exporter-only channel the typed endpoints use. Captured after the
-    // input guardrail so a blocked request records nothing.
+    // exporter-only channel the typed endpoints use.
     let content_cap = aisix_obs::content_capture_cap(
         snapshot
             .observability_exporters
@@ -1263,7 +1266,11 @@ async fn dispatch(
     }
     telemetry.service_tier = tier;
     if telemetry.content_cap.is_some() && !bypass_uninspectable_output {
-        telemetry.response_text = response_capture_text(protocol, &resp_body);
+        telemetry.response_text = if status.is_success() {
+            response_capture_text(protocol, &resp_body)
+        } else {
+            String::from_utf8_lossy(&resp_body).into_owned()
+        };
     }
 
     let mut response = Response::builder()
@@ -6027,6 +6034,16 @@ fn stream_opaque_response(
                         crate::attribution::note_upstream_first_frame();
                     }
                     telemetry.mark_first_delivery();
+                    // An opaque relay of a refusal is still that attempt's
+                    // upstream answer. A fail-open success stays uncaptured.
+                    if !status.is_success() {
+                        if let Some(cap) = telemetry.content_cap {
+                            let room = cap.saturating_sub(telemetry.response_text.len());
+                            telemetry
+                                .response_text
+                                .push_str(&String::from_utf8_lossy(&chunk[..chunk.len().min(room)]));
+                        }
+                    }
                     yield Ok::<_, std::convert::Infallible>(chunk);
                 }
                 Err(err) => {

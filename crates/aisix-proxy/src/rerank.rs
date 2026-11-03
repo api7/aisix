@@ -250,6 +250,7 @@ pub async fn rerank(
             // zero-token event (status + error class), instead of dropping it.
             // Per #655: one zero-token event per failed upstream attempt,
             // the last of them terminal when every attempt failed.
+            crate::usage_attr::note_client_error(&snapshot, &err);
             let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
             crate::usage_attr::emit_failed_attempts(
                 &state,
@@ -329,6 +330,7 @@ async fn dispatch(
     audit_out: &mut crate::usage_attr::GuardrailAudit,
     routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<RerankDispatchSuccess, ProxyError> {
+    crate::usage_attr::note_failure_request(snapshot, || body.to_string());
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -384,6 +386,11 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/rerank request",
             );
+            // A blocked request exports what the success path would have sent.
+            if crate::usage_attr::content_cap(snapshot).is_some() {
+                crate::redact::redact_rerank_request(&resolved_chain, body);
+                crate::usage_attr::note_failure_request(snapshot, || body.to_string());
+            }
             return Err(crate::error::guardrail_block_error(
                 "request",
                 guardrail_name.as_deref(),
@@ -396,6 +403,7 @@ async fn dispatch(
     // place AFTER the block check passes, BEFORE the body is forwarded
     // upstream. Pre-#696 a mask-action detector was a silent no-op here.
     let redactions = crate::redact::redact_rerank_request(&resolved_chain, body);
+    crate::usage_attr::note_failure_request(snapshot, || body.to_string());
 
     // Content capture (#700): the client-facing request body
     // (post-#932-redaction) is the prompt; the response is the upstream's
@@ -616,19 +624,15 @@ async fn dispatch(
 
                         let status = upstream_resp.status();
                         if !status.is_success() {
-                            let status_u16 = status.as_u16();
-                            let retry_after =
-                                aisix_gateway::parse_retry_after(upstream_resp.headers());
-                            let message = upstream_resp.text().await.unwrap_or_default();
                             return Err(crate::cooldown::note_failure(
                                 tracker,
                                 model_id,
                                 cooldown_cfg,
-                                aisix_gateway::BridgeError::upstream_status_with_retry_after(
-                                    status_u16,
-                                    message.chars().take(1024).collect::<String>(),
-                                    retry_after,
-                                ),
+                                aisix_gateway::upstream_status_from_response(
+                                    upstream_resp,
+                                    aisix_gateway::bounded_error_text,
+                                )
+                                .await,
                             ));
                         }
 

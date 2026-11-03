@@ -245,7 +245,7 @@ fn map_openai_status(status: &str) -> &'static str {
 /// `size` a `WIDTHxHEIGHT` resolution. `model` is required here (the
 /// gateway has no default video model). Unknown fields (e.g.
 /// `input_reference`) are ignored in Phase 1.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct VideoCreateBody {
     pub model: String,
     pub prompt: String,
@@ -258,7 +258,7 @@ pub struct VideoCreateBody {
 /// The upstream contract types `seconds` as a string enum (`"4"`, `"8"`,
 /// `"12"`); accept a bare integer too so curl-first callers aren't
 /// punished for the obvious spelling.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum SecondsField {
     Int(u64),
@@ -993,11 +993,10 @@ fn nonempty_str(v: Option<&serde_json::Value>) -> Option<&str> {
 
 /// Best-effort extraction of a vendor error envelope's message from a
 /// non-2xx upstream body. DashScope puts `{code, message}` at the top level;
-/// the OpenAI-style vendors nest `{error: {code, message}}`. Falls back to a
-/// generic marker for non-JSON or fieldless bodies so a typed error is always
-/// producible. Shared by the JSON task calls ([`provider_call`]) and the
-/// content-proxy path ([`proxy_content`]) — both must map a non-2xx upstream
-/// to a typed error rather than surfacing the raw body.
+/// the OpenAI-style vendors nest `{error: {code, message}}`. Falls back to the
+/// body's text like every other route, blank when there is none, which is what
+/// names the status to the caller instead. Shared by the JSON task calls
+/// ([`provider_call`]) and the content-proxy path ([`proxy_content`]).
 fn parse_provider_error_message(bytes: &[u8]) -> String {
     let parsed: Option<serde_json::Value> = serde_json::from_slice(bytes).ok();
     parsed
@@ -1016,7 +1015,7 @@ fn parse_provider_error_message(bytes: &[u8]) -> String {
                 (None, None) => None,
             }
         })
-        .unwrap_or_else(|| "upstream error".to_string())
+        .unwrap_or_else(|| aisix_gateway::bounded_error_text(bytes))
 }
 
 // ─────────────────────── resolved dispatch target ───────────────────────
@@ -1274,17 +1273,22 @@ fn provider_call_once<'a>(
             .map_err(|e| note(crate::dispatch::reqwest_error_to_bridge(&e, started)))?;
         aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            let body =
+                aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES)
+                    .await;
+            return Err(note(
+                aisix_gateway::BridgeError::upstream_status(
+                    status,
+                    parse_provider_error_message(&body.bytes),
+                )
+                .with_body_read_error(body.read_error),
+            ));
+        }
         let bytes = resp
             .bytes()
             .await
             .map_err(|e| note(aisix_gateway::BridgeError::UpstreamDecode(e.to_string())))?;
-
-        if !(200..300).contains(&status) {
-            let message = parse_provider_error_message(&bytes);
-            return Err(note(aisix_gateway::BridgeError::upstream_status(
-                status, message,
-            )));
-        }
 
         serde_json::from_slice(&bytes).map_err(|e| {
             aisix_gateway::BridgeError::UpstreamDecode(format!(
@@ -1394,18 +1398,28 @@ async fn proxy_content(
         // error body cannot hang the handler (the success path is already
         // bounded per-chunk; this closes the error branch).
         let code = status.as_u16();
-        let bytes = match stream_budget {
-            Some(d) => tokio::time::timeout(d, resp.bytes())
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or_default(),
-            None => resp.bytes().await.unwrap_or_default(),
-        };
-        let message = parse_provider_error_message(&bytes);
-        return Err(ProxyError::Bridge(note(
-            aisix_gateway::BridgeError::upstream_status(code, message),
-        )));
+        let read =
+            aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES);
+        let err = match stream_budget {
+            Some(d) => tokio::time::timeout(d, read).await.map_err(|_| d),
+            None => Ok(read.await),
+        }
+        .map_or_else(
+            |d| {
+                let reason = format!("timed out after {}ms", d.as_millis());
+                aisix_gateway::warn_error_body_unread(code, &reason);
+                aisix_gateway::BridgeError::upstream_status(code, "")
+                    .with_body_read_error(Some(reason))
+            },
+            |body| {
+                aisix_gateway::BridgeError::upstream_status(
+                    code,
+                    parse_provider_error_message(&body.bytes),
+                )
+                .with_body_read_error(body.read_error)
+            },
+        );
+        return Err(ProxyError::Bridge(note(err)));
     }
 
     // Relay the upstream content headers before consuming the response into a
@@ -1736,6 +1750,7 @@ pub async fn create_video(
             // events instead of vanishing.
             // Per #655: one zero-token event per failed upstream attempt,
             // the last of them terminal when every attempt failed.
+            crate::usage_attr::note_client_error(&snapshot, &err);
             let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
             crate::usage_attr::emit_failed_attempts(
                 &state,
@@ -1800,6 +1815,9 @@ async fn dispatch_create(
     audit_out: &mut crate::usage_attr::GuardrailAudit,
     routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<CreateSuccess, ProxyError> {
+    crate::usage_attr::note_failure_request(snapshot, || {
+        serde_json::to_string(&body).unwrap_or_default()
+    });
     let model_entry = crate::model_resolve::resolve_model(snapshot, &body.model)
         .ok_or_else(|| ProxyError::ModelNotFound(body.model.clone()))?;
     let model_id = model_entry.id.to_string();

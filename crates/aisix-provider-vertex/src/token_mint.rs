@@ -253,7 +253,11 @@ impl TokenMinter {
             // GCP returns OAuth-shape errors `{error, error_description}`
             // — text is operator-actionable (invalid_grant etc.) and
             // does not echo the SA's private key.
-            let body = resp.text().await.unwrap_or_default();
+            let body =
+                aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES)
+                    .await;
+            let read_error = body.read_error;
+            let body = String::from_utf8_lossy(&body.bytes);
             let truncated: String = body.chars().take(500).collect();
             let msg = format!("vertex token mint upstream returned HTTP {status}: {truncated}");
             // Audit MEDIUM (PR #387): classify 5xx as a transient
@@ -264,6 +268,7 @@ impl TokenMinter {
             // IS operator-actionable, so it stays Config.
             return Err(if status.is_server_error() {
                 BridgeError::upstream_status_with_retry_after(status.as_u16(), msg, retry_after)
+                    .with_body_read_error(read_error)
             } else {
                 BridgeError::Config(msg)
             });

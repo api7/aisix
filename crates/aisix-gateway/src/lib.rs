@@ -48,11 +48,12 @@ pub mod upstream_tls;
 pub mod url_cache;
 
 pub use bridge::{
-    capture_in_band_error, capture_in_band_error_value, capture_upstream_error_http,
-    content_type_is_json, decode_success_body, in_band_error_body, in_band_error_in_body,
-    in_band_error_reported, parse_retry_after, read_body_capped, response_is_json, truncate_lossy,
-    upstream_error_message, Bridge, BridgeCapability, BridgeContext, BridgeError, ChatChunkStream,
-    NativeMessages, UpstreamErrorView, UpstreamWire, MAX_UPSTREAM_ERROR_BODY_BYTES,
+    bounded_error_text, capture_in_band_error, capture_in_band_error_value,
+    capture_upstream_error_http, content_type_is_json, decode_success_body, in_band_error_body,
+    in_band_error_in_body, in_band_error_reported, parse_retry_after, read_body_capped,
+    response_is_json, truncate_lossy, upstream_error_message, upstream_status_from_response,
+    Bridge, BridgeCapability, BridgeContext, BridgeError, ChatChunkStream, NativeMessages,
+    UpstreamErrorBody, UpstreamErrorView, UpstreamWire, MAX_UPSTREAM_ERROR_BODY_BYTES,
     MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
 };
 pub use chat::{
@@ -63,8 +64,9 @@ pub use chat::{
 pub use credential::credential_fingerprint;
 pub use hub::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};
 pub use response_tap::{
-    capture_header_values, note_upstream_response, provider_request_id, ResponseHeaderTap,
-    UpstreamResponseCapture, PROVIDER_REQUEST_ID_HEADERS,
+    capture_header_values, note_upstream_error_body, note_upstream_response, provider_request_id,
+    wants_upstream_error_body, warn_error_body_unread, ResponseHeaderTap, UpstreamResponseCapture,
+    PROVIDER_REQUEST_ID_HEADERS,
 };
 pub use sse::{SseDecoder, SseEvent, SseFrameTooLarge};
 pub use structured_output::{

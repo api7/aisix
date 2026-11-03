@@ -84,6 +84,7 @@ pub(crate) fn upstream_error(
         message,
         wire: UpstreamWire::Bedrock,
         retry_after,
+        read_error: None,
     }
 }
 
@@ -155,6 +156,11 @@ where
 {
     let kind = svc.err().meta().code().map(str::to_string);
     let raw = svc.raw();
+    if aisix_gateway::wants_upstream_error_body() {
+        if let Some(body) = raw.body().bytes() {
+            aisix_gateway::note_upstream_error_body(&bytes::Bytes::copy_from_slice(body));
+        }
+    }
     // The SDK reads the message out of an error it can model; for one it
     // cannot, the body still carries it.
     let message = match svc.err().meta().message() {

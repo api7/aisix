@@ -316,6 +316,9 @@ async fn dispatch(
         .to_string();
     let rpc_id = value.get("id").cloned();
     let operation = canonical_operation(&method);
+    // A call with no words to capture (a task read, a cancel) reports its
+    // JSON-RPC body on a failure row.
+    crate::usage_attr::note_failure_request(&snapshot, || value.to_string());
     // To the request's attribution cell, so a caller that hangs up while the
     // agent is still thinking files a row naming the agent and the call
     // rather than an anonymous 499 (AISIX-Cloud#1571). Both spellings: the
@@ -405,6 +408,7 @@ async fn dispatch(
     let reservation = match crate::quota::enforce(state, &snapshot, &auth, None).await {
         Ok(reservation) => reservation,
         Err(err) => {
+            crate::usage_attr::note_client_error(&snapshot, &err);
             emit_a2a_usage(
                 state,
                 &snapshot,
@@ -475,6 +479,9 @@ async fn dispatch(
         Err(err) => {
             let status = a2a_error_status(&err);
             tracing::warn!(agent = %agent, error = %err, "A2A upstream call failed");
+            crate::usage_attr::note_client_error_body(&snapshot, || {
+                a2a_error_envelope(rpc_id.clone(), &err.to_string()).to_string()
+            });
             emit_a2a_usage(
                 state,
                 &snapshot,
@@ -594,6 +601,9 @@ async fn dispatch_stream(
         Err(err) => {
             let status = a2a_error_status(&err);
             tracing::warn!(agent = %agent, error = %err, "A2A upstream stream failed to open");
+            crate::usage_attr::note_client_error_body(snapshot, || {
+                a2a_error_envelope(rpc_id.clone(), &err.to_string()).to_string()
+            });
             drop(reservation);
             emit_a2a_usage(
                 state,
@@ -921,6 +931,9 @@ async fn guardrail_block_response(
         guardrail_name.as_deref(),
         unavailable.as_deref(),
     );
+    crate::usage_attr::note_client_error_body(snapshot, || {
+        a2a_error_envelope(rpc_id.clone(), &refusal.to_string()).to_string()
+    });
     let response = a2a_error_response(
         rpc_id,
         StatusCode::UNPROCESSABLE_ENTITY,
