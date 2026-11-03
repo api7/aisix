@@ -158,7 +158,8 @@ where
     let raw = svc.raw();
     if aisix_gateway::wants_upstream_error_body() {
         if let Some(body) = raw.body().bytes() {
-            aisix_gateway::note_upstream_error_body(&bytes::Bytes::copy_from_slice(body));
+            let kept = body.len().min(aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES);
+            aisix_gateway::note_upstream_error_body(&bytes::Bytes::copy_from_slice(&body[..kept]));
         }
     }
     // The SDK reads the message out of an error it can model; for one it

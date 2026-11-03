@@ -544,6 +544,21 @@ describe("failure rows carry request and response bodies", () => {
     expect(row.get("response")).toContain("sentinel-body-400");
   });
 
+  test("an upload missing its file still reports the fields it sent", async () => {
+    if (!etcdReachable) return;
+    const form = new FormData();
+    form.set("purpose", "upload-without-file-prompt");
+    const res = await fetch(`${app!.proxyUrl}/v1/files?model=row-400`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER}` },
+      body: form,
+    });
+    expect(res.status).toBe(400);
+    await res.text();
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the upload row");
+    expect(requestText(row)).toContain("upload-without-file-prompt");
+  });
+
   test("a passthrough request with no body still reports the upstream's failure", async () => {
     if (!etcdReachable) return;
     const res = await fetch(`${app!.proxyUrl}/row-passthrough/anything`, {
@@ -978,16 +993,15 @@ describe("failure rows carry request and response bodies", () => {
     expect(row.get("response")).toContain("sentinel-in-band");
   });
 
-  // Last: every sentinel above has been sent by now.
   test("a metadata_only exporter receives none of it", async () => {
     if (!etcdReachable) return;
-    const failed = () =>
-      slsLogsFor(sls!, META).filter((l) => Number(l.get("status_code") ?? "0") >= 400);
-    const deadline = Date.now() + 10_000;
-    while (failed().length < 5 && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 50));
-    }
-    expect(failed().length).toBeGreaterThanOrEqual(5);
+    const own = await post("/v1/chat/completions", {
+      model: "row-400",
+      messages: [{ role: "user", content: "metadata-check-prompt" }],
+    });
+    await own.text();
+    const requestId = own.headers.get("x-aisix-request-id");
+    await waitForSlsLog(sls!, META, (l) => l.get("request_id") === requestId, "the metadata_only row");
     for (const row of slsLogsFor(sls!, META)) {
       for (const field of ["prompt", "response", "input_messages", "output_messages"]) {
         expect(row.get(field), field).toBeUndefined();

@@ -1071,6 +1071,9 @@ pub(crate) async fn create_file(
             form = form.text(name, v);
         }
 
+        let snapshot = &**snapshot.insert(state.snapshot.load());
+        crate::usage_attr::note_failure_request(snapshot, || Value::Object(captured).to_string());
+
         if !saw_file {
             return Err(ProxyError::InvalidRequest(
                 "multipart body must include a `file` field".into(),
@@ -1078,8 +1081,6 @@ pub(crate) async fn create_file(
         }
 
         let wanted = form_model.or_else(|| explicit_model(&params, &headers));
-        let snapshot = &**snapshot.insert(state.snapshot.load());
-        crate::usage_attr::note_failure_request(snapshot, || Value::Object(captured).to_string());
         let target = resolve_target(snapshot, &auth, wanted.as_deref(), &client)?;
 
         let _reservation = crate::quota::enforce(

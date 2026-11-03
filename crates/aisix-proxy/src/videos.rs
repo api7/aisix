@@ -1537,7 +1537,14 @@ impl Telemetry<'_> {
     ) {
         let elapsed = self.started.elapsed();
         let error_source = error.map_or_else(
-            || crate::attempt::answered_error_source(false, routing),
+            // A direct model's unsupported-provider 501 records no attempt.
+            || {
+                if status >= 400 {
+                    aisix_obs::ErrorSource::Aisix
+                } else {
+                    crate::attempt::answered_error_source(false, routing)
+                }
+            },
             crate::attempt::error_source,
         );
         let (error_kind, error) = match error {

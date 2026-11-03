@@ -149,6 +149,19 @@ describe("error_source on the request counters", () => {
     await pair("es-messages-500", failing(500));
     await pair("es-messages-limited", {}, limited);
 
+    const unmappedPk = await seed.createProviderKey({
+      display_name: "es-video-unmapped-pk",
+      secret: "sk-mock",
+      provider: "anthropic",
+      api_base: "http://127.0.0.1:9",
+    });
+    await seed.createModel({
+      display_name: "es-video-unmapped",
+      provider: "anthropic",
+      model_name: "claude-3-5-haiku-20241022",
+      provider_key_id: unmappedPk.id,
+    });
+
     const guard = await seed.createGuardrail(
       {
         name: "es-output-block",
@@ -463,6 +476,14 @@ describe("error_source on the request counters", () => {
     await send("/v1/messages", messages("es-messages-limited"));
     expect(await send("/v1/messages", messages("es-messages-limited"))).toBe(429);
     await expectSource({ endpoint: "/v1/messages", model: "es-messages-limited", status: "429" }, "aisix");
+  });
+
+  test("a provider /v1/videos does not map is the gateway's 501", async (ctx) => {
+    if (!ready()) return ctx.skip();
+    expect(await send("/v1/videos", { model: "es-video-unmapped", prompt: "a cat" })).toBe(501);
+    await expectSource({ model: "es-video-unmapped", status: "501" }, "aisix", [
+      "aisix_proxy_requests_total",
+    ]);
   });
 
   test("routes that hold no typed error still name the source", async (ctx) => {
