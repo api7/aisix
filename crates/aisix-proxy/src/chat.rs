@@ -533,13 +533,7 @@ pub async fn chat_completions(
                         .iter()
                         .map(|e| &e.value),
                 )
-                .map(|cap| {
-                    CapturedContent::new(
-                        &serde_json::to_string(&req).unwrap_or_default(),
-                        "",
-                        cap as usize,
-                    )
-                })
+                .map(|cap| CapturedContent::new(&captured_request_json(&req), "", cap as usize))
             };
             // When every target failed there is no terminal event below —
             // the content rides the last failed attempt instead.
@@ -2284,8 +2278,7 @@ async fn dispatch(
         // Capture the prompt for content-capturing exporters; the response is
         // assembled inside the stream into `comp.response_text`. Both gated on
         // `content_cap` (None on the common content-free path).
-        let captured_prompt_for_telem =
-            content_cap.map(|_| serde_json::to_string(req).unwrap_or_default());
+        let captured_prompt_for_telem = content_cap.map(|_| captured_request_json(req));
         // #790: the bridge injects `stream_options.include_usage` on the
         // upstream leg whenever the client didn't set stream_options — the
         // terminal usage-only chunk that produces is for the gateway's own
@@ -2928,7 +2921,7 @@ async fn dispatch(
                 // caller, so it's logged like a fresh response.
                 let captured_content = content_cap.map(|cap| {
                     CapturedContent::new(
-                        &serde_json::to_string(req).unwrap_or_default(),
+                        &captured_request_json(req),
                         &cached.message.content_str(),
                         cap as usize,
                     )
@@ -3530,12 +3523,14 @@ async fn dispatch(
     // not the cache backend's global fallback. Backends without
     // per-entry support (defined via `Cache::put_with_ttl`'s default
     // impl) silently fall back to `put`.
-    if let (Some(ttl), Some(cache), Some(key), false) = (
+    if let (Some(ttl), Some(cache), Some(key), false, false) = (
         matched_policy_ttl,
         policy_cache.as_ref(),
         cache_key.as_ref(),
         // `Cache-Control: no-store` suppresses both layers' writes.
         cc.no_store,
+        // Generated images run to megabytes each.
+        upstream.messages().any(|m| m.extra.contains_key("images")),
     ) {
         match cache.put_with_ttl(key, upstream.clone(), ttl).await {
             Ok(()) => note_cache_ok(state, policy_backend, CacheHalf::Exact),
@@ -3605,7 +3600,7 @@ async fn dispatch(
     // `fan_out` via `Success`, never to the CP sink.
     let captured_content = content_cap.map(|cap| {
         CapturedContent::new(
-            &serde_json::to_string(req).unwrap_or_default(),
+            &captured_request_json(req),
             &upstream.message.content_str(),
             cap as usize,
         )
@@ -4975,6 +4970,37 @@ pub(crate) fn sanitize_tag(s: String) -> String {
     s.chars().filter(|c| !c.is_control()).take(256).collect()
 }
 
+/// The request as an exporter's captured prompt, in the shape the caller wrote
+/// it: a block-array message's `content` is the array, not the derived text
+/// `ChatMessage` serializes beside `content_blocks`, which would count its text
+/// twice and hide its blocks from the structured content reader. Base64 media
+/// is omitted here too, so this prompt, held to the end of a stream, stays
+/// small.
+pub(crate) fn captured_request_json(req: &ChatFormat) -> String {
+    let has_blocks = |m: &aisix_gateway::ChatMessage| {
+        m.content_blocks.is_some() || m.extra.contains_key("images")
+    };
+    if !req.messages.iter().any(has_blocks) {
+        return serde_json::to_string(req).unwrap_or_default();
+    }
+    let Ok(mut body) = serde_json::to_value(req) else {
+        return String::new();
+    };
+    for message in body
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_object_mut)
+    {
+        if let Some(blocks) = message.remove("content_blocks") {
+            message.insert("content".into(), blocks);
+        }
+    }
+    aisix_obs::sink::omit_base64_media(&mut body);
+    body.to_string()
+}
+
 /// Provider-detail bundle for `emit_usage_event`. Grouped here so the
 /// helper signature stays under the clippy-too-many-arguments bar
 /// without losing the structural relationship between the seven new
@@ -6159,6 +6185,9 @@ where
             .map(|ctx| ctx.chain.stream_output_policy())
             .unwrap_or_default();
         let hold_back = stream_policy.holds_back();
+        // A window already judged and released the text, so an empty final
+        // scan does not mean the response generated none.
+        let mut window_scanned = false;
         let mut window_tool_calls_cap = match stream_policy {
             aisix_guardrails::StreamOutputPolicy::Window { .. } => stream_policy.hold_cap(),
             _ => None,
@@ -6201,6 +6230,7 @@ where
         let mut last_usage: Option<aisix_gateway::chat::UsageStats> = None;
         let fold_base = base_usage != aisix_gateway::chat::UsageStats::default();
         let mut last_chunk_id = String::new();
+        let mut stream_id = crate::render::StreamId::default();
         let mut last_chunk_model = String::new();
         let mut last_chunk_tier = None;
         // Render + serialise one held/live chunk into an SSE Event.
@@ -6219,7 +6249,9 @@ where
                     guard.comp().downstream_latency_ms =
                         crate::attempt::measured_ms(started.elapsed());
                 }
-                let rendered = render_chunk(created, $chunk, &client_facing_model);
+                let mut chunk = $chunk;
+                stream_id.stamp(&mut chunk.id);
+                let rendered = render_chunk(created, chunk, &client_facing_model);
                 match serde_json::to_string(&rendered) {
                     Ok(json) => Event::default().data(json),
                     Err(err) => {
@@ -6506,6 +6538,9 @@ where
                 // whole response) scans clean.
                 let chunk_content = crate::held_content::chat_delta(&chunk.delta);
                 let chunk_raw = crate::held_content::chat_chunk_raw(&chunk);
+                let chunk_images_raw = matches!(stream_policy, aisix_guardrails::StreamOutputPolicy::BufferFull { .. })
+                    .then(|| crate::held_content::chat_chunk_images_raw(&chunk))
+                    .unwrap_or_default();
                 pending_bytes.add(chunk_raw);
                 pending.push(chunk);
                 match &stream_policy {
@@ -6602,6 +6637,7 @@ where
                                 // the whole buffer and re-scan every
                                 // subsequent token (cost/latency guard).
                                 window_buf.keep_tails(*overlap_chars, *size_chars);
+                                window_scanned = true;
                             }
                         }
                     }
@@ -6609,7 +6645,7 @@ where
                         max_buffer_bytes,
                         on_exceeded_fail_open,
                     } => {
-                        held.hold(chunk_content, chunk_raw);
+                        held.hold(chunk_content, chunk_raw.saturating_sub(chunk_images_raw));
                         if held.exceeds(*max_buffer_bytes) {
                             if *on_exceeded_fail_open {
                                 // Fail-open overflow releases the held
@@ -6740,7 +6776,8 @@ where
                     } else {
                         format!("{content_part}\n{tc_part}")
                     };
-                    let blocked = if final_text.is_empty() {
+                    // Consulted with no text as well: a `custom` row decides for itself.
+                    let blocked = if final_text.is_empty() && window_scanned {
                         false
                     } else {
                         let synthesized = {
@@ -7465,6 +7502,64 @@ mod complete_on_drop_tests {
         );
         assert_eq!(out.total_tokens, 8);
         assert!(out.usage_estimated);
+    }
+
+    /// The captured prompt as the sinks read it: built from the parsed request
+    /// the handler holds, not from the wire shape the caller sent.
+    #[test]
+    fn captured_chat_request_reports_its_blocks_and_omits_base64_media() {
+        let payload = "QUJD".repeat(100);
+        let uri = format!("data:image/png;base64,{payload}");
+        let text = "t".repeat(1000);
+        let req: aisix_gateway::ChatFormat = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": text},
+                    {"type": "image_url", "image_url": {"url": uri}},
+                ]},
+                {"role": "assistant", "content": "x", "images": [
+                    {"type": "image_url", "image_url": {"url": uri}, "index": 0},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": uri}},
+                ]},
+            ],
+        }))
+        .unwrap();
+        let prompt = crate::chat::captured_request_json(&req);
+        assert!(!prompt.contains(&payload));
+        assert_eq!(
+            prompt.matches(&text).count(),
+            1,
+            "a block's text is not counted twice"
+        );
+        let captured = aisix_obs::CapturedContent::new(&prompt, "", 64 * 1024);
+        assert!(!captured.prompt_truncated);
+        let structured = aisix_obs::genai::structured_content(
+            aisix_obs::genai::PromptWire::OpenAiChat,
+            &captured.prompt,
+            "",
+            None,
+            "",
+        );
+        let input: serde_json::Value =
+            serde_json::from_str(&structured.input_messages.unwrap()).unwrap();
+        let image = serde_json::json!({
+            "type": "blob",
+            "modality": "image",
+            "mime_type": "image/png",
+            "content": format!("[aisix: base64 data uri omitted, {} bytes]", uri.len()),
+        });
+        assert_eq!(
+            input[0]["parts"],
+            serde_json::json!([{"type": "text", "content": text}, image])
+        );
+        assert_eq!(
+            input[1]["parts"],
+            serde_json::json!([{"type": "text", "content": "x"}, image])
+        );
+        assert_eq!(input[2]["parts"], serde_json::json!([image]));
     }
 
     /// AISIX-Cloud#1074: upstream-reported usage wins — the armed

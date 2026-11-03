@@ -49,7 +49,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aisix_gateway::content_part::{
-    check_tool_result_parts, display_uri, translate_user_parts, Media, MediaSource,
+    check_tool_result_parts, display_uri, parse_part, translate_user_parts, ContentPart, Media,
+    MediaKind, MediaSource,
 };
 use aisix_gateway::media_fetch::{fetch_media_urls, Encoding, FetchedMedia};
 
@@ -1978,12 +1979,15 @@ struct GeminiStreamState {
     choices: std::collections::BTreeMap<u32, GeminiStreamChoice>,
     /// The last tier the stream reported, stamped on every chunk.
     service_tier: Option<ServiceTier>,
+    /// The first `responseId` the stream reported, stamped on every chunk.
+    response_id: Option<String>,
 }
 
 #[derive(Default)]
 struct GeminiStreamChoice {
     emitted_role: bool,
     tool_calls: usize,
+    images: usize,
 }
 
 impl GeminiStreamState {
@@ -1997,13 +2001,15 @@ impl GeminiStreamState {
 /// frame, keyed by `index`) yields up to TWO chunks for its choice:
 ///
 /// 1. **Role chunk** (only on the choice's first emission carrying text,
-///    reasoning or a tool call) — sets `delta.role = Role::Assistant` so downstream
+///    reasoning, a tool call, an image or a finish reason) — sets `delta.role = Role::Assistant` so downstream
 ///    consumers know this is an assistant turn. Mirrors OpenAI's
 ///    "first-chunk-is-role" wire convention.
 /// 2. **Content / terminal chunk** — carries the text and reasoning deltas,
 ///    `logprobs`, any `functionCall` parts as complete `tool_calls` deltas
 ///    (Gemini streams each call whole, never split across chunks; each gets
-///    the next `index` of its choice), and, on the final upstream chunk, the
+///    the next `index` of its choice), generated images as `delta.images`
+///    (numbered within their choice across the stream), and, on the final
+///    upstream chunk, the
 ///    `finish_reason` populated from `finishReason`.
 ///
 /// The frame's usage rides its last chunk. A frame with no candidate
@@ -2025,6 +2031,9 @@ fn gemini_chunk_into_chat_chunks(
     {
         state.service_tier = Some(tier);
     }
+    if state.response_id.is_none() {
+        state.response_id = raw.response_id.take().filter(|id| !id.is_empty());
+    }
     let blocked = raw.prompt_blocked();
     let candidates = raw.indexed_candidates();
     let mut usage = raw
@@ -2035,7 +2044,7 @@ fn gemini_chunk_into_chat_chunks(
     let chunk = |choice_index: u32, delta: ChatDelta, state: &GeminiStreamState| ChatChunk {
         choice_index,
         logprobs: None,
-        id: String::new(),
+        id: state.response_id.clone().unwrap_or_default(),
         model: upstream_id.to_string(),
         delta,
         finish_reason: None,
@@ -2069,6 +2078,7 @@ fn gemini_chunk_into_chat_chunks(
             text,
             reasoning,
             tool_calls,
+            images,
         } = c.content.map(gemini_parts_into_message).unwrap_or_default();
         // Distinguish "no finishReason field" from "finishReason: STOP".
         // The non-stream path collapses both to FinishReason::Stop (since
@@ -2088,7 +2098,11 @@ fn gemini_chunk_into_chat_chunks(
             }
         });
         let emit_role = !choice.emitted_role
-            && (!text.is_empty() || !reasoning.is_empty() || !tool_calls.is_empty());
+            && (!text.is_empty()
+                || !reasoning.is_empty()
+                || !tool_calls.is_empty()
+                || !images.is_empty()
+                || c.finish_reason.is_some());
         if emit_role {
             choice.emitted_role = true;
         }
@@ -2100,25 +2114,33 @@ fn gemini_chunk_into_chat_chunks(
                 call
             })
             .collect();
+        let first_image = choice.images;
+        choice.images += images.len();
         if emit_role {
             chunks.push(chunk(index, role(), state));
         }
         // Content / terminal chunk — emit when there's text, reasoning, a
-        // tool call, logprobs or a finishReason, so a thought-only frame
+        // tool call, an image, logprobs or a finishReason, so a thought-only frame
         // reaches the client as it arrives and the terminal-state chunk lands
         // even when its content is empty.
         if !text.is_empty()
             || !reasoning.is_empty()
             || !tool_calls.is_empty()
+            || !images.is_empty()
             || logprobs.is_some()
             || finish_reason.is_some()
         {
+            let mut extra = serde_json::Map::new();
+            if !images.is_empty() {
+                extra.insert("images".into(), openai_images(images, first_image));
+            }
             let mut content = chunk(
                 index,
                 ChatDelta {
                     content: (!text.is_empty()).then_some(text),
                     reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
                     tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                    extra,
                     ..Default::default()
                 },
                 state,
@@ -2361,6 +2383,9 @@ struct GeminiGenerationConfig {
     logprobs: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingConfig")]
     thinking_config: Option<serde_json::Value>,
+    /// OpenAI `modalities`, which Gemini spells upper-case.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "responseModalities")]
+    response_modalities: Option<serde_json::Value>,
     /// Gemini's constrained-decoding switch. `"application/json"` is the
     /// only value this bridge sets; without it neither schema field has
     /// any effect.
@@ -2635,6 +2660,39 @@ fn gemini_user_parts(
     .map_err(BridgeError::InvalidRequest)
 }
 
+/// An assistant turn's generated `images`, the part shape the same turn's
+/// response carried them in. Media downloads cover user turns only and are
+/// counted per use, so these never draw on them.
+fn gemini_replayed_image_parts(
+    m: &ChatMessage,
+    index: usize,
+) -> Result<Vec<GeminiPart>, BridgeError> {
+    let images = match m.extra.get("images") {
+        Some(images) if m.role == Role::Assistant && !images.is_null() => images,
+        _ => return Ok(Vec::new()),
+    };
+    let images = images.as_array().ok_or_else(|| {
+        BridgeError::InvalidRequest(format!("messages[{index}].images must be an array"))
+    })?;
+    images
+        .iter()
+        .enumerate()
+        .map(|(i, image)| {
+            let invalid = |reason: String| {
+                BridgeError::InvalidRequest(format!("messages[{index}].images[{i}]: {reason}"))
+            };
+            match parse_part(image).map_err(invalid)? {
+                ContentPart::Media(media) if media.kind == MediaKind::Image => {
+                    gemini_media_part(&media, &FetchedMedia::default())
+                        .map(GeminiPart::Raw)
+                        .map_err(invalid)
+                }
+                _ => Err(invalid("an image must be an image_url part".to_string())),
+            }
+        })
+        .collect()
+}
+
 /// Gemini reads `gs://` and `https://` URLs itself, but only with a media
 /// type; an `http://` URL, or an `https://` one whose type neither the
 /// caller nor the extension gives, is downloaded by the gateway.
@@ -2722,10 +2780,12 @@ fn build_gemini_request(
 ///   `toolConfig.functionCallingConfig` (the legacy `functions` /
 ///   `function_call` arrive here already rewritten as tools, by
 ///   [`aisix_gateway::tool_calls::legacy_functions_as_tools`])
+/// - Assistant `images` → `inlineData` (or `fileData`) parts after the
+///   turn's text, without a thought signature
 /// - `temperature`, `top_p`, `top_k`, `max_completion_tokens` /
 ///   `max_tokens`, `stop`, `seed`, the penalties, `n`, `logprobs` /
-///   `top_logprobs` and `reasoning_effort` → their `generationConfig`
-///   slots (see [`GeminiGenerationConfig`], [`gemini_thinking_config`])
+///   `top_logprobs`, `modalities` and `reasoning_effort` → their
+///   `generationConfig` slots (see [`GeminiGenerationConfig`], [`gemini_thinking_config`])
 /// - `response_format` → `generationConfig.responseMimeType` plus the
 ///   schema field this model's generation reads — see
 ///   [`gemini_json_output`]. Every other `extra` field has no slot in this
@@ -2746,9 +2806,10 @@ fn build_gemini_request_with(
     let mut tool_responses: Vec<GeminiPart> = Vec::new();
     let mut prior_tool_calls: Vec<&serde_json::Value> = Vec::new();
     for (index, m) in req.messages.iter().enumerate() {
+        let replayed_images = gemini_replayed_image_parts(m, index)?;
         // `generateContent` has no slot for replayed reasoning; a turn that
         // holds only that would become an empty `model` turn.
-        if m.is_reasoning_only() {
+        if m.is_reasoning_only() && replayed_images.is_empty() {
             continue;
         }
         if matches!(m.role, Role::User | Role::Assistant) && !tool_responses.is_empty() {
@@ -2777,14 +2838,25 @@ fn build_gemini_request_with(
                     .and_then(serde_json::Value::as_array)
                     .filter(|calls| !calls.is_empty());
                 let parts = match tool_calls {
-                    None => vec![GeminiPart::text(m.content_str())],
+                    None if replayed_images.is_empty() => {
+                        vec![GeminiPart::text(m.content_str())]
+                    }
+                    None => m
+                        .text()
+                        .filter(|text| !text.is_empty())
+                        .map(GeminiPart::text)
+                        .into_iter()
+                        .chain(replayed_images)
+                        .collect(),
                     Some(calls) => {
                         prior_tool_calls.extend(calls);
                         // A pure tool-call turn has `content: null` and
                         // no text part.
                         m.text()
+                            .filter(|text| !text.is_empty())
                             .map(GeminiPart::text)
                             .into_iter()
+                            .chain(replayed_images)
                             .chain(
                                 function_call_parts(calls, upstream_model)?
                                     .into_iter()
@@ -2862,6 +2934,7 @@ fn build_gemini_request_with(
         response_logprobs: extra("logprobs"),
         logprobs: extra("top_logprobs"),
         thinking_config: gemini_thinking_config(req, upstream_model)?,
+        response_modalities: extra("modalities").map(gemini_response_modalities),
         response_mime_type,
         response_json_schema,
         response_schema,
@@ -2876,6 +2949,19 @@ fn build_gemini_request_with(
     })
 }
 
+fn gemini_response_modalities(modalities: serde_json::Value) -> serde_json::Value {
+    match modalities {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .map(|item| match item {
+                serde_json::Value::String(s) => s.to_ascii_uppercase().into(),
+                other => other,
+            })
+            .collect(),
+        other => other,
+    }
+}
+
 /// Gemini's `generateContent` response shape.
 #[derive(Debug, Deserialize)]
 struct GeminiGenerateContentResponse {
@@ -2886,6 +2972,8 @@ struct GeminiGenerateContentResponse {
     /// Set, with no candidates, when the prompt itself was blocked.
     #[serde(default, rename = "promptFeedback")]
     prompt_feedback: Option<GeminiPromptFeedback>,
+    #[serde(default, rename = "responseId")]
+    response_id: Option<String>,
 }
 
 impl GeminiGenerateContentResponse {
@@ -2984,10 +3072,20 @@ struct GeminiResponsePart {
     text: Option<String>,
     #[serde(default, rename = "functionCall")]
     function_call: Option<GeminiFunctionCall>,
+    #[serde(default, rename = "inlineData")]
+    inline_data: Option<GeminiInlineData>,
     #[serde(default, rename = "thoughtSignature")]
     thought_signature: Option<String>,
     #[serde(default)]
     thought: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiInlineData {
+    #[serde(default, rename = "mimeType")]
+    mime_type: String,
+    #[serde(default)]
+    data: String,
 }
 
 #[derive(Debug, Default)]
@@ -2995,11 +3093,13 @@ struct GeminiMessageParts {
     text: String,
     reasoning: String,
     tool_calls: Vec<serde_json::Value>,
+    images: Vec<GeminiInlineData>,
 }
 
 /// A candidate's parts → the turn's text, its reasoning (`thought: true`
-/// parts, as sent) and its OpenAI-shape `tool_calls` (no `index`), each in
-/// part order.
+/// text parts, as sent), its OpenAI-shape `tool_calls` (no `index`) and its
+/// generated images (interim `thought: true` ones included), each in part
+/// order.
 fn gemini_parts_into_message(content: GeminiResponseContent) -> GeminiMessageParts {
     let mut out = GeminiMessageParts::default();
     for part in content.parts {
@@ -3016,8 +3116,32 @@ fn gemini_parts_into_message(content: GeminiResponseContent) -> GeminiMessagePar
                 part.thought_signature.as_deref(),
             ));
         }
+        if let Some(inline) = part.inline_data {
+            if inline.mime_type.starts_with("image/") {
+                out.images.push(inline);
+            }
+        }
     }
     out
+}
+
+/// Generated images as the `images` field of an OpenAI-shape message or
+/// delta, numbered from `first` — their position within the response.
+fn openai_images(images: Vec<GeminiInlineData>, first: usize) -> serde_json::Value {
+    images
+        .into_iter()
+        .zip(first..)
+        .map(|(image, index)| {
+            serde_json::json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{}", image.mime_type, image.data),
+                    "detail": "auto",
+                },
+                "index": index,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3183,7 +3307,7 @@ fn gemini_response_into_chat_response(
     ChatResponse {
         logprobs: first.logprobs,
         more_choices,
-        id: String::new(), // Gemini doesn't return a request id in the body
+        id: raw.response_id.unwrap_or_default(),
         model: upstream_id.to_string(),
         message: first.message,
         finish_reason: first.finish_reason,
@@ -3198,8 +3322,14 @@ fn gemini_candidate_into_choice(index: u32, c: GeminiCandidate) -> ChatChoice {
         text,
         reasoning,
         tool_calls,
+        images,
     } = c.content.map(gemini_parts_into_message).unwrap_or_default();
     let mut message = ChatMessage::assistant(text);
+    if !images.is_empty() {
+        message
+            .extra
+            .insert("images".into(), openai_images(images, 0));
+    }
     if !reasoning.is_empty() {
         message
             .extra
@@ -3240,7 +3370,8 @@ fn finish_with_tool_calls(reason: Option<&str>) -> FinishReason {
 /// - `STOP` → `FinishReason::Stop`
 /// - `MAX_TOKENS` → `FinishReason::Length`
 /// - `SAFETY` / `RECITATION` / `BLOCKLIST` / `PROHIBITED_CONTENT` /
-///   `SPII` / `IMAGE_SAFETY` / `LANGUAGE` → `FinishReason::ContentFilter`
+///   `SPII` / `IMAGE_SAFETY` / `IMAGE_PROHIBITED_CONTENT` / `IMAGE_RECITATION`
+///   / `IMAGE_OTHER` / `NO_IMAGE` / `LANGUAGE` → `FinishReason::ContentFilter`
 /// - `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` / `OTHER` /
 ///   `FINISH_REASON_UNSPECIFIED` / unknown → `FinishReason::Stop`
 ///
@@ -3258,6 +3389,10 @@ fn map_gemini_finish_reason(reason: Option<&str>) -> FinishReason {
         | Some("PROHIBITED_CONTENT")
         | Some("SPII")
         | Some("IMAGE_SAFETY")
+        | Some("IMAGE_PROHIBITED_CONTENT")
+        | Some("IMAGE_RECITATION")
+        | Some("IMAGE_OTHER")
+        | Some("NO_IMAGE")
         | Some("LANGUAGE") => FinishReason::ContentFilter,
         _ => FinishReason::Stop,
     }

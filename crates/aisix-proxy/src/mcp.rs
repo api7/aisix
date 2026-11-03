@@ -1360,7 +1360,8 @@ fn check_local_json(
 /// The post-mask content-capture pair for a tool call: `prompt` is the
 /// (rewritten) `params.arguments`, `response` the (rewritten) `result`.
 /// Both re-serialise through `Value` — capture is telemetry, not wire
-/// bytes, so canonical key order is fine here.
+/// bytes, so canonical key order is fine here. The result's base64 media
+/// is omitted here because `CapturedContent::new` only does so for a prompt.
 fn tool_call_capture(
     cap: u32,
     request_bytes: Option<&[u8]>,
@@ -1375,7 +1376,10 @@ fn tool_call_capture(
     let response = result_bytes
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
         .and_then(|mut v| v.get_mut("result").map(serde_json::Value::take))
-        .map(|v| v.to_string())
+        .map(|mut v| {
+            aisix_obs::sink::omit_base64_media(&mut v);
+            v.to_string()
+        })
         .unwrap_or_default();
     aisix_obs::CapturedContent::new(&prompt, &response, cap as usize)
 }

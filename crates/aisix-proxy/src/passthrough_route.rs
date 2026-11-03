@@ -3580,7 +3580,16 @@ fn response_visible_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
 /// Captures preserve the existing typed visible-content contract; guardrail
 /// scanning may include additional raw fields that are forwarded downstream.
 fn response_capture_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
-    response_visible_text(protocol, body)
+    let text = response_visible_text(protocol, body);
+    // Only the upstream's own body can carry media fields: extracted text is a
+    // model's answer, whatever it looks like.
+    if text.as_bytes() != body {
+        return text;
+    }
+    match aisix_obs::sink::omit_base64_media_in_json(&text) {
+        std::borrow::Cow::Borrowed(_) => text,
+        std::borrow::Cow::Owned(omitted) => omitted,
+    }
 }
 
 /// Every token dimension a passthrough exchange can report, mirroring the
@@ -5891,13 +5900,24 @@ fn frame_parts_and_tier(
 /// the provider's JSON source representation even though the guardrail scans
 /// decoded string values from that same frame.
 fn frame_capture_text(protocol: PassthroughProtocol, frame: &[u8], scan: &str) -> String {
-    if !matches!(protocol, PassthroughProtocol::Raw) {
-        return scan.to_string();
-    }
-    crate::redact::frame_payload(frame)
+    let payload = crate::redact::frame_payload(frame)
         .map(|payload| payload.trim().to_owned())
-        .filter(|payload| !payload.is_empty() && payload != "[DONE]")
-        .unwrap_or_else(|| scan.to_string())
+        .filter(|payload| !payload.is_empty() && payload != "[DONE]");
+    let Some(payload) = payload else {
+        return scan.to_string();
+    };
+    let omitted = aisix_obs::sink::omit_base64_media_in_json(&payload);
+    if matches!(protocol, PassthroughProtocol::Raw) {
+        return omitted.into_owned();
+    }
+    // A frame cut partway through a payload has no answer to extract: what the
+    // scan holds for it is the frame's own text, base64 included.
+    let cut = matches!(omitted, std::borrow::Cow::Owned(_))
+        && serde_json::from_str::<serde::de::IgnoredAny>(&payload).is_err();
+    if cut {
+        return omitted.into_owned();
+    }
+    scan.to_string()
 }
 
 /// The SSE error frame appended when an output guardrail blocks mid-relay,
@@ -11207,6 +11227,40 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         assert_eq!(frames[0].bytes, b"12345");
         assert!(frames[0].overflowed);
         assert!(s.take_rest().is_empty());
+    }
+
+    #[test]
+    fn captured_image_answers_carry_no_b64_json() {
+        let body = br#"{"created":1,"data":[{"b64_json":"QUJD","revised_prompt":"a cat"}]}"#;
+        for protocol in [
+            PassthroughProtocol::Raw,
+            PassthroughProtocol::OpenaiChat,
+            PassthroughProtocol::OpenaiResponses,
+        ] {
+            let captured = response_capture_text(protocol, body);
+            assert!(!captured.contains("QUJD"), "{captured}");
+            assert!(captured.contains("a cat"), "{captured}");
+        }
+        let replay = br#"{"output":[{"type":"image_generation_call","result":"QUJD"}]}"#;
+        let captured = response_capture_text(PassthroughProtocol::OpenaiResponses, replay);
+        assert!(!captured.contains("QUJD"), "{captured}");
+        // A model's answer is text, whatever it looks like.
+        let answer = br#"{"choices":[{"message":{"content":"{\"b64_json\":\"QUJD\"}"}}]}"#;
+        let captured = response_capture_text(PassthroughProtocol::OpenaiChat, answer);
+        assert!(captured.contains("QUJD"), "{captured}");
+        let frame = b"data: {\"type\":\"image_generation.completed\",\"b64_json\":\"QUJD\"}\n\n";
+        let captured = frame_capture_text(PassthroughProtocol::Raw, frame, "");
+        assert!(captured.contains("omitted"), "{captured}");
+        assert!(!captured.contains("QUJD"), "{captured}");
+        let cut = b"data: {\"type\":\"image_generation.completed\",\"b64_json\":\"QUJD";
+        for protocol in [
+            PassthroughProtocol::Raw,
+            PassthroughProtocol::OpenaiCompletions,
+        ] {
+            let captured = frame_capture_text(protocol, cut, "QUJD");
+            assert!(captured.contains("omitted"), "{captured}");
+            assert!(!captured.contains("QUJD"), "{captured}");
+        }
     }
 
     #[test]
