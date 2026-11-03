@@ -131,11 +131,19 @@ export class Browser {
 
   /** Submit a consent page's form, as its `Allow` button does. */
   allow(page: string): Promise<Response> {
+    return this.submitConsent(page, "allow");
+  }
+
+  /** Submit a consent page's form, as the button carrying `decision` does. */
+  submitConsent(page: string, decision: "allow" | "cancel"): Promise<Response> {
     const form = consentForm(page);
+    if (!page.includes(`<button type="submit" name="decision" value="${decision}">`)) {
+      throw new Error(`no ${decision} button in: ${page}`);
+    }
     return this.request(form.action, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams(form.fields).toString(),
+      body: new URLSearchParams({ ...form.fields, decision }).toString(),
     });
   }
 }

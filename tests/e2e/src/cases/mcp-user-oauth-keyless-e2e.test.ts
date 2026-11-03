@@ -183,6 +183,28 @@ async function awaitInteractive(serverUrl: string): Promise<void> {
   });
 }
 
+/** The whole of what Cancel owes the client, from a page the walk stopped at. */
+async function cancelsToClient(browser: Browser, page: string, cp: MockControlPlane): Promise<void> {
+  const before = cp.storeWrites.length;
+  const cancelled = await browser.submitConsent(page, "cancel");
+  expect(cancelled.status).toBe(303);
+  const location = new URL(cancelled.headers.get("location")!);
+  expect(`${location.origin}${location.pathname}`).toBe(REDIRECT);
+  expect(location.searchParams.get("error")).toBe("access_denied");
+  expect(location.searchParams.get("state")).toBe("client-state");
+  expect(location.searchParams.get("code")).toBeNull();
+  expect(browser.cookies.size).toBe(0);
+  expect(cp.storeWrites.slice(before).filter((w) => w.includes("mcp_oauth_code"))).toEqual([]);
+
+  // The cookie went with the click, so neither button can be replayed.
+  for (const decision of ["cancel", "allow"] as const) {
+    const replay = await browser.submitConsent(page, decision);
+    expect(replay.status, decision).toBe(400);
+    expect(replay.headers.get("location"), decision).toBeNull();
+  }
+  expect(cp.storeWrites.slice(before).filter((w) => w.includes("mcp_oauth_code"))).toEqual([]);
+}
+
 describe("keyless sign-in on managed gateways", () => {
   let cp: MockControlPlane;
   let provider: MockOidcProvider;
@@ -568,19 +590,42 @@ describe("keyless sign-in on managed gateways", () => {
     const wrongCsrf = await post(browser, { ...form.fields, csrf: "0".repeat(64) });
     expect(wrongCsrf.status).toBe(403);
     expect(wrongCsrf.headers.get("location")).toBeNull();
-    const noCsrf = await post(browser, { flow: form.fields.flow });
+    const noCsrf = await post(browser, { flow: form.fields.flow, decision: "allow" });
     expect(noCsrf.status).toBe(403);
+    const cancelWithoutCsrf = await post(browser, { flow: form.fields.flow, decision: "cancel" });
+    expect(cancelWithoutCsrf.status).toBe(403);
+    expect(cancelWithoutCsrf.headers.get("location")).toBeNull();
+    const cancelWithoutCookie = await post(undefined, { ...form.fields, decision: "cancel" });
+    expect(cancelWithoutCookie.status).toBe(400);
+    expect(cancelWithoutCookie.headers.get("location")).toBeNull();
+    const undecidedForms: Record<string, string>[] = [{ decision: "maybe" }, { decision: "" }, {}];
+    for (const decision of undecidedForms) {
+      const undecided = await post(browser, { ...form.fields, ...decision });
+      expect(undecided.status, JSON.stringify(decision)).toBe(400);
+      expect(undecided.headers.get("location"), JSON.stringify(decision)).toBeNull();
+    }
 
     // Refusals consumed nothing: the real click still lands.
-    const allowed = await post(browser, form.fields);
+    const allowed = await post(browser, { ...form.fields, decision: "allow" });
     expect(allowed.status).toBe(303);
     const location = new URL(allowed.headers.get("location")!);
     expect(location.searchParams.get("code")).not.toBeNull();
     expect(location.searchParams.get("state")).toBe("client-state");
+    expect(cp.storeWrites.some((w) => w.startsWith("PUT mcp_oauth_code/"))).toBe(true);
 
     // The cookie is gone with the click, so it cannot mint a second code.
     expect(browser.cookies.size).toBe(0);
-    expect((await post(browser, form.fields)).status).toBe(400);
+    expect((await post(browser, { ...form.fields, decision: "allow" })).status).toBe(400);
+  });
+
+  test("Cancel sends the client access_denied and its state, and leaves no code", async () => {
+    if (!etcdReachable) return;
+    provider.claims = claimsOf("alice");
+    const browser = new Browser();
+    const stop = await browser.walk(authorizeUrl(url(0)), { clickAllow: false });
+    if (stop.kind !== "page") throw new Error("expected the consent page");
+    expect(stop.text).toContain(">Cancel</button>");
+    await cancelsToClient(browser, stop.text, cp);
   });
 
   test("a consent POST for a flow still at the provider is refused", async () => {
@@ -1379,6 +1424,15 @@ describe("relay mode, with no provider offering a login", () => {
     await app?.exit();
     await upstream?.close();
     await cp?.close();
+  });
+
+  test("Cancel sends the client access_denied and its state, and leaves no code", async () => {
+    if (!etcdReachable) return;
+    const browser = new Browser();
+    const stop = await browser.walk(authorizeUrl(`${app.proxyUrl}/mcp/main`), { clickAllow: false });
+    if (stop.kind !== "page") throw new Error("expected the consent page");
+    expect(stop.text).toContain(">Cancel</button>");
+    await cancelsToClient(browser, stop.text, cp);
   });
 
   test("the client's credential still decides, through the consent page, with no flow record", async () => {

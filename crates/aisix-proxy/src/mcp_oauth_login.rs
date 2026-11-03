@@ -215,7 +215,7 @@ fn html(status: StatusCode, title: &str, body: &str) -> Response {
          body{{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;\
          color:#1f2328}}h1{{font-size:1.25rem}}dt{{font-weight:600;margin-top:.75rem}}\
          dd{{margin:0;word-break:break-all}}button{{margin-top:1.5rem;padding:.5rem 1.5rem;\
-         font-size:1rem}}</style></head><body><h1>{}</h1>{body}</body></html>",
+         font-size:1rem}}button+button{{margin-left:.5rem}}</style></head><body><h1>{}</h1>{body}</body></html>",
         escape_html(title),
         escape_html(title),
     );
@@ -284,7 +284,8 @@ fn consent_page(base: &str, flow: &FlowState, identity: Option<&str>) -> Respons
          <form method=\"post\" action=\"{action}\">\
          <input type=\"hidden\" name=\"flow\" value=\"{handle}\">\
          <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
-         <button type=\"submit\">Allow</button></form>",
+         <button type=\"submit\" name=\"decision\" value=\"allow\">Allow</button>\
+         <button type=\"submit\" name=\"decision\" value=\"cancel\">Cancel</button></form>",
         server = escape_html(&flow.server_name),
         target = escape_html(&redirect_target(&flow.redirect_uri)),
         action = escape_html(&format!("{base}/mcp-oauth/consent")),
@@ -822,8 +823,8 @@ async fn handle_callback(state: &ProxyState, request: Parts) -> Result<Response,
 
 // ── Consent ─────────────────────────────────────────────────────────────────
 
-/// `POST <base>/mcp-oauth/consent`: the user's `Allow`. Only now does a code
-/// exist for the client to receive.
+/// `POST <base>/mcp-oauth/consent`: the user's `Allow` or `Cancel`. Only an
+/// `Allow` makes a code exist for the client to receive.
 pub(crate) async fn consent(State(state): State<ProxyState>, request: Request) -> Response {
     observed(&state, None, request, async |state, request| {
         or_page(handle_consent(state, request).await)
@@ -864,15 +865,28 @@ async fn handle_consent(state: &ProxyState, request: Request) -> Result<Response
     let redirect_uri = flow.redirect_uri.clone();
     let client_state = flow.client_state.clone();
     let handle = flow.handle.clone();
-    let code = state
-        .mcp_oauth
-        .issue_code(flow)
-        .await
-        .map_err(failure_page)?;
+    let (outcome, value) = match form.get("decision").map(String::as_str) {
+        Some("allow") => (
+            "code",
+            state
+                .mcp_oauth
+                .issue_code(flow)
+                .await
+                .map_err(failure_page)?,
+        ),
+        Some("cancel") => ("error", "access_denied".to_owned()),
+        _ => {
+            return Err(error_page(
+                StatusCode::BAD_REQUEST,
+                "This sign-in was refused",
+                "The form did not say whether to allow or cancel.",
+            ))
+        }
+    };
     let mut url = url::Url::parse(&redirect_uri).map_err(|_| misconfigured_page())?;
     {
         let mut query = url.query_pairs_mut();
-        query.append_pair("code", &code);
+        query.append_pair(outcome, &value);
         if let Some(state) = &client_state {
             query.append_pair("state", state);
         }
