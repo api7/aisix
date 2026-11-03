@@ -853,7 +853,7 @@ async fn handle_callback(state: &ProxyState, request: Parts) -> Result<Response,
     {
         state
             .metrics
-            .record_auth_decision("mcp_oauth_login", false, "session_identity_changed");
+            .record_auth_decision("mcp_oauth_login", false, SESSION_IDENTITY_CHANGED);
         tracing::warn!(target: "aisix::mcp_oauth", server = %flow.server_name,
             provider = %signed_in.provider,
             "the identity claim changed during a sign-in; no upstream credential was stored");
@@ -984,6 +984,7 @@ async fn handle_consent(state: &ProxyState, request: Request) -> Result<Response
 // ── Who a session is ────────────────────────────────────────────────────────
 
 const SESSION_ISSUER_CHANGED: &str = "session_issuer_changed";
+const SESSION_IDENTITY_CHANGED: &str = "session_identity_changed";
 
 /// Two spellings of one issuer, which may differ by a trailing slash.
 fn same_issuer(a: &str, b: &str) -> bool {
@@ -1117,7 +1118,7 @@ pub(crate) async fn authenticate_session(
         },
     )?;
     if principal.subject != session.identity {
-        return Err(refused("session_identity_changed"));
+        return Err(refused(SESSION_IDENTITY_CHANGED));
     }
     state
         .metrics

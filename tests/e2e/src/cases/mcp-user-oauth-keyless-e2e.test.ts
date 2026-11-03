@@ -1663,6 +1663,33 @@ describe("whose stored credential it is, across two gateways", () => {
     }
   });
 
+  test("a claim holding the same value keeps the session but needs a new upstream sign-in", async () => {
+    if (!etcdReachable) return;
+    provider.claims = { ...claimsOf("rita"), uid: "rita" };
+    upstream.user = "up-rita";
+    const rita = await signInByHand(url(0));
+    expect(await upstreamUser(0, rita.access_token)).toBe("up-rita");
+
+    await setProvider({ identity_claim: "uid" });
+    try {
+      const challenged = await mcpPost(url(0), bearer(rita.access_token));
+      expect(challenged.status).toBe(401);
+      expect(await errorCode(challenged)).toBe("mcp_oauth_authorization_required");
+      const refused = await refresh(0, rita.refresh_token);
+      expect(refused.status).toBe(400);
+      expect(await oauthError(refused)).toBe("invalid_grant");
+
+      upstream.user = "up-rita-again";
+      const seen = upstream.authorizeRequests.length;
+      const again = await signInByHand(url(0));
+      expect(upstream.authorizeRequests.length).toBe(seen + 1);
+      expect(await upstreamUser(0, again.access_token)).toBe("up-rita-again");
+      expect(await upstreamUser(1, again.access_token)).toBe("up-rita-again");
+    } finally {
+      await setProvider({});
+    }
+  });
+
   test("naming the default identity claim changes nothing for someone signed in without it", async () => {
     if (!etcdReachable) return;
     provider.claims = claimsOf("bea");
