@@ -732,16 +732,18 @@ describe("failure rows carry request and response bodies", () => {
     expect(row.get("error_message")).toMatch(READ_FAILURE(502));
   });
 
-  // Every route family: the request body, and the upstream's own answer.
+  // Every route family: the request body, and the upstream's own answer as it
+  // sent it, which the caller's error envelope would not match.
+  const ANY_400 = '{"error":{"message":"sentinel-any-400","type":"upstream_type"}}';
   test.each([
-    ["completions", "/v1/completions", { model: "row-any-400", prompt: "path-prompt" }, "sentinel-any-400"],
-    ["images", "/v1/images/generations", { model: "row-any-400", prompt: "path-prompt" }, "sentinel-any-400"],
-    ["rerank", "/v1/rerank", { model: "row-rerank-400", query: "path-prompt", documents: ["a"] }, "sentinel-any-400"],
-    ["decisions", "/v1/decisions", { model: "row-any-400", input: "path-prompt", questions: [{ type: "predicate", name: "q", instructions: "i" }] }, "sentinel-any-400"],
-    ["jobs", "/v1/batches?model=row-any-400", { input_file_id: "path-prompt" }, "sentinel-any-400"],
-    ["messages", "/v1/messages", { model: "row-any-400", max_tokens: 5, messages: [{ role: "user", content: "path-prompt" }] }, "sentinel-any-400"],
-    ["count_tokens", "/v1/messages/count_tokens", { model: "row-count-400", messages: [{ role: "user", content: "path-prompt" }] }, "sentinel-any-400"],
-    ["bedrock converse", "/v1/chat/completions", { model: "row-bedrock-400", messages: [{ role: "user", content: "path-prompt" }] }, "sentinel-bedrock-answer"],
+    ["completions", "/v1/completions", { model: "row-any-400", prompt: "path-prompt" }, ANY_400],
+    ["images", "/v1/images/generations", { model: "row-any-400", prompt: "path-prompt" }, ANY_400],
+    ["rerank", "/v1/rerank", { model: "row-rerank-400", query: "path-prompt", documents: ["a"] }, ANY_400],
+    ["decisions", "/v1/decisions", { model: "row-any-400", input: "path-prompt", questions: [{ type: "predicate", name: "q", instructions: "i" }] }, ANY_400],
+    ["jobs", "/v1/batches?model=row-any-400", { input_file_id: "path-prompt" }, ANY_400],
+    ["messages", "/v1/messages", { model: "row-any-400", max_tokens: 5, messages: [{ role: "user", content: "path-prompt" }] }, ANY_400],
+    ["count_tokens", "/v1/messages/count_tokens", { model: "row-count-400", messages: [{ role: "user", content: "path-prompt" }] }, ANY_400],
+    ["bedrock converse", "/v1/chat/completions", { model: "row-bedrock-400", messages: [{ role: "user", content: "path-prompt" }] }, '{"message":"sentinel-bedrock-answer"}'],
     ["a2a", "/a2a/row-agent", { jsonrpc: "2.0", id: "1", method: "message/send", params: { message: { role: "user", parts: [{ kind: "text", text: "path-prompt" }], messageId: "m-1" } } }, "sentinel-a2a-answer"],
   ] as const)("%s: an upstream failure carries both bodies", async (_what, path, payload, answer) => {
     if (!etcdReachable) return;
@@ -751,7 +753,7 @@ describe("failure rows carry request and response bodies", () => {
     const row = await rowOf(res.headers.get("x-aisix-request-id")!, `the ${path} row`);
     expect(Number(row.get("status_code"))).toBeGreaterThanOrEqual(400);
     expect(requestText(row)).toContain("path-prompt");
-    expect(row.get("response")).toContain(answer);
+    expect(row.get("response")).toBe(answer);
   });
 
   test("image edits: an upstream failure carries the text fields, a checksum and the answer", async () => {
