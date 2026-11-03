@@ -483,7 +483,7 @@ pub(crate) fn resolve_identity(
     prov: &OidcProvider,
     claims: &serde_json::Value,
 ) -> Result<VerifiedIdentity, IdentityDenial> {
-    let Some(subject) = nested_claim(claims, &prov.identity_claim).and_then(|v| v.as_str()) else {
+    let Some(subject) = identity_claim(claims, prov) else {
         return Err(IdentityDenial::new(
             "jwt_identity_claim_missing",
             ProxyError::JwtIdentityUnmapped,
@@ -774,7 +774,7 @@ pub(crate) async fn authenticate_jwt(
 /// a probe cannot forge log lines or inflate log volume through them.
 const LOGGED_METADATA_MAX: usize = 128;
 
-fn clip(s: &str) -> &str {
+pub(crate) fn clip(s: &str) -> &str {
     match s.char_indices().nth(LOGGED_METADATA_MAX) {
         Some((i, _)) => &s[..i],
         None => s,
@@ -1029,6 +1029,14 @@ fn token_scopes(claims: &serde_json::Value) -> Vec<String> {
 
 /// Resolve a claim by path, dots traversing nested objects
 /// (`realm_access.roles`).
+/// The identity `prov` reads from `claims`, when that claim is a string.
+pub(crate) fn identity_claim<'a>(
+    claims: &'a serde_json::Value,
+    prov: &OidcProvider,
+) -> Option<&'a str> {
+    nested_claim(claims, &prov.identity_claim).and_then(|v| v.as_str())
+}
+
 fn nested_claim<'a>(claims: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     let mut cur = claims;
     for seg in path.split('.') {

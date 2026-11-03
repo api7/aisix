@@ -238,6 +238,23 @@ fn error_page(status: StatusCode, title: &str, reason: &str) -> Response {
     html(status, title, &format!("<p>{}</p>", escape_html(reason)))
 }
 
+/// A sign-in refused for who it turned out to be, naming that identity so the
+/// person can act on it. A token with no usable identity claim names nobody.
+fn refusal_page(identity: Option<&str>, reason: &str) -> Response {
+    const TITLE: &str = "You cannot sign in here";
+    let Some(identity) = identity else {
+        return error_page(StatusCode::FORBIDDEN, TITLE, reason);
+    };
+    let body = format!(
+        "<p>{}</p><dl><dt>Signed in as</dt><dd id=\"identity\">{}</dd></dl>\
+         <p>Contact your administrator with this identity, or, if you used the wrong account, \
+         sign out of the identity provider and start again from the MCP client.</p>",
+        escape_html(reason),
+        escape_html(identity),
+    );
+    html(StatusCode::FORBIDDEN, TITLE, &body)
+}
+
 fn unavailable_page() -> Response {
     error_page(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -605,17 +622,18 @@ async fn handle_login_callback(state: &ProxyState, request: Parts) -> Result<Res
         }
     }
 
+    // On what the session will hold, so a sign-in cannot pass and every later
+    // request fail on a claim the session does not keep.
+    let session_claims = crate::jwt::session_claims(&claims);
+    let signed_in_as = crate::jwt::identity_claim(&session_claims, provider);
     let deny = |reason: &'static str| {
         state
             .metrics
             .record_auth_decision("mcp_oauth_login", false, reason);
         tracing::warn!(target: "aisix::mcp_oauth", provider = %provider.name, reason,
-            "refused a sign-in");
-        refused(denial_text(reason))
+            identity = ?signed_in_as.map(crate::jwt::clip), "refused a sign-in");
+        refusal_page(signed_in_as, denial_text(reason))
     };
-    // On what the session will hold, so a sign-in cannot pass and every later
-    // request fail on a claim the session does not keep.
-    let session_claims = crate::jwt::session_claims(&claims);
     let principal = session_principal(state, &snapshot, provider, &session_claims)
         .map_err(|d| deny(d.reason))?;
     let acl = aisix_mcp::ToolAcl::resolve(&snapshot, &state.mcp_servers, principal.auth.key());

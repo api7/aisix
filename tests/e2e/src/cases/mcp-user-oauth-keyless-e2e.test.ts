@@ -21,6 +21,7 @@ import {
   type MockControlPlane,
   type MockOidcProvider,
   type SpawnedApp,
+  waitForLogLine,
 } from "../harness/index.js";
 
 // E2E: an MCP client configured with nothing but a URL. The browser pass signs
@@ -392,7 +393,28 @@ describe("keyless sign-in on managed gateways", () => {
       expect(stop.text, name).toMatch(reason);
       expect(stop.text, name).not.toContain("<form");
       expect(upstream.authorizeRequests.length, name).toBe(seen);
+      const sub = claims.sub as string;
+      expect(stop.text, name).toContain(`<dd id="identity">${sub}</dd>`);
+      expect(stop.text, name).toMatch(/contact your administrator with this identity/i);
+      expect(stop.text, name).toMatch(/sign out of the identity provider/i);
+      await waitForLogLine(apps[0], (l) => l.includes("refused a sign-in") && l.includes(sub), `${name} refusal log`);
     }
+  });
+
+  test("a refusal page escapes the identity it names", async () => {
+    if (!etcdReachable) return;
+    const hostile = `<img src=x onerror="alert('1')">&`;
+    provider.claims = claimsOf(hostile, "sales");
+    const stop = await new Browser().walk(authorizeUrl(url(0)));
+    if (stop.kind !== "page") throw new Error("expected a refusal page");
+    expect(stop.status).toBe(403);
+    expect(stop.text).toContain(`&lt;img src=x onerror=&quot;alert(&#39;1&#39;)&quot;&gt;&amp;`);
+    expect(stop.text).not.toContain("<img");
+    await waitForLogLine(
+      apps[0],
+      (l) => l.includes("refused a sign-in") && l.includes("<img src=x onerror="),
+      "the refusal log naming the identity",
+    );
   });
 
   test("an ID token that does not check out gets nowhere", async () => {
