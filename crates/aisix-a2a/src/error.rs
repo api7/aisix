@@ -15,8 +15,12 @@ pub enum A2aError {
     #[error("failed to reach upstream A2A agent: {0}")]
     Connect(String),
 
-    /// The upstream was reached but the request failed — a non-success HTTP
-    /// status on the JSON-RPC call, or a malformed response body.
+    /// The upstream answered the JSON-RPC call with a non-success HTTP status.
+    #[error("upstream A2A request failed: upstream returned HTTP {0}")]
+    UpstreamStatus(u16),
+
+    /// The upstream was reached but the response could not be used: a
+    /// malformed or oversized body, or a read that failed.
     #[error("upstream A2A request failed: {0}")]
     Request(String),
 }

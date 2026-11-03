@@ -125,7 +125,7 @@ pub fn decide_cooldown(
         }
         // A 2xx whose body the gateway could not read says nothing about
         // the upstream's health.
-        BridgeError::UpstreamDecode(_) => None,
+        BridgeError::UpstreamDecode(_) | BridgeError::UpstreamBodyUnread { .. } => None,
         // A credential exchange that answered unreadably served nothing.
         BridgeError::TokenExchangeDecode(_) if cfg.trigger_on_transport_or_default() => {
             Some((default_ttl, "upstream_decode_error"))

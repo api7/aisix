@@ -243,6 +243,13 @@ pub(crate) struct CancelContext {
     /// An ensemble's returned sub-calls, while no exit of the request's own
     /// has settled them. See [`crate::chat::PendingEnsemble`].
     pub ensemble: Option<crate::chat::PendingEnsemble>,
+    /// The request body as every failure row of this request reports it; only
+    /// ever set under a full-content export. See
+    /// [`crate::usage_attr::note_failure_request`].
+    pub failure_request: Option<aisix_obs::CapturedContent>,
+    /// What the caller is being sent for this failure. See
+    /// [`crate::usage_attr::note_client_error`].
+    pub client_error_body: Option<String>,
 }
 
 /// A streamed response's access-log line, parked by its handler until the
@@ -464,6 +471,10 @@ struct Cell {
     )>,
     /// See [`note_semantic_decision`].
     semantic: Option<aisix_obs::SemanticAccessLog>,
+    /// See [`note_error_source`].
+    noted_error_source: Option<aisix_obs::ErrorSource>,
+    /// See [`note_relayed_error_body`].
+    relayed_error_body: Option<bytes::Bytes>,
     /// See [`note_terminal_event`]: `(status, error_class, error_message)`
     /// of the terminal event, `None` when it named no failure.
     terminal_error: Option<(u16, String, String)>,
@@ -764,9 +775,17 @@ impl RequestAttribution {
     }
 
     /// A cell whose upstream responses record `names` for the exporters.
-    pub(crate) fn with_response_headers(names: Vec<String>) -> Self {
+    pub(crate) fn with_response_headers(
+        names: Vec<String>,
+        keeps_error_bodies: bool,
+        request_id: String,
+    ) -> Self {
         Self {
-            response_tap: Arc::new(aisix_gateway::ResponseHeaderTap::new(names)),
+            response_tap: Arc::new(aisix_gateway::ResponseHeaderTap::new(
+                names,
+                keeps_error_bodies,
+                request_id,
+            )),
             ..Self::default()
         }
     }
@@ -956,7 +975,10 @@ impl RequestAttribution {
         let target = cell.resolved.clone();
         drop(cell);
         if let Some(metrics) = metrics.filter(|_| had_head) {
-            metrics.record_terminal(event.status_code);
+            metrics.record_terminal(
+                event.status_code,
+                crate::attempt::error_source_of_class(&event.error_class),
+            );
         }
         let Some(pending) = pending else {
             return false;
@@ -1527,6 +1549,55 @@ pub(crate) fn note_terminal_event(event: &aisix_obs::UsageEvent, provider_reques
     });
 }
 
+/// Name what ended a request whose handler answers with a rendered response
+/// and files no usage event for this failure (see [`rendered_error_source`]).
+pub(crate) fn note_error_source(source: aisix_obs::ErrorSource) {
+    let _ = CURRENT.try_with(|a| a.lock().noted_error_source = Some(source));
+}
+
+/// What ended a request whose emit holds only the status of a rendered
+/// response (`/a2a`, `/mcp`, the discovery documents): what was noted, else
+/// what its terminal usage event names, else a response the gateway wrote
+/// itself.
+pub(crate) fn rendered_error_source(status: u16) -> aisix_obs::ErrorSource {
+    let known = CURRENT
+        .try_with(|a| {
+            let cell = a.lock();
+            cell.noted_error_source.or_else(|| {
+                cell.terminal_error
+                    .as_ref()
+                    .map(|(_, class, _)| crate::attempt::error_source_of_class(class))
+            })
+        })
+        .ok()
+        .flatten();
+    known.unwrap_or(if (200..400).contains(&status) {
+        aisix_obs::ErrorSource::None
+    } else {
+        aisix_obs::ErrorSource::Aisix
+    })
+}
+
+/// Keep the start of a non-2xx body a route relays to its caller, for the
+/// failure row of a route with no typed error to carry it. Shares the body
+/// the route holds anyway, so nothing is copied.
+pub(crate) fn note_relayed_error_body(body: &bytes::Bytes) {
+    let kept = body.slice(
+        ..body
+            .len()
+            .min(crate::attempt::MAX_RELAYED_ERROR_DETAIL_BYTES),
+    );
+    let _ = CURRENT.try_with(|a| a.lock().relayed_error_body = Some(kept));
+}
+
+/// See [`note_relayed_error_body`].
+pub(crate) fn relayed_error_body() -> Option<bytes::Bytes> {
+    CURRENT
+        .try_with(|a| a.lock().relayed_error_body.clone())
+        .ok()
+        .flatten()
+}
+
 /// The `provider_request_id` of the request's terminal usage event, for a
 /// line written after it on a success that has no response object of its own
 /// to read one from (`/v1/messages/count_tokens`).
@@ -1638,6 +1709,23 @@ pub(crate) fn take_attempt_upstream_response(
             a.response_tap.take()
         })
         .unwrap_or_default()
+}
+
+/// See [`CancelContext::failure_request`].
+pub(crate) fn note_failure_request(content: aisix_obs::CapturedContent) {
+    with_cancel(|c| c.failure_request = Some(content));
+}
+
+/// See [`CancelContext::client_error_body`].
+pub(crate) fn note_client_error_body(body: String) {
+    with_cancel(|c| c.client_error_body = Some(body));
+}
+
+/// The noted request body and client error body, for a failure row.
+pub(crate) fn failure_notes() -> (Option<aisix_obs::CapturedContent>, Option<String>) {
+    let mut notes = (None, None);
+    with_cancel(|c| notes = (c.failure_request.clone(), c.client_error_body.clone()));
+    notes
 }
 
 /// The streamed output captured so far, moved out (see

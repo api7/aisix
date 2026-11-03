@@ -590,8 +590,15 @@ async fn record_request_telemetry(
     // target, so this layer can attribute a cancelled request to them
     // (AISIX-Cloud#1317). Installed here because a cancelled handler
     // future never gets to hand anything back.
+    let snapshot = state.snapshot.load();
     let attribution = std::sync::Arc::new(attribution::RequestAttribution::with_response_headers(
-        client_ip::exported_header_names(&state.snapshot.load(), true),
+        client_ip::exported_header_names(&snapshot, true),
+        usage_attr::content_cap(&snapshot).is_some(),
+        request
+            .extensions()
+            .get::<request_id::RequestId>()
+            .map(|r| r.0.clone())
+            .unwrap_or_default(),
     ));
     // The access-log line is held on the cell until the guard below finishes
     // the request, which is when both body sizes are known. Written in the

@@ -245,7 +245,7 @@ fn map_openai_status(status: &str) -> &'static str {
 /// `size` a `WIDTHxHEIGHT` resolution. `model` is required here (the
 /// gateway has no default video model). Unknown fields (e.g.
 /// `input_reference`) are ignored in Phase 1.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct VideoCreateBody {
     pub model: String,
     pub prompt: String,
@@ -258,7 +258,7 @@ pub struct VideoCreateBody {
 /// The upstream contract types `seconds` as a string enum (`"4"`, `"8"`,
 /// `"12"`); accept a bare integer too so curl-first callers aren't
 /// punished for the obvious spelling.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum SecondsField {
     Int(u64),
@@ -999,24 +999,36 @@ fn nonempty_str(v: Option<&serde_json::Value>) -> Option<&str> {
 /// content-proxy path ([`proxy_content`]) — both must map a non-2xx upstream
 /// to a typed error rather than surfacing the raw body.
 fn parse_provider_error_message(bytes: &[u8]) -> String {
+    vendor_error_message(bytes).unwrap_or_else(|| "upstream error".to_string())
+}
+
+/// The typed error of a non-2xx: the caller reads
+/// [`parse_provider_error_message`], the row and the access log what the body
+/// actually said.
+fn provider_status_error(status: u16, bytes: &[u8]) -> aisix_gateway::BridgeError {
+    let detail =
+        vendor_error_message(bytes).unwrap_or_else(|| aisix_gateway::bounded_error_text(bytes));
+    aisix_gateway::BridgeError::upstream_status(status, parse_provider_error_message(bytes))
+        .with_telemetry_detail(&detail)
+}
+
+fn vendor_error_message(bytes: &[u8]) -> Option<String> {
     let parsed: Option<serde_json::Value> = serde_json::from_slice(bytes).ok();
-    parsed
-        .and_then(|p| {
-            let scope = if p.get("error").is_some() {
-                p.get("error").cloned().unwrap_or_default()
-            } else {
-                p
-            };
-            let code = nonempty_str(scope.get("code")).map(str::to_string);
-            let msg = nonempty_str(scope.get("message")).map(str::to_string);
-            match (code, msg) {
-                (Some(code), Some(msg)) => Some(format!("{code}: {msg}")),
-                (None, Some(msg)) => Some(msg),
-                (Some(code), None) => Some(code),
-                (None, None) => None,
-            }
-        })
-        .unwrap_or_else(|| "upstream error".to_string())
+    parsed.and_then(|p| {
+        let scope = if p.get("error").is_some() {
+            p.get("error").cloned().unwrap_or_default()
+        } else {
+            p
+        };
+        let code = nonempty_str(scope.get("code")).map(str::to_string);
+        let msg = nonempty_str(scope.get("message")).map(str::to_string);
+        match (code, msg) {
+            (Some(code), Some(msg)) => Some(format!("{code}: {msg}")),
+            (None, Some(msg)) => Some(msg),
+            (Some(code), None) => Some(code),
+            (None, None) => None,
+        }
+    })
 }
 
 // ─────────────────────── resolved dispatch target ───────────────────────
@@ -1274,16 +1286,18 @@ fn provider_call_once<'a>(
             .map_err(|e| note(crate::dispatch::reqwest_error_to_bridge(&e, started)))?;
         aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status().as_u16();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| note(aisix_gateway::BridgeError::UpstreamDecode(e.to_string())))?;
+        let is_success = (200..300).contains(&status);
+        let bytes = resp.bytes().await.map_err(|e| {
+            note(if is_success {
+                aisix_gateway::BridgeError::UpstreamDecode(e.to_string())
+            } else {
+                aisix_gateway::BridgeError::upstream_body_unread(status, &e)
+            })
+        })?;
 
-        if !(200..300).contains(&status) {
-            let message = parse_provider_error_message(&bytes);
-            return Err(note(aisix_gateway::BridgeError::upstream_status(
-                status, message,
-            )));
+        if !is_success {
+            aisix_gateway::note_upstream_error_body(&bytes);
+            return Err(note(provider_status_error(status, &bytes)));
         }
 
         serde_json::from_slice(&bytes).map_err(|e| {
@@ -1394,18 +1408,20 @@ async fn proxy_content(
         // error body cannot hang the handler (the success path is already
         // bounded per-chunk; this closes the error branch).
         let code = status.as_u16();
-        let bytes = match stream_budget {
-            Some(d) => tokio::time::timeout(d, resp.bytes())
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or_default(),
-            None => resp.bytes().await.unwrap_or_default(),
+        let read = aisix_gateway::read_body_capped(resp, usize::MAX);
+        let body = match stream_budget {
+            Some(d) => tokio::time::timeout(d, read).await.unwrap_or_else(|_| {
+                let reason = format!("timed out after {}ms", d.as_millis());
+                aisix_gateway::warn_error_body_unread(code, &reason);
+                aisix_gateway::UpstreamErrorBody {
+                    bytes: bytes::Bytes::new(),
+                    read_error: Some(reason),
+                }
+            }),
+            None => read.await,
         };
-        let message = parse_provider_error_message(&bytes);
-        return Err(ProxyError::Bridge(note(
-            aisix_gateway::BridgeError::upstream_status(code, message),
-        )));
+        let err = provider_status_error(code, body.whole()).with_body_read_error(body.read_error);
+        return Err(ProxyError::Bridge(note(err)));
     }
 
     // Relay the upstream content headers before consuming the response into a
@@ -1520,6 +1536,17 @@ impl Telemetry<'_> {
         routing: &crate::attempt::RoutingTelemetry,
     ) {
         let elapsed = self.started.elapsed();
+        let error_source = error.map_or_else(
+            // A direct model's unsupported-provider 501 records no attempt.
+            || {
+                if status >= 400 {
+                    aisix_obs::ErrorSource::Aisix
+                } else {
+                    crate::attempt::answered_error_source(false, routing)
+                }
+            },
+            crate::attempt::error_source,
+        );
         let (error_kind, error) = match error {
             Some(e) => {
                 let (kind, msg) = crate::attempt::access_log_error(e);
@@ -1590,6 +1617,7 @@ impl Telemetry<'_> {
                 caller,
                 upstream,
                 status,
+                error_source,
                 self.started,
             );
         } else {
@@ -1599,6 +1627,7 @@ impl Telemetry<'_> {
                 caller,
                 upstream,
                 status,
+                error_source,
                 elapsed,
             );
         }
@@ -1736,6 +1765,7 @@ pub async fn create_video(
             // events instead of vanishing.
             // Per #655: one zero-token event per failed upstream attempt,
             // the last of them terminal when every attempt failed.
+            crate::usage_attr::note_client_error(&snapshot, &err);
             let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
             crate::usage_attr::emit_failed_attempts(
                 &state,
@@ -1800,6 +1830,9 @@ async fn dispatch_create(
     audit_out: &mut crate::usage_attr::GuardrailAudit,
     routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<CreateSuccess, ProxyError> {
+    crate::usage_attr::note_failure_request(snapshot, || {
+        serde_json::to_string(&body).unwrap_or_default()
+    });
     let model_entry = crate::model_resolve::resolve_model(snapshot, &body.model)
         .ok_or_else(|| ProxyError::ModelNotFound(body.model.clone()))?;
     let model_id = model_entry.id.to_string();

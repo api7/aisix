@@ -196,6 +196,16 @@ impl CapturedContent {
         self
     }
 
+    /// Set the response of a failure row, under the same cap and cut rule as
+    /// [`Self::new`].
+    pub fn with_response(mut self, response: &str, max_bytes: usize) -> Self {
+        let (response, cut) = truncate_content(response, max_bytes);
+        self.response = response.into_owned();
+        self.response_truncated = cut;
+        self.truncated = self.prompt_truncated || cut;
+        self
+    }
+
     /// Capture `prompt` and `response`, truncating each to `max_bytes`
     /// (structure-preserving for JSON, UTF-8-boundary cut otherwise) to
     /// bound the held buffer at the largest cap any content-capturing
@@ -347,6 +357,7 @@ mod tests {
         // content key is absent, and metadata is flattened (no `usage` nesting)
         assert!(json.get("content").is_none());
         assert_eq!(json["request_id"], "req-1");
+        assert_eq!(json["is_final_attempt"], false);
     }
 
     /// The public correlation key (AISIX-Cloud#1279): `trace_id` rides the

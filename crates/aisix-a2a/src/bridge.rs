@@ -95,6 +95,14 @@ fn shared_client() -> reqwest::Client {
         .clone()
 }
 
+/// Hand a refused call's body to the request's full-content exports. The
+/// caller is sent the status only, so nothing else needs it read.
+async fn read_error_body_for_export(resp: reqwest::Response) {
+    if aisix_gateway::wants_upstream_error_body() {
+        aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    }
+}
+
 /// Read an upstream response body, refusing anything larger than
 /// [`MAX_UPSTREAM_BODY_BYTES`]. An honestly-declared oversized `Content-Length`
 /// is rejected up front; a lying or absent length (including a never-ending
@@ -521,10 +529,9 @@ impl A2aBridge for HttpBridge {
         if !resp.status().is_success() {
             // Surface the upstream STATUS only — never proxy the upstream error
             // body verbatim to the caller, which could leak upstream internals.
-            return Err(A2aError::Request(format!(
-                "upstream returned HTTP {}",
-                resp.status().as_u16()
-            )));
+            let status = resp.status().as_u16();
+            read_error_body_for_export(resp).await;
+            return Err(A2aError::UpstreamStatus(status));
         }
         let bytes = read_capped(resp).await?;
         serde_json::from_slice::<serde_json::Value>(&bytes)
@@ -561,11 +568,12 @@ impl A2aBridge for HttpBridge {
 
         if !resp.status().is_success() {
             // Status only — never proxy the upstream's error body, same as
-            // `send`.
-            return Err(A2aError::Request(format!(
-                "upstream returned HTTP {}",
-                resp.status().as_u16()
-            )));
+            // `send`. Bounded here: `send`'s request timeout has no twin on a
+            // stream, and a stalled error body must not hold the caller's answer.
+            let status = resp.status().as_u16();
+            let _ =
+                tokio::time::timeout(self.upstream.timeout, read_error_body_for_export(resp)).await;
+            return Err(A2aError::UpstreamStatus(status));
         }
 
         // A JSON-RPC error is delivered at HTTP 200 with an `error` member, so

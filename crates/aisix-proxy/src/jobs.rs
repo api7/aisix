@@ -438,9 +438,17 @@ async fn send_upstream(
     aisix_gateway::note_upstream_response(&headers);
     let bytes = resp.bytes().await;
     crate::attribution::note_upstream_wait_end(bytes.is_ok());
+    if let (false, Ok(body)) = (status.is_success(), &bytes) {
+        aisix_gateway::note_upstream_error_body(body);
+        crate::attribution::note_relayed_error_body(body);
+    }
     let bytes = bytes
         .map_err(|e| {
-            let err = aisix_gateway::BridgeError::UpstreamDecode(e.to_string());
+            let err = if status.is_success() {
+                aisix_gateway::BridgeError::UpstreamDecode(e.to_string())
+            } else {
+                aisix_gateway::BridgeError::upstream_body_unread(status.as_u16(), &e)
+            };
             note_deployment(err.http_status());
             crate::cooldown::note_failure(
                 &state.runtime_status,
@@ -650,6 +658,20 @@ fn rewrite_response_ids(v: &mut Value, model: &str) {
 
 // ─────────────────────── telemetry plumbing ───────────────────────
 
+/// A multipart field joins the capture beside any earlier one of its name:
+/// every repeat is forwarded, so none may disappear from the export.
+fn push_captured(captured: &mut serde_json::Map<String, Value>, key: String, value: String) {
+    match captured.get_mut(&key) {
+        Some(Value::String(existing)) => {
+            existing.push('\n');
+            existing.push_str(&value);
+        }
+        _ => {
+            captured.insert(key, Value::String(value));
+        }
+    }
+}
+
 /// Zero-token UsageEvent for one management call (create/list/retrieve/
 /// cancel/delete). Same contract as the `/passthrough` event (#699),
 /// but with the resolved Model attributed.
@@ -673,6 +695,17 @@ fn emit_job_usage_event(
     guardrail_scores: Vec<aisix_core::GuardrailScore>,
     guardrail_bypassed_reason: String,
 ) {
+    // A refused job call is answered with the upstream's own response, so no
+    // error reaches this point.
+    let (error_class, error_message) = if crate::attempt::relayed_response_failed(status_code) {
+        let (class, message) = crate::attempt::relayed_failure(
+            status_code,
+            &crate::attribution::relayed_error_body().unwrap_or_default(),
+        );
+        (class.to_string(), message)
+    } else {
+        Default::default()
+    };
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
@@ -696,6 +729,8 @@ fn emit_job_usage_event(
         guardrail_enforced_hits,
         guardrail_scores,
         guardrail_bypassed_reason,
+        error_class,
+        error_message,
         ..Default::default()
     };
     let pk = crate::usage_attr::ResolvedPk::resolve(snap, &target.pk_entry.id);
@@ -812,6 +847,7 @@ fn finish(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::relayed_error_source(status),
                 elapsed,
             );
             emit_job_usage_event(
@@ -837,6 +873,7 @@ fn finish(
         }
         Err(err) => {
             let status = err.status().as_u16();
+            crate::usage_attr::note_client_error(snapshot, &err);
             emit_access_log(
                 &method,
                 &path,
@@ -857,6 +894,7 @@ fn finish(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             crate::usage_attr::emit_error_usage_event(
@@ -963,6 +1001,10 @@ pub(crate) async fn create_file(
         let mut form = reqwest::multipart::Form::new();
         let mut form_model: Option<String> = None;
         let mut saw_file = false;
+        // The upload as a failure row reports it: the text fields, with the
+        // file represented by its checksum (the audio convention).
+        let capture = crate::usage_attr::content_cap(&state.snapshot.load()).is_some();
+        let mut captured = serde_json::Map::new();
 
         while let Some(field) = multipart.next_field().await.map_err(|e| {
             crate::error::proxy_error_from_multipart(
@@ -995,6 +1037,14 @@ pub(crate) async fn create_file(
                         "failed to read file field",
                     )
                 })?;
+                if capture {
+                    use sha2::Digest;
+                    push_captured(
+                        &mut captured,
+                        "file_sha256".to_string(),
+                        format!("{:x}", sha2::Sha256::digest(&bytes)),
+                    );
+                }
                 // Over the `Bytes` itself, not a `Vec` copy of the file.
                 let len = bytes.len() as u64;
                 let mut part =
@@ -1015,8 +1065,14 @@ pub(crate) async fn create_file(
                     "malformed multipart field",
                 )
             })?;
+            if capture {
+                push_captured(&mut captured, name.clone(), v.clone());
+            }
             form = form.text(name, v);
         }
+
+        let snapshot = &**snapshot.insert(state.snapshot.load());
+        crate::usage_attr::note_failure_request(snapshot, || Value::Object(captured).to_string());
 
         if !saw_file {
             return Err(ProxyError::InvalidRequest(
@@ -1025,7 +1081,6 @@ pub(crate) async fn create_file(
         }
 
         let wanted = form_model.or_else(|| explicit_model(&params, &headers));
-        let snapshot = &**snapshot.insert(state.snapshot.load());
         let target = resolve_target(snapshot, &auth, wanted.as_deref(), &client)?;
 
         let _reservation = crate::quota::enforce(
@@ -1238,6 +1293,9 @@ pub(crate) async fn create_batch(
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
+    crate::usage_attr::note_failure_request(&snapshot, || {
+        String::from_utf8_lossy(&body).into_owned()
+    });
 
     let result = async {
         let mut req_json: Value = serde_json::from_slice(&body)
@@ -1545,6 +1603,9 @@ pub(crate) async fn create_ft_job(
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
+    crate::usage_attr::note_failure_request(&snapshot, || {
+        String::from_utf8_lossy(&body).into_owned()
+    });
 
     let result = async {
         let mut req_json: Value = serde_json::from_slice(&body)
@@ -1784,6 +1845,11 @@ async fn forward_simple(
 
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
+    if let Some(body) = &spec.body {
+        crate::usage_attr::note_failure_request(&snapshot, || {
+            String::from_utf8_lossy(body).into_owned()
+        });
+    }
 
     let result = async {
         let embedded = match &spec.id {
@@ -2176,6 +2242,8 @@ async fn attribute_batch_usage(
             // deliberately bypasses it (no live request, so no trace
             // bundle), and both labels still come from one constant.
             operation: crate::operation::BATCH_COMPLETION.operation.to_string(),
+            // Each slice has its own request id, so each is its own last row.
+            is_final_attempt: true,
             request_headers: request_headers.clone(),
             ..Default::default()
         };
@@ -2690,6 +2758,7 @@ mod tests {
             agg.request_id,
             batch_attribution_request_id("batch_1", 0, false)
         );
+        assert!(agg.is_final_attempt, "a batch row stands for itself");
         assert_eq!(agg.prompt_tokens, 17);
         assert_eq!(agg.completion_tokens, 8);
         assert_eq!(agg.cached_prompt_tokens, 2);

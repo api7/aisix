@@ -322,8 +322,10 @@ async fn http_error(resp: reqwest::Response, started: Instant) -> BridgeError {
         .get("x-amzn-errortype")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let body =
-        aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    let aisix_gateway::UpstreamErrorBody {
+        bytes: body,
+        read_error,
+    } = aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
     let parsed: Option<Value> = serde_json::from_slice(&body).ok();
     let field = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
     let error_obj = parsed
@@ -342,6 +344,7 @@ async fn http_error(resp: reqwest::Response, started: Instant) -> BridgeError {
     let code = error_obj.and_then(|e| field(e, "code"));
     let kind = errortype.or_else(|| error_obj.and_then(|e| field(e, "type")).or(code.clone()));
     crate::errors::upstream_error(status, kind, code, message, retry_after, started)
+        .with_body_read_error(read_error)
 }
 
 async fn with_deadline<T, F>(

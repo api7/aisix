@@ -153,6 +153,7 @@ pub async fn image_generations(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::answered_error_source(false, &routing),
                 elapsed,
             );
             // One zero-token event per attempt that failed first (#655).
@@ -238,12 +239,14 @@ pub async fn image_generations(
                 crate::request_metrics::Caller::new(&auth),
                 last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a
             // zero-token event (status + error class), instead of dropping it.
             // Per #655: one zero-token event per failed upstream attempt,
             // the last of them terminal when every attempt failed.
+            crate::usage_attr::note_client_error(&snapshot, &err);
             let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
             crate::usage_attr::emit_failed_attempts(
                 &state,
@@ -309,6 +312,7 @@ async fn dispatch(
     audit_out: &mut crate::usage_attr::GuardrailAudit,
     routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<ImageDispatchSuccess, ProxyError> {
+    crate::usage_attr::note_failure_request(snapshot, || body.to_string());
     // Owned so the #696 in-place prompt masking below can borrow `body`
     // mutably.
     let model_name = body
@@ -390,6 +394,11 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/images/generations request",
             );
+            // A blocked request exports what the success path would have sent.
+            if crate::usage_attr::content_cap(snapshot).is_some() {
+                crate::redact::redact_images_request(&resolved_chain.without_audit(), &mut body);
+                crate::usage_attr::note_failure_request(snapshot, || body.to_string());
+            }
             return Err(crate::error::guardrail_block_error(
                 "request",
                 guardrail_name.as_deref(),
@@ -402,6 +411,7 @@ async fn dispatch(
     // the block check passes, BEFORE the body is forwarded upstream.
     // Pre-#696 a mask-action detector was a silent no-op here.
     let redactions = crate::redact::redact_images_request(&resolved_chain, &mut body);
+    crate::usage_attr::note_failure_request(snapshot, || body.to_string());
 
     // Content capture (#700): the client-facing request body
     // (post-#932-redaction) is the prompt; the response is the image JSON

@@ -153,6 +153,34 @@ fn embeddings_input_to_chat(model: &str, input: &InputField) -> ChatFormat {
     ChatFormat::new(model, messages)
 }
 
+/// Rewrite the input's text through the chain's mask rules (#932).
+fn mask_input(
+    chain: &aisix_guardrails::GuardrailChain,
+    input: &mut InputField,
+    redactions: &mut crate::redact::RedactionCounts,
+) {
+    if !aisix_guardrails::Guardrail::redacts_input(chain) {
+        return;
+    }
+    match input {
+        InputField::Single(s) => {
+            if let Some(r) = aisix_guardrails::Guardrail::redact_input_text(chain, s) {
+                *s = r.text;
+                crate::redact::merge_counts(redactions, r.counts);
+            }
+        }
+        InputField::Multi(items) => {
+            for s in items {
+                if let Some(r) = aisix_guardrails::Guardrail::redact_input_text(chain, s) {
+                    *s = r.text;
+                    crate::redact::merge_counts(redactions, r.counts);
+                }
+            }
+        }
+        InputField::Tokens(_) | InputField::TokenArrays(_) => {}
+    }
+}
+
 pub async fn embeddings(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
@@ -256,6 +284,7 @@ pub async fn embeddings(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::answered_error_source(false, &routing),
                 elapsed,
             );
             // One zero-token event per attempt that failed first (#655).
@@ -338,12 +367,14 @@ pub async fn embeddings(
                 crate::request_metrics::Caller::new(&auth),
                 last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a
             // zero-token event (status + error class), instead of dropping it.
             // Per #655: one zero-token event per failed upstream attempt,
             // the last of them terminal when every attempt failed.
+            crate::usage_attr::note_client_error(&snapshot, &err);
             let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
             crate::usage_attr::emit_failed_attempts(
                 &state,
@@ -444,6 +475,9 @@ async fn dispatch(
     audit_out: &mut crate::usage_attr::GuardrailAudit,
     routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<EmbedDispatchSuccess, ProxyError> {
+    crate::usage_attr::note_failure_request(snapshot, || {
+        serde_json::to_string(&body).unwrap_or_default()
+    });
     let model_entry = crate::model_resolve::resolve_model(snapshot, &body.model)
         .ok_or_else(|| ProxyError::ModelNotFound(body.model.clone()))?;
 
@@ -501,6 +535,17 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/embeddings request",
             );
+            // A blocked request exports what the success path would have sent.
+            if crate::usage_attr::content_cap(snapshot).is_some() {
+                mask_input(
+                    &resolved_chain.without_audit(),
+                    &mut body.input,
+                    &mut crate::redact::RedactionCounts::new(),
+                );
+                crate::usage_attr::note_failure_request(snapshot, || {
+                    serde_json::to_string(&body).unwrap_or_default()
+                });
+            }
             return Err(crate::error::guardrail_block_error(
                 "request",
                 guardrail_name.as_deref(),
@@ -513,27 +558,11 @@ async fn dispatch(
     // AFTER the block check passes — the masked text is what gets embedded,
     // so the matched values never reach the provider.
     let mut redactions = crate::redact::RedactionCounts::new();
-    if aisix_guardrails::Guardrail::redacts_input(&resolved_chain) {
-        match &mut body.input {
-            InputField::Single(s) => {
-                if let Some(r) = aisix_guardrails::Guardrail::redact_input_text(&resolved_chain, s)
-                {
-                    *s = r.text;
-                    crate::redact::merge_counts(&mut redactions, r.counts);
-                }
-            }
-            InputField::Multi(items) => {
-                for s in items {
-                    if let Some(r) =
-                        aisix_guardrails::Guardrail::redact_input_text(&resolved_chain, s)
-                    {
-                        *s = r.text;
-                        crate::redact::merge_counts(&mut redactions, r.counts);
-                    }
-                }
-            }
-            InputField::Tokens(_) | InputField::TokenArrays(_) => {}
-        }
+    mask_input(&resolved_chain, &mut body.input, &mut redactions);
+    if !redactions.is_empty() {
+        crate::usage_attr::note_failure_request(snapshot, || {
+            serde_json::to_string(&body).unwrap_or_default()
+        });
     }
 
     // Content capture (#700): the client-facing request body

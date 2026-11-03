@@ -374,8 +374,10 @@ pub async fn entry(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::error_source(&error),
                 elapsed,
             );
+            crate::usage_attr::note_client_error(&snapshot, &error);
             let mut event = crate::usage_attr::build_error_usage_event(
                 "passthrough",
                 &request_id,
@@ -628,6 +630,9 @@ async fn dispatch(
                     &auth,
                 )
             })?;
+    crate::usage_attr::note_failure_request(snapshot, || {
+        String::from_utf8_lossy(&body_bytes).into_owned()
+    });
 
     // Guardrail chain for this route (+ the caller's key/team/env scopes).
     let guardrail_ctx = aisix_guardrails::RequestContext {
@@ -731,8 +736,7 @@ async fn dispatch(
     }
 
     // Content capture (exporter-gated): the request body text, in the same
-    // exporter-only channel the typed endpoints use. Captured after the
-    // input guardrail so a blocked request records nothing.
+    // exporter-only channel the typed endpoints use.
     let content_cap = aisix_obs::content_capture_cap(
         snapshot
             .observability_exporters
@@ -1062,6 +1066,9 @@ async fn dispatch(
         error_class: String::new(),
         error_message: String::new(),
         failure_status: None,
+        error_detail: Vec::new(),
+        error_body_encoded: !status.is_success()
+            && response_has_non_identity_content_encoding(upstream_resp.headers()),
         monitor_hits,
         audit: audit_out.clone(),
         captured_prompt,
@@ -1154,10 +1161,12 @@ async fn dispatch(
     crate::attribution::note_upstream_wait_end(read.is_ok());
     let resp_body = read.map_err(|e| {
         telemetry.emitted = true;
-        RouteError::of(
-            ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(e.to_string())),
-            &auth,
-        )
+        let err = if status.is_success() {
+            aisix_gateway::BridgeError::UpstreamDecode(e.to_string())
+        } else {
+            aisix_gateway::BridgeError::upstream_body_unread(status.as_u16(), &e)
+        };
+        RouteError::of(ProxyError::Bridge(err), &auth)
     })?;
 
     // Output guardrails govern generated successful answers. A provider's
@@ -1262,8 +1271,17 @@ async fn dispatch(
         merge_usage(&mut telemetry.usage, u);
     }
     telemetry.service_tier = tier;
+    if !status.is_success() {
+        telemetry.keep_error_detail(&resp_body);
+    }
     if telemetry.content_cap.is_some() && !bypass_uninspectable_output {
-        telemetry.response_text = response_capture_text(protocol, &resp_body);
+        telemetry.response_text = if status.is_success() {
+            response_capture_text(protocol, &resp_body)
+        } else if telemetry.error_body_encoded {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&resp_body).into_owned()
+        };
     }
 
     let mut response = Response::builder()
@@ -6027,10 +6045,25 @@ fn stream_opaque_response(
                         crate::attribution::note_upstream_first_frame();
                     }
                     telemetry.mark_first_delivery();
+                    // An opaque relay of a refusal is still that attempt's
+                    // upstream answer. A fail-open success stays uncaptured.
+                    if !status.is_success() {
+                        telemetry.keep_error_detail(&chunk);
+                        if let Some(cap) = telemetry.content_cap.filter(|_| !telemetry.error_body_encoded) {
+                            let room = cap.saturating_sub(telemetry.response_text.len());
+                            telemetry
+                                .response_text
+                                .push_str(&String::from_utf8_lossy(&chunk[..chunk.len().min(room)]));
+                        }
+                    }
                     yield Ok::<_, std::convert::Infallible>(chunk);
                 }
                 Err(err) => {
-                    let bridge = crate::dispatch::reqwest_error_to_bridge(&err, telemetry.started);
+                    let bridge = if status.is_success() {
+                        crate::dispatch::reqwest_error_to_bridge(&err, telemetry.started)
+                    } else {
+                        aisix_gateway::BridgeError::upstream_body_unread(status.as_u16(), &err)
+                    };
                     telemetry.record_failure(&bridge);
                     tracing::warn!(
                         route = %route_name,
@@ -7041,6 +7074,14 @@ struct RouteTelemetry {
     /// place of the upstream's `200`: the caller's response line cannot
     /// change any more, but the record of what happened can.
     failure_status: Option<u16>,
+    /// The start of a non-2xx body relayed as sent, whatever the request's
+    /// exporters are: what the row's `error_message` is read from. Never
+    /// more than [`crate::attempt::MAX_RELAYED_ERROR_DETAIL_BYTES`], and
+    /// copied off the relay without holding it.
+    error_detail: Vec<u8>,
+    /// The relay never decodes, so a failure's compressed bytes are not text
+    /// a row could report.
+    error_body_encoded: bool,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// The request's ENFORCE-mode audit handle (AISIX-Cloud#1330). Held
     /// rather than snapshotted at construction: this struct's emit runs
@@ -7055,6 +7096,16 @@ struct RouteTelemetry {
 }
 
 impl RouteTelemetry {
+    /// See [`Self::error_detail`].
+    fn keep_error_detail(&mut self, relayed: &[u8]) {
+        if self.error_body_encoded {
+            return;
+        }
+        let room = crate::attempt::MAX_RELAYED_ERROR_DETAIL_BYTES - self.error_detail.len();
+        self.error_detail
+            .extend_from_slice(&relayed[..relayed.len().min(room)]);
+    }
+
     /// Record the upstream failure that ended a streamed relay after its
     /// head went out, or that a relayed 2xx body reports in-band. The first
     /// one is the cause; later ones do not replace it.
@@ -7137,6 +7188,21 @@ impl RouteTelemetry {
             None if self.streaming && !self.stream_reached_end => {
                 self.status = crate::CLIENT_CLOSED_REQUEST
             }
+            None if crate::attempt::relayed_response_failed(self.status)
+                && self.error_class.is_empty() =>
+            {
+                let (class, message) =
+                    crate::attempt::relayed_failure(self.status, &self.error_detail);
+                self.error_class = class.to_string();
+                self.error_message = if self.error_body_encoded {
+                    format!(
+                        "upstream returned HTTP {} with a compressed error body",
+                        self.status
+                    )
+                } else {
+                    message
+                };
+            }
             None => {}
         }
         // Named before the line is written, so the line and the event carry
@@ -7213,6 +7279,7 @@ impl RouteTelemetry {
             caller.as_caller(),
             upstream,
             self.status,
+            crate::attempt::error_source_of_class(&self.error_class),
             elapsed,
         );
         // An opaque relay times its first frame too, so it reports time to

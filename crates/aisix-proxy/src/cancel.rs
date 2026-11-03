@@ -192,6 +192,7 @@ pub(crate) fn emit(
             surface,
             event,
             &pk,
+            ctx.failure_request.as_ref(),
             trace,
             false,
             rec.dispatched,
@@ -293,7 +294,17 @@ pub(crate) fn emit(
         ..base_event(request_id, resolved, &ctx, &client, inbound_protocol, &pk)
     };
     let dispatched = attempt.as_ref().is_some_and(|a| a.dispatched);
-    emit_one(state, &snap, surface, event, &pk, trace, true, dispatched);
+    emit_one(
+        state,
+        &snap,
+        surface,
+        event,
+        &pk,
+        ctx.failure_request.as_ref(),
+        trace,
+        true,
+        dispatched,
+    );
 }
 
 /// The attempt the terminal event speaks for, once the two shapes that can
@@ -394,6 +405,9 @@ fn emit_one(
     surface: crate::operation::Surface,
     event: UsageEvent,
     pk: &ResolvedPk<'_>,
+    // The request body the request noted before it was abandoned; `Drop` runs
+    // outside the request scope a failure row would otherwise read it from.
+    content: Option<&aisix_obs::CapturedContent>,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     terminal: bool,
     dispatched: bool,
@@ -405,7 +419,7 @@ fn emit_one(
         surface,
         event,
         usage_attr::usage_event_labels(&model, pk),
-        None,
+        content,
         trace,
         terminal,
         dispatched,
