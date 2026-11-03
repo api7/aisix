@@ -2995,7 +2995,7 @@ fn build_anthropic_sse_stream(
                     let frame = format!(
                         "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"{}\",\"message\":{}}}}}\n\n",
                         e.error_type(),
-                        serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"error\"".into()),
+                        serde_json::to_string(&e.stream_frame_message()).unwrap_or_else(|_| "\"error\"".into()),
                     );
                     yield Ok(bytes::Bytes::from(frame));
                     return;

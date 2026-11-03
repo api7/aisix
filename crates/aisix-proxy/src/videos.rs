@@ -993,29 +993,42 @@ fn nonempty_str(v: Option<&serde_json::Value>) -> Option<&str> {
 
 /// Best-effort extraction of a vendor error envelope's message from a
 /// non-2xx upstream body. DashScope puts `{code, message}` at the top level;
-/// the OpenAI-style vendors nest `{error: {code, message}}`. Falls back to the
-/// body's text like every other route, blank when there is none, which is what
-/// names the status to the caller instead. Shared by the JSON task calls
-/// ([`provider_call`]) and the content-proxy path ([`proxy_content`]).
+/// the OpenAI-style vendors nest `{error: {code, message}}`. Falls back to a
+/// generic marker for non-JSON or fieldless bodies so a typed error is always
+/// producible. Shared by the JSON task calls ([`provider_call`]) and the
+/// content-proxy path ([`proxy_content`]) — both must map a non-2xx upstream
+/// to a typed error rather than surfacing the raw body.
 fn parse_provider_error_message(bytes: &[u8]) -> String {
+    vendor_error_message(bytes).unwrap_or_else(|| "upstream error".to_string())
+}
+
+/// The typed error of a non-2xx: the caller reads
+/// [`parse_provider_error_message`], the row and the access log what the body
+/// actually said.
+fn provider_status_error(status: u16, bytes: &[u8]) -> aisix_gateway::BridgeError {
+    let detail =
+        vendor_error_message(bytes).unwrap_or_else(|| aisix_gateway::bounded_error_text(bytes));
+    aisix_gateway::BridgeError::upstream_status(status, parse_provider_error_message(bytes))
+        .with_telemetry_detail(&detail)
+}
+
+fn vendor_error_message(bytes: &[u8]) -> Option<String> {
     let parsed: Option<serde_json::Value> = serde_json::from_slice(bytes).ok();
-    parsed
-        .and_then(|p| {
-            let scope = if p.get("error").is_some() {
-                p.get("error").cloned().unwrap_or_default()
-            } else {
-                p
-            };
-            let code = nonempty_str(scope.get("code")).map(str::to_string);
-            let msg = nonempty_str(scope.get("message")).map(str::to_string);
-            match (code, msg) {
-                (Some(code), Some(msg)) => Some(format!("{code}: {msg}")),
-                (None, Some(msg)) => Some(msg),
-                (Some(code), None) => Some(code),
-                (None, None) => None,
-            }
-        })
-        .unwrap_or_else(|| aisix_gateway::bounded_error_text(bytes))
+    parsed.and_then(|p| {
+        let scope = if p.get("error").is_some() {
+            p.get("error").cloned().unwrap_or_default()
+        } else {
+            p
+        };
+        let code = nonempty_str(scope.get("code")).map(str::to_string);
+        let msg = nonempty_str(scope.get("message")).map(str::to_string);
+        match (code, msg) {
+            (Some(code), Some(msg)) => Some(format!("{code}: {msg}")),
+            (None, Some(msg)) => Some(msg),
+            (Some(code), None) => Some(code),
+            (None, None) => None,
+        }
+    })
 }
 
 // ─────────────────────── resolved dispatch target ───────────────────────
@@ -1273,22 +1286,19 @@ fn provider_call_once<'a>(
             .map_err(|e| note(crate::dispatch::reqwest_error_to_bridge(&e, started)))?;
         aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status().as_u16();
-        if !(200..300).contains(&status) {
-            let body =
-                aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES)
-                    .await;
-            return Err(note(
-                aisix_gateway::BridgeError::upstream_status(
-                    status,
-                    parse_provider_error_message(&body.bytes),
-                )
-                .with_body_read_error(body.read_error),
-            ));
+        let is_success = (200..300).contains(&status);
+        let bytes = resp.bytes().await.map_err(|e| {
+            note(if is_success {
+                aisix_gateway::BridgeError::UpstreamDecode(e.to_string())
+            } else {
+                aisix_gateway::BridgeError::upstream_body_unread(status, &e)
+            })
+        })?;
+
+        if !is_success {
+            aisix_gateway::note_upstream_error_body(&bytes);
+            return Err(note(provider_status_error(status, &bytes)));
         }
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| note(aisix_gateway::BridgeError::UpstreamDecode(e.to_string())))?;
 
         serde_json::from_slice(&bytes).map_err(|e| {
             aisix_gateway::BridgeError::UpstreamDecode(format!(
@@ -1398,27 +1408,19 @@ async fn proxy_content(
         // error body cannot hang the handler (the success path is already
         // bounded per-chunk; this closes the error branch).
         let code = status.as_u16();
-        let read =
-            aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES);
-        let err = match stream_budget {
-            Some(d) => tokio::time::timeout(d, read).await.map_err(|_| d),
-            None => Ok(read.await),
-        }
-        .map_or_else(
-            |d| {
+        let read = aisix_gateway::read_body_capped(resp, usize::MAX);
+        let body = match stream_budget {
+            Some(d) => tokio::time::timeout(d, read).await.unwrap_or_else(|_| {
                 let reason = format!("timed out after {}ms", d.as_millis());
                 aisix_gateway::warn_error_body_unread(code, &reason);
-                aisix_gateway::BridgeError::upstream_status(code, "")
-                    .with_body_read_error(Some(reason))
-            },
-            |body| {
-                aisix_gateway::BridgeError::upstream_status(
-                    code,
-                    parse_provider_error_message(&body.bytes),
-                )
-                .with_body_read_error(body.read_error)
-            },
-        );
+                aisix_gateway::UpstreamErrorBody {
+                    bytes: bytes::Bytes::new(),
+                    read_error: Some(reason),
+                }
+            }),
+            None => read.await,
+        };
+        let err = provider_status_error(code, body.whole()).with_body_read_error(body.read_error);
         return Err(ProxyError::Bridge(note(err)));
     }
 

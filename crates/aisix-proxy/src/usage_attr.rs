@@ -605,7 +605,8 @@ pub(crate) fn note_client_error_body(snap: &AisixSnapshot, body: impl FnOnce() -
 
 /// What a failure row exports (AISIX-Cloud#1921): the request body and
 /// the attempt's upstream response body, or, for an attempt no upstream
-/// answered, the gateway's own error body. `None` for any other row, whose
+/// answered, the gateway's own error body, except on a `499`, which went to
+/// no one. `None` for any other row, whose
 /// `content` stands as given.
 fn failure_row_content(
     event: &UsageEvent,
@@ -638,6 +639,8 @@ fn failure_row_content(
     let response = match (delivered, upstream_body.filter(|b| !b.is_empty())) {
         (Some(delivered), _) => delivered,
         (None, Some(body)) => String::from_utf8_lossy(body).into_owned(),
+        // The caller left: nothing was sent to report.
+        (None, None) if event.status_code == crate::CLIENT_CLOSED_REQUEST => return Some(row),
         (None, None) => noted_error.filter(|_| terminal).unwrap_or_else(|| {
             let message = if event.error_message.is_empty() {
                 format!("request failed with status {}", event.status_code)

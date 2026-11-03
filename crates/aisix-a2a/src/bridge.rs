@@ -570,9 +570,11 @@ impl A2aBridge for HttpBridge {
 
         if !resp.status().is_success() {
             // Status only — never proxy the upstream's error body, same as
-            // `send`.
+            // `send`. Bounded here: `send`'s request timeout has no twin on a
+            // stream, and a stalled error body must not hold the caller's answer.
             let status = resp.status().as_u16();
-            read_error_body_for_export(resp).await;
+            let _ =
+                tokio::time::timeout(self.upstream.timeout, read_error_body_for_export(resp)).await;
             return Err(A2aError::Request(format!(
                 "upstream returned HTTP {status}"
             )));

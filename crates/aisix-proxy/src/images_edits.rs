@@ -662,6 +662,7 @@ async fn dispatch(
                                 cooldown_cfg,
                                 aisix_gateway::upstream_status_from_response(
                                     resp,
+                                    aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES,
                                     aisix_gateway::bounded_error_text,
                                 )
                                 .await,

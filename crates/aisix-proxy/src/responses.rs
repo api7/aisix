@@ -1392,6 +1392,7 @@ async fn responses_to_target(
     if !status.is_success() {
         let err = aisix_gateway::upstream_status_from_response(
             upstream_resp,
+            aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES,
             aisix_gateway::bounded_error_text,
         )
         .await;

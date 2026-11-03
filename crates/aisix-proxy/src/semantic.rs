@@ -138,6 +138,7 @@ impl DecisionFailure {
                 BridgeError::UpstreamStatus { .. }
                 | BridgeError::UpstreamInBand { .. }
                 | BridgeError::UpstreamDecode(_)
+                | BridgeError::UpstreamBodyUnread { .. }
                 | BridgeError::TokenExchangeDecode(_)
                 | BridgeError::Transport(_)
                 | BridgeError::StreamAborted,

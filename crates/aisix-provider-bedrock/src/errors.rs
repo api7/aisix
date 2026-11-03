@@ -84,7 +84,7 @@ pub(crate) fn upstream_error(
         message,
         wire: UpstreamWire::Bedrock,
         retry_after,
-        read_error: None,
+        diagnostic: None,
     }
 }
 

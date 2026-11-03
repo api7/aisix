@@ -644,6 +644,14 @@ impl ProxyError {
                 self.kind(),
             );
         }
+        if let ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamBodyUnread {
+            decode_error,
+            ..
+        }) = self
+        {
+            let as_decode = aisix_gateway::BridgeError::UpstreamDecode(decode_error.clone());
+            return ErrorEnvelope::new(as_decode.to_string(), self.kind());
+        }
         let env = ErrorEnvelope::new(self.to_string(), self.kind());
         match self {
             ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),

@@ -314,7 +314,9 @@ pub(crate) fn routing_error_class(err: &BridgeError) -> &'static str {
     match err {
         BridgeError::Timeout { .. } => "timeout",
         BridgeError::UpstreamStatus { .. } => "upstream_status",
-        BridgeError::UpstreamDecode(_) | BridgeError::TokenExchangeDecode(_) => "upstream_decode",
+        BridgeError::UpstreamDecode(_)
+        | BridgeError::UpstreamBodyUnread { .. }
+        | BridgeError::TokenExchangeDecode(_) => "upstream_decode",
         BridgeError::UpstreamInBand { .. } => "upstream_in_band",
         // Deliberately the same class `Config` reports: this variant was
         // spelled as a `Config` until #1093, and giving it a class of its
@@ -540,7 +542,9 @@ pub(crate) fn gateway_error_message(err: &ProxyError) -> String {
         | ProxyError::BudgetUnverified
         | ProxyError::RequestTooLarge { .. }
         | ProxyError::RateLimit(_)
-        | ProxyError::PolicyRateLimit { .. } => true,
+        | ProxyError::PolicyRateLimit { .. }
+        // The gateway's wording around a socket-level reason; no body was read.
+        | ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamBodyUnread { .. }) => true,
         // `InvalidRequest` can quote the request body (a serde message
         // names the offending value), a video id is whatever the caller
         // sent, and a bridge error carries upstream response text.
@@ -737,9 +741,9 @@ mod tests {
                 // would hide the outage the family exists to show.
                 BridgeError::Timeout { .. } => (true, "timeout"),
                 BridgeError::UpstreamStatus { .. } => (true, "upstream_status"),
-                BridgeError::UpstreamDecode(_) | BridgeError::TokenExchangeDecode(_) => {
-                    (true, "upstream_decode")
-                }
+                BridgeError::UpstreamDecode(_)
+                | BridgeError::UpstreamBodyUnread { .. }
+                | BridgeError::TokenExchangeDecode(_) => (true, "upstream_decode"),
                 BridgeError::UpstreamInBand { .. } => (true, "upstream_in_band"),
                 BridgeError::Transport(_) => (true, "transport"),
                 BridgeError::StreamAborted => (true, "stream_aborted"),
@@ -876,7 +880,7 @@ mod tests {
             parsed: None,
             wire: UpstreamWire::OpenAI,
             retry_after: None,
-            read_error: None,
+            diagnostic: None,
         }
     }
 

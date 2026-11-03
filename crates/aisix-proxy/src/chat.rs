@@ -6446,7 +6446,7 @@ where
                     yield Ok::<_, Infallible>(
                         Event::default()
                             .event("error")
-                            .data(error_frame_payload(etype, &err.to_string())),
+                            .data(error_frame_payload(etype, &err.stream_frame_message())),
                     );
                     None
                 }

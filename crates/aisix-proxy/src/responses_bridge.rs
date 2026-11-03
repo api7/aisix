@@ -2621,7 +2621,7 @@ pub fn build_responses_bridge_stream(
                     {
                         break;
                     }
-                    let message = e.to_string();
+                    let message = e.stream_frame_message();
                     crate::attempt::StreamFailure::record(&mut guard.comp().failure, &e);
                     // The loop stops at the terminal event, so none went out.
                     yield Ok(failure_frames(

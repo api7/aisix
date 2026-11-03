@@ -288,13 +288,13 @@ impl TokenMinter {
             let body =
                 aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES)
                     .await;
+            let text = String::from_utf8_lossy(body.whole()).into_owned();
             let read_error = body.read_error;
-            let body = String::from_utf8_lossy(&body.bytes);
             // Cap body to 500 chars. AAD error envelopes
             // `{error: "invalid_client", error_description: "..."}` are
             // operator-actionable; cap is defense-in-depth against a
             // mis-deployed front-door that returns an HTML error page.
-            let truncated: String = body.chars().take(500).collect();
+            let truncated: String = text.chars().take(500).collect();
             let msg = format!("azure aad token mint upstream returned HTTP {status}: {truncated}");
             // Mirror Vertex audit MEDIUM (ai-gateway#387): 5xx is
             // transient upstream — should surface UpstreamStatus

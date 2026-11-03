@@ -446,10 +446,7 @@ async fn send_upstream(
             let err = if status.is_success() {
                 aisix_gateway::BridgeError::UpstreamDecode(e.to_string())
             } else {
-                let reason = aisix_gateway::transport_error_message(&e);
-                aisix_gateway::warn_error_body_unread(status.as_u16(), &reason);
-                aisix_gateway::BridgeError::upstream_status(status.as_u16(), "")
-                    .with_body_read_error(Some(reason))
+                aisix_gateway::BridgeError::upstream_body_unread(status.as_u16(), &e)
             };
             note_deployment(err.http_status());
             crate::cooldown::note_failure(

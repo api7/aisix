@@ -256,9 +256,9 @@ impl TokenMinter {
             let body =
                 aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES)
                     .await;
+            let text = String::from_utf8_lossy(body.whole()).into_owned();
             let read_error = body.read_error;
-            let body = String::from_utf8_lossy(&body.bytes);
-            let truncated: String = body.chars().take(500).collect();
+            let truncated: String = text.chars().take(500).collect();
             let msg = format!("vertex token mint upstream returned HTTP {status}: {truncated}");
             // Audit MEDIUM (PR #387): classify 5xx as a transient
             // upstream failure (502 with cooldown semantics) rather

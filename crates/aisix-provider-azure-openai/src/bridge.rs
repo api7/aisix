@@ -545,7 +545,7 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
         parsed,
         wire: aisix_gateway::UpstreamWire::AzureOpenAI,
         retry_after,
-        read_error: None,
+        diagnostic: None,
     }
     .with_body_read_error(read_error)
 }

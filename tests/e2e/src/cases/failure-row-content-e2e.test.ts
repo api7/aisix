@@ -1,16 +1,21 @@
 import { createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
+import { createServer, type Server as HttpServer } from "node:http";
 import { createServer as createTcpServer, type Server as TcpServer } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { WebSocket as WsClient } from "ws";
 import {
   EtcdClient,
   SeedClient,
   slsLogsFor,
   spawnApp,
+  startMcpUpstream,
   startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
   waitForLogLine,
   waitForSlsLog,
+  type McpUpstream,
   type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
@@ -23,6 +28,8 @@ import {
 
 const CALLER = "sk-failure-row-caller";
 const LIMITED_CALLER = "sk-failure-row-limited";
+const MCP_LIMITED_CALLER = "sk-failure-row-mcp-limited";
+const MCP_BLOCKED_WORD = "sentinel-mcp-forbidden-word";
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 
 const CREDENTIAL_REF = "mock";
@@ -31,13 +38,17 @@ const META = "failure-row-meta";
 
 const NO_DETAIL = (status: number) =>
   `upstream returned HTTP ${status} with no error detail in the response`;
+const READ_FAILURE = (status: number) =>
+  new RegExp(`^upstream returned HTTP ${status}: failed to read response body: .+`);
 
 type Row = Map<string, string>;
 
 describe("failure rows carry request and response bodies", () => {
   let sls: MockSls | undefined;
   let app: SpawnedApp | undefined;
-  let truncatingUpstream: TcpServer | undefined;
+  const tcpServers: TcpServer[] = [];
+  const httpServers: HttpServer[] = [];
+  let mcpUpstream: McpUpstream | undefined;
   const upstreams: OpenAiUpstream[] = [];
   let etcdReachable = false;
   let seed: SeedClient;
@@ -67,6 +78,63 @@ describe("failure rows carry request and response bodies", () => {
     });
   }
 
+  /** An upstream answering every path and method the same way. */
+  async function fixedUpstream(
+    status: number,
+    body: string,
+    responseHeaders: Record<string, string> = { "content-type": "application/json" },
+  ): Promise<string> {
+    const server = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(status, responseHeaders);
+        res.end(body);
+      });
+    });
+    httpServers.push(server);
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  }
+
+  /** An upstream that declares more bytes than it sends, then drops the connection. */
+  async function truncatingUpstream(status: string, head: string): Promise<string> {
+    const server = createTcpServer((socket) => {
+      socket.once("data", () => {
+        socket.write(
+          `HTTP/1.1 ${status}\r\ncontent-type: application/json\r\n` +
+            `content-length: 4096\r\n\r\n${head}`,
+          () => socket.destroy(),
+        );
+      });
+      socket.on("error", () => {});
+    });
+    tcpServers.push(server);
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  }
+
+  async function modelAt(
+    name: string,
+    apiBase: string,
+    provider: { provider?: string; adapter?: string; model_name?: string; secret?: string } = {},
+  ): Promise<void> {
+    const { provider: providerName = "openai", adapter, model_name = "gpt-4o-mini", secret } = provider;
+    const pk = await seed.createProviderKey({
+      display_name: `${name}-pk`,
+      secret: secret ?? "sk-mock",
+      provider: providerName,
+      ...(adapter ? { adapter } : {}),
+      api_base: apiBase,
+    });
+    await seed.createModel({
+      display_name: name,
+      provider: providerName,
+      model_name,
+      provider_key_id: pk.id,
+      cooldown: { enabled: false },
+    });
+  }
+
   beforeAll(async () => {
     const etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
@@ -75,6 +143,8 @@ describe("failure rows carry request and response bodies", () => {
     sls = await startMockSls();
     app = await spawnApp({
       extraEnv: {
+        // The access-log line is an INFO line.
+        RUST_LOG: "info",
         SLS_CRED_MOCK_AK_ID: "LTAI_mock_ak",
         SLS_CRED_MOCK_AK_SECRET: "mock_ak_secret",
       },
@@ -171,30 +241,96 @@ describe("failure rows carry request and response bodies", () => {
       errorContentType: "text/html",
     });
 
-    // Declares more bytes than it sends, then drops the connection.
-    truncatingUpstream = createTcpServer((socket) => {
-      socket.once("data", () => {
-        socket.write(
-          "HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\n" +
-            'content-length: 4096\r\n\r\n{"error":{"message":"sentinel-cut',
-          () => socket.destroy(),
-        );
-      });
-      socket.on("error", () => {});
+    const fragment = '{"error":{"message":"sentinel-cut';
+    const truncatedBase = await truncatingUpstream("502 Bad Gateway", fragment);
+    await modelAt("row-truncated", `${truncatedBase}/v1`);
+    await modelAt("row-truncated-rerank", `${truncatedBase}/v1`, {
+      provider: "cohere",
+      adapter: "openai",
+      model_name: "rerank-v3.5",
     });
-    await new Promise<void>((r) => truncatingUpstream!.listen(0, "127.0.0.1", r));
-    const port = (truncatingUpstream.address() as { port: number }).port;
+    await modelAt("row-truncated-empty", `${await truncatingUpstream("502 Bad Gateway", "")}/v1`);
     const truncatedPk = await seed.createProviderKey({
-      display_name: "row-truncated-pk",
+      display_name: "row-truncated-route-pk",
       secret: "sk-mock",
-      api_base: `http://127.0.0.1:${port}/v1`,
+      api_base: `${truncatedBase}/v1`,
     });
-    await seed.createModel({
-      display_name: "row-truncated",
-      provider: "openai",
-      model_name: "gpt-4o-mini",
-      provider_key_id: truncatedPk.id,
-      cooldown: { enabled: false },
+
+    const answer400 = JSON.stringify({ error: { message: "sentinel-any-400", type: "upstream_type" } });
+    const any400 = await fixedUpstream(400, answer400);
+    await modelAt("row-any-400", `${any400}/v1`);
+    await modelAt("row-rerank-400", `${any400}/v1`, {
+      provider: "cohere",
+      adapter: "openai",
+      model_name: "rerank-v3.5",
+    });
+    await modelAt("row-count-400", any400, { provider: "anthropic", model_name: "claude-sonnet-4-5" });
+    await modelAt("row-bedrock-400", await fixedUpstream(
+      400,
+      JSON.stringify({ message: "sentinel-bedrock-answer" }),
+      {
+        "content-type": "application/json",
+        "x-amzn-errortype": "ValidationException:http://internal.amazon.com/coral/com.amazon.bedrock/",
+      },
+    ), {
+      provider: "bedrock",
+      adapter: "bedrock",
+      model_name: "openai.gpt-6-sol",
+      secret: JSON.stringify({
+        access_key_id: "AKIA-failure-row",
+        secret_access_key: "sk-failure-row",
+        region: "us-east-1",
+      }),
+    });
+    const textHeaders = { "content-type": "text/plain" };
+    await modelAt("row-video-text", `${await fixedUpstream(500, "sentinel video gateway page", textHeaders)}/v1`);
+    await modelAt("row-video-empty", `${await fixedUpstream(500, "", textHeaders)}/v1`);
+    await modelAt("row-video-json", `${await fixedUpstream(400, JSON.stringify({ error: { code: "bad", message: "sentinel-video" } }))}/v1`);
+    await modelAt("row-video-cut", `${truncatedBase}/v1`);
+    await modelAt("row-realtime-400", `${any400}/v1`);
+    const slowBody = {
+      id: "cmpl-slow",
+      object: "chat.completion",
+      created: 1,
+      model: "gpt-4o-mini",
+      choices: [
+        { index: 0, message: { role: "assistant", content: "late" }, finish_reason: "stop" },
+      ],
+    };
+    await failingModel("row-slow", { nonStreamBody: slowBody, responseDelayMs: 5_000 });
+    await failingModel("row-stream-slow", {
+      streamEvents: [delta("cancel-partial"), delta(" more"), delta(" more"), delta(" more")],
+      eventDelayMs: 1_000,
+    });
+
+    await seed.update("a2a_agents", randomUUID(), {
+      name: "row-agent",
+      url: await fixedUpstream(500, "sentinel-a2a-answer", textHeaders),
+      protocol_version: "1.0",
+      auth_type: "none",
+      enabled: true,
+    });
+
+    mcpUpstream = await startMcpUpstream("rowmcp");
+    const mcpId = randomUUID();
+    await seed.update("mcp_servers", mcpId, {
+      display_name: "rowmcp",
+      url: mcpUpstream.url,
+      enabled: true,
+    });
+    const mcpGuard = await seed.createGuardrail(
+      {
+        name: "row-mcp-guard",
+        kind: "keyword",
+        patterns: [{ kind: "literal", value: MCP_BLOCKED_WORD }],
+      },
+      { attach: false },
+    );
+    await seed.update("guardrail_attachments", randomUUID(), {
+      guardrail_id: mcpGuard.id,
+      scope_type: "mcp_server",
+      scope_id: mcpId,
+      priority: 100,
     });
 
     const passthroughUpstream = await startOpenAiUpstream({
@@ -210,6 +346,12 @@ describe("failure rows carry request and response bodies", () => {
     });
 
     await seed.createApiKey({
+      key_hash: hash(MCP_LIMITED_CALLER),
+      allowed_models: [],
+      mcp_access: { allow: ["*"] },
+      mcp_rate_limits: { rowmcp: { rpm: 1 } },
+    });
+    await seed.createApiKey({
       key_hash: hash(LIMITED_CALLER),
       allowed_models: ["row-ok"],
       rate_limit: { rpm: 1 },
@@ -217,7 +359,22 @@ describe("failure rows carry request and response bodies", () => {
     await seed.createApiKey({
       key_hash: hash(CALLER),
       allowed_routes: ["*"],
+      allowed_agents: ["*"],
+      mcp_access: { allow: ["*"] },
       allowed_models: [
+        "row-truncated-rerank",
+        "row-truncated-empty",
+        "row-any-400",
+        "row-rerank-400",
+        "row-count-400",
+        "row-bedrock-400",
+        "row-video-text",
+        "row-video-empty",
+        "row-video-json",
+        "row-video-cut",
+        "row-realtime-400",
+        "row-slow",
+        "row-stream-slow",
         "row-400",
         "row-401",
         "row-403",
@@ -246,7 +403,9 @@ describe("failure rows carry request and response bodies", () => {
   afterAll(async () => {
     await app?.exit();
     for (const upstream of upstreams) await upstream.close();
-    truncatingUpstream?.close();
+    await mcpUpstream?.close();
+    for (const server of tcpServers) server.close();
+    for (const server of httpServers) server.close();
     await sls?.close();
   });
 
@@ -462,28 +621,41 @@ describe("failure rows carry request and response bodies", () => {
     expect(row.get("response")).toBe(page);
   });
 
+  const post = (path: string, body: unknown, extraHeaders: Record<string, string> = {}) =>
+    fetch(`${app!.proxyUrl}${path}`, {
+      method: "POST",
+      headers: { ...headers, ...extraHeaders },
+      body: JSON.stringify(body),
+    });
+
+  const clientMessage = (body: string) =>
+    (JSON.parse(body) as { error: { message: string } }).error.message;
+
+  const STATUS_FALLBACK = "upstream returned 502 Bad Gateway";
+  const FRAGMENT = '{"error":{"message":"sentinel-cut';
+  const cutBatch = ["/v1/batches?model=row-truncated", { input_file_id: "cut-prompt" }] as const;
+
+  // The caller's half is what origin/main answers: these routes differ in
+  // whether a fragment of a cut body reaches the caller.
   test.each([
-    ["chat", "/v1/chat/completions", { messages: [{ role: "user", content: "cut-prompt" }] }],
-    ["responses", "/v1/responses", { input: "cut-prompt" }],
+    ["chat", "/v1/chat/completions", { model: "row-truncated", messages: [{ role: "user", content: "cut-prompt" }] }, FRAGMENT],
+    ["completions", "/v1/completions", { model: "row-truncated", prompt: "cut-prompt" }, FRAGMENT],
+    ["images", "/v1/images/generations", { model: "row-truncated", prompt: "cut-prompt" }, FRAGMENT],
+    ["responses", "/v1/responses", { model: "row-truncated", input: "cut-prompt" }, STATUS_FALLBACK],
+    ["rerank", "/v1/rerank", { model: "row-truncated-rerank", query: "cut-prompt", documents: ["a"] }, STATUS_FALLBACK],
+    ["speech", "/v1/audio/speech", { model: "row-truncated", input: "cut-prompt", voice: "alloy" }, STATUS_FALLBACK],
+    ["decisions", "/v1/decisions", { model: "row-truncated", input: "cut-prompt", questions: [{ type: "predicate", name: "q", instructions: "i" }] }, STATUS_FALLBACK],
   ] as const)(
-    "%s: a body the upstream cut off names the read failure; the caller gets the status",
-    async (_what, path, extra) => {
+    "%s: a body cut off leaves the caller answer as it was and the row naming the read failure",
+    async (_what, path, payload, expected) => {
       if (!etcdReachable) return;
-      const res = await fetch(`${app!.proxyUrl}${path}`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ model: "row-truncated", ...extra }),
-      });
+      const res = await post(path, payload);
       const body = await res.text();
-      const requestId = res.headers.get("x-aisix-request-id")!;
       expect(res.status).toBe(502);
-      expect((JSON.parse(body) as { error: { message: string } }).error.message).toBe(
-        "upstream returned 502 Bad Gateway",
-      );
+      expect(clientMessage(body)).toBe(expected);
+      const requestId = res.headers.get("x-aisix-request-id")!;
       const row = await rowOf(requestId, "the truncated row");
-      expect(row.get("error_message")).toMatch(
-        /^upstream returned HTTP 502: failed to read response body: .+/,
-      );
+      expect(row.get("error_message")).toMatch(READ_FAILURE(502));
       expect(requestText(row)).toContain("cut-prompt");
       // What did arrive is still reported.
       expect(row.get("response")).toContain("sentinel-cut");
@@ -494,8 +666,265 @@ describe("failure rows carry request and response bodies", () => {
         "the read-failure warning",
       );
       expect(warn).toContain("502");
+      await waitForLogLine(
+        app!,
+        (l) => l.includes(requestId) && l.includes("failed to read response body"),
+        "the access-log line",
+      );
     },
   );
+
+  test("a body cut off before any byte leaves the caller with the status fallback", async () => {
+    if (!etcdReachable) return;
+    const { res, body, requestId } = await chat("row-truncated-empty", "cut-empty-prompt");
+    expect(res.status).toBe(502);
+    expect(clientMessage(body)).toBe(STATUS_FALLBACK);
+    const row = await rowOf(requestId, "the empty-cut row");
+    expect(row.get("error_message")).toMatch(READ_FAILURE(502));
+  });
+
+  test("jobs: a body cut off answers the caller as an unparseable body; the row and the log say why", async () => {
+    if (!etcdReachable) return;
+    const res = await post(cutBatch[0], cutBatch[1]);
+    const body = await res.text();
+    expect(res.status).toBe(502);
+    expect(clientMessage(body)).toMatch(/^upstream returned an unparseable body: /);
+    expect((JSON.parse(body) as { error: { type: string } }).error.type).toBe(
+      "upstream_decode_error",
+    );
+    expect(body).not.toContain("failed to read response body");
+    const requestId = res.headers.get("x-aisix-request-id")!;
+    const row = await rowOf(requestId, "the jobs row");
+    expect(row.get("error_message")).toMatch(READ_FAILURE(502));
+    expect(requestText(row)).toContain("cut-prompt");
+    await waitForLogLine(
+      app!,
+      (l) => l.includes(requestId) && l.includes("failed to read response body"),
+      "the jobs access-log line",
+    );
+  });
+
+  test.each([
+    ["a non-JSON body", "row-video-text", 502, "upstream error", "upstream returned HTTP 500: sentinel video gateway page"],
+    ["an empty body", "row-video-empty", 502, "upstream error", NO_DETAIL(500)],
+    ["a vendor envelope", "row-video-json", 400, "bad: sentinel-video", "upstream returned HTTP 400: bad: sentinel-video"],
+  ] as const)(
+    "videos: %s keeps the caller answer; the row reports what the upstream said",
+    async (_what, model, status, clientText, rowMessage) => {
+      if (!etcdReachable) return;
+      const res = await post("/v1/videos", { model, prompt: "video-fail-prompt" });
+      const body = await res.text();
+      expect(res.status).toBe(status);
+      expect(clientMessage(body)).toBe(clientText);
+      const row = await rowOf(res.headers.get("x-aisix-request-id")!, `the ${model} row`);
+      expect(row.get("error_message")).toBe(rowMessage);
+      expect(requestText(row)).toContain("video-fail-prompt");
+    },
+  );
+
+  test("videos: a body cut off answers as an unparseable body; the row names the read failure", async () => {
+    if (!etcdReachable) return;
+    const res = await post("/v1/videos", { model: "row-video-cut", prompt: "video-cut-prompt" });
+    const body = await res.text();
+    expect(res.status).toBe(502);
+    expect(clientMessage(body)).toMatch(/^upstream returned an unparseable body: /);
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the cut video row");
+    expect(row.get("error_message")).toMatch(READ_FAILURE(502));
+  });
+
+  // Every route family: the request body, and the upstream's own answer.
+  test.each([
+    ["completions", "/v1/completions", { model: "row-any-400", prompt: "path-prompt" }, "sentinel-any-400"],
+    ["images", "/v1/images/generations", { model: "row-any-400", prompt: "path-prompt" }, "sentinel-any-400"],
+    ["rerank", "/v1/rerank", { model: "row-rerank-400", query: "path-prompt", documents: ["a"] }, "sentinel-any-400"],
+    ["decisions", "/v1/decisions", { model: "row-any-400", input: "path-prompt", questions: [{ type: "predicate", name: "q", instructions: "i" }] }, "sentinel-any-400"],
+    ["jobs", "/v1/batches?model=row-any-400", { input_file_id: "path-prompt" }, "sentinel-any-400"],
+    ["messages", "/v1/messages", { model: "row-any-400", max_tokens: 5, messages: [{ role: "user", content: "path-prompt" }] }, "sentinel-any-400"],
+    ["count_tokens", "/v1/messages/count_tokens", { model: "row-count-400", messages: [{ role: "user", content: "path-prompt" }] }, "sentinel-any-400"],
+    ["bedrock converse", "/v1/chat/completions", { model: "row-bedrock-400", messages: [{ role: "user", content: "path-prompt" }] }, "sentinel-bedrock-answer"],
+    ["a2a", "/a2a/row-agent", { jsonrpc: "2.0", id: "1", method: "message/send", params: { message: { role: "user", parts: [{ kind: "text", text: "path-prompt" }], messageId: "m-1" } } }, "sentinel-a2a-answer"],
+  ] as const)("%s: an upstream failure carries both bodies", async (_what, path, payload, answer) => {
+    if (!etcdReachable) return;
+    const res = await post(path, payload, { "anthropic-version": "2023-06-01" });
+    await res.text();
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, `the ${path} row`);
+    expect(Number(row.get("status_code"))).toBeGreaterThanOrEqual(400);
+    expect(requestText(row)).toContain("path-prompt");
+    expect(row.get("response")).toContain(answer);
+  });
+
+  test("image edits: an upstream failure carries the text fields, a checksum and the answer", async () => {
+    if (!etcdReachable) return;
+    const form = new FormData();
+    form.set("model", "row-any-400");
+    form.set("prompt", "edit-prompt");
+    form.set("image", new Blob(["sentinel-image-bytes"]), "in.png");
+    const res = await fetch(`${app!.proxyUrl}/v1/images/edits`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${CALLER}` },
+      body: form,
+    });
+    await res.text();
+    expect(res.status).toBe(400);
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the edits row");
+    const prompt = JSON.parse(row.get("prompt")!) as Record<string, string>;
+    expect(prompt.prompt).toBe("edit-prompt");
+    expect(prompt.image_sha256).toBe(hash("sentinel-image-bytes"));
+    expect(row.get("response")).toContain("sentinel-any-400");
+  });
+
+  const mcpCall = (key: string, text: string) =>
+    fetch(`${app!.proxyUrl}/mcp`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${key}`,
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: { name: "rowmcp__echo", arguments: { text } },
+      }),
+    });
+
+  test("mcp: a blocked tool call carries its arguments and the JSON-RPC refusal", async () => {
+    if (!etcdReachable) return;
+    const res = await mcpCall(CALLER, `say ${MCP_BLOCKED_WORD}`);
+    const body = await res.text();
+    expect(res.status).toBe(200);
+    expect(body).toContain("content policy");
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the blocked tool row");
+    expect(row.get("guardrail_blocked")).toBe("true");
+    expect(requestText(row)).toContain(MCP_BLOCKED_WORD);
+    expect(JSON.parse(row.get("response")!)).toEqual(JSON.parse(body));
+  });
+
+  test("mcp: a rate-limited tool call carries its arguments and the error the caller got", async () => {
+    if (!etcdReachable) return;
+    let refused: Response | undefined;
+    for (let i = 0; i < 5 && !refused; i++) {
+      const res = await mcpCall(MCP_LIMITED_CALLER, "limited-tool-prompt");
+      if (res.status === 429) refused = res;
+      else await res.text();
+    }
+    expect(refused, "the key's rpm refused a tool call").toBeDefined();
+    const body = await refused!.text();
+    const row = await rowOf(refused!.headers.get("x-aisix-request-id")!, "the limited tool row");
+    expect(row.get("status_code")).toBe("429");
+    expect(requestText(row)).toContain("limited-tool-prompt");
+    expect(JSON.parse(row.get("response")!)).toEqual(JSON.parse(body));
+  });
+
+  const openRealtime = (model: string) =>
+    new Promise<{ status: number; requestId: string; body: string }>((resolve, reject) => {
+      const ws = new WsClient(
+        `${app!.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=${model}`,
+        { headers: { authorization: `Bearer ${CALLER}` } },
+      );
+      ws.on("unexpected-response", (_req, res) => {
+        let body = "";
+        res.on("data", (c) => (body += String(c)));
+        res.on("end", () =>
+          resolve({
+            status: res.statusCode ?? 0,
+            requestId: String(res.headers["x-aisix-request-id"] ?? ""),
+            body,
+          }),
+        );
+      });
+      ws.on("open", () => {
+        ws.close();
+        reject(new Error(`realtime ${model} upgraded`));
+      });
+      ws.on("error", reject);
+    });
+
+  // A WebSocket upgrade has no request body, so the row carries only the answer.
+  test("realtime: a refused upgrade reports the error the caller got", async () => {
+    if (!etcdReachable) return;
+    const { status, requestId, body } = await openRealtime("row-unlisted");
+    expect(status).toBe(403);
+    const row = await rowOf(requestId, "the refused realtime row");
+    expect(JSON.parse(row.get("response")!)).toEqual(JSON.parse(body));
+  });
+
+  test("realtime: an upstream that refuses the socket has a row naming the transport failure", async () => {
+    if (!etcdReachable) return;
+    const requestId = await new Promise<string>((resolve, reject) => {
+      const ws = new WsClient(
+        `${app!.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=row-realtime-400`,
+        { headers: { authorization: `Bearer ${CALLER}` } },
+      );
+      let id = "";
+      ws.on("upgrade", (res) => {
+        id = String(res.headers["x-aisix-request-id"] ?? "");
+      });
+      ws.on("close", () => resolve(id));
+      ws.on("error", reject);
+    });
+    const row = await rowOf(requestId, "the failed realtime row");
+    expect(row.get("status_code")).toBe("502");
+    expect(row.get("error_class")).toBe("transport");
+    expect(row.get("response")).toBeTruthy();
+  });
+
+  test.each([
+    ["chat", "/v1/chat/completions", { model: "row-slow", messages: [{ role: "user", content: "cancel-chat-prompt" }] }, "cancel-chat-prompt"],
+    ["embeddings", "/v1/embeddings", { model: "row-slow", input: "cancel-embed-prompt" }, "cancel-embed-prompt"],
+    ["images", "/v1/images/generations", { model: "row-slow", prompt: "cancel-image-prompt" }, "cancel-image-prompt"],
+  ] as const)(
+    "%s: a caller who left has a 499 with the request and no invented response",
+    async (_what, path, payload, prompt) => {
+      if (!etcdReachable) return;
+      const abort = new AbortController();
+      const sent = fetch(`${app!.proxyUrl}${path}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+        signal: abort.signal,
+      });
+      await new Promise((r) => setTimeout(r, 500));
+      abort.abort();
+      await sent.catch(() => undefined);
+      const row = await waitForSlsLog(
+        sls!,
+        FULL,
+        (l) => l.get("status_code") === "499" && requestText(l).includes(prompt),
+        `the ${path} 499 row`,
+      );
+      expect(row.get("error_class")).toBe("client_disconnected");
+      expect(row.get("response") ?? "").toBe("");
+    },
+  );
+
+  test("a caller who left mid-stream has a 499 with what had been delivered", async () => {
+    if (!etcdReachable) return;
+    const abort = new AbortController();
+    const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "row-stream-slow",
+        stream: true,
+        messages: [{ role: "user", content: "cancel-stream-prompt" }],
+      }),
+      signal: abort.signal,
+    });
+    const requestId = res.headers.get("x-aisix-request-id")!;
+    const reader = res.body!.getReader();
+    await reader.read();
+    await new Promise((r) => setTimeout(r, 200));
+    abort.abort();
+    await reader.cancel().catch(() => undefined);
+    const row = await rowOf(requestId, "the mid-stream 499 row");
+    expect(row.get("status_code")).toBe("499");
+    expect(requestText(row)).toContain("cancel-stream-prompt");
+    expect(row.get("output_messages") ?? row.get("response")).toContain("cancel-partial");
+    expect(row.get("response") ?? "").not.toContain("client_disconnected");
+  });
 
   test("a stream cut off mid-way keeps the request and what had arrived", async () => {
     if (!etcdReachable) return;

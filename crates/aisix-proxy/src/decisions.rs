@@ -546,9 +546,12 @@ async fn dispatch(
                         tracker,
                         model_id,
                         cooldown_cfg,
-                        aisix_gateway::upstream_status_from_response(upstream_resp, |body| {
-                            upstream_error_message(body).chars().take(1024).collect()
-                        })
+                        // Whole: the message is parsed out of the JSON.
+                        aisix_gateway::upstream_status_from_response(
+                            upstream_resp,
+                            usize::MAX,
+                            |body| upstream_error_message(body).chars().take(1024).collect(),
+                        )
                         .await,
                     )));
                 }
