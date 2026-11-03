@@ -959,6 +959,36 @@ mod tests {
         assert_eq!(rejected, Err(UserOAuthFailure::Unavailable));
     }
 
+    #[test]
+    fn only_a_document_on_another_authority_is_left_to_the_ssrf_settings() {
+        let row: McpServer = serde_json::from_value(serde_json::json!({
+            "name": "s",
+            "url": "http://mcp.example/m",
+            "auth_type": "oauth2_authorization_code",
+            "token_url": "https://idp.example/token",
+            "registration_url": "https://idp.example/register",
+        }))
+        .unwrap();
+        let server = UserOAuthServer::new("server-id", &row);
+        for own in [
+            "http://mcp.example/.well-known/x",
+            "http://mcp.example:80/t",
+            "https://idp.example/token",
+            "https://idp.example/register",
+        ] {
+            assert_eq!(server.gate_for(own), http::Gate::Configured, "{own}");
+        }
+        for foreign in [
+            "https://mcp.example/t",
+            "http://mcp.example:8080/t",
+            "http://other.example/t",
+            "https://idp.example/.well-known/x",
+            "not a url",
+        ] {
+            assert_eq!(server.gate_for(foreign), http::Gate::Ssrf, "{foreign}");
+        }
+    }
+
     /// Moving a server must not send its users' tokens to the new address.
     #[tokio::test]
     async fn a_moved_upstream_cannot_reach_the_old_record() {

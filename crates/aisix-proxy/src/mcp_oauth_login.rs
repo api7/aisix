@@ -114,6 +114,8 @@ fn flow_cookie(base: &str, keys: &SessionKeys, flow: &FlowState) -> Result<Heade
         cookie_attributes(base)
     );
     if cookie.len() > MAX_FLOW_COOKIE_BYTES {
+        tracing::warn!(target: "aisix::mcp_oauth", server = %flow.server_name,
+            bytes = cookie.len(), "a sign-in does not fit in its flow cookie");
         return Err(error_page(
             StatusCode::BAD_REQUEST,
             "This sign-in is too large",

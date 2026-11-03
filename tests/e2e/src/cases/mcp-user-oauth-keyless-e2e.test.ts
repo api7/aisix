@@ -872,6 +872,12 @@ describe("keyless sessions follow the configuration on the next request", () => 
     return ((await res.json()) as { result: { tools: { name: string }[] } }).result.tools.map((t) => t.name);
   };
 
+  const opened = async (token: string) => {
+    const res = await mcpPost(url(), bearer(token));
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { result?: unknown }).result).toBeDefined();
+  };
+
   /** A key of its own and the mapping onto it, so a test can change the key alone. */
   const ownKey = async (team: string, mcpAccess: Record<string, unknown> = { allow: ["*"] }) => {
     const doc = { key_hash: hash(`sk-${team}-${randomUUID()}`), allowed_models: [], mcp_access: mcpAccess };
@@ -1003,6 +1009,18 @@ describe("keyless sessions follow the configuration on the next request", () => 
     if (stop.kind === "page") expect(stop.text).toMatch(/not mapped/);
   });
 
+  test("an ID token too large for the sign-in's cookie ends on a page saying so", async () => {
+    if (!etcdReachable) return;
+    await ownKey("large");
+    provider.claims = { ...claimsOf("vera", "large"), groups: Array.from({ length: 200 }, () => randomUUID()) };
+    const stop = await new Browser().walk(authorizeUrl(url()));
+    expect(stop.kind).toBe("page");
+    if (stop.kind === "page") {
+      expect(stop.status).toBe(400);
+      expect(stop.text).toMatch(/too large/);
+    }
+  });
+
   test("a disabled or expired key answers as it does to a JWT, and refresh is refused until it is back", async () => {
     if (!etcdReachable) return;
     provider.claims = claimsOf("omar", "lifecycle");
@@ -1054,10 +1072,11 @@ describe("keyless sessions follow the configuration on the next request", () => 
     const tokens = await signInByHand(url());
     const logins = provider.authorizeRequests.length;
     expect(await listTools(tokens.access_token)).toContain("whoami");
+    const seenBeforeDenial = upstream.tokensSeenFor("up-rosa").length;
 
     await seed.update("api_keys", id, { ...doc, mcp_access: { allow: [] } });
     await settled();
-    expect((await mcpPost(url(), bearer(tokens.access_token))).status).toBe(200);
+    await opened(tokens.access_token);
     expect(await listTools(tokens.access_token)).toEqual([]);
     const called = await mcpPost(url(), bearer(tokens.access_token), {
       jsonrpc: "2.0",
@@ -1067,7 +1086,7 @@ describe("keyless sessions follow the configuration on the next request", () => 
     });
     expect(called.status).toBe(200);
     expect(((await called.json()) as { error: { code: number } }).error.code).toBe(-32602);
-    const seenWhileDenied = upstream.tokensSeenFor("up-rosa").length;
+    expect(upstream.tokensSeenFor("up-rosa").length).toBe(seenBeforeDenial);
 
     const refreshed = await tokenRequest(url(), { grant_type: "refresh_token", refresh_token: tokens.refresh_token });
     expect(refreshed.status).toBe(200);
@@ -1078,7 +1097,7 @@ describe("keyless sessions follow the configuration on the next request", () => 
     const client = await connectMcpClient(url(), bearer(renewed.access_token));
     expect(await whoami(client.client)).toBe("up-rosa");
     await client.client.close();
-    expect(upstream.tokensSeenFor("up-rosa").length).toBeGreaterThan(seenWhileDenied);
+    expect(upstream.tokensSeenFor("up-rosa").length).toBeGreaterThan(seenBeforeDenial);
     expect(provider.authorizeRequests.length).toBe(logins);
   });
 
@@ -1099,7 +1118,7 @@ describe("keyless sessions follow the configuration on the next request", () => 
 
     await seed.update("api_keys", id, { ...doc, mcp_access: { allow: [] } });
     await settled();
-    expect((await mcpPost(url(), bearer(tokens.access_token))).status).toBe(200);
+    await opened(tokens.access_token);
     expect(await listTools(tokens.access_token)).toEqual([]);
     const refreshed = await tokenRequest(url(), { grant_type: "refresh_token", refresh_token: tokens.refresh_token });
     expect(refreshed.status).toBe(400);

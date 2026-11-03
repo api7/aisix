@@ -583,15 +583,17 @@ upstream:
 #   # request only reaches publicly routable addresses: loopback, private
 #   # (RFC 1918), CGNAT, link-local (including the 169.254.169.254 metadata
 #   # endpoint), benchmarking (198.18.0.0/15), IPv6 unique-local /
-#   # link-local, multicast and reserved ranges are refused with a 400, for
-#   # every address a name resolves to and for every redirect hop. A direct
+#   # link-local, multicast and reserved ranges are refused, for every
+#   # address a name resolves to. A media download is refused with a 400 and
+#   # each of its redirect hops is checked; an MCP sign-in fails with an error
+#   # page or an OAuth error and follows no redirects. A direct
 #   # connection goes only to the addresses that were checked. When a
 #   # proxy applies to the URL, the name is resolved and checked locally
 #   # first and the proxy then resolves it again itself.
 #   #
 #   # Behind a fake-ip DNS or a transparent proxy (Clash, sing-box,
-#   # Surge, …) public names resolve into 198.18.0.0/15, so every
-#   # download is refused: list those hosts in allowed_hosts, or turn the
+#   # Surge, …) public names resolve into 198.18.0.0/15, so every such
+#   # request is refused: list those hosts in allowed_hosts, or turn the
 #   # check off.
 #   ssrf_protection:
 #     # false turns the address check off entirely — no address is

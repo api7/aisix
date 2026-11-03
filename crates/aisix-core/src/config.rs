@@ -74,7 +74,7 @@ pub struct Config {
     /// see [`UpstreamConfig`].
     #[serde(default)]
     pub upstream: UpstreamConfig,
-    /// Rules for outbound requests to URLs an API caller supplied — see
+    /// Rules for outbound requests to URLs the operator did not choose — see
     /// [`OutboundConfig`].
     #[serde(default)]
     pub outbound: OutboundConfig,
@@ -1907,7 +1907,8 @@ pub struct OutboundConfig {
 /// (not loopback, private, link-local, CGNAT, cloud metadata, benchmarking
 /// `198.18.0.0/15`, …). A host name is resolved and every address in the
 /// answer checked; a direct connection goes only to those addresses, and
-/// each redirect hop is checked the same way. When an `HTTP(S)_PROXY`
+/// each redirect hop of a media download is checked the same way (the OAuth
+/// requests follow no redirects). When an `HTTP(S)_PROXY`
 /// applies to the URL, the name is resolved and checked the same way
 /// before the request is handed to the proxy, which then resolves it
 /// again itself.
