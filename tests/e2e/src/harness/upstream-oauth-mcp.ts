@@ -255,7 +255,7 @@ export class OAuthMcpUpstream {
     this.mcpAuthorizations.push(authorization);
     const token = authorization?.replace(/^Bearer /, "");
     const honoured = token === undefined ? undefined : this.accessTokens.get(token);
-    const user = honoured ?? (this.options.anonymousOnDeadToken ? "anonymous" : undefined);
+    const user = honoured ?? (token !== undefined && this.options.anonymousOnDeadToken ? "anonymous" : undefined);
     if (this.rejectEveryToken || user === undefined) {
       res
         .writeHead(401, {

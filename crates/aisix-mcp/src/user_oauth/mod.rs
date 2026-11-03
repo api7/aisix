@@ -63,8 +63,8 @@ const LOCAL_CACHE_CAPACITY: usize = 10_000;
 const LEASE_POLL: Duration = Duration::from_millis(200);
 /// How long a gateway waits on another gateway's proactive refresh before it
 /// goes back to the token still in the record. The holder's work is one token
-/// request, so running out means it is stuck or gone, and its lease would hold
-/// everyone else off for up to [`LEASE_TTL`].
+/// request, so this is well past a healthy one, and a holder that is stuck or
+/// gone would otherwise hold everyone else off for up to [`LEASE_TTL`].
 const PROACTIVE_WAIT: Duration = Duration::from_secs(5);
 
 /// Error codes a token endpoint answers a refresh with when the grant itself
@@ -266,7 +266,6 @@ pub fn random_token() -> String {
 type Flight = Shared<BoxFuture<'static, Result<String, UserOAuthFailure>>>;
 
 /// What a refresh replaces.
-#[derive(Clone)]
 enum Replacing {
     /// The token in this version of the record, close to expiring.
     Expiring { version: i64 },
@@ -360,10 +359,7 @@ impl UserOAuthManager {
                 };
             }
         };
-        let Some((record, version)) = stored
-            .as_ref()
-            .and_then(|stored| Some((decode_token(stored)?, stored.version)))
-        else {
+        let Some((record, version)) = stored.as_ref().and_then(decode_versioned) else {
             self.evict(key);
             return Err(UserOAuthFailure::AuthorizationRequired);
         };
@@ -563,7 +559,7 @@ impl UserOAuthManager {
             Err(_) => return Err(UserOAuthFailure::Unavailable),
         };
         let outcome = self
-            .refresh_holding_lease(server, subject, key, replacing.rejected(), lease_taken)
+            .refresh_holding_lease(server, subject, key, &replacing, lease_taken)
             .await;
         // Expires on its own if this fails.
         let _ = self.store.delete(NS_LEASE, key, Some(lease)).await;
@@ -579,15 +575,21 @@ impl UserOAuthManager {
         let started = Instant::now();
         let deadline = started + server.timeout;
         loop {
+            // Read ahead of the record: a holder stores first and lets go of
+            // the lease after, so with the lease gone the record is its last word.
+            let holder_gone = matches!(replacing, Replacing::Expiring { .. })
+                && self
+                    .store
+                    .get(NS_LEASE, key)
+                    .await
+                    .map_err(|_| UserOAuthFailure::Unavailable)?
+                    .is_none();
             let stored = self
                 .store
                 .get(NS_TOKEN, key)
                 .await
                 .map_err(|_| UserOAuthFailure::Unavailable)?;
-            let Some((record, version)) = stored
-                .as_ref()
-                .and_then(|stored| Some((decode_token(stored)?, stored.version)))
-            else {
+            let Some((record, version)) = stored.as_ref().and_then(decode_versioned) else {
                 self.evict(key);
                 return Err(UserOAuthFailure::AuthorizationRequired);
             };
@@ -596,13 +598,14 @@ impl UserOAuthManager {
                 // An upstream may end the old token the moment it issues the
                 // new one, and answer the dead one with an empty `200` that no
                 // retry can catch. So the old token is only a fallback, for a
-                // holder that does not finish in time.
+                // holder that gave up or does not finish in time.
                 Replacing::Expiring { version: held } => {
                     !record.expired(unix_now())
-                        && (version != *held || started.elapsed() >= PROACTIVE_WAIT)
+                        && (version != *held || holder_gone || started.elapsed() >= PROACTIVE_WAIT)
                 }
             };
             if settled {
+                self.remember(key, &record);
                 return Ok(record.access_token);
             }
             if Instant::now() + LEASE_POLL >= deadline {
@@ -617,7 +620,7 @@ impl UserOAuthManager {
         server: &UserOAuthServer,
         subject: &UserSubject,
         key: &str,
-        rejected: Option<&str>,
+        replacing: &Replacing,
         lease_taken: Instant,
     ) -> Result<String, UserOAuthFailure> {
         let stored = self
@@ -635,9 +638,13 @@ impl UserOAuthManager {
         };
         let now = unix_now();
         // Someone else's refresh may have landed before this lease was taken.
-        let needed = match rejected {
-            Some(rejected) => record.access_token == rejected,
-            None => record.needs_refresh(now),
+        // A token that lives inside the skew always reads as needing one, so
+        // a record that moved past the caller's read says it just happened.
+        let needed = match replacing {
+            Replacing::Rejected(rejected) => record.access_token == *rejected,
+            Replacing::Expiring { version } => {
+                record.expired(now) || (stored.version == *version && record.needs_refresh(now))
+            }
         };
         if !needed {
             self.remember(key, &record);
@@ -645,8 +652,8 @@ impl UserOAuthManager {
         }
         // Past this point a proactive refresh can fall back on the token it
         // was replacing, for what is left of its life.
-        let fallback =
-            (rejected.is_none() && !record.expired(now)).then(|| record.access_token.clone());
+        let fallback = (replacing.rejected().is_none() && !record.expired(now))
+            .then(|| record.access_token.clone());
 
         let Some(refresh_token) = record.refresh_token.clone() else {
             if let Some(token) = fallback {
@@ -762,6 +769,10 @@ impl UserOAuthManager {
 
 fn decode_token(stored: &crate::shared_store::StoredValue) -> Option<TokenRecord> {
     serde_json::from_slice(&stored.value).ok()
+}
+
+fn decode_versioned(stored: &crate::shared_store::StoredValue) -> Option<(TokenRecord, i64)> {
+    Some((decode_token(stored)?, stored.version))
 }
 
 /// The labels of a token record, owned here so the borrowed map outlives the
@@ -1284,6 +1295,80 @@ mod tests {
         assert!(
             waited < PROACTIVE_WAIT + Duration::from_secs(3),
             "{waited:?}"
+        );
+    }
+
+    /// Its refresh failed, or there was nothing to refresh with: no new record
+    /// is coming, and the old token works.
+    #[tokio::test]
+    async fn a_holder_that_gave_up_ends_the_wait_at_once() {
+        let server = server_at("http://127.0.0.1:9/token", Duration::from_secs(30));
+        let store = Arc::new(MemoryStore::default());
+        store_token(store.as_ref(), &server, "old", 45).await;
+        hold_lease(store.as_ref(), &server).await;
+        let subject = UserSubject::member("u");
+        let manager = Arc::new(UserOAuthManager::new(store.clone()));
+
+        let started = Instant::now();
+        let (token, _) = tokio::join!(manager.access_token(&server, &subject), async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let key = token_key(&server, &subject);
+            store.delete(NS_LEASE, &key, None).await.unwrap();
+        });
+
+        assert_eq!(token.as_deref(), Ok("old"));
+        assert!(started.elapsed() < PROACTIVE_WAIT);
+    }
+
+    /// A caller that read the old record and takes the lease after the refresh
+    /// landed must not end the token others just received.
+    #[tokio::test]
+    async fn a_refresh_that_landed_before_the_lease_was_taken_is_not_repeated() {
+        let upstream = RotatingUpstream::start("old", Duration::ZERO, 30).await;
+        let server = server_at(&upstream.token_url, Duration::from_secs(30));
+        let subject = UserSubject::member("u");
+        let key = token_key(&server, &subject);
+        let store = Arc::new(MemoryStore::default());
+        store_token(store.as_ref(), &server, "old", 30).await;
+        let read = store.get(NS_TOKEN, &key).await.unwrap().unwrap().version;
+        store.delete(NS_TOKEN, &key, None).await.unwrap();
+        store_token(store.as_ref(), &server, "landed", 30).await;
+
+        let token = Arc::new(UserOAuthManager::new(store))
+            .refresh(&server, &subject, Replacing::Expiring { version: read })
+            .await;
+
+        assert_eq!(token.as_deref(), Ok("landed"));
+        assert_eq!(upstream.refreshes(), 0);
+    }
+
+    /// The copy kept for an outage must not stay the token the refresh ended.
+    #[tokio::test]
+    async fn the_token_a_wait_settled_on_is_what_an_outage_falls_back_to() {
+        let server = server_at("http://127.0.0.1:9/token", Duration::from_secs(30));
+        let store = Arc::new(SwitchableStore::default());
+        store_token(store.as_ref(), &server, "old", 45).await;
+        hold_lease(store.as_ref(), &server).await;
+        land_refresh(store.clone(), &server, "new", Duration::from_millis(300));
+        let subject = UserSubject::member("u");
+        let manager = Arc::new(UserOAuthManager::new(store.clone()));
+        fresh_copy(&manager, Some(unix_now() + 45));
+        assert_eq!(
+            manager
+                .stored_access_token(&server, &subject)
+                .await
+                .as_deref(),
+            Ok("new")
+        );
+
+        store.fail(true);
+
+        assert_eq!(
+            manager
+                .stored_access_token(&server, &subject)
+                .await
+                .as_deref(),
+            Ok("new")
         );
     }
 
