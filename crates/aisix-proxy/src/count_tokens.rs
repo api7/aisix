@@ -156,6 +156,7 @@ pub async fn count_tokens(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::answered_error_source(false, &routing),
                 elapsed,
             );
             // One zero-token event per attempt that failed first (#655);
@@ -235,6 +236,7 @@ pub async fn count_tokens(
                 crate::request_metrics::Caller::new(&auth),
                 last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             // Per #655: one zero-token event per failed upstream attempt,

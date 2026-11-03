@@ -232,6 +232,7 @@ fn record_denial_metrics(
             ..Default::default()
         },
         err.status().as_u16(),
+        crate::attempt::error_source(err),
         started.elapsed(),
     );
 }

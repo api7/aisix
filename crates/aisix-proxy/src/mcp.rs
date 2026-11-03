@@ -297,6 +297,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
             ..Default::default()
         },
         status,
+        crate::attribution::rendered_error_source(status),
         elapsed,
     );
     response
@@ -946,6 +947,7 @@ async fn dispatch(
         {
             Ok(bytes) => bytes,
             Err(_) => {
+                crate::attribution::note_error_source(aisix_obs::ErrorSource::Upstream);
                 // The tool call reached the upstream: record it like every
                 // other exit, with the status the caller receives.
                 if is_tool_call {
@@ -962,7 +964,11 @@ async fn dispatch(
                         &mcp_tool,
                         StatusCode::BAD_GATEWAY.as_u16(),
                         latency,
-                        None,
+                        Some(&crate::error::ProxyError::Bridge(
+                            aisix_gateway::BridgeError::UpstreamDecode(
+                                "invalid upstream response".to_string(),
+                            ),
+                        )),
                         monitor_hits,
                         redaction_counts,
                         guardrail_chain.as_ref(),
@@ -1645,8 +1651,9 @@ fn emit_tool_call_usage(
     mcp_tool: &str,
     status_code: u16,
     latency: Duration,
-    // The gateway's own refusal of the call — a guardrail block or a quota
-    // rejection — named on the event like every other surface names it.
+    // What failed the call — the gateway's own refusal (a guardrail block, a
+    // quota rejection) or an unusable upstream answer — named on the event
+    // like every other surface names it.
     refusal: Option<&crate::error::ProxyError>,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     // Per-detector mask counts from the write-back passes (names only,

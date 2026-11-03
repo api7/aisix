@@ -153,6 +153,7 @@ pub async fn image_generations(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::answered_error_source(false, &routing),
                 elapsed,
             );
             // One zero-token event per attempt that failed first (#655).
@@ -238,6 +239,7 @@ pub async fn image_generations(
                 crate::request_metrics::Caller::new(&auth),
                 last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a

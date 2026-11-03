@@ -531,9 +531,7 @@ impl A2aBridge for HttpBridge {
             // body verbatim to the caller, which could leak upstream internals.
             let status = resp.status().as_u16();
             read_error_body_for_export(resp).await;
-            return Err(A2aError::Request(format!(
-                "upstream returned HTTP {status}"
-            )));
+            return Err(A2aError::UpstreamStatus(status));
         }
         let bytes = read_capped(resp).await?;
         serde_json::from_slice::<serde_json::Value>(&bytes)
@@ -575,9 +573,7 @@ impl A2aBridge for HttpBridge {
             let status = resp.status().as_u16();
             let _ =
                 tokio::time::timeout(self.upstream.timeout, read_error_body_for_export(resp)).await;
-            return Err(A2aError::Request(format!(
-                "upstream returned HTTP {status}"
-            )));
+            return Err(A2aError::UpstreamStatus(status));
         }
 
         // A JSON-RPC error is delivered at HTTP 200 with an `error` member, so

@@ -282,6 +282,16 @@ pub async fn responses(
                 .and_then(|u| u.failure.as_ref())
                 .filter(|_| !success.guardrail_blocked)
                 .map_or(status, |f| f.status);
+            let terminal_error_source =
+                match success.usage.as_ref().and_then(|u| u.failure.as_ref()) {
+                    Some(failure) if !success.guardrail_blocked => {
+                        crate::attempt::error_source_of_class(failure.error_class)
+                    }
+                    _ => crate::attempt::answered_error_source(
+                        success.guardrail_blocked,
+                        &success.routing,
+                    ),
+                };
             // ONE ProviderKey lookup for both the metric emit and the
             // winner's usage event below (#941).
             let pk = ResolvedPk::resolve(&snapshot, &success.provider_key_id);
@@ -340,6 +350,7 @@ pub async fn responses(
                     crate::request_metrics::Caller::new(&auth),
                     request_upstream,
                     terminal_status,
+                    terminal_error_source,
                     elapsed,
                 );
             }
@@ -476,6 +487,7 @@ pub async fn responses(
                     routing.fallback_count() > 0,
                 ),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             // AISIX-Cloud#1428: a guardrail refusal IS this failure, so the

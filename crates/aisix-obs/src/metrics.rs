@@ -2244,6 +2244,7 @@ impl Metrics {
                 k.label_bool(labels.is_fallback);
                 k.label_u16(labels.status);
                 k.label(labels.outcome.as_str());
+                k.label(labels.error_source.as_str());
             },
             RequestSeriesHandles::default,
             record,
@@ -3398,6 +3399,8 @@ pub struct RequestLabels<'a> {
     pub is_fallback: bool,
     pub status: u16,
     pub outcome: RequestOutcome,
+    /// Emitted on the request COUNTERS only, like `is_fallback`.
+    pub error_source: ErrorSource,
 }
 
 impl Default for RequestLabels<'_> {
@@ -3421,6 +3424,7 @@ impl Default for RequestLabels<'_> {
             is_fallback: false,
             status: 0,
             outcome: RequestOutcome::UpstreamError,
+            error_source: ErrorSource::None,
         }
     }
 }
@@ -3447,6 +3451,7 @@ impl RequestLabels<'_> {
             "is_fallback" => bool_str(self.is_fallback),
             "status" => self.status.to_string(),
             "outcome" => self.outcome.as_str().to_string(),
+            "error_source" => self.error_source.as_str().to_string(),
         )
     }
 
@@ -3772,6 +3777,30 @@ impl RequestOutcome {
             Self::ClientError => "client_error",
             Self::UpstreamError => "upstream_error",
             Self::RateLimited => "rate_limited",
+        }
+    }
+}
+
+/// Who ended a request that failed: the `error_source` label of the request
+/// counters. Assigned from the failure itself, never from a status code: an
+/// upstream's 429 and the gateway's own rate limit answer the same status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ErrorSource {
+    /// A success, or a caller that went away.
+    #[default]
+    None,
+    /// An upstream's error answer, or a call to it that failed.
+    Upstream,
+    /// Everything the gateway decided or failed at itself.
+    Aisix,
+}
+
+impl ErrorSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::Upstream => "upstream",
+            Self::Aisix => "aisix",
         }
     }
 }
@@ -4437,6 +4466,7 @@ mod tests {
             is_fallback: true,
             status: 200,
             outcome: RequestOutcome::Success,
+            error_source: ErrorSource::Upstream,
         };
         let usage_labels = UsageLabels {
             endpoint: "/v1/chat/completions",
@@ -4504,6 +4534,16 @@ mod tests {
         // #890 req-1/req-2: stream on counter + duration; is_fallback on
         // the counter only (verified absent from the duration below).
         assert!(rendered.contains("stream=\"true\""));
+        // Counters only, like is_fallback, and a label a series split on.
+        assert!(rendered.contains("error_source=\"upstream\""));
+        for line in rendered.lines() {
+            if line.contains("request_duration") {
+                assert!(
+                    !line.contains("error_source="),
+                    "error_source must stay off the duration histogram: {line}"
+                );
+            }
+        }
         assert!(rendered.contains("is_fallback=\"true\""));
         // is_fallback must NOT appear on the duration histogram series.
         for line in rendered.lines() {

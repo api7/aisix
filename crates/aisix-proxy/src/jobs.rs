@@ -440,6 +440,7 @@ async fn send_upstream(
     crate::attribution::note_upstream_wait_end(bytes.is_ok());
     if let (false, Ok(body)) = (status.is_success(), &bytes) {
         aisix_gateway::note_upstream_error_body(body);
+        crate::attribution::note_relayed_error_body(body);
     }
     let bytes = bytes
         .map_err(|e| {
@@ -680,6 +681,17 @@ fn emit_job_usage_event(
     guardrail_scores: Vec<aisix_core::GuardrailScore>,
     guardrail_bypassed_reason: String,
 ) {
+    // A refused job call is answered with the upstream's own response, so no
+    // error reaches this point.
+    let (error_class, error_message) = if crate::attempt::relayed_response_failed(status_code) {
+        let (class, message) = crate::attempt::relayed_failure(
+            status_code,
+            &crate::attribution::relayed_error_body().unwrap_or_default(),
+        );
+        (class.to_string(), message)
+    } else {
+        Default::default()
+    };
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
@@ -703,6 +715,8 @@ fn emit_job_usage_event(
         guardrail_enforced_hits,
         guardrail_scores,
         guardrail_bypassed_reason,
+        error_class,
+        error_message,
         ..Default::default()
     };
     let pk = crate::usage_attr::ResolvedPk::resolve(snap, &target.pk_entry.id);
@@ -819,6 +833,7 @@ fn finish(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::relayed_error_source(status),
                 elapsed,
             );
             emit_job_usage_event(
@@ -865,6 +880,7 @@ fn finish(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             crate::usage_attr::emit_error_usage_event(

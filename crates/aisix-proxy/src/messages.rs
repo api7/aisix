@@ -244,6 +244,7 @@ pub async fn messages(
                     crate::request_metrics::Caller::new(&auth),
                     request_upstream,
                     status,
+                    crate::attempt::answered_error_source(false, &routing),
                     elapsed,
                 );
             }
@@ -360,6 +361,7 @@ pub async fn messages(
                     routing.fallback_count() > 0,
                 ),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             // AISIX-Cloud#1428: a guardrail refusal IS this failure, so the

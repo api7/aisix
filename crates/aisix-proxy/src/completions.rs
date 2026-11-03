@@ -215,6 +215,7 @@ pub async fn completions(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::answered_error_source(success.guardrail_blocked, &routing),
                 elapsed,
             );
             // Issue #403: emit UsageEvent so cp-api's budget ledger
@@ -305,6 +306,7 @@ pub async fn completions(
                 crate::request_metrics::Caller::new(&auth),
                 last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             // Per #655: one zero-token event per failed upstream attempt,

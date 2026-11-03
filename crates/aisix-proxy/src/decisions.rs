@@ -211,6 +211,7 @@ async fn handle(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::answered_error_source(false, &routing),
                 elapsed,
             );
             crate::usage_attr::emit_failed_attempts(
@@ -269,6 +270,7 @@ async fn handle(
                 crate::request_metrics::Caller::new(&auth),
                 last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             crate::usage_attr::note_client_error(&snapshot, &err);

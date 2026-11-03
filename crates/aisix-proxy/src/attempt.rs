@@ -24,7 +24,7 @@
 use std::time::Instant;
 
 use aisix_gateway::BridgeError;
-use aisix_obs::RequestOutcome;
+use aisix_obs::{ErrorSource, RequestOutcome};
 
 use crate::error::ProxyError;
 
@@ -355,7 +355,7 @@ const MAX_ATTEMPT_ERROR_MESSAGE_CHARS: usize = 2048;
 /// the telemetry field and the access log. U+2028/U+2029 are listed
 /// explicitly: they are `Zl`/`Zp`, not `Cc`, so `is_control()` lets them
 /// through even though plenty of viewers break lines on them.
-fn sanitize_error_message(s: &str) -> String {
+pub(crate) fn sanitize_error_message(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}'))
         .take(MAX_ATTEMPT_ERROR_MESSAGE_CHARS)
@@ -472,31 +472,16 @@ pub(crate) fn stream_status(reached_end: bool, failure: Option<&StreamFailure>) 
 }
 
 /// Failure class + reason for the access log's `error_class` / `error`
-/// fields.
-///
-/// Deliberately NOT [`attempt_error_from_proxy`]: that one leaves the
-/// message empty for every non-bridge variant, which is fine for a
-/// per-attempt record (the class is the point) but would put a failed
-/// request back to carrying no reason at all — the gap this exists to
-/// close. Here every variant contributes its `Display`, because the access
-/// log is the one line an operator gets per request.
+/// fields: every variant contributes its `Display`.
 pub(crate) fn access_log_error(err: &ProxyError) -> (&'static str, String) {
     (error_class(err), sanitize_error_message(&err.to_string()))
 }
 
 /// Bounded error class + short message for a per-attempt record, derived
-/// from a `ProxyError`. The class is [`error_class`]; a bridge error
-/// carries its message, and so does a guardrail refusal of the upstream's
-/// answer, because that attempt is the request's terminal event and the
-/// refusal is the gateway's own (see [`gateway_error_message`]). Shared by
-/// the `/v1/messages` and `/v1/responses` dispatch loops.
+/// from a `ProxyError`: its [`error_class`] and [`gateway_error_message`].
+/// Shared by the `/v1/messages` and `/v1/responses` dispatch loops.
 pub(crate) fn attempt_error_from_proxy(err: &ProxyError) -> (String, String) {
-    let message = match err {
-        ProxyError::Bridge(be) => attempt_error_message(be),
-        ProxyError::ContentFiltered { .. } => gateway_error_message(err),
-        _ => String::new(),
-    };
-    (error_class(err).to_string(), message)
+    (error_class(err).to_string(), gateway_error_message(err))
 }
 
 /// The class of a guardrail refusal ([`ProxyError::ContentFiltered`]), for
@@ -504,59 +489,87 @@ pub(crate) fn attempt_error_from_proxy(err: &ProxyError) -> (String, String) {
 /// itself to the usage event.
 pub(crate) const GUARDRAIL_BLOCK_CLASS: &str = "content_filter";
 
-/// The `error_message` a terminal usage event carries for a failure the
-/// gateway answered itself: the access log's text, for the variants whose
-/// text is entirely the gateway's own — fixed wording, operator-configured
-/// names, bounded vocabularies, and the caller's model name, which the
-/// event already holds as `requested_model`. Empty for the rest, because
-/// the usage event travels further than the access log (the control
-/// plane's store, OTLP, SLS) and must not carry what the caller or an
-/// upstream wrote.
+/// The `error_message` a failure's usage event carries: the access log's
+/// text, for every variant. The event travels further than the access log
+/// (the control plane's store, OTLP, SLS), and this text can echo what the
+/// caller sent or an upstream answered; a guardrail refusal alone is held to
+/// policy wording and the guardrail's name (`guardrail_block_message`), so a
+/// matched value never gets here through one.
 pub(crate) fn gateway_error_message(err: &ProxyError) -> String {
-    let gateway_text = match err {
-        ProxyError::MissingAuth(_)
-        | ProxyError::MissingRouteAuthHeader(_)
-        | ProxyError::InvalidApiKey
-        | ProxyError::ApiKeyExpired
-        | ProxyError::ApiKeyDisabled
-        | ProxyError::JwtInvalid
-        | ProxyError::JwtExpired
-        | ProxyError::JwtClaimsRejected
-        | ProxyError::JwtInsufficientScope { .. }
-        | ProxyError::JwtIdentityUnmapped
-        | ProxyError::JwksUnavailable
-        | ProxyError::McpTokenExchange(_)
-        | ProxyError::ModelNotFound(_)
-        | ProxyError::ModelForbidden(_)
-        | ProxyError::ModelIpRestricted(_)
-        | ProxyError::RouteIpRestricted(_)
-        | ProxyError::RouteForbidden(_)
-        | ProxyError::WebSocketUpgradeRequired { .. }
-        | ProxyError::ProviderUnavailable
-        | ProxyError::SemanticDecisionFailed { .. }
-        | ProxyError::AllCandidatesUnavailable { .. }
-        // Built by `guardrail_block_message`: policy wording and the
-        // guardrail's name, never the matched content.
-        | ProxyError::ContentFiltered { .. }
-        | ProxyError::BudgetExceeded(_)
-        | ProxyError::BudgetUnverified
-        | ProxyError::RequestTooLarge { .. }
-        | ProxyError::RateLimit(_)
-        | ProxyError::PolicyRateLimit { .. }
-        // The gateway's wording around a socket-level reason; no body was read.
-        | ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamBodyUnread { .. }) => true,
-        // `InvalidRequest` can quote the request body (a serde message
-        // names the offending value), a video id is whatever the caller
-        // sent, and a bridge error carries upstream response text.
-        ProxyError::InvalidRequest(_) | ProxyError::VideoNotFound(_) | ProxyError::Bridge(_) => {
-            false
-        }
-    };
-    if gateway_text {
-        access_log_error(err).1
+    access_log_error(err).1
+}
+
+/// The classes an upstream's own failure reports, from
+/// [`routing_error_class`]. Every other class is the gateway's.
+const UPSTREAM_ERROR_CLASSES: &[&str] = &[
+    "timeout",
+    "upstream_status",
+    "upstream_decode",
+    "upstream_in_band",
+    "transport",
+    "stream_aborted",
+];
+
+/// What ended a request whose record names `class` ([`error_class`], or the
+/// class a stream's terminal event was given). The one mapping behind every
+/// `error_source` label, so a failed request cannot read as the gateway's on
+/// one path and the upstream's on another.
+pub(crate) fn error_source_of_class(class: &str) -> ErrorSource {
+    if class.is_empty() || class == crate::CLIENT_DISCONNECTED_KIND {
+        ErrorSource::None
+    } else if UPSTREAM_ERROR_CLASSES.contains(&class) {
+        ErrorSource::Upstream
     } else {
-        String::new()
+        ErrorSource::Aisix
     }
+}
+
+/// See [`error_source_of_class`].
+pub(crate) fn error_source(err: &ProxyError) -> ErrorSource {
+    error_source_of_class(error_class(err))
+}
+
+/// What ended a request a handler answered with a response rather than an
+/// error: a guardrail's refusal of the upstream's answer, or the route's own
+/// 501 for a provider lacking the capability (the last attempt, failed and
+/// never dispatched), and otherwise nothing.
+pub(crate) fn answered_error_source(
+    guardrail_blocked: bool,
+    routing: &RoutingTelemetry,
+) -> ErrorSource {
+    if guardrail_blocked || crate::usage_attr::failed_attempts_are_terminal(routing) {
+        ErrorSource::Aisix
+    } else {
+        ErrorSource::None
+    }
+}
+
+/// What ended a request answered by relaying an upstream's response as sent:
+/// the upstream when it answered with a failure, otherwise nothing.
+pub(crate) fn relayed_error_source(status: u16) -> ErrorSource {
+    if relayed_response_failed(status) {
+        ErrorSource::Upstream
+    } else {
+        ErrorSource::None
+    }
+}
+
+/// Whether a relayed upstream response is a failure: a redirect is a success
+/// on every request family.
+pub(crate) fn relayed_response_failed(status: u16) -> bool {
+    !(200..400).contains(&status)
+}
+
+/// The longest prefix of a relayed error body a route keeps for its failure
+/// row whatever the request's exporters are: the cap of `error_message`.
+pub(crate) const MAX_RELAYED_ERROR_DETAIL_BYTES: usize = MAX_ATTEMPT_ERROR_MESSAGE_CHARS;
+
+/// The class and message of an upstream's failure a route relays as sent, in
+/// the wording `BridgeError::UpstreamStatus` gives every other route. `body`
+/// is at most the [`MAX_RELAYED_ERROR_DETAIL_BYTES`] prefix.
+pub(crate) fn relayed_failure(status: u16, body: &[u8]) -> (&'static str, String) {
+    let err = BridgeError::upstream_status(status, aisix_gateway::upstream_error_message(body));
+    (routing_error_class(&err), attempt_error_message(&err))
 }
 
 /// Whether a failed attempt actually reached its upstream — the
@@ -786,10 +799,10 @@ mod tests {
         )));
     }
 
-    /// A usage event travels further than the access log, so only a
-    /// failure whose text is entirely the gateway's own carries it there.
+    /// Every failure names itself on its usage event, whoever wrote the text,
+    /// and a guardrail refusal stays policy wording and the guardrail's name.
     #[test]
-    fn gateway_error_message_carries_only_gateway_text() {
+    fn gateway_error_message_carries_every_failures_text() {
         let semantic = ProxyError::SemanticDecisionFailed {
             router: "router-a".into(),
             reason: crate::semantic::DecisionFailure::ClassifierTimeout,
@@ -802,28 +815,99 @@ mod tests {
             gateway_error_message(&ProxyError::ModelNotFound("ghost".into())),
             "model \"ghost\" not found"
         );
-        for quoting in [
-            ProxyError::InvalidRequest("invalid type: string \"my prompt\"".into()),
-            ProxyError::VideoNotFound("caller-id".into()),
-            ProxyError::Bridge(BridgeError::Config("upstream said x".into())),
+        for (quoting, text) in [
+            (
+                ProxyError::InvalidRequest("invalid type: string \"my prompt\"".into()),
+                "my prompt",
+            ),
+            (ProxyError::VideoNotFound("caller-id".into()), "caller-id"),
+            (
+                ProxyError::Bridge(BridgeError::upstream_status(502, "upstream said x")),
+                "upstream said x",
+            ),
         ] {
-            assert_eq!(gateway_error_message(&quoting), "", "{quoting:?}");
+            assert!(
+                gateway_error_message(&quoting).contains(text),
+                "{quoting:?}"
+            );
+            assert_eq!(
+                attempt_error_from_proxy(&quoting).1,
+                gateway_error_message(&quoting),
+                "an attempt row and a terminal row read the same"
+            );
         }
-        let refusal = ProxyError::ContentFiltered {
-            message: "request rejected by guardrail 'g'".into(),
-            unavailable: None,
-        };
+        let refusal = crate::error::guardrail_block_error("response", Some("g"), None);
         assert_eq!(error_class(&refusal), GUARDRAIL_BLOCK_CLASS);
         assert_eq!(
-            attempt_error_from_proxy(&refusal).1,
-            "request rejected by guardrail 'g'"
+            gateway_error_message(&refusal),
+            "response blocked by content policy (guardrail 'g')"
         );
     }
 
+    /// One mapping behind every `error_source` label: an upstream failure is
+    /// exactly a bridge error that reached the upstream, and no gateway
+    /// refusal shares a class with one. A status decides none of it.
+    #[test]
+    fn error_source_follows_the_failure_and_never_its_status() {
+        for err in bridge_error_samples() {
+            let expected = if err.reached_upstream() {
+                ErrorSource::Upstream
+            } else {
+                ErrorSource::Aisix
+            };
+            assert_eq!(error_source(&ProxyError::Bridge(err)), expected);
+        }
+        let upstream_429 = ProxyError::Bridge(BridgeError::upstream_status(429, "slow down"));
+        let budget = ProxyError::BudgetUnverified;
+        let refusal = crate::error::guardrail_block_error("response", None, None);
+        assert_eq!(error_source(&upstream_429), ErrorSource::Upstream);
+        for gateway in [
+            budget,
+            refusal,
+            ProxyError::InvalidApiKey,
+            ProxyError::ModelForbidden("m".into()),
+            ProxyError::ModelNotFound("m".into()),
+            ProxyError::InvalidRequest("bad".into()),
+            ProxyError::RequestTooLarge { limit_bytes: 1 },
+            ProxyError::ProviderUnavailable,
+            ProxyError::JwksUnavailable,
+        ] {
+            assert_eq!(error_source(&gateway), ErrorSource::Aisix, "{gateway:?}");
+        }
+        assert_eq!(
+            error_source_of_class(crate::CLIENT_DISCONNECTED_KIND),
+            ErrorSource::None
+        );
+        assert_eq!(error_source_of_class(""), ErrorSource::None);
+        assert_eq!(
+            error_source_of_class("rate_limit_lease_lost"),
+            ErrorSource::Aisix
+        );
+    }
+
+    /// A relayed failure reads like any route's upstream failure, in the three
+    /// forms an upstream's answer can take.
+    #[test]
+    fn a_relayed_failure_reports_what_the_upstream_said() {
+        assert_eq!(
+            relayed_failure(500, br#"{"error":{"message":"boom"}}"#),
+            ("upstream_status", "upstream returned HTTP 500: boom".into())
+        );
+        assert_eq!(
+            relayed_failure(503, b"plain text").1,
+            "upstream returned HTTP 503: plain text"
+        );
+        assert_eq!(
+            relayed_failure(404, b"").1,
+            "upstream returned HTTP 404 with no error detail in the response"
+        );
+        assert!(!relayed_response_failed(204));
+        assert!(!relayed_response_failed(302));
+        assert!(relayed_response_failed(499));
+    }
+
     /// AISIX-Cloud#1093: the access log is the one line an operator gets
-    /// per request, so EVERY failure has to name itself there — including
-    /// the variants `attempt_error_from_proxy` deliberately leaves
-    /// message-less because a per-attempt record only needs the class.
+    /// per request, so EVERY failure has to name itself there.
     #[test]
     fn access_log_error_names_every_variant_not_just_bridge_ones() {
         // The cause added for #1093 has to survive into the access log —
@@ -840,17 +924,10 @@ mod tests {
              tcp connect error: Connection timed out (os error 110)"
         );
 
-        // A non-bridge variant: `attempt_error_from_proxy` yields "" here,
-        // which would put the access log right back to naming no cause.
         let not_found = ProxyError::ModelNotFound("ghost".into());
         let (kind, msg) = access_log_error(&not_found);
         assert_eq!(kind, "model_not_found");
         assert!(msg.contains("ghost"), "{msg}");
-        assert!(
-            attempt_error_from_proxy(&not_found).1.is_empty(),
-            "per-attempt records intentionally carry no message here — \
-             that is why the access log needs its own helper"
-        );
     }
 
     /// Control chars would break the one-line-per-request shape that makes

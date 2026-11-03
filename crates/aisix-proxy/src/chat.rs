@@ -475,6 +475,7 @@ pub async fn chat_completions(
                     routing.fallback_count() > 0,
                 ),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             emit_access_log(
@@ -4704,6 +4705,7 @@ fn record_success(
                 caller,
                 request_upstream,
                 status,
+                aisix_obs::ErrorSource::None,
                 elapsed,
             );
             None

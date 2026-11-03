@@ -1536,6 +1536,10 @@ impl Telemetry<'_> {
         routing: &crate::attempt::RoutingTelemetry,
     ) {
         let elapsed = self.started.elapsed();
+        let error_source = error.map_or_else(
+            || crate::attempt::answered_error_source(false, routing),
+            crate::attempt::error_source,
+        );
         let (error_kind, error) = match error {
             Some(e) => {
                 let (kind, msg) = crate::attempt::access_log_error(e);
@@ -1606,6 +1610,7 @@ impl Telemetry<'_> {
                 caller,
                 upstream,
                 status,
+                error_source,
                 self.started,
             );
         } else {
@@ -1615,6 +1620,7 @@ impl Telemetry<'_> {
                 caller,
                 upstream,
                 status,
+                error_source,
                 elapsed,
             );
         }

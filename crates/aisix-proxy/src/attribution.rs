@@ -471,6 +471,10 @@ struct Cell {
     )>,
     /// See [`note_semantic_decision`].
     semantic: Option<aisix_obs::SemanticAccessLog>,
+    /// See [`note_error_source`].
+    noted_error_source: Option<aisix_obs::ErrorSource>,
+    /// See [`note_relayed_error_body`].
+    relayed_error_body: Option<bytes::Bytes>,
     /// See [`note_terminal_event`]: `(status, error_class, error_message)`
     /// of the terminal event, `None` when it named no failure.
     terminal_error: Option<(u16, String, String)>,
@@ -971,7 +975,10 @@ impl RequestAttribution {
         let target = cell.resolved.clone();
         drop(cell);
         if let Some(metrics) = metrics.filter(|_| had_head) {
-            metrics.record_terminal(event.status_code);
+            metrics.record_terminal(
+                event.status_code,
+                crate::attempt::error_source_of_class(&event.error_class),
+            );
         }
         let Some(pending) = pending else {
             return false;
@@ -1540,6 +1547,55 @@ pub(crate) fn note_terminal_event(event: &aisix_obs::UsageEvent, provider_reques
         cell.terminal_provider_request_id = provider_request_id.to_string();
         cell.terminal_tokens = tokens;
     });
+}
+
+/// Name what ended a request whose handler answers with a rendered response
+/// and files no usage event for this failure (see [`rendered_error_source`]).
+pub(crate) fn note_error_source(source: aisix_obs::ErrorSource) {
+    let _ = CURRENT.try_with(|a| a.lock().noted_error_source = Some(source));
+}
+
+/// What ended a request whose emit holds only the status of a rendered
+/// response (`/a2a`, `/mcp`, the discovery documents): what was noted, else
+/// what its terminal usage event names, else a response the gateway wrote
+/// itself.
+pub(crate) fn rendered_error_source(status: u16) -> aisix_obs::ErrorSource {
+    let known = CURRENT
+        .try_with(|a| {
+            let cell = a.lock();
+            cell.noted_error_source.or_else(|| {
+                cell.terminal_error
+                    .as_ref()
+                    .map(|(_, class, _)| crate::attempt::error_source_of_class(class))
+            })
+        })
+        .ok()
+        .flatten();
+    known.unwrap_or(if (200..400).contains(&status) {
+        aisix_obs::ErrorSource::None
+    } else {
+        aisix_obs::ErrorSource::Aisix
+    })
+}
+
+/// Keep the start of a non-2xx body a route relays to its caller, for the
+/// failure row of a route with no typed error to carry it. Shares the body
+/// the route holds anyway, so nothing is copied.
+pub(crate) fn note_relayed_error_body(body: &bytes::Bytes) {
+    let kept = body.slice(
+        ..body
+            .len()
+            .min(crate::attempt::MAX_RELAYED_ERROR_DETAIL_BYTES),
+    );
+    let _ = CURRENT.try_with(|a| a.lock().relayed_error_body = Some(kept));
+}
+
+/// See [`note_relayed_error_body`].
+pub(crate) fn relayed_error_body() -> Option<bytes::Bytes> {
+    CURRENT
+        .try_with(|a| a.lock().relayed_error_body.clone())
+        .ok()
+        .flatten()
 }
 
 /// The `provider_request_id` of the request's terminal usage event, for a

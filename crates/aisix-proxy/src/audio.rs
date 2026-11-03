@@ -166,6 +166,7 @@ pub async fn transcriptions(
                 &auth,
                 &success,
                 status,
+                crate::attempt::answered_error_source(success.guardrail_blocked, &routing),
                 elapsed,
                 routing.fallback_count() > 0,
                 success.usage_handled_by_stream.then_some(started),
@@ -285,6 +286,7 @@ pub async fn transcriptions(
                 crate::request_metrics::Caller::new(&auth),
                 last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs. The model
@@ -409,6 +411,7 @@ pub async fn translations(
                 &auth,
                 &success,
                 status,
+                crate::attempt::answered_error_source(success.guardrail_blocked, &routing),
                 elapsed,
                 routing.fallback_count() > 0,
                 success.usage_handled_by_stream.then_some(started),
@@ -521,6 +524,7 @@ pub async fn translations(
                 crate::request_metrics::Caller::new(&auth),
                 last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs (model not
@@ -783,6 +787,7 @@ pub async fn speech(
                 crate::request_metrics::Caller::new(&auth),
                 last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a
@@ -2632,6 +2637,7 @@ fn record_audio_metrics(
     auth: &AuthenticatedKey,
     success: &AudioDispatchSuccess,
     status: u16,
+    error_source: aisix_obs::ErrorSource,
     elapsed: Duration,
     is_fallback: bool,
     // `Some(request start)` on the live relay, whose samples are returned
@@ -2657,7 +2663,15 @@ fn record_audio_metrics(
             ),
         ),
         None => {
-            crate::request_metrics::record(state, endpoint, caller, upstream, status, elapsed);
+            crate::request_metrics::record(
+                state,
+                endpoint,
+                caller,
+                upstream,
+                status,
+                error_source,
+                elapsed,
+            );
             None
         }
     }

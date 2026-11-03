@@ -747,8 +747,8 @@ pub(crate) fn emit_error_usage_event(
 }
 
 /// The failure a request's terminal error event names: its
-/// [`crate::attempt::error_class`] and, for a failure whose text is the
-/// gateway's own, the [`crate::attempt::gateway_error_message`].
+/// [`crate::attempt::error_class`] and
+/// [`crate::attempt::gateway_error_message`].
 pub(crate) struct EventError {
     class: &'static str,
     message: String,
@@ -771,15 +771,6 @@ impl EventError {
             class: crate::attempt::error_class(err),
             message: crate::attempt::gateway_error_message(err),
             model,
-        }
-    }
-
-    /// A class the caller synthesizes without a `ProxyError`.
-    pub(crate) fn class_only(class: &'static str) -> Self {
-        Self {
-            class,
-            message: String::new(),
-            model: None,
         }
     }
 }
