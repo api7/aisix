@@ -287,9 +287,6 @@ pub async fn image_edits(
     }
 }
 
-/// Collect all multipart fields, resolve the model, swap in the upstream
-/// model id, then rebuild and forward the multipart form. See audio's
-/// `multipart_dispatch` for the pattern this follows (minus streaming).
 /// A multipart request as content capture represents it. See the capture site.
 fn captured_edit_fields(fields: &[(String, Option<String>, Option<String>, Bytes)]) -> String {
     use sha2::Digest;
@@ -331,6 +328,9 @@ fn captured_edit_fields(fields: &[(String, Option<String>, Option<String>, Bytes
     serde_json::to_string(&Value::Object(obj)).unwrap_or_default()
 }
 
+/// Collect all multipart fields, resolve the model, swap in the upstream
+/// model id, then rebuild and forward the multipart form. See audio's
+/// `multipart_dispatch` for the pattern this follows (minus streaming).
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &ProxyState,

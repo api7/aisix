@@ -1150,8 +1150,6 @@ fn observe_transcript_events(
     }
 }
 
-/// Collect all multipart fields, resolve the model, swap in the upstream
-/// model id, then rebuild and forward the multipart form.
 /// A multipart request as content capture represents it. See the capture site.
 fn captured_transcription_fields(
     fields: &[(String, Option<String>, Option<String>, Bytes)],
@@ -1188,6 +1186,8 @@ fn captured_transcription_fields(
     serde_json::to_string(&Value::Object(obj)).unwrap_or_default()
 }
 
+/// Collect all multipart fields, resolve the model, swap in the upstream
+/// model id, then rebuild and forward the multipart form.
 #[allow(clippy::too_many_arguments)]
 async fn multipart_dispatch(
     state: &ProxyState,

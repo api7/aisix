@@ -2023,7 +2023,7 @@ impl Upstream {
                             Err(e) => {
                                 yield Ok(aisix_provider_anthropic::platform::error_frame(
                                     "api_error",
-                                    &e.to_string(),
+                                    &e.stream_frame_message(),
                                 ));
                                 break;
                             }

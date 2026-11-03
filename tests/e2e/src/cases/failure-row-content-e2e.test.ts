@@ -544,6 +544,17 @@ describe("failure rows carry request and response bodies", () => {
     expect(row.get("response")).toContain("sentinel-body-400");
   });
 
+  test("a passthrough request with no body still reports the upstream's failure", async () => {
+    if (!etcdReachable) return;
+    const res = await fetch(`${app!.proxyUrl}/row-passthrough/anything`, {
+      headers: { authorization: `Bearer ${CALLER}` },
+    });
+    expect(res.status).toBe(500);
+    await res.text();
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the bodyless passthrough row");
+    expect(row.get("response")).toContain("sentinel-passthrough-answer");
+  });
+
   test("a passthrough route's upstream failure carries both bodies", async () => {
     if (!etcdReachable) return;
     const res = await fetch(`${app!.proxyUrl}/row-passthrough/anything`, {

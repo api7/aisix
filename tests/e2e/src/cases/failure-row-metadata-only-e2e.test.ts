@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type Server as HttpServer } from "node:http";
+import { gzipSync } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { WebSocket as WsClient } from "ws";
 import {
@@ -38,7 +39,7 @@ describe("failure rows name the failure under metadata_only", () => {
 
   async function fixedUpstream(
     status: number,
-    body: string,
+    body: string | Buffer,
     headers: Record<string, string> = JSON_HEADERS,
   ): Promise<string> {
     const server = createServer((req, res) => {
@@ -116,6 +117,25 @@ describe("failure rows name the failure under metadata_only", () => {
       provider_key_id: failingPk.id,
     });
 
+    await seed.createPassthroughRoute({
+      name: "meta-route-gzip",
+      path_prefix: "/meta-route-gzip",
+      target_url: await fixedUpstream(500, gzipSync(jsonError), {
+        ...JSON_HEADERS,
+        "content-encoding": "gzip",
+      }),
+      provider_key_id: failingPk.id,
+    });
+    await seed.createPassthroughRoute({
+      name: "meta-route-gzip-sse",
+      path_prefix: "/meta-route-gzip-sse",
+      target_url: await fixedUpstream(500, gzipSync(jsonError), {
+        "content-type": "text/event-stream",
+        "content-encoding": "gzip",
+      }),
+      provider_key_id: failingPk.id,
+    });
+
     await seed.update("a2a_agents", randomUUID(), {
       name: "meta-agent",
       url: await fixedUpstream(500, SENTINEL),
@@ -135,7 +155,13 @@ describe("failure rows name the failure under metadata_only", () => {
     await seed.createApiKey({
       key_hash: hash(CALLER),
       allowed_models: ["*"],
-      allowed_routes: ["meta-route-json", "meta-route-empty", "meta-route-sse"],
+      allowed_routes: [
+        "meta-route-json",
+        "meta-route-empty",
+        "meta-route-sse",
+        "meta-route-gzip",
+        "meta-route-gzip-sse",
+      ],
       allowed_agents: ["*"],
     });
     await waitConfigPropagation(async () => {
@@ -234,6 +260,18 @@ describe("failure rows name the failure under metadata_only", () => {
     expect(row.get("error_class")).toBe("upstream_status");
     expect(row.get("error_message")).toContain(SENTINEL);
   });
+
+  test.for(["/meta-route-gzip", "/meta-route-gzip-sse"])(
+    "passthrough %s: a compressed failure is not read as text",
+    async (prefix, ctx) => {
+      if (!etcdReachable) return ctx.skip();
+      const r = await post(`${prefix}/anything`, { x: 1 });
+      expect(r.status).toBe(500);
+      const row = await rowOf(r.requestId, "the compressed failure's row");
+      expect(row.get("error_class")).toBe("upstream_status");
+      expect(row.get("error_message")).toBe("upstream returned HTTP 500 with a compressed error body");
+    },
+  );
 
   test("a2a: a failed agent call names the status the caller was told", async (ctx) => {
     if (!etcdReachable) return ctx.skip();

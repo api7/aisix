@@ -161,15 +161,6 @@ type UpstreamDial = Result<
     tokio_tungstenite::tungstenite::Error,
 >;
 
-/// Dial the upstream Realtime endpoint under the deployment's outbound
-/// TLS trust, on the deployment's connect budget, through the
-/// environment proxy that takes it (`upstream_dial`).
-///
-/// `connect_async` would build its own connector over the compiled-in
-/// root set only, which leaves this the one upstream path that ignores
-/// `upstream.tls` *and* `SSL_CERT_FILE` — a self-hosted Realtime
-/// endpoint behind an enterprise CA would fail here while the same
-/// provider's `/v1/chat/completions` worked.
 /// What a failed dial reports. An upgrade the upstream answered with an error
 /// names its status and what it said, in the wording of an HTTP route's upstream
 /// failure; the caller's frame is fixed text either way.
@@ -186,6 +177,15 @@ fn connect_failure_text(err: &tokio_tungstenite::tungstenite::Error) -> String {
     }
 }
 
+/// Dial the upstream Realtime endpoint under the deployment's outbound
+/// TLS trust, on the deployment's connect budget, through the
+/// environment proxy that takes it (`upstream_dial`).
+///
+/// `connect_async` would build its own connector over the compiled-in
+/// root set only, which leaves this the one upstream path that ignores
+/// `upstream.tls` *and* `SSL_CERT_FILE` — a self-hosted Realtime
+/// endpoint behind an enterprise CA would fail here while the same
+/// provider's `/v1/chat/completions` worked.
 async fn connect_upstream(
     request: tokio_tungstenite::tungstenite::handshake::client::Request,
 ) -> UpstreamDial {

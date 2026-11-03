@@ -658,6 +658,20 @@ fn rewrite_response_ids(v: &mut Value, model: &str) {
 
 // ─────────────────────── telemetry plumbing ───────────────────────
 
+/// A multipart field joins the capture beside any earlier one of its name:
+/// every repeat is forwarded, so none may disappear from the export.
+fn push_captured(captured: &mut serde_json::Map<String, Value>, key: String, value: String) {
+    match captured.get_mut(&key) {
+        Some(Value::String(existing)) => {
+            existing.push('\n');
+            existing.push_str(&value);
+        }
+        _ => {
+            captured.insert(key, Value::String(value));
+        }
+    }
+}
+
 /// Zero-token UsageEvent for one management call (create/list/retrieve/
 /// cancel/delete). Same contract as the `/passthrough` event (#699),
 /// but with the resolved Model attributed.
@@ -1025,9 +1039,10 @@ pub(crate) async fn create_file(
                 })?;
                 if capture {
                     use sha2::Digest;
-                    captured.insert(
+                    push_captured(
+                        &mut captured,
                         "file_sha256".to_string(),
-                        format!("{:x}", sha2::Sha256::digest(&bytes)).into(),
+                        format!("{:x}", sha2::Sha256::digest(&bytes)),
                     );
                 }
                 // Over the `Bytes` itself, not a `Vec` copy of the file.
@@ -1051,7 +1066,7 @@ pub(crate) async fn create_file(
                 )
             })?;
             if capture {
-                captured.insert(name.clone(), v.clone().into());
+                push_captured(&mut captured, name.clone(), v.clone());
             }
             form = form.text(name, v);
         }

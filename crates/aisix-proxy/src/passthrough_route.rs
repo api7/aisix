@@ -1067,6 +1067,8 @@ async fn dispatch(
         error_message: String::new(),
         failure_status: None,
         error_detail: Vec::new(),
+        error_body_encoded: !status.is_success()
+            && response_has_non_identity_content_encoding(upstream_resp.headers()),
         monitor_hits,
         audit: audit_out.clone(),
         captured_prompt,
@@ -1275,6 +1277,8 @@ async fn dispatch(
     if telemetry.content_cap.is_some() && !bypass_uninspectable_output {
         telemetry.response_text = if status.is_success() {
             response_capture_text(protocol, &resp_body)
+        } else if telemetry.error_body_encoded {
+            String::new()
         } else {
             String::from_utf8_lossy(&resp_body).into_owned()
         };
@@ -6045,7 +6049,7 @@ fn stream_opaque_response(
                     // upstream answer. A fail-open success stays uncaptured.
                     if !status.is_success() {
                         telemetry.keep_error_detail(&chunk);
-                        if let Some(cap) = telemetry.content_cap {
+                        if let Some(cap) = telemetry.content_cap.filter(|_| !telemetry.error_body_encoded) {
                             let room = cap.saturating_sub(telemetry.response_text.len());
                             telemetry
                                 .response_text
@@ -7075,6 +7079,9 @@ struct RouteTelemetry {
     /// more than [`crate::attempt::MAX_RELAYED_ERROR_DETAIL_BYTES`], and
     /// copied off the relay without holding it.
     error_detail: Vec<u8>,
+    /// The relay never decodes, so a failure's compressed bytes are not text
+    /// a row could report.
+    error_body_encoded: bool,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// The request's ENFORCE-mode audit handle (AISIX-Cloud#1330). Held
     /// rather than snapshotted at construction: this struct's emit runs
@@ -7091,6 +7098,9 @@ struct RouteTelemetry {
 impl RouteTelemetry {
     /// See [`Self::error_detail`].
     fn keep_error_detail(&mut self, relayed: &[u8]) {
+        if self.error_body_encoded {
+            return;
+        }
         let room = crate::attempt::MAX_RELAYED_ERROR_DETAIL_BYTES - self.error_detail.len();
         self.error_detail
             .extend_from_slice(&relayed[..relayed.len().min(room)]);
@@ -7184,7 +7194,14 @@ impl RouteTelemetry {
                 let (class, message) =
                     crate::attempt::relayed_failure(self.status, &self.error_detail);
                 self.error_class = class.to_string();
-                self.error_message = message;
+                self.error_message = if self.error_body_encoded {
+                    format!(
+                        "upstream returned HTTP {} with a compressed error body",
+                        self.status
+                    )
+                } else {
+                    message
+                };
             }
             None => {}
         }

@@ -622,7 +622,10 @@ fn failure_row_content(
     let row = match content {
         Some(c) if !c.prompt.is_empty() => c.clone(),
         given => {
-            let request = noted_request.or_else(|| given.cloned());
+            // A bodyless request's note says nothing; `given` may hold a response.
+            let request = noted_request
+                .filter(|noted| !noted.prompt.is_empty())
+                .or_else(|| given.cloned());
             request.unwrap_or_else(|| aisix_obs::CapturedContent::new("", "", cap))
         }
     };
