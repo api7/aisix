@@ -1149,8 +1149,8 @@ describe("keyless sessions follow the configuration on the next request", () => 
       expect(refused.status).toBe(400);
       expect(await oauthError(refused)).toBe("invalid_grant");
 
-      // The same identity value at the new provider is someone else: they get a
-      // session of their own, and the old one still cannot act as them.
+      // The same identity value at the new provider signs in afresh, and that
+      // does not bring the old session back.
       other.claims = { ...claimsOf("ines", "ines"), uid: "ines" };
       const theirs = await signInByHand(url());
       await opened(theirs.access_token);
@@ -1201,9 +1201,13 @@ describe("keyless sessions follow the configuration on the next request", () => 
     try {
       await setProvider({ issuer: elsewhere() });
       const refused = await browser.walk(atUpstream.url);
-      if (refused.kind !== "page") throw new Error(`landed: ${refused.url}`);
-      expect(refused.status).toBe(400);
-      expect(refused.text).toContain("identity provider changed");
+      if (refused.kind !== "landed") throw new Error(`stopped: ${refused.status} ${refused.text}`);
+      expect(refused.url.searchParams.get("error")).toBe("access_denied");
+      expect(refused.url.searchParams.get("code")).toBeNull();
+      const metrics = await (await fetch(`${app.metricsUrl}/metrics`)).text();
+      expect(metrics).toMatch(
+        /aisix_auth_decisions_total\{[^}]*method="mcp_oauth_login"[^}]*reason="session_issuer_changed"[^}]*\}/,
+      );
     } finally {
       await setProvider({});
     }

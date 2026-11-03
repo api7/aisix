@@ -822,11 +822,19 @@ async fn handle_callback(state: &ProxyState, request: Parts) -> Result<Response,
         state
             .metrics
             .record_auth_decision("mcp_oauth_login", false, SESSION_ISSUER_CHANGED);
-        return Err(error_page(
-            StatusCode::BAD_REQUEST,
-            "This sign-in was refused",
-            "This gateway's identity provider changed during the sign-in. Start again from the \
-             MCP client.",
+        tracing::warn!(target: "aisix::mcp_oauth", server = %flow.server_name,
+            provider = %signed_in.provider,
+            "the identity provider changed during a sign-in; no upstream credential was stored");
+        return Ok(back_to_client(
+            &base,
+            &flow,
+            &[
+                ("error", "access_denied"),
+                (
+                    "error_description",
+                    "the identity provider changed during the sign-in",
+                ),
+            ],
         ));
     }
     let oauth = server_of(&snapshot, &flow).ok_or_else(misconfigured_page)?;
