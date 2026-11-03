@@ -1149,19 +1149,28 @@ describe("keyless sessions follow the configuration on the next request", () => 
       expect(refused.status).toBe(400);
       expect(await oauthError(refused)).toBe("invalid_grant");
 
-      // The same identity value at the new provider signs in afresh, and that
-      // does not bring the old session back.
+      // The same identity value at the new provider is someone else: their own
+      // upstream sign-in, their own token, and the old session stays out.
       other.claims = { ...claimsOf("ines", "ines"), uid: "ines" };
+      upstream.user = "up-ines-at-the-new-idp";
+      const seen = upstream.authorizeRequests.length;
       const theirs = await signInByHand(url());
-      await opened(theirs.access_token);
+      expect(upstream.authorizeRequests.length).toBe(seen + 1);
+      const theirClient = await connectMcpClient(url(), bearer(theirs.access_token));
+      expect(await whoami(theirClient.client)).toBe("up-ines-at-the-new-idp");
+      await theirClient.client.close();
       await refusedSoon(tokens.access_token);
     } finally {
       await setProvider({});
       await other.close();
     }
 
-    // The refused refresh rotated nothing, so the token is still good.
+    // The refused refresh rotated nothing, so the token is still good, and it
+    // still reaches the upstream as the person who signed in with it.
     await opened(tokens.access_token);
+    const ownClient = await connectMcpClient(url(), bearer(tokens.access_token));
+    expect(await whoami(ownClient.client)).toBe("up-ines");
+    await ownClient.client.close();
     expect((await refreshGrant(tokens.refresh_token)).status).toBe(200);
   });
 

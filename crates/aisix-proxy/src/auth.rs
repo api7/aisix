@@ -61,6 +61,9 @@ pub struct JwtIdentity {
     pub subject: String,
     /// Name of the OIDC provider that verified the token.
     pub provider: String,
+    /// That provider's configured issuer, which keys this caller's stored
+    /// upstream credentials. `None` on a provider that pins none.
+    pub(crate) issuer: Option<String>,
     /// Name of the claim mapping that selected the API key, or `None`
     /// when the subject was bound to the key directly via `jwt_subject`.
     pub claim_mapping: Option<String>,
@@ -75,12 +78,14 @@ impl JwtIdentity {
     pub fn new(
         subject: String,
         provider: String,
+        issuer: Option<String>,
         claim_mapping: Option<String>,
         token: Arc<str>,
     ) -> Self {
         Self {
             subject,
             provider,
+            issuer,
             claim_mapping,
             token: Some(token),
         }
@@ -91,11 +96,13 @@ impl JwtIdentity {
     pub(crate) fn for_session(
         subject: String,
         provider: String,
+        issuer: Option<String>,
         claim_mapping: Option<String>,
     ) -> Self {
         Self {
             subject,
             provider,
+            issuer,
             claim_mapping,
             token: None,
         }

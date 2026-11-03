@@ -32,10 +32,11 @@
 use std::sync::Arc;
 
 use aisix_core::models::OidcProvider;
+use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
 use aisix_mcp::user_oauth::{
-    pkce_pair, random_token, FlowStage, FlowState, LoginCode, LoginExchange, RedeemError,
-    RedeemRequest, SessionIdentity, SessionKeys, UpstreamLeg, ACCESS_TOKEN_PREFIX,
+    normalized_issuer, pkce_pair, random_token, FlowStage, FlowState, LoginCode, LoginExchange,
+    RedeemError, RedeemRequest, SessionIdentity, SessionKeys, UpstreamLeg, ACCESS_TOKEN_PREFIX,
     ACCESS_TOKEN_TTL_SECS, FLOW_TTL_SECS,
 };
 use aisix_mcp::{UserOAuthFailure, UserOAuthServer, UserSubject};
@@ -643,12 +644,17 @@ async fn handle_login_callback(state: &ProxyState, request: Parts) -> Result<Res
     state
         .metrics
         .record_auth_decision("mcp_oauth_login", true, "");
+    let subject = UserSubject::jwt(
+        &provider.name,
+        provider.issuer.as_deref(),
+        &principal.subject,
+    );
     let identity = SessionIdentity {
         provider: provider.name.clone(),
         identity: principal.subject,
         claims: session_claims,
     };
-    connect_upstream(state, &oauth, &base, &keys, flow, identity).await
+    connect_upstream(state, &oauth, &base, &keys, flow, identity, &subject).await
 }
 
 /// What a refused person is told, in terms of what they can act on.
@@ -686,9 +692,9 @@ async fn connect_upstream(
     keys: &SessionKeys,
     mut flow: FlowState,
     identity: SessionIdentity,
+    subject: &UserSubject,
 ) -> Result<Response, Response> {
-    let subject = UserSubject::jwt(&identity.provider, &identity.identity);
-    match state.mcp_oauth.access_token(oauth, &subject).await {
+    match state.mcp_oauth.access_token(oauth, subject).await {
         Ok(_) => {
             return to_consent(
                 base,
@@ -812,13 +818,13 @@ async fn handle_callback(state: &ProxyState, request: Parts) -> Result<Response,
         return to_consent(&base, &keys, flow, stage);
     };
 
-    // The credential is stored under the provider's name, which by now may mean
-    // another identity provider, and so another person with this identity value.
-    let issuer_is_current = snapshot
+    // This person signed in at the provider this name meant then. By now it may
+    // mean another one, whose record this credential must not land in.
+    let Some(provider) = snapshot
         .oidc_providers
         .get_by_name(&signed_in.provider)
-        .is_some_and(|provider| session_issuer_is_current(&provider.value, &signed_in.claims));
-    if !issuer_is_current {
+        .filter(|provider| session_issuer_is_current(&provider.value, &signed_in.claims))
+    else {
         state
             .metrics
             .record_auth_decision("mcp_oauth_login", false, SESSION_ISSUER_CHANGED);
@@ -836,9 +842,13 @@ async fn handle_callback(state: &ProxyState, request: Parts) -> Result<Response,
                 ),
             ],
         ));
-    }
+    };
     let oauth = server_of(&snapshot, &flow).ok_or_else(misconfigured_page)?;
-    let subject = UserSubject::jwt(&signed_in.provider, &signed_in.identity);
+    let subject = UserSubject::jwt(
+        &signed_in.provider,
+        provider.value.issuer.as_deref(),
+        &signed_in.identity,
+    );
     state
         .mcp_oauth
         .exchange_upstream_code(&oauth, &subject, upstream_code, leg, &verifier)
@@ -950,7 +960,7 @@ const SESSION_ISSUER_CHANGED: &str = "session_issuer_changed";
 
 /// Two spellings of one issuer, which may differ by a trailing slash.
 fn same_issuer(a: &str, b: &str) -> bool {
-    a.trim_end_matches('/') == b.trim_end_matches('/')
+    normalized_issuer(a) == normalized_issuer(b)
 }
 
 /// Whether the identity provider that signed this session in is still the one
@@ -994,6 +1004,7 @@ fn session_principal(
         Some(Arc::new(JwtIdentity::for_session(
             identity.subject.clone(),
             provider.name.clone(),
+            provider.issuer.clone(),
             identity.claim_mapping,
         ))),
         false,
@@ -1165,7 +1176,7 @@ pub(crate) async fn token(
                          match this request",
                     ),
                 };
-            if !still_authorized(state, &snapshot, &identity) {
+            if authorized_provider(state, &snapshot, &identity).is_none() {
                 return invalid_grant();
             }
             session_response(&keys, &oauth, client_id, &identity)
@@ -1191,13 +1202,17 @@ pub(crate) async fn token(
                 identity: session.identity.clone(),
                 claims: session.claims.clone(),
             };
-            if !still_authorized(state, &snapshot, &identity) {
+            let Some(provider) = authorized_provider(state, &snapshot, &identity) else {
                 return invalid_grant();
-            }
+            };
             // With the upstream credential gone a new pair would be refused on
             // its first request, and a client holding a refresh token refreshes
             // before it considers the browser. This is what sends it there.
-            let subject = UserSubject::jwt(&identity.provider, &identity.identity);
+            let subject = UserSubject::jwt(
+                &identity.provider,
+                provider.value.issuer.as_deref(),
+                &identity.identity,
+            );
             if state.mcp_oauth.access_token(&oauth, &subject).await
                 == Err(UserOAuthFailure::AuthorizationRequired)
             {
@@ -1217,18 +1232,19 @@ pub(crate) async fn token(
     }
 }
 
-/// Whether configuration still gives this identity a usable key, so a client is
-/// told at the token step rather than given a token no request will accept.
-fn still_authorized(
+/// The provider, when configuration still gives this identity a usable key, so
+/// a client is told at the token step rather than given a token no request will
+/// accept.
+fn authorized_provider(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
     identity: &SessionIdentity,
-) -> bool {
+) -> Option<Arc<ResourceEntry<OidcProvider>>> {
     snapshot
         .oidc_providers
         .get_by_name(&identity.provider)
         .filter(|entry| entry.value.enabled)
-        .is_some_and(|provider| {
+        .filter(|provider| {
             session_issuer_is_current(&provider.value, &identity.claims)
                 && session_principal(state, snapshot, &provider.value, &identity.claims)
                     .is_ok_and(|principal| principal.subject == identity.identity)

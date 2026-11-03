@@ -126,7 +126,11 @@ pub(crate) fn sign_in_mode(snapshot: &AisixSnapshot) -> SignInMode {
 /// owner: claim mappings let many identities share one key.
 pub(crate) fn caller_subject(auth: &AuthenticatedKey) -> Option<UserSubject> {
     if let Some(jwt) = &auth.jwt {
-        return Some(UserSubject::jwt(&jwt.provider, &jwt.subject));
+        return Some(UserSubject::jwt(
+            &jwt.provider,
+            jwt.issuer.as_deref(),
+            &jwt.subject,
+        ));
     }
     if auth.anonymous {
         return None;

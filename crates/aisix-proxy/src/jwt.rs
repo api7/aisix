@@ -761,6 +761,7 @@ pub(crate) async fn authenticate_jwt(
         Some(Arc::new(JwtIdentity::new(
             subject,
             prov.name.clone(),
+            prov.issuer.clone(),
             claim_mapping,
             Arc::from(token),
         ))),

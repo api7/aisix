@@ -79,10 +79,16 @@ pub struct UserSubject {
 }
 
 impl UserSubject {
-    pub fn jwt(provider: &str, subject: &str) -> Self {
+    /// `issuer` is the provider's as configured now, `None` on one that pins
+    /// none. It is in the record key because a provider's name can move to
+    /// another identity provider, where the same identity value is someone else.
+    /// `id` stays without it: the store's `subject` label comes from `id`, and
+    /// the control plane purges a provider's tokens by that label's prefix.
+    pub fn jwt(provider: &str, issuer: Option<&str>, subject: &str) -> Self {
+        let issuer = normalized_issuer(issuer.unwrap_or_default());
         Self {
             id: format!("jwt:{provider}:{subject}"),
-            record_key: digest(&["jwt", provider, subject]),
+            record_key: digest(&["jwt", provider, issuer, subject]),
             member_id: None,
         }
     }
@@ -216,6 +222,11 @@ struct CachedToken {
 }
 
 /// `(server, subject)` for one in-flight refresh and one store key.
+/// An issuer as compared, which a trailing slash does not change.
+pub fn normalized_issuer(issuer: &str) -> &str {
+    issuer.trim_end_matches('/')
+}
+
 fn digest(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
     for part in parts {
@@ -820,11 +831,25 @@ mod tests {
     #[test]
     fn identities_that_read_alike_keep_separate_records() {
         let (a, b) = (
-            UserSubject::jwt("corp", "x:alice"),
-            UserSubject::jwt("corp:x", "alice"),
+            UserSubject::jwt("corp", None, "x:alice"),
+            UserSubject::jwt("corp:x", None, "alice"),
         );
         assert_eq!(a.id(), b.id());
         assert_ne!(token_key(&server(), &a), token_key(&server(), &b));
+    }
+
+    #[test]
+    fn a_record_follows_the_issuer_and_the_label_does_not() {
+        let at = |issuer| UserSubject::jwt("corp", issuer, "alice");
+        let key = |subject: &UserSubject| token_key(&server(), subject);
+        let idp = at(Some("https://idp.example.com"));
+
+        for other in [at(Some("https://other.example.com")), at(None)] {
+            assert_eq!(idp.id(), other.id());
+            assert_eq!(idp.id(), "jwt:corp:alice");
+            assert_ne!(key(&idp), key(&other));
+        }
+        assert_eq!(key(&idp), key(&at(Some("https://idp.example.com/"))));
     }
 
     #[tokio::test]
