@@ -110,27 +110,6 @@ async function seedEnvironment(
   upstream: OAuthMcpUpstream,
   short: OAuthMcpUpstream,
 ): Promise<{ providerId: string; mappingId: string }> {
-  await seed.update("mcp_servers", SERVER_MAIN, {
-    name: "main",
-    type: "mcp",
-    url: upstream.mcpUrl,
-    auth_type: "oauth2_authorization_code",
-    // A session token must not get through by being named here.
-    forward_client_headers: ["authorization"],
-  });
-  await seed.update("mcp_servers", SERVER_OTHER, {
-    name: "other",
-    type: "mcp",
-    url: upstream.mcpUrl,
-    auth_type: "oauth2_authorization_code",
-  });
-  await seed.update("mcp_servers", SERVER_SHORT, {
-    name: "short",
-    type: "mcp",
-    url: short.mcpUrl,
-    auth_type: "oauth2_authorization_code",
-  });
-  await seed.update("mcp_auth_settings", randomUUID(), { resource_url: `${base}/mcp` });
   const providerRow = await seed.createOidcProvider({
     name: "corp",
     issuer: provider.url,
@@ -162,6 +141,29 @@ async function seedEnvironment(
     priority: 200,
     match: [{ claim: "org.team", op: "exact", values: ["no-mcp"] }],
     resolve: { api_key_id: noGrant.id },
+  });
+  // Last: etcd events apply in order, and a server the gateway knows before its
+  // login provider is a relay-mode server, whose authorize writes to the store.
+  await seed.update("mcp_auth_settings", randomUUID(), { resource_url: `${base}/mcp` });
+  await seed.update("mcp_servers", SERVER_MAIN, {
+    name: "main",
+    type: "mcp",
+    url: upstream.mcpUrl,
+    auth_type: "oauth2_authorization_code",
+    // A session token must not get through by being named here.
+    forward_client_headers: ["authorization"],
+  });
+  await seed.update("mcp_servers", SERVER_OTHER, {
+    name: "other",
+    type: "mcp",
+    url: upstream.mcpUrl,
+    auth_type: "oauth2_authorization_code",
+  });
+  await seed.update("mcp_servers", SERVER_SHORT, {
+    name: "short",
+    type: "mcp",
+    url: short.mcpUrl,
+    auth_type: "oauth2_authorization_code",
   });
   return { providerId: providerRow.id, mappingId: mapping.id };
 }
