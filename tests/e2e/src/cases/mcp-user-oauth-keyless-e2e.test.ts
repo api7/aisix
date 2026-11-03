@@ -85,6 +85,7 @@ const tokenRequest = (serverUrl: string, form: Record<string, string>) =>
   });
 
 const oauthError = async (res: Response) => ((await res.json()) as { error: string }).error;
+const errorCode = async (res: Response) => ((await res.json()) as { error: { code: string } }).error.code;
 
 /** A whole browser pass and the code exchange, as a client without an SDK runs them. */
 async function signInByHand(serverUrl: string, browser = new Browser()): Promise<Tokens> {
@@ -200,7 +201,7 @@ describe("keyless sign-in on managed gateways", () => {
     short = await new OAuthMcpUpstream({ expiresIn: 30 }).start();
     for (let i = 0; i < 2; i++) {
       const app = await spawnApp({
-        extra: { managed: cp.managed, outbound: { ssrf_protection: { allowed_hosts: ["127.0.0.1"] } } },
+        extra: { managed: cp.managed },
         awaitProxyListener: false,
       });
       apps.push(app);
@@ -733,7 +734,7 @@ describe("keyless sign-in behind a front gateway that strips a path prefix", () 
     if (!etcdReachable) return;
     provider = await startMockOidcProvider();
     upstream = await new OAuthMcpUpstream().start();
-    app = await spawnApp({ extra: { outbound: { ssrf_protection: { allowed_hosts: ["127.0.0.1"] } } } });
+    app = await spawnApp();
     front = await startPrefixStrippingProxy(PREFIX, new URL(app.proxyUrl));
     base = `${front.url}${PREFIX}`;
     await seedEnvironment(new SeedClient(etcd, app.etcdPrefix), base, provider, upstream, upstream);
@@ -834,7 +835,7 @@ describe("keyless sessions follow the configuration on the next request", () => 
     if (!etcdReachable) return;
     provider = await startMockOidcProvider();
     upstream = await new OAuthMcpUpstream().start();
-    app = await spawnApp({ extra: { outbound: { ssrf_protection: { allowed_hosts: ["127.0.0.1"] } } } });
+    app = await spawnApp();
     seed = new SeedClient(etcd, app.etcdPrefix);
     ({ providerId, mappingId } = await seedEnvironment(seed, app.proxyUrl, provider, upstream, upstream));
     await awaitInteractive(url());
@@ -859,7 +860,31 @@ describe("keyless sessions follow the configuration on the next request", () => 
     await settled();
     const res = await mcpPost(url(), bearer(token));
     expect(res.status).toBe(401);
-    expect(res.headers.get("www-authenticate")).toContain("resource_metadata");
+    expect(res.headers.get("www-authenticate")).toBe(
+      `Bearer resource_metadata="${app.proxyUrl}/.well-known/oauth-protected-resource/mcp/main"`,
+    );
+    return res;
+  };
+
+  const listTools = async (token: string) => {
+    const res = await mcpPost(url(), bearer(token), { jsonrpc: "2.0", id: 2, method: "tools/list" });
+    expect(res.status).toBe(200);
+    return ((await res.json()) as { result: { tools: { name: string }[] } }).result.tools.map((t) => t.name);
+  };
+
+  /** A key of its own and the mapping onto it, so a test can change the key alone. */
+  const ownKey = async (team: string, mcpAccess: Record<string, unknown> = { allow: ["*"] }) => {
+    const doc = { key_hash: hash(`sk-${team}-${randomUUID()}`), allowed_models: [], mcp_access: mcpAccess };
+    const key = await seed.createApiKey(doc);
+    await seed.createClaimMapping({
+      name: team,
+      jwt_provider: "corp",
+      priority: 50,
+      match: [{ claim: "org.team", op: "exact", values: [team] }],
+      resolve: { api_key_id: key.id },
+    });
+    await settled();
+    return { id: key.id, doc };
   };
 
   test("a session token beside a key is not forwarded by the servers that forward Authorization", async () => {
@@ -925,13 +950,144 @@ describe("keyless sessions follow the configuration on the next request", () => 
     expect((await mcpPost(url(), bearer(tokens.access_token))).status).toBe(200);
 
     await seed.delete("claim_mappings", mappingId);
-    await refusedSoon(tokens.access_token);
+    expect(await errorCode(await refusedSoon(tokens.access_token))).toBe("jwt_identity_unmapped");
     const afterMapping = await tokenRequest(url(), {
       grant_type: "refresh_token",
       refresh_token: tokens.refresh_token,
     });
     expect(afterMapping.status).toBe(400);
     expect(await oauthError(afterMapping)).toBe("invalid_grant");
+  });
+
+  test("a mapping added after sign-in applies to a claim nothing referred to at sign-in", async () => {
+    if (!etcdReachable) return;
+    provider.claims = claimsOf("nina", "snapshot");
+    upstream.user = "up-nina";
+    await ownKey("snapshot");
+    const tokens = await signInByHand(url());
+    expect(await listTools(tokens.access_token)).toContain("whoami");
+
+    const narrow = await seed.createApiKey({
+      key_hash: hash(`sk-narrow-${randomUUID()}`),
+      allowed_models: [],
+      mcp_access: { allow: [] },
+    });
+    const added = await seed.createClaimMapping({
+      name: "by-email",
+      jwt_provider: "corp",
+      priority: 10,
+      match: [{ claim: "email", op: "exact", values: ["nina@example.com"] }],
+      resolve: { api_key_id: narrow.id },
+    });
+    await settled();
+    expect(await listTools(tokens.access_token)).toEqual([]);
+
+    await seed.delete("claim_mappings", added.id);
+    await settled();
+    expect(await listTools(tokens.access_token)).toContain("whoami");
+  });
+
+  test("a disabled or expired key answers as it does to a JWT, and refresh is refused until it is back", async () => {
+    if (!etcdReachable) return;
+    provider.claims = claimsOf("omar", "lifecycle");
+    upstream.user = "up-omar";
+    const { id, doc } = await ownKey("lifecycle");
+    const tokens = await signInByHand(url());
+    expect((await mcpPost(url(), bearer(tokens.access_token))).status).toBe(200);
+
+    await seed.update("api_keys", id, { ...doc, disabled: true });
+    expect(await errorCode(await refusedSoon(tokens.access_token))).toBe("api_key_disabled");
+    const refreshed = await tokenRequest(url(), { grant_type: "refresh_token", refresh_token: tokens.refresh_token });
+    expect(refreshed.status).toBe(400);
+    expect(await oauthError(refreshed)).toBe("invalid_grant");
+
+    await seed.update("api_keys", id, { ...doc, expires_at: "2020-01-01T00:00:00Z" });
+    expect(await errorCode(await refusedSoon(tokens.access_token))).toBe("api_key_expired");
+
+    await seed.update("api_keys", id, doc);
+    await settled();
+    expect((await mcpPost(url(), bearer(tokens.access_token))).status).toBe(200);
+  });
+
+  test("a bound claim the session no longer meets is the policy refusal a JWT gets", async () => {
+    if (!etcdReachable) return;
+    provider.claims = claimsOf("quinn", "bound");
+    upstream.user = "up-quinn";
+    await ownKey("bound");
+    const tokens = await signInByHand(url());
+
+    await seed.update("oidc_providers", providerId, { ...providerRow(), bound_claims: { realm: "elsewhere" } });
+    await settled();
+    const refused = await mcpPost(url(), bearer(tokens.access_token));
+    expect(refused.status).toBe(403);
+    expect(refused.headers.get("www-authenticate")).toBeNull();
+    expect(await errorCode(refused)).toBe("jwt_claims_rejected");
+    const refreshed = await tokenRequest(url(), { grant_type: "refresh_token", refresh_token: tokens.refresh_token });
+    expect(await oauthError(refreshed)).toBe("invalid_grant");
+
+    await seed.update("oidc_providers", providerId, providerRow());
+    await settled();
+    expect((await mcpPost(url(), bearer(tokens.access_token))).status).toBe(200);
+  });
+
+  test("losing access to the server hides its tools; getting it back needs no new sign-in", async () => {
+    if (!etcdReachable) return;
+    provider.claims = claimsOf("rosa", "acl-flip");
+    upstream.user = "up-rosa";
+    const { id, doc } = await ownKey("acl-flip");
+    const tokens = await signInByHand(url());
+    const logins = provider.authorizeRequests.length;
+    expect(await listTools(tokens.access_token)).toContain("whoami");
+
+    await seed.update("api_keys", id, { ...doc, mcp_access: { allow: [] } });
+    await settled();
+    expect((await mcpPost(url(), bearer(tokens.access_token))).status).toBe(200);
+    expect(await listTools(tokens.access_token)).toEqual([]);
+    const called = await mcpPost(url(), bearer(tokens.access_token), {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "whoami", arguments: {} },
+    });
+    expect(called.status).toBe(200);
+    expect(((await called.json()) as { error: { code: number } }).error.code).toBe(-32602);
+    const seenWhileDenied = upstream.tokensSeenFor("up-rosa").length;
+
+    const refreshed = await tokenRequest(url(), { grant_type: "refresh_token", refresh_token: tokens.refresh_token });
+    expect(refreshed.status).toBe(200);
+    const renewed = (await refreshed.json()) as Tokens;
+
+    await seed.update("api_keys", id, doc);
+    await settled();
+    const client = await connectMcpClient(url(), bearer(renewed.access_token));
+    expect(await whoami(client.client)).toBe("up-rosa");
+    await client.client.close();
+    expect(upstream.tokensSeenFor("up-rosa").length).toBeGreaterThan(seenWhileDenied);
+    expect(provider.authorizeRequests.length).toBe(logins);
+  });
+
+  test("without access and without an upstream credential, MCP stays open and refresh sends it to the browser", async () => {
+    if (!etcdReachable) return;
+    provider.claims = claimsOf("sam", "acl-gone");
+    upstream.user = "up-sam";
+    const { id, doc } = await ownKey("acl-gone");
+    const tokens = await signInByHand(url());
+
+    upstream.rejectEveryToken = true;
+    upstream.refreshAnswer = { status: 400, error: "invalid_grant" };
+    const gone = await mcpPost(url(), bearer(tokens.access_token), { jsonrpc: "2.0", id: 2, method: "tools/list" });
+    upstream.rejectEveryToken = false;
+    upstream.refreshAnswer = "ok";
+    expect(gone.status).toBe(401);
+    expect(await errorCode(gone)).toBe("mcp_oauth_authorization_required");
+
+    await seed.update("api_keys", id, { ...doc, mcp_access: { allow: [] } });
+    await settled();
+    expect((await mcpPost(url(), bearer(tokens.access_token))).status).toBe(200);
+    expect(await listTools(tokens.access_token)).toEqual([]);
+    const refreshed = await tokenRequest(url(), { grant_type: "refresh_token", refresh_token: tokens.refresh_token });
+    expect(refreshed.status).toBe(400);
+    expect(await oauthError(refreshed)).toBe("invalid_grant");
   });
 
   test("required scopes are requested, and refused when the token response did not grant them", async () => {
@@ -999,6 +1155,152 @@ describe("keyless sessions follow the configuration on the next request", () => 
   });
 });
 
+describe("an operator's own OAuth addresses under the default SSRF settings", () => {
+  let etcdReachable = false;
+  let app: SpawnedApp;
+  let seed: SeedClient;
+  let provider: MockOidcProvider;
+  let upstream: OAuthMcpUpstream;
+  let elsewhere: OAuthMcpUpstream;
+  const started: OAuthMcpUpstream[] = [];
+
+  /** A running upstream, an entry for it on the gateway, and that entry's address. */
+  const server = async (
+    name: string,
+    options: ConstructorParameters<typeof OAuthMcpUpstream>[0],
+    fields: (mock: OAuthMcpUpstream) => Record<string, unknown> = () => ({}),
+    gateway: SpawnedApp = app,
+    into: SeedClient = seed,
+  ) => {
+    const mock = await new OAuthMcpUpstream(options).start();
+    started.push(mock);
+    await into.update("mcp_servers", randomUUID(), {
+      name,
+      type: "mcp",
+      url: mock.mcpUrl,
+      auth_type: "oauth2_authorization_code",
+      ...fields(mock),
+    });
+    const at = `${gateway.proxyUrl}/mcp/${name}`;
+    await awaitInteractive(at);
+    return { mock, at };
+  };
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+    provider = await startMockOidcProvider();
+    upstream = await new OAuthMcpUpstream().start();
+    elsewhere = await new OAuthMcpUpstream({ staticClient: { id: "pre-registered", secret: "s" } }).start();
+    app = await spawnApp();
+    seed = new SeedClient(etcd, app.etcdPrefix);
+    await seedEnvironment(seed, app.proxyUrl, provider, upstream, upstream);
+    await awaitInteractive(`${app.proxyUrl}/mcp/main`);
+    provider.claims = claimsOf("tara");
+  }, 60_000);
+
+  afterAll(async () => {
+    await app?.exit();
+    await Promise.all(started.map((mock) => mock.close()));
+    await elsewhere?.close();
+    await upstream?.close();
+    await provider?.close();
+  });
+
+  test("a provider and a server on private addresses, with what the server publishes on its own address", async () => {
+    if (!etcdReachable) return;
+    upstream.user = "up-tara";
+    const tokens = await signInByHand(`${app.proxyUrl}/mcp/main`);
+    const client = await connectMcpClient(`${app.proxyUrl}/mcp/main`, bearer(tokens.access_token));
+    expect(await whoami(client.client)).toBe("up-tara");
+    await client.client.close();
+    expect(provider.tokenRequests.length).toBeGreaterThan(0);
+    expect(upstream.requestsSeen).toContain("GET /.well-known/oauth-authorization-server");
+    expect(upstream.registrations.length).toBeGreaterThan(0);
+  });
+
+  test("a configured token and registration URL on another private address", async () => {
+    if (!etcdReachable) return;
+    const toLocalhost = (url: string) => url.replace("127.0.0.1", "localhost");
+    const { mock, at } = await server("configured", { discovery: false }, (m) => ({
+      authorization_url: `${m.url}/authorize`,
+      token_url: `${toLocalhost(m.url)}/token`,
+      registration_url: `${toLocalhost(m.url)}/register`,
+    }));
+    mock.user = "up-configured";
+    const tokens = await signInByHand(at);
+    const client = await connectMcpClient(at, bearer(tokens.access_token));
+    expect(await whoami(client.client)).toBe("up-configured");
+    await client.client.close();
+    expect(mock.registrations).toHaveLength(1);
+    expect(mock.tokenRequests).toHaveLength(1);
+  });
+
+  test("a redirect from a configured token URL is not followed", async () => {
+    if (!etcdReachable) return;
+    const { mock, at } = await server(
+      "redirecting",
+      { tokenRedirect: `${elsewhere.url}/token`, staticClient: { id: "pre-registered", secret: "s" } },
+      (m) => ({ client_id: "pre-registered", secret: "s", authorization_url: `${m.url}/authorize`, token_url: `${m.url}/token` }),
+    );
+    const grants = elsewhere.tokenRequests.length;
+    const stop = await new Browser().walk(authorizeUrl(at));
+    expect(stop.kind).toBe("page");
+    expect(mock.tokenRequestQueries).toHaveLength(1);
+    expect(elsewhere.tokenRequests.length).toBe(grants);
+  });
+
+  test.each([
+    ["authorization server metadata", { advertise: { authorizationServer: "ELSEWHERE" } }, {}],
+    ["registration endpoint", { advertise: { registrationEndpoint: "ELSEWHERE/register" } }, {}],
+    [
+      "token endpoint",
+      { advertise: { tokenEndpoint: "ELSEWHERE/token" }, staticClient: { id: "pre-registered", secret: "s" } },
+      { client_id: "pre-registered", secret: "s" },
+    ],
+  ])("a discovered %s on another private address is refused", async (name, options, fields) => {
+    if (!etcdReachable) return;
+    const advertise = Object.fromEntries(
+      Object.entries(options.advertise).map(([k, v]) => [k, v.replace("ELSEWHERE", elsewhere.url)]),
+    );
+    const seen = elsewhere.requestsSeen.length;
+    const { mock, at } = await server(
+      `cross-${name.split(" ")[0]}`,
+      { ...options, advertise },
+      () => fields,
+    );
+    const stop = await new Browser().walk(authorizeUrl(at));
+    expect(stop.kind).toBe("page");
+    if (stop.kind === "page") expect(stop.status).toBe(500);
+    expect(elsewhere.requestsSeen.length).toBe(seen);
+    // What the server publishes on its own address was read to get this far.
+    expect(mock.requestsSeen).toContain("GET /.well-known/oauth-protected-resource/mcp");
+  });
+
+  test("allowed_hosts still opens a discovered address on another authority", async () => {
+    if (!etcdReachable) return;
+    const open = await spawnApp({ extra: { outbound: { ssrf_protection: { allowed_hosts: ["127.0.0.1"] } } } });
+    try {
+      const openSeed = new SeedClient(new EtcdClient(), open.etcdPrefix);
+      await seedEnvironment(openSeed, open.proxyUrl, provider, upstream, upstream);
+      const registrar = await new OAuthMcpUpstream().start();
+      started.push(registrar);
+      const { at } = await server(
+        "cross-allowed",
+        { advertise: { registrationEndpoint: `${registrar.url}/register` } },
+        () => ({}),
+        open,
+        openSeed,
+      );
+      await new Browser().walk(authorizeUrl(at));
+      expect(registrar.registrations).toHaveLength(1);
+    } finally {
+      await open.exit();
+    }
+  });
+});
+
 describe("relay mode, with no provider offering a login", () => {
   let cp: MockControlPlane;
   let app: SpawnedApp;
@@ -1013,7 +1315,7 @@ describe("relay mode, with no provider offering a login", () => {
     cp = await startMockControlPlane();
     upstream = await new OAuthMcpUpstream().start();
     app = await spawnApp({
-      extra: { managed: cp.managed, outbound: { ssrf_protection: { allowed_hosts: ["127.0.0.1"] } } },
+      extra: { managed: cp.managed },
       awaitProxyListener: false,
     });
     const seed = new SeedClient(etcd, `${app.etcdPrefix}/${cp.envId}`);

@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::discovery::Endpoints;
-use super::http::{send, HttpFailure};
+use super::http::{send, Gate, HttpFailure};
 use super::session::SessionIdentity;
 use super::{
     digest, random_token, unix_now, RegisteredClient, TokenLabels, TokenRecord, UserOAuthManager,
@@ -217,17 +217,19 @@ pub(super) async fn token_request(
     form: &[(&str, String)],
     timeout: std::time::Duration,
 ) -> TokenOutcome {
-    token_request_named(&server.name, token_endpoint, form, timeout).await
+    let gate = server.gate_for(token_endpoint);
+    token_request_named(&server.name, gate, token_endpoint, form, timeout).await
 }
 
 /// As [`token_request`], for a party that is not an MCP server.
 pub(super) async fn token_request_named(
     name: &str,
+    gate: Gate,
     token_endpoint: &str,
     form: &[(&str, String)],
     timeout: std::time::Duration,
 ) -> TokenOutcome {
-    let response = match send(name, token_endpoint, timeout, |client, url| {
+    let response = match send(name, gate, token_endpoint, timeout, |client, url| {
         client
             .post(url)
             .header("accept", "application/json")
@@ -641,6 +643,7 @@ async fn register(
     };
     let response = send(
         &server.name,
+        server.gate_for(registration_endpoint),
         registration_endpoint,
         server.timeout,
         |client, url| client.post(url).json(&request),

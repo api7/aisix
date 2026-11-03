@@ -58,7 +58,6 @@ describe("per-user OAuth on managed gateways", () => {
       const app = await spawnApp({
         extra: {
           managed: cp.managed,
-          outbound: { ssrf_protection: { allowed_hosts: ["127.0.0.1"] } },
         },
         awaitProxyListener: false,
       });

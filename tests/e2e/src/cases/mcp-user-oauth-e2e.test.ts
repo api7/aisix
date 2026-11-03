@@ -80,9 +80,7 @@ interface Stack {
 async function startStack(
   baseFor?: (proxyUrl: string) => Promise<string>,
 ): Promise<Stack> {
-  const app = await spawnApp({
-    extra: { outbound: { ssrf_protection: { allowed_hosts: ["127.0.0.1"] } } },
-  });
+  const app = await spawnApp();
   const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
   const base = baseFor === undefined ? app.proxyUrl : await baseFor(app.proxyUrl);
   return { app, seed, base };
@@ -1000,52 +998,5 @@ describe("per-user OAuth with no public address", () => {
     expect(res.headers.get("www-authenticate")).toBeNull();
     expect(await errorCode(res)).toBe("mcp_oauth_misconfigured");
     expect((await fetch(`${stack.app.proxyUrl}/.well-known/oauth-protected-resource/mcp/main`)).status).toBe(404);
-  });
-});
-
-describe("per-user OAuth under the SSRF settings", () => {
-  let app: SpawnedApp;
-  let main: OAuthMcpUpstream;
-  let etcdReachable = false;
-
-  beforeAll(async () => {
-    etcdReachable = await new EtcdClient().ping();
-    if (!etcdReachable) return;
-    app = await spawnApp();
-    main = await new OAuthMcpUpstream().start();
-    const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
-    await seed.update("mcp_servers", randomUUID(), {
-      name: "main",
-      type: "mcp",
-      url: main.mcpUrl,
-      auth_type: "oauth2_authorization_code",
-    });
-    await seed.update("mcp_auth_settings", randomUUID(), { resource_url: `${app.proxyUrl}/mcp` });
-    await seed.createApiKey({
-      key_hash: hash("sk-ssrf"),
-      allowed_models: [],
-      mcp_access: { allow: ["*"] },
-      user_id: "alice",
-    });
-    await waitConfigPropagation(async () => {
-      const res = await fetch(`${app.proxyUrl}/v1/models`, { headers: { authorization: "Bearer sk-ssrf" } });
-      return res.status === 200;
-    });
-  }, 60_000);
-
-  afterAll(async () => {
-    await app?.exit();
-    await main?.close();
-  });
-
-  test("an endpoint the settings refuse is never contacted, and the client is told", async () => {
-    if (!etcdReachable) return;
-    const res = await fetch(authorizeUrl(`${app.proxyUrl}/mcp/main`), { redirect: "manual" });
-    expect(res.status).toBe(302);
-    const landed = new URL(res.headers.get("location")!);
-    expect(landed.origin).toBe(new URL(REDIRECT).origin);
-    expect(landed.searchParams.get("error")).toBe("server_error");
-    expect(main.registrations).toHaveLength(0);
-    expect(main.mcpAuthorizations).toHaveLength(0);
   });
 });

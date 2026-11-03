@@ -22,7 +22,9 @@
 //! The client then holds a session token: the gateway's own, sealed so that no
 //! store is read to accept it. [`authenticate_session`] re-runs the checks that
 //! depend on configuration against what the token recorded at sign-in, so a
-//! key, mapping or provider change applies on the next request.
+//! key, mapping or provider change applies on the next request, and answers as
+//! the same change answers a JWT caller. A key's access to the server is decided
+//! at sign-in and, after that, by the MCP layer as for any caller.
 
 // A step's `Err` is the page it ends the flow with.
 #![allow(clippy::result_large_err)]
@@ -116,8 +118,8 @@ fn flow_cookie(base: &str, keys: &SessionKeys, flow: &FlowState) -> Result<Heade
             StatusCode::BAD_REQUEST,
             "This sign-in is too large",
             "What this sign-in has to remember does not fit in a browser cookie. The likely \
-             causes are a very long state or redirect address from the MCP client, or very \
-             long values in the identity token claims the gateway is configured to read.",
+             causes are a very long state or redirect address from the MCP client, or a very \
+             large identity token.",
         ));
     }
     HeaderValue::from_str(&cookie).map_err(|_| {
@@ -600,22 +602,27 @@ async fn handle_login_callback(state: &ProxyState, request: Parts) -> Result<Res
         }
     }
 
-    let principal = session_principal(state, &snapshot, &oauth.name, &oauth.id, provider, &claims)
-        .map_err(|denial| {
-            state
-                .metrics
-                .record_auth_decision("mcp_oauth_login", false, denial.reason);
-            tracing::warn!(target: "aisix::mcp_oauth", provider = %provider.name,
-                reason = denial.reason, "refused a sign-in");
-            refused(denial_text(denial.reason))
-        })?;
+    let deny = |reason: &'static str| {
+        state
+            .metrics
+            .record_auth_decision("mcp_oauth_login", false, reason);
+        tracing::warn!(target: "aisix::mcp_oauth", provider = %provider.name, reason,
+            "refused a sign-in");
+        refused(denial_text(reason))
+    };
+    let principal =
+        session_principal(state, &snapshot, provider, &claims).map_err(|d| deny(d.reason))?;
+    let acl = aisix_mcp::ToolAcl::resolve(&snapshot, &state.mcp_servers, principal.auth.key());
+    if !acl.may_reach_server(&oauth.name, &oauth.id) {
+        return Err(deny("mcp_acl_denied"));
+    }
     state
         .metrics
         .record_auth_decision("mcp_oauth_login", true, "");
     let identity = SessionIdentity {
         provider: provider.name.clone(),
         identity: principal.subject,
-        claims: crate::jwt::referenced_claims(&snapshot, provider, &claims),
+        claims: crate::jwt::session_claims(&claims),
     };
     connect_upstream(state, &oauth, &base, &keys, flow, identity).await
 }
@@ -884,12 +891,10 @@ struct Principal {
 
 /// The steps after signature verification that every session passes, at
 /// sign-in on the ID token's claims and later on the token's record of them:
-/// bound claims, the key they map to, that key's access to this server.
+/// bound claims and the key they map to.
 fn session_principal(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
-    server_name: &str,
-    server_id: &str,
     provider: &OidcProvider,
     claims: &serde_json::Value,
 ) -> Result<Principal, crate::jwt::IdentityDenial> {
@@ -902,15 +907,6 @@ fn session_principal(
         });
     }
     let identity = crate::jwt::resolve_identity(state, snapshot, provider, claims)?;
-    let acl = aisix_mcp::ToolAcl::resolve(snapshot, &state.mcp_servers, &identity.entry.value);
-    if !acl.may_reach_server(server_name, server_id) {
-        return Err(crate::jwt::IdentityDenial {
-            reason: "mcp_acl_denied",
-            subject: Some(identity.subject),
-            claim_mapping: identity.claim_mapping,
-            error: ProxyError::JwtClaimsRejected,
-        });
-    }
     let auth = AuthenticatedKey::new(
         snapshot,
         identity.entry,
@@ -942,12 +938,15 @@ pub(crate) async fn authenticate_session(
     server: &str,
 ) -> Result<AuthenticatedKey, ProxyError> {
     let snapshot = state.snapshot.load();
-    let refused = |reason: &'static str| {
+    let note_refusal = |reason: &'static str| {
         state
             .metrics
             .record_auth_decision("mcp_oauth_session", false, reason);
         tracing::debug!(target: "aisix::auth", method = "mcp_oauth_session", reason, server,
             "refused an MCP session token");
+    };
+    let refused = |reason: &'static str| {
+        note_refusal(reason);
         // A server that signs users in tells the client to do that. Any other
         // name reads as what the token is to it: a key it does not know.
         if sign_in_server(&snapshot, server).is_some() {
@@ -978,10 +977,9 @@ pub(crate) async fn authenticate_session(
     let Some(session) = keys.open_access_token(token) else {
         return Err(refused("session_invalid"));
     };
-    let Some(oauth) = sign_in_server(&snapshot, server).filter(|oauth| oauth.id == session.server)
-    else {
+    if sign_in_server(&snapshot, server).is_none_or(|oauth| oauth.id != session.server) {
         return Err(refused("session_wrong_server"));
-    };
+    }
     let Some(provider) = snapshot
         .oidc_providers
         .get_by_name(&session.provider)
@@ -989,15 +987,12 @@ pub(crate) async fn authenticate_session(
     else {
         return Err(refused("session_provider_gone"));
     };
-    let principal = session_principal(
-        state,
-        &snapshot,
-        &oauth.name,
-        &oauth.id,
-        &provider.value,
-        &session.claims,
-    )
-    .map_err(|denial| refused(denial.reason))?;
+    let principal = session_principal(state, &snapshot, &provider.value, &session.claims).map_err(
+        |denial| {
+            note_refusal(denial.reason);
+            denial.error
+        },
+    )?;
     if principal.subject != session.identity {
         return Err(refused("session_identity_changed"));
     }
@@ -1086,7 +1081,7 @@ pub(crate) async fn token(
                          match this request",
                     ),
                 };
-            if !still_authorized(state, &snapshot, &oauth, &identity) {
+            if !still_authorized(state, &snapshot, &identity) {
                 return invalid_grant();
             }
             session_response(&keys, &oauth, client_id, &identity)
@@ -1112,7 +1107,7 @@ pub(crate) async fn token(
                 identity: session.identity.clone(),
                 claims: session.claims.clone(),
             };
-            if !still_authorized(state, &snapshot, &oauth, &identity) {
+            if !still_authorized(state, &snapshot, &identity) {
                 return invalid_grant();
             }
             // With the upstream credential gone a new pair would be refused on
@@ -1138,12 +1133,11 @@ pub(crate) async fn token(
     }
 }
 
-/// Whether configuration still lets this identity onto this server, so a client
-/// is told at the token step rather than given a token no request will accept.
+/// Whether configuration still gives this identity a usable key, so a client is
+/// told at the token step rather than given a token no request will accept.
 fn still_authorized(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
-    oauth: &UserOAuthServer,
     identity: &SessionIdentity,
 ) -> bool {
     snapshot
@@ -1151,15 +1145,8 @@ fn still_authorized(
         .get_by_name(&identity.provider)
         .filter(|entry| entry.value.enabled)
         .is_some_and(|provider| {
-            session_principal(
-                state,
-                snapshot,
-                &oauth.name,
-                &oauth.id,
-                &provider.value,
-                &identity.claims,
-            )
-            .is_ok_and(|principal| principal.subject == identity.identity)
+            session_principal(state, snapshot, &provider.value, &identity.claims)
+                .is_ok_and(|principal| principal.subject == identity.identity)
         })
 }
 

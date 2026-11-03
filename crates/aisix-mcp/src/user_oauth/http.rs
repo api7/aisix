@@ -1,10 +1,12 @@
 //! The HTTP client for everything the per-user OAuth flow fetches:
 //! metadata documents, dynamic client registration and token requests.
 //!
-//! Every URL goes through `outbound.ssrf_protection`, whether an operator
-//! configured it or an upstream document named it. Redirects are never
-//! followed: a token request carries a client secret or a refresh token, and
-//! a redirect target would not have been checked.
+//! `outbound.ssrf_protection` covers only an address a third party chose: an
+//! endpoint or document an upstream's metadata names on another authority than
+//! the server's own `url`. What an operator configured, and what that server
+//! publishes on its own authority, is reached like a JWKS: see [`Gate`]. Redirects
+//! are never followed on either route: a token request carries a client secret or
+//! a refresh token, and nothing about a redirect target has been decided.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -19,6 +21,15 @@ pub(super) enum HttpFailure {
     /// `outbound.ssrf_protection` refuses this URL, or it is not a URL. Only
     /// an operator can change the outcome.
     Blocked,
+}
+
+/// Whether `outbound.ssrf_protection` decides if a URL may be reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Gate {
+    /// An operator chose it, directly or by naming the server that serves it.
+    Configured,
+    /// An upstream document chose it.
+    Ssrf,
 }
 
 fn client(route: Route) -> Result<&'static reqwest::Client, HttpFailure> {
@@ -55,11 +66,12 @@ fn blocked(server: &str, url: &Url) -> HttpFailure {
     HttpFailure::Blocked
 }
 
-/// Send `build(client, url)`, bounded by `timeout`, on the client the SSRF
-/// settings choose for `url`. The caller decides how to read the response;
+/// Send `build(client, url)`, bounded by `timeout`, on the client `gate` and
+/// the SSRF settings choose for `url`. The caller decides how to read the response;
 /// this returns only whether one arrived.
 pub(super) async fn send(
     server: &str,
+    gate: Gate,
     url: &str,
     timeout: Duration,
     build: impl FnOnce(&reqwest::Client, Url) -> reqwest::RequestBuilder,
@@ -70,10 +82,14 @@ pub(super) async fn send(
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(HttpFailure::Blocked);
     }
-    let route = match ssrf::settings().route(&parsed).await {
-        Ok(route) => route,
-        Err(Refusal::Unresolvable) => return Err(HttpFailure::Transport),
-        Err(_) => return Err(blocked(server, &parsed)),
+    let route = match gate {
+        // The ordinary client: no address check, and any environment proxy.
+        Gate::Configured => Route::Proxied,
+        Gate::Ssrf => match ssrf::settings().route(&parsed).await {
+            Ok(route) => route,
+            Err(Refusal::Unresolvable) => return Err(HttpFailure::Transport),
+            Err(_) => return Err(blocked(server, &parsed)),
+        },
     };
     let client = client(route)?;
     match build(client, parsed.clone()).timeout(timeout).send().await {

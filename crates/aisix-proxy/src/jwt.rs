@@ -569,42 +569,23 @@ pub(crate) async fn verify_login_id_token(
         .map_err(|(reason, _)| reason)
 }
 
-/// The claims of `claims` that `prov`'s configuration refers to: what a later
-/// request needs to run [`resolve_identity`] and [`bound_claims_hold`] without
-/// the original token. Nested claims keep their nesting.
-pub(crate) fn referenced_claims(
-    snapshot: &AisixSnapshot,
-    prov: &OidcProvider,
-    claims: &serde_json::Value,
-) -> serde_json::Value {
-    let mut paths: Vec<String> = vec![prov.identity_claim.clone()];
-    if let Some(bound) = &prov.bound_claims {
-        paths.extend(bound.keys().cloned());
-    }
-    for mapping in snapshot.claim_mappings.entries() {
-        if mapping.value.jwt_provider == prov.name {
-            paths.extend(mapping.value.match_.iter().map(|m| m.claim.clone()));
-        }
-    }
-    let mut kept = serde_json::Value::Object(serde_json::Map::new());
-    for path in paths {
-        let Some(value) = nested_claim(claims, &path) else {
-            continue;
-        };
-        let mut at = &mut kept;
-        let mut segments = path.split('.').peekable();
-        while let Some(segment) = segments.next() {
-            let Some(object) = at.as_object_mut() else {
-                break;
-            };
-            if segments.peek().is_none() {
-                object.insert(segment.to_owned(), value.clone());
-                break;
-            }
-            at = object
-                .entry(segment.to_owned())
-                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-        }
+/// What a session keeps of an ID token: every claim, so that a claim mapping or
+/// bound claim added after sign-in reads the same token a JWT caller would
+/// present, less those that describe the token rather than the person.
+pub(crate) fn session_claims(claims: &serde_json::Value) -> serde_json::Value {
+    const ABOUT_THE_TOKEN: [&str; 8] = [
+        "exp",
+        "iat",
+        "nbf",
+        "auth_time",
+        "jti",
+        "nonce",
+        "at_hash",
+        "c_hash",
+    ];
+    let mut kept = claims.clone();
+    if let Some(object) = kept.as_object_mut() {
+        object.retain(|name, _| !ABOUT_THE_TOKEN.contains(&name.as_str()));
     }
     kept
 }
@@ -2691,54 +2672,25 @@ jyxumGxNpoIV8LlzsMsaWQ==
 }
 
 #[cfg(test)]
-mod referenced_claims_tests {
+mod session_claims_tests {
     use super::*;
 
     #[test]
-    fn only_what_the_configuration_refers_to_is_kept_with_its_nesting() {
-        let snapshot = AisixSnapshot::new();
-        snapshot.claim_mappings.insert(ResourceEntry::new(
-            "m1",
-            serde_json::from_value(serde_json::json!({
-                "name": "m", "jwt_provider": "corp",
-                "match": [{"claim": "org.team", "op": "exact", "values": ["x"]}],
-                "resolve": {"api_key_id": "k"},
-            }))
-            .unwrap(),
-            1,
-        ));
-        snapshot.claim_mappings.insert(ResourceEntry::new(
-            "m2",
-            serde_json::from_value(serde_json::json!({
-                "name": "other", "jwt_provider": "elsewhere",
-                "match": [{"claim": "secret_group", "op": "exact", "values": ["x"]}],
-                "resolve": {"api_key_id": "k"},
-            }))
-            .unwrap(),
-            1,
-        ));
-        let prov: OidcProvider = serde_json::from_value(serde_json::json!({
-            "name": "corp", "issuer": "https://i", "audiences": ["a"],
-            "identity_claim": "preferred_username",
-            "bound_claims": {"realm_access.roles": "agent"},
-        }))
-        .unwrap();
+    fn everything_about_the_person_is_kept_and_nothing_about_the_token() {
         let claims = serde_json::json!({
-            "preferred_username": "alice",
+            "sub": "alice",
             "email": "alice@example.com",
-            "secret_group": "x",
-            "realm_access": {"roles": ["agent"], "other": 1},
-            "org": {"team": "x"},
+            "org": {"team": "x", "exp": 1},
+            "exp": 1, "iat": 1, "nbf": 1, "auth_time": 1,
+            "jti": "j", "nonce": "n", "at_hash": "a", "c_hash": "c",
         });
-        let kept = referenced_claims(&snapshot, &prov, &claims);
         assert_eq!(
-            kept,
+            session_claims(&claims),
             serde_json::json!({
-                "preferred_username": "alice",
-                "realm_access": {"roles": ["agent"]},
-                "org": {"team": "x"},
+                "sub": "alice",
+                "email": "alice@example.com",
+                "org": {"team": "x", "exp": 1},
             })
         );
-        assert!(bound_claims_hold(&kept, &prov));
     }
 }

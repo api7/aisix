@@ -138,6 +138,21 @@ impl UserOAuthServer {
         }
     }
 
+    /// How `url`, about to be fetched for this server, is treated: as the
+    /// operator's when this server's configuration names it or it shares the
+    /// authority of the server's `url`, as an upstream's choice otherwise.
+    fn gate_for(&self, url: &str) -> http::Gate {
+        let origin = |url: &str| reqwest::Url::parse(url).ok().map(|url| url.origin());
+        if self.token_url.as_deref() == Some(url)
+            || self.registration_url.as_deref() == Some(url)
+            || (origin(url).is_some() && origin(url) == origin(&self.url))
+        {
+            http::Gate::Configured
+        } else {
+            http::Gate::Ssrf
+        }
+    }
+
     /// Scopes to advertise to MCP clients.
     pub fn scopes(&self) -> &[String] {
         &self.scopes

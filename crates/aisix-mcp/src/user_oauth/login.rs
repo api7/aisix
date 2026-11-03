@@ -1,6 +1,8 @@
 //! The gateway as an OIDC relying party of a trust provider: where the
 //! provider's endpoints are, and the code exchange. What the ID token then
-//! means is `aisix-proxy`'s to decide, alongside every other JWT.
+//! means is `aisix-proxy`'s to decide, alongside every other JWT. The provider's
+//! `issuer` is the operator's, and so is what its own discovery document names:
+//! the same trust a JWKS fetch runs on.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -9,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use super::flow::{token_request_named, TokenOutcome};
-use super::http::{send, HttpFailure};
+use super::http::{send, Gate, HttpFailure};
 use super::UserOAuthManager;
 use crate::error::UserOAuthFailure;
 
@@ -105,6 +107,7 @@ impl UserOAuthManager {
         }
         match token_request_named(
             code.provider,
+            Gate::Configured,
             code.token_endpoint,
             &form,
             LOGIN_HTTP_TIMEOUT,
@@ -138,9 +141,13 @@ async fn fetch_endpoints(provider: &str, issuer: &str) -> Result<LoginEndpoints,
         "{}/.well-known/openid-configuration",
         issuer.trim_end_matches('/')
     );
-    let response = send(provider, &url, LOGIN_HTTP_TIMEOUT, |client, url| {
-        client.get(url).header("accept", "application/json")
-    })
+    let response = send(
+        provider,
+        Gate::Configured,
+        &url,
+        LOGIN_HTTP_TIMEOUT,
+        |client, url| client.get(url).header("accept", "application/json"),
+    )
     .await
     .map_err(|failure| match failure {
         HttpFailure::Transport => UserOAuthFailure::Unavailable,

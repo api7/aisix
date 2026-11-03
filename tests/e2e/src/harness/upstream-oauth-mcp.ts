@@ -18,6 +18,10 @@ export interface OAuthMcpUpstreamOptions {
   noRefreshTokens?: boolean;
   /** Serve `/authorize` and `/token` under this path, as Jira Data Center does. */
   oauthPathPrefix?: string;
+  /** What the metadata documents name, instead of this server's own address. */
+  advertise?: { authorizationServer?: string; tokenEndpoint?: string; registrationEndpoint?: string };
+  /** Answer token requests with a redirect to this address. */
+  tokenRedirect?: string;
 }
 
 interface IssuedCode {
@@ -119,7 +123,7 @@ export class OAuthMcpUpstream {
         if (!this.options.discovery) return void json(404, {});
         return void json(200, {
           resource: this.mcpUrl,
-          authorization_servers: [this.url],
+          authorization_servers: [this.options.advertise?.authorizationServer ?? this.url],
           bearer_methods_supported: ["header"],
         });
       case "GET /.well-known/oauth-authorization-server":
@@ -127,8 +131,10 @@ export class OAuthMcpUpstream {
         return void json(200, {
           issuer: this.url,
           authorization_endpoint: `${this.url}/authorize`,
-          token_endpoint: `${this.url}/token`,
-          ...(this.options.registration ? { registration_endpoint: `${this.url}/register` } : {}),
+          token_endpoint: this.options.advertise?.tokenEndpoint ?? `${this.url}/token`,
+          ...(this.options.registration
+            ? { registration_endpoint: this.options.advertise?.registrationEndpoint ?? `${this.url}/register` }
+            : {}),
           response_types_supported: ["code"],
           code_challenge_methods_supported: ["S256"],
         });
@@ -138,6 +144,9 @@ export class OAuthMcpUpstream {
         return this.authorize(url, res, json);
       case "POST /token":
         this.tokenRequestQueries.push(url.search);
+        if (this.options.tokenRedirect !== undefined) {
+          return void res.writeHead(307, { location: this.options.tokenRedirect }).end();
+        }
         return this.token(req, json);
       case "POST /mcp":
         return this.mcp(req, res);

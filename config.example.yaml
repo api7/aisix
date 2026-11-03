@@ -571,10 +571,13 @@ upstream:
   #   # GovCloud. One value serves every Bedrock provider key.
   #   mantle_endpoint: null
 
-# Outbound requests to URLs an API caller supplied — today, the media
-# download (upstream.media_fetch). URLs an operator configured (a provider
-# key's api_base, guardrail, MCP and A2A endpoints, JWKS, exporters) are
-# not affected.
+# Outbound requests to URLs the operator did not choose: the media download
+# (upstream.media_fetch), whose URL an API caller supplied, and an OAuth
+# document or endpoint an MCP server's metadata names on another scheme, host
+# or port than the server's url. URLs an operator configured (a provider key's
+# api_base, guardrail, MCP and A2A endpoints, a trust provider and its
+# discovery document, an MCP server's configured OAuth endpoints and what it
+# publishes on its own address, JWKS, exporters) are not affected.
 # outbound:
 #   # Server-side request forgery protection. On (the default), such a
 #   # request only reaches publicly routable addresses: loopback, private

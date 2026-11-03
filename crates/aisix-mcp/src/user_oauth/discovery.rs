@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use reqwest::Url;
 use serde::Deserialize;
 
-use super::http::{send, HttpFailure};
+use super::http::{send, Gate, HttpFailure};
 use super::UserOAuthServer;
 use crate::error::UserOAuthFailure;
 
@@ -138,7 +138,8 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
     server: &UserOAuthServer,
     url: &str,
 ) -> Result<Fetched<T>, UserOAuthFailure> {
-    let response = match send(&server.name, url, server.timeout, |client, url| {
+    let gate = server.gate_for(url);
+    let response = match send(&server.name, gate, url, server.timeout, |client, url| {
         client.get(url).header("accept", "application/json")
     })
     .await
@@ -193,11 +194,17 @@ fn path_insert(url: &Url, well_known: &str) -> String {
 async fn discover(server: &UserOAuthServer) -> Result<Endpoints, UserOAuthFailure> {
     let url = Url::parse(&server.url).map_err(|_| UserOAuthFailure::Misconfigured)?;
 
-    let probe = send(&server.name, &server.url, server.timeout, |client, url| {
-        client
-            .get(url)
-            .header("accept", "application/json, text/event-stream")
-    })
+    let probe = send(
+        &server.name,
+        Gate::Configured,
+        &server.url,
+        server.timeout,
+        |client, url| {
+            client
+                .get(url)
+                .header("accept", "application/json, text/event-stream")
+        },
+    )
     .await;
     let challenge = match &probe {
         Ok(response) => response

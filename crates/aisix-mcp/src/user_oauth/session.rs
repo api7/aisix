@@ -58,7 +58,7 @@ pub struct SessionToken {
     pub jti: String,
     pub iat: i64,
     pub exp: i64,
-    /// The ID-token claims the provider's configuration referenced at sign-in.
+    /// The ID token's claims at sign-in, less those about the token itself.
     pub claims: serde_json::Value,
 }
 
