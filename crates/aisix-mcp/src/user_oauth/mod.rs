@@ -72,6 +72,9 @@ const DEFINITIVE_REFRESH_ERRORS: &[&str] =
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UserSubject {
     id: String,
+    /// What `id` says, hashed so that no two identities can collide: a provider
+    /// name and a claim value may both contain the `:` that `id` joins them with.
+    record_key: String,
     member_id: Option<String>,
 }
 
@@ -79,6 +82,7 @@ impl UserSubject {
     pub fn jwt(provider: &str, subject: &str) -> Self {
         Self {
             id: format!("jwt:{provider}:{subject}"),
+            record_key: digest(&["jwt", provider, subject]),
             member_id: None,
         }
     }
@@ -86,6 +90,7 @@ impl UserSubject {
     pub fn member(user_id: &str) -> Self {
         Self {
             id: format!("member:{user_id}"),
+            record_key: digest(&["member", user_id]),
             member_id: Some(user_id.to_owned()),
         }
     }
@@ -214,7 +219,7 @@ fn token_key(server: &UserOAuthServer, subject: &UserSubject) -> String {
         &server.id,
         &server.url,
         server.token_url.as_deref().unwrap_or_default(),
-        subject.id(),
+        &subject.record_key,
     ])
 }
 
@@ -795,6 +800,16 @@ mod tests {
                 read_store_after: Instant::now(),
             },
         );
+    }
+
+    #[test]
+    fn identities_that_read_alike_keep_separate_records() {
+        let (a, b) = (
+            UserSubject::jwt("corp", "x:alice"),
+            UserSubject::jwt("corp:x", "alice"),
+        );
+        assert_eq!(a.id(), b.id());
+        assert_ne!(token_key(&server(), &a), token_key(&server(), &b));
     }
 
     #[tokio::test]

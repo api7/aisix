@@ -489,6 +489,28 @@ pub(crate) fn build_openai_url(base: &str, path: &str) -> String {
     }
 }
 
+/// Rewrite every multipart `prompt` field through the chain's mask rules.
+pub(crate) fn mask_prompt_fields(
+    chain: &aisix_guardrails::GuardrailChain,
+    fields: &mut [(String, Option<String>, Option<String>, bytes::Bytes)],
+    redactions: &mut crate::redact::RedactionCounts,
+) {
+    if !aisix_guardrails::Guardrail::redacts_input(chain) {
+        return;
+    }
+    for (name, _, _, data) in fields.iter_mut() {
+        if name != "prompt" {
+            continue;
+        }
+        if let Ok(text) = std::str::from_utf8(data) {
+            if let Some(r) = aisix_guardrails::Guardrail::redact_input_text(chain, text) {
+                *data = bytes::Bytes::from(r.text.into_bytes());
+                crate::redact::merge_counts(redactions, r.counts);
+            }
+        }
+    }
+}
+
 /// Reject a multipart `prompt` field that is not valid UTF-8 (#1016).
 ///
 /// The guardrail scan and mask passes read `prompt` through

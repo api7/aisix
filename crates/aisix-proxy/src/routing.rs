@@ -116,7 +116,7 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
         // The upstream answered 2xx and the gateway could not read the
         // body: the call was served — and billed — already, so another
         // attempt would run (and charge for) the same request again.
-        BridgeError::UpstreamDecode(_) => false,
+        BridgeError::UpstreamDecode(_) | BridgeError::UpstreamBodyUnread { .. } => false,
         BridgeError::Timeout { .. }
         | BridgeError::TokenExchangeDecode(_)
         | BridgeError::Transport(_)

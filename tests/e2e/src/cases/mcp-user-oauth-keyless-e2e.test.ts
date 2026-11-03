@@ -846,8 +846,17 @@ describe("keyless sessions follow the configuration on the next request", () => 
     await provider?.close();
   });
 
+  /** Etcd events apply in order, so a row written last proves the ones before it landed. */
+  const settled = async () => {
+    const sentinel = `sk-sentinel-${randomUUID()}`;
+    await seed.createApiKey({ key_hash: hash(sentinel), allowed_models: [], mcp_access: { allow: [] } });
+    await waitConfigPropagation(
+      async () => (await fetch(`${app.proxyUrl}/v1/models`, { headers: bearer(sentinel) })).status === 200,
+    );
+  };
+
   const refusedSoon = async (token: string) => {
-    await waitConfigPropagation(async () => (await mcpPost(url(), bearer(token))).status === 401);
+    await settled();
     const res = await mcpPost(url(), bearer(token));
     expect(res.status).toBe(401);
     expect(res.headers.get("www-authenticate")).toContain("resource_metadata");
@@ -912,7 +921,8 @@ describe("keyless sessions follow the configuration on the next request", () => 
     expect(await oauthError(refresh)).toBe("invalid_client");
 
     await seed.update("oidc_providers", providerId, providerRow());
-    await waitConfigPropagation(async () => (await mcpPost(url(), bearer(tokens.access_token))).status === 200);
+    await settled();
+    expect((await mcpPost(url(), bearer(tokens.access_token))).status).toBe(200);
 
     await seed.delete("claim_mappings", mappingId);
     await refusedSoon(tokens.access_token);

@@ -242,7 +242,7 @@ describe("name labels are opt-in", () => {
     expect(keys("aisix_proxy_requests_total")).toEqual([
       "endpoint", "inbound_protocol", "upstream_protocol", "provider", "model", "upstream_model",
       "provider_key_id", "provider_key_name", "api_key_id", "team_id", "user_id", "user_name",
-      "stream", "is_fallback", "status", "outcome",
+      "stream", "is_fallback", "status", "outcome", "error_source",
     ]);
     expect(keys("aisix_deployment_requests_total")).toEqual(["provider", "model", "upstream_model", "provider_key_id"]);
     expect(keys("aisix_ratelimit_rejections_total")).toEqual(["scope", "layer", "policy_id"]);

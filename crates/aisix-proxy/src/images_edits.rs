@@ -154,6 +154,7 @@ pub async fn image_edits(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::answered_error_source(false, &routing),
                 elapsed,
             );
             // One zero-token event per attempt that failed before the
@@ -232,6 +233,7 @@ pub async fn image_edits(
                 crate::request_metrics::Caller::new(&auth),
                 last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs. The
@@ -241,6 +243,7 @@ pub async fn image_edits(
             // class still identify those.
             // Per #655: one zero-token event per failed upstream attempt,
             // the last of them terminal when every attempt failed.
+            crate::usage_attr::note_client_error(&snapshot, &err);
             let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
             crate::usage_attr::emit_failed_attempts(
                 &state,
@@ -282,6 +285,47 @@ pub async fn image_edits(
             err.into_response()
         }
     }
+}
+
+/// A multipart request as content capture represents it. See the capture site.
+fn captured_edit_fields(fields: &[(String, Option<String>, Option<String>, Bytes)]) -> String {
+    use sha2::Digest;
+    let mut obj = serde_json::Map::new();
+    // Appends on a repeated name (multipart allows repeats and all are
+    // forwarded) so no field disappears from the export. The filename is
+    // deliberately NOT captured — it is user-controlled text that skips
+    // the redaction path; the checksum alone represents the file.
+    let mut push = |key: String, value: String| match obj.get_mut(&key) {
+        Some(Value::String(existing)) => {
+            existing.push('\n');
+            existing.push_str(&value);
+        }
+        _ => {
+            obj.insert(key, Value::String(value));
+        }
+    };
+    for (name, _, _, data) in fields {
+        // `image` / `mask` are the file slots; represent them by
+        // checksum even when the bytes happen to be valid UTF-8 (an
+        // SVG source, say) — the capture is an audit trail, not an
+        // asset store. Name-based, not content-type-based: browsers
+        // and SDKs stamp `text/plain` on ordinary text fields, and
+        // hashing a `prompt` for that would erase the very text the
+        // capture exists to audit (same rule as audio's `file`).
+        let is_binary_slot = name == "image" || name == "mask";
+        match std::str::from_utf8(data) {
+            Ok(text) if !is_binary_slot => {
+                push(name.clone(), text.to_string());
+            }
+            _ => {
+                push(
+                    format!("{name}_sha256"),
+                    format!("{:x}", sha2::Sha256::digest(data)),
+                );
+            }
+        }
+    }
+    serde_json::to_string(&Value::Object(obj)).unwrap_or_default()
 }
 
 /// Collect all multipart fields, resolve the model, swap in the upstream
@@ -333,6 +377,7 @@ async fn dispatch(
         .ok_or_else(|| ProxyError::InvalidRequest("`model` field missing from form".into()))?;
 
     let snapshot = &**snapshot_out.insert(state.snapshot.load());
+    crate::usage_attr::note_failure_request(snapshot, || captured_edit_fields(&fields));
     let model_entry = crate::model_resolve::resolve_model(snapshot, &model_name)
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
@@ -415,6 +460,17 @@ async fn dispatch(
                     reason = %reason,
                     "guardrail blocked /v1/images/edits request (prompt field)",
                 );
+                // A blocked request exports what the success path would have sent.
+                if crate::usage_attr::content_cap(snapshot).is_some() {
+                    crate::dispatch::mask_prompt_fields(
+                        &resolved_chain.without_audit(),
+                        &mut fields,
+                        &mut crate::redact::RedactionCounts::new(),
+                    );
+                    crate::usage_attr::note_failure_request(snapshot, || {
+                        captured_edit_fields(&fields)
+                    });
+                }
                 return Err(crate::error::guardrail_block_error(
                     "request",
                     guardrail_name.as_deref(),
@@ -422,21 +478,7 @@ async fn dispatch(
                 ));
             }
         }
-        if aisix_guardrails::Guardrail::redacts_input(&resolved_chain) {
-            for (name, _, _, data) in fields.iter_mut() {
-                if name != "prompt" {
-                    continue;
-                }
-                if let Ok(text) = std::str::from_utf8(data) {
-                    if let Some(r) =
-                        aisix_guardrails::Guardrail::redact_input_text(&resolved_chain, text)
-                    {
-                        *data = Bytes::from(r.text.into_bytes());
-                        crate::redact::merge_counts(&mut redactions, r.counts);
-                    }
-                }
-            }
-        }
+        crate::dispatch::mask_prompt_fields(&resolved_chain, &mut fields, &mut redactions);
     }
 
     // Content capture (#700): the image/mask bytes are NOT captured — a
@@ -450,45 +492,10 @@ async fn dispatch(
             .iter()
             .map(|e| &e.value),
     );
-    let captured_prompt = content_cap.map(|_| {
-        use sha2::Digest;
-        let mut obj = serde_json::Map::new();
-        // Appends on a repeated name (multipart allows repeats and all are
-        // forwarded) so no field disappears from the export. The filename is
-        // deliberately NOT captured — it is user-controlled text that skips
-        // the redaction path; the checksum alone represents the file.
-        let mut push = |key: String, value: String| match obj.get_mut(&key) {
-            Some(Value::String(existing)) => {
-                existing.push('\n');
-                existing.push_str(&value);
-            }
-            _ => {
-                obj.insert(key, Value::String(value));
-            }
-        };
-        for (name, _, _, data) in &fields {
-            // `image` / `mask` are the file slots; represent them by
-            // checksum even when the bytes happen to be valid UTF-8 (an
-            // SVG source, say) — the capture is an audit trail, not an
-            // asset store. Name-based, not content-type-based: browsers
-            // and SDKs stamp `text/plain` on ordinary text fields, and
-            // hashing a `prompt` for that would erase the very text the
-            // capture exists to audit (same rule as audio's `file`).
-            let is_binary_slot = name == "image" || name == "mask";
-            match std::str::from_utf8(data) {
-                Ok(text) if !is_binary_slot => {
-                    push(name.clone(), text.to_string());
-                }
-                _ => {
-                    push(
-                        format!("{name}_sha256"),
-                        format!("{:x}", sha2::Sha256::digest(data)),
-                    );
-                }
-            }
-        }
-        serde_json::to_string(&Value::Object(obj)).unwrap_or_default()
-    });
+    let captured_prompt = content_cap.map(|_| captured_edit_fields(&fields));
+    if let Some(prompt) = &captured_prompt {
+        crate::usage_attr::note_failure_request(snapshot, || prompt.clone());
+    }
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
@@ -651,18 +658,16 @@ async fn dispatch(
                         aisix_gateway::note_upstream_response(resp.headers());
                         let status = resp.status();
                         if !status.is_success() {
-                            let s = status.as_u16();
-                            let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-                            let msg = resp.text().await.unwrap_or_default();
                             return Err(crate::cooldown::note_failure(
                                 tracker,
                                 model_id,
                                 cooldown_cfg,
-                                aisix_gateway::BridgeError::upstream_status_with_retry_after(
-                                    s,
-                                    msg.chars().take(1024).collect::<String>(),
-                                    retry_after,
-                                ),
+                                aisix_gateway::upstream_status_from_response(
+                                    resp,
+                                    aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES,
+                                    aisix_gateway::bounded_error_text,
+                                )
+                                .await,
                             ));
                         }
                         let body_bytes = resp.bytes().await.map_err(|e| {

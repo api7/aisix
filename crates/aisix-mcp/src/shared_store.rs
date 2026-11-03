@@ -6,6 +6,10 @@
 //! managed mode (`aisix-server`), and [`MemoryStore`] wherever there is no
 //! dp-manager. The environment is the backend's concern, never a parameter.
 //!
+//! Values include upstream tokens and the key sessions are sealed with, in the
+//! clear: encrypting them at rest and restricting who can read them is the
+//! backend's job.
+//!
 //! Every write states a precondition, so a writer can always tell whether it
 //! won. [`consume`] builds an atomic single-use read out of that.
 

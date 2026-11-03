@@ -274,10 +274,11 @@ async fn mantle_count_tokens(
             status.as_u16(),
             kind,
             None,
-            aisix_gateway::upstream_error_message(&body),
+            aisix_gateway::upstream_error_message(&body.bytes),
             retry_after,
             started,
-        ));
+        )
+        .with_body_read_error(body.read_error));
     }
     let json: Value = resp
         .json()

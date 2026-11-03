@@ -215,6 +215,7 @@ pub async fn completions(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::answered_error_source(success.guardrail_blocked, &routing),
                 elapsed,
             );
             // Issue #403: emit UsageEvent so cp-api's budget ledger
@@ -305,10 +306,12 @@ pub async fn completions(
                 crate::request_metrics::Caller::new(&auth),
                 last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             // Per #655: one zero-token event per failed upstream attempt,
             // the last of them terminal when every attempt failed.
+            crate::usage_attr::note_client_error(&snapshot, &err);
             let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
             crate::usage_attr::emit_failed_attempts(
                 &state,
@@ -384,6 +387,7 @@ async fn dispatch(
     audit_out: &mut crate::usage_attr::GuardrailAudit,
     routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<CompletionDispatchSuccess, ProxyError> {
+    crate::usage_attr::note_failure_request(snapshot, || body.to_string());
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -471,6 +475,14 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/completions request",
             );
+            // A blocked request exports what the success path would have sent.
+            if crate::usage_attr::content_cap(snapshot).is_some() {
+                crate::redact::redact_completions_request(
+                    &resolved_chain.without_audit(),
+                    &mut body,
+                );
+                crate::usage_attr::note_failure_request(snapshot, || body.to_string());
+            }
             return Err(crate::error::guardrail_block_error(
                 "request",
                 guardrail_name.as_deref(),
@@ -483,6 +495,7 @@ async fn dispatch(
     // block check passes, BEFORE the body is forwarded upstream.
     let mut redactions = crate::redact::redact_completions_request(&resolved_chain, &mut body);
     crate::redact::merge_counts(&mut redactions, input_seg_counts);
+    crate::usage_attr::note_failure_request(snapshot, || body.to_string());
 
     // Content capture (AISIX-Cloud#947): the client-facing request body
     // (post-redaction, so masked PII stays masked in the exported content),

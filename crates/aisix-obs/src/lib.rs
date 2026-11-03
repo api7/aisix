@@ -44,9 +44,9 @@ pub use genai::{
 };
 pub use metrics::{
     client_type_from_user_agent, A2aCallOutcome, A2aLabels, BudgetGauges, BudgetLabels,
-    CancelledLabels, ClientTypeClassifier, DeploymentLabels, DeploymentState, GaugeFamily,
-    GaugeLiveness, HistogramBuckets, LatencyLabels, LatencySide, LiveGaugeSeries, LlmUsage,
-    Metrics, RequestLabels, RequestOutcome, UsageEventLabels, UsageLabels,
+    CancelledLabels, ClientTypeClassifier, DeploymentLabels, DeploymentState, ErrorSource,
+    GaugeFamily, GaugeLiveness, HistogramBuckets, LatencyLabels, LatencySide, LiveGaugeSeries,
+    LlmUsage, Metrics, RequestLabels, RequestOutcome, UsageEventLabels, UsageLabels,
 };
 pub use otlp_http_sink::{content_capture_cap, OtlpHttpFanOut, OtlpSink};
 pub use output::{

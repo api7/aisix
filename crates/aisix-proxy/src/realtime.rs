@@ -161,6 +161,22 @@ type UpstreamDial = Result<
     tokio_tungstenite::tungstenite::Error,
 >;
 
+/// What a failed dial reports. An upgrade the upstream answered with an error
+/// names its status and what it said, in the wording of an HTTP route's upstream
+/// failure; the caller's frame is fixed text either way.
+fn connect_failure_text(err: &tokio_tungstenite::tungstenite::Error) -> String {
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            crate::attempt::relayed_failure(
+                response.status().as_u16(),
+                response.body().as_deref().unwrap_or_default(),
+            )
+            .1
+        }
+        other => aisix_gateway::error_with_causes(other),
+    }
+}
+
 /// Dial the upstream Realtime endpoint under the deployment's outbound
 /// TLS trust, on the deployment's connect budget, through the
 /// environment proxy that takes it (`upstream_dial`).
@@ -342,8 +358,10 @@ pub(crate) async fn realtime(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::error_source(&err),
                 started.elapsed(),
             );
+            crate::usage_attr::note_client_error(&snapshot, &err);
             crate::usage_attr::emit_error_usage_event(
                 &state,
                 &snapshot,
@@ -840,7 +858,7 @@ async fn run_session(
                 &state.runtime_status,
                 &model_entry.id,
                 model_entry.value.cooldown.as_ref(),
-                aisix_gateway::BridgeError::Transport(aisix_gateway::error_with_causes(&e)),
+                aisix_gateway::BridgeError::Transport(connect_failure_text(&e)),
             ));
             emit_access_log(
                 &Method::GET,
@@ -881,6 +899,7 @@ async fn run_session(
                     ..Default::default()
                 },
                 502,
+                aisix_obs::ErrorSource::Upstream,
                 started.elapsed(),
             );
             let mut event = crate::usage_attr::build_error_usage_event(
@@ -889,7 +908,7 @@ async fn run_session(
                 &requested_model,
                 &auth.entry.id,
                 502,
-                crate::usage_attr::EventError::class_only("transport"),
+                crate::usage_attr::EventError::of(&connect_err),
                 // Failing to open the upstream socket is not a guardrail
                 // decision, whatever the chain went on to allow.
                 /* guardrail_blocked */
@@ -1145,6 +1164,9 @@ async fn run_session(
             ..Default::default()
         },
         close_status,
+        session_error
+            .as_ref()
+            .map_or(aisix_obs::ErrorSource::None, crate::attempt::error_source),
         elapsed,
     );
     let mut event = UsageEvent {
@@ -1191,9 +1213,7 @@ async fn run_session(
             .is_some_and(ProxyError::is_guardrail_block),
         // Whatever ended the session names itself, as on every other
         // surface and as the session's access-log line does: a guardrail
-        // refusal, or the upstream failure or timeout that cut it off. The
-        // message is the gateway's own text only — empty for an upstream
-        // failure, whose text the upstream wrote.
+        // refusal, or the upstream failure or timeout that cut it off.
         error_class: session_error
             .as_ref()
             .map(|e| crate::attempt::error_class(e).to_string())

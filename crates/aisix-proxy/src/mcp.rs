@@ -332,6 +332,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
             ..Default::default()
         },
         status,
+        crate::attribution::rendered_error_source(status),
         elapsed,
     );
     response
@@ -520,10 +521,14 @@ async fn dispatch(
     // cost), which releases the concurrency slot. On 429 / budget-exceeded this
     // returns before any upstream is contacted — and the rejected call is still
     // recorded.
+    if is_tool_call {
+        crate::usage_attr::note_failure_request(&snapshot, || tool_call_prompt(&bytes));
+    }
     let _reservation = if is_tool_call {
         match crate::quota::enforce_mcp(state, &snapshot, &auth, &mcp_server).await {
             Ok(reservation) => Some(reservation),
             Err(err) => {
+                crate::usage_attr::note_client_error(&snapshot, &err);
                 emit_tool_call_usage(
                     state,
                     &snapshot,
@@ -636,11 +641,20 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked MCP tool call"
             );
+            note_blocked_tool_call(&snapshot, chain, &bytes);
             let refusal = crate::error::guardrail_block_error(
                 "tool call",
                 guardrail_name.as_deref(),
                 unavailable.as_deref(),
             );
+            crate::usage_attr::note_client_error_body(&snapshot, || {
+                jsonrpc_guardrail_block_body(
+                    rpc_id.clone(),
+                    "tool call",
+                    guardrail_name.as_deref(),
+                    unavailable.as_deref(),
+                )
+            });
             emit_tool_call_usage(
                 state,
                 &snapshot,
@@ -718,6 +732,14 @@ async fn dispatch(
                         None,
                         Some(crate::error::TAG_MASK_WRITEBACK_FAILED),
                     );
+                    crate::usage_attr::note_client_error_body(&snapshot, || {
+                        jsonrpc_guardrail_block_body(
+                            rpc_id.clone(),
+                            "tool call",
+                            None,
+                            Some(crate::error::TAG_MASK_WRITEBACK_FAILED),
+                        )
+                    });
                     emit_tool_call_usage(
                         state,
                         &snapshot,
@@ -770,11 +792,20 @@ async fn dispatch(
                     guardrail_name,
                     unavailable,
                 } => {
+                    note_blocked_tool_call(&snapshot, chain, &bytes);
                     let refusal = crate::error::guardrail_block_error(
                         "tool call",
                         guardrail_name.as_deref(),
                         unavailable.as_deref(),
                     );
+                    crate::usage_attr::note_client_error_body(&snapshot, || {
+                        jsonrpc_guardrail_block_body(
+                            rpc_id.clone(),
+                            "tool call",
+                            guardrail_name.as_deref(),
+                            unavailable.as_deref(),
+                        )
+                    });
                     emit_tool_call_usage(
                         state,
                         &snapshot,
@@ -808,6 +839,9 @@ async fn dispatch(
     // capturing exporter can never archive a value the mask removed
     // (same ordering rule as the LLM path — mask first, capture after).
     let captured_args = capture_cap.map(|_| bytes.clone());
+    if is_tool_call {
+        crate::usage_attr::note_failure_request(&snapshot, || tool_call_prompt(&bytes));
+    }
 
     // Scope the gateway to the tools this caller's key permits — resolved
     // from the key together with the environment/team MCP access policies —
@@ -921,6 +955,7 @@ async fn dispatch(
             crate::error::ProxyError::McpTokenExchange(failure.failure.clone()).into_response();
         let error = crate::error::ProxyError::McpTokenExchange(failure.failure);
         if is_tool_call {
+            crate::usage_attr::note_client_error(&snapshot, &error);
             emit_tool_call_usage(
                 state,
                 &snapshot,
@@ -1012,9 +1047,13 @@ async fn dispatch(
         {
             Ok(bytes) => bytes,
             Err(_) => {
+                crate::attribution::note_error_source(aisix_obs::ErrorSource::Upstream);
                 // The tool call reached the upstream: record it like every
                 // other exit, with the status the caller receives.
                 if is_tool_call {
+                    crate::usage_attr::note_client_error_body(&snapshot, || {
+                        "invalid upstream response".to_string()
+                    });
                     emit_tool_call_usage(
                         state,
                         &snapshot,
@@ -1025,7 +1064,11 @@ async fn dispatch(
                         &mcp_tool,
                         StatusCode::BAD_GATEWAY.as_u16(),
                         latency,
-                        None,
+                        Some(&crate::error::ProxyError::Bridge(
+                            aisix_gateway::BridgeError::UpstreamDecode(
+                                "invalid upstream response".to_string(),
+                            ),
+                        )),
                         monitor_hits,
                         redaction_counts,
                         guardrail_chain.as_ref(),
@@ -1048,6 +1091,14 @@ async fn dispatch(
                         guardrail_name.as_deref(),
                         unavailable.as_deref(),
                     );
+                    crate::usage_attr::note_client_error_body(&snapshot, || {
+                        jsonrpc_guardrail_block_body(
+                            rpc_id.clone(),
+                            "tool result",
+                            guardrail_name.as_deref(),
+                            unavailable.as_deref(),
+                        )
+                    });
                     emit_tool_call_usage(
                         state,
                         &snapshot,
@@ -1407,12 +1458,7 @@ fn tool_call_capture(
     request_bytes: Option<&[u8]>,
     result_bytes: Option<&[u8]>,
 ) -> aisix_obs::CapturedContent {
-    let prompt = request_bytes
-        .and_then(|b| serde_json::from_slice::<JsonRpcPeek>(b).ok())
-        .and_then(|p| p.params)
-        .and_then(|p| p.arguments)
-        .map(|v| v.to_string())
-        .unwrap_or_default();
+    let prompt = request_bytes.map(tool_call_prompt).unwrap_or_default();
     let response = result_bytes
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
         .and_then(|mut v| v.get_mut("result").map(serde_json::Value::take))
@@ -1422,6 +1468,31 @@ fn tool_call_capture(
         })
         .unwrap_or_default();
     aisix_obs::CapturedContent::new(&prompt, &response, cap as usize)
+}
+
+/// Note a blocked tool call for its failure row as the success path would
+/// have sent it: masked, though the block ended the call before the write-back.
+fn note_blocked_tool_call(
+    snapshot: &aisix_core::AisixSnapshot,
+    chain: &aisix_guardrails::GuardrailChain,
+    bytes: &[u8],
+) {
+    crate::usage_attr::note_failure_request(snapshot, || {
+        match rewrite_tool_arguments(&chain.without_audit(), bytes) {
+            Ok(Some((masked, _))) => tool_call_prompt(&masked),
+            _ => tool_call_prompt(bytes),
+        }
+    });
+}
+
+/// The prompt half of [`tool_call_capture`].
+fn tool_call_prompt(request_bytes: &[u8]) -> String {
+    serde_json::from_slice::<JsonRpcPeek>(request_bytes)
+        .ok()
+        .and_then(|p| p.params)
+        .and_then(|p| p.arguments)
+        .map(|v| v.to_string())
+        .unwrap_or_default()
 }
 
 /// Outcome of the output-hook guardrail pass over an MCP tool result.
@@ -1685,8 +1756,9 @@ fn emit_tool_call_usage(
     mcp_tool: &str,
     status_code: u16,
     latency: Duration,
-    // The gateway's own refusal of the call — a guardrail block or a quota
-    // rejection — named on the event like every other surface names it.
+    // What failed the call — the gateway's own refusal (a guardrail block, a
+    // quota rejection) or an unusable upstream answer — named on the event
+    // like every other surface names it.
     refusal: Option<&crate::error::ProxyError>,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     // Per-detector mask counts from the write-back passes (names only,
@@ -1837,21 +1909,31 @@ fn jsonrpc_guardrail_block(
     guardrail_name: Option<&str>,
     unavailable: Option<&str>,
 ) -> Response {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        jsonrpc_guardrail_block_body(id, side, guardrail_name, unavailable),
+    )
+        .into_response()
+}
+
+/// The body [`jsonrpc_guardrail_block`] sends.
+fn jsonrpc_guardrail_block_body(
+    id: Option<serde_json::Value>,
+    side: &str,
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+) -> String {
     let message = crate::error::guardrail_block_message(side, guardrail_name, unavailable);
-    let body = serde_json::json!({
+    serde_json::json!({
         "jsonrpc": "2.0",
         "id": id.unwrap_or(serde_json::Value::Null),
         "result": {
             "content": [{ "type": "text", "text": message }],
             "isError": true,
         }
-    });
-    (
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
-    )
-        .into_response()
+    })
+    .to_string()
 }
 
 #[cfg(test)]

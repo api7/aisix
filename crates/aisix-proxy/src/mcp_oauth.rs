@@ -363,6 +363,7 @@ where
             crate::request_metrics::Caller::new,
         ),
         response.status().as_u16(),
+        crate::attribution::rendered_error_source(response.status().as_u16()),
         started,
     );
     response

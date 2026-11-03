@@ -108,6 +108,7 @@ pub(crate) fn reject_before_dispatch(
             ..Default::default()
         },
         status,
+        crate::attempt::error_source(&err),
         elapsed,
     );
     match envelope {
@@ -166,6 +167,7 @@ pub(crate) fn record_undispatched(
     path: &str,
     caller: crate::request_metrics::Caller<'_>,
     status: u16,
+    error_source: aisix_obs::ErrorSource,
     started: Instant,
 ) {
     crate::request_metrics::record_undispatched(
@@ -174,6 +176,7 @@ pub(crate) fn record_undispatched(
         caller,
         crate::request_metrics::Upstream::default(),
         status,
+        error_source,
         started.elapsed(),
     );
 }
