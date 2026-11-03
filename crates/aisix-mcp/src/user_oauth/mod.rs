@@ -1352,7 +1352,6 @@ mod tests {
         land_refresh(store.clone(), &server, "new", Duration::from_millis(300));
         let subject = UserSubject::member("u");
         let manager = Arc::new(UserOAuthManager::new(store.clone()));
-        fresh_copy(&manager, Some(unix_now() + 45));
         assert_eq!(
             manager
                 .stored_access_token(&server, &subject)
