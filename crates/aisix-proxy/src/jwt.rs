@@ -1027,8 +1027,6 @@ fn token_scopes(claims: &serde_json::Value) -> Vec<String> {
     }
 }
 
-/// Resolve a claim by path, dots traversing nested objects
-/// (`realm_access.roles`).
 /// The identity `prov` reads from `claims`, when that claim is a string.
 pub(crate) fn identity_claim<'a>(
     claims: &'a serde_json::Value,
@@ -1037,6 +1035,8 @@ pub(crate) fn identity_claim<'a>(
     nested_claim(claims, &prov.identity_claim).and_then(|v| v.as_str())
 }
 
+/// Resolve a claim by path, dots traversing nested objects
+/// (`realm_access.roles`).
 fn nested_claim<'a>(claims: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     let mut cur = claims;
     for seg in path.split('.') {

@@ -631,7 +631,7 @@ async fn handle_login_callback(state: &ProxyState, request: Parts) -> Result<Res
             .metrics
             .record_auth_decision("mcp_oauth_login", false, reason);
         tracing::warn!(target: "aisix::mcp_oauth", provider = %provider.name, reason,
-            identity = ?signed_in_as.map(crate::jwt::clip), "refused a sign-in");
+            subject = ?signed_in_as.map(crate::jwt::clip), "refused a sign-in");
         refusal_page(signed_in_as, denial_text(reason))
     };
     let principal = session_principal(state, &snapshot, provider, &session_claims)
