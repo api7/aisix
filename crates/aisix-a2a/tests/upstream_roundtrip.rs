@@ -206,7 +206,7 @@ async fn refuses_to_follow_upstream_redirect() {
     let err = bridge.send(&message_send("r")).await.unwrap_err();
     // The 302 surfaces as a non-success status error — it is NOT followed.
     assert!(
-        matches!(err, A2aError::Request(_)),
+        matches!(err, A2aError::UpstreamStatus(302)),
         "a redirect must surface as an error, got {err:?}"
     );
     assert_eq!(
@@ -448,7 +448,7 @@ async fn a_refused_stream_surfaces_before_any_event() {
     else {
         panic!("a refused stream must not open");
     };
-    assert!(matches!(err, A2aError::Request(_)), "got {err:?}");
+    assert!(matches!(err, A2aError::UpstreamStatus(405)), "got {err:?}");
 }
 
 /// An upstream that answers a streaming call the way an A2A agent refuses one:
