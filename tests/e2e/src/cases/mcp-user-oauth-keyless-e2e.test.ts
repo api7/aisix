@@ -636,6 +636,37 @@ describe("keyless sign-in on managed gateways", () => {
     await again.client.close();
   });
 
+  test("an SDK client whose upstream credential is gone is sent back to the browser, not refreshed in a loop", async () => {
+    if (!etcdReachable) return;
+    provider.claims = claimsOf("pat");
+    short.user = "up-pat";
+    const first = await signInMcpClient(url(0, "short"), {});
+    expect(await whoami(first.client)).toBe("up-pat");
+    await first.client.close();
+
+    short.refreshAnswer = { status: 400, error: "invalid_grant" };
+    const refused = await mcpPost(url(0, "short"), bearer(first.state.saved!.access_token));
+    short.refreshAnswer = "ok";
+    expect(refused.status).toBe(401);
+
+    short.user = "up-pat-again";
+    const opens = first.state.browserOpens.length;
+    const again = await signInMcpClient(url(0, "short"), {}, first.state);
+    expect(first.state.browserOpens.length).toBe(opens + 1);
+    expect(await whoami(again.client)).toBe("up-pat-again");
+    await again.client.close();
+  });
+
+  test("a refused authorization request does not send the browser to an address nobody consented to", async () => {
+    if (!etcdReachable) return;
+    const res = await fetch(authorizeUrl(url(0), { redirect_uri: "https://evil.example/", response_type: "token" }), {
+      redirect: "manual",
+    });
+    expect(res.status).toBe(400);
+    expect(res.headers.get("location")).toBeNull();
+    expect(await oauthError(res)).toBe("unsupported_response_type");
+  });
+
   test("two gateways accept each other's sessions and share one key", async () => {
     if (!etcdReachable) return;
     provider.claims = claimsOf("nina");

@@ -281,6 +281,38 @@ fn validate_redirect_uri(redirect_uri: &str) -> Result<(), &'static str> {
     Err("redirect_uri must use https unless it is a loopback address")
 }
 
+/// Answer an authorization request that gets no further. A client on this
+/// machine hears about it at its `redirect_uri`, as RFC 6749 §4.1.2.1 has it. Any
+/// other address is whatever the link said and nobody has consented to it, so
+/// sending the browser there would make the gateway an open redirector (RFC 9700
+/// §4.11.2): the browser is told here instead.
+pub(crate) fn refuse_to_client(
+    redirect_uri: &str,
+    state: Option<&str>,
+    error: &str,
+    description: &str,
+) -> Response {
+    if may_receive_unconsented_redirect(redirect_uri) {
+        return redirect_to_client(
+            redirect_uri,
+            state,
+            &[("error", error), ("error_description", description)],
+        );
+    }
+    let status = match error {
+        "temporarily_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+        "server_error" => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    oauth_error(status, error, description)
+}
+
+fn may_receive_unconsented_redirect(redirect_uri: &str) -> bool {
+    url::Url::parse(redirect_uri).is_ok_and(|url| {
+        !matches!(url.scheme(), "http" | "https") || url.host().is_some_and(|h| is_loopback(&h))
+    })
+}
+
 /// Private-use redirect URIs of native MCP clients, compared exactly.
 const NATIVE_REDIRECT_URIS: &[&str] = &["cursor://anysphere.cursor-mcp/oauth/callback"];
 
@@ -534,11 +566,7 @@ pub(crate) async fn authorize(
         }
         let state_param = param("state");
         let back = |error: &str, description: &str| {
-            redirect_to_client(
-                redirect_uri,
-                state_param,
-                &[("error", error), ("error_description", description)],
-            )
+            refuse_to_client(redirect_uri, state_param, error, description)
         };
         if param("response_type") != Some("code") {
             return back("unsupported_response_type", "response_type must be code");
@@ -796,6 +824,21 @@ mod tests {
         ] {
             check(uri).expect_err(uri);
         }
+    }
+
+    #[test]
+    fn only_a_client_on_this_machine_hears_of_a_refusal_by_redirect() {
+        for uri in [
+            "http://127.0.0.1:9/cb",
+            "https://localhost/cb",
+            "cursor://anysphere.cursor-mcp/oauth/callback",
+        ] {
+            let response = refuse_to_client(uri, None, "invalid_request", "no");
+            assert_eq!(response.status(), StatusCode::FOUND, "{uri}");
+        }
+        let response = refuse_to_client("https://evil.example/", None, "invalid_request", "no");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response.headers().contains_key(header::LOCATION));
     }
 
     #[test]

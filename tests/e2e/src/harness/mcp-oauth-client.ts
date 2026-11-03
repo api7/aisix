@@ -47,6 +47,10 @@ export class ClientAuthState implements OAuthClientProvider {
   codeVerifier() {
     return this.verifier;
   }
+  invalidateCredentials(scope: "all" | "client" | "tokens" | "verifier" | "discovery") {
+    if (scope === "all" || scope === "tokens") this.saved = undefined;
+    if (scope === "all" || scope === "client") this.info = undefined;
+  }
 }
 
 /** Where a walk through the browser pass stopped. */

@@ -49,7 +49,7 @@ use crate::auth::{AuthenticatedKey, JwtIdentity};
 use crate::error::ProxyError;
 use crate::mcp_oauth::{
     callback_url, failure_response, no_store, oauth_error, observed, query_params, redirect,
-    redirect_to_client, resource_matches, sign_in_server, SignInMode,
+    redirect_to_client, refuse_to_client, resource_matches, sign_in_server, SignInMode,
 };
 use crate::state::ProxyState;
 
@@ -365,11 +365,7 @@ pub(crate) async fn begin_relay(
                     "this MCP server cannot sign in users as configured",
                 )
             };
-            return redirect_to_client(
-                client.redirect_uri,
-                client.state,
-                &[("error", error), ("error_description", description)],
-            );
+            return refuse_to_client(client.redirect_uri, client.state, error, description);
         }
     };
     let mut flow = new_flow(
@@ -963,6 +959,11 @@ pub(crate) async fn authenticate_session(
             ProxyError::InvalidApiKey
         }
     };
+    // Before anything is read: a name that signs nobody in is no reason to
+    // reach the store, and this is reachable with no credential at all.
+    if sign_in_server(&snapshot, server).is_none() {
+        return Err(refused("session_wrong_server"));
+    }
     let keys = match state.mcp_oauth.session_keys().await {
         Ok(Some(keys)) => keys,
         Ok(None) => return Err(refused("session_key_absent")),
@@ -1114,6 +1115,15 @@ pub(crate) async fn token(
             if !still_authorized(state, &snapshot, &oauth, &identity) {
                 return invalid_grant();
             }
+            // With the upstream credential gone a new pair would be refused on
+            // its first request, and a client holding a refresh token refreshes
+            // before it considers the browser. This is what sends it there.
+            let subject = UserSubject::jwt(&identity.provider, &identity.identity);
+            if state.mcp_oauth.access_token(&oauth, &subject).await
+                == Err(UserOAuthFailure::AuthorizationRequired)
+            {
+                return invalid_grant();
+            }
             match state.mcp_oauth.spend_refresh_token(&session).await {
                 Ok(true) => session_response(&keys, &oauth, &session.client_id, &identity),
                 Ok(false) => invalid_grant(),
@@ -1204,8 +1214,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_consent_page_escapes_what_it_shows() {
+    #[tokio::test]
+    async fn the_consent_page_escapes_what_it_shows() {
         let flow = FlowState {
             handle: "h".repeat(64),
             expires_at: 0,
@@ -1228,6 +1238,16 @@ mod tests {
         assert!(!response
             .headers()
             .contains_key(header::CONTENT_SECURITY_POLICY));
+        let body = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "{body}"
+        );
+        assert!(!body.contains("<script>"), "{body}");
+        assert!(body.contains("a&amp;b"), "{body}");
     }
 
     #[test]

@@ -130,7 +130,10 @@ pub async fn consume(
 /// Past this many live entries in one namespace a write answers
 /// [`StoreError::OverQuota`]. Per namespace so that a flood of one kind of record
 /// cannot take the room that signed-in users' tokens and leases need.
-const MEMORY_STORE_MAX_ENTRIES_PER_NAMESPACE: usize = 20_000;
+///
+/// Sized for spent refresh tokens, the namespace that grows fastest: one record
+/// per hour per connected client, each kept for up to 14 days.
+const MEMORY_STORE_MAX_ENTRIES_PER_NAMESPACE: usize = 200_000;
 
 /// The backend for a gateway with no dp-manager. Its contents live in this
 /// process alone: a restart loses every sign-in, and replicas do not share

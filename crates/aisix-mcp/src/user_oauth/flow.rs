@@ -191,8 +191,10 @@ struct TokenBody {
     expires_in: Option<serde_json::Value>,
     #[serde(default)]
     id_token: Option<String>,
+    /// Loose like `expires_in`: only a trust provider's is read, and a shape
+    /// some other server invents must not cost it the tokens beside it.
     #[serde(default)]
-    scope: Option<String>,
+    scope: Option<serde_json::Value>,
     #[serde(default)]
     error: Option<String>,
 }
@@ -258,7 +260,9 @@ pub(super) async fn token_request_named(
             refresh_token: body.refresh_token.filter(|t| !t.is_empty()),
             expires_at: expires_at(body.expires_in.as_ref()),
             id_token: body.id_token.filter(|t| !t.is_empty()),
-            scope: body.scope,
+            scope: body
+                .scope
+                .and_then(|scope| scope.as_str().map(str::to_owned)),
         }),
         None => TokenOutcome::Transient,
     }
