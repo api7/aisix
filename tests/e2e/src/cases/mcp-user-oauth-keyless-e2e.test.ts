@@ -1093,7 +1093,7 @@ describe("keyless sessions follow the configuration on the next request", () => 
   /** Sign in as a person of their own, on a key of their own: earlier tests remove the shared mapping. */
   const signedInOnOwnKey = async (name: string) => {
     await ownKey(name);
-    provider.claims = { ...claimsOf(name, name), uid: name };
+    provider.claims = claimsOf(name, name);
     upstream.user = `up-${name}`;
     return signInByHand(url());
   };
@@ -1117,8 +1117,7 @@ describe("keyless sessions follow the configuration on the next request", () => 
     };
 
     try {
-      // `uid` holds the same value as `sub`, so the session's identity does not move.
-      await setProvider({ jwks_uri: `${provider.url}/jwks`, identity_claim: "uid" });
+      await setProvider({ jwks_uri: `${provider.url}/jwks` });
       await stillWorks();
       await setProvider({ issuer: `${provider.url}/` });
       await stillWorks();
@@ -1151,7 +1150,7 @@ describe("keyless sessions follow the configuration on the next request", () => 
 
       // The same identity value at the new provider is someone else: their own
       // upstream sign-in, their own token, and the old session stays out.
-      other.claims = { ...claimsOf("ines", "ines"), uid: "ines" };
+      other.claims = claimsOf("ines", "ines");
       upstream.user = "up-ines-at-the-new-idp";
       const seen = upstream.authorizeRequests.length;
       const theirs = await signInByHand(url());
@@ -1538,6 +1537,243 @@ describe("an operator's own OAuth addresses under the default SSRF settings", ()
       expect(registrar.registrations).toHaveLength(1);
     } finally {
       await open.exit();
+    }
+  });
+});
+
+describe("whose stored credential it is, across two gateways", () => {
+  let etcdReachable = false;
+  let cp: MockControlPlane;
+  let provider: MockOidcProvider;
+  let upstream: OAuthMcpUpstream;
+  const apps: SpawnedApp[] = [];
+  const seeds: SeedClient[] = [];
+  const providerIds: string[] = [];
+  const url = (i: number) => `${apps[i].proxyUrl}/mcp/main`;
+  const providerRow = () => ({
+    name: "corp",
+    issuer: provider.url,
+    audiences: ["some-api"],
+    bound_claims: { realm: "staff" },
+    login: { client_id: provider.clientId, scopes: ["profile"] },
+  });
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+    cp = await startMockControlPlane();
+    provider = await startMockOidcProvider();
+    upstream = await new OAuthMcpUpstream().start();
+    for (let i = 0; i < 2; i++) {
+      const app = await spawnApp({ extra: { managed: cp.managed }, awaitProxyListener: false });
+      apps.push(app);
+      const seed = new SeedClient(etcd, `${app.etcdPrefix}/${cp.envId}`);
+      seeds.push(seed);
+      providerIds.push((await seedEnvironment(seed, app.proxyUrl, provider, upstream, upstream)).providerId);
+      await awaitInteractive(url(i));
+    }
+  }, 120_000);
+
+  afterAll(async () => {
+    for (const app of apps) await app.exit();
+    await upstream?.close();
+    await provider?.close();
+    await cp?.close();
+  });
+
+  /** Both gateways, with the row written last proving the ones before it landed. */
+  const setProvider = async (changes: Record<string, unknown>) => {
+    for (let i = 0; i < 2; i++) {
+      await seeds[i].update("oidc_providers", providerIds[i], { ...providerRow(), ...changes });
+      const sentinel = `sk-sentinel-${randomUUID()}`;
+      await seeds[i].createApiKey({ key_hash: hash(sentinel), allowed_models: [], mcp_access: { allow: [] } });
+      await waitConfigPropagation(
+        async () => (await fetch(`${apps[i].proxyUrl}/v1/models`, { headers: bearer(sentinel) })).status === 200,
+      );
+    }
+  };
+
+  const storedFor = (subject: string) =>
+    [...cp.store].filter(([id, r]) => id.startsWith("mcp_oauth_token/") && r.labels.subject === subject);
+  /** What the control plane does on an administrator's disconnect or a provider change. */
+  const purge = (subject: string) => {
+    for (const [id] of storedFor(subject)) cp.store.delete(id);
+  };
+  const upstreamUser = async (i: number, session: string) => {
+    const { client } = await connectMcpClient(url(i), bearer(session));
+    const user = await whoami(client);
+    await client.close();
+    return user;
+  };
+  const refresh = (i: number, refreshToken: string) =>
+    tokenRequest(url(i), { grant_type: "refresh_token", refresh_token: refreshToken });
+
+  test("after the identity claim changes, a new value equal to someone's old one is its own person", async () => {
+    if (!etcdReachable) return;
+    await setProvider({ identity_claim: "preferred_username" });
+    try {
+      provider.claims = { ...claimsOf("sub-ann"), preferred_username: "ann", given_name: "Annabel" };
+      upstream.user = "up-ann";
+      const ann = await signInByHand(url(0));
+      expect(await upstreamUser(0, ann.access_token)).toBe("up-ann");
+      expect(await upstreamUser(1, ann.access_token)).toBe("up-ann");
+
+      await setProvider({ identity_claim: "given_name" });
+      purge("jwt:corp:ann");
+      for (const i of [0, 1]) expect((await mcpPost(url(i), bearer(ann.access_token))).status).toBe(401);
+
+      provider.claims = { ...claimsOf("sub-zed"), preferred_username: "zed", given_name: "ann" };
+      upstream.user = "up-zed";
+      const seen = upstream.authorizeRequests.length;
+      const browser = new Browser();
+      const zed = await signInByHand(url(1), browser);
+      expect(upstream.authorizeRequests.length).toBe(seen + 1);
+      expect(browser.consentPages[0]).toContain(">ann<");
+
+      // Including where the first person's token is still held.
+      expect(await upstreamUser(1, zed.access_token)).toBe("up-zed");
+      expect(await upstreamUser(0, zed.access_token)).toBe("up-zed");
+
+      // The label the control plane purges by does not name the claim.
+      expect(storedFor("jwt:corp:ann")).toHaveLength(1);
+    } finally {
+      await setProvider({});
+    }
+  });
+
+  test("the same value under another claim is not the same identity, purged or not", async () => {
+    if (!etcdReachable) return;
+    await setProvider({ identity_claim: "preferred_username" });
+    try {
+      provider.claims = { ...claimsOf("sub-otto"), preferred_username: "otto", given_name: "Bruno" };
+      upstream.user = "up-otto";
+      const otto = await signInByHand(url(0));
+      expect(await upstreamUser(0, otto.access_token)).toBe("up-otto");
+
+      await setProvider({ identity_claim: "given_name" });
+      provider.claims = { ...claimsOf("sub-bruno"), preferred_username: "bruno", given_name: "otto" };
+      upstream.user = "up-bruno";
+      const seen = upstream.authorizeRequests.length;
+      const bruno = await signInByHand(url(0));
+      expect(upstream.authorizeRequests.length).toBe(seen + 1);
+      expect(await upstreamUser(0, bruno.access_token)).toBe("up-bruno");
+    } finally {
+      await setProvider({});
+    }
+  });
+
+  test("a claim holding the same value keeps the session but needs a new upstream sign-in", async () => {
+    if (!etcdReachable) return;
+    provider.claims = { ...claimsOf("rita"), uid: "rita" };
+    upstream.user = "up-rita";
+    const rita = await signInByHand(url(0));
+    expect(await upstreamUser(0, rita.access_token)).toBe("up-rita");
+
+    await setProvider({ identity_claim: "uid" });
+    try {
+      const challenged = await mcpPost(url(0), bearer(rita.access_token));
+      expect(challenged.status).toBe(401);
+      expect(await errorCode(challenged)).toBe("mcp_oauth_authorization_required");
+      const refused = await refresh(0, rita.refresh_token);
+      expect(refused.status).toBe(400);
+      expect(await oauthError(refused)).toBe("invalid_grant");
+
+      upstream.user = "up-rita-again";
+      const seen = upstream.authorizeRequests.length;
+      const again = await signInByHand(url(0));
+      expect(upstream.authorizeRequests.length).toBe(seen + 1);
+      expect(await upstreamUser(0, again.access_token)).toBe("up-rita-again");
+      expect(await upstreamUser(1, again.access_token)).toBe("up-rita-again");
+    } finally {
+      await setProvider({});
+    }
+  });
+
+  test("naming the default identity claim changes nothing for someone signed in without it", async () => {
+    if (!etcdReachable) return;
+    provider.claims = claimsOf("bea");
+    upstream.user = "up-bea";
+    const bea = await signInByHand(url(0));
+    expect(await upstreamUser(0, bea.access_token)).toBe("up-bea");
+
+    await setProvider({ identity_claim: "sub" });
+    try {
+      upstream.user = "somebody-else-entirely";
+      const seen = upstream.authorizeRequests.length;
+      expect(await upstreamUser(0, bea.access_token)).toBe("up-bea");
+      expect(await upstreamUser(1, bea.access_token)).toBe("up-bea");
+      const refreshed = await refresh(1, bea.refresh_token);
+      expect(refreshed.status).toBe(200);
+      const again = await signInByHand(url(1));
+      expect(upstream.authorizeRequests.length).toBe(seen);
+      expect(await upstreamUser(1, again.access_token)).toBe("up-bea");
+    } finally {
+      await setProvider({});
+    }
+  });
+
+  test("a sign-in and a refresh ask the store, while requests elsewhere keep their cached window", async () => {
+    if (!etcdReachable) return;
+    provider.claims = claimsOf("cleo");
+    upstream.user = "up-cleo";
+    const cleo = await signInByHand(url(0));
+    expect(await upstreamUser(0, cleo.access_token)).toBe("up-cleo");
+    expect(await upstreamUser(1, cleo.access_token)).toBe("up-cleo");
+
+    purge("jwt:corp:cleo");
+    expect((await mcpPost(url(0), bearer(cleo.access_token))).status).toBe(200);
+    expect((await mcpPost(url(1), bearer(cleo.access_token))).status).toBe(200);
+
+    const refused = await refresh(0, cleo.refresh_token);
+    expect(refused.status).toBe(400);
+    expect(await oauthError(refused)).toBe("invalid_grant");
+    // That gateway has noticed, and the other has not.
+    const challenged = await mcpPost(url(0), bearer(cleo.access_token));
+    expect(challenged.status).toBe(401);
+    expect(await errorCode(challenged)).toBe("mcp_oauth_authorization_required");
+    expect((await mcpPost(url(1), bearer(cleo.access_token))).status).toBe(200);
+
+    // A new sign-in where the old token is still held goes to the upstream.
+    upstream.user = "up-cleo-again";
+    const seen = upstream.authorizeRequests.length;
+    const again = await signInByHand(url(1));
+    expect(upstream.authorizeRequests.length).toBe(seen + 1);
+    expect(storedFor("jwt:corp:cleo")).toHaveLength(1);
+    expect(await upstreamUser(1, again.access_token)).toBe("up-cleo-again");
+    expect(await upstreamUser(0, again.access_token)).toBe("up-cleo-again");
+  });
+
+  test("an upstream sign-in finishing after the identity claim changed stores no credential", async () => {
+    if (!etcdReachable) return;
+    await setProvider({ identity_claim: "preferred_username" });
+    try {
+      provider.claims = { ...claimsOf("sub-dora"), preferred_username: "dora", given_name: "Dorothy" };
+      upstream.user = "up-dora";
+      const browser = new Browser();
+      const atUpstream = await browser.walk(authorizeUrl(url(0)), { landing: upstream.url });
+      if (atUpstream.kind !== "landed") throw new Error(`stopped: ${atUpstream.status} ${atUpstream.text}`);
+
+      await setProvider({ identity_claim: "given_name" });
+      const refused = await browser.walk(atUpstream.url);
+      if (refused.kind !== "landed") throw new Error(`stopped: ${refused.status} ${refused.text}`);
+      expect(refused.url.searchParams.get("error")).toBe("access_denied");
+      expect(refused.url.searchParams.get("code")).toBeNull();
+      expect(storedFor("jwt:corp:dora")).toEqual([]);
+      const metrics = await (await fetch(`${apps[0].metricsUrl}/metrics`)).text();
+      expect(metrics).toMatch(
+        /aisix_auth_decisions_total\{[^}]*method="mcp_oauth_login"[^}]*reason="session_identity_changed"[^}]*\}/,
+      );
+
+      // Had the credential been kept, this other person would be handed it.
+      provider.claims = { ...claimsOf("sub-eve"), preferred_username: "eve", given_name: "dora" };
+      upstream.user = "up-eve";
+      const seen = upstream.authorizeRequests.length;
+      const eve = await signInByHand(url(0));
+      expect(upstream.authorizeRequests.length).toBe(seen + 1);
+      expect(await upstreamUser(0, eve.access_token)).toBe("up-eve");
+    } finally {
+      await setProvider({});
     }
   });
 });

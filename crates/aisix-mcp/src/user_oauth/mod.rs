@@ -80,15 +80,16 @@ pub struct UserSubject {
 
 impl UserSubject {
     /// `issuer` is the provider's as configured now, `None` on one that pins
-    /// none. It is in the record key because a provider's name can move to
-    /// another identity provider, where the same identity value is someone else.
-    /// `id` stays without it: the store's `subject` label comes from `id`, and
-    /// the control plane purges a provider's tokens by that label's prefix.
-    pub fn jwt(provider: &str, issuer: Option<&str>, subject: &str) -> Self {
+    /// none, and `identity_claim` the claim it reads `subject` from now. Both are
+    /// in the record key because the same value means someone else at another
+    /// identity provider, or under another claim. `id` stays without them: the
+    /// store's `subject` label comes from `id`, and the control plane purges a
+    /// provider's tokens by that label's prefix.
+    pub fn jwt(provider: &str, issuer: Option<&str>, identity_claim: &str, subject: &str) -> Self {
         let issuer = normalized_issuer(issuer.unwrap_or_default());
         Self {
             id: format!("jwt:{provider}:{subject}"),
-            record_key: digest(&["jwt", provider, issuer, subject]),
+            record_key: digest(&["jwt", provider, issuer, identity_claim, subject]),
             member_id: None,
         }
     }
@@ -296,7 +297,31 @@ impl UserOAuthManager {
         if let Some((token, true)) = &cached {
             return Ok(token.clone());
         }
-        let stored = match self.store.get(NS_TOKEN, &key).await {
+        self.token_from_store(server, subject, &key, cached).await
+    }
+
+    /// [`Self::access_token`] for a decision about whether `subject` is still
+    /// connected, which a copy held here cannot answer: the store does, however
+    /// recent the copy. Not for the request path, which relies on that copy to
+    /// stay off the store.
+    pub async fn stored_access_token(
+        self: &Arc<Self>,
+        server: &UserOAuthServer,
+        subject: &UserSubject,
+    ) -> Result<String, UserOAuthFailure> {
+        let key = token_key(server, subject);
+        let cached = self.cached(&key);
+        self.token_from_store(server, subject, &key, cached).await
+    }
+
+    async fn token_from_store(
+        self: &Arc<Self>,
+        server: &UserOAuthServer,
+        subject: &UserSubject,
+        key: &str,
+        cached: Option<(String, bool)>,
+    ) -> Result<String, UserOAuthFailure> {
+        let stored = match self.store.get(NS_TOKEN, key).await {
             Ok(stored) => stored,
             Err(error) => {
                 // A token already in hand keeps working through a storage
@@ -313,11 +338,11 @@ impl UserOAuthManager {
             }
         };
         let Some(record) = stored.as_ref().and_then(decode_token) else {
-            self.evict(&key);
+            self.evict(key);
             return Err(UserOAuthFailure::AuthorizationRequired);
         };
         if !record.needs_refresh(unix_now()) {
-            self.remember(&key, &record);
+            self.remember(key, &record);
             return Ok(record.access_token);
         }
         match self.refresh(server, subject, None).await {
@@ -831,8 +856,8 @@ mod tests {
     #[test]
     fn identities_that_read_alike_keep_separate_records() {
         let (a, b) = (
-            UserSubject::jwt("corp", None, "x:alice"),
-            UserSubject::jwt("corp:x", None, "alice"),
+            UserSubject::jwt("corp", None, "sub", "x:alice"),
+            UserSubject::jwt("corp:x", None, "sub", "alice"),
         );
         assert_eq!(a.id(), b.id());
         assert_ne!(token_key(&server(), &a), token_key(&server(), &b));
@@ -840,7 +865,7 @@ mod tests {
 
     #[test]
     fn a_record_follows_the_issuer_and_the_label_does_not() {
-        let at = |issuer| UserSubject::jwt("corp", issuer, "alice");
+        let at = |issuer| UserSubject::jwt("corp", issuer, "sub", "alice");
         let key = |subject: &UserSubject| token_key(&server(), subject);
         let idp = at(Some("https://idp.example.com"));
 
@@ -850,6 +875,64 @@ mod tests {
             assert_ne!(key(&idp), key(&other));
         }
         assert_eq!(key(&idp), key(&at(Some("https://idp.example.com/"))));
+    }
+
+    #[test]
+    fn a_record_follows_the_identity_claim_and_the_label_does_not() {
+        let under = |claim| UserSubject::jwt("corp", Some("https://idp"), claim, "alice");
+        assert_eq!(under("sub").id(), under("given_name").id());
+        assert_ne!(
+            token_key(&server(), &under("sub")),
+            token_key(&server(), &under("given_name"))
+        );
+    }
+
+    /// A copy this gateway still trusts, as a recent read leaves it.
+    fn fresh_copy(manager: &UserOAuthManager, expires_at: Option<i64>) {
+        manager.remember(
+            &token_key(&server(), &UserSubject::member("u")),
+            &TokenRecord {
+                access_token: "cached".to_owned(),
+                refresh_token: None,
+                expires_at,
+                resource: None,
+                registered_client: None,
+                redirect_uri: None,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn the_store_decides_over_a_fresh_copy_and_a_gone_record_takes_the_copy_with_it() {
+        let manager = Arc::new(UserOAuthManager::new(Arc::new(MemoryStore::default())));
+        let subject = UserSubject::member("u");
+        fresh_copy(&manager, None);
+        assert_eq!(
+            manager.stored_access_token(&server(), &subject).await,
+            Err(UserOAuthFailure::AuthorizationRequired)
+        );
+        assert_eq!(
+            manager.access_token(&server(), &subject).await,
+            Err(UserOAuthFailure::AuthorizationRequired)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_read_survives_an_outage_on_a_copy_as_a_request_does() {
+        let manager = Arc::new(UserOAuthManager::new(Arc::new(DownStore)));
+        let subject = UserSubject::member("u");
+        assert_eq!(
+            manager.stored_access_token(&server(), &subject).await,
+            Err(UserOAuthFailure::Unavailable)
+        );
+        fresh_copy(&manager, None);
+        assert_eq!(
+            manager
+                .stored_access_token(&server(), &subject)
+                .await
+                .as_deref(),
+            Ok("cached")
+        );
     }
 
     #[tokio::test]
