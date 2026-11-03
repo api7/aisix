@@ -1143,6 +1143,7 @@ async fn dispatch(
     };
 
     if is_tool_call {
+        let (response, transport_refusal) = name_transport_refusal(response).await;
         let capture = capture_cap.map(|cap| {
             tool_call_capture(cap, captured_args.as_deref(), captured_result.as_deref())
         });
@@ -1156,7 +1157,7 @@ async fn dispatch(
             &mcp_tool,
             response.status().as_u16(),
             latency,
-            None,
+            transport_refusal.as_ref(),
             monitor_hits,
             redaction_counts,
             guardrail_chain.as_ref(),
@@ -1164,8 +1165,28 @@ async fn dispatch(
             trace,
             /* dispatched */ true,
         );
+        return response;
     }
     response
+}
+
+/// What a tool call's 4xx says, when the transport answered it rather than the
+/// handler: rmcp refuses a call over its headers, session or params with a body
+/// naming why, and nothing else carries that to the row. A body rendered in this
+/// process, so reading it delays no one.
+async fn name_transport_refusal(
+    response: Response,
+) -> (Response, Option<crate::error::ProxyError>) {
+    if !response.status().is_client_error() {
+        return (response, None);
+    }
+    let (parts, body) = response.into_parts();
+    let bytes = to_bytes(body, usize::MAX).await.unwrap_or_default();
+    let detail = aisix_gateway::upstream_error_message(&bytes);
+    let refusal = (!detail.trim().is_empty()).then_some(crate::error::ProxyError::Bridge(
+        aisix_gateway::BridgeError::InvalidRequest(detail),
+    ));
+    (Response::from_parts(parts, Body::from(bytes)), refusal)
 }
 
 /// The caller's own credentials for the servers that act on the caller's

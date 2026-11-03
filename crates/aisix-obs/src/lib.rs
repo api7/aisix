@@ -37,7 +37,8 @@ use aisix_core::ObservabilityConfig;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 pub use access_log::{
-    AccessLog, AccessLogRecord, CacheAccessLog, McpAccessLog, SemanticAccessLog, SemanticFallback,
+    request_failed_message, AccessLog, AccessLogRecord, CacheAccessLog, McpAccessLog,
+    SemanticAccessLog, SemanticFallback,
 };
 pub use genai::{
     genai_provider_name, GenAiRequestParams, HttpServerFacts, SpanFacts, UpstreamFacts,

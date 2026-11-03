@@ -276,3 +276,21 @@ export async function waitForSlsLog(
   }
   throw new Error(`no SLS log in '${logstore}' matching: ${what}`);
 }
+
+/**
+ * Every failure row the logstore has received so far names its failure: a row
+ * with a status of 400 or above, or with an `error_class`, has an
+ * `error_message`. Returns how many failure rows it checked.
+ */
+export function expectFailureRowsNamed(sls: MockSls, logstore: string): number {
+  const failures = slsLogsFor(sls, logstore).filter(
+    (row) => Number(row.get("status_code")) >= 400 || !!row.get("error_class"),
+  );
+  const unnamed = failures
+    .filter((row) => !row.get("error_message")?.trim())
+    .map((row) => Object.fromEntries(row));
+  if (unnamed.length > 0) {
+    throw new Error(`${logstore}: failure rows without error_message: ${JSON.stringify(unnamed)}`);
+  }
+  return failures.length;
+}

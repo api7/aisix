@@ -1065,6 +1065,30 @@ impl VideoTarget {
     }
 }
 
+/// A provider `/v1/videos` has no mapping for, and what the 501 says about it.
+struct UnsupportedProvider(String);
+
+impl UnsupportedProvider {
+    fn into_success(
+        self,
+        model_id: String,
+        applied_guardrails: Vec<AppliedGuardrail>,
+        monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
+    ) -> CreateSuccess {
+        let env = ErrorEnvelope::new(self.0.clone(), "not_implemented");
+        CreateSuccess {
+            response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
+            provider: "unknown".into(),
+            model_id,
+            provider_key_id: String::new(),
+            applied_guardrails,
+            monitor_hits,
+            upstream_called: false,
+            unsupported: Some(self.0),
+        }
+    }
+}
+
 /// Shared resolve → ACL → IP-allowlist → provider gate for a Model on the
 /// videos surface. `acl_name` is the name the caller's key is checked
 /// against (the requested alias on submit, the stored display name on the
@@ -1075,7 +1099,7 @@ fn resolve_video_target(
     model_entry: std::sync::Arc<aisix_core::ResourceEntry<aisix_core::Model>>,
     acl_name: &str,
     client_ctx: &ClientContext,
-) -> Result<Result<VideoTarget, Response>, ProxyError> {
+) -> Result<Result<VideoTarget, UnsupportedProvider>, ProxyError> {
     if !auth.key().can_access(snapshot, acl_name) {
         return Err(ProxyError::ModelForbidden(acl_name.to_string()));
     }
@@ -1087,11 +1111,9 @@ fn resolve_video_target(
     // GET routes by resolve_get_target). MiniMax (Files-API fetch
     // indirection) is the tracked Phase 2 follow-up.
     let Some(video_provider) = VideoProvider::from_provider(&provider) else {
-        let env = ErrorEnvelope::new(
-            format!("provider {provider:?} is not yet supported on /v1/videos"),
-            "not_implemented",
-        );
-        return Ok(Err((StatusCode::NOT_IMPLEMENTED, Json(env)).into_response()));
+        return Ok(Err(UnsupportedProvider(format!(
+            "provider {provider:?} is not yet supported on /v1/videos"
+        ))));
     };
 
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &model_entry.value)?;
@@ -1747,6 +1769,7 @@ pub async fn create_video(
                     &audit,
                     routing.attempts.last(),
                     success.upstream_called,
+                    success.unsupported.as_deref(),
                 );
             }
             success.response
@@ -1819,6 +1842,8 @@ struct CreateSuccess {
     /// `false` on the 501 unsupported-provider branch: no upstream call
     /// happened, so its usage event exports no upstream span.
     upstream_called: bool,
+    /// The 501's text, which names that row's failure.
+    unsupported: Option<String>,
 }
 
 async fn dispatch_create(
@@ -1855,18 +1880,10 @@ async fn dispatch_create(
     // is screened or burns a rate-limit slot; a Model Group's targets are
     // gated one by one in the dispatch below.
     if model_entry.value.routing.is_none() {
-        if let Err(resp) =
+        if let Err(unsupported) =
             resolve_video_target(snapshot, auth, model_entry.clone(), &body.model, client)?
         {
-            return Ok(CreateSuccess {
-                response: resp,
-                provider: "unknown".into(),
-                model_id,
-                provider_key_id: String::new(),
-                applied_guardrails: Vec::new(),
-                monitor_hits: Vec::new(),
-                upstream_called: false,
-            });
+            return Ok(unsupported.into_success(model_id, Vec::new(), Vec::new()));
         }
     } else {
         if !auth.key().can_access(snapshot, &body.model) {
@@ -1932,7 +1949,7 @@ async fn dispatch_create(
     // caller addressed (the group), exactly as here.
     enum Submitted {
         Accepted(Box<VideoTarget>, serde_json::Value),
-        Unsupported(Response),
+        Unsupported(UnsupportedProvider),
     }
     *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
         .with_trace(client.trace.clone());
@@ -1960,7 +1977,7 @@ async fn dispatch_create(
                 let target = match resolve_video_target(snapshot, auth, entry, &body.model, client)?
                 {
                     Ok(t) => t,
-                    Err(resp) => return Ok(Submitted::Unsupported(resp)),
+                    Err(unsupported) => return Ok(Submitted::Unsupported(unsupported)),
                 };
                 let upstream_model =
                     crate::dispatch::require_upstream_model(&target.model_entry.value)?.to_string();
@@ -2005,16 +2022,8 @@ async fn dispatch_create(
     reservation.commit_tokens(0).await;
     let (target, resp) = match submitted {
         Submitted::Accepted(target, resp) => (*target, resp),
-        Submitted::Unsupported(resp) => {
-            return Ok(CreateSuccess {
-                response: resp,
-                provider: "unknown".into(),
-                model_id,
-                provider_key_id: String::new(),
-                applied_guardrails,
-                monitor_hits,
-                upstream_called: false,
-            })
+        Submitted::Unsupported(unsupported) => {
+            return Ok(unsupported.into_success(model_id, applied_guardrails, monitor_hits));
         }
     };
 
@@ -2053,6 +2062,7 @@ async fn dispatch_create(
         applied_guardrails,
         monitor_hits,
         upstream_called: true,
+        unsupported: None,
     })
 }
 
@@ -2345,6 +2355,8 @@ fn emit_submit_usage_event(
     winner: Option<&crate::attempt::AttemptRecord>,
     // Whether the submit reached an upstream; the route's own 501 did not.
     dispatched: bool,
+    // The route's own 501, in the wording it answered with.
+    unsupported: Option<&str>,
 ) {
     let mut event = UsageEvent {
         request_id: client.request_id.clone(),
@@ -2372,6 +2384,10 @@ fn emit_submit_usage_event(
     let pk = crate::usage_attr::ResolvedPk::resolve(snap, provider_key_id);
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
     crate::usage_attr::apply_winning_attempt(&mut event, winner);
+    if let Some(message) = unsupported {
+        event.error_class = "config".to_string();
+        event.error_message = message.to_string();
+    }
     crate::usage_attr::apply_caller_identity(&mut event, client.jwt.as_ref(), &client.caller);
     let usage_model =
         crate::usage_attr::usage_event_model_label(snap, &event.requested_model).into_owned();
@@ -3177,6 +3193,8 @@ mod tests {
             .expect("the 501 must emit its zero-token UsageEvent")
             .expect("usage_sink sender dropped");
         assert_eq!(ev.status_code, 501);
+        assert_eq!(ev.error_class, "config", "{ev:?}");
+        assert_eq!(ev.error_message, v["error"]["message"], "{ev:?}");
         assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
     }
 

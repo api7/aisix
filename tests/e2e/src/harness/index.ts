@@ -38,6 +38,7 @@ export {
   lz4DecompressBlock,
   slsLogsFor,
   waitForSlsLog,
+  expectFailureRowsNamed,
   type MockSls,
   type CapturedPutLogs,
 } from "./sls-mock.js";
