@@ -357,6 +357,7 @@ mod tests {
         // content key is absent, and metadata is flattened (no `usage` nesting)
         assert!(json.get("content").is_none());
         assert_eq!(json["request_id"], "req-1");
+        assert_eq!(json["is_final_attempt"], false);
     }
 
     /// The public correlation key (AISIX-Cloud#1279): `trace_id` rides the

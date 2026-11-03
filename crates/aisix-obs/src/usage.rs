@@ -771,6 +771,15 @@ pub struct UsageEvent {
     #[serde(default)]
     pub attempt_index: u32,
 
+    /// Whether this is the last row of its client request: of all the rows
+    /// sharing a `request_id` exactly one is `true`. It is what a reader asks
+    /// for to count requests rather than attempts, and neither a status nor
+    /// `attempt_index` can answer that, since a failed last attempt looks like
+    /// a superseded one. Each row of a retroactive batch attribution stands
+    /// alone and is `true`.
+    #[serde(default)]
+    pub is_final_attempt: bool,
+
     /// What kind of attempt this is: `"initial"` (first try of the
     /// first target), `"retry"` (same target, after a retryable
     /// failure), or `"fallback"` (a different target than the previous
@@ -1177,6 +1186,7 @@ fn log_provider_call(handler: &'static str, event: &UsageEvent) {
         request_id = event.request_id.as_str(),
         provider_request_id = event.provider_request_id.as_str(),
         attempt_index = event.attempt_index,
+        is_final_attempt = event.is_final_attempt,
         // A blank kind reads as `initial` only on the request's first row; a
         // later blank row is a synthesized one that speaks for no attempt.
         attempt_kind = if event.attempt_kind.is_empty() && event.attempt_index == 0 {
@@ -2346,12 +2356,14 @@ mod tests {
         let won = UsageEvent {
             request_id: "req-routing".into(),
             attempt_index: 1,
+            is_final_attempt: true,
             attempt_kind: "fallback".into(),
             attempt_model: "secondary".into(),
             status_code: 200,
             ..Default::default()
         };
         let json = serde_json::to_string(&won).unwrap();
+        assert!(json.contains(r#""is_final_attempt":true"#));
         assert!(json.contains(r#""attempt_kind":"fallback""#));
         assert!(json.contains(r#""attempt_model":"secondary""#));
         // No error fields on the winner.
@@ -2360,6 +2372,9 @@ mod tests {
 
         // A direct (non-routing) request omits the routing-only fields.
         let empty = serde_json::to_string(&UsageEvent::default()).unwrap();
+        // `false` is written out: it states something about the row, where an
+        // absent field means a gateway that predates it.
+        assert!(empty.contains(r#""is_final_attempt":false"#));
         assert!(!empty.contains("attempt_kind"));
         assert!(!empty.contains("attempt_model"));
         assert!(!empty.contains("error_class"));

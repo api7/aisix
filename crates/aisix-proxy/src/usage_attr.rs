@@ -1099,6 +1099,8 @@ fn stamp_requested_model_id(event: &mut UsageEvent) {
 /// says whether this event ends the request — the terminal event carries
 /// the SERVER + logical spans (ending the SERVER span at NOW, the real
 /// body EOF/drop), a non-terminal one carries its own attempt span alone.
+/// It is also the wire's `is_final_attempt`, so an emitter owes exactly one
+/// `true` per request, on the last row it writes.
 /// `dispatched` is the caller's statement that this event describes work
 /// that actually reached an upstream — a cache hit and a pre-dispatch
 /// error pass `false`, which zeroes the event's `upstream_*` latencies and
@@ -1122,6 +1124,7 @@ pub(crate) fn emit_usage(
     // present on a family's success path and missing from its error or
     // streaming one (AISIX-Cloud#1461).
     event.operation = surface.operation.to_string();
+    event.is_final_attempt = terminal;
     stamp_requested_model_id(&mut event);
     // Upstream-supplied text bound for line-oriented stores: the same
     // control-character strip and cap as the provider's response id.

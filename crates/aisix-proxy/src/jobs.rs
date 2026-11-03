@@ -2226,6 +2226,8 @@ async fn attribute_batch_usage(
             // deliberately bypasses it (no live request, so no trace
             // bundle), and both labels still come from one constant.
             operation: crate::operation::BATCH_COMPLETION.operation.to_string(),
+            // Each slice has its own request id, so each is its own last row.
+            is_final_attempt: true,
             request_headers: request_headers.clone(),
             ..Default::default()
         };
@@ -2740,6 +2742,7 @@ mod tests {
             agg.request_id,
             batch_attribution_request_id("batch_1", 0, false)
         );
+        assert!(agg.is_final_attempt, "a batch row stands for itself");
         assert_eq!(agg.prompt_tokens, 17);
         assert_eq!(agg.completion_tokens, 8);
         assert_eq!(agg.cached_prompt_tokens, 2);
