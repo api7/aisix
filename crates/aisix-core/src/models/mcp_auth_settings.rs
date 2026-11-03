@@ -40,13 +40,13 @@ pub struct McpAuthSettings {
     /// Canonical URI of this environment's `/mcp` endpoint, e.g.
     /// `https://gw.example.com/mcp`. Published verbatim as the PRM
     /// document's `resource` (never derived from the request Host
-    /// header) and the value the trust providers' `audiences` must
-    /// include for OAuth-for-MCP tokens to validate. The URL path must
-    /// end in `/mcp` at a segment boundary, such as `/mcp` or
-    /// `/aisix/mcp`. A prefix in front of `/mcp` is for a reverse proxy
-    /// that strips it before forwarding to the gateway, and the protected
-    /// resource metadata is then advertised under the same prefix. Unset
-    /// leaves the OAuth discovery surface dormant.
+    /// header). A token's `aud` is never compared with this value: an
+    /// inbound token is checked against its trust provider's `audiences`
+    /// alone. The URL path must end in `/mcp` at a segment boundary, such
+    /// as `/mcp` or `/aisix/mcp`. A prefix in front of `/mcp` is for a
+    /// reverse proxy that strips it before forwarding to the gateway, and
+    /// the protected resource metadata is then advertised under the same
+    /// prefix. Unset leaves the OAuth discovery surface dormant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub resource_url: Option<String>,

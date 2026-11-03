@@ -1090,6 +1090,130 @@ describe("keyless sessions follow the configuration on the next request", () => 
     }
   });
 
+  /** Sign in as a person of their own, on a key of their own: earlier tests remove the shared mapping. */
+  const signedInOnOwnKey = async (name: string) => {
+    await ownKey(name);
+    provider.claims = { ...claimsOf(name, name), uid: name };
+    upstream.user = `up-${name}`;
+    return signInByHand(url());
+  };
+  const refreshGrant = (refreshToken: string) =>
+    tokenRequest(url(), { grant_type: "refresh_token", refresh_token: refreshToken });
+  const setProvider = async (changes: Record<string, unknown>) => {
+    await seed.update("oidc_providers", providerId, { ...providerRow(), ...changes });
+    await settled();
+  };
+  const elsewhere = () => `${provider.url}/elsewhere`;
+
+  test("a provider edit that keeps the issuer leaves a session alone, whichever way the issuer is spelled", async () => {
+    if (!etcdReachable) return;
+    let tokens = await signedInOnOwnKey("gina");
+    const stillWorks = async () => {
+      await opened(tokens.access_token);
+      const refreshed = await refreshGrant(tokens.refresh_token);
+      expect(refreshed.status).toBe(200);
+      tokens = (await refreshed.json()) as Tokens;
+      await opened(tokens.access_token);
+    };
+
+    try {
+      // `uid` holds the same value as `sub`, so the session's identity does not move.
+      await setProvider({ jwks_uri: `${provider.url}/jwks`, identity_claim: "uid" });
+      await stillWorks();
+      await setProvider({ issuer: `${provider.url}/` });
+      await stillWorks();
+    } finally {
+      await setProvider({});
+    }
+    await stillWorks();
+  });
+
+  test("a session is refused once its provider means another identity provider, and nothing of it is spent", async () => {
+    if (!etcdReachable) return;
+    const tokens = await signedInOnOwnKey("ines");
+    await opened(tokens.access_token);
+
+    const other = await startMockOidcProvider();
+    try {
+      await seed.update("oidc_providers", providerId, {
+        ...providerRow(),
+        issuer: other.url,
+        login: { client_id: other.clientId, scopes: ["profile"] },
+      });
+      await refusedSoon(tokens.access_token);
+      const metrics = await (await fetch(`${app.metricsUrl}/metrics`)).text();
+      expect(metrics).toMatch(
+        /aisix_auth_decisions_total\{[^}]*method="mcp_oauth_session"[^}]*reason="session_issuer_changed"[^}]*\}/,
+      );
+      const refused = await refreshGrant(tokens.refresh_token);
+      expect(refused.status).toBe(400);
+      expect(await oauthError(refused)).toBe("invalid_grant");
+
+      // The same identity value at the new provider is someone else: they get a
+      // session of their own, and the old one still cannot act as them.
+      other.claims = { ...claimsOf("ines", "ines"), uid: "ines" };
+      const theirs = await signInByHand(url());
+      await opened(theirs.access_token);
+      await refusedSoon(tokens.access_token);
+    } finally {
+      await setProvider({});
+      await other.close();
+    }
+
+    // The refused refresh rotated nothing, so the token is still good.
+    await opened(tokens.access_token);
+    expect((await refreshGrant(tokens.refresh_token)).status).toBe(200);
+  });
+
+  test("a code issued before the issuer changed is not redeemed after it", async () => {
+    if (!etcdReachable) return;
+    await ownKey("hugo");
+    provider.claims = claimsOf("hugo", "hugo");
+    upstream.user = "up-hugo";
+    const stop = await new Browser().walk(authorizeUrl(url()));
+    if (stop.kind !== "landed") throw new Error(`stopped: ${stop.status} ${stop.text}`);
+
+    try {
+      await setProvider({ issuer: elsewhere() });
+      const res = await tokenRequest(url(), {
+        grant_type: "authorization_code",
+        code: stop.url.searchParams.get("code")!,
+        client_id: "client",
+        redirect_uri: REDIRECT,
+        code_verifier: VERIFIER,
+      });
+      expect(res.status).toBe(400);
+      expect(await oauthError(res)).toBe("invalid_grant");
+    } finally {
+      await setProvider({});
+    }
+  });
+
+  test("an upstream sign-in finishing after the issuer changed stores no credential under the provider's name", async () => {
+    if (!etcdReachable) return;
+    await ownKey("jonas");
+    provider.claims = claimsOf("jonas", "jonas");
+    upstream.user = "up-jonas";
+    const browser = new Browser();
+    const atUpstream = await browser.walk(authorizeUrl(url()), { landing: upstream.url });
+    if (atUpstream.kind !== "landed") throw new Error(`stopped: ${atUpstream.status} ${atUpstream.text}`);
+
+    try {
+      await setProvider({ issuer: elsewhere() });
+      const refused = await browser.walk(atUpstream.url);
+      if (refused.kind !== "page") throw new Error(`landed: ${refused.url}`);
+      expect(refused.status).toBe(400);
+      expect(refused.text).toContain("identity provider changed");
+    } finally {
+      await setProvider({});
+    }
+
+    // Had the credential been kept, this pass would not need the upstream.
+    const seen = upstream.authorizeRequests.length;
+    await signInByHand(url());
+    expect(upstream.authorizeRequests.length).toBe(seen + 1);
+  });
+
   test("a disabled or expired key answers as it does to a JWT, and refresh is refused until it is back", async () => {
     if (!etcdReachable) return;
     provider.claims = claimsOf("omar", "lifecycle");

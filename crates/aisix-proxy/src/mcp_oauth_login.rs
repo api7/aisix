@@ -519,7 +519,7 @@ async fn handle_login_callback(state: &ProxyState, request: Parts) -> Result<Res
     };
 
     // RFC 9207: a provider that says who it is must be the one this flow went to.
-    if param("iss").is_some_and(|iss| iss.trim_end_matches('/') != issuer.trim_end_matches('/')) {
+    if param("iss").is_some_and(|iss| !same_issuer(iss, issuer)) {
         tracing::warn!(target: "aisix::mcp_oauth", provider = %provider.name,
             "an authentication response named an unexpected issuer");
         return Err(error_page(
@@ -812,6 +812,23 @@ async fn handle_callback(state: &ProxyState, request: Parts) -> Result<Response,
         return to_consent(&base, &keys, flow, stage);
     };
 
+    // The credential is stored under the provider's name, which by now may mean
+    // another identity provider, and so another person with this identity value.
+    let issuer_is_current = snapshot
+        .oidc_providers
+        .get_by_name(&signed_in.provider)
+        .is_some_and(|provider| session_issuer_is_current(&provider.value, &signed_in.claims));
+    if !issuer_is_current {
+        state
+            .metrics
+            .record_auth_decision("mcp_oauth_login", false, SESSION_ISSUER_CHANGED);
+        return Err(error_page(
+            StatusCode::BAD_REQUEST,
+            "This sign-in was refused",
+            "This gateway's identity provider changed during the sign-in. Start again from the \
+             MCP client.",
+        ));
+    }
     let oauth = server_of(&snapshot, &flow).ok_or_else(misconfigured_page)?;
     let subject = UserSubject::jwt(&signed_in.provider, &signed_in.identity);
     state
@@ -921,6 +938,25 @@ async fn handle_consent(state: &ProxyState, request: Request) -> Result<Response
 
 // ── Who a session is ────────────────────────────────────────────────────────
 
+const SESSION_ISSUER_CHANGED: &str = "session_issuer_changed";
+
+/// Two spellings of one issuer, which may differ by a trailing slash.
+fn same_issuer(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
+/// Whether the identity provider that signed this session in is still the one
+/// its provider name points at. The name alone cannot say: repointed at another
+/// identity provider, it can give the same identity value to another person,
+/// who must not inherit this session or be reached through it.
+fn session_issuer_is_current(provider: &OidcProvider, claims: &serde_json::Value) -> bool {
+    let recorded = claims.get("iss").and_then(serde_json::Value::as_str);
+    match (recorded, provider.issuer.as_deref()) {
+        (Some(recorded), Some(current)) => same_issuer(recorded, current),
+        _ => false,
+    }
+}
+
 struct Principal {
     subject: String,
     auth: AuthenticatedKey,
@@ -1024,6 +1060,9 @@ pub(crate) async fn authenticate_session(
     else {
         return Err(refused("session_provider_gone"));
     };
+    if !session_issuer_is_current(&provider.value, &session.claims) {
+        return Err(refused(SESSION_ISSUER_CHANGED));
+    }
     let principal = session_principal(state, &snapshot, &provider.value, &session.claims).map_err(
         |denial| {
             note_refusal(denial.reason);
@@ -1182,8 +1221,9 @@ fn still_authorized(
         .get_by_name(&identity.provider)
         .filter(|entry| entry.value.enabled)
         .is_some_and(|provider| {
-            session_principal(state, snapshot, &provider.value, &identity.claims)
-                .is_ok_and(|principal| principal.subject == identity.identity)
+            session_issuer_is_current(&provider.value, &identity.claims)
+                && session_principal(state, snapshot, &provider.value, &identity.claims)
+                    .is_ok_and(|principal| principal.subject == identity.identity)
         })
 }
 
@@ -1272,6 +1312,31 @@ mod tests {
         );
         assert!(!body.contains("<script>"), "{body}");
         assert!(body.contains("a&amp;b"), "{body}");
+    }
+
+    #[test]
+    fn a_session_belongs_to_the_issuer_it_recorded() {
+        let provider = |issuer: serde_json::Value| -> OidcProvider {
+            serde_json::from_value(json!({"name": "corp", "issuer": issuer, "audiences": ["a"]}))
+                .unwrap()
+        };
+        let idp = provider(json!("https://idp.example.com"));
+        let current = |claims: serde_json::Value| session_issuer_is_current(&idp, &claims);
+
+        assert!(current(json!({"iss": "https://idp.example.com"})));
+        assert!(current(json!({"iss": "https://idp.example.com/"})));
+        assert!(session_issuer_is_current(
+            &provider(json!("https://idp.example.com/")),
+            &json!({"iss": "https://idp.example.com"}),
+        ));
+
+        assert!(!current(json!({"iss": "https://other.example.com"})));
+        assert!(!current(json!({"sub": "alice"})));
+        assert!(!current(json!({"iss": 1})));
+        assert!(!session_issuer_is_current(
+            &provider(serde_json::Value::Null),
+            &json!({"iss": "https://idp.example.com"}),
+        ));
     }
 
     #[test]
