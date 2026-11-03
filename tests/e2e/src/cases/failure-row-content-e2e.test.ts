@@ -552,7 +552,10 @@ describe("failure rows carry request and response bodies", () => {
     expect(res.status).toBe(500);
     await res.text();
     const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the bodyless passthrough row");
-    expect(row.get("response")).toContain("sentinel-passthrough-answer");
+    // As sent, not the gateway's own envelope quoting it.
+    expect(JSON.parse(row.get("response")!)).toEqual({
+      error: { message: "sentinel-passthrough-answer" },
+    });
   });
 
   test("a passthrough route's upstream failure carries both bodies", async () => {
