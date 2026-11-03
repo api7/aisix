@@ -1373,7 +1373,7 @@ fn note_blocked_tool_call(
     bytes: &[u8],
 ) {
     crate::usage_attr::note_failure_request(snapshot, || {
-        match rewrite_tool_arguments(chain, bytes) {
+        match rewrite_tool_arguments(&chain.without_audit(), bytes) {
             Ok(Some((masked, _))) => tool_call_prompt(&masked),
             _ => tool_call_prompt(bytes),
         }

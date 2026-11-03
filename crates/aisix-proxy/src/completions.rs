@@ -477,7 +477,10 @@ async fn dispatch(
             );
             // A blocked request exports what the success path would have sent.
             if crate::usage_attr::content_cap(snapshot).is_some() {
-                crate::redact::redact_completions_request(&resolved_chain, &mut body);
+                crate::redact::redact_completions_request(
+                    &resolved_chain.without_audit(),
+                    &mut body,
+                );
                 crate::usage_attr::note_failure_request(snapshot, || body.to_string());
             }
             return Err(crate::error::guardrail_block_error(

@@ -1340,9 +1340,9 @@ async fn multipart_dispatch(
                 // A blocked request exports what the success path would have sent.
                 if crate::usage_attr::content_cap(snapshot).is_some() {
                     crate::dispatch::mask_prompt_fields(
-                        &resolved_chain,
+                        &resolved_chain.without_audit(),
                         &mut fields,
-                        &mut redactions,
+                        &mut crate::redact::RedactionCounts::new(),
                     );
                     crate::usage_attr::note_failure_request(snapshot, || {
                         captured_transcription_fields(&fields)
@@ -2182,7 +2182,7 @@ async fn speech_dispatch(
             );
             // A blocked request exports what the success path would have sent.
             if crate::usage_attr::content_cap(snapshot).is_some() {
-                crate::redact::redact_speech_request(&resolved_chain, &mut body);
+                crate::redact::redact_speech_request(&resolved_chain.without_audit(), &mut body);
                 crate::usage_attr::note_failure_request(snapshot, || body.to_string());
             }
             return Err(crate::error::guardrail_block_error(

@@ -208,6 +208,16 @@ impl GuardrailChain {
         self
     }
 
+    /// This chain with no audit log, for masking a copy of the request that
+    /// only an export reads: what a request's row says the guardrails did must
+    /// not depend on which exporters are configured.
+    pub fn without_audit(&self) -> Self {
+        Self {
+            audit: None,
+            ..self.clone()
+        }
+    }
+
     /// The similarity scores recorded on this request so far
     /// (AISIX-Cloud#1467). Empty when no scoring guardrail ran or when the
     /// chain carries no log. Non-destructive — see

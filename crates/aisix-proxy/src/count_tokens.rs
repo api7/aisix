@@ -410,7 +410,7 @@ async fn screen_input(
         );
         // A blocked request exports what the success path would have sent.
         if crate::usage_attr::content_cap(snapshot).is_some() {
-            crate::redact::redact_anthropic_request(&chain, body);
+            crate::redact::redact_anthropic_request(&chain.without_audit(), body);
             crate::usage_attr::note_failure_request(snapshot, || body.to_string());
         }
         return Err(crate::error::guardrail_block_error(

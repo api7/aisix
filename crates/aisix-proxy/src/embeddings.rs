@@ -538,7 +538,7 @@ async fn dispatch(
             // A blocked request exports what the success path would have sent.
             if crate::usage_attr::content_cap(snapshot).is_some() {
                 mask_input(
-                    &resolved_chain,
+                    &resolved_chain.without_audit(),
                     &mut body.input,
                     &mut crate::redact::RedactionCounts::new(),
                 );

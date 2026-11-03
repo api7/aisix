@@ -463,9 +463,9 @@ async fn dispatch(
                 // A blocked request exports what the success path would have sent.
                 if crate::usage_attr::content_cap(snapshot).is_some() {
                     crate::dispatch::mask_prompt_fields(
-                        &resolved_chain,
+                        &resolved_chain.without_audit(),
                         &mut fields,
-                        &mut redactions,
+                        &mut crate::redact::RedactionCounts::new(),
                     );
                     crate::usage_attr::note_failure_request(snapshot, || {
                         captured_edit_fields(&fields)
