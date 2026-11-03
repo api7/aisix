@@ -312,6 +312,13 @@ pub struct McpAccessLog<'a> {
     pub tools_returned: Option<u32>,
 }
 
+/// What a failure says when nothing more specific reached the record: the
+/// usage event's `error_message` and the access log's `error`, so the two read
+/// the same.
+pub fn request_failed_message(status: u16) -> String {
+    format!("request failed with status {status}")
+}
+
 impl AccessLog<'_> {
     /// Emit a single `tracing::info!` event carrying every field, unless
     /// `observability.access_log` is off. When on, the line is filtered by
@@ -325,6 +332,8 @@ impl AccessLog<'_> {
             return;
         }
         let mcp = self.mcp.as_ref();
+        let fallback_error = (self.status >= 400 && self.error.is_none())
+            .then(|| request_failed_message(self.status));
         tracing::info!(
             method = self.method,
             path = self.path,
@@ -345,7 +354,7 @@ impl AccessLog<'_> {
             routing_attempt_count = self.routing_attempt_count,
             routing_fallback_count = self.routing_fallback_count,
             error_class = self.error_kind,
-            error = self.error,
+            error = self.error.or(fallback_error.as_deref()),
             cache_status = self.cache.as_ref().map(|c| c.status),
             cache_hit_layer = self.cache.as_ref().and_then(|c| c.hit_layer),
             mcp_method = mcp.and_then(|m| m.method),

@@ -162,19 +162,43 @@ type UpstreamDial = Result<
 >;
 
 /// What a failed dial reports. An upgrade the upstream answered with an error
-/// names its status and what it said, in the wording of an HTTP route's upstream
-/// failure; the caller's frame is fixed text either way.
+/// names its status, and what it said when that arrived whole, in the wording
+/// of an HTTP route's upstream failure; the caller's frame is fixed text either
+/// way.
 fn connect_failure_text(err: &tokio_tungstenite::tungstenite::Error) -> String {
     match err {
         tokio_tungstenite::tungstenite::Error::Http(response) => {
-            crate::attempt::relayed_failure(
-                response.status().as_u16(),
-                response.body().as_deref().unwrap_or_default(),
-            )
-            .1
+            let status = response.status().as_u16();
+            match complete_handshake_body(response) {
+                Some(body) => crate::attempt::relayed_failure(status, body).1,
+                None => format!("upstream returned HTTP {status} during the realtime handshake"),
+            }
         }
         other => aisix_gateway::error_with_causes(other),
     }
+}
+
+/// The refused upgrade's body, when it is one. tungstenite hands over the raw
+/// bytes that happened to arrive with the response head and drops the socket:
+/// a later part is lost, and chunked framing is left in. Only a `Content-Length`
+/// they satisfy says they are the whole body.
+fn complete_handshake_body(
+    response: &tokio_tungstenite::tungstenite::handshake::client::Response,
+) -> Option<&[u8]> {
+    let headers = response.headers();
+    if headers.contains_key(axum::http::header::TRANSFER_ENCODING)
+        || headers.contains_key(axum::http::header::CONTENT_ENCODING)
+    {
+        return None;
+    }
+    let body = response.body().as_deref()?;
+    let declared: usize = headers
+        .get(axum::http::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()?;
+    (declared == body.len() && !body.iter().all(u8::is_ascii_whitespace)).then_some(body)
 }
 
 /// Dial the upstream Realtime endpoint under the deployment's outbound
@@ -1523,6 +1547,59 @@ fn emit_access_log(
 
 #[cfg(test)]
 mod tests {
+    /// tungstenite gives a refused upgrade only the bytes that came with its
+    /// head, undecoded. Only a body they demonstrably complete is quoted.
+    #[test]
+    fn a_refused_upgrade_quotes_only_a_body_that_arrived_whole() {
+        let refused = |headers: &[(&str, &str)], body: Option<&[u8]>| {
+            let mut response = axum::http::Response::builder().status(400);
+            for (name, value) in headers {
+                response = response.header(*name, *value);
+            }
+            super::connect_failure_text(&tokio_tungstenite::tungstenite::Error::Http(
+                response.body(body.map(<[u8]>::to_vec)).unwrap(),
+            ))
+        };
+        let whole = br#"{"error":{"message":"bad session"}}"#;
+        let length = whole.len().to_string();
+        assert_eq!(
+            refused(&[("content-length", &length)], Some(whole)),
+            "upstream returned HTTP 400: bad session"
+        );
+        let in_handshake = "upstream returned HTTP 400 during the realtime handshake";
+        for (what, headers, body) in [
+            (
+                "detail still on its way",
+                vec![("content-length", "4096")],
+                Some(&b""[..]),
+            ),
+            (
+                "part of the body",
+                vec![("content-length", "4096")],
+                Some(&whole[..]),
+            ),
+            (
+                "chunk sizes in the text",
+                vec![("transfer-encoding", "chunked")],
+                Some(&b"23\r\n{\"error\":{\"message\":\"x\"}}\r\n0\r\n\r\n"[..]),
+            ),
+            ("no length to check against", vec![], Some(&whole[..])),
+            (
+                "compressed",
+                vec![("content-length", "4"), ("content-encoding", "gzip")],
+                Some(&b"\x1f\x8b\x08\x00"[..]),
+            ),
+            ("nothing kept", vec![("content-length", "0")], None),
+            (
+                "an empty body",
+                vec![("content-length", "0")],
+                Some(&b""[..]),
+            ),
+        ] {
+            assert_eq!(refused(&headers, body), in_handshake, "{what}");
+        }
+    }
+
     /// `LIBRARY_REJECTED_CLOSE` mirrors a literal private to tungstenite;
     /// this fails if a tungstenite bump changes what it substitutes.
     #[tokio::test]

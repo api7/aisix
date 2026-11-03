@@ -1960,6 +1960,8 @@ mod tests {
             .expect("the 501 must emit its zero-token UsageEvent")
             .expect("usage sink remains open");
         assert_eq!(ev.status_code, 501);
+        assert_eq!(ev.error_class, "config", "{ev:?}");
+        assert!(ev.error_message.contains("does not support"), "{ev:?}");
         assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
         assert!(ev.guardrail_enforced_hits.is_empty(), "{ev:?}");
 

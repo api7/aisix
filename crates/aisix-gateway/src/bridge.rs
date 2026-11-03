@@ -402,7 +402,7 @@ pub enum BridgeError {
     /// [`UpstreamDecode`](Self::UpstreamDecode) keeps the provider's
     /// own error type/message intact instead of surfacing a serde
     /// parse failure (AISIX-Cloud#1222 scenario 3).
-    #[error("upstream reported an in-band stream error: {message}")]
+    #[error("{}", in_band_display(.message, .parsed.as_deref()))]
     UpstreamInBand {
         status: Option<u16>,
         message: String,
@@ -558,6 +558,9 @@ impl BridgeError {
             Self::UpstreamStatus {
                 status, message, ..
             } => format!("upstream returned HTTP {status}: {message}"),
+            Self::UpstreamInBand { message, .. } => {
+                format!("{IN_BAND_STREAM_ERROR}: {message}")
+            }
             other => other.to_string(),
         }
     }
@@ -570,6 +573,19 @@ fn upstream_status_display(status: u16, message: &str, diagnostic: Option<&str>)
             format!("upstream returned HTTP {status} with no error detail in the response")
         }
         None => format!("upstream returned HTTP {status}: {message}"),
+    }
+}
+
+const IN_BAND_STREAM_ERROR: &str = "upstream reported an in-band stream error";
+
+fn in_band_display(message: &str, parsed: Option<&UpstreamErrorView>) -> String {
+    if !message.chars().all(|c| c.is_control() || c.is_whitespace()) {
+        return format!("{IN_BAND_STREAM_ERROR}: {message}");
+    }
+    let named = parsed.and_then(|p| p.code.as_deref().or(p.kind.as_deref()));
+    match named {
+        Some(name) => format!("{IN_BAND_STREAM_ERROR} with no message: {name}"),
+        None => format!("{IN_BAND_STREAM_ERROR} with no message"),
     }
 }
 
@@ -1223,6 +1239,41 @@ mod tests {
 
     /// The wording of a blank message is the error's `Display`, and its
     /// `message` stays blank for the client's status fallback.
+    /// An in-band error with an empty message says so where telemetry reads
+    /// it; the stream's error frame keeps what the caller has always been sent.
+    #[test]
+    fn a_blank_in_band_message_is_named_without_changing_the_callers_frame() {
+        let in_band = |payload: serde_json::Value| {
+            capture_in_band_error_value(&payload, UpstreamWire::OpenAI).unwrap()
+        };
+        let with_code =
+            in_band(serde_json::json!({"error": {"message": "", "code": "overloaded"}}));
+        assert_eq!(
+            with_code.to_string(),
+            "upstream reported an in-band stream error with no message: overloaded"
+        );
+        assert_eq!(
+            with_code.stream_frame_message(),
+            "upstream reported an in-band stream error: "
+        );
+        let bare = BridgeError::UpstreamInBand {
+            status: None,
+            message: " \n".into(),
+            parsed: None,
+            wire: UpstreamWire::OpenAI,
+        };
+        assert_eq!(
+            bare.to_string(),
+            "upstream reported an in-band stream error with no message"
+        );
+        let named = in_band(serde_json::json!({"error": {"message": "boom"}}));
+        assert_eq!(
+            named.to_string(),
+            "upstream reported an in-band stream error: boom"
+        );
+        assert_eq!(named.stream_frame_message(), named.to_string());
+    }
+
     #[test]
     fn upstream_status_display_names_what_a_blank_message_means() {
         for blank in ["", " \n", "\u{1}\u{2028}"] {

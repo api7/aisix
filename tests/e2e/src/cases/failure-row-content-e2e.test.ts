@@ -2,11 +2,12 @@ import { createHash } from "node:crypto";
 import { randomUUID } from "node:crypto";
 import { createServer, type Server as HttpServer } from "node:http";
 import { createServer as createTcpServer, type Server as TcpServer } from "node:net";
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 import { WebSocket as WsClient } from "ws";
 import {
   EtcdClient,
   SeedClient,
+  expectFailureRowsNamed,
   slsLogsFor,
   spawnApp,
   startMcpUpstream,
@@ -35,6 +36,8 @@ const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 const CREDENTIAL_REF = "mock";
 const FULL = "failure-row-full";
 const META = "failure-row-meta";
+const CAPPED = "failure-row-capped";
+const CAPPED_MAX_BYTES = 2048;
 
 const NO_DETAIL = (status: number) =>
   `upstream returned HTTP ${status} with no error detail in the response`;
@@ -166,6 +169,17 @@ describe("failure rows carry request and response bodies", () => {
         content_mode,
       });
     }
+    await seed.createObservabilityExporter({
+      name: CAPPED,
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: "aisix-e2e-obs",
+      logstore: CAPPED,
+      credential_ref: CREDENTIAL_REF,
+      content_mode: "full",
+      content_max_bytes: CAPPED_MAX_BYTES,
+    });
 
     for (const status of [400, 401, 403]) {
       await failingModel(`row-${status}`, {
@@ -409,6 +423,11 @@ describe("failure rows carry request and response bodies", () => {
     await sls?.close();
   });
 
+  afterEach(() => {
+    if (!etcdReachable) return;
+    for (const logstore of [FULL, META, CAPPED]) expectFailureRowsNamed(sls!, logstore);
+  });
+
   async function chat(model: string, content: string) {
     const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
       method: "POST",
@@ -453,6 +472,44 @@ describe("failure rows carry request and response bodies", () => {
       });
     },
   );
+
+  test("a request over content_max_bytes keeps its cut request on the failure row", async () => {
+    if (!etcdReachable) return;
+    const prompt = "oversized-request-prompt";
+    const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "row-400",
+        messages: [{ role: "user", content: prompt }],
+        tools: Array.from({ length: 64 }, (_, i) => ({
+          type: "function",
+          function: {
+            name: `oversized_tool_${i}`,
+            description: "a tool description long enough to matter ".repeat(8),
+            parameters: { type: "object", properties: { value: { type: "string" } } },
+          },
+        })),
+      }),
+    });
+    const body = await res.text();
+    expect(res.status).toBe(400);
+    const requestId = res.headers.get("x-aisix-request-id")!;
+    const row = await waitForSlsLog(
+      sls!,
+      CAPPED,
+      (l) => l.get("request_id") === requestId,
+      "the capped failure row",
+    );
+    expect(row.get("error_message")).toContain("sentinel-body-400");
+    expect(requestText(row)).toContain(prompt);
+    expect(row.get("content_truncated") ?? row.get("truncated")).toBe("true");
+    expect(body).toContain("sentinel-body-400");
+    // The uncapped exporter on the same request has the whole thing.
+    const whole = JSON.stringify(Object.fromEntries(await rowOf(requestId, "the uncapped row")));
+    expect(whole).toContain("oversized_tool_63");
+    expect(JSON.stringify(Object.fromEntries(row)).length).toBeLessThan(whole.length);
+  });
 
   test("a model the key may not use still records what was sent and answered", async () => {
     if (!etcdReachable) return;
