@@ -12,6 +12,8 @@
 mod discovery;
 mod flow;
 mod http;
+mod login;
+mod session;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -25,17 +27,25 @@ use sha2::{Digest, Sha256};
 use crate::error::UserOAuthFailure;
 use crate::shared_store::{PutCondition, SharedStore, StoreError};
 
-pub use flow::{AuthorizationRequest, CompletedFlow, RedeemError, RedeemRequest};
+pub use flow::{
+    pkce_pair, FlowStage, FlowState, RedeemError, RedeemRequest, RelayedCode, UpstreamLeg,
+    FLOW_TTL_SECS,
+};
+pub use login::{LoginCode, LoginEndpoints, LoginExchange};
+pub use session::{
+    SessionIdentity, SessionKeys, SessionToken, SessionTokenPair, ACCESS_TOKEN_PREFIX,
+    ACCESS_TOKEN_TTL_SECS,
+};
 
 const NS_TOKEN: &str = "mcp_oauth_token";
 const NS_CLIENT: &str = "mcp_oauth_client";
-const NS_FLOW: &str = "mcp_oauth_flow";
 const NS_CODE: &str = "mcp_oauth_code";
 const NS_LEASE: &str = "mcp_oauth_lease";
+const NS_SESSION_KEY: &str = "mcp_oauth_session_key";
+const NS_REFRESH_USED: &str = "mcp_oauth_refresh_used";
 
 const TOKEN_TTL: Duration = Duration::from_secs(365 * 24 * 3600);
 const CLIENT_TTL: Duration = Duration::from_secs(365 * 24 * 3600);
-const FLOW_TTL: Duration = Duration::from_secs(600);
 const CODE_TTL: Duration = Duration::from_secs(120);
 const LEASE_TTL: Duration = Duration::from_secs(60);
 /// How far ahead of its lease's expiry a refresh stops waiting, leaving time
@@ -91,7 +101,6 @@ pub struct UserOAuthServer {
     pub id: String,
     pub name: String,
     pub url: String,
-    pub trusted_redirect_origins: Vec<String>,
     client_id: Option<String>,
     client_secret: Option<String>,
     authorization_url: Option<String>,
@@ -111,7 +120,6 @@ impl UserOAuthServer {
             id: id.to_owned(),
             name: server.name.clone(),
             url: server.url.clone(),
-            trusted_redirect_origins: server.trusted_redirect_origins.clone(),
             client_id: non_empty(&server.client_id),
             client_secret: non_empty(&server.secret),
             authorization_url: non_empty(&server.authorization_url),
@@ -210,8 +218,8 @@ fn token_key(server: &UserOAuthServer, subject: &UserSubject) -> String {
     ])
 }
 
-/// An unguessable URL-safe value for a flow state or an authorization code.
-fn random_token() -> String {
+/// An unguessable URL-safe value for a flow handle or an authorization code.
+pub fn random_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -228,6 +236,8 @@ pub struct UserOAuthManager {
     inflight: Mutex<HashMap<String, Flight>>,
     discovery: discovery::DiscoveryCache,
     registrations: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    login_discovery: login::LoginDiscoveryCache,
+    session_key: session::SessionKeyCache,
 }
 
 impl UserOAuthManager {
@@ -238,6 +248,8 @@ impl UserOAuthManager {
             inflight: Mutex::default(),
             discovery: discovery::DiscoveryCache::default(),
             registrations: Mutex::default(),
+            login_discovery: login::LoginDiscoveryCache::default(),
+            session_key: session::SessionKeyCache::default(),
         }
     }
 
@@ -693,6 +705,51 @@ mod tests {
     use crate::shared_store::{MemoryStore, StoredValue};
     use async_trait::async_trait;
 
+    /// A store that can be taken down and brought back.
+    #[derive(Default)]
+    pub(super) struct SwitchableStore {
+        inner: MemoryStore,
+        down: std::sync::atomic::AtomicBool,
+    }
+
+    impl SwitchableStore {
+        pub(super) fn fail(&self, down: bool) {
+            self.down.store(down, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn check(&self) -> Result<(), StoreError> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(StoreError::Unavailable)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SharedStore for SwitchableStore {
+        async fn get(&self, ns: &str, key: &str) -> Result<Option<StoredValue>, StoreError> {
+            self.check()?;
+            self.inner.get(ns, key).await
+        }
+        async fn put(
+            &self,
+            ns: &str,
+            key: &str,
+            value: Vec<u8>,
+            ttl: Duration,
+            labels: &BTreeMap<&str, &str>,
+            condition: PutCondition,
+        ) -> Result<i64, StoreError> {
+            self.check()?;
+            self.inner.put(ns, key, value, ttl, labels, condition).await
+        }
+        async fn delete(&self, ns: &str, key: &str, v: Option<i64>) -> Result<(), StoreError> {
+            self.check()?;
+            self.inner.delete(ns, key, v).await
+        }
+    }
+
     /// A store whose every call fails, as one in an outage does.
     struct DownStore;
 
@@ -925,6 +982,7 @@ mod tests {
         let stored = StoredValue {
             value: br#"{"access_token":"a","added_later":{"x":1}}"#.to_vec(),
             version: 1,
+            expires_at: None,
         };
         assert_eq!(decode_token(&stored).unwrap().access_token, "a");
     }

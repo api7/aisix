@@ -74,6 +74,8 @@ fn unexpected(status: StatusCode) -> StoreError {
 struct GetResponse {
     value: String,
     version: i64,
+    #[serde(default)]
+    expires_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -104,6 +106,11 @@ impl SharedStore for DpManagerStore {
         Ok(Some(StoredValue {
             value,
             version: body.version,
+            expires_at: body
+                .expires_at
+                .as_deref()
+                .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                .map(|at| at.timestamp()),
         }))
     }
 
@@ -190,6 +197,7 @@ mod tests {
             .unwrap();
         assert_eq!(stored.value, b"hi");
         assert_eq!(stored.version, 7);
+        assert_eq!(stored.expires_at, Some(1_893_456_000));
     }
 
     #[tokio::test]

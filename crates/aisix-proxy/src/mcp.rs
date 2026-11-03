@@ -155,6 +155,31 @@ async fn resolve_caller(
     parts: &mut axum::http::request::Parts,
     scope: Option<&str>,
 ) -> Result<McpCaller, crate::error::ProxyError> {
+    // Ahead of every other credential, and only on a scoped entry: the
+    // session token names one server, and nothing else knows what it is.
+    if let Some(server) = scope {
+        if let Some(token) = crate::mcp_oauth_login::presented_session_token(&parts.headers) {
+            let started = Instant::now();
+            return match crate::mcp_oauth_login::authenticate_session(state, token, server).await {
+                Ok(auth) => {
+                    auth.publish(parts);
+                    if let Some(jwt) = &auth.jwt {
+                        parts.extensions.insert(jwt.clone());
+                    }
+                    crate::attribution::note_authenticated(&auth);
+                    Ok(McpCaller {
+                        auth,
+                        anonymous_allowlist: None,
+                    })
+                }
+                Err(err) => {
+                    crate::auth::emit_denial_access_log(parts, started, &err);
+                    crate::auth::record_denial_metrics(state, parts, started, &err);
+                    Err(err)
+                }
+            };
+        }
+    }
     if !crate::auth::credential_offered(parts) {
         let snapshot = state.snapshot.load();
         if let Some(anon) = crate::mcp_auth::anonymous_entry(state, &snapshot, parts, scope) {
@@ -193,7 +218,17 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
     let (mut parts, body) = request.into_parts();
     let caller = match resolve_caller(&state, &mut parts, scope.as_deref()).await {
         Ok(caller) => caller,
-        Err(err) => return err.into_response(),
+        Err(err) => {
+            let mut response = err.into_response();
+            if let Some(server) = &scope {
+                crate::mcp_oauth::challenge_for_server(
+                    &state.snapshot.load(),
+                    server,
+                    &mut response,
+                );
+            }
+            return response;
+        }
     };
     let McpCaller {
         auth,
@@ -801,7 +836,12 @@ async fn dispatch(
     // Read off `parts` rather than the request that is about to be rebuilt
     // below: only `content-length` was ever rewritten, and that header is
     // never forwarded.
-    let client_headers = parts.headers.clone();
+    let mut client_headers = parts.headers.clone();
+    // Whichever credential admitted this request, a session token is the
+    // gateway's own and no server's `forward_client_headers` may have it.
+    if crate::mcp_oauth_login::presented_session_token(&client_headers).is_some() {
+        client_headers.remove(axum::http::header::AUTHORIZATION);
+    }
     let caller_credentials = caller_credentials(state, &auth, &parts.headers);
     let gateway = match scope {
         // Same snapshot as the resolution above, so the entry is still there.
@@ -1092,15 +1132,15 @@ fn caller_credentials(
     headers: &axum::http::HeaderMap,
 ) -> aisix_mcp::CallerCredentials {
     aisix_mcp::CallerCredentials {
-        delegated_authorization: if crate::auth::admitted_via_gateway_key_header(headers) {
+        // A session token may sit beside `x-aisix-api-key`, and wins over it.
+        delegated_authorization: if crate::auth::admitted_via_gateway_key_header(headers)
+            && crate::mcp_oauth_login::presented_session_token(headers).is_none()
+        {
             headers.get(axum::http::header::AUTHORIZATION).cloned()
         } else {
             None
         },
-        subject_token: auth
-            .jwt
-            .as_ref()
-            .map(|jwt| std::sync::Arc::clone(&jwt.token)),
+        subject_token: auth.jwt.as_ref().and_then(|jwt| jwt.token.clone()),
         user_oauth: Some(aisix_mcp::UserOAuthCaller {
             manager: std::sync::Arc::clone(&state.mcp_oauth),
             subject: crate::mcp_oauth::caller_subject(auth),

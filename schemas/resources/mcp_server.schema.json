@@ -303,7 +303,7 @@
           "type": "string"
         },
         {
-          "description": "Per-user OAuth 2.0 authorization code flow with PKCE, for `type: mcp` only. Each user signs in to the upstream authorization server once; the gateway keeps the resulting tokens and sends that user's access token as `Authorization: Bearer <access_token>`, refreshing it when needed. A caller whose gateway credential has no user cannot use such a server. The upstream tokens never reach the MCP client, and the client's own `Authorization` header is never sent to the server. The public address of the sign-in endpoints comes from `resource_url` in the MCP authentication settings.",
+          "description": "Per-user OAuth 2.0 authorization code flow with PKCE, for `type: mcp` only. Each user signs in to the upstream authorization server once; the gateway keeps the resulting tokens and sends that user's access token as `Authorization: Bearer <access_token>`, refreshing it when needed. A caller whose gateway credential has no user cannot use such a server. The upstream tokens never reach the MCP client, and the client's own `Authorization` header is never sent to the server. The public address of the sign-in endpoints comes from `resource_url` in the MCP authentication settings. A client with no gateway credential can connect when a trust provider in the environment has `login`.",
           "enum": [
             "oauth2_authorization_code"
           ],
@@ -501,13 +501,6 @@
       ],
       "default": "streamable_http",
       "description": "Transport used to reach the upstream server. Streamable HTTP is the only supported transport."
-    },
-    "trusted_redirect_origins": {
-      "description": "Additional origins an MCP client may be redirected back to after signing in, when `auth_type` is `oauth2_authorization_code`. Each entry is a host, a `host:port`, or a `*.example.com` wildcard that matches subdomains only, and applies to `https` redirects. Loopback addresses and the gateway's own origin are always accepted. Ignored otherwise.",
-      "items": {
-        "type": "string"
-      },
-      "type": "array"
     },
     "type": {
       "allOf": [

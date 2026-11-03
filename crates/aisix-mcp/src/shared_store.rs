@@ -20,6 +20,8 @@ use async_trait::async_trait;
 pub struct StoredValue {
     pub value: Vec<u8>,
     pub version: i64,
+    /// When the record's TTL runs out, in Unix seconds, if the backend said.
+    pub expires_at: Option<i64>,
 }
 
 // By hand: a value here may be a token.
@@ -28,6 +30,7 @@ impl std::fmt::Debug for StoredValue {
         f.debug_struct("StoredValue")
             .field("value", &"***redacted***")
             .field("version", &self.version)
+            .field("expires_at", &self.expires_at)
             .finish()
     }
 }
@@ -125,9 +128,8 @@ pub async fn consume(
 }
 
 /// Past this many live entries in one namespace a write answers
-/// [`StoreError::OverQuota`]. Per namespace because the sign-in endpoints write
-/// flows before anyone has authenticated, and a flood of those must not take
-/// the room that signed-in users' tokens and leases need.
+/// [`StoreError::OverQuota`]. Per namespace so that a flood of one kind of record
+/// cannot take the room that signed-in users' tokens and leases need.
 const MEMORY_STORE_MAX_ENTRIES_PER_NAMESPACE: usize = 20_000;
 
 /// The backend for a gateway with no dp-manager. Its contents live in this
@@ -168,6 +170,15 @@ impl SharedStore for MemoryStore {
             .map(|entry| StoredValue {
                 value: entry.value.clone(),
                 version: entry.version,
+                expires_at: Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |now| now.as_secs() as i64)
+                        + entry
+                            .expires_at
+                            .saturating_duration_since(Instant::now())
+                            .as_secs() as i64,
+                ),
             }))
     }
 

@@ -40,6 +40,10 @@ export interface MockControlPlane {
   store: Map<string, StoreRecord>;
   /** Answer every `/dp/store/v1` request with this status instead of serving it. */
   storeStatusOverride: number | undefined;
+  /** `<method> <namespace>/<key>` of every store write served, in arrival order. */
+  storeWrites: string[];
+  /** Every `/dp/telemetry` body, in arrival order. */
+  telemetryBodies: string[];
   close(): Promise<void>;
 }
 
@@ -48,6 +52,8 @@ export interface StoreRecord {
   version: number;
   ttlSeconds: number;
   labels: Record<string, string>;
+  /** Unix milliseconds. */
+  expiresAt: number;
 }
 
 /** The dp-manager's store API: create-only, compare-and-set, idempotent delete. */
@@ -59,25 +65,33 @@ function serveStore(cp: MockControlPlane, req: IncomingMessage, raw: string, res
   const current = cp.store.get(id);
   const ifMatch = req.headers["if-match"];
   if (req.method === "GET") {
-    if (current === undefined) return void json(404, {});
+    if (current === undefined || current.expiresAt <= Date.now()) return void json(404, {});
     return void json(200, {
       value: current.value,
       version: current.version,
-      expires_at: "2099-01-01T00:00:00Z",
+      expires_at: new Date(current.expiresAt).toISOString(),
     });
   }
   if (req.method === "DELETE") {
+    cp.storeWrites.push(`DELETE ${id}`);
     if (ifMatch === undefined || current?.version === Number(ifMatch)) cp.store.delete(id);
     return void json(204);
   }
   if (req.method === "PUT") {
+    cp.storeWrites.push(`PUT ${id}`);
     const createOnly = req.headers["if-none-match"] === "*";
     if (createOnly === (ifMatch !== undefined)) return void json(400, { error: "exactly one precondition" });
     const holds = createOnly ? current === undefined : current?.version === Number(ifMatch);
     if (!holds) return void json(412, {});
     const body = JSON.parse(raw) as { value: string; ttl_seconds: number; labels: Record<string, string> };
     const version = (current?.version ?? 0) + 1;
-    cp.store.set(id, { value: body.value, version, ttlSeconds: body.ttl_seconds, labels: body.labels });
+    cp.store.set(id, {
+      value: body.value,
+      version,
+      ttlSeconds: body.ttl_seconds,
+      labels: body.labels,
+      expiresAt: Date.now() + body.ttl_seconds * 1000,
+    });
     return void json(200, { version });
   }
   json(405, {});
@@ -144,6 +158,8 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
     calls: [],
     store: new Map(),
     storeStatusOverride: undefined,
+    storeWrites: [],
+    telemetryBodies: [],
     close: async () => {},
   };
 
@@ -159,6 +175,7 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
         res.writeHead(200, { "content-type": "application/json" });
         res.end("{}");
       } else if (req.method === "POST" && path === "/dp/telemetry") {
+        cp.telemetryBodies.push(Buffer.concat(chunks).toString("utf8"));
         const status = cp.telemetryStatus;
         cp.telemetryAnswers.push(status);
         res.writeHead(status, { "content-type": "application/json" });

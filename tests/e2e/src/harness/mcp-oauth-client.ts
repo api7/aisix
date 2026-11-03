@@ -49,19 +49,117 @@ export class ClientAuthState implements OAuthClientProvider {
   }
 }
 
-/** Follow redirects as a browser would, until one lands on the client. */
-export async function followBrowser(start: URL | string, landing = OAUTH_CLIENT_REDIRECT): Promise<URL> {
-  let next = start.toString();
-  for (let hop = 0; hop < 6; hop++) {
-    if (next.startsWith(landing)) return new URL(next);
-    const res = await fetch(next, { redirect: "manual" });
-    const location = res.headers.get("location");
-    if (location === null) {
-      throw new Error(`browser stopped at ${next}: HTTP ${res.status} ${await res.text()}`);
-    }
-    next = new URL(location, next).toString();
+/** Where a walk through the browser pass stopped. */
+export type BrowserStop =
+  | { kind: "landed"; url: URL }
+  | { kind: "page"; url: string; status: number; text: string };
+
+/**
+ * A browser with a cookie jar, honouring what a browser honours of a cookie:
+ * its path and its lifetime. A consent page is clicked through unless the walk
+ * is told to stop at it.
+ */
+export class Browser {
+  cookies = new Map<string, { value: string; path: string }>();
+  /** Every `Set-Cookie` received, verbatim. */
+  setCookies: string[] = [];
+  /** Every consent page shown, verbatim. */
+  consentPages: string[] = [];
+  /** Every URL requested, in order. */
+  visited: string[] = [];
+
+  private cookieHeader(url: URL): Record<string, string> {
+    const matching = [...this.cookies]
+      .filter(([, cookie]) => url.pathname === cookie.path || url.pathname.startsWith(`${cookie.path.replace(/\/$/, "")}/`))
+      .map(([name, cookie]) => `${name}=${cookie.value}`);
+    return matching.length === 0 ? {} : { cookie: matching.join("; ") };
   }
-  throw new Error("too many redirects");
+
+  private remember(res: Response): void {
+    for (const raw of res.headers.getSetCookie()) {
+      this.setCookies.push(raw);
+      const [pair, ...attributes] = raw.split(";").map((part) => part.trim());
+      const separator = pair.indexOf("=");
+      const name = pair.slice(0, separator);
+      const attribute = (key: string) =>
+        attributes.find((a) => a.toLowerCase().startsWith(`${key}=`))?.slice(key.length + 1);
+      if (attribute("max-age") === "0") this.cookies.delete(name);
+      else this.cookies.set(name, { value: pair.slice(separator + 1), path: attribute("path") ?? "/" });
+    }
+  }
+
+  async request(url: string, init: RequestInit = {}): Promise<Response> {
+    this.visited.push(url);
+    const res = await fetch(url, {
+      redirect: "manual",
+      ...init,
+      headers: { ...(init.headers as Record<string, string>), ...this.cookieHeader(new URL(url)) },
+    });
+    this.remember(res);
+    return res;
+  }
+
+  /** Follow redirects until the browser lands on `landing` or a page. */
+  async walk(start: URL | string, options: { landing?: string; clickAllow?: boolean } = {}): Promise<BrowserStop> {
+    const landing = options.landing ?? OAUTH_CLIENT_REDIRECT;
+    const clickAllow = options.clickAllow ?? true;
+    let next = start.toString();
+    let res: Response | undefined;
+    for (let hop = 0; hop < 12; hop++) {
+      if (next.startsWith(landing)) return { kind: "landed", url: new URL(next) };
+      res = await this.request(next);
+      let location = res.headers.get("location");
+      if (location === null) {
+        const text = await res.text();
+        if (!isConsentPage(text)) return { kind: "page", url: next, status: res.status, text };
+        this.consentPages.push(text);
+        if (!clickAllow) return { kind: "page", url: next, status: res.status, text };
+        res = await this.allow(text);
+        location = res.headers.get("location");
+        if (location === null) {
+          return { kind: "page", url: next, status: res.status, text: await res.text() };
+        }
+      }
+      next = new URL(location, next).toString();
+    }
+    throw new Error("too many redirects");
+  }
+
+  /** Submit a consent page's form, as its `Allow` button does. */
+  allow(page: string): Promise<Response> {
+    const form = consentForm(page);
+    return this.request(form.action, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(form.fields).toString(),
+    });
+  }
+}
+
+const isConsentPage = (text: string) => /<form[^>]*>/.test(text) && /<button[^>]*>\s*Allow\s*<\/button>/.test(text);
+
+/** The action and hidden fields of a consent page's form. */
+export function consentForm(page: string): { action: string; fields: Record<string, string> } {
+  const action = /<form[^>]*action="([^"]+)"/.exec(page)?.[1];
+  if (action === undefined) throw new Error(`no form in: ${page}`);
+  const fields: Record<string, string> = {};
+  for (const match of page.matchAll(/<input type="hidden" name="([^"]+)" value="([^"]*)"/g)) {
+    fields[match[1]] = match[2];
+  }
+  return { action, fields };
+}
+
+/** Follow redirects as a browser would, until one lands on the client. */
+export async function followBrowser(
+  start: URL | string,
+  landing = OAUTH_CLIENT_REDIRECT,
+  browser = new Browser(),
+): Promise<URL> {
+  const stop = await browser.walk(start, { landing });
+  if (stop.kind === "page") {
+    throw new Error(`browser stopped at ${stop.url}: HTTP ${stop.status} ${stop.text}`);
+  }
+  return stop.url;
 }
 
 export async function connectMcpClient(
@@ -86,6 +184,7 @@ export async function signInMcpClient(
   url: string,
   headers: Record<string, string>,
   state = new ClientAuthState(),
+  browser = new Browser(),
 ): Promise<{ state: ClientAuthState; client: Client }> {
   const transport = new StreamableHTTPClientTransport(new URL(url), {
     authProvider: state,
@@ -99,7 +198,7 @@ export async function signInMcpClient(
   if (!(refused instanceof UnauthorizedError)) {
     throw new Error(`expected a sign-in challenge, got: ${String(refused)}`);
   }
-  const landed = await followBrowser(state.browserOpens.at(-1)!);
+  const landed = await followBrowser(state.browserOpens.at(-1)!, OAUTH_CLIENT_REDIRECT, browser);
   const code = landed.searchParams.get("code");
   if (code === null) throw new Error(`sign-in failed: ${landed}`);
   await transport.finishAuth(code);

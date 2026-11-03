@@ -1,22 +1,22 @@
 import { createHash, randomUUID } from "node:crypto";
-import { createServer, request, type Server } from "node:http";
 
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import {
+  Browser,
   ClientAuthState,
   connectMcpClient as connect,
   EtcdClient,
   followBrowser,
   OAUTH_CLIENT_REDIRECT as REDIRECT,
   OAuthMcpUpstream,
-  pickFreePort,
   scrapeMetrics,
   SeedClient,
   signInMcpClient as signIn,
   spawnApp,
   startMockIdp,
+  startPrefixStrippingProxy,
   waitConfigPropagation,
   whoami,
   type MockIdp,
@@ -183,7 +183,6 @@ describe("per-user OAuth to an upstream MCP server", () => {
       registration: false,
       expiresIn: 7200,
       oauthPathPrefix: "/jira/rest/oauth2/latest",
-      refreshNeedsRedirectUri: true,
       staticClient: { id: "jira-client", secret: "jira-secret" },
     });
 
@@ -330,14 +329,28 @@ describe("per-user OAuth to an upstream MCP server", () => {
     expect(main.tokenRequests.length).toBe(before + 1);
   });
 
-  test("the callback consumes its state once", async () => {
+  test("the callback is bound to the browser that started the flow, and a code waits for consent", async () => {
     if (!etcdReachable) return;
-    const authorize = authorizeUrl(url("main"));
-    const toUpstream = await fetch(authorize, { redirect: "manual" });
-    const toCallback = await fetch(toUpstream.headers.get("location")!, { redirect: "manual" });
+    const browser = new Browser();
+    const toUpstream = await browser.request(authorizeUrl(url("main")).toString());
+    const toCallback = await browser.request(toUpstream.headers.get("location")!);
     const callback = toCallback.headers.get("location")!;
-    expect((await fetch(callback, { redirect: "manual" })).status).toBe(302);
-    expect((await fetch(callback, { redirect: "manual" })).status).toBe(400);
+
+    // Another browser, with no flow of its own, gets nowhere with that link.
+    const elsewhere = await fetch(callback, { redirect: "manual" });
+    expect(elsewhere.status).toBe(400);
+    expect(elsewhere.headers.get("location")).toBeNull();
+
+    // This one is shown the consent page, and no code yet.
+    const consent = await browser.request(callback);
+    expect(consent.status).toBe(200);
+    expect(consent.headers.get("location")).toBeNull();
+    const page = await consent.text();
+    expect(page).toContain("Allow");
+    expect(page).toContain("main");
+    expect(page).toContain(new URL(REDIRECT).origin);
+    expect(page).not.toMatch(/upstream-code-/);
+
     expect((await fetch(`${stack.base}/mcp-oauth/callback?state=unknown&code=x`)).status).toBe(400);
   });
 
@@ -523,12 +536,12 @@ describe("per-user OAuth to an upstream MCP server", () => {
 
   test("an authorization response from another issuer is refused", async () => {
     if (!etcdReachable) return;
+    const browser = new Browser();
     const toUpstream = new URL(
-      (await fetch(authorizeUrl(url("main")), { redirect: "manual" })).headers.get("location")!,
+      (await browser.request(authorizeUrl(url("main")).toString())).headers.get("location")!,
     );
-    const back = await fetch(
+    const back = await browser.request(
       `${stack.base}/mcp-oauth/callback?state=${toUpstream.searchParams.get("state")}&code=x&iss=https://other.example`,
-      { redirect: "manual" },
     );
     const landed = new URL(back.headers.get("location")!);
     expect(landed.searchParams.get("error")).toBe("access_denied");
@@ -723,7 +736,6 @@ describe("per-user OAuth to an upstream MCP server", () => {
     const authorize = (params: Record<string, string>) =>
       fetch(authorizeUrl(url("main"), params), { redirect: "manual" });
     for (const redirect_uri of [
-      "https://evil.example/cb",
       "http://evil.example/cb",
       "http://user:pw@127.0.0.1/cb",
       "http://127.0.0.1/cb#fragment",
@@ -734,7 +746,8 @@ describe("per-user OAuth to an upstream MCP server", () => {
       expect(res.headers.get("location"), redirect_uri).toBeNull();
     }
     expect((await authorize({ redirect_uri: "cursor://anysphere.cursor-mcp/oauth/callback" })).status).toBe(302);
-    expect((await authorize({ redirect_uri: `${stack.base}/ui/callback` })).status).toBe(302);
+    // Any https address may be asked for: the consent page names it.
+    expect((await authorize({ redirect_uri: "https://chat.example.org/oauth/cb" })).status).toBe(302);
 
     const downgrades: Record<string, string>[] = [{ code_challenge_method: "plain" }, { code_challenge: "" }];
     for (const params of downgrades) {
@@ -747,11 +760,11 @@ describe("per-user OAuth to an upstream MCP server", () => {
 
   test("the upstream's refusal goes back to the client with the client's state", async () => {
     if (!etcdReachable) return;
+    const browser = new Browser();
     const authorize = authorizeUrl(url("main"), { state: "mine" });
-    const toUpstream = new URL((await fetch(authorize, { redirect: "manual" })).headers.get("location")!);
-    const back = await fetch(
+    const toUpstream = new URL((await browser.request(authorize.toString())).headers.get("location")!);
+    const back = await browser.request(
       `${stack.base}/mcp-oauth/callback?state=${toUpstream.searchParams.get("state")}&error=access_denied`,
-      { redirect: "manual" },
     );
     const landed = new URL(back.headers.get("location")!);
     expect(landed.searchParams.get("error")).toBe("access_denied");
@@ -776,7 +789,7 @@ describe("per-user OAuth to an upstream MCP server", () => {
         token_endpoint: `${stack.base}/mcp/main/oauth/token`,
         registration_endpoint: `${stack.base}/mcp/main/oauth/register`,
         code_challenge_methods_supported: ["S256"],
-        grant_types_supported: ["authorization_code"],
+        grant_types_supported: ["authorization_code", "refresh_token"],
         token_endpoint_auth_methods_supported: ["none"],
         jwks_uri: `${stack.base}/mcp/main/.well-known/jwks.json`,
       });
@@ -807,9 +820,11 @@ describe("per-user OAuth to an upstream MCP server", () => {
       "/mcp/main/.well-known/jwks.json",
       "/mcp/main/oauth/authorize",
       "/mcp-oauth/callback",
+      "/mcp-oauth/login/callback",
     ];
     await Promise.all(plainGets.map((path) => fetch(`${stack.base}${path}`, { redirect: "manual" })));
     await fetch(`${url("main")}/oauth/register`, { method: "POST", body: "{}" });
+    await fetch(`${stack.base}/mcp-oauth/consent`, { method: "POST", redirect: "manual" });
     await fetch(`${url("main")}/oauth/token`, { method: "POST", headers: key(BOB) });
     await fetch(`${url("selfrevoke")}/oauth/credential`, { method: "DELETE", headers: key(NO_USER) });
     await mcpPost(url("main"), key(NO_USER));
@@ -825,53 +840,14 @@ describe("per-user OAuth to an upstream MCP server", () => {
       "/mcp/{server}/oauth/token",
       "/mcp/{server}/oauth/credential",
       "/mcp-oauth/callback",
+      "/mcp-oauth/login/callback",
+      "/mcp-oauth/consent",
       "/mcp/{server}",
     ]) {
       expect(endpoints, endpoint).toContain(endpoint);
     }
   });
 });
-
-/** Forwards `${prefix}/...` to `target` as `/...`; anything else is a 404. */
-async function startPrefixStrippingProxy(prefix: string, target: URL) {
-  const port = await pickFreePort();
-  const seen: string[] = [];
-  const server: Server = createServer((req, res) => {
-    const path = req.url ?? "";
-    if (!path.startsWith(`${prefix}/`)) {
-      res.writeHead(404).end();
-      return;
-    }
-    seen.push(path.split("?")[0]);
-    const upstream = request(
-      {
-        hostname: target.hostname,
-        port: target.port,
-        method: req.method,
-        path: path.slice(prefix.length),
-        headers: req.headers,
-      },
-      (upstreamRes) => {
-        res.writeHead(upstreamRes.statusCode ?? 502, upstreamRes.headers);
-        upstreamRes.pipe(res);
-      },
-    );
-    upstream.on("error", () => {
-      if (res.headersSent) res.destroy();
-      else res.writeHead(502).end();
-    });
-    req.pipe(upstream);
-  });
-  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
-  return {
-    url: `http://127.0.0.1:${port}`,
-    seen,
-    close: () => {
-      server.closeAllConnections();
-      return new Promise<void>((resolve) => server.close(() => resolve()));
-    },
-  };
-}
 
 describe("per-user OAuth behind a front gateway that strips a path prefix", () => {
   const PREFIX = "/team-a/gw";

@@ -1,10 +1,16 @@
 //! The sign-in flow: from an MCP client's authorization request, through the
 //! upstream's redirect back, to tokens stored under the caller's subject.
 //!
-//! The client's PKCE challenge goes upstream and its verifier follows at the
-//! token step, so the gateway never holds a secret of the client's. What the
-//! client receives instead of the upstream's code is a code of the gateway's
-//! own.
+//! Nothing about a flow in progress is stored: its state travels in an
+//! encrypted cookie ([`FlowState`]), so a client backend that requests the
+//! authorization URL with no cookie jar before the browser does leaves nothing
+//! behind. What the client receives at the end is a code of the gateway's own.
+//!
+//! When the client's credential says who is calling at the token step (a
+//! relayed sign-in), the client's PKCE challenge goes upstream and its verifier
+//! follows, so the gateway never holds a secret of the client's. When the
+//! identity is already known from a sign-in at a trust provider, the gateway
+//! runs its own PKCE upstream and stores the tokens as soon as they arrive.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -15,10 +21,10 @@ use sha2::{Digest, Sha256};
 
 use super::discovery::Endpoints;
 use super::http::{send, HttpFailure};
+use super::session::SessionIdentity;
 use super::{
     digest, random_token, unix_now, RegisteredClient, TokenLabels, TokenRecord, UserOAuthManager,
-    UserOAuthServer, UserSubject, CLIENT_TTL, CODE_TTL, FLOW_TTL, NS_CLIENT, NS_CODE, NS_FLOW,
-    NS_TOKEN, TOKEN_TTL,
+    UserOAuthServer, UserSubject, CLIENT_TTL, CODE_TTL, NS_CLIENT, NS_CODE, NS_TOKEN, TOKEN_TTL,
 };
 use crate::error::UserOAuthFailure;
 use crate::shared_store::{consume, PutCondition, StoreError};
@@ -26,26 +32,63 @@ use crate::shared_store::{consume, PutCondition, StoreError};
 /// How many times a sign-in re-reads a record that keeps moving under it.
 const STORE_TOKEN_ATTEMPTS: usize = 3;
 
-/// A validated authorization request from an MCP client.
-pub struct AuthorizationRequest<'a> {
-    pub client_id: &'a str,
-    pub redirect_uri: &'a str,
-    pub state: Option<&'a str>,
-    pub code_challenge: &'a str,
-    pub scope: Option<&'a str>,
-    /// Where the upstream sends the user back to.
-    pub upstream_redirect_uri: &'a str,
+/// How long a flow's cookie lives at each step.
+pub const FLOW_TTL_SECS: i64 = 600;
+
+/// A flow in progress, as the browser carries it. Records written here are
+/// read by gateways of other versions only for the few minutes a flow lives.
+#[derive(Serialize, Deserialize)]
+pub struct FlowState {
+    pub handle: String,
+    /// Unix seconds.
+    pub expires_at: i64,
+    pub server_id: String,
+    pub server_name: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_state: Option<String>,
+    pub code_challenge: String,
+    /// Proves a consent POST came from the page this flow rendered.
+    pub csrf: String,
+    pub stage: FlowStage,
 }
 
+/// Where a flow has got to. A step accepts only the stage before it, which is
+/// what keeps a consent from being given before the sign-in it depends on.
 #[derive(Serialize, Deserialize)]
-struct FlowRecord {
-    server_id: String,
-    server_name: String,
-    client_id: String,
-    redirect_uri: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    client_state: Option<String>,
-    code_challenge: String,
+#[serde(tag = "at", rename_all = "snake_case")]
+pub enum FlowStage {
+    /// The browser is at the trust provider.
+    ProviderLogin {
+        provider: String,
+        verifier: String,
+        nonce: String,
+    },
+    /// The browser is at the upstream authorization server.
+    Upstream {
+        /// Who the upstream's tokens are for, once a trust provider has said.
+        /// Without it the tokens wait for the client's credential at the token
+        /// step.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signed_in: Option<SessionIdentity>,
+        /// The gateway's own PKCE verifier, when the client's is not used.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verifier: Option<String>,
+        leg: UpstreamLeg,
+    },
+    /// The user is deciding.
+    Consent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signed_in: Option<SessionIdentity>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relayed: Option<RelayedCode>,
+    },
+}
+
+/// What the callback needs to remember of an upstream authorization request.
+#[derive(Serialize, Deserialize)]
+pub struct UpstreamLeg {
     upstream_redirect_uri: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resource: Option<String>,
@@ -55,46 +98,53 @@ struct FlowRecord {
     registered_client: Option<RegisteredClient>,
 }
 
+impl UpstreamLeg {
+    /// Whether `iss` from the authorization response (RFC 9207) names the
+    /// authorization server this flow went to.
+    pub fn issuer_matches(&self, iss: &str) -> bool {
+        self.issuer
+            .as_deref()
+            .is_none_or(|issuer| issuer.trim_end_matches('/') == iss.trim_end_matches('/'))
+    }
+
+    /// The upstream's `code`, kept for the client's token request.
+    pub fn relay(self, upstream_code: &str) -> RelayedCode {
+        RelayedCode {
+            upstream_code: upstream_code.to_owned(),
+            leg: self,
+        }
+    }
+}
+
+/// An upstream code waiting for the client's credential at the token step.
+#[derive(Serialize, Deserialize)]
+pub struct RelayedCode {
+    upstream_code: String,
+    leg: UpstreamLeg,
+}
+
+/// An unguessable PKCE verifier and its S256 challenge.
+pub fn pkce_pair() -> (String, String) {
+    let verifier = random_token();
+    let challenge = pkce_challenge(&verifier);
+    (verifier, challenge)
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
 #[derive(Serialize, Deserialize)]
 struct CodeRecord {
     server_id: String,
     client_id: String,
     redirect_uri: String,
     code_challenge: String,
-    upstream_code: String,
-    upstream_redirect_uri: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    resource: Option<String>,
+    relayed: Option<RelayedCode>,
+    /// Who the sign-in established, when a trust provider did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    registered_client: Option<RegisteredClient>,
-}
-
-/// A flow the upstream's redirect has just consumed.
-pub struct CompletedFlow {
-    record: FlowRecord,
-}
-
-impl CompletedFlow {
-    pub fn redirect_uri(&self) -> &str {
-        &self.record.redirect_uri
-    }
-    pub fn client_state(&self) -> Option<&str> {
-        self.record.client_state.as_deref()
-    }
-    pub fn server_name(&self) -> &str {
-        &self.record.server_name
-    }
-    pub fn server_id(&self) -> &str {
-        &self.record.server_id
-    }
-    /// Whether `iss` from the authorization response (RFC 9207) names the
-    /// authorization server this flow went to.
-    pub fn issuer_matches(&self, iss: &str) -> bool {
-        self.record
-            .issuer
-            .as_deref()
-            .is_none_or(|issuer| issuer.trim_end_matches('/') == iss.trim_end_matches('/'))
-    }
+    signed_in: Option<SessionIdentity>,
 }
 
 /// A client's token request.
@@ -127,6 +177,8 @@ pub(super) struct IssuedTokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_at: Option<i64>,
+    pub id_token: Option<String>,
+    pub scope: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -137,6 +189,10 @@ struct TokenBody {
     refresh_token: Option<String>,
     #[serde(default)]
     expires_in: Option<serde_json::Value>,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
     #[serde(default)]
     error: Option<String>,
 }
@@ -159,7 +215,17 @@ pub(super) async fn token_request(
     form: &[(&str, String)],
     timeout: std::time::Duration,
 ) -> TokenOutcome {
-    let response = match send(&server.name, token_endpoint, timeout, |client, url| {
+    token_request_named(&server.name, token_endpoint, form, timeout).await
+}
+
+/// As [`token_request`], for a party that is not an MCP server.
+pub(super) async fn token_request_named(
+    name: &str,
+    token_endpoint: &str,
+    form: &[(&str, String)],
+    timeout: std::time::Duration,
+) -> TokenOutcome {
+    let response = match send(name, token_endpoint, timeout, |client, url| {
         client
             .post(url)
             .header("accept", "application/json")
@@ -191,6 +257,8 @@ pub(super) async fn token_request(
             access_token,
             refresh_token: body.refresh_token.filter(|t| !t.is_empty()),
             expires_at: expires_at(body.expires_in.as_ref()),
+            id_token: body.id_token.filter(|t| !t.is_empty()),
+            scope: body.scope,
         }),
         None => TokenOutcome::Transient,
     }
@@ -231,13 +299,17 @@ struct RegistrationRequest<'a> {
 }
 
 impl UserOAuthManager {
-    /// Start a sign-in: record the flow and return the upstream authorization
-    /// URL to send the user to.
-    pub async fn begin_authorization(
+    /// Where to send the user to sign in to `server`, and what the callback
+    /// will need. `state` comes back on the redirect and `code_challenge`
+    /// goes into the request. `scope` overrides what the server asks for.
+    pub async fn begin_upstream(
         &self,
         server: &UserOAuthServer,
-        request: &AuthorizationRequest<'_>,
-    ) -> Result<String, UserOAuthFailure> {
+        upstream_redirect_uri: &str,
+        state: &str,
+        code_challenge: &str,
+        scope: Option<&str>,
+    ) -> Result<(String, UpstreamLeg), UserOAuthFailure> {
         let endpoints = self.discovery.endpoints(server).await?;
         let authorization_endpoint = endpoints
             .authorization
@@ -248,7 +320,7 @@ impl UserOAuthManager {
             .filter(|u| matches!(u.scheme(), "http" | "https"))
             .ok_or(UserOAuthFailure::Misconfigured)?;
         let registered = self
-            .registered_client(server, &endpoints, request.upstream_redirect_uri)
+            .registered_client(server, &endpoints, upstream_redirect_uri)
             .await?;
         let upstream_client_id = server
             .client_id
@@ -256,33 +328,7 @@ impl UserOAuthManager {
             .or_else(|| registered.as_ref().map(|c| c.client_id.clone()))
             .ok_or(UserOAuthFailure::Misconfigured)?;
 
-        let state = random_token();
-        let record = FlowRecord {
-            server_id: server.id.clone(),
-            server_name: server.name.clone(),
-            client_id: request.client_id.to_owned(),
-            redirect_uri: request.redirect_uri.to_owned(),
-            client_state: request.state.map(str::to_owned),
-            code_challenge: request.code_challenge.to_owned(),
-            upstream_redirect_uri: request.upstream_redirect_uri.to_owned(),
-            resource: endpoints.resource.clone(),
-            issuer: endpoints.issuer.clone(),
-            registered_client: registered,
-        };
-        let labels = BTreeMap::from([("mcp_server_id", server.id.as_str())]);
-        self.store
-            .put(
-                NS_FLOW,
-                &digest(&[&state]),
-                serde_json::to_vec(&record).expect("flow record serializes"),
-                FLOW_TTL,
-                &labels,
-                PutCondition::CreateOnly,
-            )
-            .await
-            .map_err(store_failure)?;
-
-        let scope = request.scope.map(str::to_owned).or_else(|| {
+        let scope = scope.map(str::to_owned).or_else(|| {
             let scopes = if server.scopes.is_empty() {
                 &endpoints.scopes
             } else {
@@ -295,9 +341,9 @@ impl UserOAuthManager {
             query
                 .append_pair("response_type", "code")
                 .append_pair("client_id", &upstream_client_id)
-                .append_pair("redirect_uri", request.upstream_redirect_uri)
-                .append_pair("state", &state)
-                .append_pair("code_challenge", request.code_challenge)
+                .append_pair("redirect_uri", upstream_redirect_uri)
+                .append_pair("state", state)
+                .append_pair("code_challenge", code_challenge)
                 .append_pair("code_challenge_method", "S256");
             if let Some(scope) = &scope {
                 query.append_pair("scope", scope);
@@ -306,28 +352,23 @@ impl UserOAuthManager {
                 query.append_pair("resource", resource);
             }
         }
-        Ok(url.into())
+        Ok((
+            url.into(),
+            UpstreamLeg {
+                upstream_redirect_uri: upstream_redirect_uri.to_owned(),
+                resource: endpoints.resource.clone(),
+                issuer: endpoints.issuer.clone(),
+                registered_client: registered,
+            },
+        ))
     }
 
-    /// Take the flow `state` names, once. `None` is every state this gateway
-    /// did not issue, has already consumed, or has let expire.
-    pub async fn take_flow(&self, state: &str) -> Result<Option<CompletedFlow>, UserOAuthFailure> {
-        let value = consume(self.store.as_ref(), NS_FLOW, &digest(&[state]))
-            .await
-            .map_err(store_failure)?;
-        Ok(value
-            .and_then(|value| serde_json::from_slice(&value).ok())
-            .map(|record| CompletedFlow { record }))
-    }
-
-    /// Keep the upstream's `code` here, and return the single-use code the
-    /// client gets in its place.
-    pub async fn issue_code(
-        &self,
-        flow: CompletedFlow,
-        upstream_code: &str,
-    ) -> Result<String, UserOAuthFailure> {
-        let flow = flow.record;
+    /// The single-use code the client gets for a flow the user has consented
+    /// to.
+    pub async fn issue_code(&self, flow: FlowState) -> Result<String, UserOAuthFailure> {
+        let FlowStage::Consent { signed_in, relayed } = flow.stage else {
+            return Err(UserOAuthFailure::Misconfigured);
+        };
         let code = random_token();
         let labels = BTreeMap::from([("mcp_server_id", flow.server_id.as_str())]);
         let record = CodeRecord {
@@ -335,10 +376,8 @@ impl UserOAuthManager {
             client_id: flow.client_id,
             redirect_uri: flow.redirect_uri,
             code_challenge: flow.code_challenge,
-            upstream_code: upstream_code.to_owned(),
-            upstream_redirect_uri: flow.upstream_redirect_uri,
-            resource: flow.resource,
-            registered_client: flow.registered_client,
+            relayed,
+            signed_in,
         };
         self.store
             .put(
@@ -354,14 +393,12 @@ impl UserOAuthManager {
         Ok(code)
     }
 
-    /// Exchange a gateway-issued code upstream and store the tokens under
-    /// `subject`.
-    pub async fn redeem_code(
-        self: &Arc<Self>,
+    /// Spend `request`'s code, if it is one and everything bound to it matches.
+    async fn take_code(
+        &self,
         server: &UserOAuthServer,
-        subject: &UserSubject,
         request: &RedeemRequest<'_>,
-    ) -> Result<(), RedeemError> {
+    ) -> Result<CodeRecord, RedeemError> {
         let value = consume(self.store.as_ref(), NS_CODE, &digest(&[request.code]))
             .await
             .map_err(|error| {
@@ -371,16 +408,61 @@ impl UserOAuthManager {
             .ok_or(RedeemError::InvalidGrant)?;
         let code: CodeRecord =
             serde_json::from_slice(&value).map_err(|_| RedeemError::InvalidGrant)?;
-        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(Sha256::digest(request.code_verifier.as_bytes()));
         if code.server_id != server.id
             || code.client_id != request.client_id
             || code.redirect_uri != request.redirect_uri
-            || code.code_challenge != challenge
+            || code.code_challenge != pkce_challenge(request.code_verifier)
         {
             return Err(RedeemError::InvalidGrant);
         }
+        Ok(code)
+    }
 
+    /// Spend a code issued for a sign-in at a trust provider, returning who it
+    /// established.
+    pub async fn redeem_session_code(
+        &self,
+        server: &UserOAuthServer,
+        request: &RedeemRequest<'_>,
+    ) -> Result<SessionIdentity, RedeemError> {
+        self.take_code(server, request)
+            .await?
+            .signed_in
+            .ok_or(RedeemError::InvalidGrant)
+    }
+
+    /// Exchange a gateway-issued code upstream and store the tokens under
+    /// `subject`.
+    pub async fn redeem_code(
+        self: &Arc<Self>,
+        server: &UserOAuthServer,
+        subject: &UserSubject,
+        request: &RedeemRequest<'_>,
+    ) -> Result<(), RedeemError> {
+        let relayed = self
+            .take_code(server, request)
+            .await?
+            .relayed
+            .ok_or(RedeemError::InvalidGrant)?;
+        self.exchange_upstream_code(
+            server,
+            subject,
+            &relayed.upstream_code,
+            relayed.leg,
+            request.code_verifier,
+        )
+        .await
+    }
+
+    /// Exchange an upstream code and store the tokens under `subject`.
+    pub async fn exchange_upstream_code(
+        &self,
+        server: &UserOAuthServer,
+        subject: &UserSubject,
+        upstream_code: &str,
+        leg: UpstreamLeg,
+        code_verifier: &str,
+    ) -> Result<(), RedeemError> {
         let token_endpoint = self
             .discovery
             .token_endpoint(server)
@@ -391,14 +473,14 @@ impl UserOAuthManager {
             })?;
         let mut form = vec![
             ("grant_type", "authorization_code".to_owned()),
-            ("code", code.upstream_code),
-            ("redirect_uri", code.upstream_redirect_uri.clone()),
-            ("code_verifier", request.code_verifier.to_owned()),
+            ("code", upstream_code.to_owned()),
+            ("redirect_uri", leg.upstream_redirect_uri.clone()),
+            ("code_verifier", code_verifier.to_owned()),
         ];
-        if let Some(resource) = &code.resource {
+        if let Some(resource) = &leg.resource {
             form.push(("resource", resource.clone()));
         }
-        add_client(&mut form, server, code.registered_client.as_ref());
+        add_client(&mut form, server, leg.registered_client.as_ref());
         let issued = match token_request(server, &token_endpoint, &form, server.timeout).await {
             TokenOutcome::Issued(issued) => issued,
             // The gateway's own registration, which no new sign-in can fix.
@@ -419,9 +501,9 @@ impl UserOAuthManager {
             access_token: issued.access_token,
             refresh_token: issued.refresh_token,
             expires_at: issued.expires_at,
-            resource: code.resource,
-            registered_client: code.registered_client,
-            redirect_uri: Some(code.upstream_redirect_uri),
+            resource: leg.resource,
+            registered_client: leg.registered_client,
+            redirect_uri: Some(leg.upstream_redirect_uri),
         };
         self.store_signed_in(server, subject, &record).await
     }

@@ -786,6 +786,8 @@ describe("every proxy route emits every per-request metric family", () => {
         ["/mcp/:server/oauth/token", "/mcp/{server}/oauth/token", "/mcp/alpha/oauth/token", "POST", 404],
         ["/mcp/:server/oauth/credential", "/mcp/{server}/oauth/credential", "/mcp/alpha/oauth/credential", "DELETE", 404],
         ["/mcp-oauth/callback", "/mcp-oauth/callback", "/mcp-oauth/callback", "GET", 400],
+        ["/mcp-oauth/login/callback", "/mcp-oauth/login/callback", "/mcp-oauth/login/callback", "GET", 400],
+        ["/mcp-oauth/consent", "/mcp-oauth/consent", "/mcp-oauth/consent", "POST", 400],
       ] as const
     ).map(([route, endpoint, path, method, status]) => ({
       route,

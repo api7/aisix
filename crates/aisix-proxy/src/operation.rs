@@ -271,6 +271,14 @@ mod tests {
             "/mcp-oauth/callback",
             Emits::Nothing("part of signing in; no tool is called"),
         ),
+        (
+            "/mcp-oauth/login/callback",
+            Emits::Nothing("part of signing in; no tool is called"),
+        ),
+        (
+            "/mcp-oauth/consent",
+            Emits::Nothing("part of signing in; no tool is called"),
+        ),
         ("/mcp", Emits::Usage(MCP)),
         ("/mcp/", Emits::Usage(MCP)),
         ("/mcp/:server", Emits::Usage(MCP)),
@@ -460,6 +468,8 @@ mod tests {
         "/mcp/:server/oauth/token",
         "/mcp/:server/oauth/credential",
         "/mcp-oauth/callback",
+        "/mcp-oauth/login/callback",
+        "/mcp-oauth/consent",
     ];
 
     #[test]

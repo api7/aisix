@@ -65,6 +65,7 @@ mod jwt_index;
 mod mcp;
 mod mcp_auth;
 mod mcp_oauth;
+mod mcp_oauth_login;
 mod messages;
 mod model_echo;
 mod model_resolve;
@@ -235,7 +236,12 @@ pub fn build_router(state: ProxyState) -> Router {
             "/mcp/:server/oauth/credential",
             axum::routing::delete(mcp_oauth::delete_credential),
         )
-        .route("/mcp-oauth/callback", get(mcp_oauth::callback))
+        .route("/mcp-oauth/callback", get(mcp_oauth_login::callback))
+        .route(
+            "/mcp-oauth/login/callback",
+            get(mcp_oauth_login::login_callback),
+        )
+        .route("/mcp-oauth/consent", post(mcp_oauth_login::consent))
         // Downstream-facing MCP gateway. Authentication (AISIX API key or,
         // with trust providers configured, an IdP-issued JWT) is enforced
         // inside the handler via the `AuthenticatedKey` extractor.
@@ -434,6 +440,8 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
             "/.well-known/oauth-authorization-server/mcp/{server}"
         }
         "/mcp-oauth/callback" => "/mcp-oauth/callback",
+        "/mcp-oauth/login/callback" => "/mcp-oauth/login/callback",
+        "/mcp-oauth/consent" => "/mcp-oauth/consent",
         _ if path.starts_with("/mcp/") => match path.split('/').nth(3) {
             None => "/mcp/{server}",
             Some(".well-known") if path.ends_with("/.well-known/openid-configuration") => {
@@ -474,7 +482,7 @@ fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
         "anthropic"
     } else if endpoint == "/mcp"
         || endpoint.starts_with("/mcp/")
-        || endpoint == "/mcp-oauth/callback"
+        || endpoint.starts_with("/mcp-oauth/")
     {
         "mcp"
     } else if endpoint == "/a2a" || endpoint == "/a2a/{agent}/.well-known/agent-card.json" {
@@ -1590,6 +1598,8 @@ mod tests {
                 "/.well-known/oauth-authorization-server/mcp/{server}",
             ),
             ("/mcp-oauth/callback", "/mcp-oauth/callback"),
+            ("/mcp-oauth/login/callback", "/mcp-oauth/login/callback"),
+            ("/mcp-oauth/consent", "/mcp-oauth/consent"),
             // A path no route serves stays out of the server's series.
             ("/mcp/alpha/oauth/nope", "other"),
             ("/mcp/alpha/anything", "other"),

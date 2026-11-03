@@ -1086,6 +1086,8 @@ mod tests {
         "/mcp/some-server/oauth/token",
         "/mcp/some-server/oauth/credential",
         "/mcp-oauth/callback",
+        "/mcp-oauth/login/callback",
+        "/mcp-oauth/consent",
         "/a2a/some-agent/.well-known/agent-card.json",
         "/v1/chat/completions",
         "/v1/completions",

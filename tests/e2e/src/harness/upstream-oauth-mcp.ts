@@ -18,8 +18,6 @@ export interface OAuthMcpUpstreamOptions {
   noRefreshTokens?: boolean;
   /** Serve `/authorize` and `/token` under this path, as Jira Data Center does. */
   oauthPathPrefix?: string;
-  /** Refuse a refresh that does not repeat `redirect_uri`, as Jira documents it. */
-  refreshNeedsRedirectUri?: boolean;
 }
 
 interface IssuedCode {
@@ -224,9 +222,6 @@ export class OAuthMcpUpstream {
     }
     if (form.grant_type === "refresh_token") {
       if (this.refreshDelayMs > 0) await new Promise((r) => setTimeout(r, this.refreshDelayMs));
-      if (this.options.refreshNeedsRedirectUri && !form.redirect_uri) {
-        return json(400, { error: "invalid_request" });
-      }
       if (this.refreshAnswer !== "ok") {
         return json(this.refreshAnswer.status, { error: this.refreshAnswer.error });
       }

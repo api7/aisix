@@ -138,7 +138,7 @@ describe("per-user OAuth on managed gateways", () => {
     expect(clients[0][1].ttlSeconds).toBe(365 * 24 * 3600);
     // Single-use records and leases are gone once used.
     expect(records.filter(([id]) => id.startsWith("mcp_oauth_lease/"))).toHaveLength(0);
-    expect(records.filter(([id]) => id.startsWith("mcp_oauth_flow/"))).toHaveLength(0);
+    expect(cp.storeWrites.filter((w) => w.includes("mcp_oauth_flow"))).toEqual([]);
     expect(records.filter(([id]) => id.startsWith("mcp_oauth_code/"))).toHaveLength(0);
   });
 

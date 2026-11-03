@@ -150,14 +150,6 @@ pub struct McpServer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration_url: Option<String>,
 
-    /// Additional origins an MCP client may be redirected back to after
-    /// signing in, when `auth_type` is `oauth2_authorization_code`. Each entry
-    /// is a host, a `host:port`, or a `*.example.com` wildcard that matches
-    /// subdomains only, and applies to `https` redirects. Loopback addresses
-    /// and the gateway's own origin are always accepted. Ignored otherwise.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub trusted_redirect_origins: Vec<String>,
-
     /// OAuth scopes to request. Joined with spaces into the `scope` parameter
     /// of the token request. Used when `auth_type` is `oauth2` (optional) or
     /// `oauth2_token_exchange` (required, at least one — for `entra_obo` the
@@ -339,7 +331,8 @@ pub enum McpAuthType {
     /// The upstream tokens never reach the MCP client, and the client's own
     /// `Authorization` header is never sent to the server. The public address
     /// of the sign-in endpoints comes from `resource_url` in the MCP
-    /// authentication settings.
+    /// authentication settings. A client with no gateway credential can
+    /// connect when a trust provider in the environment has `login`.
     #[serde(rename = "oauth2_authorization_code")]
     OAuth2AuthorizationCode,
 }
@@ -561,18 +554,11 @@ mod tests {
             "token_url": "https://idp.example/token",
             "registration_url": "https://idp.example/register",
             "scopes": ["read"],
-            "trusted_redirect_origins": ["app.example", "*.example.org"],
         }))
         .unwrap();
         assert_eq!(server.auth_type, McpAuthType::OAuth2AuthorizationCode);
         validate_mcp_server(&serde_json::to_value(&server).unwrap())
             .expect("a full configuration round-trips through the strict schema");
-
-        for bad in [json!("not-an-array"), json!([1])] {
-            let mut v = minimal.clone();
-            v["trusted_redirect_origins"] = bad;
-            validate_mcp_server(&v).expect_err("trusted_redirect_origins is a list of strings");
-        }
 
         let openapi = json!({
             "name": "erp",
@@ -958,7 +944,6 @@ mod tests {
             token_exchange_profile: None,
             authorization_url: None,
             registration_url: None,
-            trusted_redirect_origins: Vec::new(),
             protocol_version: None,
             forward_client_headers: Vec::new(),
             timeout_ms: None,

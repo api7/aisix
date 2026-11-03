@@ -102,7 +102,7 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
     ),
     (
         "/mcp/:server/oauth/token",
-        Posture::NoUpstreamContent("exchanges an OAuth code with the upstream; no caller content"),
+        Posture::NoUpstreamContent("issues or exchanges OAuth tokens; no caller content"),
     ),
     (
         "/mcp/:server/oauth/credential",
@@ -111,6 +111,14 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
     (
         "/mcp-oauth/callback",
         Posture::NoUpstreamContent("a browser redirect carrying OAuth parameters only"),
+    ),
+    (
+        "/mcp-oauth/login/callback",
+        Posture::NoUpstreamContent("a browser redirect carrying OAuth parameters only"),
+    ),
+    (
+        "/mcp-oauth/consent",
+        Posture::NoUpstreamContent("a browser form carrying OAuth parameters only"),
     ),
     (
         "/a2a/:agent/.well-known/agent-card.json",

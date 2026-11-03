@@ -57,9 +57,13 @@ export {
 } from "./aws-eventstream.js";
 export { startMockControlPlane, type MockControlPlane, type StoreRecord } from "./managed-cp.js";
 export { OAuthMcpUpstream, type OAuthMcpUpstreamOptions } from "./upstream-oauth-mcp.js";
+export { startMockOidcProvider, type MockOidcProvider } from "./mock-oidc-provider.js";
+export { startPrefixStrippingProxy } from "./prefix-proxy.js";
 export {
+  Browser,
   ClientAuthState,
   connectMcpClient,
+  consentForm,
   followBrowser,
   OAUTH_CLIENT_REDIRECT,
   signInMcpClient,

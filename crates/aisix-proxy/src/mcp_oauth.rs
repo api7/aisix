@@ -4,9 +4,15 @@
 //! server, reached under `{base}/mcp/{server}`: it discovers the endpoints
 //! here, opens the browser, and redeems a code of the gateway's. Behind that,
 //! the gateway runs the same flow against the upstream, as an OAuth client of
-//! its own, and keeps the tokens (`aisix_mcp::user_oauth`). The client ends up
-//! with a placeholder that means nothing to anyone: on every later request it
-//! is the gateway credential beside it that says who is calling.
+//! its own, and keeps the tokens (`aisix_mcp::user_oauth`).
+//!
+//! There are two modes, chosen by the environment's trust providers
+//! ([`sign_in_mode`]). In the relay mode the client ends up with a placeholder
+//! that means nothing to anyone: on every later request it is the gateway
+//! credential beside it that says who is calling. In the interactive mode the
+//! client has no gateway credential, so the browser pass signs the user in at
+//! a trust provider too and the client gets a session token
+//! ([`crate::mcp_oauth_login`]).
 //!
 //! `base` is `mcp_auth_settings.resource_url` without its trailing `/mcp`, so
 //! every URL handed out survives a front gateway that routes on a path prefix
@@ -14,11 +20,13 @@
 //! discovery in [`crate::mcp_auth`].
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
-use aisix_core::models::McpServerType;
+use aisix_core::models::{McpServerType, OidcProvider};
+use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, McpAuthType};
-use aisix_mcp::user_oauth::{AuthorizationRequest, RedeemError, RedeemRequest};
+use aisix_mcp::user_oauth::{RedeemError, RedeemRequest};
 use aisix_mcp::{UserOAuthFailure, UserOAuthServer, UserSubject};
 use axum::body::{to_bytes, Body};
 use axum::extract::{FromRequestParts, Request, State};
@@ -51,11 +59,11 @@ const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'~');
 
-fn scoped_url(base: &str, server: &str) -> String {
+pub(crate) fn scoped_url(base: &str, server: &str) -> String {
     format!("{base}/mcp/{}", utf8_percent_encode(server, PATH_SEGMENT))
 }
 
-fn callback_url(base: &str) -> String {
+pub(crate) fn callback_url(base: &str) -> String {
     format!("{base}/mcp-oauth/callback")
 }
 
@@ -68,13 +76,49 @@ fn challenge_metadata_url(base: &str, server: &str) -> String {
 }
 
 /// The registered server `name`, if it serves this surface.
-fn sign_in_server(snapshot: &AisixSnapshot, name: &str) -> Option<UserOAuthServer> {
+pub(crate) fn sign_in_server(snapshot: &AisixSnapshot, name: &str) -> Option<UserOAuthServer> {
     let entry = snapshot.mcp_servers.get_by_name(name)?;
     let server = &entry.value;
     (server.enabled
         && server.server_type == McpServerType::Mcp
         && server.auth_type == McpAuthType::OAuth2AuthorizationCode)
         .then(|| UserOAuthServer::new(&entry.id, server))
+}
+
+/// How the environment's `oauth2_authorization_code` servers sign users in.
+pub(crate) enum SignInMode {
+    /// No enabled trust provider has `login`: the client's credential says who
+    /// is calling.
+    Relay,
+    /// Exactly one does, and can use it.
+    Interactive(Arc<ResourceEntry<OidcProvider>>),
+    /// More than one does, or the one that does has no authorization server to
+    /// send anyone to. A disabled provider is ignored, as it is everywhere.
+    Misconfigured,
+}
+
+pub(crate) fn sign_in_mode(snapshot: &AisixSnapshot) -> SignInMode {
+    let mut with_login = snapshot
+        .oidc_providers
+        .entries()
+        .into_iter()
+        .filter(|entry| entry.value.enabled && entry.value.login.is_some());
+    let Some(provider) = with_login.next() else {
+        return SignInMode::Relay;
+    };
+    if with_login.next().is_some()
+        || !provider.value.is_jwks_mode()
+        || provider.value.issuer.is_none()
+    {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(target: "aisix::mcp_oauth",
+                "`login` needs exactly one enabled trust provider, with an issuer and no \
+                 hmac_secret; sign-in to MCP servers fails until that is so");
+        });
+        return SignInMode::Misconfigured;
+    }
+    SignInMode::Interactive(provider)
 }
 
 /// Who a stored token belongs to, or `None` for a caller with no user to keep
@@ -94,6 +138,34 @@ pub(crate) fn caller_subject(auth: &AuthenticatedKey) -> Option<UserSubject> {
         .map(UserSubject::member)
 }
 
+/// Point a 401 on `server` at that server's own sign-in, if it signs users in.
+/// Replaces whatever the `/mcp` discovery would have said: its document names
+/// the trust providers, whose tokens this server has no use for.
+pub(crate) fn challenge_for_server(
+    snapshot: &AisixSnapshot,
+    server: &str,
+    response: &mut Response,
+) {
+    if response.status() != StatusCode::UNAUTHORIZED || sign_in_server(snapshot, server).is_none() {
+        return;
+    }
+    let Some(base) = crate::mcp_auth::public_base(snapshot) else {
+        return;
+    };
+    let value = format!(
+        "Bearer resource_metadata=\"{}\"",
+        challenge_metadata_url(&base, server)
+    );
+    if let Ok(value) = HeaderValue::from_str(&value) {
+        response
+            .extensions_mut()
+            .remove::<crate::error::AuthChallenge>();
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
+    }
+}
+
 /// The response `/mcp/{server}` gives a request it cannot serve for want of a
 /// usable token. Only `AuthorizationRequired` starts a sign-in: every other
 /// failure must not, because signing in would not help.
@@ -107,24 +179,12 @@ pub(crate) fn failure_response(
         server: server.to_owned(),
     }
     .into_response();
-    if failure == UserOAuthFailure::AuthorizationRequired {
-        if let Some(base) = crate::mcp_auth::public_base(snapshot) {
-            let value = format!(
-                "Bearer resource_metadata=\"{}\"",
-                challenge_metadata_url(&base, server)
-            );
-            if let Ok(value) = HeaderValue::from_str(&value) {
-                response
-                    .headers_mut()
-                    .insert(header::WWW_AUTHENTICATE, value);
-            }
-        }
-    }
+    challenge_for_server(snapshot, server, &mut response);
     response
 }
 
 /// An OAuth error body (RFC 6749 §5.2).
-fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
+pub(crate) fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
     let mut response = (
         status,
         Json(json!({ "error": error, "error_description": description })),
@@ -134,13 +194,13 @@ fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
     response
 }
 
-fn no_store(response: &mut Response) {
+pub(crate) fn no_store(response: &mut Response) {
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 }
 
-fn redirect(location: &str) -> Response {
+pub(crate) fn redirect(location: &str) -> Response {
     let Ok(value) = HeaderValue::from_str(location) else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -156,7 +216,7 @@ fn redirect(location: &str) -> Response {
 
 /// Send the browser back to the client with `params` added to its
 /// `redirect_uri`, and its `state` if it sent one.
-fn redirect_to_client(
+pub(crate) fn redirect_to_client(
     redirect_uri: &str,
     state: Option<&str>,
     params: &[(&str, &str)],
@@ -180,24 +240,20 @@ fn redirect_to_client(
     redirect(url.as_str())
 }
 
-fn query_params(uri: &axum::http::Uri) -> HashMap<String, String> {
+pub(crate) fn query_params(uri: &axum::http::Uri) -> HashMap<String, String> {
     url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
         .into_owned()
         .collect()
 }
 
 /// Whether an MCP client may be sent back to `redirect_uri` after signing in:
-/// the loopback addresses native clients listen on, the gateway's own origin,
-/// the operator's `trusted_redirect_origins` over https, and the known
-/// private-use URIs of native clients. `Err` names what is wrong with it.
+/// any https URL, the loopback addresses native clients listen on, and the
+/// known private-use URIs of native clients. `Err` names what is wrong with it.
 ///
-/// There is no consent page, so this is what keeps an authorization code from
-/// being delivered to a site a user was merely lured into starting a flow for.
-fn validate_redirect_uri(
-    redirect_uri: &str,
-    base: &str,
-    trusted_origins: &[String],
-) -> Result<(), &'static str> {
+/// This is not what keeps a code from a site a user was lured into starting a
+/// flow for. The consent page is: it names where the code is going, and nothing
+/// is issued until the user allows it.
+fn validate_redirect_uri(redirect_uri: &str) -> Result<(), &'static str> {
     // A URL parser reads `\` as `/` in an http authority, which a browser may
     // not agree with about which host that is.
     if redirect_uri.contains('\\') {
@@ -219,27 +275,10 @@ fn validate_redirect_uri(
         };
     }
     let host = url.host().ok_or("redirect_uri must include a host")?;
-    if is_loopback(&host) {
+    if url.scheme() == "https" || is_loopback(&host) {
         return Ok(());
     }
-    let same_origin = url::Url::parse(base).is_ok_and(|base| base.origin() == url.origin());
-    if same_origin {
-        return Ok(());
-    }
-    if url.scheme() == "https" {
-        let host = url.host_str().unwrap_or_default();
-        let authority = match url.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_owned(),
-        };
-        if trusted_origins
-            .iter()
-            .any(|entry| trusted_origin_matches(entry, host, &authority))
-        {
-            return Ok(());
-        }
-    }
-    Err("redirect_uri is not loopback, not the gateway's own origin, and not a trusted origin of this server")
+    Err("redirect_uri must use https unless it is a loopback address")
 }
 
 /// Private-use redirect URIs of native MCP clients, compared exactly.
@@ -255,28 +294,9 @@ fn is_loopback(host: &url::Host<&str>) -> bool {
     }
 }
 
-/// `entry` is `host`, `host:port`, or `*.suffix`, which covers strict
-/// subdomains of `suffix` on any port. A scheme or path in it is ignored, and
-/// `:443` is the default port an https `authority` no longer spells.
-fn trusted_origin_matches(entry: &str, host: &str, authority: &str) -> bool {
-    let entry = entry.trim().to_ascii_lowercase();
-    let entry = entry
-        .split_once("://")
-        .map_or(entry.as_str(), |(_, rest)| rest);
-    let entry = entry.split('/').next().unwrap_or_default();
-    if let Some(suffix) = entry.strip_prefix("*.") {
-        return !suffix.is_empty()
-            && host
-                .strip_suffix(suffix)
-                .is_some_and(|sub| sub.len() > 1 && sub.ends_with('.'));
-    }
-    let entry = entry.strip_suffix(":443").unwrap_or(entry);
-    !entry.is_empty() && entry == authority
-}
-
 /// Runs a handler with the bookkeeping every route here shares: no usage row
 /// on any outcome, one access-log line, the request families.
-async fn observed<F>(
+pub(crate) async fn observed<F>(
     state: &ProxyState,
     caller: Option<&AuthenticatedKey>,
     request: Request,
@@ -381,7 +401,7 @@ pub(crate) async fn authorization_server(
             "token_endpoint": format!("{issuer}/oauth/token"),
             "registration_endpoint": format!("{issuer}/oauth/register"),
             "response_types_supported": ["code"],
-            "grant_types_supported": ["authorization_code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
             "code_challenge_methods_supported": ["S256"],
             "token_endpoint_auth_methods_supported": ["none"],
             "jwks_uri": format!("{issuer}/.well-known/jwks.json"),
@@ -444,7 +464,7 @@ pub(crate) async fn register(
                 "client_id": server,
                 "redirect_uris": metadata.get("redirect_uris").cloned().unwrap_or(json!([])),
                 "token_endpoint_auth_method": "none",
-                "grant_types": ["authorization_code"],
+                "grant_types": ["authorization_code", "refresh_token"],
                 "response_types": ["code"],
             })),
         )
@@ -458,6 +478,10 @@ pub(crate) async fn register(
 /// `GET /mcp/{server}/oauth/authorize`. A problem with `redirect_uri` or
 /// `client_id` is answered here, since nowhere safe to send the browser is
 /// known yet; any other goes back to the client (RFC 6749 §4.1.2.1).
+///
+/// A client backend may request this URL with no cookie jar before the browser
+/// does, so it answers the same both times and writes nothing about the flow:
+/// all of it goes into the cookie this sets.
 pub(crate) async fn authorize(
     AisixPath(server): AisixPath<String>,
     State(state): State<ProxyState>,
@@ -471,6 +495,10 @@ pub(crate) async fn authorize(
         let Some(base) = crate::mcp_auth::public_base(&snapshot) else {
             return failure_response(&snapshot, &server, UserOAuthFailure::Misconfigured);
         };
+        let mode = sign_in_mode(&snapshot);
+        if matches!(mode, SignInMode::Misconfigured) {
+            return failure_response(&snapshot, &server, UserOAuthFailure::Misconfigured);
+        }
         if request.uri().query().map_or(0, str::len) > MAX_QUERY_BYTES {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
@@ -499,9 +527,7 @@ pub(crate) async fn authorize(
                 "redirect_uri is required",
             );
         };
-        if let Err(reason) =
-            validate_redirect_uri(redirect_uri, &base, &oauth.trusted_redirect_origins)
-        {
+        if let Err(reason) = validate_redirect_uri(redirect_uri) {
             tracing::warn!(target: "aisix::mcp_oauth", server = %server, reason,
                 "refused an authorization request's redirect_uri");
             return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", reason);
@@ -523,109 +549,60 @@ pub(crate) async fn authorize(
         if param("code_challenge_method") != Some("S256") {
             return back("invalid_request", "code_challenge_method must be S256");
         }
-        let upstream_redirect_uri = callback_url(&base);
-        match state
-            .mcp_oauth
-            .begin_authorization(
+        let client = crate::mcp_oauth_login::ClientRequest {
+            client_id,
+            redirect_uri,
+            state: state_param,
+            code_challenge,
+        };
+        let SignInMode::Interactive(provider) = mode else {
+            return crate::mcp_oauth_login::begin_relay(
+                state,
+                &snapshot,
                 &oauth,
-                &AuthorizationRequest {
-                    client_id,
-                    redirect_uri,
-                    state: state_param,
-                    code_challenge,
-                    scope: param("scope"),
-                    upstream_redirect_uri: &upstream_redirect_uri,
-                },
+                &base,
+                &client,
+                param("scope"),
             )
-            .await
-        {
-            Ok(upstream) => redirect(&upstream),
-            Err(UserOAuthFailure::Unavailable) => back(
-                "temporarily_unavailable",
-                "the gateway could not start the sign-in right now",
-            ),
-            Err(_) => back(
-                "server_error",
-                "this MCP server cannot sign in users as configured",
-            ),
+            .await;
+        };
+        if param("resource").is_some_and(|resource| !resource_matches(resource, &base, &server)) {
+            return back("invalid_target", "resource does not name this MCP server");
         }
+        crate::mcp_oauth_login::begin_login(
+            state,
+            &snapshot,
+            &oauth,
+            &provider.value,
+            &base,
+            &client,
+        )
+        .await
     })
     .await
 }
 
-/// `GET /mcp-oauth/callback`, where the upstream sends the browser back. The
-/// upstream's code goes no further than this.
-pub(crate) async fn callback(State(state): State<ProxyState>, request: Request) -> Response {
-    observed(&state, None, request, async |state, request| {
-        let params = query_params(request.uri());
-        let param = |name: &str| params.get(name).map(String::as_str).filter(|v| !v.is_empty());
-        let Some(flow_state) = param("state") else {
-            return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", "state is required");
-        };
-        let flow = match state.mcp_oauth.take_flow(flow_state).await {
-            Ok(Some(flow)) => flow,
-            Ok(None) => {
-                return oauth_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request",
-                    "this sign-in is unknown, expired or already used; start it again from the MCP client",
-                );
-            }
-            Err(_) => {
-                return oauth_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "temporarily_unavailable",
-                    "the gateway could not finish the sign-in right now",
-                );
-            }
-        };
-        let redirect_uri = flow.redirect_uri().to_owned();
-        let client_state = flow.client_state().map(str::to_owned);
-        let back = |params: &[(&str, &str)]| {
-            redirect_to_client(&redirect_uri, client_state.as_deref(), params)
-        };
-        // RFC 9207: an authorization server that says who it is must be the
-        // one this flow was sent to.
-        if param("iss").is_some_and(|iss| !flow.issuer_matches(iss)) {
-            tracing::warn!(target: "aisix::mcp_oauth", server = %flow.server_name(),
-                "an authorization response named an unexpected issuer");
-            return back(&[
-                ("error", "access_denied"),
-                ("error_description", "the response came from an unexpected authorization server"),
-            ]);
-        }
-        if let Some(error) = param("error") {
-            let mut relayed = vec![("error", error)];
-            if let Some(description) = param("error_description") {
-                relayed.push(("error_description", description));
-            }
-            return back(&relayed);
-        }
-        let Some(upstream_code) = param("code") else {
-            return back(&[
-                ("error", "server_error"),
-                ("error_description", "the authorization response carried no code"),
-            ]);
-        };
-        match state.mcp_oauth.issue_code(flow, upstream_code).await {
-            Ok(code) => back(&[("code", &code)]),
-            Err(_) => back(&[
-                ("error", "temporarily_unavailable"),
-                ("error_description", "the gateway could not finish the sign-in right now"),
-            ]),
-        }
-    })
-    .await
+/// Whether `resource` (RFC 8707) names the server at `server`.
+pub(crate) fn resource_matches(resource: &str, base: &str, server: &str) -> bool {
+    resource.trim_end_matches('/') == scoped_url(base, server)
 }
 
-/// `POST /mcp/{server}/oauth/token`. The caller proves who it is with its
-/// gateway credential, and the access token it gets back carries no authority
-/// at all: the real tokens are stored here under that caller.
+/// `POST /mcp/{server}/oauth/token`. In the relay mode the caller proves who it
+/// is with its gateway credential, and the access token it gets back carries no
+/// authority at all: the real tokens are stored here under that caller. In the
+/// interactive mode no credential is involved: the code already says who.
 pub(crate) async fn token(
     AisixPath(server): AisixPath<String>,
     State(state): State<ProxyState>,
     request: Request,
 ) -> Response {
+    let mode = sign_in_mode(&state.snapshot.load());
+    if !matches!(mode, SignInMode::Relay) {
+        return observed(&state, None, request, async |state, request| {
+            crate::mcp_oauth_login::token(state, &server, mode, request).await
+        })
+        .await;
+    }
     // Denials are recorded by the credential extractor itself.
     let (mut parts, body) = request.into_parts();
     let auth = match AuthenticatedKey::from_request_parts(&mut parts, &state).await {
@@ -776,11 +753,8 @@ pub(crate) async fn delete_credential(
 mod tests {
     use super::*;
 
-    const BASE: &str = "https://gw.example.com/aisix";
-
-    fn check(uri: &str, trusted: &[&str]) -> Result<(), &'static str> {
-        let trusted: Vec<String> = trusted.iter().map(|s| s.to_string()).collect();
-        validate_redirect_uri(uri, BASE, &trusted)
+    fn check(uri: &str) -> Result<(), &'static str> {
+        validate_redirect_uri(uri)
     }
 
     #[test]
@@ -793,31 +767,17 @@ mod tests {
             "https://[::1]:8443/cb",
             "http://[::ffff:127.0.0.1]/cb",
         ] {
-            check(uri, &[]).unwrap_or_else(|e| panic!("{uri}: {e}"));
+            check(uri).unwrap_or_else(|e| panic!("{uri}: {e}"));
         }
     }
 
     #[test]
-    fn the_gateways_own_origin_is_accepted_whatever_the_path() {
-        check("https://gw.example.com/ui/callback", &[]).unwrap();
-        check("https://gw.example.com:443/ui/callback", &[]).unwrap();
-        check("http://gw.example.com/ui/callback", &[]).unwrap_err();
-        check("https://gw.example.com:8443/ui/callback", &[]).unwrap_err();
-    }
-
-    #[test]
-    fn a_trusted_origin_needs_https_and_an_exact_or_subdomain_match() {
-        check("https://app.example.org/cb", &[]).unwrap_err();
-        check("https://app.example.org/cb", &["app.example.org"]).unwrap();
-        check("https://app.example.org:443/cb", &["app.example.org:443"]).unwrap();
-        check("https://app.example.org/cb", &["https://app.example.org/x"]).unwrap();
-        check("http://app.example.org/cb", &["app.example.org"]).unwrap_err();
-        check("https://app.example.org:8443/cb", &["app.example.org"]).unwrap_err();
-        check("https://evil-app.example.org/cb", &["app.example.org"]).unwrap_err();
-        check("https://a.example.org/cb", &["*.example.org"]).unwrap();
-        check("https://a.b.example.org:8443/cb", &["*.example.org"]).unwrap();
-        check("https://example.org/cb", &["*.example.org"]).unwrap_err();
-        check("https://evilexample.org/cb", &["*.example.org"]).unwrap_err();
+    fn any_https_is_accepted_and_http_only_for_loopback() {
+        check("https://app.example.org/cb").unwrap();
+        check("https://app.example.org:8443/cb?x=1").unwrap();
+        check("http://app.example.org/cb").unwrap_err();
+        check("http://gw.example.com/ui/callback").unwrap_err();
+        check("http://localhost.example.org/cb").unwrap_err();
     }
 
     #[test]
@@ -826,22 +786,66 @@ mod tests {
             "not a url",
             "/relative",
             "http://localhost/cb#frag",
+            "https://app.example.org/cb#frag",
             "http://user:pw@localhost/cb",
-            "http://user@localhost/cb",
+            "https://user@app.example.org/cb",
             "http://evil.example\\@localhost/cb",
             "javascript:alert(1)",
             "data:text/html,x",
             "myapp://callback",
         ] {
-            check(uri, &["*"]).expect_err(uri);
+            check(uri).expect_err(uri);
         }
     }
 
     #[test]
     fn only_a_known_native_uri_is_accepted_and_only_exactly() {
-        check("cursor://anysphere.cursor-mcp/oauth/callback", &[]).unwrap();
-        check("cursor://anysphere.cursor-mcp/oauth/callback?x=1", &[]).unwrap_err();
-        check("cursor://anysphere.cursor-mcp/oauth/callback-2", &[]).unwrap_err();
+        check("cursor://anysphere.cursor-mcp/oauth/callback").unwrap();
+        check("cursor://anysphere.cursor-mcp/oauth/callback?x=1").unwrap_err();
+        check("cursor://anysphere.cursor-mcp/oauth/callback-2").unwrap_err();
+    }
+
+    #[test]
+    fn sign_in_mode_follows_the_enabled_providers_with_login() {
+        let provider = |id: &str, doc: serde_json::Value| {
+            ResourceEntry::new(id, serde_json::from_value(doc).unwrap(), 1)
+        };
+        let usable = |name: &str| {
+            json!({"name": name, "issuer": format!("https://{name}"), "audiences": ["a"],
+                   "login": {"client_id": "gw"}})
+        };
+        let mode = |docs: Vec<serde_json::Value>| {
+            let snapshot = AisixSnapshot::new();
+            for (i, doc) in docs.into_iter().enumerate() {
+                snapshot
+                    .oidc_providers
+                    .insert(provider(&format!("p{i}"), doc));
+            }
+            match sign_in_mode(&snapshot) {
+                SignInMode::Relay => "relay",
+                SignInMode::Interactive(_) => "interactive",
+                SignInMode::Misconfigured => "misconfigured",
+            }
+        };
+        assert_eq!(mode(vec![]), "relay");
+        assert_eq!(
+            mode(vec![
+                json!({"name": "a", "issuer": "https://a", "audiences": ["a"]})
+            ]),
+            "relay"
+        );
+        assert_eq!(mode(vec![usable("a")]), "interactive");
+        assert_eq!(mode(vec![usable("a"), usable("b")]), "misconfigured");
+        let mut disabled = usable("b");
+        disabled["enabled"] = json!(false);
+        assert_eq!(mode(vec![usable("a"), disabled.clone()]), "interactive");
+        assert_eq!(mode(vec![disabled]), "relay");
+        assert_eq!(
+            mode(vec![json!({"name": "h", "issuer": "https://h",
+                             "hmac_secret": "x".repeat(32),
+                             "login": {"client_id": "gw"}})]),
+            "misconfigured"
+        );
     }
 
     #[test]

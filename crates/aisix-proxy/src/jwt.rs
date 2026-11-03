@@ -440,6 +440,175 @@ fn claim_match_holds(claims: &serde_json::Value, m: &ClaimMatch) -> bool {
     }
 }
 
+/// Who a verified set of claims is, and which key they act as.
+pub(crate) struct VerifiedIdentity {
+    pub subject: String,
+    pub entry: Arc<ResourceEntry<ApiKey>>,
+    pub claim_mapping: Option<String>,
+}
+
+/// Why a verified set of claims maps to no usable key.
+pub(crate) struct IdentityDenial {
+    pub reason: &'static str,
+    pub subject: Option<String>,
+    pub claim_mapping: Option<String>,
+    pub error: ProxyError,
+}
+
+impl IdentityDenial {
+    fn new(reason: &'static str, error: ProxyError) -> Self {
+        Self {
+            reason,
+            subject: None,
+            claim_mapping: None,
+            error,
+        }
+    }
+
+    fn of(mut self, subject: &str, claim_mapping: Option<&str>) -> Self {
+        self.subject = Some(subject.to_owned());
+        self.claim_mapping = claim_mapping.map(str::to_owned);
+        self
+    }
+}
+
+/// The step every caller a trust provider vouches for goes through once its
+/// claims are verified, by whatever token they came in: the identity claim
+/// selects the key, by a direct binding or else a claim mapping, and the key's
+/// lifecycle applies.
+#[allow(clippy::result_large_err)] // Not on any path that fails often.
+pub(crate) fn resolve_identity(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    prov: &OidcProvider,
+    claims: &serde_json::Value,
+) -> Result<VerifiedIdentity, IdentityDenial> {
+    let Some(subject) = nested_claim(claims, &prov.identity_claim).and_then(|v| v.as_str()) else {
+        return Err(IdentityDenial::new(
+            "jwt_identity_claim_missing",
+            ProxyError::JwtIdentityUnmapped,
+        ));
+    };
+
+    // The direct `(jwt_provider, jwt_subject)` key binding is
+    // authoritative for its subject — including its disabled/expired
+    // lifecycle. Claim mappings only admit identities no key binds
+    // explicitly, so adding a mapping can never reroute (or re-enable)
+    // an identity an operator pinned to a specific key. An AMBIGUOUS
+    // binding fails closed here for the same reason: the subject *is*
+    // bound, just not resolvably, and letting it fall through to the
+    // mappings would hand a mis-provisioned identity whatever a rule
+    // grants.
+    let (bound, ambiguous) = key_for_subject(&state.jwt_bindings, snapshot, &prov.name, subject);
+    if ambiguous {
+        return Err(
+            IdentityDenial::new("jwt_binding_ambiguous", ProxyError::JwtIdentityUnmapped)
+                .of(subject, None),
+        );
+    }
+    let (entry, claim_mapping) = match bound {
+        Some(entry) => (entry, None),
+        None => match matching_claim_mapping(snapshot, &prov.name, claims) {
+            Some(mapping) => {
+                let Some(entry) = snapshot
+                    .apikeys
+                    .get_by_id(&mapping.value.resolve.api_key_id)
+                else {
+                    return Err(IdentityDenial::new(
+                        "claim_mapping_target_missing",
+                        ProxyError::JwtIdentityUnmapped,
+                    )
+                    .of(subject, Some(&mapping.value.name)));
+                };
+                (entry, Some(mapping.value.name.clone()))
+            }
+            None => {
+                return Err(IdentityDenial::new(
+                    "jwt_identity_unmapped",
+                    ProxyError::JwtIdentityUnmapped,
+                )
+                .of(subject, None));
+            }
+        },
+    };
+
+    // Same lifecycle enforcement as the API-key path (#933).
+    if entry.value.disabled {
+        return Err(IdentityDenial::new(
+            "key_disabled",
+            ProxyError::ApiKeyDisabled,
+        ));
+    }
+    if entry.value.is_expired_at(chrono::Utc::now()) {
+        return Err(IdentityDenial::new(
+            "key_expired",
+            ProxyError::ApiKeyExpired,
+        ));
+    }
+    Ok(VerifiedIdentity {
+        subject: subject.to_owned(),
+        entry,
+        claim_mapping,
+    })
+}
+
+/// Verify an ID token the gateway itself obtained at `prov` on behalf of OAuth
+/// client `client_id`: the provider's signature and issuer, and an audience of
+/// that client rather than the provider's accepted `audiences`, which are about
+/// tokens presented to the gateway. `Err` is a denial reason.
+pub(crate) async fn verify_login_id_token(
+    prov: &OidcProvider,
+    token: &str,
+    client_id: &str,
+) -> Result<serde_json::Value, &'static str> {
+    let header = jsonwebtoken::decode_header(token).map_err(|_| "jwt_malformed")?;
+    let mut for_client = prov.clone();
+    for_client.audiences = vec![client_id.to_owned()];
+    verify_against_jwks(&for_client, token, &header)
+        .await
+        .map_err(|(reason, _)| reason)
+}
+
+/// The claims of `claims` that `prov`'s configuration refers to: what a later
+/// request needs to run [`resolve_identity`] and [`bound_claims_hold`] without
+/// the original token. Nested claims keep their nesting.
+pub(crate) fn referenced_claims(
+    snapshot: &AisixSnapshot,
+    prov: &OidcProvider,
+    claims: &serde_json::Value,
+) -> serde_json::Value {
+    let mut paths: Vec<String> = vec![prov.identity_claim.clone()];
+    if let Some(bound) = &prov.bound_claims {
+        paths.extend(bound.keys().cloned());
+    }
+    for mapping in snapshot.claim_mappings.entries() {
+        if mapping.value.jwt_provider == prov.name {
+            paths.extend(mapping.value.match_.iter().map(|m| m.claim.clone()));
+        }
+    }
+    let mut kept = serde_json::Value::Object(serde_json::Map::new());
+    for path in paths {
+        let Some(value) = nested_claim(claims, &path) else {
+            continue;
+        };
+        let mut at = &mut kept;
+        let mut segments = path.split('.').peekable();
+        while let Some(segment) = segments.next() {
+            let Some(object) = at.as_object_mut() else {
+                break;
+            };
+            if segments.peek().is_none() {
+                object.insert(segment.to_owned(), value.clone());
+                break;
+            }
+            at = object
+                .entry(segment.to_owned())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        }
+    }
+    kept
+}
+
 /// Authenticate a JWT-shaped bearer. Called from the auth choke point
 /// once [`looks_like_jwt`] and [`any_enabled_provider`] both hold, with
 /// the snapshot the gate already loaded (avoids a second atomic load;
@@ -573,96 +742,25 @@ pub(crate) async fn authenticate_jwt(
     }
 
     // ── Identity mapping ─────────────────────────────────────────────
-    let Some(subject) = nested_claim(&claims, &prov.identity_claim).and_then(|v| v.as_str()) else {
-        return Err(deny(
-            d,
-            "jwt_identity_claim_missing",
-            &iss,
-            kid.as_deref(),
-            None,
-            None,
-            ProxyError::JwtIdentityUnmapped,
-        ));
+    let identity = match resolve_identity(state, snapshot, prov, &claims) {
+        Ok(identity) => identity,
+        Err(denial) => {
+            return Err(deny(
+                d,
+                denial.reason,
+                &iss,
+                kid.as_deref(),
+                denial.subject.as_deref(),
+                denial.claim_mapping.as_deref(),
+                denial.error,
+            ))
+        }
     };
-
-    // The direct `(jwt_provider, jwt_subject)` key binding is
-    // authoritative for its subject — including its disabled/expired
-    // lifecycle. Claim mappings only admit identities no key binds
-    // explicitly, so adding a mapping can never reroute (or re-enable)
-    // an identity an operator pinned to a specific key. An AMBIGUOUS
-    // binding fails closed here for the same reason: the subject *is*
-    // bound, just not resolvably, and letting it fall through to the
-    // mappings would hand a mis-provisioned identity whatever a rule
-    // grants.
-    let (bound, ambiguous) = key_for_subject(&state.jwt_bindings, snapshot, &prov.name, subject);
-    if ambiguous {
-        return Err(deny(
-            d,
-            "jwt_binding_ambiguous",
-            &iss,
-            kid.as_deref(),
-            Some(subject),
-            None,
-            ProxyError::JwtIdentityUnmapped,
-        ));
-    }
-    let (entry, claim_mapping) = match bound {
-        Some(entry) => (entry, None),
-        None => match matching_claim_mapping(snapshot, &prov.name, &claims) {
-            Some(mapping) => {
-                let Some(entry) = snapshot
-                    .apikeys
-                    .get_by_id(&mapping.value.resolve.api_key_id)
-                else {
-                    return Err(deny(
-                        d,
-                        "claim_mapping_target_missing",
-                        &iss,
-                        kid.as_deref(),
-                        Some(subject),
-                        Some(&mapping.value.name),
-                        ProxyError::JwtIdentityUnmapped,
-                    ));
-                };
-                (entry, Some(mapping.value.name.clone()))
-            }
-            None => {
-                return Err(deny(
-                    d,
-                    "jwt_identity_unmapped",
-                    &iss,
-                    kid.as_deref(),
-                    Some(subject),
-                    None,
-                    ProxyError::JwtIdentityUnmapped,
-                ));
-            }
-        },
-    };
-
-    // Same lifecycle enforcement as the API-key path (#933).
-    if entry.value.disabled {
-        return Err(deny(
-            d,
-            "key_disabled",
-            &iss,
-            kid.as_deref(),
-            None,
-            None,
-            ProxyError::ApiKeyDisabled,
-        ));
-    }
-    if entry.value.is_expired_at(chrono::Utc::now()) {
-        return Err(deny(
-            d,
-            "key_expired",
-            &iss,
-            kid.as_deref(),
-            None,
-            None,
-            ProxyError::ApiKeyExpired,
-        ));
-    }
+    let VerifiedIdentity {
+        subject,
+        entry,
+        claim_mapping,
+    } = identity;
 
     state.metrics.record_auth_decision("jwt", true, "");
     tracing::debug!(
@@ -679,7 +777,7 @@ pub(crate) async fn authenticate_jwt(
         snapshot,
         entry,
         Some(Arc::new(JwtIdentity::new(
-            subject.to_string(),
+            subject,
             prov.name.clone(),
             claim_mapping,
             Arc::from(token),
@@ -919,16 +1017,19 @@ fn check_provider_claims(
             return Err(ClaimsRejection::Scope);
         }
     }
-    if let Some(bound) = &prov.bound_claims {
-        for (path, expect) in bound {
-            let matched = nested_claim(claims, path)
-                .is_some_and(|actual| bound_claim_matches(actual, expect));
-            if !matched {
-                return Err(ClaimsRejection::BoundClaim);
-            }
-        }
+    if !bound_claims_hold(claims, prov) {
+        return Err(ClaimsRejection::BoundClaim);
     }
     Ok(())
+}
+
+/// Whether every one of the provider's `bound_claims` is satisfied.
+pub(crate) fn bound_claims_hold(claims: &serde_json::Value, prov: &OidcProvider) -> bool {
+    prov.bound_claims.as_ref().is_none_or(|bound| {
+        bound.iter().all(|(path, expect)| {
+            nested_claim(claims, path).is_some_and(|actual| bound_claim_matches(actual, expect))
+        })
+    })
 }
 
 /// The token's granted scopes: a `scope` claim as the OAuth
@@ -2586,5 +2687,58 @@ jyxumGxNpoIV8LlzsMsaWQ==
             .oidc_providers
             .insert(ResourceEntry::new("p-jwks", base_provider(), 1));
         assert!(any_enabled_jwks_provider(&snapshot));
+    }
+}
+
+#[cfg(test)]
+mod referenced_claims_tests {
+    use super::*;
+
+    #[test]
+    fn only_what_the_configuration_refers_to_is_kept_with_its_nesting() {
+        let snapshot = AisixSnapshot::new();
+        snapshot.claim_mappings.insert(ResourceEntry::new(
+            "m1",
+            serde_json::from_value(serde_json::json!({
+                "name": "m", "jwt_provider": "corp",
+                "match": [{"claim": "org.team", "op": "exact", "values": ["x"]}],
+                "resolve": {"api_key_id": "k"},
+            }))
+            .unwrap(),
+            1,
+        ));
+        snapshot.claim_mappings.insert(ResourceEntry::new(
+            "m2",
+            serde_json::from_value(serde_json::json!({
+                "name": "other", "jwt_provider": "elsewhere",
+                "match": [{"claim": "secret_group", "op": "exact", "values": ["x"]}],
+                "resolve": {"api_key_id": "k"},
+            }))
+            .unwrap(),
+            1,
+        ));
+        let prov: OidcProvider = serde_json::from_value(serde_json::json!({
+            "name": "corp", "issuer": "https://i", "audiences": ["a"],
+            "identity_claim": "preferred_username",
+            "bound_claims": {"realm_access.roles": "agent"},
+        }))
+        .unwrap();
+        let claims = serde_json::json!({
+            "preferred_username": "alice",
+            "email": "alice@example.com",
+            "secret_group": "x",
+            "realm_access": {"roles": ["agent"], "other": 1},
+            "org": {"team": "x"},
+        });
+        let kept = referenced_claims(&snapshot, &prov, &claims);
+        assert_eq!(
+            kept,
+            serde_json::json!({
+                "preferred_username": "alice",
+                "realm_access": {"roles": ["agent"]},
+                "org": {"team": "x"},
+            })
+        );
+        assert!(bound_claims_hold(&kept, &prov));
     }
 }
