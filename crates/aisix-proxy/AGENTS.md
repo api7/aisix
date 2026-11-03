@@ -481,3 +481,11 @@ for a client request must do the same. Gateway-internal calls (health checks,
 the semantic-routing and guardrail embedders) and MCP / A2A do not spend a
 provider key's budget.
 
+## A Failure Row Carries Both Bodies Under Full Content
+
+**With any exporter at `content_mode: full`, every usage event with a status of 400 or above or an `error_class` exports the request body and that attempt's own response body, whichever endpoint and status it is.** `usage_attr::emit_usage` fills them in, so a family cannot opt out by what it passes; it can only starve the fill. A new or changed route owes two things:
+
+- **Note the request body before its first possible failure** with `usage_attr::note_failure_request`, and again after a guardrail masks it, in the representation the route's success path captures. A guardrail block returns before the mask runs: mask there too, so a blocked row never exports what the success path would have hidden. `usage_attr::note_client_error` holds the error body the terminal row reports when no upstream answered; a route that does not answer with the OpenAI envelope uses `note_client_error_body`.
+- **Read every non-2xx upstream body through `aisix_gateway::read_body_capped`** (or hand a body it must relay anyway to `note_upstream_error_body`). That is what reaches the row, and a read that swallows its failure leaves `error_message` naming nothing. All of it is gated on the exporters: under `metadata_only` nothing extra may be read or copied.
+
+`BridgeError::UpstreamStatus.message` decides what the caller is sent (blank falls back to the status and reason phrase), so explanatory wording belongs in the variant's `Display` and never in that field.
