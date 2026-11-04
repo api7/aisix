@@ -122,6 +122,8 @@ pub async fn chat_completions(
             );
         }
     };
+    req.thoughts_requested =
+        aisix_gateway::chat::effort_asks_for_thoughts(req.extra.get("reasoning_effort"));
     let request_id = client.request_id.clone();
     let api_key_id = auth.entry.id.clone();
     let model_name = req.model.clone();
@@ -243,10 +245,7 @@ pub async fn chat_completions(
                 &client,
                 &applied_guardrails,
                 &success.routing.attempts,
-                // The winner's success event carries the content.
-                /* content_for_last */
-                None,
-                // ...and the terminal trace spans.
+                // The winner's success event carries the terminal trace spans.
                 /* terminal_last */
                 false,
                 &audit,
@@ -476,6 +475,7 @@ pub async fn chat_completions(
                     routing.fallback_count() > 0,
                 ),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             emit_access_log(
@@ -513,39 +513,11 @@ pub async fn chat_completions(
             // (AISIX-Cloud#1428).
             let guardrail_blocked = err.is_guardrail_block();
             let model_id_str = resolved_model_id.as_deref().unwrap_or("");
-            // AISIX-Cloud#1013: failed requests carry the (post-mask)
-            // request body so a 4xx/5xx can be triaged from the log alone.
-            // Same opt-in gate and cap as the success path; 401/403 stay
-            // body-less (a 401 here is upstream-auth passthrough — caller
-            // 401s are rejected by the auth extractor before any event
-            // exists) — the body adds nothing to an authorization
-            // failure and callers probing keys shouldn't get their
-            // payloads archived.
-            let mut failure_content = if status == 401 || status == 403 {
-                None
-            } else {
-                content_capture_cap(
-                    snapshot
-                        .observability_exporters
-                        .entries()
-                        .iter()
-                        .map(|e| &e.value),
-                )
-                .map(|cap| {
-                    CapturedContent::new(
-                        &serde_json::to_string(&req).unwrap_or_default(),
-                        "",
-                        cap as usize,
-                    )
-                })
-            };
-            // When every target failed there is no terminal event below —
-            // the content rides the last failed attempt instead.
-            let content_for_last = if charge.is_none() && !routing.attempts.is_empty() {
-                failure_content.take()
-            } else {
-                None
-            };
+            // Every failure row of this request reports the (post-mask)
+            // request body and, without an upstream answer, this error body
+            // (AISIX-Cloud#1013, #1921).
+            crate::usage_attr::note_failure_request(&snapshot, || captured_request_json(&req));
+            crate::usage_attr::note_client_error(&snapshot, &err);
             // Per #655: emit one zero-token event for each FAILED attempt.
             // `applied_guardrails` (resolved by `dispatch`) is recorded on
             // every attempt so an input-blocked / failed request still
@@ -559,7 +531,6 @@ pub async fn chat_completions(
                 &client,
                 &applied_guardrails,
                 &routing.attempts,
-                content_for_last,
                 // All-failed (no charge): the last failed attempt is the
                 // request's terminal emission. With a charge, the
                 // billed-then-blocked event below is terminal instead.
@@ -648,7 +619,7 @@ pub async fn chat_completions(
                         /* cost_usd */ 0.0,
                         guardrail_blocked,
                         &client,
-                        failure_content.take(),
+                        None,
                         /* terminal */ true,
                         // Billed-then-blocked: the upstream answered.
                         /* dispatched */
@@ -701,7 +672,7 @@ pub async fn chat_completions(
                         /* cost_usd */ 0.0,
                         guardrail_blocked,
                         &client,
-                        failure_content.take(),
+                        None,
                         /* terminal */ true,
                         // Pre-dispatch failure: no upstream was contacted;
                         // `elapsed` is handler time, not an upstream call.
@@ -1674,6 +1645,7 @@ async fn dispatch(
         redactions_out,
         crate::redact::redact_chat_format(resolved_chain.as_ref(), req),
     );
+    crate::usage_attr::note_failure_request(snapshot, || captured_request_json(req));
 
     // Key-level budgets, decided from the pushed budget documents.
     crate::budget::enforce_key(state, snapshot, auth).map_err(&with_model)?;
@@ -2282,8 +2254,7 @@ async fn dispatch(
         // Capture the prompt for content-capturing exporters; the response is
         // assembled inside the stream into `comp.response_text`. Both gated on
         // `content_cap` (None on the common content-free path).
-        let captured_prompt_for_telem =
-            content_cap.map(|_| serde_json::to_string(req).unwrap_or_default());
+        let captured_prompt_for_telem = content_cap.map(|_| captured_request_json(req));
         // #790: the bridge injects `stream_options.include_usage` on the
         // upstream leg whenever the client didn't set stream_options — the
         // terminal usage-only chunk that produces is for the gateway's own
@@ -2926,7 +2897,7 @@ async fn dispatch(
                 // caller, so it's logged like a fresh response.
                 let captured_content = content_cap.map(|cap| {
                     CapturedContent::new(
-                        &serde_json::to_string(req).unwrap_or_default(),
+                        &captured_request_json(req),
                         &cached.message.content_str(),
                         cap as usize,
                     )
@@ -3528,12 +3499,14 @@ async fn dispatch(
     // not the cache backend's global fallback. Backends without
     // per-entry support (defined via `Cache::put_with_ttl`'s default
     // impl) silently fall back to `put`.
-    if let (Some(ttl), Some(cache), Some(key), false) = (
+    if let (Some(ttl), Some(cache), Some(key), false, false) = (
         matched_policy_ttl,
         policy_cache.as_ref(),
         cache_key.as_ref(),
         // `Cache-Control: no-store` suppresses both layers' writes.
         cc.no_store,
+        // Generated images run to megabytes each.
+        upstream.messages().any(|m| m.extra.contains_key("images")),
     ) {
         match cache.put_with_ttl(key, upstream.clone(), ttl).await {
             Ok(()) => note_cache_ok(state, policy_backend, CacheHalf::Exact),
@@ -3603,7 +3576,7 @@ async fn dispatch(
     // `fan_out` via `Success`, never to the CP sink.
     let captured_content = content_cap.map(|cap| {
         CapturedContent::new(
-            &serde_json::to_string(req).unwrap_or_default(),
+            &captured_request_json(req),
             &upstream.message.content_str(),
             cap as usize,
         )
@@ -4732,6 +4705,7 @@ fn record_success(
                 caller,
                 request_upstream,
                 status,
+                aisix_obs::ErrorSource::None,
                 elapsed,
             );
             None
@@ -4973,6 +4947,37 @@ pub(crate) fn sanitize_tag(s: String) -> String {
     s.chars().filter(|c| !c.is_control()).take(256).collect()
 }
 
+/// The request as an exporter's captured prompt, in the shape the caller wrote
+/// it: a block-array message's `content` is the array, not the derived text
+/// `ChatMessage` serializes beside `content_blocks`, which would count its text
+/// twice and hide its blocks from the structured content reader. Base64 media
+/// is omitted here too, so this prompt, held to the end of a stream, stays
+/// small.
+pub(crate) fn captured_request_json(req: &ChatFormat) -> String {
+    let has_blocks = |m: &aisix_gateway::ChatMessage| {
+        m.content_blocks.is_some() || m.extra.contains_key("images")
+    };
+    if !req.messages.iter().any(has_blocks) {
+        return serde_json::to_string(req).unwrap_or_default();
+    }
+    let Ok(mut body) = serde_json::to_value(req) else {
+        return String::new();
+    };
+    for message in body
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_object_mut)
+    {
+        if let Some(blocks) = message.remove("content_blocks") {
+            message.insert("content".into(), blocks);
+        }
+    }
+    aisix_obs::sink::omit_base64_media(&mut body);
+    body.to_string()
+}
+
 /// Provider-detail bundle for `emit_usage_event`. Grouped here so the
 /// helper signature stays under the clippy-too-many-arguments bar
 /// without losing the structural relationship between the seven new
@@ -5072,12 +5077,6 @@ fn emit_failed_attempts(
     client: &ClientContext,
     applied_guardrails: &[AppliedGuardrail],
     attempts: &[AttemptRecord],
-    // AISIX-Cloud#1013: when every target failed there is no terminal
-    // event, so the captured request body rides the LAST failed attempt —
-    // the one whose status the caller saw. Other attempts (and the
-    // success-path caller) stay content-less to avoid duplicating a large
-    // prompt across N events.
-    mut content_for_last: Option<CapturedContent>,
     // AISIX-Cloud#1279: on the all-failed path the LAST failed attempt's
     // event is the request's terminal emission (there is no other), so it
     // carries the trace's SERVER + logical spans. False on the success
@@ -5089,11 +5088,6 @@ fn emit_failed_attempts(
 ) {
     let last_failed = attempts.iter().rposition(|a| !a.success);
     for (i, rec) in attempts.iter().enumerate().filter(|(_, a)| !a.success) {
-        let content = if Some(i) == last_failed {
-            content_for_last.take()
-        } else {
-            None
-        };
         // Each failed attempt hit its own target, hence its own key.
         let pk = crate::usage_attr::ResolvedPk::resolve(snap, &rec.provider_key_id);
         emit_usage_event(
@@ -5126,7 +5120,7 @@ fn emit_failed_attempts(
             /* cost_usd */ 0.0,
             /* guardrail_blocked */ false,
             client,
-            content,
+            None,
             /* terminal */ terminal_last && Some(i) == last_failed,
             // The record's own network-boundary fact: a rate-limit-refused
             // attempt never reached an upstream.
@@ -5443,7 +5437,6 @@ fn emit_failed_subcall(
             latency_ms: failure.latency_ms,
             dispatched: failure.dispatched,
         }],
-        /* content_for_last */ None,
         /* terminal_last */ false,
         &ctx.audit,
     );
@@ -6157,6 +6150,9 @@ where
             .map(|ctx| ctx.chain.stream_output_policy())
             .unwrap_or_default();
         let hold_back = stream_policy.holds_back();
+        // A window already judged and released the text, so an empty final
+        // scan does not mean the response generated none.
+        let mut window_scanned = false;
         let mut window_tool_calls_cap = match stream_policy {
             aisix_guardrails::StreamOutputPolicy::Window { .. } => stream_policy.hold_cap(),
             _ => None,
@@ -6199,6 +6195,7 @@ where
         let mut last_usage: Option<aisix_gateway::chat::UsageStats> = None;
         let fold_base = base_usage != aisix_gateway::chat::UsageStats::default();
         let mut last_chunk_id = String::new();
+        let mut stream_id = crate::render::StreamId::default();
         let mut last_chunk_model = String::new();
         let mut last_chunk_tier = None;
         // Render + serialise one held/live chunk into an SSE Event.
@@ -6217,7 +6214,9 @@ where
                     guard.comp().downstream_latency_ms =
                         crate::attempt::measured_ms(started.elapsed());
                 }
-                let rendered = render_chunk(created, $chunk, &client_facing_model);
+                let mut chunk = $chunk;
+                stream_id.stamp(&mut chunk.id);
+                let rendered = render_chunk(created, chunk, &client_facing_model);
                 match serde_json::to_string(&rendered) {
                     Ok(json) => Event::default().data(json),
                     Err(err) => {
@@ -6449,7 +6448,7 @@ where
                     yield Ok::<_, Infallible>(
                         Event::default()
                             .event("error")
-                            .data(error_frame_payload(etype, &err.to_string())),
+                            .data(error_frame_payload(etype, &err.stream_frame_message())),
                     );
                     None
                 }
@@ -6504,6 +6503,9 @@ where
                 // whole response) scans clean.
                 let chunk_content = crate::held_content::chat_delta(&chunk.delta);
                 let chunk_raw = crate::held_content::chat_chunk_raw(&chunk);
+                let chunk_images_raw = matches!(stream_policy, aisix_guardrails::StreamOutputPolicy::BufferFull { .. })
+                    .then(|| crate::held_content::chat_chunk_images_raw(&chunk))
+                    .unwrap_or_default();
                 pending_bytes.add(chunk_raw);
                 pending.push(chunk);
                 match &stream_policy {
@@ -6600,6 +6602,7 @@ where
                                 // the whole buffer and re-scan every
                                 // subsequent token (cost/latency guard).
                                 window_buf.keep_tails(*overlap_chars, *size_chars);
+                                window_scanned = true;
                             }
                         }
                     }
@@ -6607,7 +6610,7 @@ where
                         max_buffer_bytes,
                         on_exceeded_fail_open,
                     } => {
-                        held.hold(chunk_content, chunk_raw);
+                        held.hold(chunk_content, chunk_raw.saturating_sub(chunk_images_raw));
                         if held.exceeds(*max_buffer_bytes) {
                             if *on_exceeded_fail_open {
                                 // Fail-open overflow releases the held
@@ -6738,7 +6741,8 @@ where
                     } else {
                         format!("{content_part}\n{tc_part}")
                     };
-                    let blocked = if final_text.is_empty() {
+                    // Consulted with no text as well: a `custom` row decides for itself.
+                    let blocked = if final_text.is_empty() && window_scanned {
                         false
                     } else {
                         let synthesized = {
@@ -7463,6 +7467,64 @@ mod complete_on_drop_tests {
         );
         assert_eq!(out.total_tokens, 8);
         assert!(out.usage_estimated);
+    }
+
+    /// The captured prompt as the sinks read it: built from the parsed request
+    /// the handler holds, not from the wire shape the caller sent.
+    #[test]
+    fn captured_chat_request_reports_its_blocks_and_omits_base64_media() {
+        let payload = "QUJD".repeat(100);
+        let uri = format!("data:image/png;base64,{payload}");
+        let text = "t".repeat(1000);
+        let req: aisix_gateway::ChatFormat = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": text},
+                    {"type": "image_url", "image_url": {"url": uri}},
+                ]},
+                {"role": "assistant", "content": "x", "images": [
+                    {"type": "image_url", "image_url": {"url": uri}, "index": 0},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": uri}},
+                ]},
+            ],
+        }))
+        .unwrap();
+        let prompt = crate::chat::captured_request_json(&req);
+        assert!(!prompt.contains(&payload));
+        assert_eq!(
+            prompt.matches(&text).count(),
+            1,
+            "a block's text is not counted twice"
+        );
+        let captured = aisix_obs::CapturedContent::new(&prompt, "", 64 * 1024);
+        assert!(!captured.prompt_truncated);
+        let structured = aisix_obs::genai::structured_content(
+            aisix_obs::genai::PromptWire::OpenAiChat,
+            &captured.prompt,
+            "",
+            None,
+            "",
+        );
+        let input: serde_json::Value =
+            serde_json::from_str(&structured.input_messages.unwrap()).unwrap();
+        let image = serde_json::json!({
+            "type": "blob",
+            "modality": "image",
+            "mime_type": "image/png",
+            "content": format!("[aisix: base64 data uri omitted, {} bytes]", uri.len()),
+        });
+        assert_eq!(
+            input[0]["parts"],
+            serde_json::json!([{"type": "text", "content": text}, image])
+        );
+        assert_eq!(
+            input[1]["parts"],
+            serde_json::json!([{"type": "text", "content": "x"}, image])
+        );
+        assert_eq!(input[2]["parts"], serde_json::json!([image]));
     }
 
     /// AISIX-Cloud#1074: upstream-reported usage wins — the armed

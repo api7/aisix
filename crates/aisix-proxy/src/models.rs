@@ -76,6 +76,7 @@ pub async fn list_models(
         "/v1/models",
         crate::request_metrics::Caller::new(&auth),
         response.status().as_u16(),
+        crate::attribution::rendered_error_source(response.status().as_u16()),
         started,
     );
     response

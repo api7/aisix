@@ -549,17 +549,22 @@ struct RawStreamChunk {
     #[serde(default)]
     service_tier: Option<serde_json::Value>,
     #[serde(default)]
-    error: Option<serde::de::IgnoredAny>,
+    error: Option<serde_json::Value>,
 }
 
 impl TryFrom<RawStreamChunk> for OpenAiStreamChunk {
     type Error = &'static str;
 
-    /// A frame with an `error` and no `choices` is the provider reporting a
-    /// failure inside the stream, not a chunk: it fails to parse, so the
-    /// caller's in-band error capture takes it.
+    /// A frame whose `error` reports a failure is the provider reporting it
+    /// inside the stream, not a chunk — with or without `choices` (OpenRouter
+    /// sends `"choices": []` beside it): it fails to parse, so the caller's
+    /// in-band error capture takes it.
     fn try_from(raw: RawStreamChunk) -> Result<Self, Self::Error> {
-        if raw.choices.is_none() && raw.error.is_some() {
+        if raw
+            .error
+            .as_ref()
+            .is_some_and(aisix_gateway::in_band_error_reported)
+        {
             return Err("an in-band error frame, not a chunk");
         }
         Ok(Self {
@@ -1869,6 +1874,7 @@ mod tests {
             gateway_strict_schema: false,
             top_k: None,
             thinking_budget_tokens: None,
+            thoughts_requested: false,
             model: "my-model".into(),
             messages: vec![ChatMessage::user("hi")],
             temperature: Some(0.4),
@@ -1901,6 +1907,7 @@ mod tests {
             gateway_strict_schema: false,
             top_k: None,
             thinking_budget_tokens: None,
+            thoughts_requested: false,
             model: "m".into(),
             messages: vec![ChatMessage::user("hi")],
             temperature: None,
@@ -1930,6 +1937,7 @@ mod tests {
             gateway_strict_schema: false,
             top_k: None,
             thinking_budget_tokens: None,
+            thoughts_requested: false,
             model: "m".into(),
             messages: vec![],
             temperature: None,
@@ -1958,6 +1966,7 @@ mod tests {
             gateway_strict_schema: false,
             top_k: None,
             thinking_budget_tokens: None,
+            thoughts_requested: false,
             model: "m".into(),
             messages: vec![],
             temperature: None,
@@ -1980,6 +1989,7 @@ mod tests {
             gateway_strict_schema: false,
             top_k: None,
             thinking_budget_tokens: None,
+            thoughts_requested: false,
             model: "m".into(),
             messages: vec![],
             temperature: None,
@@ -2015,6 +2025,7 @@ mod tests {
             gateway_strict_schema: false,
             top_k: None,
             thinking_budget_tokens: None,
+            thoughts_requested: false,
             model: "my-model".into(),
             messages,
             temperature: None,

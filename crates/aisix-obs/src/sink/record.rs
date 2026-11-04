@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use super::truncate::truncate_content;
+use super::truncate::{omit_base64_media_in_json, truncate_content};
 use crate::usage::UsageEvent;
 
 /// Current canonical event schema version, emitted on every [`SinkRecord`]
@@ -196,13 +196,29 @@ impl CapturedContent {
         self
     }
 
+    /// Set the response of a failure row, under the same cap and cut rule as
+    /// [`Self::new`].
+    pub fn with_response(mut self, response: &str, max_bytes: usize) -> Self {
+        let (response, cut) = truncate_content(response, max_bytes);
+        self.response = response.into_owned();
+        self.response_truncated = cut;
+        self.truncated = self.prompt_truncated || cut;
+        self
+    }
+
     /// Capture `prompt` and `response`, truncating each to `max_bytes`
     /// (structure-preserving for JSON, UTF-8-boundary cut otherwise) to
     /// bound the held buffer at the largest cap any content-capturing
     /// exporter requested. `truncated` is set if either was cut here; a
     /// per-exporter `SinkContent` ORs in its own (smaller) cap.
+    ///
+    /// The prompt's base64 media is omitted first, so no structured or flat
+    /// field can carry it and a large attachment alone never pushes a prompt
+    /// over the cap. A prompt that is not JSON has no fields to recognise and is
+    /// only truncated.
     pub fn new(prompt: &str, response: &str, max_bytes: usize) -> Self {
-        let (prompt, p_cut) = truncate_content(prompt, max_bytes);
+        let prompt = omit_base64_media_in_json(prompt);
+        let (prompt, p_cut) = truncate_content(&prompt, max_bytes);
         let (response, r_cut) = truncate_content(response, max_bytes);
         Self {
             prompt: prompt.into_owned(),
@@ -341,6 +357,7 @@ mod tests {
         // content key is absent, and metadata is flattened (no `usage` nesting)
         assert!(json.get("content").is_none());
         assert_eq!(json["request_id"], "req-1");
+        assert_eq!(json["is_final_attempt"], false);
     }
 
     /// The public correlation key (AISIX-Cloud#1279): `trace_id` rides the

@@ -155,6 +155,31 @@ async fn resolve_caller(
     parts: &mut axum::http::request::Parts,
     scope: Option<&str>,
 ) -> Result<McpCaller, crate::error::ProxyError> {
+    // Ahead of every other credential, and only on a scoped entry: the
+    // session token names one server, and nothing else knows what it is.
+    if let Some(server) = scope {
+        if let Some(token) = crate::mcp_oauth_login::presented_session_token(&parts.headers) {
+            let started = Instant::now();
+            return match crate::mcp_oauth_login::authenticate_session(state, token, server).await {
+                Ok(auth) => {
+                    auth.publish(parts);
+                    if let Some(jwt) = &auth.jwt {
+                        parts.extensions.insert(jwt.clone());
+                    }
+                    crate::attribution::note_authenticated(&auth);
+                    Ok(McpCaller {
+                        auth,
+                        anonymous_allowlist: None,
+                    })
+                }
+                Err(err) => {
+                    crate::auth::emit_denial_access_log(parts, started, &err);
+                    crate::auth::record_denial_metrics(state, parts, started, &err);
+                    Err(err)
+                }
+            };
+        }
+    }
     if !crate::auth::credential_offered(parts) {
         let snapshot = state.snapshot.load();
         if let Some(anon) = crate::mcp_auth::anonymous_entry(state, &snapshot, parts, scope) {
@@ -193,7 +218,17 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
     let (mut parts, body) = request.into_parts();
     let caller = match resolve_caller(&state, &mut parts, scope.as_deref()).await {
         Ok(caller) => caller,
-        Err(err) => return err.into_response(),
+        Err(err) => {
+            let mut response = err.into_response();
+            if let Some(server) = &scope {
+                crate::mcp_oauth::challenge_for_server(
+                    &state.snapshot.load(),
+                    server,
+                    &mut response,
+                );
+            }
+            return response;
+        }
     };
     let McpCaller {
         auth,
@@ -297,6 +332,7 @@ async fn serve(state: ProxyState, request: Request, scope: Option<String>) -> Re
             ..Default::default()
         },
         status,
+        crate::attribution::rendered_error_source(status),
         elapsed,
     );
     response
@@ -333,6 +369,31 @@ async fn dispatch(
                 format!("unknown MCP server: {server}"),
             )
                 .into_response();
+        }
+    }
+    // The server signs in each user, which takes a public address to send
+    // them back to. Nothing a caller does can make up for one missing.
+    let user_oauth_scope = scope.filter(|server| {
+        snapshot
+            .mcp_servers
+            .get_by_name(server)
+            .is_some_and(|entry| {
+                entry.value.auth_type == aisix_core::McpAuthType::OAuth2AuthorizationCode
+            })
+    });
+    if let Some(server) = user_oauth_scope {
+        if crate::mcp_auth::public_base(&snapshot).is_none() {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(target: "aisix::mcp_oauth", server,
+                    "this MCP server signs in each user, which needs a valid resource_url in \
+                     the MCP authentication settings");
+            });
+            return crate::mcp_oauth::failure_response(
+                &snapshot,
+                server,
+                aisix_mcp::UserOAuthFailure::Misconfigured,
+            );
         }
     }
 
@@ -460,10 +521,14 @@ async fn dispatch(
     // cost), which releases the concurrency slot. On 429 / budget-exceeded this
     // returns before any upstream is contacted — and the rejected call is still
     // recorded.
+    if is_tool_call {
+        crate::usage_attr::note_failure_request(&snapshot, || tool_call_prompt(&bytes));
+    }
     let _reservation = if is_tool_call {
         match crate::quota::enforce_mcp(state, &snapshot, &auth, &mcp_server).await {
             Ok(reservation) => Some(reservation),
             Err(err) => {
+                crate::usage_attr::note_client_error(&snapshot, &err);
                 emit_tool_call_usage(
                     state,
                     &snapshot,
@@ -576,11 +641,20 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked MCP tool call"
             );
+            note_blocked_tool_call(&snapshot, chain, &bytes);
             let refusal = crate::error::guardrail_block_error(
                 "tool call",
                 guardrail_name.as_deref(),
                 unavailable.as_deref(),
             );
+            crate::usage_attr::note_client_error_body(&snapshot, || {
+                jsonrpc_guardrail_block_body(
+                    rpc_id.clone(),
+                    "tool call",
+                    guardrail_name.as_deref(),
+                    unavailable.as_deref(),
+                )
+            });
             emit_tool_call_usage(
                 state,
                 &snapshot,
@@ -658,6 +732,14 @@ async fn dispatch(
                         None,
                         Some(crate::error::TAG_MASK_WRITEBACK_FAILED),
                     );
+                    crate::usage_attr::note_client_error_body(&snapshot, || {
+                        jsonrpc_guardrail_block_body(
+                            rpc_id.clone(),
+                            "tool call",
+                            None,
+                            Some(crate::error::TAG_MASK_WRITEBACK_FAILED),
+                        )
+                    });
                     emit_tool_call_usage(
                         state,
                         &snapshot,
@@ -710,11 +792,20 @@ async fn dispatch(
                     guardrail_name,
                     unavailable,
                 } => {
+                    note_blocked_tool_call(&snapshot, chain, &bytes);
                     let refusal = crate::error::guardrail_block_error(
                         "tool call",
                         guardrail_name.as_deref(),
                         unavailable.as_deref(),
                     );
+                    crate::usage_attr::note_client_error_body(&snapshot, || {
+                        jsonrpc_guardrail_block_body(
+                            rpc_id.clone(),
+                            "tool call",
+                            guardrail_name.as_deref(),
+                            unavailable.as_deref(),
+                        )
+                    });
                     emit_tool_call_usage(
                         state,
                         &snapshot,
@@ -748,6 +839,9 @@ async fn dispatch(
     // capturing exporter can never archive a value the mask removed
     // (same ordering rule as the LLM path — mask first, capture after).
     let captured_args = capture_cap.map(|_| bytes.clone());
+    if is_tool_call {
+        crate::usage_attr::note_failure_request(&snapshot, || tool_call_prompt(&bytes));
+    }
 
     // Scope the gateway to the tools this caller's key permits — resolved
     // from the key together with the environment/team MCP access policies —
@@ -776,8 +870,13 @@ async fn dispatch(
     // Read off `parts` rather than the request that is about to be rebuilt
     // below: only `content-length` was ever rewritten, and that header is
     // never forwarded.
-    let client_headers = parts.headers.clone();
-    let caller_credentials = caller_credentials(&auth, &parts.headers);
+    let mut client_headers = parts.headers.clone();
+    // Whichever credential admitted this request, a session token is the
+    // gateway's own and no server's `forward_client_headers` may have it.
+    if crate::mcp_oauth_login::presented_session_token(&client_headers).is_some() {
+        client_headers.remove(axum::http::header::AUTHORIZATION);
+    }
+    let caller_credentials = caller_credentials(state, &auth, &parts.headers);
     let gateway = match scope {
         // Same snapshot as the resolution above, so the entry is still there.
         Some(server) => match aisix_mcp::McpGateway::from_snapshot_scoped_for_request(
@@ -813,13 +912,20 @@ async fn dispatch(
     // the list, a call to it fails as a tool error), so one server cannot
     // fail the whole surface.
     let token_exchange_failure = gateway.token_exchange_failure();
+    let user_oauth_failure = gateway.user_oauth_failure();
     let opening = matches!(
         peek.as_ref().and_then(|p| p.method.as_deref()),
         Some("initialize" | "server/discover")
     );
-    if scope.is_some() && opening {
-        if let Some(failure) = gateway.preflight_upstream_auth().await {
-            return crate::error::ProxyError::McpTokenExchange(failure).into_response();
+    if opening {
+        if let Some(server) = user_oauth_scope {
+            if let Some(failure) = gateway.preflight_user_oauth().await {
+                return crate::mcp_oauth::failure_response(&snapshot, server, failure);
+            }
+        } else if scope.is_some() {
+            if let Some(failure) = gateway.preflight_upstream_auth().await {
+                return crate::error::ProxyError::McpTokenExchange(failure).into_response();
+            }
         }
     }
     // Cloned out before the gateway is handed to the transport, which clones
@@ -849,6 +955,7 @@ async fn dispatch(
             crate::error::ProxyError::McpTokenExchange(failure.failure.clone()).into_response();
         let error = crate::error::ProxyError::McpTokenExchange(failure.failure);
         if is_tool_call {
+            crate::usage_attr::note_client_error(&snapshot, &error);
             emit_tool_call_usage(
                 state,
                 &snapshot,
@@ -869,6 +976,34 @@ async fn dispatch(
                 // the re-exchange after the upstream rejected a token.
                 /* dispatched */
                 failure.reached_upstream,
+            );
+        }
+        return response;
+    }
+
+    if let (Some(server), Some(failure)) = (user_oauth_scope, user_oauth_failure.get().cloned()) {
+        let response = crate::mcp_oauth::failure_response(&snapshot, server, failure.failure);
+        if is_tool_call {
+            emit_tool_call_usage(
+                state,
+                &snapshot,
+                &auth,
+                request_id,
+                request_headers,
+                &mcp_server,
+                &mcp_tool,
+                response.status().as_u16(),
+                latency,
+                Some(&crate::error::ProxyError::McpUserOAuth {
+                    failure: failure.failure,
+                    server: server.to_owned(),
+                }),
+                monitor_hits,
+                redaction_counts,
+                guardrail_chain.as_ref(),
+                None,
+                trace,
+                /* dispatched */ failure.reached_upstream,
             );
         }
         return response;
@@ -912,9 +1047,13 @@ async fn dispatch(
         {
             Ok(bytes) => bytes,
             Err(_) => {
+                crate::attribution::note_error_source(aisix_obs::ErrorSource::Upstream);
                 // The tool call reached the upstream: record it like every
                 // other exit, with the status the caller receives.
                 if is_tool_call {
+                    crate::usage_attr::note_client_error_body(&snapshot, || {
+                        "invalid upstream response".to_string()
+                    });
                     emit_tool_call_usage(
                         state,
                         &snapshot,
@@ -925,7 +1064,11 @@ async fn dispatch(
                         &mcp_tool,
                         StatusCode::BAD_GATEWAY.as_u16(),
                         latency,
-                        None,
+                        Some(&crate::error::ProxyError::Bridge(
+                            aisix_gateway::BridgeError::UpstreamDecode(
+                                "invalid upstream response".to_string(),
+                            ),
+                        )),
                         monitor_hits,
                         redaction_counts,
                         guardrail_chain.as_ref(),
@@ -948,6 +1091,14 @@ async fn dispatch(
                         guardrail_name.as_deref(),
                         unavailable.as_deref(),
                     );
+                    crate::usage_attr::note_client_error_body(&snapshot, || {
+                        jsonrpc_guardrail_block_body(
+                            rpc_id.clone(),
+                            "tool result",
+                            guardrail_name.as_deref(),
+                            unavailable.as_deref(),
+                        )
+                    });
                     emit_tool_call_usage(
                         state,
                         &snapshot,
@@ -992,6 +1143,7 @@ async fn dispatch(
     };
 
     if is_tool_call {
+        let (response, transport_refusal) = name_transport_refusal(response).await;
         let capture = capture_cap.map(|cap| {
             tool_call_capture(cap, captured_args.as_deref(), captured_result.as_deref())
         });
@@ -1005,7 +1157,7 @@ async fn dispatch(
             &mcp_tool,
             response.status().as_u16(),
             latency,
-            None,
+            transport_refusal.as_ref(),
             monitor_hits,
             redaction_counts,
             guardrail_chain.as_ref(),
@@ -1013,8 +1165,28 @@ async fn dispatch(
             trace,
             /* dispatched */ true,
         );
+        return response;
     }
     response
+}
+
+/// What a tool call's 4xx says, when the transport answered it rather than the
+/// handler: rmcp refuses a call over its headers, session or params with a body
+/// naming why, and nothing else carries that to the row. A body rendered in this
+/// process, so reading it delays no one.
+async fn name_transport_refusal(
+    response: Response,
+) -> (Response, Option<crate::error::ProxyError>) {
+    if !response.status().is_client_error() {
+        return (response, None);
+    }
+    let (parts, body) = response.into_parts();
+    let bytes = to_bytes(body, usize::MAX).await.unwrap_or_default();
+    let detail = aisix_gateway::upstream_error_message(&bytes);
+    let refusal = (!detail.trim().is_empty()).then_some(crate::error::ProxyError::Bridge(
+        aisix_gateway::BridgeError::InvalidRequest(detail),
+    ));
+    (Response::from_parts(parts, Body::from(bytes)), refusal)
 }
 
 /// The caller's own credentials for the servers that act on the caller's
@@ -1027,19 +1199,24 @@ async fn dispatch(
 /// else: an API key, an anonymous entry, or an `Authorization` the gateway
 /// did not verify never becomes one.
 fn caller_credentials(
+    state: &ProxyState,
     auth: &AuthenticatedKey,
     headers: &axum::http::HeaderMap,
 ) -> aisix_mcp::CallerCredentials {
     aisix_mcp::CallerCredentials {
-        delegated_authorization: if crate::auth::admitted_via_gateway_key_header(headers) {
+        // A session token may sit beside `x-aisix-api-key`, and wins over it.
+        delegated_authorization: if crate::auth::admitted_via_gateway_key_header(headers)
+            && crate::mcp_oauth_login::presented_session_token(headers).is_none()
+        {
             headers.get(axum::http::header::AUTHORIZATION).cloned()
         } else {
             None
         },
-        subject_token: auth
-            .jwt
-            .as_ref()
-            .map(|jwt| std::sync::Arc::clone(&jwt.token)),
+        subject_token: auth.jwt.as_ref().and_then(|jwt| jwt.token.clone()),
+        user_oauth: Some(aisix_mcp::UserOAuthCaller {
+            manager: std::sync::Arc::clone(&state.mcp_oauth),
+            subject: crate::mcp_oauth::caller_subject(auth),
+        }),
     }
 }
 
@@ -1295,24 +1472,48 @@ fn check_local_json(
 /// The post-mask content-capture pair for a tool call: `prompt` is the
 /// (rewritten) `params.arguments`, `response` the (rewritten) `result`.
 /// Both re-serialise through `Value` — capture is telemetry, not wire
-/// bytes, so canonical key order is fine here.
+/// bytes, so canonical key order is fine here. The result's base64 media
+/// is omitted here because `CapturedContent::new` only does so for a prompt.
 fn tool_call_capture(
     cap: u32,
     request_bytes: Option<&[u8]>,
     result_bytes: Option<&[u8]>,
 ) -> aisix_obs::CapturedContent {
-    let prompt = request_bytes
-        .and_then(|b| serde_json::from_slice::<JsonRpcPeek>(b).ok())
-        .and_then(|p| p.params)
-        .and_then(|p| p.arguments)
-        .map(|v| v.to_string())
-        .unwrap_or_default();
+    let prompt = request_bytes.map(tool_call_prompt).unwrap_or_default();
     let response = result_bytes
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
         .and_then(|mut v| v.get_mut("result").map(serde_json::Value::take))
-        .map(|v| v.to_string())
+        .map(|mut v| {
+            aisix_obs::sink::omit_base64_media(&mut v);
+            v.to_string()
+        })
         .unwrap_or_default();
     aisix_obs::CapturedContent::new(&prompt, &response, cap as usize)
+}
+
+/// Note a blocked tool call for its failure row as the success path would
+/// have sent it: masked, though the block ended the call before the write-back.
+fn note_blocked_tool_call(
+    snapshot: &aisix_core::AisixSnapshot,
+    chain: &aisix_guardrails::GuardrailChain,
+    bytes: &[u8],
+) {
+    crate::usage_attr::note_failure_request(snapshot, || {
+        match rewrite_tool_arguments(&chain.without_audit(), bytes) {
+            Ok(Some((masked, _))) => tool_call_prompt(&masked),
+            _ => tool_call_prompt(bytes),
+        }
+    });
+}
+
+/// The prompt half of [`tool_call_capture`].
+fn tool_call_prompt(request_bytes: &[u8]) -> String {
+    serde_json::from_slice::<JsonRpcPeek>(request_bytes)
+        .ok()
+        .and_then(|p| p.params)
+        .and_then(|p| p.arguments)
+        .map(|v| v.to_string())
+        .unwrap_or_default()
 }
 
 /// Outcome of the output-hook guardrail pass over an MCP tool result.
@@ -1576,8 +1777,9 @@ fn emit_tool_call_usage(
     mcp_tool: &str,
     status_code: u16,
     latency: Duration,
-    // The gateway's own refusal of the call — a guardrail block or a quota
-    // rejection — named on the event like every other surface names it.
+    // What failed the call — the gateway's own refusal (a guardrail block, a
+    // quota rejection) or an unusable upstream answer — named on the event
+    // like every other surface names it.
     refusal: Option<&crate::error::ProxyError>,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     // Per-detector mask counts from the write-back passes (names only,
@@ -1728,21 +1930,31 @@ fn jsonrpc_guardrail_block(
     guardrail_name: Option<&str>,
     unavailable: Option<&str>,
 ) -> Response {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        jsonrpc_guardrail_block_body(id, side, guardrail_name, unavailable),
+    )
+        .into_response()
+}
+
+/// The body [`jsonrpc_guardrail_block`] sends.
+fn jsonrpc_guardrail_block_body(
+    id: Option<serde_json::Value>,
+    side: &str,
+    guardrail_name: Option<&str>,
+    unavailable: Option<&str>,
+) -> String {
     let message = crate::error::guardrail_block_message(side, guardrail_name, unavailable);
-    let body = serde_json::json!({
+    serde_json::json!({
         "jsonrpc": "2.0",
         "id": id.unwrap_or(serde_json::Value::Null),
         "result": {
             "content": [{ "type": "text", "text": message }],
             "isError": true,
         }
-    });
-    (
-        StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
-    )
-        .into_response()
+    })
+    .to_string()
 }
 
 #[cfg(test)]

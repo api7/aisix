@@ -39,9 +39,12 @@ rmcp-reqwest = { package = "reqwest", version = "0.13", default-features = false
 # Token-cache keying: the client secret is folded into the cache key as a
 # SHA-256 digest so a rotated secret never reuses the previous secret's token.
 sha2.workspace = true
+ring.workspace = true
 hex.workspace = true
 # Path-parameter encoding for OpenAPI-backed tool calls (`crate::openapi`).
 percent-encoding.workspace = true
+rand.workspace = true
+base64.workspace = true
 
 # Official MCP Rust SDK. Pinned exactly: rmcp is <2 years old and still
 # ships breaking changes on a roughly-monthly cadence, so we hold a fixed

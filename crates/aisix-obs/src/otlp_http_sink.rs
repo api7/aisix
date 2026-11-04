@@ -1328,6 +1328,7 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
     // `aisix.attempt_index`. The OTLP encoder is an explicit allowlist, so
     // these are added here alongside the wire fields.
     attributes.push(attr_int("aisix.attempt_index", event.attempt_index as i64));
+    attributes.push(attr_bool("aisix.is_final_attempt", event.is_final_attempt));
     if !event.attempt_kind.is_empty() {
         attributes.push(attr_string("aisix.attempt_kind", &event.attempt_kind));
     }
@@ -3287,6 +3288,7 @@ mod tests {
         ev.attempt_index = 1;
         ev.attempt_kind = "fallback".into();
         ev.attempt_model = "secondary".into();
+        ev.is_final_attempt = true;
         ev.error_class = "upstream_status".into();
         ev.error_message = "upstream returned 502".into();
         let body = build_otlp_traces_payload(&ev, "test-exp");
@@ -3297,6 +3299,10 @@ mod tests {
         assert_eq!(
             find("aisix.attempt_index").unwrap()["value"]["intValue"],
             "1"
+        );
+        assert_eq!(
+            find("aisix.is_final_attempt").unwrap()["value"]["boolValue"],
+            true
         );
         assert_eq!(
             find("aisix.attempt_kind").unwrap()["value"]["stringValue"],

@@ -55,6 +55,7 @@ pub static METRIC_VARIABLES: &[MetricVariable] = &[
     variable!("status_class", "The HTTP status class: 2xx, 3xx, 4xx, 5xx, or other."),
     variable!("status_code", "The HTTP status class on usage-event metrics: 2xx, 3xx, 4xx, 5xx, or other. The status variable retains the exact code."),
     variable!("outcome", "The outcome defined by the metric, such as the request result, cache decision, or request-body-limit result."),
+    variable!("error_source", "Who ended a failed request: upstream for an upstream's error answer or a call to it that failed, aisix for anything the gateway decided or failed at itself, including rate limits, budgets and guardrail blocks. Empty for a success or a caller that went away."),
     variable!("client_type", "The classified client name from built-in or configured client_type_rules; never the raw User-Agent."),
     variable!("token_type", "The token count category: input, output, or total. Total already includes the input and output categories."),
     variable!("fallback_model", "The configured fallback model attributed to a routing fallback."),
@@ -123,6 +124,7 @@ const REQUEST: &[&str] = &[
     "is_fallback",
     "status",
     "outcome",
+    "error_source",
 ];
 const REQUEST_DURATION: &[&str] = &[
     "endpoint",
@@ -727,6 +729,30 @@ mod tests {
                     && matches!(line.as_bytes().get(name.len()), Some(b'{' | b' '))
             })
             .collect()
+    }
+
+    #[test]
+    fn error_source_is_selectable_on_the_request_counters_only() {
+        let definition = |name: &str| {
+            METRIC_DEFINITIONS
+                .iter()
+                .find(|d| d.name == name)
+                .expect(name)
+        };
+        for counter in [
+            M_LLM_REQUESTS_TOTAL,
+            M_PROXY_REQUESTS_TOTAL,
+            M_PROXY_FAILED_REQUESTS_TOTAL,
+        ] {
+            assert!(definition(counter).supports("error_source"), "{counter}");
+        }
+        for other in [
+            M_REQUESTS_TOTAL,
+            M_LLM_REQUEST_DURATION,
+            M_PROXY_REQUEST_DURATION,
+        ] {
+            assert!(!definition(other).supports("error_source"), "{other}");
+        }
     }
 
     #[test]

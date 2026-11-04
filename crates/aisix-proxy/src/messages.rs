@@ -244,6 +244,7 @@ pub async fn messages(
                     crate::request_metrics::Caller::new(&auth),
                     request_upstream,
                     status,
+                    crate::attempt::answered_error_source(false, &routing),
                     elapsed,
                 );
             }
@@ -262,10 +263,7 @@ pub async fn messages(
                 &client,
                 &applied_guardrails,
                 &routing,
-                // The winner's success event carries the content.
-                /* content_for_last */
-                None,
-                // ...and the terminal trace spans.
+                // The winner's success event carries the terminal trace spans.
                 /* terminal_last */
                 false,
                 // These are the attempts a WINNER superseded — the request
@@ -363,6 +361,7 @@ pub async fn messages(
                     routing.fallback_count() > 0,
                 ),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             // AISIX-Cloud#1428: a guardrail refusal IS this failure, so the
@@ -370,37 +369,13 @@ pub async fn messages(
             // "Guardrail blocks" view filters on. Every other 4xx/5xx class
             // leaves the flag alone.
             let guardrail_blocked = err.is_guardrail_block();
-            // AISIX-Cloud#1013: failed requests carry the (post-mask)
-            // request body so a 4xx/5xx can be triaged from the log alone.
-            // Same opt-in gate and cap as the success path; 401/403 stay
-            // body-less (a 401 here is upstream-auth passthrough — caller
-            // 401s are rejected by the auth extractor before any event
-            // exists) (the body adds nothing to an authorization failure).
-            let mut failure_content = if status == 401 || status == 403 {
-                None
-            } else {
-                content_capture_cap(
-                    snapshot
-                        .observability_exporters
-                        .entries()
-                        .iter()
-                        .map(|e| &e.value),
-                )
-                .map(|cap| {
-                    CapturedContent::new(
-                        &serde_json::to_string(&body).unwrap_or_default(),
-                        "",
-                        cap as usize,
-                    )
-                })
-            };
-            // When every target failed there is no terminal event below —
-            // the content rides the last failed attempt instead.
-            let content_for_last = if !routing.attempts.is_empty() {
-                failure_content.take()
-            } else {
-                None
-            };
+            // Every failure row of this request reports the (post-mask)
+            // request body and, without an upstream answer, this error body
+            // (AISIX-Cloud#1013, #1921).
+            crate::usage_attr::note_failure_request(&snapshot, || {
+                serde_json::to_string(&body).unwrap_or_default()
+            });
+            crate::usage_attr::note_client_error_body(&snapshot, || err.anthropic_body());
             // Per #655: emit one zero-token UsageEvent per FAILED attempt so
             // the dashboard's Logs tab surfaces each failed upstream try.
             emit_failed_attempts_anthropic(
@@ -415,7 +390,6 @@ pub async fn messages(
                 &client,
                 &applied_guardrails,
                 &routing,
-                content_for_last,
                 // All-failed: the last failed attempt is the terminal
                 // emission; the pre-dispatch branch below covers empty.
                 /* terminal_last */
@@ -457,7 +431,7 @@ pub async fn messages(
                     // Input masking may have fired before the failure.
                     redaction_counts.clone(),
                     monitor_hits.clone(),
-                    failure_content.take(),
+                    None,
                     /* terminal */ true,
                     // Pre-dispatch failure: no upstream was contacted.
                     /* dispatched */
@@ -491,11 +465,6 @@ fn emit_failed_attempts_anthropic(
     client: &ClientContext,
     applied_guardrails: &[AppliedGuardrail],
     routing: &RoutingTelemetry,
-    // AISIX-Cloud#1013: when every target failed there is no terminal
-    // event, so the captured request body rides the LAST failed attempt —
-    // the one whose status the caller saw. Other attempts (and the
-    // success-path caller) stay content-less.
-    mut content_for_last: Option<CapturedContent>,
     // AISIX-Cloud#1279: on the all-failed path the LAST failed attempt's
     // event is the request's terminal emission, so it carries the trace's
     // SERVER + logical spans. False on the success path.
@@ -514,11 +483,6 @@ fn emit_failed_attempts_anthropic(
         .enumerate()
         .filter(|(_, a)| !a.success)
     {
-        let content = if Some(i) == last_failed {
-            content_for_last.take()
-        } else {
-            None
-        };
         let pk = crate::usage_attr::ResolvedPk::resolve(snap, &rec.provider_key_id);
         emit_anthropic_usage_event(
             state,
@@ -548,7 +512,7 @@ fn emit_failed_attempts_anthropic(
             // terminal (winner / pre-dispatch) event does.
             crate::redact::RedactionCounts::new(),
             Vec::new(),
-            content,
+            None,
             /* terminal */ terminal_last && Some(i) == last_failed,
             // The record's own network-boundary fact: a rate-limit-refused
             // attempt never reached an upstream.
@@ -742,6 +706,10 @@ async fn dispatch(
             crate::redact::redact_anthropic_request(resolved_chain.as_ref(), body),
         );
     }
+
+    crate::usage_attr::note_failure_request(snapshot, || {
+        serde_json::to_string(&*body).unwrap_or_default()
+    });
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
@@ -2079,7 +2047,7 @@ impl Upstream {
                             Err(e) => {
                                 yield Ok(aisix_provider_anthropic::platform::error_frame(
                                     "api_error",
-                                    &e.to_string(),
+                                    &e.stream_frame_message(),
                                 ));
                                 break;
                             }
@@ -2099,7 +2067,13 @@ impl Upstream {
         deadline: Option<std::time::Duration>,
     ) -> Result<Value, aisix_gateway::BridgeError> {
         match self {
-            Self::Http(resp) => crate::dispatch::json_body_within(resp, deadline).await,
+            Self::Http(resp) => {
+                let body = crate::dispatch::json_body_within(resp, deadline).await?;
+                match aisix_provider_anthropic::wire::body_in_band_error(&body) {
+                    Some(err) => Err(err),
+                    None => Ok(body),
+                }
+            }
             Self::Native(aisix_gateway::NativeMessages::Json(v)) => Ok(v),
             Self::Native(aisix_gateway::NativeMessages::Stream(_)) => {
                 unreachable!("a stream takes the SSE branch")
@@ -2792,7 +2766,10 @@ async fn cross_provider_dispatch(
     // Capture the prompt (the Anthropic request body) + assembled assistant
     // text for content-capturing exporters (gated); threaded to `fan_out` via
     // `DispatchOutcome`, never to the CP sink.
-    let json = chat_response_into_anthropic_json(&resp, model_name);
+    let mut json = chat_response_into_anthropic_json(&resp, model_name);
+    if resp.id.is_empty() {
+        json["id"] = format!("msg_{}", Uuid::new_v4().simple()).into();
+    }
     let captured_content = content_capture_cap(
         snapshot
             .observability_exporters
@@ -2995,6 +2972,10 @@ fn build_anthropic_sse_stream(
                     if let (Some((max_hold, fail_open)), false) = (hold_policy, released) {
                         // Hold-back: withhold the chunk until the end-of-
                         // stream scan clears it.
+                        // This protocol discards generated images, so they
+                        // are neither held nor counted against the hold.
+                        let mut chunk = chunk;
+                        chunk.delta.extra.remove("images");
                         let raw = crate::held_content::chat_chunk_raw(&chunk);
                         held_bytes.hold(crate::held_content::chat_delta(&chunk.delta), raw);
                         held_chunk_bytes.add(raw);
@@ -3040,7 +3021,7 @@ fn build_anthropic_sse_stream(
                     let frame = format!(
                         "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"{}\",\"message\":{}}}}}\n\n",
                         e.error_type(),
-                        serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"error\"".into()),
+                        serde_json::to_string(&e.stream_frame_message()).unwrap_or_else(|_| "\"error\"".into()),
                     );
                     yield Ok(bytes::Bytes::from(frame));
                     return;
@@ -3071,98 +3052,97 @@ fn build_anthropic_sse_stream(
         // assistant text and, on a block, emit a terminal Anthropic
         // `error` event instead of completing the stream cleanly.
         if let (Some(chain), false) = (output_guardrail.as_ref(), released) {
-            if !content_text.is_empty() || !tool_call_fragments.is_empty() {
-                let mut message =
-                    aisix_gateway::ChatMessage::assistant(std::mem::take(&mut content_text));
-                if !tool_call_fragments.is_empty() {
-                    // guardrail_output_text() serializes extra["tool_calls"],
-                    // so streamed tool-call arguments are scanned too.
-                    message.extra.insert(
-                        "tool_calls".to_string(),
-                        serde_json::Value::Array(std::mem::take(&mut tool_call_fragments)),
-                    );
-                }
-                let synth = aisix_gateway::ChatResponse { logprobs: None, more_choices: Vec::new(),
-                    id: String::new(),
-                    model: model_label.clone(),
-                    message,
-                    finish_reason: aisix_gateway::FinishReason::Stop,
-                    usage: aisix_gateway::UsageStats::new(0, 0),
-                    service_tier: None,
-                };
-                let (verdict, hits) =
-                    aisix_guardrails::Guardrail::check_output_non_segment_observed(
-                        chain.as_ref(),
-                        &synth,
-                    )
-                    .await;
-                guard.comp().monitor_hits.extend(hits);
-                // Segment pass: over the held chunks under a hold-back policy
-                // (a mask rewrites them), otherwise over the assembled
-                // message the live relay already sent — read-only.
-                let mut seg_counts = crate::redact::RedactionCounts::new();
-                let mut seg_hits = Vec::new();
-                let verdict = crate::redact::moderate_body(
+            // Consulted with no text as well: a `custom` row decides for itself.
+            let mut message =
+                aisix_gateway::ChatMessage::assistant(std::mem::take(&mut content_text));
+            if !tool_call_fragments.is_empty() {
+                // guardrail_output_text() serializes extra["tool_calls"],
+                // so streamed tool-call arguments are scanned too.
+                message.extra.insert(
+                    "tool_calls".to_string(),
+                    serde_json::Value::Array(std::mem::take(&mut tool_call_fragments)),
+                );
+            }
+            let synth = aisix_gateway::ChatResponse { logprobs: None, more_choices: Vec::new(),
+                id: String::new(),
+                model: model_label.clone(),
+                message,
+                finish_reason: aisix_gateway::FinishReason::Stop,
+                usage: aisix_gateway::UsageStats::new(0, 0),
+                service_tier: None,
+            };
+            let (verdict, hits) =
+                aisix_guardrails::Guardrail::check_output_non_segment_observed(
                     chain.as_ref(),
-                    crate::redact::Direction::Output,
-                    None,
-                    verdict,
-                    &mut seg_counts,
-                    &mut seg_hits,
-                    |g| {
-                        if hold_policy.is_some() {
-                            crate::redact::redact_chat_chunks(g, &mut held_chunks)
-                        } else {
-                            let _ = crate::redact::redact_chat_response(g, &mut synth.clone());
-                            crate::redact::RedactionCounts::new()
-                        }
-                    },
+                    &synth,
                 )
                 .await;
-                guard.comp().monitor_hits.extend(seg_hits);
-                if hold_policy.is_some() && !seg_counts.is_empty() {
-                    // Bedrock masked the held chunks — rebuild the content-
-                    // capture accumulator from the masked content channel
-                    // (the sync redactor below can't reproduce a provider-
-                    // side mask), keeping the original soft cap
-                    // (#932 × AISIX-Cloud#947).
-                    if let Some(cap) = content_cap {
-                        let mut rebuilt = String::new();
-                        for c in held_chunks.iter() {
-                            if rebuilt.len() >= cap as usize {
-                                break;
-                            }
-                            if let Some(t) = c.delta.content.as_deref() {
-                                rebuilt.push_str(t);
-                            }
-                        }
-                        guard.comp().response_text = rebuilt;
+            guard.comp().monitor_hits.extend(hits);
+            // Segment pass: over the held chunks under a hold-back policy
+            // (a mask rewrites them), otherwise over the assembled
+            // message the live relay already sent — read-only.
+            let mut seg_counts = crate::redact::RedactionCounts::new();
+            let mut seg_hits = Vec::new();
+            let verdict = crate::redact::moderate_body(
+                chain.as_ref(),
+                crate::redact::Direction::Output,
+                None,
+                verdict,
+                &mut seg_counts,
+                &mut seg_hits,
+                |g| {
+                    if hold_policy.is_some() {
+                        crate::redact::redact_chat_chunks(g, &mut held_chunks)
+                    } else {
+                        let _ = crate::redact::redact_chat_response(g, &mut synth.clone());
+                        crate::redact::RedactionCounts::new()
                     }
-                    crate::redact::merge_counts(
-                        &mut guard.comp().redacted_entity_counts,
-                        seg_counts,
-                    );
+                },
+            )
+            .await;
+            guard.comp().monitor_hits.extend(seg_hits);
+            if hold_policy.is_some() && !seg_counts.is_empty() {
+                // Bedrock masked the held chunks — rebuild the content-
+                // capture accumulator from the masked content channel
+                // (the sync redactor below can't reproduce a provider-
+                // side mask), keeping the original soft cap
+                // (#932 × AISIX-Cloud#947).
+                if let Some(cap) = content_cap {
+                    let mut rebuilt = String::new();
+                    for c in held_chunks.iter() {
+                        if rebuilt.len() >= cap as usize {
+                            break;
+                        }
+                        if let Some(t) = c.delta.content.as_deref() {
+                            rebuilt.push_str(t);
+                        }
+                    }
+                    guard.comp().response_text = rebuilt;
                 }
-                if let aisix_guardrails::GuardrailVerdict::Block {
-                    reason,
-                    guardrail_name,
-                    unavailable,
-                } = verdict
-                {
-                    tracing::warn!(
-                        guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
-                        guardrail_hook = "output",
-                        model = %model_label,
-                        reason = %reason,
-                        "guardrail blocked streaming /v1/messages response",
-                    );
-                    // Hold-back: the held chunks are dropped — the matched
-                    // content never reached the wire.
-                    guard.comp().record_refusal(guardrail_name.as_deref(), unavailable.as_deref());
-                    let frame = guardrail_block_frame(guardrail_name.as_deref(), unavailable.as_deref());
-                    yield Ok(bytes::Bytes::from(frame));
-                    return;
-                }
+                crate::redact::merge_counts(
+                    &mut guard.comp().redacted_entity_counts,
+                    seg_counts,
+                );
+            }
+            if let aisix_guardrails::GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+                unavailable,
+            } = verdict
+            {
+                tracing::warn!(
+                    guardrail_name = crate::guardrail_stream::guardrail_name_field(guardrail_name.as_deref()),
+                    guardrail_hook = "output",
+                    model = %model_label,
+                    reason = %reason,
+                    "guardrail blocked streaming /v1/messages response",
+                );
+                // Hold-back: the held chunks are dropped — the matched
+                // content never reached the wire.
+                guard.comp().record_refusal(guardrail_name.as_deref(), unavailable.as_deref());
+                let frame = guardrail_block_frame(guardrail_name.as_deref(), unavailable.as_deref());
+                yield Ok(bytes::Bytes::from(frame));
+                return;
             }
         }
         // Hold-back release (#932): the scan cleared — mask the held
@@ -4547,11 +4527,11 @@ where
                 );
             }
             // When the cut took the ENTIRE response, dropping it silently
-            // would hand the caller an empty 200 and no signal at all — and
-            // the scan below is skipped too, since nothing ever reached
-            // `response_text`. Refuse explicitly instead, the same shape the
-            // frame-cap arm above uses. A `held` that was empty to begin
-            // with is an empty upstream response and is left alone.
+            // would hand the caller an empty 200 and no signal at all, and
+            // nothing ever reached `response_text` for the scan below to read.
+            // Refuse explicitly instead, the same shape the frame-cap arm above
+            // uses. A `held` that was empty to begin with is an empty upstream
+            // response, which only the scan below decides.
             if held.is_empty() && seal.cut_anything() {
                 guard.usage().record_refusal(None, Some(crate::error::TAG_UNSCANNABLE_BODY));
                 yield Ok(Bytes::from(guardrail_block_frame(
@@ -4601,7 +4581,10 @@ where
                 }
                 text.push_str(payload);
             }
-            if !text.is_empty() {
+            // Consulted with no text as well: a `custom` row decides for itself.
+            // An upstream failure with no output is the provider's answer, and
+            // reaches the client as such.
+            if !text.is_empty() || guard.usage().failure.is_none() {
                 let synth = aisix_gateway::ChatResponse { logprobs: None, more_choices: Vec::new(),
                     id: String::new(),
                     model: model_label.clone(),

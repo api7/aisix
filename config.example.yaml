@@ -571,24 +571,29 @@ upstream:
   #   # GovCloud. One value serves every Bedrock provider key.
   #   mantle_endpoint: null
 
-# Outbound requests to URLs an API caller supplied — today, the media
-# download (upstream.media_fetch). URLs an operator configured (a provider
-# key's api_base, guardrail, MCP and A2A endpoints, JWKS, exporters) are
-# not affected.
+# Outbound requests to URLs the operator did not choose: the media download
+# (upstream.media_fetch), whose URL an API caller supplied, and an OAuth
+# document or endpoint an MCP server's metadata names on another scheme, host
+# or port than the server's url. URLs an operator configured (a provider key's
+# api_base, guardrail, MCP and A2A endpoints, a trust provider and its
+# discovery document, an MCP server's configured OAuth endpoints and what it
+# publishes on its own address, JWKS, exporters) are not affected.
 # outbound:
 #   # Server-side request forgery protection. On (the default), such a
 #   # request only reaches publicly routable addresses: loopback, private
 #   # (RFC 1918), CGNAT, link-local (including the 169.254.169.254 metadata
 #   # endpoint), benchmarking (198.18.0.0/15), IPv6 unique-local /
-#   # link-local, multicast and reserved ranges are refused with a 400, for
-#   # every address a name resolves to and for every redirect hop. A direct
+#   # link-local, multicast and reserved ranges are refused, for every
+#   # address a name resolves to. A media download is refused with a 400 and
+#   # each of its redirect hops is checked; an MCP sign-in fails with an error
+#   # page or an OAuth error and follows no redirects. A direct
 #   # connection goes only to the addresses that were checked. When a
 #   # proxy applies to the URL, the name is resolved and checked locally
 #   # first and the proxy then resolves it again itself.
 #   #
 #   # Behind a fake-ip DNS or a transparent proxy (Clash, sing-box,
-#   # Surge, …) public names resolve into 198.18.0.0/15, so every
-#   # download is refused: list those hosts in allowed_hosts, or turn the
+#   # Surge, …) public names resolve into 198.18.0.0/15, so every such
+#   # request is refused: list those hosts in allowed_hosts, or turn the
 #   # check off.
 #   ssrf_protection:
 #     # false turns the address check off entirely — no address is

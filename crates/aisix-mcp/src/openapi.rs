@@ -238,6 +238,9 @@ impl OpenApiBridge {
             McpAuthType::OAuth2TokenExchange => {
                 request.bearer_auth(self.token_exchange().token(deadline).await?)
             }
+            // `type: mcp` only; a row combining it with `type: openapi` fails
+            // both schemas and never gets here.
+            McpAuthType::OAuth2AuthorizationCode => request,
         };
         Ok(forwarded.iter().fold(request, |req, (name, value)| {
             req.header(name.clone(), value.clone())

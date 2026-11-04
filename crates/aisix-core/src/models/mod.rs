@@ -80,7 +80,9 @@ pub use observability_exporter::{
     AliyunSlsConfig, DatadogConfig, ExporterKind, ObjectStoreCompression, ObjectStoreConfig,
     ObjectStoreProvider, ObservabilityExporter, OtlpHttpConfig, SlsContentMode,
 };
-pub use oidc_provider::{BoundClaimExpect, HmacSecret, OidcProvider, HMAC_SECRET_MIN_BYTES};
+pub use oidc_provider::{
+    BoundClaimExpect, HmacSecret, OidcClientSecret, OidcLogin, OidcProvider, HMAC_SECRET_MIN_BYTES,
+};
 pub use passthrough_route::{PassthroughAuthMode, PassthroughCredentialMode, PassthroughRoute};
 pub use policy_conditions::{
     eval_condition_nodes, validate_condition_nodes, ConditionGroup, ConditionInput, ConditionLogic,

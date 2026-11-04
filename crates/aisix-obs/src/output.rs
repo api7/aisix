@@ -16,8 +16,8 @@
 //! - OpenAI Responses: `message` text, the readable summary and text of a
 //!   `reasoning` item (never its `encrypted_content`), and `function_call`.
 //!
-//! Every other output kind — a refusal, audio, a server-side tool call or
-//! its result — has no exact counterpart among the conventions' part
+//! Every other output kind — a refusal, audio, a generated image, a
+//! server-side tool call or its result — has no exact counterpart among the conventions' part
 //! types and is left out rather than reported as a near-match.
 
 use std::collections::BTreeMap;

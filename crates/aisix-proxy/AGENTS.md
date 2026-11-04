@@ -363,6 +363,8 @@ deployments; `quota::enforce` for the remaining-quota gauges.
 `metric-endpoint-parity-e2e.test.ts` holds one row per route with the families
 it must emit; a new route, or a family a route cannot have, is declared there.
 
+**Every request-metric emit states what ended the request.** `request_metrics::record` and its siblings take an `ErrorSource` so a new path cannot leave it out; give it the failure, never the status code: `attempt::error_source(&err)` for a typed error, `error_source_of_class` for a stream's terminal class, `answered_error_source` for a response a handler answers with itself, `relayed_error_source` for an upstream's response relayed as sent, and `attribution::rendered_error_source` where only a rendered response survives (note the source first with `note_error_source` if no usage event names it). A new class an upstream's failure reports goes into `UPSTREAM_ERROR_CLASSES`; anything unlisted reads as the gateway's. A local refusal rewritten as `BridgeError::UpstreamStatus` reads as the upstream's, so keep the `ProxyError` (ensemble members and judges are the known exception).
+
 ## A per-model gate must say whether it binds the requested entry or each target
 
 `resolve_attempt_models` expands a routing model into targets, so `model_entry` /
@@ -481,3 +483,15 @@ for a client request must do the same. Gateway-internal calls (health checks,
 the semantic-routing and guardrail embedders) and MCP / A2A do not spend a
 provider key's budget.
 
+## A Failure Row Carries Both Bodies Under Full Content
+
+**With any exporter at `content_mode: full`, every usage event with a status of 400 or above or an `error_class` exports the request body and that attempt's own response body, whichever endpoint and status it is.** `usage_attr::emit_usage` fills them in, so a family cannot opt out by what it passes; it can only starve the fill. A new or changed route owes two things:
+
+- **Note the request body before its first possible failure** with `usage_attr::note_failure_request`, and again after a guardrail masks it, in the representation the route's success path captures. A guardrail block returns before the mask runs: mask there too, so a blocked row never exports what the success path would have hidden. `usage_attr::note_client_error` holds the error body the terminal row reports when no upstream answered; a route that does not answer with the OpenAI envelope uses `note_client_error_body`.
+- **Read every non-2xx upstream body through `aisix_gateway::read_body_capped`** (or hand a body it must relay anyway to `note_upstream_error_body`). That is what reaches the row, and a read that swallows its failure leaves `error_message` naming nothing. All of it is gated on the exporters: under `metadata_only` nothing extra may be read or copied, and a route never reads a body it would otherwise leave unread, because that delays its caller.
+
+**Every failure row also names the failure in `error_message`, at any `content_mode`, whoever wrote the text.** A typed error goes through `attempt::gateway_error_message`. A non-2xx relayed as sent has no typed error: keep at most `MAX_RELAYED_ERROR_DETAIL_BYTES` of a body the route holds or relays anyway, without holding the relay for it, and build the row's fields with `attempt::relayed_failure`. A guardrail refusal stays `guardrail_block_message`: the message and the guardrail's name, never what it matched.
+
+**`usage_attr::emit_usage` guarantees a failure row a non-empty `error_message`, and `AccessLog` gives a line with a status of 400 or above a non-empty `error`, both with `request_failed_message`.** That wording is the backstop for a failure nobody anticipated, not a way to name one: a route that can say why writes it at the source. A row with a status of 400 or above that a route answers itself, like a 501 for a provider lacking the capability, sets `error_class` too, since the access log reads the row's failure only through it.
+
+**None of this changes what a caller is sent.** `BridgeError::UpstreamStatus.message` decides that (blank falls back to the status and reason phrase), so wording for logs and rows belongs in the variant's `Display` (`with_body_read_error`, `with_telemetry_detail`) and never in that field; a stream's error frame takes `stream_frame_message`, never `Display`. A row on a `499` has no error body: the caller left, so nothing was sent to report.

@@ -515,8 +515,10 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     let retry_after = aisix_gateway::parse_retry_after(resp.headers());
     let is_json = aisix_gateway::response_is_json(&resp);
-    let body =
-        aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    let aisix_gateway::UpstreamErrorBody {
+        bytes: body,
+        read_error,
+    } = aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
     // Skip the serde parse on non-JSON bodies (HTML error page from a
     // load-balancer / front door). Same guard as
     // `capture_upstream_error_http`.
@@ -543,7 +545,9 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
         parsed,
         wire: aisix_gateway::UpstreamWire::AzureOpenAI,
         retry_after,
+        diagnostic: None,
     }
+    .with_body_read_error(read_error)
 }
 
 /// Extract the Azure error code from the envelope, applying the
@@ -795,10 +799,9 @@ impl Bridge for AzureOpenAiBridge {
             // `#[serde(default)]` on optional fields and does NOT set
             // `deny_unknown_fields`, so the extension fields pass
             // through transparently without breaking deserialization.
-            let parsed: OpenAiResponse = resp
-                .json()
-                .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            let parsed: OpenAiResponse =
+                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::AzureOpenAI)
+                    .await?;
             Ok(response_into_chat_response(parsed))
         })
         .await

@@ -245,6 +245,7 @@ pub async fn a2a_endpoint(
             crate::request_metrics::Caller::new(&caller_auth),
             a2a_upstream,
             status,
+            crate::attribution::rendered_error_source(status),
             elapsed,
         );
     }
@@ -316,6 +317,9 @@ async fn dispatch(
         .to_string();
     let rpc_id = value.get("id").cloned();
     let operation = canonical_operation(&method);
+    // A call with no words to capture (a task read, a cancel) reports its
+    // JSON-RPC body on a failure row.
+    crate::usage_attr::note_failure_request(&snapshot, || value.to_string());
     // To the request's attribution cell, so a caller that hangs up while the
     // agent is still thinking files a row naming the agent and the call
     // rather than an anonymous 499 (AISIX-Cloud#1571). Both spellings: the
@@ -405,6 +409,7 @@ async fn dispatch(
     let reservation = match crate::quota::enforce(state, &snapshot, &auth, None).await {
         Ok(reservation) => reservation,
         Err(err) => {
+            crate::usage_attr::note_client_error(&snapshot, &err);
             emit_a2a_usage(
                 state,
                 &snapshot,
@@ -417,6 +422,7 @@ async fn dispatch(
                 trace.as_ref(),
                 /* dispatched */ false,
                 Some(&err),
+                None,
             );
             let response = err.into_response();
             return response;
@@ -469,12 +475,16 @@ async fn dispatch(
                 trace.as_ref(),
                 /* dispatched */ true,
                 /* refusal */ None,
+                /* failure */ None,
             );
             axum::Json(response_value).into_response()
         }
         Err(err) => {
             let status = a2a_error_status(&err);
             tracing::warn!(agent = %agent, error = %err, "A2A upstream call failed");
+            crate::usage_attr::note_client_error_body(&snapshot, || {
+                a2a_error_envelope(rpc_id.clone(), &err.to_string()).to_string()
+            });
             emit_a2a_usage(
                 state,
                 &snapshot,
@@ -487,6 +497,7 @@ async fn dispatch(
                 trace.as_ref(),
                 /* dispatched */ true,
                 /* refusal */ None,
+                Some(&A2aFailure::of(&err)),
             );
             a2a_error_response(rpc_id, status, &err.to_string())
         }
@@ -521,6 +532,8 @@ struct StreamUsageOnDrop {
     /// caller and is downgraded if the stream later faults — once the headers
     /// are out, the usage event is the only place that can say so.
     status: u16,
+    /// What faulted the stream, for that same event.
+    failure: Option<A2aFailure>,
     /// The request's trace bundle (AISIX-Cloud#1279) — the Drop emit is
     /// the request's terminal emission, so it carries the terminal spans.
     trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
@@ -558,6 +571,7 @@ impl Drop for StreamUsageOnDrop {
             self.trace.as_ref(),
             /* dispatched */ true,
             /* refusal */ None,
+            self.failure.as_ref(),
         );
     }
 }
@@ -594,6 +608,9 @@ async fn dispatch_stream(
         Err(err) => {
             let status = a2a_error_status(&err);
             tracing::warn!(agent = %agent, error = %err, "A2A upstream stream failed to open");
+            crate::usage_attr::note_client_error_body(snapshot, || {
+                a2a_error_envelope(rpc_id.clone(), &err.to_string()).to_string()
+            });
             drop(reservation);
             emit_a2a_usage(
                 state,
@@ -607,6 +624,7 @@ async fn dispatch_stream(
                 trace.as_ref(),
                 /* dispatched */ true,
                 /* refusal */ None,
+                Some(&A2aFailure::of(&err)),
             );
             return a2a_error_response(rpc_id, status, &err.to_string());
         }
@@ -620,6 +638,7 @@ async fn dispatch_stream(
         call,
         started,
         status: StatusCode::OK.as_u16(),
+        failure: None,
         trace,
         _concurrency: reservation.into_stream_hold(),
     };
@@ -687,6 +706,7 @@ async fn dispatch_stream(
                     // connection and leaving a truncated task looking complete.
                     tracing::warn!(agent = %agent_label, error = %err, "A2A stream failed mid-flight");
                     guard.status = a2a_error_status(&err).as_u16();
+                    guard.failure = Some(A2aFailure::of(&err));
                     yield Ok(axum::response::sse::Event::default()
                         .data(a2a_error_envelope(rpc_id.clone(), &err.to_string()).to_string()));
                     break;
@@ -742,6 +762,7 @@ pub async fn a2a_agent_card(
         uri.path(),
         crate::request_metrics::Caller::new(&auth),
         response.status().as_u16(),
+        crate::attribution::rendered_error_source(response.status().as_u16()),
         started,
     );
     response
@@ -795,6 +816,7 @@ async fn agent_card(
         Ok(card) => card,
         Err(err) => {
             tracing::warn!(agent = %agent, error = %err, "A2A agent card fetch failed");
+            crate::attribution::note_error_source(aisix_obs::ErrorSource::Upstream);
             return (StatusCode::BAD_GATEWAY, err.to_string()).into_response();
         }
     };
@@ -860,7 +882,30 @@ fn gateway_base(uri: &axum::http::Uri, headers: &HeaderMap) -> Option<String> {
 /// a bad gateway.
 fn a2a_error_status(err: &A2aError) -> StatusCode {
     match err {
-        A2aError::Connect(_) | A2aError::Request(_) => StatusCode::BAD_GATEWAY,
+        A2aError::Connect(_) | A2aError::UpstreamStatus(_) | A2aError::Request(_) => {
+            StatusCode::BAD_GATEWAY
+        }
+    }
+}
+
+/// The failure an upstream agent's error leaves on the call's usage event. The
+/// message is what the caller was told: the agent's error body stays unread
+/// unless a full-content exporter wants it, where it reaches the row's response.
+struct A2aFailure {
+    class: &'static str,
+    message: String,
+}
+
+impl A2aFailure {
+    fn of(err: &A2aError) -> Self {
+        Self {
+            class: match err {
+                A2aError::Connect(_) => "transport",
+                A2aError::UpstreamStatus(_) => "upstream_status",
+                A2aError::Request(_) => "upstream_decode",
+            },
+            message: crate::attempt::sanitize_error_message(&err.to_string()),
+        }
     }
 }
 
@@ -921,6 +966,9 @@ async fn guardrail_block_response(
         guardrail_name.as_deref(),
         unavailable.as_deref(),
     );
+    crate::usage_attr::note_client_error_body(snapshot, || {
+        a2a_error_envelope(rpc_id.clone(), &refusal.to_string()).to_string()
+    });
     let response = a2a_error_response(
         rpc_id,
         StatusCode::UNPROCESSABLE_ENTITY,
@@ -939,6 +987,7 @@ async fn guardrail_block_response(
         /* dispatched */ false,
         // This IS the guardrail refusal.
         Some(&refusal),
+        None,
     );
     Some(response)
 }
@@ -997,6 +1046,8 @@ fn emit_a2a_usage(
     // place a refusal can appear to the dashboard's "Guardrail blocks"
     // view (AISIX-Cloud#1428).
     refusal: Option<&crate::error::ProxyError>,
+    // The upstream agent's failure, for a call that reached it.
+    failure: Option<&A2aFailure>,
 ) {
     let guardrail_blocked = refusal.is_some_and(crate::error::ProxyError::is_guardrail_block);
     // No model resolves on this endpoint, so the estimator falls back to its
@@ -1041,10 +1092,13 @@ fn emit_a2a_usage(
             .unwrap_or_default(),
         guardrail_blocked,
         error_class: refusal
-            .map(|e| crate::attempt::error_class(e).to_string())
-            .unwrap_or_default(),
+            .map(crate::attempt::error_class)
+            .or(failure.map(|f| f.class))
+            .unwrap_or_default()
+            .to_string(),
         error_message: refusal
             .map(crate::attempt::gateway_error_message)
+            .or(failure.map(|f| f.message.clone()))
             .unwrap_or_default(),
         applied_guardrails: call.applied_guardrails.clone(),
         guardrail_monitor_hits: call.guardrail_monitor_hits.clone(),

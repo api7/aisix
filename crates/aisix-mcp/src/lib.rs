@@ -18,17 +18,23 @@ pub mod error;
 pub mod gateway;
 mod oauth;
 pub mod openapi;
+pub mod shared_store;
 mod token_cache;
 pub mod token_exchange;
+pub mod user_oauth;
 
 pub use bridge::{
     forwarded_client_headers, upstream_from_mcp_server, CallerCredentials, EphemeralBridge,
     McpAuth, McpBridge, McpProtocol, McpTool, McpToolResult, McpUpstream, OAuthClientConfig,
-    RmcpBridge,
+    RmcpBridge, UserOAuthCaller,
 };
-pub use error::{McpError, TokenExchangeError, TokenExchangeFailure};
+pub use error::{
+    McpError, TokenExchangeError, TokenExchangeFailure, UserOAuthError, UserOAuthFailure,
+};
 pub use gateway::{
     streamable_http_service, strip_server_prefix, McpGateway, ToolAcl, ToolsListCounts,
     SUPPORTED_PROTOCOL_VERSION_NAMES, TOOL_NAMESPACE_SEPARATOR,
 };
 pub use openapi::OpenApiBridge;
+pub use shared_store::{MemoryStore, PutCondition, SharedStore, StoreError, StoredValue};
+pub use user_oauth::{UserOAuthManager, UserOAuthServer, UserSubject};

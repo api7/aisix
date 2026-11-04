@@ -17,6 +17,8 @@
 //! nothing. So each hold-back also bounds the raw bytes it keeps, at
 //! [`RAW_HOLD_FACTOR`] times the same cap, through [`HeldBuffer`]. Crossing
 //! either bound is the same buffer-exceeded event.
+//! A chat frame's generated `images` are outside the raw bound as well
+//! ([`chat_chunk_images_raw`]).
 
 use std::{
     collections::HashMap,
@@ -171,6 +173,14 @@ fn json_len(v: &impl serde::Serialize) -> usize {
 /// chunk occupies once rendered at release.
 pub(crate) fn chat_chunk_raw(chunk: &aisix_gateway::ChatChunk) -> usize {
     json_len(chunk)
+}
+
+/// The share of a chat chunk's raw size that stays outside the hold-back's
+/// raw-byte bound: its generated images. A guardrail does not read an image,
+/// so an image is never the reason a response is refused or released
+/// unscanned; the bytes are still reported through [`HeldBytes`].
+pub(crate) fn chat_chunk_images_raw(chunk: &aisix_gateway::ChatChunk) -> usize {
+    chunk.delta.extra.get("images").map_or(0, json_len)
 }
 
 /// Held content in one normalised chat delta.

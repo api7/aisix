@@ -10,6 +10,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  type CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
 
 export interface McpUpstream {
@@ -52,6 +53,12 @@ export interface McpUpstreamOptions {
    * argument — a tool result carrying a JSON number rather than a string.
    */
   numericTool?: boolean;
+  /**
+   * Also expose a `media` tool answering with exactly these content blocks and
+   * this `structuredContent`, marked `isError` when its `failed` argument is
+   * true.
+   */
+  mediaResult?: { content: unknown[]; structuredContent?: Record<string, unknown> };
   /**
    * Answer `401` (with a bare `WWW-Authenticate: Bearer`) to any request
    * whose `Authorization` this predicate rejects — an OAuth-protected
@@ -178,6 +185,15 @@ async function handle(
               },
             ]
           : []),
+        ...(options.mediaResult
+          ? [
+              {
+                name: "media",
+                description: "return fixed media content",
+                inputSchema: { type: "object" as const, properties: {} },
+              },
+            ]
+          : []),
         ...(options.reportContent
           ? [
               {
@@ -210,6 +226,12 @@ async function handle(
           ],
           structuredContent: { log: structuredLog, cells: 42 },
         };
+      }
+      if (request.params.name === "media" && options.mediaResult) {
+        return {
+          ...options.mediaResult,
+          ...(request.params.arguments?.failed === true ? { isError: true } : {}),
+        } as CallToolResult;
       }
       if (request.params.name === "count" && options.numericTool) {
         return {

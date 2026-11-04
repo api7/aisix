@@ -237,6 +237,13 @@ pub enum ProxyError {
     /// the caller from an `oauth2_token_exchange` server's token endpoint.
     #[error("upstream token exchange failed: {0}")]
     McpTokenExchange(aisix_mcp::TokenExchangeFailure),
+    /// `/mcp/{server}` has no usable upstream token for the caller of an
+    /// `oauth2_authorization_code` server.
+    #[error("{}", mcp_user_oauth_message(.failure, .server))]
+    McpUserOAuth {
+        failure: aisix_mcp::UserOAuthFailure,
+        server: String,
+    },
     #[error("model {0:?} not found")]
     ModelNotFound(String),
     /// A `/v1/videos/{video_id}` id that this gateway could not have
@@ -479,6 +486,14 @@ impl ProxyError {
                 aisix_mcp::TokenExchangeFailure::Misconfigured => StatusCode::INTERNAL_SERVER_ERROR,
                 aisix_mcp::TokenExchangeFailure::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             },
+            ProxyError::McpUserOAuth { failure, .. } => match failure {
+                aisix_mcp::UserOAuthFailure::AuthorizationRequired => StatusCode::UNAUTHORIZED,
+                // Never a 401: an MCP client answers any 401 by opening a
+                // browser, and signing in cannot give this caller a user.
+                aisix_mcp::UserOAuthFailure::NoSubject => StatusCode::FORBIDDEN,
+                aisix_mcp::UserOAuthFailure::Misconfigured => StatusCode::INTERNAL_SERVER_ERROR,
+                aisix_mcp::UserOAuthFailure::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+            },
             ProxyError::ModelForbidden(_) => StatusCode::FORBIDDEN,
             ProxyError::ModelIpRestricted(_) => StatusCode::FORBIDDEN,
             ProxyError::RouteIpRestricted(_) => StatusCode::FORBIDDEN,
@@ -523,6 +538,12 @@ impl ProxyError {
                 | aisix_mcp::TokenExchangeFailure::SubjectRejected { .. } => "authentication_error",
                 aisix_mcp::TokenExchangeFailure::Misconfigured
                 | aisix_mcp::TokenExchangeFailure::Unavailable => "api_error",
+            },
+            ProxyError::McpUserOAuth { failure, .. } => match failure {
+                aisix_mcp::UserOAuthFailure::AuthorizationRequired => "authentication_error",
+                aisix_mcp::UserOAuthFailure::NoSubject => "permission_denied",
+                aisix_mcp::UserOAuthFailure::Misconfigured
+                | aisix_mcp::UserOAuthFailure::Unavailable => "api_error",
             },
             ProxyError::ModelForbidden(_) => "permission_denied",
             ProxyError::ModelIpRestricted(_) => "permission_denied",
@@ -644,6 +665,14 @@ impl ProxyError {
                 self.kind(),
             );
         }
+        if let ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamBodyUnread {
+            decode_error,
+            ..
+        }) = self
+        {
+            let as_decode = aisix_gateway::BridgeError::UpstreamDecode(decode_error.clone());
+            return ErrorEnvelope::new(as_decode.to_string(), self.kind());
+        }
         let env = ErrorEnvelope::new(self.to_string(), self.kind());
         match self {
             ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
@@ -687,6 +716,14 @@ impl ProxyError {
                 }
                 aisix_mcp::TokenExchangeFailure::Misconfigured => "token_exchange_misconfigured",
                 aisix_mcp::TokenExchangeFailure::Unavailable => "token_exchange_unavailable",
+            }),
+            ProxyError::McpUserOAuth { failure, .. } => env.with_code(match failure {
+                aisix_mcp::UserOAuthFailure::AuthorizationRequired => {
+                    "mcp_oauth_authorization_required"
+                }
+                aisix_mcp::UserOAuthFailure::NoSubject => "mcp_oauth_no_subject",
+                aisix_mcp::UserOAuthFailure::Misconfigured => "mcp_oauth_misconfigured",
+                aisix_mcp::UserOAuthFailure::Unavailable => "mcp_oauth_unavailable",
             }),
             ProxyError::SemanticDecisionFailed { .. } => env.with_code("semantic_routing_failed"),
             // Same stable-code convention, for the one distinction a
@@ -871,6 +908,27 @@ fn apply_retry_headers(
     }
 }
 
+/// The caller-facing text of [`ProxyError::McpUserOAuth`].
+fn mcp_user_oauth_message(failure: &aisix_mcp::UserOAuthFailure, server: &str) -> String {
+    match failure {
+        aisix_mcp::UserOAuthFailure::AuthorizationRequired => {
+            format!("MCP server '{server}' requires this user to sign in")
+        }
+        aisix_mcp::UserOAuthFailure::NoSubject => format!(
+            "this gateway credential has no user, so it cannot be used with MCP server \
+             '{server}', which signs in each user individually"
+        ),
+        aisix_mcp::UserOAuthFailure::Misconfigured => format!(
+            "MCP server '{server}' cannot sign in users as configured; an administrator must \
+             check its OAuth settings and the MCP authentication settings"
+        ),
+        aisix_mcp::UserOAuthFailure::Unavailable => format!(
+            "this user's upstream token for MCP server '{server}' is temporarily unavailable; \
+             try again"
+        ),
+    }
+}
+
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let challenge = self.auth_challenge();
@@ -1014,29 +1072,33 @@ impl ProxyError {
         let status = self.status();
         let retry_after = self.retry_after_secs();
         let rate_limit_detail = self.rate_limit_detail();
-        let kind = anthropic_kind_from_status(status).to_string();
-        let code = match &self {
+        let mut response = (status, Json(self.anthropic_envelope())).into_response();
+        apply_retry_headers(&mut response, retry_after, rate_limit_detail);
+        response
+    }
+
+    /// The body [`Self::into_anthropic_response`] sends.
+    pub(crate) fn anthropic_body(&self) -> String {
+        serde_json::to_string(&self.anthropic_envelope()).unwrap_or_default()
+    }
+
+    fn anthropic_envelope(&self) -> AnthropicErrorEnvelope {
+        let code = match self {
             ProxyError::ContentFiltered { unavailable, .. } => {
                 Some(anthropic_guardrail_code(unavailable.as_deref()))
             }
             _ => None,
         };
-        // Reuse OpenAI envelope only for the SAFE-MESSAGE logic
-        // (the upstream message, translated on a 4xx).
-        // The inner type is overwritten to the Anthropic-canonical
-        // string above.
-        let openai_env = self.envelope();
-        let anth_body = AnthropicErrorEnvelope {
+        AnthropicErrorEnvelope {
             discriminator: "error",
             error: AnthropicErrorBody {
-                kind,
-                message: openai_env.error.message,
+                kind: anthropic_kind_from_status(self.status()).to_string(),
+                // Reuse OpenAI envelope only for the SAFE-MESSAGE logic
+                // (the upstream message, translated on a 4xx).
+                message: self.envelope().error.message,
                 code,
             },
-        };
-        let mut response = (status, Json(anth_body)).into_response();
-        apply_retry_headers(&mut response, retry_after, rate_limit_detail);
-        response
+        }
     }
 }
 

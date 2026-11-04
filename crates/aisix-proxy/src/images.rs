@@ -58,8 +58,8 @@ struct ImageDispatchSuccess {
     /// Monitor-mode guardrail observations (AISIX-Cloud#562).
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// Captured request/response content for content-capturing exporters
-    /// (#700, LiteLLM parity: the full image response JSON — url or
-    /// b64_json — truncated at the capture cap). `Some` only when an
+    /// (#700: the image response JSON with its base64 replaced by a
+    /// placeholder, truncated at the capture cap). `Some` only when an
     /// exporter opted into `content_mode = full`.
     captured_content: Option<CapturedContent>,
 }
@@ -153,6 +153,7 @@ pub async fn image_generations(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::answered_error_source(false, &routing),
                 elapsed,
             );
             // One zero-token event per attempt that failed first (#655).
@@ -238,12 +239,14 @@ pub async fn image_generations(
                 crate::request_metrics::Caller::new(&auth),
                 last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             // Per #655 parity: surface the failed request in Logs with a
             // zero-token event (status + error class), instead of dropping it.
             // Per #655: one zero-token event per failed upstream attempt,
             // the last of them terminal when every attempt failed.
+            crate::usage_attr::note_client_error(&snapshot, &err);
             let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
             crate::usage_attr::emit_failed_attempts(
                 &state,
@@ -309,6 +312,7 @@ async fn dispatch(
     audit_out: &mut crate::usage_attr::GuardrailAudit,
     routing_out: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<ImageDispatchSuccess, ProxyError> {
+    crate::usage_attr::note_failure_request(snapshot, || body.to_string());
     // Owned so the #696 in-place prompt masking below can borrow `body`
     // mutably.
     let model_name = body
@@ -390,6 +394,11 @@ async fn dispatch(
                 reason = %reason,
                 "guardrail blocked /v1/images/generations request",
             );
+            // A blocked request exports what the success path would have sent.
+            if crate::usage_attr::content_cap(snapshot).is_some() {
+                crate::redact::redact_images_request(&resolved_chain.without_audit(), &mut body);
+                crate::usage_attr::note_failure_request(snapshot, || body.to_string());
+            }
             return Err(crate::error::guardrail_block_error(
                 "request",
                 guardrail_name.as_deref(),
@@ -402,11 +411,11 @@ async fn dispatch(
     // the block check passes, BEFORE the body is forwarded upstream.
     // Pre-#696 a mask-action detector was a silent no-op here.
     let redactions = crate::redact::redact_images_request(&resolved_chain, &mut body);
+    crate::usage_attr::note_failure_request(snapshot, || body.to_string());
 
     // Content capture (#700): the client-facing request body
     // (post-#932-redaction) is the prompt; the response is the image JSON
-    // (url or b64_json — LiteLLM logs it unstripped too), truncated at the
-    // cap.
+    // with its base64 replaced by a placeholder, truncated at the cap.
     let content_cap = content_capture_cap(
         snapshot
             .observability_exporters
@@ -533,12 +542,11 @@ async fn dispatch(
                 u64::from(u.prompt_tokens) + u64::from(u.completion_tokens)
             });
             reservation.commit_tokens(total_tokens).await;
-            // Content capture (#700): the full response JSON (LiteLLM
-            // parity); CapturedContent::new truncates to the cap.
+            // Content capture (#700): CapturedContent::new truncates to the cap.
             let captured_content = match (&captured_prompt, content_cap) {
                 (Some(prompt), Some(cap)) => Some(CapturedContent::new(
                     prompt,
-                    &serde_json::to_string(&resp_json).unwrap_or_default(),
+                    &captured_image_response(&resp_json),
                     cap as usize,
                 )),
                 _ => None,
@@ -777,6 +785,16 @@ pub(crate) fn emit_access_log(
         request_body_bytes: None,
         response_body_bytes: None,
     });
+}
+
+/// The image response as an exporter's captured response: its base64 is a
+/// placeholder, every other field as the upstream sent it.
+pub(crate) fn captured_image_response(response: &serde_json::Value) -> String {
+    let text = serde_json::to_string(response).unwrap_or_default();
+    match aisix_obs::sink::omit_base64_media_in_json(&text) {
+        std::borrow::Cow::Borrowed(_) => text,
+        std::borrow::Cow::Owned(omitted) => omitted,
+    }
 }
 
 #[cfg(test)]
@@ -1278,6 +1296,8 @@ mod tests {
             .expect("the 501 must emit its zero-token UsageEvent")
             .expect("usage sink remains open");
         assert_eq!(ev.status_code, 501);
+        assert_eq!(ev.error_class, "config", "{ev:?}");
+        assert!(ev.error_message.contains("does not support"), "{ev:?}");
         assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
         assert!(ev.guardrail_enforced_hits.is_empty(), "{ev:?}");
 

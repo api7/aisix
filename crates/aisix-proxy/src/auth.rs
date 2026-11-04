@@ -61,27 +61,57 @@ pub struct JwtIdentity {
     pub subject: String,
     /// Name of the OIDC provider that verified the token.
     pub provider: String,
+    /// That provider's configured issuer, which keys this caller's stored
+    /// upstream credentials. `None` on a provider that pins none.
+    pub(crate) issuer: Option<String>,
+    /// That provider's identity claim, which keys them too: `subject` means
+    /// someone else under another claim.
+    pub(crate) identity_claim: String,
     /// Name of the claim mapping that selected the API key, or `None`
     /// when the subject was bound to the key directly via `jwt_subject`.
     pub claim_mapping: Option<String>,
     /// The bearer token itself, exactly as the trust provider verified it —
     /// what an `oauth2_token_exchange` MCP server exchanges on the caller's
-    /// behalf. Never printed.
-    pub(crate) token: Arc<str>,
+    /// behalf. Never printed. `None` for a session token: the gateway's own
+    /// credential, which means nothing to anyone else and never leaves here.
+    pub(crate) token: Option<Arc<str>>,
 }
 
 impl JwtIdentity {
     pub fn new(
         subject: String,
         provider: String,
+        issuer: Option<String>,
+        identity_claim: String,
         claim_mapping: Option<String>,
         token: Arc<str>,
     ) -> Self {
         Self {
             subject,
             provider,
+            issuer,
+            identity_claim,
             claim_mapping,
-            token,
+            token: Some(token),
+        }
+    }
+
+    /// The identity of a session token, which a trust provider verified at
+    /// sign-in rather than on this request.
+    pub(crate) fn for_session(
+        subject: String,
+        provider: String,
+        issuer: Option<String>,
+        identity_claim: String,
+        claim_mapping: Option<String>,
+    ) -> Self {
+        Self {
+            subject,
+            provider,
+            issuer,
+            identity_claim,
+            claim_mapping,
+            token: None,
         }
     }
 }
@@ -214,7 +244,7 @@ where
 /// Count a request the extractor refused in the request families, as every
 /// other refusal is: without it a 401 / 403 on a typed route existed in the
 /// access log and nowhere in `aisix_proxy_*` / `aisix_llm_*`.
-fn record_denial_metrics(
+pub(crate) fn record_denial_metrics(
     state: &ProxyState,
     parts: &Parts,
     started: std::time::Instant,
@@ -232,6 +262,7 @@ fn record_denial_metrics(
             ..Default::default()
         },
         err.status().as_u16(),
+        crate::attempt::error_source(err),
         started.elapsed(),
     );
 }
@@ -243,7 +274,7 @@ fn record_denial_metrics(
 /// access-log record at all. Nothing about the caller is resolved yet: the
 /// line carries no key id (a disabled or expired key's id is on the
 /// `aisix::auth` warn line), and never any part of the presented credential.
-fn emit_denial_access_log(parts: &Parts, started: std::time::Instant, err: &ProxyError) {
+pub(crate) fn emit_denial_access_log(parts: &Parts, started: std::time::Instant, err: &ProxyError) {
     let request_id = parts
         .extensions
         .get::<crate::request_id::RequestId>()

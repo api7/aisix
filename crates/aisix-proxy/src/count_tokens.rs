@@ -156,6 +156,7 @@ pub async fn count_tokens(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::answered_error_source(false, &routing),
                 elapsed,
             );
             // One zero-token event per attempt that failed first (#655);
@@ -235,10 +236,12 @@ pub async fn count_tokens(
                 crate::request_metrics::Caller::new(&auth),
                 last_target.upstream(metric_model.as_ref(), false, routing.fallback_count() > 0),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             // Per #655: one zero-token event per failed upstream attempt,
             // the last of them terminal when every attempt failed.
+            crate::usage_attr::note_client_error_body(&snapshot, || err.anthropic_body());
             let failed_terminal = crate::usage_attr::failed_attempts_are_terminal(&routing);
             crate::usage_attr::emit_failed_attempts_as(
                 &state,
@@ -317,6 +320,7 @@ struct InputScreening {
 /// census asserts.
 async fn screen_input(
     state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
     auth: &AuthenticatedKey,
     model_entry_id: &str,
     model_name: &str,
@@ -404,6 +408,11 @@ async fn screen_input(
             reason = %reason,
             "guardrail blocked /v1/messages/count_tokens request",
         );
+        // A blocked request exports what the success path would have sent.
+        if crate::usage_attr::content_cap(snapshot).is_some() {
+            crate::redact::redact_anthropic_request(&chain.without_audit(), body);
+            crate::usage_attr::note_failure_request(snapshot, || body.to_string());
+        }
         return Err(crate::error::guardrail_block_error(
             "request",
             guardrail_name.as_deref(),
@@ -453,6 +462,7 @@ async fn dispatch(
     screening: &mut InputScreening,
     routing: &mut crate::attempt::RoutingTelemetry,
 ) -> Result<CountTokensSuccess, ProxyError> {
+    crate::usage_attr::note_failure_request(snapshot, || body.to_string());
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -473,7 +483,17 @@ async fn dispatch(
     // rationale as the `/v1/messages` sibling: before the reservation, so a
     // content-policy refusal doesn't burn an RPM slot. See the module doc
     // for why the input hook applies here and the output hook does not.
-    screen_input(state, auth, &model_entry.id, &model_name, body, screening).await?;
+    screen_input(
+        state,
+        snapshot,
+        auth,
+        &model_entry.id,
+        &model_name,
+        body,
+        screening,
+    )
+    .await?;
+    crate::usage_attr::note_failure_request(snapshot, || body.to_string());
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
@@ -955,9 +975,6 @@ async fn count_tokens_to_target(
         return Err(ProxyError::Bridge(err));
     }
 
-    state.health.record_success(&model.display_name);
-    state.runtime_status.mark_healthy(model_id);
-
     // Forward the `{"input_tokens": <int>}` response body verbatim — the
     // gateway adds nothing to the token-counting contract.
     let upstream_headers = upstream_resp.headers().clone();
@@ -973,6 +990,20 @@ async fn count_tokens_to_target(
             )
         })
         .map_err(ProxyError::Bridge)?;
+    if let Some(err) = aisix_gateway::in_band_error_body(&body_bytes)
+        .as_ref()
+        .and_then(aisix_provider_anthropic::wire::body_in_band_error)
+    {
+        return Err(ProxyError::Bridge(crate::cooldown::note_failure(
+            &state.runtime_status,
+            model_id,
+            model.cooldown.as_ref(),
+            err,
+        )));
+    }
+
+    state.health.record_success(&model.display_name);
+    state.runtime_status.mark_healthy(model_id);
 
     let mut resp = axum::response::Response::new(axum::body::Body::from(body_bytes));
     if let Some(ct) = upstream_headers.get("content-type") {
@@ -1147,9 +1178,8 @@ fn emit_usage_event(
         crate::operation::COUNT_TOKENS,
         event,
         crate::usage_attr::usage_event_labels(&usage_model, pk),
-        // Content capture (#700) is not wired on this route — it is a
-        // separate, per-exporter opt-in capability, and #1435 is about the
-        // event existing at all.
+        // Content capture (#700) is not wired for a counted request; a failed
+        // one reports its body through `failure_row_content`.
         None,
         client.trace.as_ref(),
         /* terminal */ true,

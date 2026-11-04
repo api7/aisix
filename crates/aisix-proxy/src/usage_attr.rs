@@ -562,6 +562,103 @@ pub(crate) fn apply_caller_identity(
     event.jwt_claim_mapping = sanitize_tag(jwt.claim_mapping.clone().unwrap_or_default());
 }
 
+/// The content cap the snapshot's enabled exporters ask for, `None` when none
+/// of them runs at `content_mode: full`.
+pub(crate) fn content_cap(snap: &AisixSnapshot) -> Option<u32> {
+    aisix_obs::content_capture_cap(
+        snap.observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &e.value),
+    )
+}
+
+/// Hold the request body every failure row of this request reports, in the
+/// representation the endpoint's success path captures. `prompt` runs only
+/// under a full-content export. Call again once a guardrail has masked the
+/// request: the latest note is the one reported.
+pub(crate) fn note_failure_request(snap: &AisixSnapshot, prompt: impl FnOnce() -> String) {
+    if let Some(cap) = content_cap(snap) {
+        crate::attribution::note_failure_request(aisix_obs::CapturedContent::new(
+            &prompt(),
+            "",
+            cap as usize,
+        ));
+    }
+}
+
+/// Hold the error body the caller is about to be sent, for the terminal
+/// failure row. Only a full-content export reads it.
+pub(crate) fn note_client_error(snap: &AisixSnapshot, err: &ProxyError) {
+    note_client_error_body(snap, || {
+        serde_json::to_string(&err.envelope()).unwrap_or_default()
+    });
+}
+
+/// [`note_client_error`] for a route that does not answer with the OpenAI
+/// envelope.
+pub(crate) fn note_client_error_body(snap: &AisixSnapshot, body: impl FnOnce() -> String) {
+    if content_cap(snap).is_some() {
+        crate::attribution::note_client_error_body(body());
+    }
+}
+
+/// Whether `event` reports a failure, whatever its status told the caller.
+fn is_failure_row(event: &UsageEvent) -> bool {
+    event.status_code >= 400 || !event.error_class.is_empty()
+}
+
+/// What a failure row exports (AISIX-Cloud#1921): the request body and
+/// the attempt's upstream response body, or, for an attempt no upstream
+/// answered, the gateway's own error body, except on a `499`, which went to
+/// no one. `None` for any other row, whose
+/// `content` stands as given.
+fn failure_row_content(
+    event: &UsageEvent,
+    content: Option<&aisix_obs::CapturedContent>,
+    upstream_body: Option<&[u8]>,
+    terminal: bool,
+    cap: usize,
+) -> Option<aisix_obs::CapturedContent> {
+    if !is_failure_row(event) {
+        return None;
+    }
+    let (noted_request, noted_error) = crate::attribution::failure_notes();
+    let row = match content {
+        Some(c) if !c.prompt.is_empty() => c.clone(),
+        given => {
+            // A bodyless request's note says nothing; `given` may hold a response.
+            let request = noted_request
+                .filter(|noted| !noted.prompt.is_empty())
+                .or_else(|| given.cloned());
+            request.unwrap_or_else(|| aisix_obs::CapturedContent::new("", "", cap))
+        }
+    };
+    if !row.response.is_empty() {
+        return Some(row);
+    }
+    // A stream that failed mid-way ends with no finish reason, which is what
+    // the structured output field needs: what it delivered goes here instead.
+    let delivered = row
+        .output
+        .as_ref()
+        .and_then(aisix_obs::OutputCapture::parts_json)
+        .map(|parts| serde_json::Value::Array(parts).to_string());
+    let response = match (delivered, upstream_body.filter(|b| !b.is_empty())) {
+        (Some(delivered), _) => delivered,
+        (None, Some(body)) => String::from_utf8_lossy(body).into_owned(),
+        // The caller left: nothing was sent to report.
+        (None, None) if event.status_code == crate::CLIENT_CLOSED_REQUEST => return Some(row),
+        (None, None) => noted_error.filter(|_| terminal).unwrap_or_else(|| {
+            serde_json::json!({
+                "error": { "message": event.error_message, "type": event.error_class }
+            })
+            .to_string()
+        }),
+    };
+    Some(row.with_response(&response, cap))
+}
+
 /// Emit ONE zero-token `UsageEvent` for a FAILED request on a non-chat handler
 /// (completions / embeddings / rerank / audio / images / passthrough / jobs /
 /// realtime), so the dashboard Logs and budget ledger surface the failure
@@ -655,8 +752,8 @@ pub(crate) fn emit_error_usage_event(
 }
 
 /// The failure a request's terminal error event names: its
-/// [`crate::attempt::error_class`] and, for a failure whose text is the
-/// gateway's own, the [`crate::attempt::gateway_error_message`].
+/// [`crate::attempt::error_class`] and
+/// [`crate::attempt::gateway_error_message`].
 pub(crate) struct EventError {
     class: &'static str,
     message: String,
@@ -679,15 +776,6 @@ impl EventError {
             class: crate::attempt::error_class(err),
             message: crate::attempt::gateway_error_message(err),
             model,
-        }
-    }
-
-    /// A class the caller synthesizes without a `ProxyError`.
-    pub(crate) fn class_only(class: &'static str) -> Self {
-        Self {
-            class,
-            message: String::new(),
-            model: None,
         }
     }
 }
@@ -847,7 +935,8 @@ pub(crate) fn split_route_refusal(
 /// event: its index / kind / target, and its own upstream latency — the
 /// failed attempts before it emitted their own events, so the whole
 /// request's elapsed time would count them twice. `None` (nothing was
-/// dispatched) leaves the event as built.
+/// dispatched) leaves the event as built. The route's own 501 answers through
+/// the same event, so a failed record also names the failure on it.
 pub(crate) fn apply_winning_attempt(
     event: &mut UsageEvent,
     winner: Option<&crate::attempt::AttemptRecord>,
@@ -857,6 +946,10 @@ pub(crate) fn apply_winning_attempt(
         event.attempt_kind = w.kind.to_string();
         event.attempt_model = w.target_model.clone();
         event.upstream_latency_ms = w.latency_ms;
+        if !w.success {
+            event.error_class = w.error_class.clone();
+            event.error_message = w.error_message.clone();
+        }
     }
 }
 
@@ -1016,6 +1109,8 @@ fn stamp_requested_model_id(event: &mut UsageEvent) {
 /// says whether this event ends the request — the terminal event carries
 /// the SERVER + logical spans (ending the SERVER span at NOW, the real
 /// body EOF/drop), a non-terminal one carries its own attempt span alone.
+/// It is also the wire's `is_final_attempt`, so an emitter owes exactly one
+/// `true` per request, on the last row it writes.
 /// `dispatched` is the caller's statement that this event describes work
 /// that actually reached an upstream — a cache hit and a pre-dispatch
 /// error pass `false`, which zeroes the event's `upstream_*` latencies and
@@ -1039,6 +1134,7 @@ pub(crate) fn emit_usage(
     // present on a family's success path and missing from its error or
     // streaming one (AISIX-Cloud#1461).
     event.operation = surface.operation.to_string();
+    event.is_final_attempt = terminal;
     stamp_requested_model_id(&mut event);
     // Upstream-supplied text bound for line-oriented stores: the same
     // control-character strip and cap as the provider's response id.
@@ -1060,8 +1156,14 @@ pub(crate) fn emit_usage(
         &mut event.error_class,
         &mut event.error_message,
     );
+    // A route names its own failures; this is for the one that did not.
+    if is_failure_row(&event) && event.error_message.trim().is_empty() {
+        event.error_message = aisix_obs::request_failed_message(event.status_code);
+    }
+    let mut upstream_error_body = None;
     if dispatched {
         let response = crate::attribution::take_attempt_upstream_response(event.attempt_index);
+        upstream_error_body = response.error_body;
         // A surface that runs detached from the request scope (`/v1/realtime`)
         // read its own off the upgrade response.
         if event.upstream_response_headers.is_empty() {
@@ -1170,6 +1272,17 @@ pub(crate) fn emit_usage(
         },
         other => other,
     };
+    let failure_content = aisix_obs::content_capture_cap(exporters.iter().map(|e| &e.value))
+        .and_then(|cap| {
+            failure_row_content(
+                &event,
+                content,
+                upstream_error_body.as_deref(),
+                terminal,
+                cap as usize,
+            )
+        });
+    let content = failure_content.as_ref().or(content);
     // Export-only span facts: the request-scoped ones the bundle holds, and
     // this event's own upstream, read off the request's snapshot. Only the
     // OTLP encoder reads them, so nothing is resolved without one.
@@ -1252,6 +1365,66 @@ fn attach_gateway_embedding_audit(event: &mut UsageEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Routes name their failures, so no request drives this fallback. It is
+    /// the chokepoint's own guarantee for one that forgets, read at the sink
+    /// every consumer of the event reads.
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)]
+    async fn emit_usage_names_a_failure_row_nothing_named() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = crate::ProxyState::new(
+            aisix_core::snapshot::SnapshotHandle::new(AisixSnapshot::new()),
+            std::sync::Arc::new(aisix_gateway::Hub::new()),
+            &aisix_core::ProxyConfig {
+                addr: "127.0.0.1:0".into(),
+                request_body_limit_bytes: 1_048_576,
+                real_ip: Default::default(),
+                request_id: Default::default(),
+                url_rewrites: Vec::new(),
+                expose_debug_headers: false,
+                tls: None,
+                listeners: Vec::new(),
+                thread_per_core: None,
+                workers: None,
+            },
+        )
+        .without_cache()
+        .with_usage_sink(aisix_obs::UsageSink::new(tx));
+        let snap = state.snapshot.load();
+        let mut emit = |status_code: u16, class: &str, message: &str| {
+            let mut event = UsageEvent::default();
+            event.status_code = status_code;
+            event.error_class = class.to_string();
+            event.error_message = message.to_string();
+            emit_usage(
+                &state,
+                &snap,
+                crate::operation::CHAT,
+                event,
+                usage_event_labels("m", &ResolvedPk::unresolved()),
+                None,
+                None,
+                true,
+                false,
+            );
+            rx.try_recv()
+                .expect("the event reaches the sink")
+                .error_message
+        };
+        assert_eq!(emit(500, "", ""), "request failed with status 500");
+        assert_eq!(
+            emit(422, "some_class", ""),
+            "request failed with status 422"
+        );
+        assert_eq!(
+            emit(200, "some_class", ""),
+            "request failed with status 200"
+        );
+        assert_eq!(emit(500, "", " "), "request failed with status 500");
+        assert_eq!(emit(502, "some_class", "named"), "named");
+        assert_eq!(emit(200, "", ""), "");
+    }
 
     #[test]
     fn summed_upstream_total_stands_only_while_every_counting_report_carried_one() {

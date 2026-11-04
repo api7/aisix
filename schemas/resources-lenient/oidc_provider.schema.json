@@ -17,6 +17,32 @@
         }
       ],
       "description": "Expected value(s) for one bound claim: a single string, or a list matched as any-of."
+    },
+    "OidcLogin": {
+      "description": "The OAuth client the gateway signs users in with at this identity provider, for MCP clients that present no gateway credential.",
+      "properties": {
+        "client_id": {
+          "description": "Client identifier registered at the identity provider. Its redirect URI is the gateway's public address followed by `/mcp-oauth/login/callback`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "client_secret": {
+          "description": "Client secret, sent to the token endpoint in the request body. Omit it for a public client.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "scopes": {
+          "description": "Scopes to request beside `openid` and the provider's `required_scopes`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "client_id"
+      ],
+      "type": "object"
     }
   },
   "properties": {
@@ -66,6 +92,14 @@
       "maximum": 300.0,
       "minimum": 0.0,
       "type": "integer"
+    },
+    "login": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/OidcLogin"
+        }
+      ],
+      "description": "Signs users in at this provider when they connect an MCP client with no gateway credential to an MCP server with `auth_type: oauth2_authorization_code`. When exactly one enabled provider in the environment has it, every such server uses this sign-in; when none does, those servers keep relaying the client's sign-in and need a gateway credential. Usable only on an enabled provider with `issuer` and no `hmac_secret`, whose endpoints come from the issuer's OIDC discovery document. A second enabled provider with it, or one on a provider that cannot use it, makes sign-in fail with `mcp_oauth_misconfigured`. The gateway checks the ID token's audience against `client_id`, so `audiences` need not list it."
     },
     "name": {
       "description": "Human-readable provider name, unique within the environment (e.g. `\"corp-keycloak\"`).",

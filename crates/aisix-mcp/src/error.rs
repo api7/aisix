@@ -24,6 +24,26 @@ pub enum McpError {
     /// for the caller.
     #[error("upstream token exchange failed: {0}")]
     TokenExchange(TokenExchangeError),
+
+    /// An `oauth2_authorization_code` server has no usable token for the
+    /// caller.
+    #[error("upstream user authorization failed: {0}")]
+    UserOAuth(UserOAuthError),
+
+    /// As [`McpError::Request`], for an upstream that answered `401` after the
+    /// session opened, which is worth telling apart when the caller's token
+    /// can be refreshed.
+    #[error("upstream MCP request failed: {0}")]
+    Unauthorized(String),
+}
+
+impl From<UserOAuthFailure> for McpError {
+    fn from(failure: UserOAuthFailure) -> Self {
+        McpError::UserOAuth(UserOAuthError {
+            failure,
+            reached_upstream: false,
+        })
+    }
 }
 
 impl From<TokenExchangeFailure> for McpError {
@@ -79,5 +99,32 @@ pub enum TokenExchangeFailure {
     /// The identity provider could not be reached, failed, throttled or
     /// timed out the request, or answered without a usable access token.
     #[error("the identity provider did not return a usable token")]
+    Unavailable,
+}
+
+/// A failed attempt to use a caller's stored upstream token, and whether the
+/// operation that hit it had already contacted the upstream server.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{failure}")]
+pub struct UserOAuthError {
+    pub failure: UserOAuthFailure,
+    pub reached_upstream: bool,
+}
+
+/// Why an `oauth2_authorization_code` server cannot be called for a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum UserOAuthFailure {
+    /// The caller's credential names no user to keep a token for.
+    #[error("the caller's credential has no user")]
+    NoSubject,
+    /// The caller has no usable token, and signing in would give it one.
+    #[error("the caller has not signed in to this server")]
+    AuthorizationRequired,
+    /// The gateway cannot run the flow for this server as configured.
+    #[error("the server's OAuth settings cannot be used")]
+    Misconfigured,
+    /// Storage or the upstream authorization server could not answer. The
+    /// caller's connection, if it has one, is intact.
+    #[error("the caller's upstream token is temporarily unavailable")]
     Unavailable,
 }

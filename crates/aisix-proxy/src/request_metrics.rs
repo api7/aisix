@@ -53,6 +53,9 @@
 //! the token families, which had the same coverage problem, in
 //! three different shapes (see its own docs).
 //!
+//! The counters of the two detailed tiers also carry `error_source`, which each
+//! emit is handed: see [`aisix_obs::ErrorSource`] and `crates/aisix-proxy/AGENTS.md`.
+//!
 //! Handlers call [`record`] and [`record_usage`] instead of touching
 //! `Metrics` directly, and the tier is decided from the endpoint rather than
 //! by the caller, so a new endpoint cannot land with a half-wired label set —
@@ -68,7 +71,7 @@ use std::borrow::Cow;
 use std::time::Duration;
 
 use aisix_core::{AisixSnapshot, ApiKey};
-use aisix_obs::{LatencySide, LlmUsage, RequestLabels, RequestOutcome, UsageLabels};
+use aisix_obs::{ErrorSource, LatencySide, LlmUsage, RequestLabels, RequestOutcome, UsageLabels};
 
 use crate::auth::AuthenticatedKey;
 use crate::state::ProxyState;
@@ -401,12 +404,14 @@ fn is_llm_endpoint(endpoint: &str) -> bool {
 /// `endpoint` must be a bounded route template — a literal for the fixed
 /// routes, or [`crate::normalize_endpoint_label`] output for the `:param` /
 /// wildcard ones. Never a raw request path (#451).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record(
     state: &ProxyState,
     endpoint: &'static str,
     caller: Caller<'_>,
     upstream: Upstream<'_>,
     status: u16,
+    error_source: ErrorSource,
     elapsed: Duration,
 ) {
     record_in_tier(
@@ -416,6 +421,7 @@ pub(crate) fn record(
         caller,
         upstream,
         status,
+        error_source,
         elapsed,
     );
 }
@@ -424,6 +430,7 @@ pub(crate) fn record(
 /// `/passthrough_route`, which carries opaque relays and identified LLM
 /// exchanges alike. `llm` is whether THIS request is model inference of a
 /// kind a typed endpoint serves — see `LLM_ENDPOINTS`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_in_tier(
     state: &ProxyState,
     endpoint: &'static str,
@@ -431,10 +438,21 @@ pub(crate) fn record_in_tier(
     caller: Caller<'_>,
     upstream: Upstream<'_>,
     status: u16,
+    error_source: ErrorSource,
     elapsed: Duration,
 ) {
     let e2e = E2eSides::for_request(&state.snapshot.load());
-    record_bounded(state, endpoint, llm, caller, upstream, status, elapsed, e2e);
+    record_bounded(
+        state,
+        endpoint,
+        llm,
+        caller,
+        upstream,
+        status,
+        error_source,
+        elapsed,
+        e2e,
+    );
 }
 
 /// [`record`] for a request answered before anything was dispatched — a
@@ -446,6 +464,7 @@ pub(crate) fn record_undispatched(
     caller: Caller<'_>,
     upstream: Upstream<'_>,
     status: u16,
+    error_source: ErrorSource,
     elapsed: Duration,
 ) {
     record_bounded(
@@ -455,6 +474,7 @@ pub(crate) fn record_undispatched(
         caller,
         upstream,
         status,
+        error_source,
         elapsed,
         E2eSides::DownstreamOnly,
     );
@@ -470,6 +490,7 @@ pub(crate) fn record_spanning_body(
     caller: Caller<'_>,
     upstream: Upstream<'_>,
     status: u16,
+    error_source: ErrorSource,
     started: std::time::Instant,
 ) {
     record_bounded(
@@ -479,6 +500,7 @@ pub(crate) fn record_spanning_body(
         caller,
         upstream,
         status,
+        error_source,
         started.elapsed(),
         E2eSides::AtBodyEnd(started),
     );
@@ -492,6 +514,7 @@ fn record_bounded(
     caller: Caller<'_>,
     upstream: Upstream<'_>,
     status: u16,
+    error_source: ErrorSource,
     elapsed: Duration,
     e2e: E2eSides,
 ) {
@@ -514,6 +537,7 @@ fn record_bounded(
         caller,
         upstream,
         status,
+        error_source,
         elapsed,
         e2e,
     );
@@ -563,6 +587,7 @@ fn emit(
     caller: Caller<'_>,
     upstream: Upstream<'_>,
     status: u16,
+    error_source: ErrorSource,
     elapsed: Duration,
     e2e: E2eSides,
 ) {
@@ -593,6 +618,7 @@ fn emit(
         is_fallback: upstream.is_fallback,
         status,
         outcome,
+        error_source,
     };
     if llm {
         metrics.record_proxy_and_llm_request(labels, elapsed);
@@ -686,8 +712,9 @@ impl PendingRequestMetrics {
         }
     }
 
-    /// Record the parked samples under the request's terminal status.
-    pub(crate) fn record_terminal(self, status: u16) {
+    /// Record the parked samples under the request's terminal status and
+    /// what ended it.
+    pub(crate) fn record_terminal(self, status: u16, error_source: ErrorSource) {
         let upstream = Upstream {
             provider: &self.provider,
             model: &self.model,
@@ -707,6 +734,7 @@ impl PendingRequestMetrics {
             self.caller.as_caller(),
             upstream,
             status,
+            error_source,
             self.started.elapsed(),
             self.e2e,
         );
@@ -1077,6 +1105,17 @@ mod tests {
         "/v1/models",
         "/.well-known/oauth-protected-resource",
         "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-protected-resource/mcp/some-server",
+        "/.well-known/oauth-authorization-server/mcp/some-server",
+        "/mcp/some-server/.well-known/openid-configuration",
+        "/mcp/some-server/.well-known/jwks.json",
+        "/mcp/some-server/oauth/register",
+        "/mcp/some-server/oauth/authorize",
+        "/mcp/some-server/oauth/token",
+        "/mcp/some-server/oauth/credential",
+        "/mcp-oauth/callback",
+        "/mcp-oauth/login/callback",
+        "/mcp-oauth/consent",
         "/a2a/some-agent/.well-known/agent-card.json",
         "/v1/chat/completions",
         "/v1/completions",

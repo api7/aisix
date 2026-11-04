@@ -102,6 +102,66 @@ impl schemars::JsonSchema for HmacSecret {
     }
 }
 
+/// The client secret of [`OidcLogin`]. A plain string on the wire, with a
+/// [`Debug`] that reveals nothing, as [`HmacSecret`] has.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OidcClientSecret(String);
+
+impl OidcClientSecret {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for OidcClientSecret {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl std::fmt::Debug for OidcClientSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OidcClientSecret(<redacted>)")
+    }
+}
+
+impl schemars::JsonSchema for OidcClientSecret {
+    fn schema_name() -> String {
+        "OidcClientSecret".to_string()
+    }
+
+    fn is_referenceable() -> bool {
+        false
+    }
+
+    fn json_schema(generator: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        let mut schema = <String as schemars::JsonSchema>::json_schema(generator).into_object();
+        schema.string().min_length = Some(1);
+        schema.into()
+    }
+}
+
+/// The OAuth client the gateway signs users in with at this identity
+/// provider, for MCP clients that present no gateway credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OidcLogin {
+    /// Client identifier registered at the identity provider. Its redirect
+    /// URI is the gateway's public address followed by
+    /// `/mcp-oauth/login/callback`.
+    #[schemars(length(min = 1))]
+    pub client_id: String,
+
+    /// Client secret, sent to the token endpoint in the request body. Omit it
+    /// for a public client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<OidcClientSecret>,
+
+    /// Scopes to request beside `openid` and the provider's `required_scopes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+}
+
 /// Expected value(s) for one bound claim: a single string, or a list
 /// matched as any-of.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -202,6 +262,20 @@ pub struct OidcProvider {
     #[serde(default, skip_serializing_if = "is_zero")]
     #[schemars(range(max = 300))]
     pub leeway_secs: u64,
+
+    /// Signs users in at this provider when they connect an MCP client with
+    /// no gateway credential to an MCP server with `auth_type:
+    /// oauth2_authorization_code`. When exactly one enabled provider in the
+    /// environment has it, every such server uses this sign-in; when none
+    /// does, those servers keep relaying the client's sign-in and need a
+    /// gateway credential. Usable only on an enabled provider with `issuer`
+    /// and no `hmac_secret`, whose endpoints come from the issuer's OIDC
+    /// discovery document. A second enabled provider with it, or one on a
+    /// provider that cannot use it, makes sign-in fail with
+    /// `mcp_oauth_misconfigured`. The gateway checks the ID token's audience
+    /// against `client_id`, so `audiences` need not list it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<OidcLogin>,
 
     /// Whether the provider participates in JWT authentication. A
     /// disabled provider is kept but ignored. Treated as `true` when
@@ -329,6 +403,55 @@ mod tests {
         assert!(p.bound_claims.is_none());
         assert_eq!(p.leeway_secs, 0);
         assert!(p.enabled);
+    }
+
+    #[test]
+    fn login_is_optional_and_its_secret_never_prints() {
+        use crate::models::schema::{validate_oidc_provider, validate_oidc_provider_lenient};
+
+        let doc = serde_json::json!({
+            "name": "corp",
+            "issuer": "https://idp.example",
+            "audiences": ["a"],
+            "login": {
+                "client_id": "gw",
+                "client_secret": "s3cret-value",
+                "scopes": ["profile"],
+            },
+        });
+        validate_oidc_provider(&doc).unwrap();
+        validate_oidc_provider_lenient(&doc).unwrap();
+        let provider: OidcProvider = serde_json::from_value(doc.clone()).unwrap();
+        let login = provider.login.as_ref().unwrap();
+        assert_eq!(
+            login.client_secret.as_ref().unwrap().expose(),
+            "s3cret-value"
+        );
+        assert!(!format!("{provider:?}").contains("s3cret-value"));
+        assert_eq!(
+            serde_json::to_value(&provider).unwrap()["login"],
+            doc["login"]
+        );
+        // No row-level rule: what cannot use `login` is reported at sign-in.
+        let hmac: OidcProvider = serde_json::from_value(serde_json::json!({
+            "name": "h",
+            "hmac_secret": "x".repeat(32),
+            "login": {"client_id": "gw"},
+        }))
+        .unwrap();
+        hmac.validate_semantics().unwrap();
+
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"client_id": ""}),
+            serde_json::json!({"client_id": "gw", "client_secret": ""}),
+            serde_json::json!({"client_id": "gw", "scopes": "profile"}),
+            serde_json::json!({"client_id": "gw", "extra": 1}),
+        ] {
+            let mut row = doc.clone();
+            row["login"] = bad.clone();
+            validate_oidc_provider(&row).expect_err(&bad.to_string());
+        }
     }
 
     #[test]

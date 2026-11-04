@@ -22,9 +22,7 @@ import {
 
 // E2E: a request the gateway refuses itself files a terminal usage event
 // whose `error_message` names the failure with the access log's text — on
-// every endpoint, through one shared helper — for the failures whose text
-// is entirely the gateway's own. A failure that can quote what the caller
-// sent (`invalid_request_error`) keeps the message empty.
+// every endpoint, through one shared helper.
 //
 // Before, those events carried `error_class` alone, so the control plane's
 // usage log and the OTLP span showed a semantic router's failed decision,
@@ -627,16 +625,15 @@ describe("gateway-side failures name themselves on the usage event", () => {
     expect(realtimeEvent.get("error_message")).toMatch(/^this endpoint requires a WebSocket upgrade: /);
   });
 
-  test("a failure that can quote the request keeps the message empty", async (ctx) => {
+  test("a failure that can quote the request names itself too", async (ctx) => {
     if (!ready()) return ctx.skip();
     // A semantic router cannot serve embeddings: the refusal is an
-    // `invalid_request_error`, a class whose text can carry what the
-    // caller sent, so it never reaches the usage event.
+    // `invalid_request_error`.
     const r = await send("/v1/embeddings", { body: { model: "gem-semantic", input: "hi" } });
     expect(r.status).toBe(400);
     const event = await eventFor(r.requestId, "invalid request");
     expect(event.get("error_class")).toBe("invalid_request_error");
-    expect(event.get("error_message")).toBeUndefined();
+    expect(event.get("error_message")).toBeTruthy();
   });
   const streamed: Array<[string, string, Record<string, unknown>]> = [
     [

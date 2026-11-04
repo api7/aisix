@@ -646,6 +646,9 @@ fn openai_chat_input(body: &Map<String, Value>) -> Option<Converted> {
                 parts.push(json!({"type": "reasoning", "content": reasoning}));
             }
             parts.extend(openai_content_parts(m.get("content"))?);
+            if let Some(images @ Value::Array(_)) = m.get("images") {
+                parts.extend(openai_content_parts(Some(images))?);
+            }
             for call in m
                 .get("tool_calls")
                 .and_then(Value::as_array)

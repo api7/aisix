@@ -283,6 +283,16 @@ pub async fn responses(
                 .and_then(|u| u.failure.as_ref())
                 .filter(|_| !success.guardrail_blocked)
                 .map_or(status, |f| f.status);
+            let terminal_error_source =
+                match success.usage.as_ref().and_then(|u| u.failure.as_ref()) {
+                    Some(failure) if !success.guardrail_blocked => {
+                        crate::attempt::error_source_of_class(failure.error_class)
+                    }
+                    _ => crate::attempt::answered_error_source(
+                        success.guardrail_blocked,
+                        &success.routing,
+                    ),
+                };
             // ONE ProviderKey lookup for both the metric emit and the
             // winner's usage event below (#941).
             let pk = ResolvedPk::resolve(&snapshot, &success.provider_key_id);
@@ -341,6 +351,7 @@ pub async fn responses(
                     crate::request_metrics::Caller::new(&auth),
                     request_upstream,
                     terminal_status,
+                    terminal_error_source,
                     elapsed,
                 );
             }
@@ -354,9 +365,6 @@ pub async fn responses(
                 &api_key_id,
                 &client,
                 &success.routing,
-                // The winner's success event carries the content.
-                /* content_for_last */
-                None,
                 // The winner's event carries the terminal spans.
                 /* terminal_last */
                 false,
@@ -480,6 +488,7 @@ pub async fn responses(
                     routing.fallback_count() > 0,
                 ),
                 status,
+                crate::attempt::error_source(&err),
                 elapsed,
             );
             // AISIX-Cloud#1428: a guardrail refusal IS this failure, so the
@@ -487,37 +496,13 @@ pub async fn responses(
             // "Guardrail blocks" view filters on. Every other 4xx/5xx class
             // leaves the flag alone.
             let guardrail_blocked = err.is_guardrail_block();
-            // AISIX-Cloud#1013: failed requests carry the (post-mask)
-            // request body so a 4xx/5xx can be triaged from the log alone.
-            // Same opt-in gate and cap as the success path; 401/403 stay
-            // body-less (a 401 here is upstream-auth passthrough — caller
-            // 401s are rejected by the auth extractor before any event
-            // exists) (the body adds nothing to an authorization failure).
-            let mut failure_content = if status == 401 || status == 403 {
-                None
-            } else {
-                content_capture_cap(
-                    snapshot
-                        .observability_exporters
-                        .entries()
-                        .iter()
-                        .map(|e| &e.value),
-                )
-                .map(|cap| {
-                    CapturedContent::new(
-                        &serde_json::to_string(&body).unwrap_or_default(),
-                        "",
-                        cap as usize,
-                    )
-                })
-            };
-            // When every target failed there is no terminal event below —
-            // the content rides the last failed attempt instead.
-            let content_for_last = if !routing.attempts.is_empty() {
-                failure_content.take()
-            } else {
-                None
-            };
+            // Every failure row of this request reports the (post-mask)
+            // request body and, without an upstream answer, this error body
+            // (AISIX-Cloud#1013, #1921).
+            crate::usage_attr::note_failure_request(&snapshot, || {
+                serde_json::to_string(&body).unwrap_or_default()
+            });
+            crate::usage_attr::note_client_error(&snapshot, &err);
             // Per #655: emit one zero-token UsageEvent per FAILED attempt so
             // the dashboard's Logs tab surfaces each failed upstream try.
             emit_failed_attempts(
@@ -528,7 +513,6 @@ pub async fn responses(
                 &api_key_id,
                 &client,
                 &routing,
-                content_for_last,
                 // All-failed: the last failed attempt is the terminal
                 // emission; the pre-dispatch branch below covers empty.
                 /* terminal_last */
@@ -565,7 +549,7 @@ pub async fn responses(
                     // Input masking may have fired before the failure.
                     redaction_counts.clone(),
                     monitor_hits.clone(),
-                    failure_content.take(),
+                    None,
                     /* terminal */ true,
                     // Pre-dispatch failure: no upstream contacted.
                     /* dispatched */
@@ -707,6 +691,10 @@ async fn dispatch(
             crate::redact::redact_responses_request(resolved_chain.as_ref(), body),
         );
     }
+
+    crate::usage_attr::note_failure_request(snapshot, || {
+        serde_json::to_string(&*body).unwrap_or_default()
+    });
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
@@ -1440,14 +1428,12 @@ async fn responses_to_target(
     let status = upstream_resp.status();
 
     if !status.is_success() {
-        let status_u16 = status.as_u16();
-        let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
-        let message = upstream_resp.text().await.unwrap_or_default();
-        let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
-            status_u16,
-            message.chars().take(1024).collect::<String>(),
-            retry_after,
-        );
+        let err = aisix_gateway::upstream_status_from_response(
+            upstream_resp,
+            aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES,
+            aisix_gateway::bounded_error_text,
+        )
+        .await;
         if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
         {
             state.runtime_status.mark_cooldown(model_id, ttl, reason);
@@ -2191,6 +2177,10 @@ async fn responses_to_target(
         let json_body: Value =
             crate::dispatch::json_body_within(upstream_resp, buffered_body_deadline)
                 .await
+                .and_then(|body| match responses_body_in_band_error(&body) {
+                    Some(err) => Err(err),
+                    None => Ok(body),
+                })
                 .map_err(|be| {
                     crate::cooldown::note_failure(
                         &state.runtime_status,
@@ -2434,8 +2424,10 @@ async fn responses_cross_provider_to_target(
     // operator-facing name so the bridge re-resolves the upstream id via
     // `ctx.model.upstream_model()` exactly like chat.rs.
     let outbound_body = crate::effort_mapping::responses_request(body, model);
-    let chat =
+    let mut chat =
         crate::responses_bridge::responses_request_to_chat(requested_model, outbound_body.as_ref());
+    chat.thoughts_requested =
+        aisix_gateway::chat::effort_asks_for_thoughts(body.pointer("/reasoning/effort"));
     // A rewritten body is a whole-request copy; the translation above is
     // all this attempt needs from it.
     drop(outbound_body);
@@ -3337,8 +3329,8 @@ pub(crate) fn responses_in_band_error(event: &Value) -> Option<aisix_gateway::Br
         _ => return None,
     };
     Some(
-        aisix_gateway::capture_in_band_error(
-            &serde_json::json!({ "error": error }).to_string(),
+        aisix_gateway::capture_in_band_error_value(
+            &serde_json::json!({ "error": error }),
             aisix_gateway::UpstreamWire::OpenAI,
         )
         .unwrap_or_else(|| aisix_gateway::BridgeError::UpstreamInBand {
@@ -3348,6 +3340,16 @@ pub(crate) fn responses_in_band_error(event: &Value) -> Option<aisix_gateway::Br
             wire: aisix_gateway::UpstreamWire::OpenAI,
         }),
     )
+}
+
+/// The failure a buffered 2xx Responses body reports in place of an answer:
+/// a bare error envelope. A response object is the answer even when its own
+/// `error` is set (`status: "failed"`) and is relayed as sent.
+pub(crate) fn responses_body_in_band_error(body: &Value) -> Option<aisix_gateway::BridgeError> {
+    if body.get("object").and_then(Value::as_str) == Some("response") {
+        return None;
+    }
+    aisix_gateway::capture_in_band_error_value(body, aisix_gateway::UpstreamWire::OpenAI)
 }
 
 /// Streamed output-text accumulator for content-capturing exporters
@@ -3695,13 +3697,19 @@ where
         // fully-delivered stream.
         let hits = match eos_scan {
             Some(scan) => {
-                let capture = guard.parts().1;
+                let (usage, capture) = guard.parts();
+                let failed = usage.as_ref().is_some_and(|u| u.failure.is_some());
                 let text = capture
                     .as_ref()
                     .map(|c| c.scan_text())
                     .unwrap_or_default();
                 let segments = capture.and_then(|c| c.terminal_segments());
-                scan.observe(&text, segments).await
+                // A failed stream with no text is not a response to judge.
+                if text.is_empty() && failed {
+                    Vec::new()
+                } else {
+                    scan.observe(&text, segments).await
+                }
             }
             None => Vec::new(),
         };
@@ -4266,11 +4274,6 @@ fn emit_failed_attempts(
     api_key_id: &str,
     client: &ClientContext,
     routing: &RoutingTelemetry,
-    // AISIX-Cloud#1013: when every target failed there is no terminal
-    // event, so the captured request body rides the LAST failed attempt —
-    // the one whose status the caller saw. Other attempts (and the
-    // success-path caller) stay content-less.
-    mut content_for_last: Option<CapturedContent>,
     // AISIX-Cloud#1279: on the all-failed path the LAST failed attempt's
     // event is the request's terminal emission, so it carries the trace's
     // SERVER + logical spans. False on the success path.
@@ -4289,11 +4292,6 @@ fn emit_failed_attempts(
         .enumerate()
         .filter(|(_, a)| !a.success)
     {
-        let content = if Some(i) == last_failed {
-            content_for_last.take()
-        } else {
-            None
-        };
         emit_zero_token_event(
             state,
             snap,
@@ -4313,7 +4311,7 @@ fn emit_failed_attempts(
             // terminal event does.
             crate::redact::RedactionCounts::new(),
             Vec::new(),
-            content,
+            None,
             /* terminal */ terminal_last && Some(i) == last_failed,
             // The record's own network-boundary fact: a rate-limit-refused
             // attempt never reached an upstream.

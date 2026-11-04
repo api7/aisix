@@ -90,11 +90,14 @@ pub struct UpstreamResponseCapture {
     pub headers: BTreeMap<String, String>,
     /// See [`provider_request_id`].
     pub request_id: String,
+    /// The body of a non-2xx response, as read, when the request has a
+    /// full-content export to hand it to.
+    pub error_body: Option<bytes::Bytes>,
 }
 
 impl UpstreamResponseCapture {
     pub fn is_empty(&self) -> bool {
-        self.headers.is_empty() && self.request_id.is_empty()
+        self.headers.is_empty() && self.request_id.is_empty() && self.error_body.is_none()
     }
 }
 
@@ -103,13 +106,19 @@ impl UpstreamResponseCapture {
 #[derive(Debug, Default)]
 pub struct ResponseHeaderTap {
     names: Vec<String>,
+    /// Whether an exporter of this request runs at `content_mode: full`.
+    /// Without one no error body is kept, nor read where nothing else needs it.
+    keeps_error_bodies: bool,
+    request_id: String,
     latest: Mutex<UpstreamResponseCapture>,
 }
 
 impl ResponseHeaderTap {
-    pub fn new(names: Vec<String>) -> Self {
+    pub fn new(names: Vec<String>, keeps_error_bodies: bool, request_id: String) -> Self {
         Self {
             names,
+            keeps_error_bodies,
+            request_id,
             latest: Mutex::default(),
         }
     }
@@ -118,6 +127,7 @@ impl ResponseHeaderTap {
         let captured = UpstreamResponseCapture {
             headers: capture_header_values(headers, &self.names),
             request_id: provider_request_id(headers),
+            error_body: None,
         };
         *self.lock() = captured;
     }
@@ -156,6 +166,35 @@ pub fn sync_scope<T>(tap: &Arc<ResponseHeaderTap>, f: impl FnOnce() -> T) -> T {
 /// attempt, as soon as the head is in hand — success or failure.
 pub fn note_upstream_response(headers: &http::HeaderMap) {
     let _ = TAP.try_with(|tap| tap.record(headers));
+}
+
+/// Keep the non-2xx body of the response last noted, for the same attempt's
+/// failure row. Sharing `body`, so nothing is copied.
+pub fn note_upstream_error_body(body: &bytes::Bytes) {
+    let _ = TAP.try_with(|tap| {
+        if tap.keeps_error_bodies {
+            tap.lock().error_body = Some(body.clone());
+        }
+    });
+}
+
+/// Log an error response whose body could not be read. Names the request
+/// itself: the request span is off at the `warn` level this is meant to reach.
+pub fn warn_error_body_unread(status: u16, reason: &str) {
+    let request_id = TAP
+        .try_with(|tap| tap.request_id.clone())
+        .unwrap_or_default();
+    tracing::warn!(
+        status,
+        %request_id,
+        %reason,
+        "failed to read upstream error response body"
+    );
+}
+
+/// Whether a route that does not otherwise need a non-2xx body should read it.
+pub fn wants_upstream_error_body() -> bool {
+    TAP.try_with(|tap| tap.keeps_error_bodies).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -200,7 +239,11 @@ mod tests {
         h.insert("request-id", "req_1".parse().unwrap());
         note_upstream_response(&h);
 
-        let tap = Arc::new(ResponseHeaderTap::new(vec!["x-upstream-id".into()]));
+        let tap = Arc::new(ResponseHeaderTap::new(
+            vec!["x-upstream-id".into()],
+            false,
+            String::new(),
+        ));
         scope(tap.clone(), async { note_upstream_response(&h) }).await;
         let got = tap.take();
         assert_eq!(
@@ -211,7 +254,7 @@ mod tests {
         assert!(tap.take().is_empty(), "take leaves nothing behind");
 
         // No exporter asked for a header: the request id is still read.
-        let idle = Arc::new(ResponseHeaderTap::new(Vec::new()));
+        let idle = Arc::new(ResponseHeaderTap::new(Vec::new(), false, String::new()));
         scope(idle.clone(), async { note_upstream_response(&h) }).await;
         let got = idle.take();
         assert!(got.headers.is_empty());

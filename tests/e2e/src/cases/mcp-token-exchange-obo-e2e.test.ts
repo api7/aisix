@@ -579,17 +579,21 @@ describe("oauth2_token_exchange (entra_obo) e2e", () => {
     expect(entra!.hits("/slow-reject/token")).toBe(2);
   });
 
-  test("a step-up rejection hands the provider's claims to the caller", async () => {
+  test.each([
+    ["a plain /mcp resource URL", ""],
+    ["a path-prefixed resource URL", "/team-a"],
+  ])("a step-up rejection hands the provider's claims to the caller, on %s", async (_, prefix) => {
     if (!etcdReachable) return;
     const etcd = new EtcdClient();
     const seed = new SeedClient(etcd, app!.etcdPrefix);
     const settingsId = randomUUID();
-    await seed.update("mcp_auth_settings", settingsId, { resource_url: `${app!.proxyUrl}/mcp` });
+    const resourceUrl = `${app!.proxyUrl}${prefix}/mcp`;
+    await seed.update("mcp_auth_settings", settingsId, { resource_url: resourceUrl });
     try {
-      const metadata = `${app!.proxyUrl}/.well-known/oauth-protected-resource/mcp`;
+      const metadata = `${app!.proxyUrl}${prefix}/.well-known/oauth-protected-resource/mcp`;
       await waitConfigPropagation(async () => {
-        const res = await mcpPost("/mcp/oboreject", initialize, bearer(jwt1));
-        return res.headers.get("www-authenticate") !== null;
+        const res = await fetch(`${app!.proxyUrl}/.well-known/oauth-protected-resource/mcp`);
+        return res.ok && ((await res.json()) as { resource: string }).resource === resourceUrl;
       });
 
       const res = await mcpPost("/mcp/obostepup", initialize, bearer(jwt1));

@@ -679,6 +679,7 @@ pub(crate) fn judge_request(
         out.extra
             .insert("reasoning_effort".to_string(), effort.clone());
     }
+    out.thoughts_requested = req.thoughts_requested;
     out.temperature = Some(JUDGE_TEMPERATURE);
     out.stream = Some(false);
     out
@@ -855,6 +856,7 @@ mod tests {
         let mut req = user_request("what is 2+2?");
         req.extra
             .insert("reasoning_effort".to_string(), "medium".into());
+        req.thoughts_requested = true;
         let out = run_ensemble(&req, &cfg, &caller, &EnsembleProgress::default())
             .await
             .unwrap();
@@ -877,6 +879,7 @@ mod tests {
             caller.calls_to("judge")[0].extra["reasoning_effort"],
             "medium"
         );
+        assert!(caller.calls_to("judge")[0].thoughts_requested);
     }
 
     #[tokio::test]

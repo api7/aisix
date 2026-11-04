@@ -374,8 +374,10 @@ pub async fn entry(
                     ..Default::default()
                 },
                 status,
+                crate::attempt::error_source(&error),
                 elapsed,
             );
+            crate::usage_attr::note_client_error(&snapshot, &error);
             let mut event = crate::usage_attr::build_error_usage_event(
                 "passthrough",
                 &request_id,
@@ -628,6 +630,9 @@ async fn dispatch(
                     &auth,
                 )
             })?;
+    crate::usage_attr::note_failure_request(snapshot, || {
+        String::from_utf8_lossy(&body_bytes).into_owned()
+    });
 
     // Guardrail chain for this route (+ the caller's key/team/env scopes).
     let guardrail_ctx = aisix_guardrails::RequestContext {
@@ -731,8 +736,7 @@ async fn dispatch(
     }
 
     // Content capture (exporter-gated): the request body text, in the same
-    // exporter-only channel the typed endpoints use. Captured after the
-    // input guardrail so a blocked request records nothing.
+    // exporter-only channel the typed endpoints use.
     let content_cap = aisix_obs::content_capture_cap(
         snapshot
             .observability_exporters
@@ -1062,6 +1066,9 @@ async fn dispatch(
         error_class: String::new(),
         error_message: String::new(),
         failure_status: None,
+        error_detail: Vec::new(),
+        error_body_encoded: !status.is_success()
+            && response_has_non_identity_content_encoding(upstream_resp.headers()),
         monitor_hits,
         audit: audit_out.clone(),
         captured_prompt,
@@ -1154,18 +1161,34 @@ async fn dispatch(
     crate::attribution::note_upstream_wait_end(read.is_ok());
     let resp_body = read.map_err(|e| {
         telemetry.emitted = true;
-        RouteError::of(
-            ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamDecode(e.to_string())),
-            &auth,
-        )
+        let err = if status.is_success() {
+            aisix_gateway::BridgeError::UpstreamDecode(e.to_string())
+        } else {
+            aisix_gateway::BridgeError::upstream_body_unread(status.as_u16(), &e)
+        };
+        RouteError::of(ProxyError::Bridge(err), &auth)
     })?;
 
     // Output guardrails govern generated successful answers. A provider's
     // non-success body is its error contract, so preserve its status, headers,
     // and bytes instead of replacing a 4xx/5xx with a local guardrail 422.
+    // A 2xx body that reports a failure in-band is the provider's error,
+    // relayed as sent like a non-success one, and recorded as a failure.
+    let in_band = if status.is_success() {
+        body_in_band_error(protocol, &resp_body)
+    } else {
+        None
+    };
+    if let Some(err) = &in_band {
+        telemetry.record_failure(err);
+    }
     if status.is_success() && !bypass_uninspectable_output && output_guardrail_active {
         let text = match try_buffered_response_guardrail_text(protocol, &resp_body) {
             Ok(text) => Some(text),
+            // An error body with no answer in it is the provider's failure,
+            // not an answer the guardrail could not read. One that carries
+            // answer text beside its error is still scanned.
+            Err(_) if in_band.is_some() => None,
             Err(err)
                 if !aisix_guardrails::Guardrail::refuses_unevaluable_output(&resolved_chain) =>
             {
@@ -1248,8 +1271,17 @@ async fn dispatch(
         merge_usage(&mut telemetry.usage, u);
     }
     telemetry.service_tier = tier;
+    if !status.is_success() {
+        telemetry.keep_error_detail(&resp_body);
+    }
     if telemetry.content_cap.is_some() && !bypass_uninspectable_output {
-        telemetry.response_text = response_capture_text(protocol, &resp_body);
+        telemetry.response_text = if status.is_success() {
+            response_capture_text(protocol, &resp_body)
+        } else if telemetry.error_body_encoded {
+            String::new()
+        } else {
+            String::from_utf8_lossy(&resp_body).into_owned()
+        };
     }
 
     let mut response = Response::builder()
@@ -3566,7 +3598,16 @@ fn response_visible_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
 /// Captures preserve the existing typed visible-content contract; guardrail
 /// scanning may include additional raw fields that are forwarded downstream.
 fn response_capture_text(protocol: PassthroughProtocol, body: &[u8]) -> String {
-    response_visible_text(protocol, body)
+    let text = response_visible_text(protocol, body);
+    // Only the upstream's own body can carry media fields: extracted text is a
+    // model's answer, whatever it looks like.
+    if text.as_bytes() != body {
+        return text;
+    }
+    match aisix_obs::sink::omit_base64_media_in_json(&text) {
+        std::borrow::Cow::Borrowed(_) => text,
+        std::borrow::Cow::Owned(omitted) => omitted,
+    }
 }
 
 /// Every token dimension a passthrough exchange can report, mirroring the
@@ -4207,31 +4248,38 @@ fn frame_in_band_error(
         return None;
     }
     let payload = crate::redact::frame_payload(frame)?;
-    let payload = payload.trim();
-    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(payload.trim()).ok()?;
     match protocol {
-        PassthroughProtocol::Raw => None,
         PassthroughProtocol::OpenaiResponses => crate::responses::responses_in_band_error(&value),
-        // The chat envelope carries Anthropic Messages traffic too, whose
-        // in-band failure is a `type: "error"` event.
-        PassthroughProtocol::OpenaiChat
-        | PassthroughProtocol::AnthropicMessages
-        | PassthroughProtocol::OpenaiCompletions => {
-            if value.get("type").and_then(|t| t.as_str()) == Some("error") {
-                if let Some(body) = value.get("error").and_then(|e| {
-                    serde_json::from_value::<
-                            aisix_provider_anthropic::wire::AnthropicStreamErrorBody,
-                        >(e.clone())
-                        .ok()
-                }) {
-                    return Some(
-                        aisix_provider_anthropic::wire::stream_error_into_bridge_error(&body),
-                    );
-                }
-            }
-            aisix_gateway::capture_in_band_error(payload, aisix_gateway::UpstreamWire::OpenAI)
-        }
+        _ => chat_in_band_error(&value),
     }
+}
+
+/// The upstream failure a buffered 2xx body reports in place of an
+/// answer.
+fn body_in_band_error(
+    protocol: PassthroughProtocol,
+    body: &[u8],
+) -> Option<aisix_gateway::BridgeError> {
+    if matches!(protocol, PassthroughProtocol::Raw) {
+        return None;
+    }
+    let value = aisix_gateway::in_band_error_body(body)?;
+    match protocol {
+        PassthroughProtocol::OpenaiResponses => {
+            crate::responses::responses_body_in_band_error(&value)
+        }
+        _ => chat_in_band_error(&value),
+    }
+}
+
+/// The chat envelope carries Anthropic Messages traffic too, whose in-band
+/// failure is a `type: "error"` event read with the Anthropic taxonomy.
+fn chat_in_band_error(value: &serde_json::Value) -> Option<aisix_gateway::BridgeError> {
+    if value.get("type").and_then(|t| t.as_str()) == Some("error") {
+        return aisix_provider_anthropic::wire::body_in_band_error(value);
+    }
+    aisix_gateway::capture_in_band_error_value(value, aisix_gateway::UpstreamWire::OpenAI)
 }
 
 #[cfg(test)]
@@ -5870,13 +5918,24 @@ fn frame_parts_and_tier(
 /// the provider's JSON source representation even though the guardrail scans
 /// decoded string values from that same frame.
 fn frame_capture_text(protocol: PassthroughProtocol, frame: &[u8], scan: &str) -> String {
-    if !matches!(protocol, PassthroughProtocol::Raw) {
-        return scan.to_string();
-    }
-    crate::redact::frame_payload(frame)
+    let payload = crate::redact::frame_payload(frame)
         .map(|payload| payload.trim().to_owned())
-        .filter(|payload| !payload.is_empty() && payload != "[DONE]")
-        .unwrap_or_else(|| scan.to_string())
+        .filter(|payload| !payload.is_empty() && payload != "[DONE]");
+    let Some(payload) = payload else {
+        return scan.to_string();
+    };
+    let omitted = aisix_obs::sink::omit_base64_media_in_json(&payload);
+    if matches!(protocol, PassthroughProtocol::Raw) {
+        return omitted.into_owned();
+    }
+    // A frame cut partway through a payload has no answer to extract: what the
+    // scan holds for it is the frame's own text, base64 included.
+    let cut = matches!(omitted, std::borrow::Cow::Owned(_))
+        && serde_json::from_str::<serde::de::IgnoredAny>(&payload).is_err();
+    if cut {
+        return omitted.into_owned();
+    }
+    scan.to_string()
 }
 
 /// The SSE error frame appended when an output guardrail blocks mid-relay,
@@ -5986,10 +6045,25 @@ fn stream_opaque_response(
                         crate::attribution::note_upstream_first_frame();
                     }
                     telemetry.mark_first_delivery();
+                    // An opaque relay of a refusal is still that attempt's
+                    // upstream answer. A fail-open success stays uncaptured.
+                    if !status.is_success() {
+                        telemetry.keep_error_detail(&chunk);
+                        if let Some(cap) = telemetry.content_cap.filter(|_| !telemetry.error_body_encoded) {
+                            let room = cap.saturating_sub(telemetry.response_text.len());
+                            telemetry
+                                .response_text
+                                .push_str(&String::from_utf8_lossy(&chunk[..chunk.len().min(room)]));
+                        }
+                    }
                     yield Ok::<_, std::convert::Infallible>(chunk);
                 }
                 Err(err) => {
-                    let bridge = crate::dispatch::reqwest_error_to_bridge(&err, telemetry.started);
+                    let bridge = if status.is_success() {
+                        crate::dispatch::reqwest_error_to_bridge(&err, telemetry.started)
+                    } else {
+                        aisix_gateway::BridgeError::upstream_body_unread(status.as_u16(), &err)
+                    };
                     telemetry.record_failure(&bridge);
                     tracing::warn!(
                         route = %route_name,
@@ -6991,7 +7065,8 @@ struct RouteTelemetry {
     streaming: bool,
     /// Bounded error class + message for a failure the relay could not
     /// answer with a status code — an upstream that dies mid-stream, after
-    /// the response head is already on the wire.
+    /// the response head is already on the wire, or a 2xx body relayed as
+    /// sent that reports a failure in-band.
     error_class: String,
     error_message: String,
     /// The status that same failure gets before the response head
@@ -6999,6 +7074,14 @@ struct RouteTelemetry {
     /// place of the upstream's `200`: the caller's response line cannot
     /// change any more, but the record of what happened can.
     failure_status: Option<u16>,
+    /// The start of a non-2xx body relayed as sent, whatever the request's
+    /// exporters are: what the row's `error_message` is read from. Never
+    /// more than [`crate::attempt::MAX_RELAYED_ERROR_DETAIL_BYTES`], and
+    /// copied off the relay without holding it.
+    error_detail: Vec<u8>,
+    /// The relay never decodes, so a failure's compressed bytes are not text
+    /// a row could report.
+    error_body_encoded: bool,
     monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     /// The request's ENFORCE-mode audit handle (AISIX-Cloud#1330). Held
     /// rather than snapshotted at construction: this struct's emit runs
@@ -7013,9 +7096,19 @@ struct RouteTelemetry {
 }
 
 impl RouteTelemetry {
+    /// See [`Self::error_detail`].
+    fn keep_error_detail(&mut self, relayed: &[u8]) {
+        if self.error_body_encoded {
+            return;
+        }
+        let room = crate::attempt::MAX_RELAYED_ERROR_DETAIL_BYTES - self.error_detail.len();
+        self.error_detail
+            .extend_from_slice(&relayed[..relayed.len().min(room)]);
+    }
+
     /// Record the upstream failure that ended a streamed relay after its
-    /// head went out. The first one is the cause; later ones do not replace
-    /// it.
+    /// head went out, or that a relayed 2xx body reports in-band. The first
+    /// one is the cause; later ones do not replace it.
     fn record_failure(&mut self, err: &aisix_gateway::BridgeError) {
         if self.failure_status.is_some() {
             return;
@@ -7090,12 +7183,27 @@ impl RouteTelemetry {
         // endpoints do rather than a success the caller never received.
         // One an upstream failure ended records that failure's status
         // instead, unless a guardrail refused it.
-        if self.streaming {
-            match self.failure_status.filter(|_| !self.guardrail_blocked) {
-                Some(status) => self.status = status,
-                None if !self.stream_reached_end => self.status = crate::CLIENT_CLOSED_REQUEST,
-                None => {}
+        match self.failure_status.filter(|_| !self.guardrail_blocked) {
+            Some(status) => self.status = status,
+            None if self.streaming && !self.stream_reached_end => {
+                self.status = crate::CLIENT_CLOSED_REQUEST
             }
+            None if crate::attempt::relayed_response_failed(self.status)
+                && self.error_class.is_empty() =>
+            {
+                let (class, message) =
+                    crate::attempt::relayed_failure(self.status, &self.error_detail);
+                self.error_class = class.to_string();
+                self.error_message = if self.error_body_encoded {
+                    format!(
+                        "upstream returned HTTP {} with a compressed error body",
+                        self.status
+                    )
+                } else {
+                    message
+                };
+            }
+            None => {}
         }
         // Named before the line is written, so the line and the event carry
         // the same class for a stream the caller abandoned.
@@ -7171,6 +7279,7 @@ impl RouteTelemetry {
             caller.as_caller(),
             upstream,
             self.status,
+            crate::attempt::error_source_of_class(&self.error_class),
             elapsed,
         );
         // An opaque relay times its first frame too, so it reports time to
@@ -11185,6 +11294,40 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         assert_eq!(frames[0].bytes, b"12345");
         assert!(frames[0].overflowed);
         assert!(s.take_rest().is_empty());
+    }
+
+    #[test]
+    fn captured_image_answers_carry_no_b64_json() {
+        let body = br#"{"created":1,"data":[{"b64_json":"QUJD","revised_prompt":"a cat"}]}"#;
+        for protocol in [
+            PassthroughProtocol::Raw,
+            PassthroughProtocol::OpenaiChat,
+            PassthroughProtocol::OpenaiResponses,
+        ] {
+            let captured = response_capture_text(protocol, body);
+            assert!(!captured.contains("QUJD"), "{captured}");
+            assert!(captured.contains("a cat"), "{captured}");
+        }
+        let replay = br#"{"output":[{"type":"image_generation_call","result":"QUJD"}]}"#;
+        let captured = response_capture_text(PassthroughProtocol::OpenaiResponses, replay);
+        assert!(!captured.contains("QUJD"), "{captured}");
+        // A model's answer is text, whatever it looks like.
+        let answer = br#"{"choices":[{"message":{"content":"{\"b64_json\":\"QUJD\"}"}}]}"#;
+        let captured = response_capture_text(PassthroughProtocol::OpenaiChat, answer);
+        assert!(captured.contains("QUJD"), "{captured}");
+        let frame = b"data: {\"type\":\"image_generation.completed\",\"b64_json\":\"QUJD\"}\n\n";
+        let captured = frame_capture_text(PassthroughProtocol::Raw, frame, "");
+        assert!(captured.contains("omitted"), "{captured}");
+        assert!(!captured.contains("QUJD"), "{captured}");
+        let cut = b"data: {\"type\":\"image_generation.completed\",\"b64_json\":\"QUJD";
+        for protocol in [
+            PassthroughProtocol::Raw,
+            PassthroughProtocol::OpenaiCompletions,
+        ] {
+            let captured = frame_capture_text(protocol, cut, "QUJD");
+            assert!(captured.contains("omitted"), "{captured}");
+            assert!(!captured.contains("QUJD"), "{captured}");
+        }
     }
 
     #[test]

@@ -37,16 +37,17 @@ use aisix_core::ObservabilityConfig;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 pub use access_log::{
-    AccessLog, AccessLogRecord, CacheAccessLog, McpAccessLog, SemanticAccessLog, SemanticFallback,
+    request_failed_message, AccessLog, AccessLogRecord, CacheAccessLog, McpAccessLog,
+    SemanticAccessLog, SemanticFallback,
 };
 pub use genai::{
     genai_provider_name, GenAiRequestParams, HttpServerFacts, SpanFacts, UpstreamFacts,
 };
 pub use metrics::{
     client_type_from_user_agent, A2aCallOutcome, A2aLabels, BudgetGauges, BudgetLabels,
-    CancelledLabels, ClientTypeClassifier, DeploymentLabels, DeploymentState, GaugeFamily,
-    GaugeLiveness, HistogramBuckets, LatencyLabels, LatencySide, LiveGaugeSeries, LlmUsage,
-    Metrics, RequestLabels, RequestOutcome, UsageEventLabels, UsageLabels,
+    CancelledLabels, ClientTypeClassifier, DeploymentLabels, DeploymentState, ErrorSource,
+    GaugeFamily, GaugeLiveness, HistogramBuckets, LatencyLabels, LatencySide, LiveGaugeSeries,
+    LlmUsage, Metrics, RequestLabels, RequestOutcome, UsageEventLabels, UsageLabels,
 };
 pub use otlp_http_sink::{content_capture_cap, OtlpHttpFanOut, OtlpSink};
 pub use output::{

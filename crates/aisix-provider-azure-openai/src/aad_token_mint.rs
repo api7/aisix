@@ -285,12 +285,16 @@ impl TokenMinter {
         if !status.is_success() {
             // Read Retry-After BEFORE consuming the body.
             let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-            let body = resp.text().await.unwrap_or_default();
+            let body =
+                aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES)
+                    .await;
+            let text = String::from_utf8_lossy(body.whole()).into_owned();
+            let read_error = body.read_error;
             // Cap body to 500 chars. AAD error envelopes
             // `{error: "invalid_client", error_description: "..."}` are
             // operator-actionable; cap is defense-in-depth against a
             // mis-deployed front-door that returns an HTML error page.
-            let truncated: String = body.chars().take(500).collect();
+            let truncated: String = text.chars().take(500).collect();
             let msg = format!("azure aad token mint upstream returned HTTP {status}: {truncated}");
             // Mirror Vertex audit MEDIUM (ai-gateway#387): 5xx is
             // transient upstream — should surface UpstreamStatus
@@ -299,6 +303,7 @@ impl TokenMinter {
             // is operator-actionable, stays Config.
             return Err(if status.is_server_error() {
                 BridgeError::upstream_status_with_retry_after(status.as_u16(), msg, retry_after)
+                    .with_body_read_error(read_error)
             } else {
                 BridgeError::Config(msg)
             });
