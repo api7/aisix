@@ -195,13 +195,15 @@ pub struct UsageEvent {
     pub team_id: String,
 
     /// The request's effective cost-attribution tags, tag key to tag value:
-    /// per key, the ApiKey's own value, else that of the team its `team_id`
-    /// names, else that of the member its `user_id` names. Resolved once,
-    /// from the snapshot the request authenticated on, so every event of a
-    /// request — every attempt, the terminal row, a cancel row — carries
-    /// the same set; a batch attribution row resolves it from the key that
-    /// observed the batch complete. Never taken from the request. Omitted
-    /// when empty.
+    /// per key, on a JWT-authenticated request the value the provider's
+    /// `tag_claims` reads from the verified token, else the ApiKey's own
+    /// value, else that of the team its `team_id` names, else that of the
+    /// member its `user_id` names. Resolved once, from the snapshot the
+    /// request authenticated on, so every event of a request — every
+    /// attempt, the terminal row, a cancel row — carries the same set; a
+    /// batch attribution row resolves it from the caller that observed the
+    /// batch complete. Nothing a client merely asserts in the request (its
+    /// body, its headers) sets a tag. Omitted when empty.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub tags: std::collections::BTreeMap<String, String>,
 

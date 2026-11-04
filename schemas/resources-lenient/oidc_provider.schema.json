@@ -57,7 +57,7 @@
       "additionalProperties": {
         "$ref": "#/definitions/BoundClaimExpect"
       },
-      "description": "Additional claim requirements, all of which must hold. Keys name claims (dots traverse nested objects, e.g. `\"realm_access.roles\"`); each requirement is satisfied when the claim equals — or, for array claims, contains — one of the expected values.",
+      "description": "Additional claim requirements, all of which must hold. Keys name claims (read as one claim of exactly that name, then with dots traversing nested objects, e.g. `\"realm_access.roles\"`); each requirement is satisfied when the claim equals — or, for array claims, contains — one of the expected values.",
       "type": "object"
     },
     "enabled": {
@@ -72,7 +72,7 @@
     },
     "identity_claim": {
       "default": "sub",
-      "description": "Claim whose value selects the API key to act as: the request is bound to the key whose `jwt_subject` equals this claim's value. Dots traverse nested objects (e.g. `\"resource_access.account\"`). Defaults to `sub`.",
+      "description": "Claim whose value selects the API key to act as: the request is bound to the key whose `jwt_subject` equals this claim's value. The value is first read as one claim of exactly this name, then with dots traversing nested objects (e.g. `\"resource_access.account\"`). Defaults to `sub`.",
       "minLength": 1,
       "type": "string"
     },
@@ -112,6 +112,16 @@
         "type": "string"
       },
       "type": "array"
+    },
+    "tag_claims": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Cost-attribution tags read from the verified token, as tag key to claim path — for example `{\"department\": \"department\", \"subsidiary\": \"org.subsidiary\"}`. For each request this provider authenticates, the value a path yields takes precedence, per tag key, over the `tags` of the API key, its team and its member; a session from an MCP client's sign-in reads the claims recorded at sign-in. The token is not written back to any of those documents.\n\nA path is first read as one claim of exactly that name, then with dots traversing nested objects. A string is used as is and a number as its JSON text. An array of strings and numbers becomes its distinct values, sorted and joined with commas. Any other value, an empty array, or a result that is not 1 to 128 characters, contains a control character, or starts or ends with whitespace yields nothing, and the tag key keeps the value the API key, team or member gives it.\n\nKeys match `^[a-z][a-z0-9_]{0,62}$`, paths are non-empty, and at most 32 entries are allowed. Omitted or empty means tags are not read from tokens.",
+      "type": [
+        "object",
+        "null"
+      ]
     }
   },
   "required": [

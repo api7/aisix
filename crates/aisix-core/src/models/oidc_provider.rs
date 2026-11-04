@@ -10,7 +10,10 @@
 //! are enforced, and the value of `identity_claim` selects the API key
 //! whose `jwt_subject` equals it. The request then proceeds with that
 //! key's permissions, rate limits, and budget — external identities
-//! never widen access beyond a key an operator explicitly created.
+//! never widen access beyond a key an operator explicitly created. The
+//! one thing a token adds to the key is the cost-attribution tags
+//! `tag_claims` reads from it, which select tag budgets and `tag:` rate
+//! limits but grant nothing.
 //!
 //! A provider verifies in one of two **modes**, derived from the row
 //! rather than declared by it:
@@ -237,8 +240,9 @@ pub struct OidcProvider {
 
     /// Claim whose value selects the API key to act as: the request is
     /// bound to the key whose `jwt_subject` equals this claim's value.
-    /// Dots traverse nested objects (e.g. `"resource_access.account"`).
-    /// Defaults to `sub`.
+    /// The value is first read as one claim of exactly this name, then
+    /// with dots traversing nested objects (e.g.
+    /// `"resource_access.account"`). Defaults to `sub`.
     #[serde(default = "default_identity_claim")]
     #[schemars(length(min = 1))]
     pub identity_claim: String,
@@ -250,12 +254,39 @@ pub struct OidcProvider {
     pub required_scopes: Vec<String>,
 
     /// Additional claim requirements, all of which must hold. Keys name
-    /// claims (dots traverse nested objects, e.g.
-    /// `"realm_access.roles"`); each requirement is satisfied when the
-    /// claim equals — or, for array claims, contains — one of the
-    /// expected values.
+    /// claims (read as one claim of exactly that name, then with dots
+    /// traversing nested objects, e.g. `"realm_access.roles"`); each
+    /// requirement is satisfied when the claim equals — or, for array
+    /// claims, contains — one of the expected values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_claims: Option<BTreeMap<String, BoundClaimExpect>>,
+
+    /// Cost-attribution tags read from the verified token, as tag key to
+    /// claim path — for example `{"department": "department", "subsidiary":
+    /// "org.subsidiary"}`. For each request this provider authenticates, the
+    /// value a path yields takes precedence, per tag key, over the `tags` of
+    /// the API key, its team and its member; a session from an MCP client's
+    /// sign-in reads the claims recorded at sign-in. The token is not written
+    /// back to any of those documents.
+    ///
+    /// A path is first read as one claim of exactly that name, then with dots
+    /// traversing nested objects. A string is used as is and a number as its
+    /// JSON text. An array of strings and numbers becomes its distinct values,
+    /// sorted and joined with commas. Any other value, an empty array, or a
+    /// result that is not 1 to 128 characters, contains a control character,
+    /// or starts or ends with whitespace yields nothing, and the tag key keeps
+    /// the value the API key, team or member gives it.
+    ///
+    /// Keys match `^[a-z][a-z0-9_]{0,62}$`, paths are non-empty, and at most
+    /// 32 entries are allowed. Omitted or empty means tags are not read from
+    /// tokens.
+    #[serde(
+        default,
+        deserialize_with = "crate::models::tags::null_as_empty",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    #[schemars(schema_with = "crate::models::tags::tags_schema")]
+    pub tag_claims: BTreeMap<String, String>,
 
     /// Clock-skew allowance in seconds applied to time-based claims
     /// (`exp`, `nbf`). Defaults to 0.
@@ -380,6 +411,55 @@ impl Resource for OidcProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tag_claims_limits_bind_writes_and_not_stored_rows() {
+        let row = |tag_claims: serde_json::Value| {
+            serde_json::json!({
+                "name": "corp",
+                "issuer": "https://sso.example.com",
+                "audiences": ["aisix-gateway"],
+                "tag_claims": tag_claims,
+            })
+        };
+        let too_many: serde_json::Map<_, _> = (0..33)
+            .map(|i| (format!("k{i}"), serde_json::json!("claim")))
+            .collect();
+
+        let ok = row(serde_json::json!({"department": "org.department"}));
+        assert!(crate::models::validate_oidc_provider(&ok).is_ok());
+        assert!(crate::models::validate_oidc_provider_lenient(&ok).is_ok());
+
+        for bad in [
+            row(serde_json::json!({"Not-A-Tag-Key": "claim"})),
+            row(serde_json::json!({"department": ""})),
+            row(serde_json::json!(too_many)),
+            row(serde_json::Value::Null),
+        ] {
+            assert!(
+                crate::models::validate_oidc_provider(&bad).is_err(),
+                "{bad}"
+            );
+            assert!(
+                crate::models::validate_oidc_provider_lenient(&bad).is_ok(),
+                "{bad}"
+            );
+            let provider: OidcProvider = serde_json::from_value(bad).unwrap();
+            assert_eq!(provider.name, "corp");
+        }
+
+        let absent: OidcProvider = serde_json::from_value(serde_json::json!({
+            "name": "corp",
+            "issuer": "https://sso.example.com",
+            "audiences": ["aisix-gateway"],
+        }))
+        .unwrap();
+        assert!(absent.tag_claims.is_empty());
+        assert!(serde_json::to_value(&absent)
+            .unwrap()
+            .get("tag_claims")
+            .is_none());
+    }
 
     #[test]
     fn deserialises_minimal_provider_with_defaults() {

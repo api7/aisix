@@ -86,8 +86,10 @@ pub struct ApiKey {
     /// the request is made with the nearest setting winning: this key's own
     /// value, else the value in the `tags` of the team `team_id` names, else
     /// the value in the `tags` of the member `user_id` names. Different keys
-    /// combine, so a request can carry tags from all three. Tags are never
-    /// read from the request itself. Keys match `^[a-z][a-z0-9_]{0,62}$`,
+    /// combine, so a request can carry tags from all three. A request
+    /// authenticated by a JWT takes the value its identity provider's
+    /// `tag_claims` reads from the verified token ahead of all three; nothing
+    /// else in a request sets a tag. Keys match `^[a-z][a-z0-9_]{0,62}$`,
     /// values are 1 to 128 characters, and at most 32 entries are allowed.
     /// Omitted or empty means the key adds no tags of its own.
     #[serde(

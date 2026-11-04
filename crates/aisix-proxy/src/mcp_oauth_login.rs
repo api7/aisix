@@ -1026,17 +1026,18 @@ fn session_principal(
         });
     }
     let identity = crate::jwt::resolve_identity(state, snapshot, provider, claims)?;
-    let auth = AuthenticatedKey::new(
+    let auth = AuthenticatedKey::for_jwt(
         snapshot,
         identity.entry,
-        Some(Arc::new(JwtIdentity::for_session(
+        JwtIdentity::for_session(
             identity.subject.clone(),
             provider.name.clone(),
             provider.issuer.clone(),
             provider.identity_claim.clone(),
             identity.claim_mapping,
-        ))),
-        false,
+        ),
+        provider,
+        claims,
     );
     Ok(Principal {
         subject: identity.subject,

@@ -15,8 +15,10 @@
 //! token's identity claim is recorded for usage attribution.
 //!
 //! Claims only ever *select* a key an operator already created; no claim
-//! value becomes configuration. A token matching no mapping is rejected,
-//! never admitted with defaults.
+//! value becomes configuration here. The one claim value that reaches a
+//! request is what the provider's `tag_claims` names, and that is
+//! cost attribution rather than access. A token matching no mapping is
+//! rejected, never admitted with defaults.
 
 use serde::{Deserialize, Serialize};
 
@@ -41,8 +43,9 @@ pub enum ClaimMatchOp {
 /// (logical OR).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ClaimMatch {
-    /// Claim to inspect. Dots traverse nested objects (for example
-    /// `realm_access.roles`). A missing claim never matches.
+    /// Claim to inspect, read as one claim of exactly this name, then with
+    /// dots traversing nested objects (for example `realm_access.roles`). A
+    /// missing claim never matches.
     #[schemars(length(min = 1))]
     pub claim: String,
 

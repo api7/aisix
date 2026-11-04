@@ -1106,6 +1106,15 @@ const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "oidc_provider",
+        &[
+            "/properties/tag_claims/additionalProperties/minLength",
+            "/properties/tag_claims/maxProperties",
+            "/properties/tag_claims/propertyNames",
+            "/properties/tag_claims/type",
+        ],
+    ),
+    (
         "observability_exporter",
         &[
             "/oneOf/0/properties/request_headers/items/not",

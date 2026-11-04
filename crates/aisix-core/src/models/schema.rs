@@ -143,7 +143,7 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "mcp_server" => mcp_server_root_schema(strict),
         "mcp_policy" => mcp_policy_root_schema(strict),
         "a2a_agent" => a2a_agent_root_schema(),
-        "oidc_provider" => oidc_provider_root_schema(),
+        "oidc_provider" => oidc_provider_root_schema(strict),
         "claim_mapping" => claim_mapping_root_schema(),
         "passthrough_route" => passthrough_route_root_schema(),
         "mcp_auth_settings" => mcp_auth_settings_root_schema(),
@@ -1609,8 +1609,11 @@ fn title_single_value_enum_variants(
 /// are.
 ///
 /// [`OidcProvider::validate_semantics`]: crate::models::OidcProvider::validate_semantics
-pub fn oidc_provider_root_schema() -> Value {
+pub fn oidc_provider_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::OidcProvider>(false);
+    if strict {
+        super::tags::constrain_tag_claims_property(&mut schema);
+    }
     // schemars does not propagate the `#[schemars(length(min = 1))]` on
     // the `BoundClaimExpect::Any(Vec<String>)` variant into the untagged
     // enum's array branch, so the generated schema would accept an empty

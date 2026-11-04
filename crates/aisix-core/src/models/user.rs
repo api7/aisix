@@ -24,10 +24,10 @@ pub struct User {
 
     /// Cost-attribution tags of this member, as tag key to tag value. Each
     /// request made with an API key whose `user_id` names this member is
-    /// attributed to them, per tag key, unless the key itself or the key's
-    /// team sets the same key. Keys match `^[a-z][a-z0-9_]{0,62}$`, values
-    /// are 1 to 128 characters, and at most 32 entries are allowed. Omitted
-    /// or empty means the member adds no tags.
+    /// attributed to them, per tag key, unless the key itself, the key's team
+    /// or a JWT's `tag_claims` sets the same key. Keys match
+    /// `^[a-z][a-z0-9_]{0,62}$`, values are 1 to 128 characters, and at most 32
+    /// entries are allowed. Omitted or empty means the member adds no tags.
     #[serde(
         default,
         deserialize_with = "crate::models::tags::null_as_empty",

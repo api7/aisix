@@ -121,6 +121,6 @@ pub use semantic::{
     Semantic, SemanticClassifier, SemanticMatch, SemanticRoute, TYPESAFE_PROVIDER,
 };
 pub use snapshot::{AisixSnapshot, KeyOwnerNames};
-pub use tags::{effective_tags, is_valid_tag_key, Tags, TAG_KEY_PATTERN};
+pub use tags::{effective_tags, is_valid_tag_key, tag_value_from_claim, Tags, TAG_KEY_PATTERN};
 pub use team::Team;
 pub use user::User;

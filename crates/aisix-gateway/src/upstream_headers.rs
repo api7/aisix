@@ -76,16 +76,15 @@ pub struct CallerIdentity {
     /// four `request.api_key.*` keys, and `HeaderVars::resolve` matches
     /// them one by one — this is not among them.
     pub user_name: Option<String>,
-    /// The request's effective cost-attribution tags
-    /// ([`aisix_core::KeyOwnerNames::effective_tags`]). Not a header-template
-    /// variable either.
+    /// The request's effective cost-attribution tags, as the authenticated
+    /// principal carries them, a JWT's `tag_claims` included. Not a
+    /// header-template variable either.
     pub tags: std::sync::Arc<aisix_core::Tags>,
 }
 
 impl CallerIdentity {
     /// Read the identity off the authenticated key's snapshot entry, the
-    /// owner names resolved for it and the effective tags resolved from
-    /// both ([`aisix_core::KeyOwnerNames::effective_tags`]).
+    /// owner names resolved for it and the principal's effective tags.
     pub fn from_entry(
         entry: &aisix_core::ResourceEntry<aisix_core::ApiKey>,
         owner: &aisix_core::KeyOwnerNames,

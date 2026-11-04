@@ -209,9 +209,10 @@ impl schemars::JsonSchema for PolicyDimension {
                     "type": "string",
                     "pattern": tag_dimension_pattern(),
                     "description": "`tag:<key>` — the request's effective value of the \
-                        cost-attribution tag `<key>`: the API key's own `tags[<key>]`, else that \
-                        of the team its `team_id` names, else that of the member its `user_id` \
-                        names. A string dimension: it admits `==`, `~=`, `in`, `~~` and `~*`. A \
+                        cost-attribution tag `<key>`: on a request authenticated by a JWT, the \
+                        value its provider's `tag_claims` reads from the token; else the API \
+                        key's own `tags[<key>]`, else that of the team its `team_id` names, else \
+                        that of the member its `user_id` names. A string dimension: it admits `==`, `~=`, `in`, `~~` and `~*`. A \
                         request with no value for the key matches neither the condition nor its \
                         negation, exactly like `team` on a key that belongs to no team.",
                 },
