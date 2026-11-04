@@ -427,7 +427,7 @@
           "type": "string"
         },
         {
-          "description": "Forward the caller's own credential headers verbatim — bring-your-own-credential. The slot the gateway consumed to authenticate the caller is still stripped so the gateway credential never leaks upstream: to send its own `Authorization` under `auth_mode: gateway_key`, a caller carries its gateway key in `x-aisix-api-key`.",
+          "description": "Forward the caller's own credential headers verbatim — bring-your-own-credential. The slot the gateway consumed to authenticate the caller is stripped by default so the gateway credential stays home, unless `forward_client_headers` names that slot exactly. To send its own `Authorization` under `auth_mode: gateway_key`, a caller carries its gateway key in `x-aisix-api-key`.",
           "enum": [
             "forward_client"
           ],
