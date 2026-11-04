@@ -246,7 +246,7 @@ async fn exchange(
         Err(e) => {
             tracing::warn!(
                 server = %cfg.server,
-                error = %crate::bridge::sanitize_error_message(&aisix_gateway::transport_error_message(&e)),
+                error = %crate::bridge::sanitize_error_message(&aisix_gateway::transport_error_message(&e.without_url())),
                 "upstream token exchange request failed"
             );
             return Err(TokenExchangeFailure::Unavailable);
@@ -301,8 +301,12 @@ async fn exchange(
         tracing::warn!(server = %cfg.server, "upstream token exchange returned {reason}");
         TokenExchangeFailure::Unavailable
     };
-    let Ok(token) = response.json::<TokenResponse>().await else {
-        return Err(unusable("a malformed token response"));
+    let token = match response.json::<TokenResponse>().await {
+        Ok(token) => token,
+        Err(e) => {
+            aisix_gateway::log_body_read_causes(&e);
+            return Err(unusable("a malformed token response"));
+        }
     };
     let Some(access_token) = token.access_token.filter(|t| !t.is_empty()) else {
         return Err(unusable("no access_token"));
@@ -382,11 +386,9 @@ impl TokenExchangeAuth {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
+pub(crate) mod test_logs {
     /// Run `f` under a capturing subscriber; returns its result and what it logged.
-    async fn capture_logs<T>(f: impl std::future::Future<Output = T>) -> (T, String) {
+    pub(crate) async fn capture_logs<T>(f: impl std::future::Future<Output = T>) -> (T, String) {
         #[derive(Clone, Default)]
         struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {
@@ -411,6 +413,12 @@ mod tests {
         let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         (out, logged)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_logs::capture_logs;
+    use super::*;
 
     /// A loopback address nothing listens on, so a connect is refused at once.
     fn refused_url(path: &str) -> String {

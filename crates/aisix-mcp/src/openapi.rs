@@ -1004,4 +1004,41 @@ mod tests {
         assert!(text.to_lowercase().contains("refused"), "{text}");
         assert!(!text.contains("secret-arg"), "{text}");
     }
+
+    /// Answers one request with a `200` whose body stops short of its length.
+    async fn cut_short_url(path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = sock.read(&mut request).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort")
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}{path}")
+    }
+
+    #[tokio::test]
+    async fn a_cut_short_body_names_its_cause() {
+        let server: McpServer = serde_json::from_value(json!({
+            "name": "srv-cut-short",
+            "type": "openapi",
+            "url": cut_short_url("/").await,
+            "spec": {
+                "openapi": "3.0.0",
+                "paths": { "/items": { "get": { "operationId": "listItems" } } }
+            }
+        }))
+        .expect("test mcp_server");
+        let bridge = OpenApiBridge::new(Arc::new(ResourceEntry::new("cut-short-row", server, 1)));
+        let name = bridge.tools().unwrap()[0].name.clone();
+        let err = bridge
+            .call_tool(&name, json!({}))
+            .await
+            .expect_err("the body is cut short");
+        assert!(err.to_string().contains("end of file"), "{err}");
+    }
 }

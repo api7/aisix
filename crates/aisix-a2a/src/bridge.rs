@@ -952,4 +952,30 @@ mod tests {
         assert!(text.contains("error sending request"), "{text}");
         assert!(!text.to_lowercase().contains("refused"), "{text}");
     }
+
+    /// Answers one request with a `200` whose body stops short of its length.
+    async fn cut_short_url(path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = sock.read(&mut request).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort")
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}{path}")
+    }
+
+    /// As for a failed send: the read's cause stays out of the error's text.
+    #[tokio::test]
+    async fn a_failed_body_read_logs_its_cause_and_keeps_the_error_text() {
+        let bridge = bridge_at(&cut_short_url("/a2a").await);
+        let (result, logged) = capture_logs(bridge.send(&serde_json::json!({}))).await;
+        let text = result.expect_err("the body is cut short").to_string();
+        assert!(logged.contains("end of file"), "{logged}");
+        assert!(!text.contains("end of file"), "{text}");
+    }
 }

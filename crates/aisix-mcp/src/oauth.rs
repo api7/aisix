@@ -157,7 +157,8 @@ async fn fetch_token(cfg: &OAuthClientConfig) -> Result<(String, Duration), McpE
         )));
     }
 
-    let token: TokenResponse = response.json().await.map_err(|_| {
+    let token: TokenResponse = response.json().await.map_err(|e| {
+        aisix_gateway::log_body_read_causes(&e);
         McpError::Connect(
             "upstream OAuth token endpoint returned a malformed token response".to_string(),
         )

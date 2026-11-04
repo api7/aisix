@@ -314,6 +314,7 @@ impl TokenMinter {
             });
         }
         let parsed: TokenResponse = resp.json().await.map_err(|e| {
+            aisix_gateway::log_body_read_causes(&e);
             BridgeError::TokenExchangeDecode(format!("azure aad token mint response: {e}"))
         })?;
         Ok((parsed.access_token, parsed.expires_in))

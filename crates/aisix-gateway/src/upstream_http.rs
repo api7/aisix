@@ -230,11 +230,25 @@ pub fn transport_error_message(err: &reqwest::Error) -> String {
 /// Its text reaches the usage event's `error_message`, so it stays reqwest's
 /// top-level message; the cause chain that names the fault goes to the log here.
 pub fn upstream_body_read_error(err: &reqwest::Error) -> BridgeError {
+    log_body_read_causes(err);
+    BridgeError::UpstreamDecode(err.to_string())
+}
+
+/// Log why a response body could not be read. `Response::json` reports a parse
+/// failure through the same error type, and that source is a serde message that
+/// can quote the body, a token included, so a parse failure logs nothing here.
+pub fn log_body_read_causes(err: &reqwest::Error) {
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        if cause.is::<serde_json::Error>() {
+            return;
+        }
+        source = cause.source();
+    }
     tracing::warn!(
         error = %transport_error_message(err),
         "reading the upstream response body failed",
     );
-    BridgeError::UpstreamDecode(err.to_string())
 }
 
 /// Classify a `reqwest` **send** failure into its [`BridgeError`].
@@ -1164,5 +1178,31 @@ mod tests {
             "{err:?}"
         );
         assert!(logged.contains(&cause), "{logged}");
+    }
+
+    /// serde quotes what it could not parse, and this body may be a token response.
+    #[tokio::test]
+    async fn an_unparsable_body_logs_nothing_that_could_quote_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = sock.read(&mut request).await;
+            let body = r#"{"access_token": 1, "x": "tok-LEAK"#;
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(body.as_bytes()).await.unwrap();
+        });
+
+        let parse_err = reqwest::get(format!("http://{addr}/"))
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .expect_err("the body is not JSON");
+        let (_, logged) = capture_logs(async { log_body_read_causes(&parse_err) }).await;
+        assert!(logged.is_empty(), "{logged}");
     }
 }

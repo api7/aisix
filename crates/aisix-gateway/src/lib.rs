@@ -80,7 +80,7 @@ pub use upstream_headers::{
     UpstreamHeaderContext,
 };
 pub use upstream_http::{
-    client_builder, error_with_causes, json_body, send_error, transport_error_message,
-    upstream_body_read_error, UpstreamHttpConfig,
+    client_builder, error_with_causes, json_body, log_body_read_causes, send_error,
+    transport_error_message, upstream_body_read_error, UpstreamHttpConfig,
 };
 pub use upstream_tls::TlsSettings;

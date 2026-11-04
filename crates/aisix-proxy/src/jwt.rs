@@ -1513,6 +1513,25 @@ mod tests {
         assert!(err.to_lowercase().contains("refused"), "{err}");
     }
 
+    #[tokio::test]
+    async fn a_cut_short_body_names_its_transport_cause() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = sock.read(&mut request).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort")
+                .await
+                .unwrap();
+        });
+        let err = fetch_json(&format!("http://{addr}/jwks"))
+            .await
+            .expect_err("the body is cut short");
+        assert!(err.contains("end of file"), "{err}");
+    }
+
     async fn fetch_server(discovery: bool) -> FetchServer {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -169,7 +169,7 @@ impl VertexBridge {
             let json: Value = resp
                 .json()
                 .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+                .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?;
             let tokens = json
                 .get("input_tokens")
                 .and_then(Value::as_u64)

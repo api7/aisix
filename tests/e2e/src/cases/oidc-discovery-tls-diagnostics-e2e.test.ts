@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:https";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -29,6 +29,7 @@ describe("OIDC discovery failure diagnostics", () => {
   let app: SpawnedApp | undefined;
   let idp: MockIdp | undefined;
   let issuerServer: Server | undefined;
+  let pkiDir: string | undefined;
   let issuer = "";
   let ready = false;
 
@@ -36,7 +37,8 @@ describe("OIDC discovery failure diagnostics", () => {
     const etcd = new EtcdClient();
     if (!(await etcd.ping())) return;
 
-    const dir = mkdtempSync(join(tmpdir(), "aisix-oidc-tls-"));
+    pkiDir = mkdtempSync(join(tmpdir(), "aisix-oidc-tls-"));
+    const dir = pkiDir;
     execFileSync(
       "openssl",
       [
@@ -81,6 +83,7 @@ describe("OIDC discovery failure diagnostics", () => {
     await app?.exit();
     await idp?.close();
     await new Promise((resolve) => (issuerServer ? issuerServer.close(resolve) : resolve(undefined)));
+    if (pkiDir) rmSync(pkiDir, { recursive: true, force: true });
   });
 
   test("the log names the certificate and the caller's answer stays generic", async (ctx) => {
