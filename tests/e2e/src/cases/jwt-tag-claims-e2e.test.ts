@@ -320,6 +320,7 @@ describe("tags from JWT claims on bearer tokens", () => {
     ["the longest allowed value is kept", "x".repeat(128), "x".repeat(128)],
     ["length counts characters, not bytes", "研".repeat(128), "研".repeat(128)],
     ["whitespace inside a value is kept", "research and development", "research and development"],
+    ["a comma inside an element is not treated specially", ["a,b", "c"], "a,b,c"],
   ])("%s", async (name, claim, expected) => {
     if (!etcdReachable) return;
     expect(await tagsOfChat(tokenFor("attributed", { department: claim })), name).toEqual({
@@ -337,6 +338,9 @@ describe("tags from JWT claims on bearer tokens", () => {
     ["an array holding an object", ["rnd", { a: 1 }]],
     ["a value over 128 characters", "x".repeat(129)],
     ["an array joining to over 128 characters", ["x".repeat(100), "y".repeat(100)]],
+    ["an array holding an empty string", ["", "rnd"]],
+    ["an array holding an element with outer whitespace", ["a ", "b"]],
+    ["an array holding an element with a control character", ["r\nd", "ops"]],
     ["an empty string", ""],
     ["leading whitespace", " rnd"],
     ["trailing whitespace", "rnd "],

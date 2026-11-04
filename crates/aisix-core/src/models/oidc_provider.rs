@@ -273,9 +273,10 @@ pub struct OidcProvider {
     /// traversing nested objects. A string is used as is and a number as its
     /// JSON text. An array of strings and numbers becomes its distinct values,
     /// sorted and joined with commas. Any other value, an empty array, or a
-    /// result that is not 1 to 128 characters, contains a control character,
-    /// or starts or ends with whitespace yields nothing, and the tag key keeps
-    /// the value the API key, team or member gives it.
+    /// value, array element or joined result that is not 1 to 128 characters,
+    /// contains a control character, or starts or ends with whitespace yields
+    /// nothing, and the tag key keeps the value the API key, team or member
+    /// gives it.
     ///
     /// Keys match `^[a-z][a-z0-9_]{0,62}$`, paths are non-empty, and at most
     /// 32 entries are allowed. Omitted or empty means tags are not read from

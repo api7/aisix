@@ -51,9 +51,9 @@ pub fn effective_tags<'a>(key: &'a Tags, team: Option<&'a Tags>, user: Option<&'
 /// A string is used as is and a number as its JSON text. An array of strings
 /// and numbers becomes its distinct texts, sorted and joined with commas, so
 /// one set of values is one tag value whatever order the identity provider
-/// lists it in. The result must pass the same rule the control plane applies
-/// to a tag value written to a document (`ValidValue` in its `tags` package):
-/// it is rejected, never truncated or trimmed.
+/// lists it in. Each text, and the joined result, must pass the same rule the
+/// control plane applies to a tag value written to a document (`ValidValue` in
+/// its `tags` package): it is rejected, never truncated or trimmed.
 pub fn tag_value_from_claim(claim: &Value) -> Result<String, &'static str> {
     fn scalar_text(value: &Value) -> Option<String> {
         match value {
@@ -62,31 +62,38 @@ pub fn tag_value_from_claim(claim: &Value) -> Result<String, &'static str> {
             _ => None,
         }
     }
-    let text = match claim {
-        Value::Array(items) if items.is_empty() => return Err("empty_array"),
-        Value::Array(items) => {
-            let mut texts = items
-                .iter()
-                .map(scalar_text)
-                .collect::<Option<Vec<_>>>()
-                .ok_or("array_element_type")?;
-            texts.sort_unstable();
-            texts.dedup();
-            texts.join(",")
+    fn check(text: &str) -> Result<(), &'static str> {
+        let chars = text.chars().count();
+        if chars == 0 || chars > MAX_TAG_VALUE_CHARS {
+            return Err("length");
         }
-        other => scalar_text(other).ok_or("value_type")?,
+        if text.chars().any(char::is_control) {
+            return Err("control_character");
+        }
+        if text.starts_with(char::is_whitespace) || text.ends_with(char::is_whitespace) {
+            return Err("surrounding_whitespace");
+        }
+        Ok(())
+    }
+    let Value::Array(items) = claim else {
+        let text = scalar_text(claim).ok_or("value_type")?;
+        check(&text)?;
+        return Ok(text);
     };
-    let chars = text.chars().count();
-    if chars == 0 || chars > MAX_TAG_VALUE_CHARS {
-        return Err("length");
+    if items.is_empty() {
+        return Err("empty_array");
     }
-    if text.chars().any(char::is_control) {
-        return Err("control_character");
-    }
-    if text.starts_with(char::is_whitespace) || text.ends_with(char::is_whitespace) {
-        return Err("surrounding_whitespace");
-    }
-    Ok(text)
+    let mut texts = items
+        .iter()
+        .map(scalar_text)
+        .collect::<Option<Vec<_>>>()
+        .ok_or("array_element_type")?;
+    texts.iter().try_for_each(|text| check(text))?;
+    texts.sort_unstable();
+    texts.dedup();
+    let joined = texts.join(",");
+    check(&joined)?;
+    Ok(joined)
 }
 
 /// The schema `schemars` renders for a `tags` field: an object of strings,
@@ -209,6 +216,7 @@ mod tests {
             (json!(["b", "a", "b"]), "a,b"),
             (json!([10, "9", 10]), "10,9"),
             (json!(["1", 1]), "1"),
+            (json!(["a,b", "c"]), "a,b,c"),
             (
                 json!("x".repeat(MAX_TAG_VALUE_CHARS)),
                 &*"x".repeat(MAX_TAG_VALUE_CHARS),
@@ -236,6 +244,14 @@ mod tests {
             (json!([""]), "length"),
             (json!("x".repeat(MAX_TAG_VALUE_CHARS + 1)), "length"),
             (json!(["x".repeat(100), "y".repeat(100)]), "length"),
+            (json!(["", "rnd"]), "length"),
+            (
+                json!(["x".repeat(MAX_TAG_VALUE_CHARS + 1), "rnd"]),
+                "length",
+            ),
+            (json!(["a ", "b"]), "surrounding_whitespace"),
+            (json!(["b", " a"]), "surrounding_whitespace"),
+            (json!(["a\nb", "c"]), "control_character"),
             (json!("a\nb"), "control_character"),
             (json!("a\u{7f}b"), "control_character"),
             (json!(" rnd"), "surrounding_whitespace"),
