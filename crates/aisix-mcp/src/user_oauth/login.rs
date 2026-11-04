@@ -159,10 +159,10 @@ async fn fetch_endpoints(provider: &str, issuer: &str) -> Result<LoginEndpoints,
             "could not read the trust provider's OIDC discovery document");
         return Err(UserOAuthFailure::Unavailable);
     }
-    let document: DiscoveryDocument = response
-        .json()
-        .await
-        .map_err(|_| UserOAuthFailure::Unavailable)?;
+    let document: DiscoveryDocument = response.json().await.map_err(|e| {
+        aisix_gateway::log_body_read_causes(&e);
+        UserOAuthFailure::Unavailable
+    })?;
     // OIDC Discovery 1.0 §4.3: the document must claim the issuer asked about.
     if document.issuer.as_deref() != Some(issuer) {
         tracing::warn!(target: "aisix::mcp_oauth", provider,

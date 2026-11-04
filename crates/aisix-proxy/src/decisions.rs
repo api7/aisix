@@ -562,7 +562,7 @@ async fn dispatch(
                         tracker,
                         model_id,
                         cooldown_cfg,
-                        aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+                        aisix_gateway::upstream_body_read_error(&e),
                     ))
                 })?;
                 // A converted answer is read here, inside the attempt, so a 200

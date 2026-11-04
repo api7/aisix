@@ -1077,13 +1077,14 @@ async fn host_fetch(
             // Never the full URL: scripts commonly build it from a secret
             // (`${base}/scan?key=${ctx.secrets.SCAN_KEY}`), and this line
             // goes to the operator's log.
+            let for_script = e.to_string();
             tracing::warn!(
                 guardrail_name = %row_name,
                 target = %redact_url(&url),
-                error = %e,
+                error = %crate::error_chain(&e.without_url()),
                 "custom guardrail fetch failed",
             );
-            return fetch_error(e.to_string());
+            return fetch_error(for_script);
         }
     };
 
@@ -2074,5 +2075,35 @@ mod tests {
                 ..
             },
         ));
+    }
+
+    /// The log line carries the cause and not the URL, whose query a script may
+    /// have built from a secret; what the script's own `fetch` rejects with is
+    /// unchanged.
+    #[tokio::test]
+    async fn a_failed_fetch_logs_its_cause_and_not_the_query_secret() {
+        use crate::call_error::testing::*;
+        let endpoint = refused_endpoint();
+        let url = format!("{endpoint}/scan?key=sk-live-42");
+        let mut returned = String::new();
+        let logged = capture_logs(|| async {
+            returned = host_fetch(
+                Arc::new(reqwest::Client::new()),
+                "row".to_owned(),
+                url.clone(),
+                None,
+                1024,
+            )
+            .await;
+        })
+        .await;
+        assert!(logged.to_lowercase().contains("refused"), "{logged}");
+        assert!(!logged.contains("sk-live-42"), "{logged}");
+        let error = serde_json::from_str::<serde_json::Value>(&returned).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(error.contains("error sending request"), "{error}");
+        assert!(!error.to_lowercase().contains("refused"), "{error}");
     }
 }

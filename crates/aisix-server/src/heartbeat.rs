@@ -267,7 +267,7 @@ async fn run(cfg: HeartbeatConfig, cancel: &mut watch::Receiver<bool>) {
     let client = match build_client(&cfg.mtls) {
         Ok(c) => Arc::new(c),
         Err(e) => {
-            tracing::error!(error = %e, "heartbeat: build mTLS reqwest client failed; disabled");
+            tracing::error!(error = %format_args!("{e:#}"), "heartbeat: build mTLS reqwest client failed; disabled");
             return;
         }
     };
@@ -293,7 +293,7 @@ async fn run(cfg: HeartbeatConfig, cancel: &mut watch::Receiver<bool>) {
                 let uptime = started.elapsed().as_secs() as i64;
                 match send(&client, &cfg, uptime).await {
                     Ok(()) => tracing::debug!("heartbeat ok"),
-                    Err(e) => tracing::warn!(error = %e, "heartbeat failed"),
+                    Err(e) => tracing::warn!(error = %format_args!("{e:#}"), "heartbeat failed"),
                 }
             }
             _ = cancel.changed() => {
@@ -1233,5 +1233,23 @@ managed:
             extra_ca_pem: None,
         };
         build_client(&mtls).expect("build_client must tolerate PEM without trailing newline");
+    }
+
+    #[tokio::test]
+    async fn a_failed_heartbeat_logs_its_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/dp/heartbeat", listener.local_addr().unwrap());
+        drop(listener);
+        let cfg = cfg_with_bundle(url, write_test_bundle(dir.path()));
+        let (_keep, mut cancel) = watch::channel(false);
+        // The first tick fires at once; `run` never returns on its own.
+        let (_, logged) = crate::dp_store::test_logs::capture_logs(tokio::time::timeout(
+            Duration::from_secs(3),
+            run(cfg, &mut cancel),
+        ))
+        .await;
+        assert!(logged.contains("heartbeat failed"), "{logged}");
+        assert!(logged.to_lowercase().contains("refused"), "{logged}");
     }
 }

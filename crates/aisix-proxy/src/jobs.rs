@@ -445,7 +445,7 @@ async fn send_upstream(
     let bytes = bytes
         .map_err(|e| {
             let err = if status.is_success() {
-                aisix_gateway::BridgeError::UpstreamDecode(e.to_string())
+                aisix_gateway::upstream_body_read_error(&e)
             } else {
                 aisix_gateway::BridgeError::upstream_body_unread(status.as_u16(), &e)
             };
@@ -2142,11 +2142,17 @@ async fn attribute_batch_usage(
         Adapter::AzureOpenai => builder.header("api-key", secret),
         _ => builder.header(header::AUTHORIZATION, format!("Bearer {secret}")),
     };
-    let resp = builder.send().await.map_err(|e| e.to_string())?;
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| aisix_gateway::transport_error_message(&e))?;
     if !resp.status().is_success() {
         return Err(format!("output file download returned {}", resp.status()));
     }
-    let body = resp.bytes().await.map_err(|e| e.to_string())?;
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| aisix_gateway::transport_error_message(&e))?;
 
     // Aggregate per provider-billed model (`response.body.model`).
     #[derive(Default)]

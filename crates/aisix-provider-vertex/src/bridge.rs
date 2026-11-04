@@ -924,7 +924,7 @@ impl Bridge for VertexBridge {
             let parsed: VertexPredictEmbeddingsResponse = resp
                 .json()
                 .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+                .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?;
 
             let mut data = Vec::with_capacity(parsed.predictions.len());
             let mut prompt_tokens: u64 = 0;
@@ -1079,7 +1079,7 @@ impl VertexBridge {
             let parsed: GeminiGenerateContentResponse = resp
                 .json()
                 .await
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+                .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?;
             Ok(gemini_response_into_chat_response(parsed, upstream_id)
                 .with_fallback_service_tier(header_tier))
         })

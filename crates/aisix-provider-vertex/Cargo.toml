@@ -11,6 +11,7 @@ description = "aisix: Google Vertex AI provider bridge (skeleton — multi-publi
 [dependencies]
 aisix-core = { path = "../aisix-core" }
 aisix-gateway = { path = "../aisix-gateway" }
+tracing.workspace = true
 # Claude on Vertex reuses the Anthropic Messages request serializer +
 # response decoder (same crate the Bedrock /invoke path reuses) — the
 # Vertex `:rawPredict` body is Anthropic Messages JSON with a
@@ -37,3 +38,4 @@ uuid.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 wiremock.workspace = true
+tracing-subscriber.workspace = true

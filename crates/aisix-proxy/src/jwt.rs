@@ -1446,11 +1446,12 @@ async fn refresh_jwks(url: &str, unknown_kid: bool) -> Result<Arc<JwkSet>, Strin
 }
 
 async fn fetch_json(url: &str) -> Result<serde_json::Value, String> {
-    let mut resp = http_client()
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
+    let mut resp = http_client().get(url).send().await.map_err(|e| {
+        format!(
+            "request failed: {}",
+            aisix_gateway::transport_error_message(&e)
+        )
+    })?;
     if !resp.status().is_success() {
         return Err(format!("endpoint returned status {}", resp.status()));
     }
@@ -1464,11 +1465,12 @@ async fn fetch_json(url: &str) -> Result<serde_json::Value, String> {
         return Err(format!("response exceeds {JWKS_MAX_BYTES} bytes"));
     }
     let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| format!("reading response failed: {e}"))?
-    {
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        format!(
+            "reading response failed: {}",
+            aisix_gateway::transport_error_message(&e)
+        )
+    })? {
         if buf.len() + chunk.len() > JWKS_MAX_BYTES {
             return Err(format!("response exceeds {JWKS_MAX_BYTES} bytes"));
         }
@@ -1498,6 +1500,36 @@ mod tests {
             self.release.notify_waiters();
             self.task.abort();
         }
+    }
+
+    /// The string `fetch_json` returns is only ever logged: the caller is told
+    /// `jwks_unavailable`. It has to say what went wrong.
+    #[tokio::test]
+    async fn a_failed_fetch_names_its_transport_cause() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/jwks", listener.local_addr().unwrap());
+        drop(listener);
+        let err = fetch_json(&url).await.expect_err("nothing listens");
+        assert!(err.to_lowercase().contains("refused"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_cut_short_body_names_its_transport_cause() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = sock.read(&mut request).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort")
+                .await
+                .unwrap();
+        });
+        let err = fetch_json(&format!("http://{addr}/jwks"))
+            .await
+            .expect_err("the body is cut short");
+        assert!(err.contains("end of file"), "{err}");
     }
 
     async fn fetch_server(discovery: bool) -> FetchServer {

@@ -108,7 +108,43 @@ pub(super) async fn send(
         Ok(response) => Ok(response),
         Err(error) => match Refusal::from_error(&error) {
             Some(Refusal::Blocked(_)) => Err(blocked(server, &parsed)),
-            _ => Err(HttpFailure::Transport),
+            _ => {
+                tracing::warn!(
+                    target: "aisix::mcp_oauth",
+                    server,
+                    error = %aisix_gateway::transport_error_message(&error),
+                    "an OAuth request to an MCP server's authority failed",
+                );
+                Err(HttpFailure::Transport)
+            }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The IdP behind a sign-in is often the one an operator is debugging; the
+    /// caller is only told "unavailable".
+    #[tokio::test]
+    async fn a_failed_request_logs_its_cause() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/token?access_token=tok-LEAK",
+            listener.local_addr().unwrap()
+        );
+        drop(listener);
+        let (result, logged) = crate::token_exchange::test_logs::capture_logs(send(
+            "srv",
+            Gate::Configured,
+            &url,
+            Duration::from_secs(5),
+            |client, url| client.get(url),
+        ))
+        .await;
+        assert_eq!(result.err(), Some(HttpFailure::Transport));
+        assert!(logged.to_lowercase().contains("refused"), "{logged}");
+        assert!(!logged.contains("tok-LEAK"), "{logged}");
     }
 }

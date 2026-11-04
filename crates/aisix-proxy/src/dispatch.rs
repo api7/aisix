@@ -817,10 +817,10 @@ pub(crate) async fn json_body_within(
                 cause: "upstream answered a streaming request with a JSON body that stalled"
                     .to_string(),
             })?
-            .map_err(|e| BridgeError::UpstreamDecode(e.to_string())),
+            .map_err(|e| aisix_gateway::upstream_body_read_error(&e)),
         None => read
             .await
-            .map_err(|e| BridgeError::UpstreamDecode(e.to_string())),
+            .map_err(|e| aisix_gateway::upstream_body_read_error(&e)),
     }
 }
 

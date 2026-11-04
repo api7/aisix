@@ -1166,7 +1166,7 @@ async fn dispatch(
     let resp_body = read.map_err(|e| {
         telemetry.emitted = true;
         let err = if status.is_success() {
-            aisix_gateway::BridgeError::UpstreamDecode(e.to_string())
+            aisix_gateway::upstream_body_read_error(&e)
         } else {
             aisix_gateway::BridgeError::upstream_body_unread(status.as_u16(), &e)
         };

@@ -80,6 +80,7 @@ aisix-core = { path = "../aisix-core" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 axum.workspace = true
 async-trait.workspace = true
+tracing-subscriber.workspace = true
 # Raw-HTTP wire-shape assertions in tests/protocol_generations.rs: real
 # clients hide the headers and envelope details those tests pin.
 reqwest.workspace = true

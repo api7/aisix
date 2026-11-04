@@ -103,6 +103,26 @@ async fn read_error_body_for_export(resp: reqwest::Response) {
     }
 }
 
+/// Log the cause chain of an upstream transport failure. The text of an
+/// [`A2aError`] is what the caller and the usage event are given, so it stays
+/// reqwest's top-level message and the cause stops here.
+fn log_transport_causes(err: &reqwest::Error) {
+    tracing::warn!(
+        error = %aisix_gateway::transport_error_message(err),
+        "A2A upstream transport failure",
+    );
+}
+
+fn connect_error(err: reqwest::Error) -> A2aError {
+    log_transport_causes(&err);
+    A2aError::Connect(err.to_string())
+}
+
+fn read_error(err: reqwest::Error) -> A2aError {
+    log_transport_causes(&err);
+    A2aError::Request(err.to_string())
+}
+
 /// Read an upstream response body, refusing anything larger than
 /// [`MAX_UPSTREAM_BODY_BYTES`]. An honestly-declared oversized `Content-Length`
 /// is rejected up front; a lying or absent length (including a never-ending
@@ -119,7 +139,7 @@ async fn read_capped(resp: reqwest::Response) -> Result<Vec<u8>, A2aError> {
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| A2aError::Request(e.to_string()))?;
+        let chunk = chunk.map_err(read_error)?;
         if buf.len() + chunk.len() > MAX_UPSTREAM_BODY_BYTES {
             return Err(A2aError::Request(
                 "upstream response exceeded size cap".to_string(),
@@ -459,7 +479,7 @@ impl HttpBridge {
             .prepare(self.client.get(url).timeout(budget))
             .send()
             .await
-            .map_err(|e| A2aError::Connect(e.to_string()))?;
+            .map_err(connect_error)?;
         if !resp.status().is_success() {
             return Err(A2aError::Connect(format!(
                 "agent card fetch returned HTTP {}",
@@ -524,7 +544,7 @@ impl A2aBridge for HttpBridge {
             )
             .send()
             .await
-            .map_err(|e| A2aError::Connect(e.to_string()))?;
+            .map_err(connect_error)?;
         aisix_gateway::note_upstream_response(resp.headers());
         if !resp.status().is_success() {
             // Surface the upstream STATUS only — never proxy the upstream error
@@ -563,7 +583,7 @@ impl A2aBridge for HttpBridge {
         )
         .await
         .map_err(|_| A2aError::Connect("timed out opening the upstream stream".to_string()))?
-        .map_err(|e| A2aError::Connect(e.to_string()))?;
+        .map_err(connect_error)?;
         aisix_gateway::note_upstream_response(resp.headers());
 
         if !resp.status().is_success() {
@@ -621,7 +641,7 @@ fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> 
             let chunk = match bytes.next().await {
                 Some(Ok(chunk)) => chunk,
                 Some(Err(e)) => {
-                    yield Err(A2aError::Request(e.to_string()));
+                    yield Err(read_error(e));
                     return;
                 }
                 None => break,
@@ -885,5 +905,77 @@ mod tests {
         let back = serde_json::to_value(&card).unwrap();
         assert_eq!(back["version"], "2.1.0");
         assert_eq!(back["skills"][0]["id"], "s1");
+    }
+
+    /// Run `f` under a capturing subscriber; returns its result and what it logged.
+    async fn capture_logs<T>(f: impl std::future::Future<Output = T>) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // A callsite first hit where no subscriber was set has cached "disabled".
+        tracing::callsite::rebuild_interest_cache();
+        let out = f.await;
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (out, logged)
+    }
+
+    /// A loopback address nothing listens on, so a connect is refused at once.
+    fn refused_url(path: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}{path}", listener.local_addr().unwrap())
+    }
+
+    /// The text of an `A2aError` is what the caller and the usage event are
+    /// given, so the transport cause reaches the log and nothing else.
+    #[tokio::test]
+    async fn a_transport_failure_logs_its_cause_and_keeps_the_error_text() {
+        let bridge = bridge_at(&refused_url("/a2a"));
+        let (result, logged) = capture_logs(bridge.send(&serde_json::json!({}))).await;
+        let err = result.expect_err("nothing listens");
+        assert!(logged.to_lowercase().contains("refused"), "{logged}");
+        let text = err.to_string();
+        assert!(text.contains("error sending request"), "{text}");
+        assert!(!text.to_lowercase().contains("refused"), "{text}");
+    }
+
+    /// Answers one request with a `200` whose body stops short of its length.
+    async fn cut_short_url(path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = sock.read(&mut request).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort")
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}{path}")
+    }
+
+    /// As for a failed send: the read's cause stays out of the error's text.
+    #[tokio::test]
+    async fn a_failed_body_read_logs_its_cause_and_keeps_the_error_text() {
+        let bridge = bridge_at(&cut_short_url("/a2a").await);
+        let (result, logged) = capture_logs(bridge.send(&serde_json::json!({}))).await;
+        let text = result.expect_err("the body is cut short").to_string();
+        assert!(logged.contains("end of file"), "{logged}");
+        assert!(!text.contains("end of file"), "{text}");
     }
 }

@@ -1598,12 +1598,11 @@ async fn multipart_dispatch(
                                         elapsed_ms: d.as_millis() as u64,
                                         cause: String::new(),
                                     })?
-                                    .map_err(|e| {
-                                        aisix_gateway::BridgeError::UpstreamDecode(e.to_string())
-                                    }),
-                                None => resp.bytes().await.map_err(|e| {
-                                    aisix_gateway::BridgeError::UpstreamDecode(e.to_string())
-                                }),
+                                    .map_err(|e| aisix_gateway::upstream_body_read_error(&e)),
+                                None => resp
+                                    .bytes()
+                                    .await
+                                    .map_err(|e| aisix_gateway::upstream_body_read_error(&e)),
                             }
                         };
                         let body_bytes = read.await.map_err(|be| {

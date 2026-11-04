@@ -317,16 +317,19 @@ impl OpenApiBridge {
                 request = request.json(body);
             }
 
-            // The error text (which may embed the operator-configured base URL)
-            // is logged server-side by the gateway and never returned to the
-            // agent; sanitizing bounds it and strips log-injection vectors.
+            // The error text is logged server-side by the gateway and never
+            // returned to the agent; sanitizing bounds it and strips
+            // log-injection vectors. The URL stays out: it carries the tool's
+            // arguments, and a long one would push the cause past the bound.
             let response = tokio::time::timeout_at(deadline, request.send())
                 .await
                 .map_err(|_| tool_call_timed_out())?
                 .map_err(|e| {
                     McpError::Request(format!(
                         "HTTP request failed: {}",
-                        crate::bridge::sanitize_error_message(&e.to_string())
+                        crate::bridge::sanitize_error_message(
+                            &aisix_gateway::transport_error_message(&e.without_url())
+                        )
                     ))
                 })?;
             if response.status() != reqwest::StatusCode::UNAUTHORIZED {
@@ -352,7 +355,9 @@ impl OpenApiBridge {
             .map_err(|e| {
                 McpError::Request(format!(
                     "failed to read response: {}",
-                    crate::bridge::sanitize_error_message(&e.to_string())
+                    crate::bridge::sanitize_error_message(&aisix_gateway::transport_error_message(
+                        &e.without_url()
+                    ))
                 ))
             })?;
 
@@ -963,5 +968,77 @@ mod tests {
         assert_eq!(coerce_body(Some(&json!(5))), Some(json!({"data": 5})));
         assert_eq!(coerce_body(Some(&Value::Null)), None);
         assert_eq!(coerce_body(None), None);
+    }
+
+    /// What this text becomes is the gateway's `upstream tools/call failed`
+    /// warn line. A tool's arguments can land in the URL, so the URL stays out
+    /// and a long one cannot push the cause past the bound.
+    #[tokio::test]
+    async fn a_failed_call_names_its_cause_and_not_the_arguments() {
+        let server: McpServer = serde_json::from_value(json!({
+            "name": "srv-transport-cause",
+            "type": "openapi",
+            "url": "http://127.0.0.1:1/",
+            "spec": {
+                "openapi": "3.0.0",
+                "paths": { "/items": { "get": {
+                    "operationId": "searchItems",
+                    "parameters": [
+                        { "name": "q", "in": "query", "schema": { "type": "string" } }
+                    ]
+                } } }
+            }
+        }))
+        .expect("test mcp_server");
+        let bridge = OpenApiBridge::new(Arc::new(ResourceEntry::new(
+            "transport-cause-row",
+            server,
+            1,
+        )));
+        let name = bridge.tools().unwrap()[0].name.clone();
+        let err = bridge
+            .call_tool(&name, json!({ "q": "secret-arg".repeat(100) }))
+            .await
+            .expect_err("nothing listens on port 1");
+        let text = err.to_string();
+        assert!(text.to_lowercase().contains("refused"), "{text}");
+        assert!(!text.contains("secret-arg"), "{text}");
+    }
+
+    /// Answers one request with a `200` whose body stops short of its length.
+    async fn cut_short_url(path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = sock.read(&mut request).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort")
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}{path}")
+    }
+
+    #[tokio::test]
+    async fn a_cut_short_body_names_its_cause() {
+        let server: McpServer = serde_json::from_value(json!({
+            "name": "srv-cut-short",
+            "type": "openapi",
+            "url": cut_short_url("/").await,
+            "spec": {
+                "openapi": "3.0.0",
+                "paths": { "/items": { "get": { "operationId": "listItems" } } }
+            }
+        }))
+        .expect("test mcp_server");
+        let bridge = OpenApiBridge::new(Arc::new(ResourceEntry::new("cut-short-row", server, 1)));
+        let name = bridge.tools().unwrap()[0].name.clone();
+        let err = bridge
+            .call_tool(&name, json!({}))
+            .await
+            .expect_err("the body is cut short");
+        assert!(err.to_string().contains("end of file"), "{err}");
     }
 }

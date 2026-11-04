@@ -25,6 +25,8 @@ use std::sync::{Arc, OnceLock};
 use aisix_core::config::OutboundTlsConfig;
 use aisix_core::models::provider_key::UpstreamConnection;
 
+use crate::upstream_http::error_with_causes;
+
 /// PEM material and verification policy shared by every outbound client.
 ///
 /// Holds PEM *bytes* rather than parsed certificates because the four
@@ -172,14 +174,16 @@ static REQWEST_TLS: OnceLock<ReqwestTlsMaterial> = OnceLock::new();
 pub(crate) fn init_reqwest_material(settings: &TlsSettings) -> Result<(), String> {
     let roots = match &settings.extra_ca_pem {
         Some(pem) => reqwest::Certificate::from_pem_bundle(pem)
-            .map_err(|e| format!("upstream.tls.ca_file: {e}"))?,
+            .map_err(|e| format!("upstream.tls.ca_file: {}", error_with_causes(&e)))?,
         None => Vec::new(),
     };
     let identity = match &settings.client_identity {
-        Some(id) => Some(
-            reqwest::Identity::from_pem(&id.joined())
-                .map_err(|e| format!("upstream.tls.client_cert_file/client_key_file: {e}"))?,
-        ),
+        Some(id) => Some(reqwest::Identity::from_pem(&id.joined()).map_err(|e| {
+            format!(
+                "upstream.tls.client_cert_file/client_key_file: {}",
+                error_with_causes(&e)
+            )
+        })?),
         None => None,
     };
     let _ = REQWEST_TLS.set(ReqwestTlsMaterial { roots, identity });
@@ -270,7 +274,7 @@ fn worker_client() -> Option<reqwest::Client> {
             Ok(client) => Some(client),
             Err(e) => {
                 tracing::error!(
-                    error = %e,
+                    error = %error_with_causes(&e),
                     "per-worker upstream pool could not be built; this worker \
                      dispatches on the shared pool"
                 );
@@ -318,7 +322,7 @@ fn raw_worker_client() -> Option<reqwest::Client> {
             Ok(client) => Some(client),
             Err(e) => {
                 tracing::error!(
-                    error = %e,
+                    error = %error_with_causes(&e),
                     "per-worker raw passthrough upstream pool could not be built; this worker \
                      dispatches on the shared raw pool"
                 );
@@ -440,7 +444,7 @@ fn build_provider_key_client_with(
     if let Some(tls) = conn.tls.as_ref() {
         if let Some(pem) = tls.ca_cert.as_ref().filter(|p| !p.trim().is_empty()) {
             let roots = reqwest::Certificate::from_pem_bundle(pem.as_bytes())
-                .map_err(|e| format!("provider_key.tls.ca_cert: {e}"))?;
+                .map_err(|e| format!("provider_key.tls.ca_cert: {}", error_with_causes(&e)))?;
             if roots.is_empty() {
                 return Err("provider_key.tls.ca_cert contains no certificate".into());
             }
@@ -468,7 +472,7 @@ fn build_provider_key_client_with(
             .collect();
         builder = builder.resolve_to_addrs(host, &socket_addrs);
     }
-    builder.build().map_err(|e| e.to_string())
+    builder.build().map_err(|e| error_with_causes(&e))
 }
 
 // ─── raw rustls (Realtime WebSocket) ─────────────────────────────────

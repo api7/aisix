@@ -22,7 +22,7 @@ use http::{HeaderName, HeaderValue};
 use rmcp::model::{CallToolRequestParams, CallToolResponse, ClientInfo, ProtocolVersion};
 use rmcp::service::{ClientInitializeError, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::{
-    StreamableHttpClientTransportConfig, StreamableHttpError,
+    SseError, StreamableHttpClientTransportConfig, StreamableHttpError,
 };
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::ClientCacheConfig;
@@ -105,7 +105,7 @@ fn shared_http_client() -> rmcp_reqwest::Client {
                         }
                     }
                     Err(e) => tracing::error!(
-                        error = %e,
+                        error = %aisix_gateway::error_with_causes(&e),
                         "upstream.tls.ca_file not applied to MCP upstream connections"
                     ),
                 }
@@ -114,7 +114,7 @@ fn shared_http_client() -> rmcp_reqwest::Client {
                 match rmcp_reqwest::Identity::from_pem(&configured.joined()) {
                     Ok(identity) => b = b.identity(identity),
                     Err(e) => tracing::error!(
-                        error = %e,
+                        error = %aisix_gateway::error_with_causes(&e),
                         "upstream.tls client identity not applied to MCP upstream connections"
                     ),
                 }
@@ -687,7 +687,18 @@ impl RmcpBridge {
                     // logs. An upstream that reflects request headers into its
                     // error body (or emits control characters for log injection)
                     // must not get either past this point verbatim.
-                    let error = McpError::Connect(sanitize_error_message(&e.to_string()));
+                    let causes = match &e {
+                        ClientInitializeError::TransportError { error, .. } => {
+                            transport_causes(error)
+                        }
+                        _ => String::new(),
+                    };
+                    // Bounded apart: rmcp's own text can fill the bound by itself.
+                    let error = McpError::Connect(format!(
+                        "{}{}",
+                        sanitize_error_message(&e.to_string()),
+                        sanitize_error_message(&causes)
+                    ));
                     // An upstream 401 is handed to `connect`, which decides
                     // per auth type (drop a minted token, re-exchange, or
                     // surface it to the caller).
@@ -800,8 +811,35 @@ fn request_error(error: rmcp::ServiceError) -> McpError {
         {
             McpError::Unauthorized(error.to_string())
         }
+        rmcp::ServiceError::TransportSend(transport) => {
+            // Bounded apart, as on connect.
+            McpError::Request(format!(
+                "{}{}",
+                sanitize_error_message(&error.to_string()),
+                sanitize_error_message(&transport_causes(transport))
+            ))
+        }
         _ => McpError::Request(error.to_string()),
     }
+}
+
+/// `": <causes>"` when the transport failed inside its HTTP client, otherwise
+/// empty. rmcp's `StreamableHttpError` and the SSE decoder under it show the
+/// client error's own `Display` and hide it from `source()`, so each is opened
+/// by hand.
+fn transport_causes(error: &rmcp::transport::DynamicTransportError) -> String {
+    use std::error::Error as _;
+    let cause = match error
+        .error
+        .downcast_ref::<StreamableHttpError<rmcp_reqwest::Error>>()
+    {
+        Some(StreamableHttpError::Client(client)) => client.source(),
+        Some(StreamableHttpError::Sse(SseError::Body(body))) => body.source(),
+        _ => None,
+    };
+    cause
+        .map(|cause| format!(": {}", aisix_gateway::error_with_causes(cause)))
+        .unwrap_or_default()
 }
 
 fn transport_error_is_unauthorized(error: &rmcp::transport::DynamicTransportError) -> bool {
@@ -1353,5 +1391,47 @@ mod tests {
         let truncated = sanitize_error_message(&long);
         assert!(truncated.chars().count() <= 257, "bounded output");
         assert!(truncated.ends_with('…'));
+    }
+
+    /// rmcp's text ends at reqwest's "error sending request"; the failed session
+    /// has to reach the gateway's warn line with what actually went wrong.
+    #[tokio::test]
+    async fn a_failed_connect_names_its_cause() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let upstream = McpUpstream::new(format!("http://{addr}/mcp"));
+        let err = RmcpBridge::connect(&upstream)
+            .await
+            .err()
+            .expect("nothing listens");
+        let text = err.to_string();
+        assert!(text.to_lowercase().contains("refused"), "{text}");
+    }
+
+    /// After the session opened, a dead connection arrives two ways: the POST
+    /// failing, and the response's event stream failing mid-body.
+    #[tokio::test]
+    async fn a_failed_request_names_its_cause() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let send = || async {
+            rmcp_reqwest::get(format!("http://{addr}/mcp"))
+                .await
+                .expect_err("nothing listens")
+        };
+        let client = StreamableHttpError::<rmcp_reqwest::Error>::Client(send().await);
+        let body =
+            StreamableHttpError::<rmcp_reqwest::Error>::Sse(SseError::Body(Box::new(send().await)));
+        for failure in [client, body] {
+            let transport = rmcp::transport::DynamicTransportError::from_parts(
+                "test",
+                std::any::TypeId::of::<()>(),
+                Box::new(failure),
+            );
+            let text = request_error(rmcp::ServiceError::TransportSend(transport)).to_string();
+            assert!(text.to_lowercase().contains("refused"), "{text}");
+        }
     }
 }

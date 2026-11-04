@@ -2271,7 +2271,7 @@ pub async fn decode_success_body<T: serde::de::DeserializeOwned>(
     let body = resp
         .bytes()
         .await
-        .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+        .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?;
     if let Some(err) = aisix_gateway::in_band_error_body(&body)
         .as_ref()
         .and_then(body_in_band_error)

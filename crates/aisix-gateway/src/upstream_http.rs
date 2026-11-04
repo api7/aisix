@@ -224,6 +224,33 @@ pub fn transport_error_message(err: &reqwest::Error) -> String {
     msg
 }
 
+/// The [`BridgeError`] for a success response whose body could not be read off
+/// the wire.
+///
+/// Its text reaches the usage event's `error_message`, so it stays reqwest's
+/// top-level message; the cause chain that names the fault goes to the log here.
+pub fn upstream_body_read_error(err: &reqwest::Error) -> BridgeError {
+    log_body_read_causes(err);
+    BridgeError::UpstreamDecode(err.to_string())
+}
+
+/// Log why a response body could not be read. `Response::json` reports a parse
+/// failure through the same error type, and that source is a serde message that
+/// can quote the body, a token included, so a parse failure logs nothing here.
+pub fn log_body_read_causes(err: &reqwest::Error) {
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        if cause.is::<serde_json::Error>() {
+            return;
+        }
+        source = cause.source();
+    }
+    tracing::warn!(
+        error = %transport_error_message(err),
+        "reading the upstream response body failed",
+    );
+}
+
 /// Classify a `reqwest` **send** failure into its [`BridgeError`].
 ///
 /// reqwest reports a *builder* error when the request could not even be
@@ -1041,5 +1068,141 @@ mod tests {
             .expect_err("nothing listens on port 1");
         assert!(!io_err.is_builder());
         assert!(matches!(send_error(io_err), BridgeError::Transport(_)));
+    }
+
+    /// Run `f` under a capturing subscriber; returns its result and what it logged.
+    async fn capture_logs<T>(f: impl std::future::Future<Output = T>) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // A callsite first hit where no subscriber was set has cached "disabled".
+        tracing::callsite::rebuild_interest_cache();
+        let out = f.await;
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (out, logged)
+    }
+
+    /// The diagnosis the OIDC discovery and JWKS logs depend on: against a real
+    /// TLS handshake, reqwest's `Display` says only "error sending request",
+    /// the certificate failure is in the chain, and the credential in the query
+    /// stays out of it.
+    #[tokio::test]
+    async fn an_untrusted_certificate_is_named_and_the_query_credential_is_not() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = acceptor.accept(sock).await;
+                });
+            }
+        });
+
+        let err = client_builder()
+            .build()
+            .unwrap()
+            .get(format!(
+                "https://localhost:{port}/jwks?access_token=sk-live-1"
+            ))
+            .send()
+            .await
+            .expect_err("the certificate is not trusted");
+
+        assert!(
+            !err.to_string().to_lowercase().contains("certificate"),
+            "reqwest's Display is expected to hide the cause: {err}"
+        );
+        let message = transport_error_message(&err);
+        assert!(message.contains("certificate"), "{message}");
+        assert!(!message.contains("sk-live-1"), "{message}");
+    }
+
+    /// A body that stops short of its `Content-Length`: the error's text, which
+    /// reaches the usage event, stays reqwest's top-level message, and the cause
+    /// goes to the log.
+    #[tokio::test]
+    async fn a_failed_body_read_logs_its_cause_and_keeps_its_text() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = sock.read(&mut request).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort")
+                .await
+                .unwrap();
+        });
+
+        let read_err = reqwest::get(format!("http://{addr}/"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .expect_err("the body is cut short");
+        let top_level = read_err.to_string();
+        let cause = std::error::Error::source(&read_err)
+            .expect("reqwest carries the cause in source()")
+            .to_string();
+        assert!(!top_level.contains(&cause), "{top_level}");
+
+        let (err, logged) = capture_logs(async { upstream_body_read_error(&read_err) }).await;
+        assert!(
+            matches!(&err, BridgeError::UpstreamDecode(text) if *text == top_level),
+            "{err:?}"
+        );
+        assert!(logged.contains(&cause), "{logged}");
+    }
+
+    /// serde quotes what it could not parse, and this body may be a token response.
+    #[tokio::test]
+    async fn an_unparsable_body_logs_nothing_that_could_quote_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = sock.read(&mut request).await;
+            let body = r#"{"access_token": 1, "x": "tok-LEAK"#;
+            let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(body.as_bytes()).await.unwrap();
+        });
+
+        let parse_err = reqwest::get(format!("http://{addr}/"))
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .expect_err("the body is not JSON");
+        let (_, logged) = capture_logs(async { log_body_read_causes(&parse_err) }).await;
+        assert!(logged.is_empty(), "{logged}");
     }
 }

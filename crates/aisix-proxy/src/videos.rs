@@ -1311,7 +1311,7 @@ fn provider_call_once<'a>(
         let is_success = (200..300).contains(&status);
         let bytes = resp.bytes().await.map_err(|e| {
             note(if is_success {
-                aisix_gateway::BridgeError::UpstreamDecode(e.to_string())
+                aisix_gateway::upstream_body_read_error(&e)
             } else {
                 aisix_gateway::BridgeError::upstream_body_unread(status, &e)
             })

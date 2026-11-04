@@ -986,7 +986,7 @@ async fn count_tokens_to_target(
                 &state.runtime_status,
                 model_id,
                 model.cooldown.as_ref(),
-                aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+                aisix_gateway::upstream_body_read_error(&e),
             )
         })
         .map_err(ProxyError::Bridge)?;
