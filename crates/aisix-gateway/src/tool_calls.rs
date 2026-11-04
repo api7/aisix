@@ -80,15 +80,32 @@ pub fn chat_without_thought_signatures(req: Cow<'_, ChatFormat>) -> Cow<'_, Chat
     Cow::Owned(req)
 }
 
+/// What a raw-body key holds, for the two walkers below: they must agree, or
+/// a signed body takes the path that does not strip it.
+enum BodyField {
+    ToolCallId,
+    /// A call's own arguments: the caller's data, whatever keys they hold.
+    Arguments,
+    Nested,
+}
+
+fn body_field(key: &str, value: &Value) -> BodyField {
+    match (key, value) {
+        ("id" | "call_id" | "tool_call_id" | "tool_use_id", _) => BodyField::ToolCallId,
+        ("arguments", _) | ("input", Value::Object(_)) => BodyField::Arguments,
+        _ => BodyField::Nested,
+    }
+}
+
 /// Whether [`strip_thought_signatures_in_body`] would change `body`: some
 /// tool-call id in it carries a signature. Lets a caller that only holds
 /// the body borrowed skip copying it when there is nothing to strip.
 pub fn body_has_thought_signatures(body: &Value) -> bool {
     match body {
-        Value::Object(obj) => obj.iter().any(|(key, value)| match (key.as_str(), value) {
-            ("id" | "call_id" | "tool_call_id" | "tool_use_id", _) => has_signature(Some(value)),
-            ("arguments", _) | ("input", Value::Object(_)) => false,
-            _ => body_has_thought_signatures(value),
+        Value::Object(obj) => obj.iter().any(|(key, value)| match body_field(key, value) {
+            BodyField::ToolCallId => has_signature(Some(value)),
+            BodyField::Arguments => false,
+            BodyField::Nested => body_has_thought_signatures(value),
         }),
         Value::Array(items) => items.iter().any(body_has_thought_signatures),
         _ => false,
@@ -104,12 +121,10 @@ pub fn strip_thought_signatures_in_body(body: &mut Value) {
     match body {
         Value::Object(obj) => {
             for (key, value) in obj.iter_mut() {
-                match (key.as_str(), &*value) {
-                    ("id" | "call_id" | "tool_call_id" | "tool_use_id", _) => {
-                        strip_in_place(Some(value))
-                    }
-                    ("arguments", _) | ("input", Value::Object(_)) => {}
-                    _ => strip_thought_signatures_in_body(value),
+                match body_field(key, value) {
+                    BodyField::ToolCallId => strip_in_place(Some(value)),
+                    BodyField::Arguments => {}
+                    BodyField::Nested => strip_thought_signatures_in_body(value),
                 }
             }
         }

@@ -9,15 +9,13 @@ pub(crate) fn model_only_fields<'a>(
     signature_field: Option<&str>,
 ) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
     let fields = body.as_object()?;
+    if pk.request.as_ref().is_some_and(|r| r.rewrites_body()) {
+        return None;
+    }
     let signatures = signature_field
         .and_then(|field| fields.get(field))
         .is_some_and(aisix_gateway::tool_calls::body_has_thought_signatures);
-    let overrides = pk.request.as_ref().is_some_and(|r| {
-        !r.param_renames.is_empty()
-            || r.param_constraints.is_some()
-            || !r.default_body_fields.is_empty()
-    });
-    (!signatures && !overrides).then_some(fields)
+    (!signatures).then_some(fields)
 }
 
 /// The same bytes as cloning an object, replacing an existing `model`,

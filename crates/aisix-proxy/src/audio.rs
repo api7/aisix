@@ -2221,9 +2221,9 @@ async fn speech_dispatch(
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
-    // A Model Group walks its targets (AISIX-Cloud#1111). Each attempt
-    // rewrites its own copy of the body — the `model` field and the PK's
-    // `request.*` overrides belong to the target it is sent to.
+    // A Model Group walks its targets (AISIX-Cloud#1111). Each attempt builds
+    // its own wire body — the `model` field and the PK's `request.*` overrides
+    // belong to the target it is sent to.
     let base_body = &body;
     *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
         .with_trace(client_ctx.trace.clone());

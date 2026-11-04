@@ -545,6 +545,16 @@ pub struct RequestOverrides {
     pub default_body_fields: Map<String, Value>,
 }
 
+impl RequestOverrides {
+    /// Whether these overrides change the outbound body, as opposed to only
+    /// its headers.
+    pub fn rewrites_body(&self) -> bool {
+        !self.param_renames.is_empty()
+            || self.param_constraints.is_some()
+            || !self.default_body_fields.is_empty()
+    }
+}
+
 /// Numeric range clamps applied to chat-completion request bodies.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct ParamConstraints {

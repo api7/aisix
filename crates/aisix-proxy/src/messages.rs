@@ -1614,10 +1614,10 @@ async fn anthropic_passthrough_dispatch(
         let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
-        // Token-estimation fallback context (AISIX-Cloud#1074): the stream
-        // owns the outbound request until an end-of-stream Drop, rebuilt
-        // from its wire bytes now that the upstream has answered.
-        // Tokenized only if the upstream never reports usage.
+        // Token-estimation fallback context (AISIX-Cloud#1074): the closure
+        // runs at end-of-stream Drop, so it keeps the wire bytes (a shared
+        // `Bytes`, no copy) and parses them only if the upstream never
+        // reports usage.
         let estimator = crate::token_estimate::Estimator::new(
             &upstream_model,
             crate::token_estimate::PromptInput::AnthropicWire(body_bytes.clone()),
