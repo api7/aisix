@@ -190,7 +190,8 @@ async fn preserves_wire_and_overrides(endpoint: Endpoint) {
         1,
     );
     let received = forward(&endpoint, endpoint.body, json!({})).await;
-    // Deliberately compare bytes, not parsed JSON: nested model, order and escaping matter.
+    // Deliberately compare bytes, not parsed JSON: a nested model and escaping matter.
+    // Fixture keys are sorted because the parsed body serializes in sorted key order.
     assert_eq!(received, expected, "{} model-only", endpoint.path);
 
     let mut expected: Value = serde_json::from_str(&expected).unwrap();
@@ -241,6 +242,17 @@ async fn assert_signed_tool_ids_stripped(endpoint: Endpoint) {
         .replace("call_1__thought__eHl6", "call_1")
         .replace(MODEL_ALIAS, endpoint.upstream_model);
     assert_eq!(received, expected, "{} signed tool ids", endpoint.path);
+}
+
+#[tokio::test]
+async fn responses_strips_signed_call_ids_without_touching_tool_arguments() {
+    let body = r#"{"input":[{"arguments":"{\"call_id\":\"argument__thought__keep\"}","call_id":"call_1__thought__eHl6","name":"lookup","type":"function_call"},{"call_id":"call_1__thought__eHl6","output":"done","type":"function_call_output"}],"model":"client-model"}"#;
+    let endpoint = responses();
+    let received = forward(&endpoint, body, json!({})).await;
+    let expected = body
+        .replace("call_1__thought__eHl6", "call_1")
+        .replace(MODEL_ALIAS, endpoint.upstream_model);
+    assert_eq!(received, expected, "{} signed call ids", endpoint.path);
 }
 
 #[tokio::test]

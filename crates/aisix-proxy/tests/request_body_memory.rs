@@ -760,43 +760,69 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
         Family::new("embeddings", "/v1/embeddings", embeddings_body),
         // Relayed to an Anthropic upstream as-is: the route builds the
         // outbound body itself rather than through a provider bridge.
-        Family {
-            peak: Some(2.0 + MARGIN),
-            ..Family::new("messages passthrough", "/v1/messages", messages_body)
-        },
+        Family::new("messages passthrough", "/v1/messages", messages_body),
         Family::new(
             "messages -> openai (bridged)",
             "/v1/messages",
             messages_to_openai_body,
         ),
-        Family {
-            peak: Some(2.0 + MARGIN),
-            ..Family::new(
-                "count_tokens passthrough",
-                "/v1/messages/count_tokens",
-                messages_body,
-            )
-        },
+        Family::new(
+            "count_tokens passthrough",
+            "/v1/messages/count_tokens",
+            messages_body,
+        ),
         // Served natively by the OpenAI upstream, likewise built by the route.
-        // Only `model` changes on the way out, so the outbound body is
-        // serialized from the parsed request as it stands, not from a copy:
-        // the parsed request plus its wire body is the highest point too.
-        Family {
-            peak: Some(2.0 + MARGIN),
-            ..Family::new("responses passthrough", "/v1/responses", responses_body)
-        },
+        Family::new("responses passthrough", "/v1/responses", responses_body),
         Family::new(
             "responses -> anthropic (bridged)",
             "/v1/responses",
             responses_to_anthropic_body,
         ),
+        Family::new("rerank", "/v1/rerank", rerank_body),
+        Family::new("speech", "/v1/audio/speech", speech_body),
+        // Only `model` changes on the way out, so the outbound body is
+        // serialized from the parsed request as it stands, not from a copy.
+        // A full-content export renders the request for failure rows first,
+        // a separate copy, so the send peak is measured without one. The
+        // bound is the parsed request plus the wire buffer at its final
+        // size; `to_vec` doubling can leave that buffer near 2x before it is
+        // shrunk, and LARGE's 16 equal blocks happen to land exactly on a
+        // doubling. A whole-request clone costs 1x above either bound.
         Family {
             peak: Some(2.0 + MARGIN),
-            ..Family::new("rerank", "/v1/rerank", rerank_body)
+            capture_content: false,
+            ..Family::new(
+                "messages passthrough (no content capture)",
+                "/v1/messages",
+                messages_body,
+            )
         },
         Family {
-            // Serializing one large string grows the wire buffer to ~2x;
-            // a full Value clone would add another 1x above this bound.
+            peak: Some(2.0 + MARGIN),
+            capture_content: false,
+            ..Family::new(
+                "count_tokens passthrough (no content capture)",
+                "/v1/messages/count_tokens",
+                messages_body,
+            )
+        },
+        Family {
+            peak: Some(2.0 + MARGIN),
+            capture_content: false,
+            ..Family::new(
+                "responses passthrough (no content capture)",
+                "/v1/responses",
+                responses_body,
+            )
+        },
+        Family {
+            peak: Some(2.0 + MARGIN),
+            capture_content: false,
+            ..Family::new("rerank (no content capture)", "/v1/rerank", rerank_body)
+        },
+        // One large string is written whole, so the next write doubles the
+        // buffer: the wire buffer peaks at 2x here.
+        Family {
             peak: Some(3.0 + MARGIN),
             capture_content: false,
             ..Family::new(
