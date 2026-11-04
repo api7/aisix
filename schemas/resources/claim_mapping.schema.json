@@ -7,7 +7,7 @@
       "description": "One claim condition. A mapping matches only when every condition holds (logical AND); within one condition, `values` are alternatives (logical OR).",
       "properties": {
         "claim": {
-          "description": "Claim to inspect. Dots traverse nested objects (for example `realm_access.roles`). A missing claim never matches.",
+          "description": "Claim to inspect, read as one claim of exactly this name, then with dots traversing nested objects (for example `realm_access.roles`). A missing claim never matches.",
           "minLength": 1,
           "type": "string"
         },

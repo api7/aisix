@@ -31,8 +31,10 @@ pub struct Budget {
     /// - `team`: every API key whose `team_id` is `scope_ref`.
     /// - `team_member`: every API key whose `team_id` is `scope_ref` and that
     ///   also names a member; each member is capped separately.
-    /// - `tag`: every API key whose effective value for `tag.key` is
-    ///   `tag.value`.
+    /// - `tag`: every request whose effective value for `tag.key` is
+    ///   `tag.value`. That value is what the identity provider's `tag_claims`
+    ///   reads from the token, else the API key's, else its team's, else its
+    ///   member's, so requests on one API key can differ.
     /// - `provider_key`: every upstream call made with the provider key whose
     ///   id is `scope_ref`.
     pub scope: BudgetScope,

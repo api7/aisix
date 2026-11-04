@@ -162,7 +162,7 @@
           "$ref": "#/definitions/BudgetScope"
         }
       ],
-      "description": "What the budget caps.\n\n- `org`, `environment`: every API key in this environment. - `api_key`: the API key whose id is `scope_ref`. - `member`: every API key whose `user_id` is `scope_ref`. - `team`: every API key whose `team_id` is `scope_ref`. - `team_member`: every API key whose `team_id` is `scope_ref` and that also names a member; each member is capped separately. - `tag`: every API key whose effective value for `tag.key` is `tag.value`. - `provider_key`: every upstream call made with the provider key whose id is `scope_ref`."
+      "description": "What the budget caps.\n\n- `org`, `environment`: every API key in this environment. - `api_key`: the API key whose id is `scope_ref`. - `member`: every API key whose `user_id` is `scope_ref`. - `team`: every API key whose `team_id` is `scope_ref`. - `team_member`: every API key whose `team_id` is `scope_ref` and that also names a member; each member is capped separately. - `tag`: every request whose effective value for `tag.key` is `tag.value`. That value is what the identity provider's `tag_claims` reads from the token, else the API key's, else its team's, else its member's, so requests on one API key can differ. - `provider_key`: every upstream call made with the provider key whose id is `scope_ref`."
     },
     "scope_ref": {
       "description": "Id of the capped resource. Present for every scope except `tag`.",

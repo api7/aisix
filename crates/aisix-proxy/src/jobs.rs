@@ -2036,8 +2036,9 @@ fn maybe_attribute_batch(
 
     let state = state.clone();
     let api_key_id = auth.entry.id.clone();
-    // The key that observed the batch complete, resolved now: its
-    // member, team and tags are what the attribution rows carry.
+    // The caller that observed the batch complete, resolved now: its
+    // member, team and tags are what the attribution rows carry, so with
+    // `tag_claims` the tags are the observer's, not the submitter's.
     let caller = auth.caller();
     let jwt = auth.jwt.clone();
     let request_headers = client.request_headers.clone();

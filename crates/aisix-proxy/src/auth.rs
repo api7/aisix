@@ -44,9 +44,11 @@ pub struct AuthenticatedKey {
     /// key's own `user_name` is only the fallback.
     pub owner: aisix_core::KeyOwnerNames,
     /// The request's effective cost-attribution tags, resolved from the key
-    /// and its `owner` rows ([`aisix_core::KeyOwnerNames::effective_tags`]).
-    /// Read by the `tag:` rate-limit policy dimensions and stamped on every
-    /// usage event through [`AuthenticatedKey::caller`].
+    /// and its `owner` rows ([`aisix_core::KeyOwnerNames::effective_tags`])
+    /// and, for a JWT caller, overridden per key by what the provider's
+    /// `tag_claims` reads from the token ([`AuthenticatedKey::for_jwt`]).
+    /// Read by tag budgets and the `tag:` rate-limit policy dimensions, and
+    /// stamped on every usage event through [`AuthenticatedKey::caller`].
     pub tags: Arc<aisix_core::Tags>,
 }
 
@@ -184,6 +186,21 @@ impl AuthenticatedKey {
             jwt,
             anonymous,
         }
+    }
+
+    /// A principal a trust provider vouched for, by a token verified on this
+    /// request or at sign-in. The one way a JWT identity becomes a principal,
+    /// so neither path can miss the tags `provider` reads from `claims`.
+    pub(crate) fn for_jwt(
+        snapshot: &aisix_core::AisixSnapshot,
+        entry: Arc<ResourceEntry<ApiKey>>,
+        jwt: JwtIdentity,
+        provider: &aisix_core::models::OidcProvider,
+        claims: &serde_json::Value,
+    ) -> Self {
+        let mut auth = Self::new(snapshot, entry, Some(Arc::new(jwt)), false);
+        crate::jwt::apply_tag_claims(Arc::make_mut(&mut auth.tags), provider, claims);
+        auth
     }
 
     pub fn key(&self) -> &ApiKey {

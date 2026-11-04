@@ -9,7 +9,8 @@
 //! the value of the provider's `identity_claim` selects the API key whose
 //! `jwt_subject` equals it. The request then proceeds as that key — its
 //! `allowed_models`, rate limits, budget, and usage attribution all apply
-//! unchanged.
+//! unchanged, except that the provider's `tag_claims` override the key's
+//! effective cost-attribution tags per tag key.
 //!
 //! A provider verifies in one of two modes, derived from the row rather
 //! than declared by it (`OidcProvider::hmac_secret`):
@@ -755,18 +756,19 @@ pub(crate) async fn authenticate_jwt(
         claim_mapping = ?claim_mapping,
         "jwt authentication succeeded",
     );
-    Ok(AuthenticatedKey::new(
+    Ok(AuthenticatedKey::for_jwt(
         snapshot,
         entry,
-        Some(Arc::new(JwtIdentity::new(
+        JwtIdentity::new(
             subject,
             prov.name.clone(),
             prov.issuer.clone(),
             prov.identity_claim.clone(),
             claim_mapping,
             Arc::from(token),
-        ))),
-        false,
+        ),
+        prov,
+        &claims,
     ))
 }
 
@@ -1038,14 +1040,40 @@ pub(crate) fn identity_claim<'a>(
     nested_claim(claims, &prov.identity_claim).and_then(|v| v.as_str())
 }
 
-/// Resolve a claim by path, dots traversing nested objects
+/// Resolve a claim by path: as one top-level claim of exactly that name
+/// (`https://acme.com/dept`), else with dots traversing nested objects
 /// (`realm_access.roles`).
 fn nested_claim<'a>(claims: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
-    let mut cur = claims;
-    for seg in path.split('.') {
-        cur = cur.get(seg)?;
+    claims
+        .get(path)
+        .or_else(|| path.split('.').try_fold(claims, |cur, seg| cur.get(seg)))
+}
+
+/// Override `tags` per key with the values `prov.tag_claims` reads from
+/// verified `claims`. A claim that yields nothing leaves its key alone, and
+/// logs at debug: it recurs on every request of a caller whose token lacks it.
+pub(crate) fn apply_tag_claims(
+    tags: &mut aisix_core::Tags,
+    prov: &OidcProvider,
+    claims: &serde_json::Value,
+) {
+    for (tag_key, path) in &prov.tag_claims {
+        let value = nested_claim(claims, path)
+            .ok_or("claim_absent")
+            .and_then(aisix_core::models::tag_value_from_claim);
+        match value {
+            Ok(value) => {
+                tags.insert(tag_key.clone(), value);
+            }
+            Err(reason) => tracing::debug!(
+                target: "aisix::auth",
+                provider = %prov.name,
+                tag_key = %tag_key,
+                reason,
+                "claim yields no tag value",
+            ),
+        }
     }
-    Some(cur)
 }
 
 /// A bound-claim requirement holds when the claim equals — or, for array
@@ -2163,6 +2191,25 @@ jyxumGxNpoIV8LlzsMsaWQ==
         assert_eq!(nested_claim(&v, "a.b.c").unwrap(), "x");
         assert_eq!(nested_claim(&v, "flat").unwrap(), "y");
         assert!(nested_claim(&v, "a.missing").is_none());
+    }
+
+    #[test]
+    fn nested_claim_reads_a_dotted_name_first() {
+        let v = serde_json::json!({
+            "https://acme.com/dept": "literal",
+            "a.b": "literal",
+            "a": {"b": "nested", "c": 1},
+            "null.claim": null,
+            "null": {"claim": "nested"},
+        });
+        assert_eq!(
+            nested_claim(&v, "https://acme.com/dept").unwrap(),
+            "literal"
+        );
+        assert_eq!(nested_claim(&v, "a.b").unwrap(), "literal");
+        assert_eq!(nested_claim(&v, "a.c").unwrap(), 1);
+        assert!(nested_claim(&v, "null.claim").unwrap().is_null());
+        assert!(nested_claim(&v, "a.c.d").is_none());
     }
 
     #[test]

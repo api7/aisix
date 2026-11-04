@@ -190,10 +190,11 @@ impl KeyOwnerNames {
         }
     }
 
-    /// The request's effective cost-attribution tags: per tag key, the
-    /// key's own value, else the team's, else the member's
+    /// The cost-attribution tags a request takes from documents: per tag
+    /// key, the key's own value, else the team's, else the member's
     /// ([`crate::models::effective_tags`]). Only the key's own `team_id` /
-    /// `user_id` count.
+    /// `user_id` count. A JWT request overrides these per key with its
+    /// provider's `tag_claims`.
     pub fn effective_tags(&self, key: &ApiKey) -> crate::models::Tags {
         crate::models::effective_tags(
             &key.tags,

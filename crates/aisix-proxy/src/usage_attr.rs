@@ -534,8 +534,9 @@ pub(crate) fn apply_caller_identity(
     }
     // Request-scoped, like the member pair: resolved once from the
     // snapshot the request authenticated on, so every event of the request
-    // carries the same set. Values are operator-typed text bound for line-
-    // oriented sinks, so they get the same treatment as the ids above.
+    // carries the same set. Values are operator-typed or identity-provider
+    // text bound for line-oriented sinks, so they get the same treatment as
+    // the ids above.
     event.tags = caller
         .tags
         .iter()
