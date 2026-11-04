@@ -89,9 +89,10 @@ struct NamedUpstream {
 /// Strip `server`'s namespace prefix from `name`: `Some(bare)` when `name`
 /// is `<server>__<bare>`, `None` otherwise. The one primitive both the
 /// scoped gateway and the proxy's attribution peek use to interpret a tool
-/// name on `/mcp/{server}`, so the two can never drift. Prefix matching is
-/// by whole-string prefix (not first-separator split), so a server name
-/// that itself ends in `_` still namespaces cleanly.
+/// name on `/mcp/{server}`, so the two can never drift. The server name
+/// rule excludes `__` and a trailing `_`, so for any valid `server` this
+/// returns `Some(bare)` exactly when `split_once("__")` yields
+/// `(server, bare)`.
 pub fn strip_server_prefix<'a>(server: &str, name: &'a str) -> Option<&'a str> {
     name.strip_prefix(server)
         .and_then(|rest| rest.strip_prefix(TOOL_NAMESPACE_SEPARATOR))

@@ -134,6 +134,9 @@ pub const NEVER_FORWARD_FROM_CLIENT_PREFIXES: &[&str] = &["x-stainless-"];
 /// three and drops any supplied value — so what this entry governs is
 /// every OTHER upstream, where relaying the caller's AWS session token
 /// under a `"x-*"` glob would hand a third party a live AWS credential.
+///
+/// A `passthrough_route` forwards by default, so `credential_mode: inject`
+/// strips this whole list rather than relying on a pattern to withhold it.
 pub const CREDENTIAL_SLOT_HEADERS: &[&str] = &[
     "api-key",              // Azure OpenAI key
     "authorization",        // OpenAI / Anthropic / Vertex Bearer

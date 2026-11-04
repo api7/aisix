@@ -326,6 +326,11 @@ export async function startOpenAiUpstream(
   const server: Server = opts.tls
     ? createTlsServer({ key: opts.tls.key, cert: opts.tls.cert }, handler)
     : createServer(handler);
+  // Node's default closes an idle connection after a few seconds, which a test
+  // pausing that long races against the gateway reusing it from its pool: the
+  // request dies with "connection closed before message completed".
+  server.keepAliveTimeout = 120_000;
+  server.headersTimeout = 125_000;
 
   const port = await pickFreePort();
   await new Promise<void>((resolve) =>

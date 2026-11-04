@@ -91,7 +91,9 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<ResponseOverrides>,
 
-    /// Inbound headers removed before passthrough forwarding.
+    /// Inbound headers removed before passthrough forwarding. A passthrough
+    /// route with `credential_mode: inject` also removes every credential
+    /// slot, listed here or not.
     #[serde(
         default = "default_strip_headers",
         deserialize_with = "deserialize_normalized_strip_headers"
@@ -359,9 +361,9 @@ impl ProviderKey {
 /// on the passthrough endpoint, per issue #411. These four headers
 /// are credentials that the upstream LLM provider has no legitimate
 /// use for. Stripping by default protects against accidental
-/// session-token disclosure. Customers can remove entries via the
-/// dashboard (with a warning) if they have a specific audit /
-/// forwarding need.
+/// session-token disclosure. Removing a credential slot from this list
+/// does not forward it on an inject route; that takes naming it in the
+/// route's `forward_client_headers`.
 pub fn default_strip_headers() -> Vec<String> {
     vec![
         "authorization".to_string(),

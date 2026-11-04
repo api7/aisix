@@ -94,6 +94,30 @@ describe("failure rows carry request and response bodies", () => {
         res.end(body);
       });
     });
+    server.keepAliveTimeout = 120_000;
+    server.headersTimeout = 125_000;
+    httpServers.push(server);
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  }
+
+  /** An upstream that drops the first connection unanswered, then answers `status`. */
+  async function dropsFirstUpstream(status: number, body: string): Promise<string> {
+    let dropped = false;
+    const server = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        if (!dropped) {
+          dropped = true;
+          req.socket.destroy();
+          return;
+        }
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(body);
+      });
+    });
+    server.keepAliveTimeout = 120_000;
+    server.headersTimeout = 125_000;
     httpServers.push(server);
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
     return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
@@ -257,6 +281,10 @@ describe("failure rows carry request and response bodies", () => {
 
     const fragment = '{"error":{"message":"sentinel-cut';
     const truncatedBase = await truncatingUpstream("502 Bad Gateway", fragment);
+    await modelAt(
+      "row-drops-then-400",
+      `${await dropsFirstUpstream(400, JSON.stringify({ error: { message: "sentinel-retried-400" } }))}/v1`,
+    );
     await modelAt("row-truncated", `${truncatedBase}/v1`);
     await modelAt("row-truncated-rerank", `${truncatedBase}/v1`, {
       provider: "cohere",
@@ -390,6 +418,7 @@ describe("failure rows carry request and response bodies", () => {
         "row-slow",
         "row-stream-slow",
         "row-400",
+        "row-drops-then-400",
         "row-401",
         "row-403",
         "row-first-fails",
@@ -446,8 +475,14 @@ describe("failure rows carry request and response bodies", () => {
     return slsLogsFor(sls!, FULL).filter((l) => l.get("request_id") === requestId);
   }
 
+  /** The request's final row: a retried request leaves one row per attempt. */
   async function rowOf(requestId: string, what: string): Promise<Row> {
-    return waitForSlsLog(sls!, FULL, (l) => l.get("request_id") === requestId, what);
+    return waitForSlsLog(
+      sls!,
+      FULL,
+      (l) => l.get("request_id") === requestId && l.get("is_final_attempt") === "true",
+      what,
+    );
   }
 
   async function rowsOf(requestId: string, n: number): Promise<Row[]> {
@@ -581,8 +616,28 @@ describe("failure rows carry request and response bodies", () => {
     await res.text();
     expect(res.status).toBe(400);
     const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the embeddings row");
+    expect(row.get("status_code")).toBe("400");
     expect(row.get("prompt")).toContain("embed-prompt");
     expect(row.get("response")).toContain("sentinel-body-400");
+  });
+
+  test("a retried attempt's 400 is on the final row, after the lost connection's row", async () => {
+    if (!etcdReachable) return;
+    const res = await fetch(`${app!.proxyUrl}/v1/embeddings`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model: "row-drops-then-400", input: "retried-prompt" }),
+    });
+    await res.text();
+    expect(res.status).toBe(400);
+    const requestId = res.headers.get("x-aisix-request-id")!;
+    const row = await rowOf(requestId, "the retried embeddings row");
+    expect(row.get("status_code")).toBe("400");
+    expect(row.get("prompt")).toContain("retried-prompt");
+    expect(row.get("response")).toContain("sentinel-retried-400");
+    const [lost] = await rowsOf(requestId, 2);
+    expect(lost!.get("is_final_attempt")).toBe("false");
+    expect(lost!.get("response")).toContain("transport error");
   });
 
   test("a multipart failure reports text fields and a file checksum, never the file", async () => {
