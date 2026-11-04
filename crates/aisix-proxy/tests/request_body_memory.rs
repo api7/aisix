@@ -786,8 +786,9 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
         // a separate copy, so the send peak is measured without one. The
         // bound is the parsed request plus the wire buffer at its final
         // size; `to_vec` doubling can leave that buffer near 2x before it is
-        // shrunk, and LARGE's 16 equal blocks happen to land exactly on a
-        // doubling. A whole-request clone costs 1x above either bound.
+        // shrunk, and LARGE's 16 equal blocks land on a doubling, so other
+        // sizes may peak higher. A whole-request clone costs 1x above either
+        // bound.
         Family {
             peak: Some(2.0 + MARGIN),
             capture_content: false,
@@ -821,7 +822,8 @@ async fn request_body_is_held_at_most_twice_while_upstream_is_pending() {
             ..Family::new("rerank (no content capture)", "/v1/rerank", rerank_body)
         },
         // One large string is written whole, so the next write doubles the
-        // buffer: the wire buffer peaks at 2x here.
+        // buffer: both this test's request string and the wire buffer reach
+        // 2x capacity, each alongside the parsed 1x, so the bound is 3x.
         Family {
             peak: Some(3.0 + MARGIN),
             capture_content: false,

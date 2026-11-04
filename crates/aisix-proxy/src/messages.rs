@@ -5643,6 +5643,55 @@ data: [DONE]\n\n";
         assert!(rx.try_recv().is_err(), "usage event should be emitted once");
     }
 
+    /// A native stream that never reports usage estimates its prompt from the
+    /// request: 3 per message + "user" + "hi" + 3 reply priming.
+    #[tokio::test]
+    async fn estimates_prompt_when_native_stream_omits_usage() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::builder().start().await;
+        let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-haiku\",\"content\":[]}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "claude-haiku",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+                "stream": true,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        to_bytes(resp.into_body(), 65536).await.unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("usage event sender dropped");
+        assert_eq!(event.prompt_tokens, 8);
+        assert!(event.usage_estimated);
+    }
+
     #[tokio::test]
     async fn upstream_error_returns_502() {
         let upstream = MockServer::builder().start().await;

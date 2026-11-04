@@ -6967,6 +6967,54 @@ data: [DONE]\n\n";
         );
     }
 
+    /// A native stream that never reports usage estimates its prompt from the
+    /// request, the same count the non-streaming path above gets.
+    #[tokio::test]
+    async fn estimates_prompt_when_native_stream_omits_usage() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::builder().start().await;
+        let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-abc\",\"object\":\"response\",\"model\":\"gpt-4o-2024-08-06\",\"output\":[]}}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hello",
+                "stream": true
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        to_bytes(resp.into_body(), 65536).await.unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.prompt_tokens, 8);
+        assert!(event.usage_estimated);
+    }
+
     /// #808: a streaming `/v1/responses` 200 (e.g. all Codex traffic, which
     /// always streams) MUST emit a UsageEvent with the tokens carried on the
     /// terminal `response.completed` event — pre-#808 the streaming path
