@@ -1204,53 +1204,77 @@ async fn anthropic_passthrough_dispatch(
     // format with no object schema injects nothing and goes out as sent.
     let mut synthetic_json = false;
     let (body_bytes, is_stream, platform_body) = {
-        let mut body = body.into_owned();
-        if platform.is_some() && needs_synthetic_structured_output(&body, model) {
-            synthetic_json = aisix_provider_anthropic::json_tool::inject(&mut body);
-        }
-
-        // Rewrite the `model` field to the upstream value.
-        if let Some(m) = body.get_mut("model") {
-            *m = Value::String(upstream_model.clone());
-        }
-        // A Gemini thought signature riding in a tool id is for Gemini only.
-        if let Some(messages) = body.get_mut("messages") {
-            aisix_gateway::tool_calls::strip_thought_signatures_in_body(messages);
-        }
-
-        // Apply the PK's `request.*` override block to the outbound
-        // body. Mirrors the OpenAI dispatch path's `prepare_outbound_body`
-        // in `crates/aisix-provider-openai/src/bridge.rs:317-323`. The
-        // OpenAI bridge applies the same primitives via the Hub dispatch,
-        // but the Anthropic-passthrough path bypasses the Hub and builds
-        // the request directly here — without this block the override
-        // pipeline silently no-ops on `/v1/messages` (issue #302 §5
-        // contract; tracked as ai-gateway#335 for the gap-as-shipped).
-        //
-        // Apply order matches §5: renames → constraints → defaults. Each
-        // primitive is a no-op when its configured map is empty.
-        if let Some(r) = pk_value.request.as_ref() {
-            aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
-            if let Some(constraints) = &r.param_constraints {
-                aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
+        let only_model_renamed = match &body {
+            std::borrow::Cow::Borrowed(body) if platform.is_none() => {
+                crate::util::model_only_fields(body, pk_value, Some("messages"))
             }
-            aisix_provider_openai::overrides::apply_default_body_fields(
-                &mut body,
-                &r.default_body_fields,
-            );
+            _ => None,
+        };
+        if let Some(fields) = only_model_renamed {
+            let is_stream = fields
+                .get("stream")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            (
+                crate::util::outbound_json(&crate::util::ModelRenamed {
+                    fields,
+                    model: &upstream_model,
+                })?,
+                is_stream,
+                None,
+            )
+        } else {
+            let mut body = body.into_owned();
+            if platform.is_some() && needs_synthetic_structured_output(&body, model) {
+                synthetic_json = aisix_provider_anthropic::json_tool::inject(&mut body);
+            }
+
+            // Rewrite the `model` field to the upstream value.
+            if let Some(m) = body.get_mut("model") {
+                *m = Value::String(upstream_model.clone());
+            }
+            // A Gemini thought signature riding in a tool id is for Gemini only.
+            if let Some(messages) = body.get_mut("messages") {
+                aisix_gateway::tool_calls::strip_thought_signatures_in_body(messages);
+            }
+
+            // Apply the PK's `request.*` override block to the outbound
+            // body. Mirrors the OpenAI dispatch path's `prepare_outbound_body`
+            // in `crates/aisix-provider-openai/src/bridge.rs:317-323`. The
+            // OpenAI bridge applies the same primitives via the Hub dispatch,
+            // but the Anthropic-passthrough path bypasses the Hub and builds
+            // the request directly here — without this block the override
+            // pipeline silently no-ops on `/v1/messages` (issue #302 §5
+            // contract; tracked as ai-gateway#335 for the gap-as-shipped).
+            //
+            // Apply order matches §5: renames → constraints → defaults. Each
+            // primitive is a no-op when its configured map is empty.
+            if let Some(r) = pk_value.request.as_ref() {
+                aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
+                if let Some(constraints) = &r.param_constraints {
+                    aisix_provider_openai::overrides::apply_param_constraints(
+                        &mut body,
+                        constraints,
+                    );
+                }
+                aisix_provider_openai::overrides::apply_default_body_fields(
+                    &mut body,
+                    &r.default_body_fields,
+                );
+            }
+            // Check if the request wants streaming.
+            let is_stream = body
+                .get("stream")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if synthetic_json && is_stream {
+                body["stream"] = Value::Bool(false);
+            }
+            let bytes = crate::util::outbound_json(&body)?;
+            // A platform bridge adapts the body itself, so it takes the value
+            // rather than parsing the bytes back.
+            (bytes, is_stream, platform.is_some().then_some(body))
         }
-        // Check if the request wants streaming.
-        let is_stream = body
-            .get("stream")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if synthetic_json && is_stream {
-            body["stream"] = Value::Bool(false);
-        }
-        let bytes = crate::util::outbound_json(&body)?;
-        // A platform bridge adapts the body itself, so it takes the value
-        // rather than parsing the bytes back.
-        (bytes, is_stream, platform.is_some().then_some(body))
     };
     let upstream_streams = is_stream && !synthetic_json;
 
@@ -1590,13 +1614,13 @@ async fn anthropic_passthrough_dispatch(
         let post_stream_keys = reservation.as_ref().map(|r| r.keys()).unwrap_or_default();
         let stream_hold = reservation.take().map(|r| r.into_stream_hold());
         let limiter_c = std::sync::Arc::clone(&state.limiter);
-        // Token-estimation fallback context (AISIX-Cloud#1074): the stream
-        // owns the outbound request until an end-of-stream Drop, rebuilt
-        // from its wire bytes now that the upstream has answered.
-        // Tokenized only if the upstream never reports usage.
+        // Token-estimation fallback context (AISIX-Cloud#1074): the closure
+        // runs at end-of-stream Drop, so it keeps the wire bytes (a shared
+        // `Bytes`, no copy) and parses them only if the upstream never
+        // reports usage.
         let estimator = crate::token_estimate::Estimator::new(
             &upstream_model,
-            crate::token_estimate::PromptInput::Anthropic(crate::util::outbound_value(&body_bytes)),
+            crate::token_estimate::PromptInput::AnthropicWire(body_bytes.clone()),
         );
         let parsed_stream = build_anthropic_passthrough_stream(
             body_stream,
@@ -5617,6 +5641,55 @@ data: [DONE]\n\n";
             "streaming /v1/messages telemetry must record TTFT"
         );
         assert!(rx.try_recv().is_err(), "usage event should be emitted once");
+    }
+
+    /// A native stream that never reports usage estimates its prompt from the
+    /// request: 3 per message + "user" + "hi" + 3 reply priming.
+    #[tokio::test]
+    async fn estimates_prompt_when_native_stream_omits_usage() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::builder().start().await;
+        let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-haiku\",\"content\":[]}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+
+        let resp = crate::build_router(state)
+            .oneshot(make_req(serde_json::json!({
+                "model": "claude-haiku",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100,
+                "stream": true,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        to_bytes(resp.into_body(), 65536).await.unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("usage event sender dropped");
+        assert_eq!(event.prompt_tokens, 8);
+        assert!(event.usage_estimated);
     }
 
     #[tokio::test]

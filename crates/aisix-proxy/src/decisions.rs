@@ -714,10 +714,7 @@ fn apply_body_overrides(
     let Some(r) = pk.request.as_ref() else {
         return Ok(outbound);
     };
-    if r.param_renames.is_empty()
-        && r.param_constraints.is_none()
-        && r.default_body_fields.is_empty()
-    {
+    if !r.rewrites_body() {
         return Ok(outbound);
     }
     let mut body: Value = serde_json::from_slice(&outbound).map_err(|e| {

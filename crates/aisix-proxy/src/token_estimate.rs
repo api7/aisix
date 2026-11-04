@@ -106,6 +106,12 @@ pub enum PromptInput {
     Anthropic(Value),
     /// Raw `/v1/responses` request body.
     Responses(Value),
+    /// Outbound `/v1/responses` wire bytes, parsed only if estimation
+    /// runs: a stream that keeps its estimator to the end would otherwise
+    /// hold a second parsed copy of the request for its whole lifetime.
+    ResponsesWire(bytes::Bytes),
+    /// Outbound `/v1/messages` bytes with the same deferred parsing.
+    AnthropicWire(bytes::Bytes),
 }
 
 /// Prompt shape + the model name that selects the tokenizer encoding.
@@ -137,6 +143,12 @@ impl Estimator {
             PromptInput::Chat(req) => count_chat_prompt(bpe, req),
             PromptInput::Anthropic(body) => count_anthropic_prompt(bpe, body),
             PromptInput::Responses(body) => count_responses_prompt(bpe, body),
+            PromptInput::ResponsesWire(wire) => {
+                count_responses_prompt(bpe, &crate::util::outbound_value(wire))
+            }
+            PromptInput::AnthropicWire(wire) => {
+                count_anthropic_prompt(bpe, &crate::util::outbound_value(wire))
+            }
         }
     }
 
@@ -1213,7 +1225,13 @@ mod tests {
                 ]}
             ]
         });
+        let wire_bytes = serde_json::to_vec(&body).unwrap();
         let est = Estimator::new("claude-sonnet-4-5", PromptInput::Anthropic(body));
+        let wire = Estimator::new(
+            "claude-sonnet-4-5",
+            PromptInput::AnthropicWire(wire_bytes.into()),
+        );
+        assert_eq!(wire.count_prompt(), est.count_prompt());
         let m = |s: &str| count_text("claude-sonnet-4-5", s);
         let expected = (TOKENS_PER_MESSAGE + m("system") + m("Be helpful"))
             + (TOKENS_PER_MESSAGE + m("user") + m("Hello"))
@@ -1246,12 +1264,17 @@ mod tests {
                  "name": "get_weather", "arguments": "{}", "status": "completed"}
             ]
         });
+        let wire_bytes = serde_json::to_vec(&items).unwrap();
         let est = Estimator::new("gpt-4o", PromptInput::Responses(items));
         let expected = (TOKENS_PER_MESSAGE + m("system") + m("Be brief"))
             + (TOKENS_PER_MESSAGE + m("user") + m("Hello"))
             + (TOKENS_PER_MESSAGE + m("call_1") + m("get_weather") + m("{}"))
             + REPLY_PRIMING;
         assert_eq!(est.count_prompt(), expected);
+
+        // The wire bytes of the same body count the same, parsed on demand.
+        let wire = Estimator::new("gpt-4o", PromptInput::ResponsesWire(wire_bytes.into()));
+        assert_eq!(wire.count_prompt(), expected);
     }
 
     #[test]

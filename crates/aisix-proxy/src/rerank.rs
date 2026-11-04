@@ -422,9 +422,9 @@ async fn dispatch(
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
-    // A Model Group walks its targets (AISIX-Cloud#1111). Each attempt
-    // rewrites its own copy of the body — the `model` field and the PK's
-    // `request.*` overrides belong to the target it is sent to.
+    // A Model Group walks its targets (AISIX-Cloud#1111). Each attempt builds
+    // its own wire body — the `model` field and the PK's `request.*` overrides
+    // belong to the target it is sent to.
     let base_body: &Value = body;
     *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
         .with_trace(client_ctx.trace.clone());
@@ -491,7 +491,14 @@ async fn dispatch(
 
                 // This attempt's body exists only as its wire bytes past this
                 // block (see `crate::util::outbound_json`).
-                let body = {
+                let body = if let Some(fields) =
+                    crate::util::model_only_fields(base_body, &pk_entry.value, None)
+                {
+                    crate::util::outbound_json(&crate::util::ModelRenamed {
+                        fields,
+                        model: &upstream_model,
+                    })?
+                } else {
                     let mut attempt_body = base_body.clone();
                     let body = &mut attempt_body;
                     // Rewrite model field.
