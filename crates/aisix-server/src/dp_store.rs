@@ -31,7 +31,7 @@ impl DpManagerStore {
     pub fn new(origin: &str, mtls: &MtlsBundle) -> Self {
         let client = crate::heartbeat::build_client(mtls)
             .inspect_err(|error| {
-                tracing::error!(%error, "per-user MCP token storage is unavailable: \
+                tracing::error!(error = %format_args!("{error:#}"), "per-user MCP token storage is unavailable: \
                     could not build the dp-manager client");
             })
             .ok();
@@ -58,7 +58,10 @@ impl DpManagerStore {
 
 async fn send(request: RequestBuilder) -> Result<Response, StoreError> {
     request.send().await.map_err(|error| {
-        tracing::warn!(error = %error.without_url(), "dp-manager store request failed");
+        tracing::warn!(
+            error = %aisix_gateway::transport_error_message(&error.without_url()),
+            "dp-manager store request failed",
+        );
         StoreError::Unavailable
     })
 }
@@ -319,5 +322,47 @@ mod tests {
             store.get("mcp_oauth_token", "abc").await,
             Err(StoreError::Unavailable)
         );
+    }
+
+    /// Run `f` under a capturing subscriber; returns its result and what it logged.
+    async fn capture_logs<T>(f: impl std::future::Future<Output = T>) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // A callsite first hit where no subscriber was set has cached "disabled".
+        tracing::callsite::rebuild_interest_cache();
+        let out = f.await;
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (out, logged)
+    }
+
+    /// A loopback address nothing listens on, so a connect is refused at once.
+    fn refused_url(path: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}{path}", listener.local_addr().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_logs_its_cause_without_the_url() {
+        let store = DpManagerStore::with_client(&refused_url(""), Some(reqwest::Client::new()));
+        let (result, logged) = capture_logs(store.get("mcp_oauth_token", "abc")).await;
+        assert!(matches!(result, Err(StoreError::Unavailable)));
+        assert!(logged.to_lowercase().contains("refused"), "{logged}");
+        assert!(!logged.contains("mcp_oauth_token"), "{logged}");
     }
 }

@@ -240,6 +240,11 @@ impl TokenMinter {
             .send()
             .await
             .map_err(|e| {
+                // This text reaches the usage event, so the cause goes to the log alone.
+                tracing::warn!(
+                    error = %aisix_gateway::transport_error_message(&e),
+                    "vertex token mint request failed",
+                );
                 BridgeError::Transport(format!("vertex token mint POST {endpoint}: {e}"))
             })?;
 
@@ -542,5 +547,54 @@ mod tests {
     /// form-encoder leaves untouched.
     fn urlencoding_decode(s: &str) -> String {
         s.replace('+', " ").replace("%2B", "+").replace("%2F", "/")
+    }
+
+    /// Run `f` under a capturing subscriber; returns its result and what it logged.
+    async fn capture_logs<T>(f: impl std::future::Future<Output = T>) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // A callsite first hit where no subscriber was set has cached "disabled".
+        tracing::callsite::rebuild_interest_cache();
+        let out = f.await;
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (out, logged)
+    }
+
+    /// A loopback address nothing listens on, so a connect is refused at once.
+    fn refused_url(path: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}{path}", listener.local_addr().unwrap())
+    }
+
+    /// The `Transport` text reaches the usage event; the cause goes to the log.
+    #[tokio::test]
+    async fn a_failed_mint_logs_its_cause_and_keeps_the_error_text() {
+        let (private_pem, _) = test_key_pair();
+        let endpoint = refused_url("/token");
+        let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(endpoint.clone());
+        let sa = sample_sa(&private_pem, &endpoint);
+        let (result, logged) = capture_logs(minter.get_token(&sa)).await;
+        let Err(BridgeError::Transport(text)) = result else {
+            panic!("expected a transport failure, got {result:?}");
+        };
+        assert!(logged.to_lowercase().contains("refused"), "{logged}");
+        assert!(text.starts_with("vertex token mint POST"), "{text}");
+        assert!(!text.to_lowercase().contains("refused"), "{text}");
     }
 }

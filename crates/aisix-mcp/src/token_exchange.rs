@@ -246,7 +246,7 @@ async fn exchange(
         Err(e) => {
             tracing::warn!(
                 server = %cfg.server,
-                error = %crate::bridge::sanitize_error_message(&e.to_string()),
+                error = %crate::bridge::sanitize_error_message(&aisix_gateway::transport_error_message(&e)),
                 "upstream token exchange request failed"
             );
             return Err(TokenExchangeFailure::Unavailable);
@@ -378,5 +378,59 @@ impl TokenExchangeAuth {
 
     pub(crate) fn invalidate(&self) {
         invalidate(&self.config, self.subject());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run `f` under a capturing subscriber; returns its result and what it logged.
+    async fn capture_logs<T>(f: impl std::future::Future<Output = T>) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // A callsite first hit where no subscriber was set has cached "disabled".
+        tracing::callsite::rebuild_interest_cache();
+        let out = f.await;
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (out, logged)
+    }
+
+    /// A loopback address nothing listens on, so a connect is refused at once.
+    fn refused_url(path: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}{path}", listener.local_addr().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_failed_exchange_logs_its_cause_and_no_credential() {
+        let cfg = TokenExchangeConfig {
+            profile: Some(McpTokenExchangeProfile::EntraObo),
+            token_url: refused_url("/token"),
+            client_id: "cid".into(),
+            client_secret: "obo-secret-LEAK".into(),
+            scopes: vec!["api://x/.default".into()],
+            server: "s".into(),
+        };
+        let (result, logged) = capture_logs(exchange(&cfg, "subject-LEAK")).await;
+        assert!(matches!(result, Err(TokenExchangeFailure::Unavailable)));
+        assert!(logged.to_lowercase().contains("refused"), "{logged}");
+        assert!(!logged.contains("LEAK"), "{logged}");
     }
 }

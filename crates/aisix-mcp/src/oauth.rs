@@ -144,7 +144,10 @@ async fn fetch_token(cfg: &OAuthClientConfig) -> Result<(String, Duration), McpE
         .map_err(|e| {
             // reqwest transport errors describe the connection (and may name
             // the non-secret token_url), never the form body.
-            McpError::Connect(format!("upstream OAuth token request failed: {e}"))
+            McpError::Connect(format!(
+                "upstream OAuth token request failed: {}",
+                aisix_gateway::transport_error_message(&e)
+            ))
         })?;
 
     let status = response.status();
@@ -546,5 +549,21 @@ mod tests {
                 "error should name the misconfiguration: {err}"
             );
         }
+    }
+
+    /// A loopback address nothing listens on, so a connect is refused at once.
+    fn refused_url(path: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}{path}", listener.local_addr().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_failed_token_request_names_its_cause() {
+        let err = get_or_fetch(&config(refused_url("/oauth/token")))
+            .await
+            .expect_err("nothing listens");
+        let text = err.to_string();
+        assert!(text.to_lowercase().contains("refused"), "{text}");
+        assert!(!text.contains("s3cret"), "{text}");
     }
 }

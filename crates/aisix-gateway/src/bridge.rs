@@ -796,7 +796,7 @@ pub async fn decode_success_body<T: serde::de::DeserializeOwned>(
     let body = resp
         .bytes()
         .await
-        .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+        .map_err(|e| crate::upstream_http::upstream_body_read_error(&e))?;
     if let Some(err) = in_band_error_in_body(&body, wire) {
         return Err(err);
     }

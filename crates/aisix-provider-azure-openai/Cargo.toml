@@ -40,3 +40,4 @@ aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
 # a whole, so it cannot distinguish per-chunk from total-duration timeouts.
 tokio = { workspace = true, features = ["macros", "rt", "time", "net", "io-util"] }
 wiremock.workspace = true
+tracing-subscriber.workspace = true
