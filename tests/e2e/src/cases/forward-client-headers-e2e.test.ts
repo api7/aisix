@@ -74,6 +74,17 @@ const CUSTOM_HEADER = "x-user-jwt";
 const CALLER_CREDENTIAL = "Bearer callers-own-credential";
 const GATEWAY_SECRET = "sk-mock-provider-secret";
 
+// What a caller carries in the slots no route's strip set used to name.
+const CALLER_SLOTS: Record<string, string> = {
+  "api-key": "caller-azure-key",
+  "x-goog-api-key": "caller-gemini-key",
+  "x-amz-security-token": "caller-aws-session-token",
+  "x-amz-date": "20260903T120000Z",
+  "x-amz-content-sha256": "e3b0c44298fc1c14",
+  cookie: "session=caller-cookie",
+};
+const PLAIN_HEADER = "x-plain-context";
+
 const ANTHROPIC_BODY = {
   id: "msg_01",
   type: "message",
@@ -364,6 +375,75 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
 
     const callerKeyId = randomUUID();
 
+    // Credential slots on `inject` hold whatever the ProviderKey lists, so
+    // this one lists nothing at all.
+    const injectPk = await seed.createProviderKey({
+      display_name: "fwd-inject-pk",
+      api_key: GATEWAY_SECRET,
+      api_base: upstream.baseUrl,
+      strip_headers: [],
+    });
+    const injectRoutes: Array<[string, Record<string, unknown>]> = [
+      ["none", {}],
+      ["subglob", { forward_client_headers: ["x-*"] }],
+      ["star", { forward_client_headers: ["*"] }],
+      [
+        "named",
+        { forward_client_headers: [...Object.keys(CALLER_SLOTS), "authorization"] },
+      ],
+      ["one-named", { forward_client_headers: ["x-goog-api-key", "x-*"] }],
+      [
+        "anon",
+        {
+          auth_mode: "anonymous",
+          anonymous_key_id: callerKeyId,
+          source_cidrs: ["127.0.0.0/8", "::1/128"],
+          forward_client_headers: ["x-*"],
+        },
+      ],
+      [
+        "headerkey",
+        {
+          auth_mode: "header_key",
+          auth_header_name: GATEWAY_KEY_HEADER,
+          forward_client_headers: ["x-*"],
+        },
+      ],
+    ];
+    for (const [suffix, overrides] of injectRoutes) {
+      await seed.createPassthroughRoute({
+        name: `fwd-route-inject-${suffix}`,
+        path_prefix: `${ROUTE_PREFIX}-inject-${suffix}`,
+        target_url: upstream.baseUrl,
+        auth_mode: "gateway_key",
+        credential_mode: "inject",
+        provider_key_id: injectPk.id,
+        ...overrides,
+      });
+    }
+    await seed.createPassthroughRoute({
+      name: "fwd-route-inject-anthropic-named",
+      path_prefix: `${ROUTE_PREFIX}-inject-anthropic-named`,
+      target_url: upstream.baseUrl,
+      auth_mode: "gateway_key",
+      credential_mode: "inject",
+      provider_key_id: anthropicRoutePk.id,
+      forward_client_headers: ["x-api-key"],
+    });
+    for (const [suffix, overrides] of [
+      ["byo", {}],
+      ["byo-glob", { forward_client_headers: ["x-*"] }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      await seed.createPassthroughRoute({
+        name: `fwd-route-${suffix}`,
+        path_prefix: `${ROUTE_PREFIX}-${suffix}`,
+        target_url: upstream.baseUrl,
+        auth_mode: "gateway_key",
+        credential_mode: "forward_client",
+        ...overrides,
+      });
+    }
+
     // A route that names its OWN gateway-credential slot, and one that
     // names none. `x-*` is the same pattern on both: what differs is
     // whether the route declared a slot for it to have to leave alone.
@@ -611,6 +691,105 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     expect(seen.headers["anthropic-version"]).toBe("2023-01-01");
     // And the gateway's own credential still authenticates the call.
     expect(seen.headers["x-api-key"]).toBe(GATEWAY_SECRET);
+  });
+
+  const callRoute = async (
+    suffix: string,
+    headers: Record<string, string>,
+  ): Promise<ReceivedRequest> => {
+    const mark = upstream!.receivedRequests.length;
+    await fetch(`${app!.proxyUrl}${ROUTE_PREFIX}-${suffix}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...CALLER_SLOTS,
+        [PLAIN_HEADER]: "kept",
+        ...headers,
+      },
+      body: JSON.stringify({ model: "gpt-4o-mini", messages: [] }),
+    }).then((r) => bodyOf(r, `the ${suffix} route`));
+    return since(mark).at(-1)!;
+  };
+
+  test.each([
+    ["no pattern", "inject-none", { authorization: `Bearer ${CALLER_KEY}` }],
+    ["an x-* glob", "inject-subglob", { authorization: `Bearer ${CALLER_KEY}` }],
+    ["a * glob", "inject-star", { authorization: `Bearer ${CALLER_KEY}` }],
+    ["auth_mode anonymous", "inject-anon", {}],
+    ["auth_mode header_key", "inject-headerkey", { [GATEWAY_KEY_HEADER]: CALLER_KEY }],
+  ])("an injecting route keeps every credential slot home under %s", async (_, suffix, auth) => {
+    if (!etcdReachable) return;
+
+    const seen = await callRoute(suffix, { ...auth, "x-api-key": "caller-x-api-key" });
+
+    for (const name of Object.keys(CALLER_SLOTS)) {
+      expect(seen.headers[name], `${name} reached the upstream`).toBeUndefined();
+    }
+    expect(seen.headers["x-api-key"]).toBeUndefined();
+    // Withholding the slots is not withholding everything: the header no
+    // credential rule applies to still rides, or the checks above would
+    // pass for a route that forwards nothing.
+    expect(seen.headers[PLAIN_HEADER]).toBe("kept");
+    expect(seen.headers.authorization).toBe(`Bearer ${GATEWAY_SECRET}`);
+    expect(occurrences(seen, "authorization")).toBe(1);
+  });
+
+  test("an injecting route returns a slot named exactly, in place of the injected value", async () => {
+    if (!etcdReachable) return;
+
+    const seen = await callRoute("inject-named", { authorization: `Bearer ${CALLER_KEY}` });
+
+    for (const [name, value] of Object.entries(CALLER_SLOTS)) {
+      expect(seen.headers[name]).toBe(value);
+      expect(occurrences(seen, name)).toBe(1);
+    }
+    expect(seen.headers.authorization).toBe(`Bearer ${CALLER_KEY}`);
+    expect(occurrences(seen, "authorization")).toBe(1);
+    expect(seen.headers[PLAIN_HEADER]).toBe("kept");
+  });
+
+  test("an Anthropic injecting route returns a named x-api-key in place of its own", async () => {
+    if (!etcdReachable) return;
+
+    const seen = await callRoute("inject-anthropic-named", {
+      authorization: `Bearer ${CALLER_KEY}`,
+      "x-api-key": "caller-x-api-key",
+    });
+
+    expect(seen.headers["x-api-key"]).toBe("caller-x-api-key");
+    expect(occurrences(seen, "x-api-key")).toBe(1);
+  });
+
+  test("naming one slot beside a glob returns that slot and no other", async () => {
+    if (!etcdReachable) return;
+
+    const seen = await callRoute("inject-one-named", { authorization: `Bearer ${CALLER_KEY}` });
+
+    expect(seen.headers["x-goog-api-key"]).toBe(CALLER_SLOTS["x-goog-api-key"]);
+    for (const name of Object.keys(CALLER_SLOTS).filter((n) => n !== "x-goog-api-key")) {
+      expect(seen.headers[name], `${name} reached the upstream`).toBeUndefined();
+    }
+    expect(seen.headers.authorization).toBe(`Bearer ${GATEWAY_SECRET}`);
+  });
+
+  test.each([
+    ["no pattern", "byo"],
+    ["an x-* glob", "byo-glob"],
+  ])("a forward_client route relays the caller's credentials under %s", async (_, suffix) => {
+    if (!etcdReachable) return;
+
+    const seen = await callRoute(suffix, {
+      "x-aisix-api-key": CALLER_KEY,
+      authorization: "Bearer callers-upstream-credential",
+      "x-api-key": "caller-x-api-key",
+    });
+
+    for (const [name, value] of Object.entries(CALLER_SLOTS)) {
+      expect(seen.headers[name]).toBe(value);
+    }
+    expect(seen.headers.authorization).toBe("Bearer callers-upstream-credential");
+    expect(seen.headers["x-api-key"]).toBe("caller-x-api-key");
+    expect(seen.headers[PLAIN_HEADER]).toBe("kept");
   });
 
   test("a REST system server exposed as MCP tools receives them", async () => {

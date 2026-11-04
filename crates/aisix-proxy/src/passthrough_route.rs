@@ -805,14 +805,18 @@ async fn dispatch(
                         .map(|s| s.to_ascii_lowercase()),
                 );
             }
-            // The two slots the injection below writes are stripped
-            // UNCONDITIONALLY — `RequestBuilder::header` appends, so a
-            // `strip_headers` override that keeps `authorization` would
-            // put the caller's credential on the wire beside the injected
-            // one. Explicit client-credential forwarding is what
-            // `forward_client` is for; inject never double-sends.
-            strip.insert("authorization".into());
-            strip.insert("x-api-key".into());
+            // Every credential slot is stripped UNCONDITIONALLY, whatever
+            // `strip_headers` says: this upstream authenticates on the
+            // gateway's credential, so the caller's has no business there.
+            // It also keeps the injection below from double-sending, since
+            // `RequestBuilder::header` appends. Explicit client-credential
+            // forwarding is what `forward_client` is for, and
+            // `forward_client_headers` puts back a slot it names exactly.
+            strip.extend(
+                aisix_core::CREDENTIAL_SLOT_HEADERS
+                    .iter()
+                    .map(|s| (*s).to_string()),
+            );
             // The header-key slot never goes upstream either.
             if let Some(h) = route.auth_header_name.as_deref() {
                 strip.insert(h.to_ascii_lowercase());

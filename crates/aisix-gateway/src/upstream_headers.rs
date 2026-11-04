@@ -37,7 +37,7 @@
 //! Before #1167 the standard endpoints rebuilt the outbound header set from
 //! scratch and dropped every client header — the default this module
 //! preserves. `/passthrough/*` is the opposite policy (forward everything
-//! except `pk.strip_headers`) and does not use this pipeline; there
+//! except what the route strips) and does not use this pipeline; there
 //! `forward_client_headers` overrides the strip instead.
 
 use std::collections::HashSet;

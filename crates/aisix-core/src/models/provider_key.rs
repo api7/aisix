@@ -91,7 +91,9 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<ResponseOverrides>,
 
-    /// Inbound headers removed before passthrough forwarding.
+    /// Inbound headers removed before passthrough forwarding. A passthrough
+    /// route with `credential_mode: inject` also removes every credential
+    /// slot, listed here or not.
     #[serde(
         default = "default_strip_headers",
         deserialize_with = "deserialize_normalized_strip_headers"

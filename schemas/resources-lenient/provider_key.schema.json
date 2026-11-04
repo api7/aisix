@@ -356,7 +356,7 @@
         "set-cookie",
         "x-api-key"
       ],
-      "description": "Inbound headers removed before passthrough forwarding.",
+      "description": "Inbound headers removed before passthrough forwarding. A passthrough route with `credential_mode: inject` also removes every credential slot, listed here or not.",
       "items": {
         "type": "string"
       },

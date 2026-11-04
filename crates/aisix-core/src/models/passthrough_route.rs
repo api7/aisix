@@ -134,25 +134,35 @@ pub struct PassthroughRoute {
     /// value preserved.
     ///
     /// A route forwards the caller's headers by default, so this field
-    /// only matters for the ones it removes: the ProviderKey's
-    /// `strip_headers` under `credential_mode: inject`, and the slot the
-    /// gateway consumed to authenticate the caller. Naming `authorization`
-    /// under `auth_mode: gateway_key` therefore puts the caller's own
-    /// credential back on the upstream request in place of the one this
-    /// route would inject, never both — which is what lets an internal
-    /// service that already authorizes on the end user's `Authorization`
-    /// keep doing so unchanged.
+    /// only matters for the ones it removes, and `credential_mode` decides
+    /// which credentials those are. The credential slots are
+    /// `authorization`, `proxy-authorization`, `x-api-key`, `api-key`,
+    /// `x-goog-api-key`, `cookie`, and the AWS SigV4 trio
+    /// `x-amz-security-token` / `x-amz-date` / `x-amz-content-sha256`.
     ///
-    /// A credential slot — `authorization`, `proxy-authorization`,
-    /// `x-api-key`, `api-key`, `x-goog-api-key`, `cookie`, and the AWS
-    /// SigV4 trio `x-amz-security-token` / `x-amz-date` /
-    /// `x-amz-content-sha256` — and
-    /// `traceparent` / `tracestate` are forwarded only when a pattern
-    /// names them exactly. A glob such as `"*"` or `"x-*"` is a statement
-    /// about the operator's own headers, not consent to hand a third party
-    /// the caller's credential or to graft the caller's trace onto that
-    /// party's telemetry, so a broad pattern overrides the rest of the
-    /// strip set and leaves those alone.
+    /// Under `credential_mode: inject` the route removes every credential
+    /// slot, whatever the ProviderKey's `strip_headers` lists and whatever
+    /// the `auth_mode`, and removes the rest of `strip_headers` as well.
+    /// Naming the slot the route injects into (`x-api-key` for an Anthropic
+    /// ProviderKey, `authorization` otherwise) puts the caller's value on
+    /// the upstream request in place of the injected one, never both —
+    /// which is what lets an internal service that already authorizes on
+    /// the end user's `Authorization` keep doing so unchanged.
+    ///
+    /// Under `credential_mode: forward_client` the caller's credentials are
+    /// relayed without any pattern. The route removes only
+    /// `proxy-authorization` and the slot the gateway consumed to
+    /// authenticate the caller: `authorization` and `x-api-key` under
+    /// `auth_mode: gateway_key`, unless the caller sent its gateway key in
+    /// `x-aisix-api-key`, and `auth_header_name` under `header_key`.
+    ///
+    /// Among the headers a route removes, a credential slot and
+    /// `traceparent` / `tracestate` come back only when a pattern names
+    /// them exactly. A glob such as `"*"` or `"x-*"` is a statement about
+    /// the operator's own headers, not consent to hand a third party the
+    /// caller's credential or to graft the caller's trace onto that party's
+    /// telemetry, so a broad pattern overrides the rest of the strip set
+    /// and leaves those alone.
     ///
     /// This route's own `auth_header_name` and `identity_header` are read
     /// the same way. Both are slots this route chose rather than ones the
@@ -216,8 +226,9 @@ pub enum PassthroughAuthMode {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum PassthroughCredentialMode {
-    /// Strip inbound credential headers and inject the configured
+    /// Strip every inbound credential slot and inject the configured
     /// ProviderKey's secret (the legacy tunnel's behavior, now explicit).
+    /// `forward_client_headers` puts back a slot it names exactly.
     #[default]
     Inject,
     /// Forward the caller's own `Authorization` (and other credential
