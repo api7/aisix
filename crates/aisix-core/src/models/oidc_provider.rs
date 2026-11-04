@@ -13,7 +13,7 @@
 //! never widen access beyond a key an operator explicitly created. The
 //! one thing a token adds to the key is the cost-attribution tags
 //! `tag_claims` reads from it, which select tag budgets and `tag:` rate
-//! limits but grant nothing.
+//! limits and open no model or tool the key does not already allow.
 //!
 //! A provider verifies in one of two **modes**, derived from the row
 //! rather than declared by it:

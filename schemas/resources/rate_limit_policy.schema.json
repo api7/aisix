@@ -89,7 +89,7 @@
           "type": "string"
         },
         {
-          "description": "`tag:<key>` — one counter per effective value of the cost-attribution tag `<key>` (the API key's own value, else its team's, else its member's). A matched request with no value for the key is not subject to the policy, exactly like `team` on a key that belongs to no team.",
+          "description": "`tag:<key>` — one counter per effective value of the cost-attribution tag `<key>` (on a request authenticated by a JWT, what its provider's `tag_claims` reads from the token; else the API key's own value, else its team's, else its member's). A matched request with no value for the key is not subject to the policy, exactly like `team` on a key that belongs to no team.",
           "pattern": "^tag:[a-z][a-z0-9_]{0,62}$",
           "type": "string"
         }

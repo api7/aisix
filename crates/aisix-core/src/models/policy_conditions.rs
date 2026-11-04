@@ -91,8 +91,8 @@ pub enum PolicyDimension {
     /// Dispatched model's `provider` (models.dev catalog id).
     Provider,
     /// `tag:<key>`: the request's effective value of a cost-attribution
-    /// tag ([`crate::models::KeyOwnerNames::effective_tags`]). Holds the
-    /// key, already checked against [`TAG_KEY_PATTERN`].
+    /// tag (`AuthenticatedKey::tags`). Holds the key, already checked against
+    /// [`TAG_KEY_PATTERN`].
     Tag(String),
 }
 
@@ -320,8 +320,9 @@ impl schemars::JsonSchema for GroupByDimension {
                     "type": "string",
                     "pattern": tag_dimension_pattern(),
                     "description": "`tag:<key>` — one counter per effective value of the \
-                        cost-attribution tag `<key>` (the API key's own value, else its team's, \
-                        else its member's). A matched request with no value for the key is not \
+                        cost-attribution tag `<key>` (on a request authenticated by a JWT, what \
+                        its provider's `tag_claims` reads from the token; else the API key's own \
+                        value, else its team's, else its member's). A matched request with no value for the key is not \
                         subject to the policy, exactly like `team` on a key that belongs to no \
                         team.",
                 },
