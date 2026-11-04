@@ -76,8 +76,8 @@
 //!
 //! ## Credentials
 //!
-//! `inject` strips inbound credential headers (the ProviderKey's
-//! `strip_headers`) and injects the configured ProviderKey's secret with
+//! `inject` strips every inbound credential slot plus the ProviderKey's
+//! `strip_headers`, and injects the configured ProviderKey's secret with
 //! the per-provider auth shape (#166). `forward_client` forwards the
 //! caller's own credential headers verbatim and strips only the gateway's
 //! side-channel headers, so the gateway credential never leaks upstream.

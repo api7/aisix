@@ -147,14 +147,16 @@ pub struct PassthroughRoute {
     /// ProviderKey, `authorization` otherwise) puts the caller's value on
     /// the upstream request in place of the injected one, never both —
     /// which is what lets an internal service that already authorizes on
-    /// the end user's `Authorization` keep doing so unchanged.
+    /// the end user's `Authorization` keep doing so unchanged. Any other
+    /// named slot rides beside the injected credential.
     ///
     /// Under `credential_mode: forward_client` the caller's credentials are
     /// relayed without any pattern. The route removes only
-    /// `proxy-authorization` and the slot the gateway consumed to
-    /// authenticate the caller: `authorization` and `x-api-key` under
-    /// `auth_mode: gateway_key`, unless the caller sent its gateway key in
-    /// `x-aisix-api-key`, and `auth_header_name` under `header_key`.
+    /// `proxy-authorization`, its own `identity_header`, and the slot the
+    /// gateway consumed to authenticate the caller: `authorization` and
+    /// `x-api-key` under `auth_mode: gateway_key`, unless the caller sent
+    /// its gateway key in `x-aisix-api-key`, and `auth_header_name` under
+    /// `header_key`.
     ///
     /// Among the headers a route removes, a credential slot and
     /// `traceparent` / `tracestate` come back only when a pattern names
@@ -227,14 +229,16 @@ pub enum PassthroughAuthMode {
 #[serde(rename_all = "snake_case")]
 pub enum PassthroughCredentialMode {
     /// Strip every inbound credential slot and inject the configured
-    /// ProviderKey's secret (the legacy tunnel's behavior, now explicit).
-    /// `forward_client_headers` puts back a slot it names exactly.
+    /// ProviderKey's secret. `forward_client_headers` puts back a slot it
+    /// names exactly.
     #[default]
     Inject,
-    /// Forward the caller's own `Authorization` (and other credential
-    /// headers) verbatim — bring-your-own-credential. Gateway side-channel
-    /// headers are still stripped so the gateway credential never leaks
-    /// upstream.
+    /// Forward the caller's own credential headers verbatim —
+    /// bring-your-own-credential. The slot the gateway consumed to
+    /// authenticate the caller is still stripped so the gateway credential
+    /// never leaks upstream: to send its own `Authorization` under
+    /// `auth_mode: gateway_key`, a caller carries its gateway key in
+    /// `x-aisix-api-key`.
     ForwardClient,
 }
 

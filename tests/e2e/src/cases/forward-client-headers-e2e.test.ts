@@ -389,7 +389,13 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
       ["star", { forward_client_headers: ["*"] }],
       [
         "named",
-        { forward_client_headers: [...Object.keys(CALLER_SLOTS), "authorization"] },
+        {
+          forward_client_headers: [
+            ...Object.keys(CALLER_SLOTS),
+            "authorization",
+            "proxy-authorization",
+          ],
+        },
       ],
       ["one-named", { forward_client_headers: ["x-goog-api-key", "x-*"] }],
       [
@@ -715,17 +721,24 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
     ["no pattern", "inject-none", { authorization: `Bearer ${CALLER_KEY}` }],
     ["an x-* glob", "inject-subglob", { authorization: `Bearer ${CALLER_KEY}` }],
     ["a * glob", "inject-star", { authorization: `Bearer ${CALLER_KEY}` }],
-    ["auth_mode anonymous", "inject-anon", {}],
-    ["auth_mode header_key", "inject-headerkey", { [GATEWAY_KEY_HEADER]: CALLER_KEY }],
+    ["auth_mode anonymous", "inject-anon", { authorization: "Bearer caller-upstream-cred" }],
+    [
+      "auth_mode header_key",
+      "inject-headerkey",
+      { [GATEWAY_KEY_HEADER]: CALLER_KEY, authorization: "Bearer caller-upstream-cred" },
+    ],
   ])("an injecting route keeps every credential slot home under %s", async (_, suffix, auth) => {
     if (!etcdReachable) return;
 
-    const seen = await callRoute(suffix, { ...auth, "x-api-key": "caller-x-api-key" });
+    const seen = await callRoute(suffix, {
+      ...auth,
+      "x-api-key": "caller-x-api-key",
+      "proxy-authorization": "Basic caller-proxy",
+    });
 
-    for (const name of Object.keys(CALLER_SLOTS)) {
+    for (const name of [...Object.keys(CALLER_SLOTS), "x-api-key", "proxy-authorization"]) {
       expect(seen.headers[name], `${name} reached the upstream`).toBeUndefined();
     }
-    expect(seen.headers["x-api-key"]).toBeUndefined();
     // Withholding the slots is not withholding everything: the header no
     // credential rule applies to still rides, or the checks above would
     // pass for a route that forwards nothing.
@@ -737,9 +750,15 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
   test("an injecting route returns a slot named exactly, in place of the injected value", async () => {
     if (!etcdReachable) return;
 
-    const seen = await callRoute("inject-named", { authorization: `Bearer ${CALLER_KEY}` });
+    const seen = await callRoute("inject-named", {
+      authorization: `Bearer ${CALLER_KEY}`,
+      "proxy-authorization": "Basic caller-proxy",
+    });
 
-    for (const [name, value] of Object.entries(CALLER_SLOTS)) {
+    for (const [name, value] of Object.entries({
+      ...CALLER_SLOTS,
+      "proxy-authorization": "Basic caller-proxy",
+    })) {
       expect(seen.headers[name]).toBe(value);
       expect(occurrences(seen, name)).toBe(1);
     }
@@ -758,6 +777,7 @@ describe("forward_client_headers e2e: one capability across every proxy face", (
 
     expect(seen.headers["x-api-key"]).toBe("caller-x-api-key");
     expect(occurrences(seen, "x-api-key")).toBe(1);
+    expect(seen.headers.authorization).toBeUndefined();
   });
 
   test("naming one slot beside a glob returns that slot and no other", async () => {
