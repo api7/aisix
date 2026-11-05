@@ -344,7 +344,7 @@ describe("an upstream's failure reads the same on every route that sends its own
 
   test("a realtime handshake refused with a 5xx is not counted under that 5xx", async () => {
     if (!etcdReachable) return;
-    await refusedHandshake("openai-500");
+    await finalRow(await refusedHandshake("openai-500"), "the realtime row");
     const metrics = await scrapeMetrics(app!.metricsUrl);
     expect(sumMetric(metrics, "aisix_proxy_requests_total", { endpoint: "/v1/realtime", status: "500" })).toBe(0);
   });
