@@ -181,6 +181,21 @@ jobs:
           shared-key: docker-image-${{ matrix.arch }}-${{ steps.pgomode.outputs.profile }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Phase A's fat-LTO link of the instrumented binary peaks near 20 GB of
+      # RAM plus swap on arm64, past the runner's 16 GB + 3 GB, and the runner
+      # then ends the job with exit 143 and no compile error. Swap changes when
+      # rustc gets its memory, not what it emits. A PGO build only: the other
+      # profiles fit in RAM.
+      - name: Add swap for the PGO build
+        if: steps.pgomode.outputs.value == 'on'
+        run: |
+          set -eux
+          sudo fallocate -l 16G /swapfile-pgo
+          sudo chmod 600 /swapfile-pgo
+          sudo mkswap /swapfile-pgo
+          sudo swapon /swapfile-pgo
+          swapon --show
+
       # Same short sha the `type=sha,prefix=sha-` tag uses, stamped into
       # the binary so a DP reports `<version>+sha-<short>` (release) or
       # `dev+sha-<short>` and operators can match a node to its image tag.
