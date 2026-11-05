@@ -246,6 +246,7 @@ async fn connect_failure(
     elapsed: Duration,
     read_budget: Option<Duration>,
     request_id: &str,
+    client_gone: impl std::future::Future<Output = ()>,
 ) -> (BridgeError, Option<RefusedResponse>) {
     use tokio_tungstenite::tungstenite::Error;
     let response = match failure.error {
@@ -265,7 +266,7 @@ async fn connect_failure(
     let status = response.status().as_u16();
     let retry_after = aisix_gateway::parse_retry_after(response.headers());
     let wire = aisix_gateway::UpstreamWire::OpenAI;
-    let body = read_refused_body(&response, failure.stream, read_budget).await;
+    let body = read_refused_body(&response, failure.stream, read_budget, client_gone).await;
     if let Some(reason) = &body.read_error {
         tracing::warn!(status, request_id, %reason, "failed to read upstream error response body");
     }
@@ -316,54 +317,28 @@ fn connect_failure_frame(err: &ProxyError) -> String {
 }
 
 /// The refused upgrade's body, up to the bound and the time limit of an HTTP
-/// route's error body. A compressed one stays unread: the handshake asks for no
-/// encoding and nothing here decodes one.
+/// route's error body, or until the client leaves, which on this detached task
+/// would otherwise cancel nothing. A compressed one stays unread: the handshake
+/// asks for no encoding and nothing here decodes one.
 async fn read_refused_body(
     response: &tokio_tungstenite::tungstenite::handshake::client::Response,
     stream: Option<aisix_gateway::upstream_dial::UpstreamStream>,
     budget: Option<Duration>,
+    client_gone: impl std::future::Future<Output = ()>,
 ) -> aisix_gateway::UpstreamErrorBody {
-    if response
-        .headers()
-        .contains_key(axum::http::header::CONTENT_ENCODING)
-    {
+    let headers = response.headers();
+    let coding = headers
+        .get(axum::http::header::TRANSFER_ENCODING)
+        .map(|v| v.to_str().unwrap_or_default());
+    let chunked = coding.is_some_and(|c| c.eq_ignore_ascii_case("chunked"));
+    let other_coding = coding.is_some_and(|c| !chunked && !c.eq_ignore_ascii_case("identity"));
+    if other_coding || headers.contains_key(axum::http::header::CONTENT_ENCODING) {
         return aisix_gateway::UpstreamErrorBody {
             bytes: bytes::Bytes::new(),
             read_error: None,
         };
     }
-    let read = read_body_framing(response, stream);
-    let Some(budget) = budget else {
-        return read.await;
-    };
-    tokio::time::timeout(budget, read)
-        .await
-        .unwrap_or_else(|_| aisix_gateway::UpstreamErrorBody {
-            bytes: bytes::Bytes::new(),
-            read_error: Some(format!("timed out after {}ms", budget.as_millis())),
-        })
-}
-
-/// Read the body by the framing its head declares: `Content-Length`, chunked, or
-/// up to the end of the connection. Nothing past the bound is kept or read, so a
-/// longer body reads as an HTTP route's does once cut at the same bound.
-async fn read_body_framing(
-    response: &tokio_tungstenite::tungstenite::handshake::client::Response,
-    mut stream: Option<aisix_gateway::upstream_dial::UpstreamStream>,
-) -> aisix_gateway::UpstreamErrorBody {
-    use tokio::io::AsyncReadExt as _;
-    const LIMIT: usize = aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES;
-    let done = |mut body: Vec<u8>, read_error: Option<String>| {
-        body.truncate(LIMIT);
-        aisix_gateway::UpstreamErrorBody {
-            bytes: body.into(),
-            read_error,
-        }
-    };
-    let headers = response.headers();
-    let chunked = headers.contains_key(axum::http::header::TRANSFER_ENCODING);
-    let bodyless = matches!(response.status().as_u16(), 204 | 304);
-    let declared = if bodyless {
+    let declared = if matches!(response.status().as_u16(), 204 | 304) {
         Some(0)
     } else {
         headers
@@ -371,21 +346,57 @@ async fn read_body_framing(
             .and_then(|v| v.to_str().ok()?.parse::<usize>().ok())
     };
     let mut raw = response.body().clone().unwrap_or_default();
+    let read = read_body_framing(&mut raw, chunked, declared, stream);
+    let timed = async {
+        match budget {
+            Some(budget) => tokio::time::timeout(budget, read)
+                .await
+                .unwrap_or_else(|_| Err(format!("timed out after {}ms", budget.as_millis()))),
+            None => read.await,
+        }
+    };
+    let read_error = tokio::select! {
+        outcome = timed => outcome.err(),
+        () = client_gone => Some("the client closed the session".to_string()),
+    };
+    let mut body = if chunked {
+        decode_chunked(&raw).map_or_else(Vec::new, |(body, _)| body)
+    } else {
+        raw
+    };
+    if let Some(declared) = declared {
+        body.truncate(declared);
+    }
+    body.truncate(aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES);
+    aisix_gateway::UpstreamErrorBody {
+        bytes: body.into(),
+        read_error,
+    }
+}
+
+/// Read into `raw` by the framing the head declares: `Content-Length`, chunked,
+/// or up to the end of the connection. Nothing past the bound is read, so a
+/// longer body reads as an HTTP route's does once cut at the same bound.
+async fn read_body_framing(
+    raw: &mut Vec<u8>,
+    chunked: bool,
+    declared: Option<usize>,
+    mut stream: Option<aisix_gateway::upstream_dial::UpstreamStream>,
+) -> Result<(), String> {
+    use tokio::io::AsyncReadExt as _;
+    const LIMIT: usize = aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES;
     let mut buf = [0u8; 8 * 1024];
     loop {
         if chunked {
-            match decode_chunked(&raw) {
-                Some((body, true)) => return done(body, None),
-                Some((body, false)) if body.len() >= LIMIT => return done(body, None),
-                // Framing alone cannot legitimately outgrow the body it frames.
-                Some(_) if raw.len() < 2 * LIMIT => {}
-                _ => return done(Vec::new(), Some("malformed chunked body".to_string())),
+            match decode_chunked(raw) {
+                Some((_, true)) => return Ok(()),
+                Some((body, false)) if body.len() >= LIMIT => return Ok(()),
+                // Room for a body in one-byte chunks; only broken framing gets here.
+                Some(_) if raw.len() < 8 * LIMIT => {}
+                _ => return Err("malformed chunked body".to_string()),
             }
-        } else if let Some(declared) = declared.filter(|d| raw.len() >= *d) {
-            raw.truncate(declared);
-            return done(raw, None);
-        } else if raw.len() >= LIMIT {
-            return done(raw, None);
+        } else if raw.len() >= declared.unwrap_or(LIMIT).min(LIMIT) {
+            return Ok(());
         }
         let read = match stream.as_mut() {
             Some(stream) => stream.read(&mut buf).await,
@@ -393,14 +404,11 @@ async fn read_body_framing(
         };
         match read {
             Ok(0) if chunked || declared.is_some() => {
-                return done(
-                    raw,
-                    Some("the connection closed before the whole body arrived".to_string()),
-                )
+                return Err("the connection closed before the whole body arrived".to_string())
             }
-            Ok(0) => return done(raw, None),
+            Ok(0) => return Ok(()),
             Ok(n) => raw.extend_from_slice(&buf[..n]),
-            Err(e) => return done(raw, Some(e.to_string())),
+            Err(e) => return Err(e.to_string()),
         }
     }
 }
@@ -457,9 +465,8 @@ async fn connect_upstream(
 ///
 /// The budget covers the WHOLE dial — DNS, TCP, any proxy tunnel, TLS
 /// *and* the WebSocket handshake exchange — where the HTTP routes'
-/// `connect_timeout` stops at the end of TLS. tokio-tungstenite exposes
-/// no seam between those phases, and the extra phase is the one that matters most here: an
-/// upstream that completes TLS and then never answers the upgrade is as
+/// `connect_timeout` stops at the end of TLS. The extra phase is the one
+/// that matters most here: an upstream that completes TLS and then never answers the upgrade is as
 /// stuck as one that never answers the SYN, and nothing downstream
 /// bounds it — the session's idle deadline only starts once the socket
 /// is up. Left unbounded the upgrade hangs until the kernel exhausts its
@@ -1089,19 +1096,35 @@ async fn run_session(
     // streaming HTTP route's error body has its stream budget.
     let idle_cap =
         crate::routing::effective_timeouts(&model_entry.value, None, state.default_timeouts).stream;
-    let upstream = match connect_upstream(upstream_request).await {
+    let (upstream, upgrade_request_id) = match connect_upstream(upstream_request).await {
         Ok((ws, resp)) => {
+            let upgrade_request_id = crate::usage_attr::sanitize_provider_response_id(
+                &aisix_gateway::provider_request_id(resp.headers()),
+            );
             let names = crate::client_ip::exported_header_names(&state.snapshot.load(), true);
             if !names.is_empty() {
                 upstream_response_headers =
                     aisix_gateway::capture_header_values(resp.headers(), &names);
             }
-            ws
+            (ws, upgrade_request_id)
         }
         Err(failure) => {
             tracing::warn!(error = %failure.error, model = %requested_model, "realtime upstream connect failed");
-            let (connect_err, refused) =
-                connect_failure(failure, dial_started.elapsed(), idle_cap, &request_id).await;
+            let client_gone = async {
+                while let Some(Ok(message)) = client_rx.next().await {
+                    if matches!(message, AxMessage::Close(_)) {
+                        break;
+                    }
+                }
+            };
+            let (connect_err, refused) = connect_failure(
+                failure,
+                dial_started.elapsed(),
+                idle_cap,
+                &request_id,
+                client_gone,
+            )
+            .await;
             let provider_request_id = refused
                 .as_ref()
                 .map(|r| {
@@ -1197,26 +1220,36 @@ async fn run_session(
             event.model_id = model_entry.id.clone();
             event.requested_model_id = model_entry.id.clone();
             event.provider_request_id = provider_request_id;
-            let mut content = None;
+            let model = crate::usage_attr::usage_event_model_label(&snap, &requested_model);
+            let unresolved_pk = crate::usage_attr::ResolvedPk::unresolved();
+            let labels = crate::usage_attr::usage_event_labels(&model, &unresolved_pk);
             if let Some(refused) = &refused {
                 let names = crate::client_ip::exported_header_names(&snap, true);
                 if !names.is_empty() {
                     event.upstream_response_headers =
                         aisix_gateway::capture_header_values(&refused.headers, &names);
                 }
-                content = upstream_failure_content(&snap, &refused.body);
+                event.upstream_latency_ms = crate::attempt::measured_ms(dial_started.elapsed());
+                let content = upstream_failure_content(&snap, &refused.body);
+                crate::usage_attr::emit_usage(
+                    &state,
+                    &snap,
+                    crate::operation::REALTIME,
+                    event,
+                    labels,
+                    content.as_ref(),
+                    client.trace.as_ref(),
+                    /* terminal */ true,
+                    /* dispatched */ true,
+                );
+                return;
             }
-            let model = crate::usage_attr::usage_event_model_label(&snap, &requested_model);
-            crate::usage_attr::emit_prepared_usage_event_with_content(
+            crate::usage_attr::emit_prepared_usage_event(
                 &state,
                 &snap,
                 crate::operation::REALTIME,
                 event,
-                crate::usage_attr::usage_event_labels(
-                    &model,
-                    &crate::usage_attr::ResolvedPk::unresolved(),
-                ),
-                content.as_ref(),
+                labels,
                 client.trace.as_ref(),
             );
             return;
@@ -1328,12 +1361,20 @@ async fn run_session(
                             }
                         }
                     });
-                    close_upstream(&mut up_tx, &mut up_rx, frame, &mut usage).await;
+                    close_upstream(&mut up_tx, &mut up_rx, frame, |text| {
+                        usage.absorb(text);
+                        opening.observe(&state, &model_entry.id, Some(text));
+                    })
+                    .await;
                     break;
                 }
                 Some(Ok(_)) => {} // ping/pong handled by the transports
                 Some(Err(_)) | None => {
-                    close_upstream(&mut up_tx, &mut up_rx, None, &mut usage).await;
+                    close_upstream(&mut up_tx, &mut up_rx, None, |text| {
+                        usage.absorb(text);
+                        opening.observe(&state, &model_entry.id, Some(text));
+                    })
+                    .await;
                     break;
                 }
             },
@@ -1436,8 +1477,19 @@ async fn run_session(
         )));
         refusal_frame = Some(refusal.frame);
     } else if !opening.usable {
-        crate::attempt::RoutingTelemetry::record_deployment(&state, &model_entry.id, 200);
+        // No frame took this sample. A session that an upstream failure ended
+        // says so; otherwise the upgrade itself was the success.
+        let upstream_failed = session_error
+            .as_ref()
+            .is_some_and(|e| crate::attempt::error_source(e) == aisix_obs::ErrorSource::Upstream);
+        let status = if upstream_failed { close_status } else { 200 };
+        crate::attempt::RoutingTelemetry::record_deployment(&state, &model_entry.id, status);
     }
+    let provider_request_id = if refusal_frame.is_some() {
+        upgrade_request_id
+    } else {
+        String::new()
+    };
 
     let elapsed = started.elapsed();
     let total_tokens = usage.input_tokens + usage.output_tokens;
@@ -1452,7 +1504,7 @@ async fn run_session(
         Some((&provider_label, &requested_model)),
         session_error.as_ref(),
         Some((usage.input_tokens, usage.output_tokens)),
-        None,
+        Some(provider_request_id.as_str()).filter(|id| !id.is_empty()),
     );
     // A realtime session can run for minutes, so its terminal emits read a
     // FRESH snapshot rather than the one `prepare` resolved against (#941) —
@@ -1496,6 +1548,7 @@ async fn run_session(
         // chokepoint cannot read it off the attribution cell; realtime
         // serves direct models only, which address themselves.
         requested_model_id: model_entry.id.clone(),
+        provider_request_id,
         prompt_tokens: usage.input_tokens.min(u32::MAX as u64) as u32,
         completion_tokens: usage.output_tokens.min(u32::MAX as u64) as u32,
         total_tokens: usage.upstream_total.recorded(),
@@ -1687,13 +1740,13 @@ fn session_refusal_error(text: &str) -> Option<BridgeError> {
 const UPSTREAM_CLOSE_ACK: Duration = Duration::from_secs(2);
 
 /// Close the upstream socket and wait, briefly, for its acknowledgement,
-/// so the upstream sees a completed handshake rather than a reset. Usage
-/// in the frames that arrive meanwhile (a response finishing) still counts.
+/// so the upstream sees a completed handshake rather than a reset. A text frame
+/// that arrives meanwhile (a response finishing) still goes to `on_text`.
 async fn close_upstream<T, R>(
     up_tx: &mut T,
     up_rx: &mut R,
     frame: Option<TgCloseFrame<'static>>,
-    usage: &mut SessionUsage,
+    mut on_text: impl FnMut(&str),
 ) where
     T: futures::Sink<TgMessage> + Unpin,
     R: futures::Stream<Item = Result<TgMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
@@ -1704,7 +1757,7 @@ async fn close_upstream<T, R>(
     let _ = tokio::time::timeout(UPSTREAM_CLOSE_ACK, async {
         while let Some(Ok(m)) = up_rx.next().await {
             match m {
-                TgMessage::Text(text) => usage.absorb(&text),
+                TgMessage::Text(text) => on_text(&text),
                 TgMessage::Close(_) => break,
                 _ => {}
             }
@@ -1949,7 +2002,7 @@ mod tests {
                 ),
                 stream: None,
             };
-            super::connect_failure(failure, Duration::ZERO, None, "req")
+            super::connect_failure(failure, Duration::ZERO, None, "req", std::future::pending())
                 .await
                 .0
                 .to_string()
@@ -1975,6 +2028,21 @@ mod tests {
             refused(&[], Some(whole)).await,
             quoted,
             "up to the end of the connection"
+        );
+
+        let one_byte_chunks: String = "x"
+            .repeat(30_000)
+            .chars()
+            .map(|c| format!("1\r\n{c}\r\n"))
+            .collect();
+        assert_eq!(
+            refused(
+                &[("transfer-encoding", "chunked")],
+                Some(format!("{one_byte_chunks}0\r\n\r\n").as_bytes())
+            )
+            .await,
+            format!("upstream returned HTTP 400: {}…", "x".repeat(1024)),
+            "framing that outweighs its payload is still framing"
         );
 
         let cut = "upstream returned HTTP 400: failed to read response body: \
@@ -2014,6 +2082,11 @@ mod tests {
                 "compressed",
                 vec![("content-length", "4"), ("content-encoding", "gzip")],
                 Some(&b"\x1f\x8b\x08\x00"[..]),
+            ),
+            (
+                "compressed in transfer",
+                vec![("transfer-encoding", "gzip, chunked")],
+                Some(&b"4\r\n\x1f\x8b\x08\x00\r\n0\r\n\r\n"[..]),
             ),
             ("nothing kept", vec![("content-length", "0")], None),
             (
@@ -2150,8 +2223,14 @@ mod tests {
         .expect("the dial must end on its own budget")
         .err()
         .expect("a silent upstream cannot complete the handshake");
-        let (failure, refused) =
-            connect_failure(err, Duration::from_millis(300), None, "req").await;
+        let (failure, refused) = connect_failure(
+            err,
+            Duration::from_millis(300),
+            None,
+            "req",
+            std::future::pending(),
+        )
+        .await;
         assert!(refused.is_none());
         assert!(
             matches!(

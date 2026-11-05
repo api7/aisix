@@ -80,6 +80,17 @@ const REFUSALS: Record<string, Script> = {
     await sleep(SPLIT);
     s.destroy();
   },
+  "cut-off-chunked": async (s) => {
+    s.write(`${head("500 Internal Server Error", { ...JSON_TYPE, "transfer-encoding": "chunked" })}23\r\n{"error":{"mess`);
+    await sleep(SPLIT);
+    s.destroy();
+  },
+  "stalled-long-budget": (s) => {
+    s.write(`${head("500 Internal Server Error", { ...JSON_TYPE, "content-length": 1000 })}{"error":{"mess`);
+  },
+  "stalled-no-budget": (s) => {
+    s.write(`${head("500 Internal Server Error", { ...JSON_TYPE, "content-length": 1000 })}{"error":{"mess`);
+  },
   "with-headers": async (s) => {
     const body = envelope("sentinel recorded text");
     s.write(
@@ -125,7 +136,20 @@ const SESSIONS: Record<string, Step[]> = {
   "usable-then-error-close": [{ frame: CREATED }, { frame: RECOVERABLE }, { close: [4000, "sentinel_late"] }],
   "error-before-created": [{ frame: RECOVERABLE }, { frame: CREATED }, { close: [1000, ""] }],
   "clean-session": [{ frame: CREATED }, { close: [1000, ""] }],
+  "drop-no-frames": ["drop"],
 };
+
+// Text and close frames as a server sends them, for an upstream that must answer
+// only after it has seen the gateway's own close.
+const wsFrame = (opcode: number, payload: Buffer) => {
+  const header =
+    payload.length < 126
+      ? Buffer.from([0x80 | opcode, payload.length])
+      : Buffer.from([0x80 | opcode, 126, payload.length >> 8, payload.length & 0xff]);
+  return Buffer.concat([header, payload]);
+};
+const wsText = (value: unknown) => wsFrame(1, Buffer.from(JSON.stringify(value)));
+const wsClose = wsFrame(8, Buffer.from([0x03, 0xe8]));
 
 describe("a realtime session the upstream never let start", () => {
   let app: SpawnedApp | undefined;
@@ -150,8 +174,43 @@ describe("a realtime session the upstream never let start", () => {
     return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
   }
 
+  // Sends `first` on upgrade and `afterClose` once the gateway closes its half.
+  async function drainUpstream(first: unknown[], afterClose: unknown[]): Promise<string> {
+    const server = createTcpServer((socket) => {
+      socket.on("error", () => {});
+      let upgraded = false;
+      let seen = "";
+      socket.on("data", (chunk) => {
+        if (upgraded) {
+          for (const frame of afterClose) socket.write(wsText(frame));
+          socket.end(wsClose);
+          return;
+        }
+        seen += chunk.toString("latin1");
+        if (!seen.includes("\r\n\r\n")) return;
+        upgraded = true;
+        const key = /sec-websocket-key: (.+)\r\n/i.exec(seen)![1];
+        const accept = createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
+        socket.write(
+          head("101 Switching Protocols", {
+            upgrade: "websocket",
+            connection: "Upgrade",
+            "sec-websocket-accept": accept,
+          }),
+        );
+        for (const frame of first) socket.write(wsText(frame));
+      });
+    });
+    tcpServers.push(server);
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  }
+
   async function sessionUpstream(steps: Step[]): Promise<string> {
     const server = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    server.on("headers", (headers) => {
+      headers.push("x-request-id: req-sentinel-session", "x-sentinel-region: us-sentinel");
+    });
     server.on("connection", (ws) => {
       ws.on("error", () => {});
       void (async () => {
@@ -196,7 +255,12 @@ describe("a realtime session the upstream never let start", () => {
       });
     }
     const names: string[] = [];
-    const model = async (name: string, base: string, cooldown: Record<string, unknown> = { enabled: false }) => {
+    const model = async (
+      name: string,
+      base: string,
+      cooldown: Record<string, unknown> = { enabled: false },
+      budget: Record<string, number> = { timeout: READ_BUDGET_MS, stream_timeout: READ_BUDGET_MS },
+    ) => {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
         secret: "sk-mock",
@@ -209,14 +273,21 @@ describe("a realtime session the upstream never let start", () => {
           provider: "openai",
           model_name: "m",
           provider_key_id: pk.id,
-          timeout: READ_BUDGET_MS,
-          stream_timeout: READ_BUDGET_MS,
+          ...budget,
           cooldown,
         })
       ).id;
       names.push(name);
     };
-    for (const [name, script] of Object.entries(REFUSALS)) await model(name, await scriptedUpstream(script));
+    const budgets: Record<string, Record<string, number>> = {
+      "stalled-long-budget": { timeout: 120_000, stream_timeout: 120_000 },
+      "stalled-no-budget": { timeout: 0 },
+    };
+    for (const [name, script] of Object.entries(REFUSALS)) {
+      await model(name, await scriptedUpstream(script), { enabled: false }, budgets[name]);
+    }
+    await model("drained-refusal", await drainUpstream([], [WRONG_KEY]));
+    await model("drained-usable", await drainUpstream([RECOVERABLE], [CREATED]));
     for (const [name, steps] of Object.entries(SESSIONS)) await model(name, await sessionUpstream(steps));
     const silentBase = await scriptedUpstream(REFUSALS.silent);
     await model("silent-timeout-gate-only", silentBase, { enabled: true, trigger_on_transport: false });
@@ -243,7 +314,11 @@ describe("a realtime session the upstream never let start", () => {
   });
 
   type Session = { requestId: string; frames: unknown[]; code: number; reason: string; elapsed: number };
-  const session = (model: string, onFrame?: (ws: WebSocket) => void): Promise<Session> =>
+  const session = (
+    model: string,
+    onFrame?: (ws: WebSocket) => void,
+    onOpen?: (ws: WebSocket) => void,
+  ): Promise<Session> =>
     new Promise((resolve, reject) => {
       const started = Date.now();
       const ws = new WebSocket(`${app!.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=${model}`, {
@@ -254,6 +329,7 @@ describe("a realtime session the upstream never let start", () => {
       ws.on("upgrade", (res) => {
         requestId = String(res.headers["x-aisix-request-id"] ?? "");
       });
+      ws.on("open", () => onOpen?.(ws));
       ws.on("message", (data) => {
         frames.push(JSON.parse(String(data)));
         onFrame?.(ws);
@@ -355,7 +431,30 @@ describe("a realtime session the upstream never let start", () => {
     });
   });
 
+  describe("a client that leaves while the body stalls", () => {
+    test.each(["stalled-long-budget", "stalled-no-budget"])("%s ends the read", async (model) => {
+      if (!etcdReachable) return;
+      const got = await session(model, undefined, (ws) => ws.close(1000));
+      const failure = await row(got.requestId);
+      expect(failure.get("error_message")).toBe(
+        "upstream returned HTTP 500: failed to read response body: the client closed the session",
+      );
+    });
+  });
+
   describe("the failure row of a refused handshake", () => {
+    test("holds what arrived of a body cut short, without its framing", async () => {
+      if (!etcdReachable) return;
+      expect((await row((await session("cut-off-chunked")).requestId)).get("response")).toBe('{"error":{"mess');
+      expect((await row((await session("stalled")).requestId)).get("response")).toBe('{"error":{"mess');
+    });
+
+    test("says the upstream was reached and how long it took", async () => {
+      if (!etcdReachable) return;
+      const failure = await row((await session("with-headers")).requestId);
+      expect(Number(failure.get("upstream_latency_ms"))).toBeGreaterThanOrEqual(SPLIT - 50);
+    });
+
     test("records the upstream's response and headers as chat's row does", async () => {
       if (!etcdReachable) return;
       const [http, ws] = [await chat("with-headers"), await session("with-headers")];
@@ -435,6 +534,8 @@ describe("a realtime session the upstream never let start", () => {
       expect(failure.get("error_class")).toBe("upstream_in_band");
       expect(failure.get("error_message")).toBe(`upstream reported an in-band error: ${event.error.message}`);
       expect(JSON.parse(failure.get("response")!)).toEqual(event);
+      expect(failure.get("provider_request_id")).toBe("req-sentinel-session");
+      expect(JSON.parse(failure.get("upstream_response_headers")!)).toEqual({ "x-sentinel-region": "us-sentinel" });
       await waitForLogLine(
         app!,
         (l) => l.includes(got.requestId) && l.includes(`status_code=${status}`) && l.includes(event.error.message),
@@ -445,6 +546,10 @@ describe("a realtime session the upstream never let start", () => {
       ).toBeGreaterThan(0);
       expect(await metric("aisix_requests_total", { model, status: String(status), outcome })).toBeGreaterThan(0);
       expect(await metric("aisix_deployment_success_responses_total", { model })).toBe(0);
+      expect(await metric("aisix_deployment_failure_responses_total", { model })).toBe(1);
+      const meta = await row(got.requestId, META);
+      expect(meta.get("status_code")).toBe(String(status));
+      expect(meta.get("response")).toBeUndefined();
     });
 
     test("an error followed by a normal close is a failure too", async () => {
@@ -472,6 +577,12 @@ describe("a realtime session the upstream never let start", () => {
       const failure = await row(got.requestId);
       expect(failure.get("status_code")).toBe("401");
       expect(failure.get("error_class")).toBe("upstream_in_band");
+    });
+
+    test("an error that arrives after the caller hung up still counts", async () => {
+      if (!etcdReachable) return;
+      const got = await session("drained-refusal", undefined, (ws) => ws.close(1000));
+      expect((await row(got.requestId)).get("status_code")).toBe("401");
     });
 
     test("a status on the trigger list cools the model down, named for the status", async () => {
@@ -522,6 +633,7 @@ describe("a realtime session the upstream never let start", () => {
       const ended = await row(got.requestId);
       expect(ended.get("status_code")).toBe("200");
       expect(ended.get("error_class")).toBeFalsy();
+      expect(ended.get("provider_request_id")).toBeUndefined();
     });
 
     test("an error that a non-error frame then follows leaves the session usable", async () => {
@@ -531,6 +643,22 @@ describe("a realtime session the upstream never let start", () => {
       expect((await row(got.requestId)).get("status_code")).toBe("200");
     });
 
+    test("a usable frame that arrives after the caller hung up on an error still counts", async () => {
+      if (!etcdReachable) return;
+      const got = await session("drained-usable", (ws) => ws.close(1000));
+      const ended = await row(got.requestId);
+      expect(ended.get("status_code")).toBe("200");
+      expect(ended.get("error_class")).toBeFalsy();
+    });
+
+    test("a connection dropped before any frame counts as a deployment failure", async () => {
+      if (!etcdReachable) return;
+      const got = await session("drop-no-frames");
+      expect((await row(got.requestId)).get("status_code")).toBe("502");
+      expect(await metric("aisix_deployment_success_responses_total", { model: "drop-no-frames" })).toBe(0);
+      expect(await metric("aisix_deployment_failure_responses_total", { model: "drop-no-frames" })).toBe(1);
+    });
+
     test("a close with no frames at all keeps its 200 and the gateway frame", async () => {
       if (!etcdReachable) return;
       const got = await session("no-frames-close");
@@ -538,6 +666,7 @@ describe("a realtime session the upstream never let start", () => {
         { type: "error", error: { type: "server_error", message: "upstream websocket closed with code 4000: no frames" } },
       ]);
       expect((await row(got.requestId)).get("status_code")).toBe("200");
+      expect(await metric("aisix_deployment_success_responses_total", { model: "no-frames-close" })).toBe(1);
     });
 
     test("a clean session counts one deployment success", async () => {

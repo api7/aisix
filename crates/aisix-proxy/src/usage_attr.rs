@@ -1058,22 +1058,8 @@ pub(crate) fn emit_prepared_usage_event(
     state: &ProxyState,
     snap: &AisixSnapshot,
     surface: Surface,
-    event: UsageEvent,
-    labels: UsageEventLabels<'_>,
-    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
-) {
-    emit_prepared_usage_event_with_content(state, snap, surface, event, labels, None, trace);
-}
-
-/// [`emit_prepared_usage_event`] for a surface that holds the failure's response
-/// itself, running detached from the request scope that would otherwise keep it.
-pub(crate) fn emit_prepared_usage_event_with_content(
-    state: &ProxyState,
-    snap: &AisixSnapshot,
-    surface: Surface,
     mut event: UsageEvent,
     labels: UsageEventLabels<'_>,
-    content: Option<&aisix_obs::CapturedContent>,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
 ) {
     // It speaks for no attempt of its own: after the failed attempts of a
@@ -1086,7 +1072,7 @@ pub(crate) fn emit_prepared_usage_event_with_content(
     // derivable either way — `dispatched: false` states the common case
     // (most error events never reached a provider).
     emit_usage(
-        state, snap, surface, event, labels, content, trace, true, false,
+        state, snap, surface, event, labels, None, trace, true, false,
     );
 }
 
