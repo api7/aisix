@@ -333,25 +333,13 @@ describe("an upstream's failure reads the same on every route that sends its own
     }
     await model("refused-no-answer", "openai", "http://127.0.0.1:1/v1");
     names.push("refused-no-answer");
-    const azurePk = await seed.createProviderKey({
-      display_name: "refused-azure-404-pk",
-      secret: "sk-mock",
-      provider: "azure-openai",
-      adapter: "azure-openai",
-      api_base: await fixedUpstream(
+    for (const [name, status, body, contentType] of [
+      [
+        "refused-azure-404",
         404,
         JSON.stringify({ error: { code: "DeploymentNotFound", message: `${TEXT} azure` } }),
-      ),
-    });
-    await seed.createModel({
-      display_name: "refused-azure-404",
-      provider: "azure-openai",
-      model_name: "m",
-      provider_key_id: azurePk.id,
-      cooldown: { enabled: false },
-    });
-    names.push("refused-azure-404");
-    for (const [name, status, body, contentType] of [
+        "application/json",
+      ],
       ["azure-no-deployment", 404, AZURE_NO_DEPLOYMENT, null],
       ["azure-bad-param", 400, AZURE_BAD_PARAM, "application/json"],
     ] as const) {
@@ -644,6 +632,16 @@ describe("an upstream's failure reads the same on every route that sends its own
         param: "temperature",
       });
     });
+  });
+
+  test("azure 4xx on messages keeps the upstream's text under its status-mapped type", async () => {
+    if (!etcdReachable) return;
+    const got = await send(
+      "/v1/messages",
+      json({ model: "azure-no-deployment", messages: [{ role: "user", content: "hi" }], max_tokens: 5 }),
+    );
+    expect(got.status).toBe(404);
+    expect(got.body.error).toEqual({ type: "not_found_error", message: AZURE_NO_DEPLOYMENT_TEXT });
   });
 
   test("a top-level message is read out of the body too", async () => {

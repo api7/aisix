@@ -683,12 +683,6 @@ pub fn parse_retry_after(headers: &http::HeaderMap) -> Option<Duration> {
 /// [`BridgeError::UpstreamStatus`] with a best-effort parsed view of
 /// the envelope.
 ///
-/// The `parse` closure runs only when the response declares an
-/// `application/json` content-type — this guards against fronting WAFs
-/// or load balancers returning HTML error pages that would otherwise be
-/// fed to a JSON parser and either fail expensively or surface
-/// nonsensical fragments.
-///
 /// `parse` returning `None` is treated as "envelope shape unknown"; the
 /// message then comes from [`upstream_error_message`], which reads the other
 /// shapes an upstream's text arrives in and keeps a non-JSON body as sent.

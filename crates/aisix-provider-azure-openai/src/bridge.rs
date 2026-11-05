@@ -527,15 +527,29 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
 /// outer `code` so the gateway can recognise the policy hit even when
 /// the outer code is the generic `invalid_request_error`.
 fn parse_azure_error_envelope(body: &[u8]) -> Option<aisix_gateway::UpstreamErrorView> {
+    #[derive(serde::Deserialize)]
+    struct Outer {
+        error: Inner,
+    }
+    #[derive(serde::Deserialize)]
+    struct Inner {
+        inner_error: Option<InnerInner>,
+        innererror: Option<InnerInner>,
+    }
+    #[derive(serde::Deserialize)]
+    struct InnerInner {
+        code: Option<String>,
+    }
     const POLICY_VIOLATION: &str = "ResponsibleAIPolicyViolation";
     let mut view = aisix_provider_openai::parse_openai_error_envelope(body)?;
-    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let error = &parsed["error"];
-    let inner = error.get("inner_error").or_else(|| error.get("innererror"));
-    let policy_hit =
-        inner.and_then(|i| i.get("code")).and_then(|c| c.as_str()) == Some(POLICY_VIOLATION);
-    if policy_hit {
-        view.code = Some(POLICY_VIOLATION.to_string());
+    let inner_code = serde_json::from_slice::<Outer>(body).ok().and_then(|o| {
+        o.error
+            .inner_error
+            .or(o.error.innererror)
+            .and_then(|i| i.code)
+    });
+    if inner_code.as_deref() == Some(POLICY_VIOLATION) {
+        view.code = inner_code;
     }
     view.kind = view.code.clone();
     Some(view)
@@ -2017,8 +2031,8 @@ mod tests {
         }
     }
 
-    /// Copilot review (PR #323): Azure's envelope only has `error.code`
-    /// (no separate `type`). For OpenAI-compatible tokens that Azure
+    /// Copilot review (PR #323): the translation table keys on Azure's
+    /// `error.code`, not its `type`. For OpenAI-compatible tokens that Azure
     /// inherits unchanged (e.g. `rate_limit_exceeded`), the bridge
     /// must populate BOTH `parsed.kind` AND `parsed.code` from the
     /// upstream — otherwise the downstream OpenAI client receives
@@ -2054,13 +2068,10 @@ mod tests {
         }
     }
 
-    /// Copilot review (PR #323): when upstream returns a non-JSON
-    /// body (HTML error page from Azure Front Door, etc.), the parser
-    /// must skip the serde attempt rather than try to deserialize
-    /// `<html>...</html>` as JSON. Same content-type guard as
-    /// `capture_upstream_error_http`.
+    /// A non-JSON body (HTML error page from Azure Front Door, etc.)
+    /// yields no parsed view.
     #[tokio::test]
-    async fn chat_400_non_json_body_skips_envelope_parse() {
+    async fn chat_400_non_json_body_has_no_parsed_view() {
         let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
