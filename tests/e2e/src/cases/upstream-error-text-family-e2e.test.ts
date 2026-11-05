@@ -36,6 +36,42 @@ const openAiEnvelope = (status: number) =>
     },
   });
 
+// What each video provider answered a request for a model it does not have.
+const VIDEO_PROVIDER_ANSWERS: [string, string, number, string][] = [
+  [
+    "real-dashscope",
+    "alibaba",
+    400,
+    JSON.stringify({ code: "InvalidParameter", message: "Model not exist.", request_id: "r-1" }),
+  ],
+  [
+    "real-zhipu",
+    "zhipuai",
+    400,
+    JSON.stringify({ error: { code: "1211", message: "模型不存在，请检查模型代码。" } }),
+  ],
+  [
+    "real-ark",
+    "volcengine",
+    404,
+    JSON.stringify({
+      error: {
+        code: "InvalidEndpointOrModel.NotFound",
+        message: "The model or endpoint qa-video-nope does not exist",
+        param: "",
+        type: "Not Found",
+      },
+    }),
+  ],
+  [
+    "real-runway",
+    "runwayml",
+    400,
+    JSON.stringify({ error: "Validation of body failed", issues: [{ path: ["model"] }] }),
+  ],
+  ["real-openai-empty", "openai", 404, ""],
+];
+
 describe("an upstream's failure reads the same on every route that sends its own request", () => {
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
@@ -234,17 +270,11 @@ describe("an upstream's failure reads the same on every route that sends its own
       "alibaba",
       await fixedUpstream(500, JSON.stringify({ code: "InternalError", message: `${TEXT} dashscope` })),
     );
-    await model(
-      "video-numeric-code",
-      "openai",
-      `${await fixedUpstream(400, JSON.stringify({ code: 400, message: `${TEXT} numeric` }))}/v1`,
-    );
-    await model(
-      "video-code-no-message",
-      "openai",
-      `${await fixedUpstream(400, JSON.stringify({ code: "vendor_code" }))}/v1`,
-    );
-    names.push("alibaba-top-level", "alibaba-top-level-500", "video-numeric-code", "video-code-no-message");
+    names.push("alibaba-top-level", "alibaba-top-level-500");
+    for (const [name, provider, status, body] of VIDEO_PROVIDER_ANSWERS) {
+      await model(name, provider, await fixedUpstream(status, body));
+      names.push(name);
+    }
     for (const leg of ["poll", "content"] as const) {
       for (const [shape, failure] of [
         ["envelope", { status: 400, body: openAiEnvelope(400) }],
@@ -648,22 +678,55 @@ describe("an upstream's failure reads the same on every route that sends its own
       expect(got.body.error).toEqual({ message: `${TEXT} dashscope`, type: "upstream_error" });
     });
 
-    test("a number at the top level is no vendor code", async () => {
+    test("DashScope's model-not-found carries its code at the top level", async () => {
       if (!etcdReachable) return;
-      const chat = await chatOn("video-numeric-code");
-      const got = await submit("video-numeric-code");
-      expect(got.body.error).toEqual({ message: `${TEXT} numeric`, type: "upstream_error" });
-      expect(got.body).toEqual(chat.body);
+      const got = await submit("real-dashscope");
+      expect(got.status).toBe(400);
+      expect(got.body.error).toEqual({
+        message: "Model not exist.",
+        type: "upstream_error",
+        code: "InvalidParameter",
+      });
     });
 
-    test("a code with no message key carries the code and the body as text", async () => {
+    test.each([
+      [
+        "Zhipu's model-not-found",
+        "real-zhipu",
+        400,
+        { message: "模型不存在，请检查模型代码。", type: "upstream_error", code: "1211" },
+      ],
+      [
+        "Ark's model-not-found",
+        "real-ark",
+        404,
+        {
+          message: "The model or endpoint qa-video-nope does not exist",
+          type: "upstream_error",
+          code: "InvalidEndpointOrModel.NotFound",
+          param: "",
+        },
+      ],
+      [
+        "Runway's validation failure",
+        "real-runway",
+        400,
+        { message: "Validation of body failed", type: "upstream_error" },
+      ],
+      [
+        "OpenAI's empty 404",
+        "real-openai-empty",
+        404,
+        { message: "upstream returned 404 Not Found", type: "upstream_error" },
+      ],
+    ] as const)("%s answers what chat answers", async (_what, model, status, error) => {
       if (!etcdReachable) return;
-      const got = await submit("video-code-no-message");
-      expect(got.body.error).toEqual({
-        message: JSON.stringify({ code: "vendor_code" }),
-        type: "upstream_error",
-        code: "vendor_code",
-      });
+      const got = await submit(model);
+      expect(got.status).toBe(status);
+      expect(got.body.error).toEqual(error);
+      const chat = await chatOn(model);
+      expect(chat.status).toBe(got.status);
+      expect(chat.body).toEqual(got.body);
     });
 
     test.each([

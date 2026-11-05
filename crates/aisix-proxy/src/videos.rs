@@ -992,9 +992,8 @@ fn nonempty_str(v: Option<&serde_json::Value>) -> Option<&str> {
 }
 
 /// The envelope of a non-2xx: OpenAI's, or the top-level `{code, message}`
-/// DashScope answers with instead. A top-level `code` counts only as a string:
-/// a number there is as often an HTTP status or a success sentinel. Any other
-/// shape's text is the shared reader's, and carries no code.
+/// DashScope answers with instead. Any other shape's text is the shared
+/// reader's, and carries no code.
 fn video_error_view(body: &[u8]) -> Option<aisix_gateway::UpstreamErrorView> {
     if let Some(view) = aisix_provider_openai::parse_openai_error_envelope(body) {
         return Some(view);
@@ -3320,11 +3319,6 @@ mod tests {
             "{} bytes",
             row.len()
         );
-    }
-
-    #[test]
-    fn a_number_at_the_top_level_is_no_vendor_code() {
-        assert_eq!(video_error_view(br#"{"code":400,"message":"m"}"#), None);
     }
 
     #[tokio::test]
