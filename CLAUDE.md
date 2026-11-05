@@ -119,6 +119,10 @@ This covers a validation that got stricter (an existing resource that no longer 
 - **Never gate the guardrail chain on having found text to scan.** "Nothing to scan" is not "nothing to decide": a `kind: custom` row's verdict can be independent of the text, so a call site that skips the chain when its collect walk came back empty converts an operator's block rule into a silent allow. The call site always consults the chain; only a guardrail kind may decide it needs text, and every remote kind already self-guards, so consulting costs no provider round-trip. `crates/aisix-proxy/src/guardrail_coverage.rs` enforces this: it parses the routing table out of `build_router`'s own source, so a new route fails the census until it declares a posture, and every surface declared `Enforced` is driven against an unconditional-block guardrail.
 - Prefer hoisting the shared logic into one chokepoint (e.g. `resolve_attempt_models`) so the family can't drift again.
 
+## An Upstream Error Shape Needs a Provider That Sends It
+
+A mock upstream that returns an unusual or malformed failure proves a branch works, not that the branch should exist. Before adding or changing code for an upstream error shape, check that a real provider returns it, then read how LiteLLM and the API's main client treat it: Claude Code for the Messages API, Codex for the Responses API, the OpenAI SDK for Chat Completions. If no provider answers that way, don't handle it: code for a failure nobody sends never runs, and chasing every error a mock can construct is how these paths grow redundant.
+
 ## A Request Field Is Handled by the Target Platform's Contract
 
 **Every time the gateway builds an upstream request — same protocol or translated — it handles each client field by what the target platform's documented contract defines for it:**
