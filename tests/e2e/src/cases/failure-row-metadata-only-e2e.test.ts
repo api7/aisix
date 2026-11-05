@@ -414,11 +414,11 @@ describe("failure rows name the failure under metadata_only", () => {
     },
   );
 
-  test("realtime: a refusal whose detail had not arrived claims nothing about it", async (ctx) => {
+  test("realtime: a refusal whose detail never arrived names the failed read", async (ctx) => {
     if (!etcdReachable) return ctx.skip();
     const row = await refusedRealtime("meta-realtime-late-detail");
-    expect(row.get("error_message")).toBe(
-      "upstream returned HTTP 400 during the realtime handshake",
+    expect(row.get("error_message")).toMatch(
+      /^upstream returned HTTP 400: failed to read response body: .+/,
     );
   });
 

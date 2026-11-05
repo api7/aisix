@@ -728,11 +728,11 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
           return {
             legacy: metricDelta(before, after, "aisix_requests_total", {
               model: "realtime-e2e-silent-model",
-              status: "502",
+              status: "504",
             }),
             proxy: metricDelta(before, after, "aisix_proxy_requests_total", {
               endpoint: "/v1/realtime",
-              status: "502",
+              status: "504",
             }),
           };
         },

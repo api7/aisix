@@ -59,6 +59,15 @@ async fn tcp(host: &str, port: u16) -> io::Result<TcpStream> {
 }
 
 /// An IPv6 literal without the brackets a URI puts around it.
+/// Run the deployment's outbound TLS over a stream from [`connect`]. `host` is
+/// spelled as there.
+pub async fn connect_tls(stream: UpstreamStream, host: &str) -> io::Result<UpstreamStream> {
+    let name = rustls::pki_types::ServerName::try_from(bare(host).to_owned())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let tls = tokio_rustls::TlsConnector::from(crate::upstream_tls::rustls_client_config());
+    Ok(Box::new(tls.connect(name, stream).await?))
+}
+
 fn bare(host: &str) -> &str {
     host.trim_start_matches('[').trim_end_matches(']')
 }
