@@ -1511,6 +1511,19 @@ impl Telemetry<'_> {
         );
     }
 
+    /// A failure before the request had a target. `model` is the row it got
+    /// as far as, if any; a video id itself is caller-controlled text and
+    /// never a label.
+    fn finish_without_target(&self, err: ProxyError, model: Option<&str>) -> Response {
+        self.finish(
+            err.status().as_u16(),
+            "unknown",
+            model.unwrap_or(crate::usage_attr::UNRESOLVED_MODEL_LABEL),
+            Some(&err),
+        );
+        err.into_response()
+    }
+
     /// [`Self::finish`] for the submit, whose dispatch can fail over to
     /// another Model Group target: the access log carries its routing
     /// summary, the request series its `is_fallback`.
@@ -1648,13 +1661,7 @@ pub async fn create_video(
             // invalid_request_error, not axum's stock 422.
             let err =
                 crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes);
-            telemetry.finish(
-                err.status().as_u16(),
-                "unknown",
-                crate::usage_attr::UNRESOLVED_MODEL_LABEL,
-                Some(&err),
-            );
-            return err.into_response();
+            return telemetry.finish_without_target(err, None);
         }
     };
     let model_name = body.model.clone();
@@ -2059,21 +2066,33 @@ fn resolve_get_target(
     auth: &AuthenticatedKey,
     video_id: &str,
     client_ctx: &ClientContext,
-) -> Result<(VideoTarget, String, String), ProxyError> {
-    let (entry_id, alias, task_id) =
-        decode_video_id(video_id).ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
-    let model_entry = snapshot
-        .models
-        .get_by_id(&entry_id)
-        .ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
+) -> Result<(VideoTarget, String, String), GetTargetFailure> {
+    let not_found = || GetTargetFailure {
+        err: ProxyError::VideoNotFound(video_id.to_string()),
+        model: None,
+    };
+    let (entry_id, alias, task_id) = decode_video_id(video_id).ok_or_else(not_found)?;
+    let model_entry = snapshot.models.get_by_id(&entry_id).ok_or_else(not_found)?;
+    let display_name = model_entry.value.display_name.clone();
     match resolve_video_target(snapshot, auth, model_entry, &alias, client_ctx) {
         Ok(Ok(target)) => Ok((target, task_id, alias)),
         // Unsupported provider → uniform 404 (oracle fold, see above).
-        Ok(Err(_)) => Err(ProxyError::VideoNotFound(video_id.to_string())),
+        Ok(Err(_)) => Err(not_found()),
         // ACL denial → uniform 404 (oracle fold, see above).
-        Err(ProxyError::ModelForbidden(_)) => Err(ProxyError::VideoNotFound(video_id.to_string())),
-        Err(e) => Err(e),
+        Err(ProxyError::ModelForbidden(_)) => Err(not_found()),
+        Err(err) => Err(GetTargetFailure {
+            err,
+            model: Some(display_name),
+        }),
     }
+}
+
+/// Why a follow-up route has no target, and the model its telemetry names:
+/// `None` for the outcomes answered as a uniform 404, so an id probing a
+/// row the caller cannot use does not count as that row's traffic.
+struct GetTargetFailure {
+    err: ProxyError,
+    model: Option<String>,
 }
 
 /// Whether `group` names a Model Group with `target` among its targets.
@@ -2108,9 +2127,15 @@ pub async fn get_video(
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
 
-    let result: Result<(Response, String, String), ProxyError> = async {
-        let (target, task_id, requested_alias) =
-            resolve_get_target(&snapshot, &auth, &video_id, &client)?;
+    let (target, task_id, requested_alias) =
+        match resolve_get_target(&snapshot, &auth, &video_id, &client) {
+            Ok(resolved) => resolved,
+            Err(failure) => {
+                return telemetry.finish_without_target(failure.err, failure.model.as_deref())
+            }
+        };
+
+    let result: Result<Response, ProxyError> = async {
         // Poll traffic is exempt from model-level limits BY DESIGN
         // (AISIX-Cloud#1118 decision 3): a client polling a task it
         // already paid an RPM slot to submit must not starve itself.
@@ -2138,26 +2163,18 @@ pub async fn get_video(
                 target.display_name()
             };
         let video = video_object_from_poll(&video_id, echoed, &poll);
-        Ok((
-            Json(video).into_response(),
-            target.provider_label.clone(),
-            target.display_name().to_string(),
-        ))
+        Ok(Json(video).into_response())
     }
     .await;
 
+    let (provider, model_label) = (&target.provider_label, target.display_name());
     match result {
-        Ok((resp, provider, model_label)) => {
-            telemetry.finish(resp.status().as_u16(), &provider, &model_label, None);
+        Ok(resp) => {
+            telemetry.finish(resp.status().as_u16(), provider, model_label, None);
             resp
         }
         Err(err) => {
-            telemetry.finish(
-                err.status().as_u16(),
-                "unknown",
-                crate::usage_attr::UNRESOLVED_MODEL_LABEL,
-                Some(&err),
-            );
+            telemetry.finish(err.status().as_u16(), provider, model_label, Some(&err));
             err.into_response()
         }
     }
@@ -2189,8 +2206,14 @@ pub async fn video_content(
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
 
-    let result: Result<(Response, String, String, bool), ProxyError> = async {
-        let (target, task_id, _) = resolve_get_target(&snapshot, &auth, &video_id, &client)?;
+    let (target, task_id, _) = match resolve_get_target(&snapshot, &auth, &video_id, &client) {
+        Ok(resolved) => resolved,
+        Err(failure) => {
+            return telemetry.finish_without_target(failure.err, failure.model.as_deref())
+        }
+    };
+
+    let result: Result<(Response, bool), ProxyError> = async {
         // Same model-layer exemption as the poll route (see get_video).
         let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
         crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_id)?;
@@ -2265,28 +2288,19 @@ pub async fn video_content(
                 )));
             }
         };
-        Ok((
-            response,
-            target.provider_label.clone(),
-            target.display_name().to_string(),
-            relays_body,
-        ))
+        Ok((response, relays_body))
     }
     .await;
 
+    let (provider, model_label) = (&target.provider_label, target.display_name());
     match result {
-        Ok((resp, provider, model_label, relays_body)) => {
+        Ok((resp, relays_body)) => {
             telemetry.duration_spans_body = relays_body;
-            telemetry.finish(resp.status().as_u16(), &provider, &model_label, None);
+            telemetry.finish(resp.status().as_u16(), provider, model_label, None);
             resp
         }
         Err(err) => {
-            telemetry.finish(
-                err.status().as_u16(),
-                "unknown",
-                crate::usage_attr::UNRESOLVED_MODEL_LABEL,
-                Some(&err),
-            );
+            telemetry.finish(err.status().as_u16(), provider, model_label, Some(&err));
             err.into_response()
         }
     }
