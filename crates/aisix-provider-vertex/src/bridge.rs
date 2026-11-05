@@ -6276,9 +6276,8 @@ mod tests {
     }
 
     /// Copilot review (PR #323): non-JSON body (HTML error page from a
-    /// fronting load balancer) must NOT trigger serde parsing — the
-    /// bridge applies the same content-type guard as
-    /// `capture_upstream_error_http`.
+    /// fronting load balancer) must NOT trigger serde parsing: the bridge
+    /// reads `error.status` only from a body labelled JSON.
     #[tokio::test]
     async fn chat_gemini_non_json_body_skips_envelope_parse() {
         let server = MockServer::builder().start().await;

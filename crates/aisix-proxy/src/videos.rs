@@ -1001,7 +1001,6 @@ fn video_error_view(body: &[u8]) -> Option<aisix_gateway::UpstreamErrorView> {
     let top: serde_json::Value = serde_json::from_slice(body).ok()?;
     Some(aisix_gateway::UpstreamErrorView {
         code: Some(nonempty_str(top.get("code"))?.to_string()),
-        param: nonempty_str(top.get("param")).map(str::to_string),
         ..Default::default()
     })
 }

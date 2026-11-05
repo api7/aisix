@@ -577,7 +577,7 @@ describe("an upstream's failure reads the same on every route that sends its own
       expect(row.get("error_message")).toBe(rowText);
     });
 
-    test("an empty error body reads on the row as chat's does", async () => {
+    test("an empty error body records the text chat records", async () => {
       if (!etcdReachable) return;
       const chat = await send(
         "/v1/chat/completions",

@@ -365,8 +365,7 @@ pub enum BridgeError {
         retry_after: Option<Duration>,
         /// What `Display` says instead of the `message` wording, when the
         /// caller's text is not the diagnosis. See
-        /// [`with_body_read_error`](Self::with_body_read_error) and
-        /// [`with_telemetry_detail`](Self::with_telemetry_detail).
+        /// [`with_body_read_error`](Self::with_body_read_error).
         diagnostic: Option<String>,
     },
     /// A non-2xx whose body could not be read, on a route that reports that
@@ -524,18 +523,6 @@ impl BridgeError {
             *diagnostic = Some(format!(
                 "upstream returned HTTP {status}: failed to read response body: {reason}"
             ));
-        }
-        self
-    }
-
-    /// Have `Display` report `detail` as this `UpstreamStatus`'s message, for
-    /// a route whose caller is sent other text than what the upstream said.
-    pub fn with_telemetry_detail(mut self, detail: &str) -> Self {
-        if let Self::UpstreamStatus {
-            status, diagnostic, ..
-        } = &mut self
-        {
-            *diagnostic = Some(upstream_status_display(*status, detail, None));
         }
         self
     }
@@ -923,7 +910,7 @@ impl UpstreamErrorBody {
 /// full-content exports ([`crate::response_tap::note_upstream_error_body`])
 /// and logs a failed read.
 ///
-/// Public so non-OpenAI / non-Anthropic bridges (Vertex, Azure) can
+/// Public so non-OpenAI / non-Anthropic bridges (Vertex) can
 /// enforce the same cap when they need a custom parse path (e.g.
 /// extracting only `kind` from the upstream envelope while suppressing
 /// the `message` for operator-taxonomy redaction).
@@ -966,9 +953,8 @@ pub async fn read_body_capped(resp: reqwest::Response, limit: usize) -> Upstream
 /// allows a trailing `; charset=…` parameter, so a prefix match is the
 /// right shape here — exact equality misses `application/json; charset=utf-8`).
 ///
-/// Public so non-OpenAI / non-Anthropic bridges (Vertex, Azure) can
-/// apply the same JSON-only guard when they need a custom parse path
-/// that doesn't route through [`capture_upstream_error_http`].
+/// Public so a bridge with a custom parse path that doesn't route through
+/// [`capture_upstream_error_http`] can apply a JSON-only guard, as Vertex does.
 pub fn content_type_is_json(ct: &str) -> bool {
     let ct = ct.trim_start();
     ct.starts_with("application/json")
@@ -1351,18 +1337,6 @@ mod tests {
             unreachable!()
         };
         assert_eq!(message, "fragment");
-        assert_eq!(
-            BridgeError::upstream_status(502, "upstream error")
-                .with_telemetry_detail("real detail")
-                .to_string(),
-            "upstream returned HTTP 502: real detail"
-        );
-        assert_eq!(
-            BridgeError::upstream_status(502, "upstream error")
-                .with_telemetry_detail("")
-                .to_string(),
-            "upstream returned HTTP 502 with no error detail in the response"
-        );
         // An error frame keeps the plain wording whatever `Display` says.
         assert_eq!(
             BridgeError::upstream_status(500, "").stream_frame_message(),
