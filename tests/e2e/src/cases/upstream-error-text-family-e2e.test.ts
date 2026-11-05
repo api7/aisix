@@ -633,7 +633,7 @@ describe("an upstream's failure reads the same on every route that sends its own
       send("/v1/chat/completions", json({ model, messages: [{ role: "user", content: "hi" }] }));
     const submit = (model: string) => send("/v1/videos", json({ model, prompt: "hi" }));
 
-    test("a vendor's bare code is the caller's code and stays in the row", async () => {
+    test("a vendor's bare code is the caller's code; the row reads as chat's", async () => {
       if (!etcdReachable) return;
       const got = await submit("video-code-only");
       expect(got.status).toBe(400);
@@ -642,8 +642,9 @@ describe("an upstream's failure reads the same on every route that sends its own
         type: "upstream_error",
         code: "vendor_code",
       });
+      const chat = await chatOn("video-code-only");
       expect(await rowMessage(got.requestId, "the code-only row")).toBe(
-        "upstream returned HTTP 400: vendor_code",
+        await rowMessage(chat.requestId, "chat's code-only row"),
       );
     });
 

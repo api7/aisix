@@ -1007,33 +1007,20 @@ fn video_error_view(body: &[u8]) -> Option<aisix_gateway::UpstreamErrorView> {
 }
 
 /// The typed error of a non-2xx body, read as a bridge reads chat's. Past the
-/// error-body cap it is not parsed, however much of it was read. A vendor's
-/// bare code is no text for the caller, who gets it as `code`, but it is all
-/// the row and the access log have to report.
+/// error-body cap it is not parsed, however much of it was read.
 fn provider_status_error(
     status: u16,
     body: &[u8],
     retry_after: Option<Duration>,
 ) -> aisix_gateway::BridgeError {
     let body = &body[..body.len().min(aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES)];
-    let err = aisix_gateway::upstream_status_of_body(
+    aisix_gateway::upstream_status_of_body(
         status,
         body,
         retry_after,
         aisix_gateway::UpstreamWire::OpenAI,
         video_error_view,
-    );
-    let has_text = aisix_gateway::upstream_error_text(body).is_some_and(|t| !t.trim().is_empty());
-    let code = match &err {
-        aisix_gateway::BridgeError::UpstreamStatus {
-            parsed: Some(view), ..
-        } if !has_text => view.code.clone(),
-        _ => None,
-    };
-    match code {
-        Some(code) => err.with_telemetry_detail(&code),
-        None => err,
-    }
+    )
 }
 
 // ─────────────────────── resolved dispatch target ───────────────────────
@@ -3306,19 +3293,6 @@ mod tests {
                     .unwrap();
             assert_eq!(poll.status(), StatusCode::OK);
         }
-    }
-
-    #[test]
-    fn a_vendors_bare_code_reaches_the_row_capped() {
-        let long = "x".repeat(5000);
-        let body = serde_json::json!({"code": long, "message": ""}).to_string();
-        let row = provider_status_error(400, body.as_bytes(), None).to_string();
-        assert!(row.contains("xxx"), "{row}");
-        assert!(
-            row.len() <= aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES + 64,
-            "{} bytes",
-            row.len()
-        );
     }
 
     #[tokio::test]
