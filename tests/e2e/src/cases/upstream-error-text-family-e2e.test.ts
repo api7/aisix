@@ -170,6 +170,37 @@ describe("an upstream's failure reads the same on every route that sends its own
       await model(`anthropic-${shape}`, "anthropic", base);
       names.push(`openai-${shape}`, `anthropic-${shape}`);
     }
+    for (const [name, status, body] of [
+      ["refused-401", 401, openAiEnvelope(401)],
+      ["refused-429", 429, openAiEnvelope(429)],
+      ["refused-500", 500, openAiEnvelope(500)],
+      ["refused-500-empty", 500, ""],
+      ["refused-200-body", 200, `${TEXT} not an upgrade`],
+      ["refused-200-long", 200, "x".repeat(2048)],
+    ] as const) {
+      await model(name, "openai", `${await fixedUpstream(status, body)}/v1`);
+      names.push(name);
+    }
+    await model("refused-no-answer", "openai", "http://127.0.0.1:1/v1");
+    names.push("refused-no-answer");
+    const azurePk = await seed.createProviderKey({
+      display_name: "refused-azure-404-pk",
+      secret: "sk-mock",
+      provider: "azure-openai",
+      adapter: "azure-openai",
+      api_base: await fixedUpstream(
+        404,
+        JSON.stringify({ error: { code: "DeploymentNotFound", message: `${TEXT} azure` } }),
+      ),
+    });
+    await seed.createModel({
+      display_name: "refused-azure-404",
+      provider: "azure-openai",
+      model_name: "m",
+      provider_key_id: azurePk.id,
+      cooldown: { enabled: false },
+    });
+    names.push("refused-azure-404");
     await seed.createApiKey({ key_hash: sha256(CALLER), allowed_routes: ["*"], allowed_models: names });
 
     await waitConfigPropagation(async () => {
@@ -218,19 +249,22 @@ describe("an upstream's failure reads the same on every route that sends its own
   const rowMessage = async (requestId: string, what: string) =>
     (await finalRow(requestId, what)).get("error_message");
 
-  const refusedHandshake = (model: string) =>
-    new Promise<string>((resolve, reject) => {
+  const refusal = (model: string) =>
+    new Promise<{ requestId: string; frames: unknown[]; code: number; reason: string }>((resolve, reject) => {
       const ws = new WebSocket(
         `${app!.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=${model}`,
         { headers: { authorization: `Bearer ${CALLER}` } },
       );
-      let id = "";
+      let requestId = "";
+      const frames: unknown[] = [];
       ws.on("upgrade", (res) => {
-        id = String(res.headers["x-aisix-request-id"] ?? "");
+        requestId = String(res.headers["x-aisix-request-id"] ?? "");
       });
-      ws.on("close", () => resolve(id));
+      ws.on("message", (data) => frames.push(JSON.parse(String(data))));
+      ws.on("close", (code, reason) => resolve({ requestId, frames, code, reason: String(reason) }));
       ws.on("error", reject);
     });
+  const refusedHandshake = async (model: string) => (await refusal(model)).requestId;
 
   const DECISION_QUESTIONS = [{ type: "predicate", name: "q", instructions: "i" }];
   const ROUTES: [string, string, (model: string) => RequestInit, "openai" | "cohere"][] = [
@@ -287,25 +321,107 @@ describe("an upstream's failure reads the same on every route that sends its own
     });
   });
 
-  test.each<[number, string]>([
-    [401, "client_error"],
-    [429, "rate_limited"],
-    [500, "upstream_error"],
-    [400, "client_error"],
-  ])("a realtime handshake refused with %i is recorded under that status", async (upstream, outcome) => {
+  test.each<[number, number, string]>([
+    [401, 401, "client_error"],
+    [429, 429, "rate_limited"],
+    [500, 502, "upstream_error"],
+    [400, 400, "client_error"],
+  ])("a realtime handshake refused with %i is recorded as %i", async (upstream, recorded, outcome) => {
     if (!etcdReachable) return;
     const model = `openai-${upstream}`;
     const requestId = await refusedHandshake(model);
     const row = await finalRow(requestId, "the realtime row");
-    expect(row.get("status_code")).toBe(String(upstream));
+    expect(row.get("status_code")).toBe(String(recorded));
     await waitForLogLine(
       app!,
-      (l) => l.includes(requestId) && l.includes(`status_code=${upstream}`),
+      (l) => l.includes(requestId) && l.includes(`status_code=${recorded}`),
       "the realtime access-log line",
     );
     const metrics = await scrapeMetrics(app!.metricsUrl);
-    expect(sumMetric(metrics, "aisix_proxy_requests_total", { endpoint: "/v1/realtime", status: String(upstream) })).toBeGreaterThan(0);
-    expect(sumMetric(metrics, "aisix_requests_total", { model, status: String(upstream), outcome })).toBeGreaterThan(0);
+    expect(sumMetric(metrics, "aisix_proxy_requests_total", { endpoint: "/v1/realtime", status: String(recorded) })).toBeGreaterThan(0);
+    expect(sumMetric(metrics, "aisix_requests_total", { model, status: String(recorded), outcome })).toBeGreaterThan(0);
+  });
+
+  test("a realtime handshake refused with a 5xx is not counted under that 5xx", async () => {
+    if (!etcdReachable) return;
+    await finalRow(await refusedHandshake("openai-500"), "the realtime row");
+    const metrics = await scrapeMetrics(app!.metricsUrl);
+    expect(sumMetric(metrics, "aisix_proxy_requests_total", { endpoint: "/v1/realtime", status: "500" })).toBe(0);
+  });
+
+  describe("a refused realtime handshake reaches the caller as an HTTP route's error would", () => {
+    const fixedText = "failed to connect to the upstream realtime endpoint";
+    const answered = (status: number) =>
+      `upstream returned HTTP ${status}: ${TEXT} ${status}`;
+    test.each<[string, Record<string, string>, number, string, string]>([
+      [
+        "refused-401",
+        { type: "upstream_error", message: `${TEXT} 401`, code: "sentinel_code_401", param: "sentinel_param_401" },
+        401,
+        "upstream_status",
+        answered(401),
+      ],
+      [
+        "refused-429",
+        { type: "upstream_error", message: `${TEXT} 429`, code: "sentinel_code_429", param: "sentinel_param_429" },
+        429,
+        "upstream_status",
+        answered(429),
+      ],
+      ["refused-500", { type: "upstream_error", message: `${TEXT} 500` }, 502, "upstream_status", answered(500)],
+      [
+        "refused-500-empty",
+        { type: "upstream_error", message: "upstream returned 500 Internal Server Error" },
+        502,
+        "upstream_status",
+        "upstream returned HTTP 500 during the realtime handshake",
+      ],
+      [
+        "refused-200-body",
+        { type: "upstream_error", message: `${TEXT} not an upgrade` },
+        502,
+        "upstream_status",
+        `upstream returned HTTP 200: ${TEXT} not an upgrade`,
+      ],
+      [
+        "refused-azure-404",
+        { type: "upstream_error", message: `${TEXT} azure`, code: "DeploymentNotFound" },
+        404,
+        "upstream_status",
+        `upstream returned HTTP 404: ${TEXT} azure`,
+      ],
+    ])("%s", async (model, error, status, errorClass, rowText) => {
+      if (!etcdReachable) return;
+      const got = await refusal(model);
+      expect(got.frames).toEqual([{ type: "error", error }]);
+      expect(got.code).toBe(1011);
+      expect(got.reason).toBe("upstream connect failed");
+      const row = await finalRow(got.requestId, "the realtime row");
+      expect(row.get("status_code")).toBe(String(status));
+      expect(row.get("error_class")).toBe(errorClass);
+      expect(row.get("error_message")).toBe(rowText);
+    });
+
+    test("a body that is no error is quoted within the usual bound", async () => {
+      if (!etcdReachable) return;
+      const got = await refusal("refused-200-long");
+      const { error } = got.frames[0] as { error: { message: string } };
+      expect(error.message).toBe(`${"x".repeat(1024)}…`);
+      expect(got.code).toBe(1011);
+      expect((await finalRow(got.requestId, "the realtime row")).get("status_code")).toBe("502");
+    });
+
+    test("a dial nothing answered keeps the fixed text", async () => {
+      if (!etcdReachable) return;
+      const got = await refusal("refused-no-answer");
+      expect(got.frames).toEqual([{ type: "error", error: { type: "upstream_error", message: fixedText } }]);
+      expect(got.code).toBe(1011);
+      expect(got.reason).toBe("upstream connect failed");
+      const row = await finalRow(got.requestId, "the realtime row");
+      expect(row.get("status_code")).toBe("502");
+      expect(row.get("error_class")).toBe("transport");
+      expect(row.get("error_message")).toMatch(/^transport error: /);
+    });
   });
 
   describe("a refused realtime handshake cools its model down as any upstream status does", () => {

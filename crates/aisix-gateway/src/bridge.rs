@@ -635,7 +635,7 @@ pub async fn upstream_status_parsed_from_response(
 
 /// The `UpstreamStatus` of an error body: `parse`'s view of the envelope, and
 /// its message or else what [`upstream_error_message`] reads out of the body.
-fn upstream_status_of_body(
+pub fn upstream_status_of_body(
     status: u16,
     body: &[u8],
     retry_after: Option<Duration>,
