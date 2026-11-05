@@ -559,7 +559,7 @@ impl BridgeError {
                 status, message, ..
             } => format!("upstream returned HTTP {status}: {message}"),
             Self::UpstreamInBand { message, .. } => {
-                format!("{IN_BAND_STREAM_ERROR}: {message}")
+                format!("upstream reported an in-band stream error: {message}")
             }
             other => other.to_string(),
         }
@@ -576,39 +576,86 @@ fn upstream_status_display(status: u16, message: &str, diagnostic: Option<&str>)
     }
 }
 
-const IN_BAND_STREAM_ERROR: &str = "upstream reported an in-band stream error";
+/// Says nothing of a stream: a whole 2xx body reports a failure this way too.
+const IN_BAND_ERROR: &str = "upstream reported an in-band error";
 
 fn in_band_display(message: &str, parsed: Option<&UpstreamErrorView>) -> String {
     if !message.chars().all(|c| c.is_control() || c.is_whitespace()) {
-        return format!("{IN_BAND_STREAM_ERROR}: {message}");
+        return format!("{IN_BAND_ERROR}: {message}");
     }
     let named = parsed.and_then(|p| p.code.as_deref().or(p.kind.as_deref()));
     match named {
-        Some(name) => format!("{IN_BAND_STREAM_ERROR} with no message: {name}"),
-        None => format!("{IN_BAND_STREAM_ERROR} with no message"),
+        Some(name) => format!("{IN_BAND_ERROR} with no message: {name}"),
+        None => format!("{IN_BAND_ERROR} with no message"),
     }
 }
 
-/// A non-JSON-aware route's error message: the body text as sent, bounded.
-pub fn bounded_error_text(body: &[u8]) -> String {
-    String::from_utf8_lossy(body).chars().take(1024).collect()
+/// Bound `read`, the read of a non-2xx body, by `deadline` on a path whose
+/// request-level deadline ended with the response head, as a streaming one's
+/// does: an upstream that stalls after its headers holds the caller for one more
+/// budget at most. Past it the head is still known, so the answer is its status
+/// and `Retry-After` with nothing read, the failure of a body cut off mid-read.
+pub async fn upstream_error_within<F: std::future::Future<Output = BridgeError>>(
+    deadline: Option<Duration>,
+    resp: reqwest::Response,
+    read: impl FnOnce(reqwest::Response) -> F,
+) -> BridgeError {
+    let Some(d) = deadline else {
+        return read(resp).await;
+    };
+    let status = resp.status().as_u16();
+    let retry_after = parse_retry_after(resp.headers());
+    tokio::time::timeout(d, read(resp))
+        .await
+        .unwrap_or_else(|_| {
+            let reason = format!("timed out after {}ms", d.as_millis());
+            crate::response_tap::warn_error_body_unread(status, &reason);
+            BridgeError::upstream_status_with_retry_after(status, "", retry_after)
+                .with_body_read_error(Some(reason))
+        })
 }
 
-/// Read a non-2xx answer a proxy route holds itself into an `UpstreamStatus`
-/// with no parsed envelope, `message` deriving its text from the body. A body
-/// that could not be read whole gives `message` nothing: these routes answer
-/// such a failure with the status fallback, not with a fragment.
-pub async fn upstream_status_from_response(
+/// Read a non-2xx answer a proxy route holds itself into the
+/// `UpstreamStatus` a bridge would give it: the envelope `parse` recognises
+/// for the client's `code` and `param`, and the upstream's own text as the
+/// message whichever shape carried it. A body that could not be read whole
+/// parses to nothing, so these routes answer such a failure with the status
+/// fallback, not with a fragment.
+pub async fn upstream_status_parsed_from_response(
     resp: reqwest::Response,
-    limit: usize,
-    message: impl FnOnce(&[u8]) -> String,
+    wire: UpstreamWire,
+    parse: impl FnOnce(&[u8]) -> Option<UpstreamErrorView>,
 ) -> BridgeError {
     let status = resp.status().as_u16();
     let retry_after = parse_retry_after(resp.headers());
-    let body = read_body_capped(resp, limit).await;
-    let text = message(body.whole());
-    BridgeError::upstream_status_with_retry_after(status, text, retry_after)
+    let body = read_body_capped(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    upstream_status_of_body(status, body.whole(), retry_after, wire, parse)
         .with_body_read_error(body.read_error)
+}
+
+/// The `UpstreamStatus` of an error body: `parse`'s view of the envelope, and
+/// its message or else what [`upstream_error_message`] reads out of the body.
+fn upstream_status_of_body(
+    status: u16,
+    body: &[u8],
+    retry_after: Option<Duration>,
+    wire: UpstreamWire,
+    parse: impl FnOnce(&[u8]) -> Option<UpstreamErrorView>,
+) -> BridgeError {
+    let parsed = parse(body).map(cap_error_view);
+    let message = parsed
+        .as_ref()
+        .and_then(|v| v.message.clone())
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| upstream_error_message(body));
+    BridgeError::UpstreamStatus {
+        status,
+        message,
+        parsed: parsed.map(Box::new),
+        wire,
+        retry_after,
+        diagnostic: None,
+    }
 }
 
 /// Parse the `Retry-After` response header into a Duration.
@@ -643,9 +690,8 @@ pub fn parse_retry_after(headers: &http::HeaderMap) -> Option<Duration> {
 /// nonsensical fragments.
 ///
 /// `parse` returning `None` is treated as "envelope shape unknown"; the
-/// fallback in that case is the truncated raw body string in
-/// [`BridgeError::UpstreamStatus::message`], same as for non-JSON
-/// bodies.
+/// message then comes from [`upstream_error_message`], which reads the other
+/// shapes an upstream's text arrives in and keeps a non-JSON body as sent.
 pub async fn capture_upstream_error_http(
     status: http::StatusCode,
     resp: reqwest::Response,
@@ -667,52 +713,57 @@ pub async fn capture_upstream_error_http(
     // provider's `{"error": {...}}` shape and returns `None` on any
     // non-matching body (HTML error pages, plain text, 5xx bodies), so
     // attempting it unconditionally is safe and strictly more robust.
-    let parsed = parse(&body)
-        // Truncate every parsed string at the same cap as the outer
-        // `message`. Otherwise a hostile or buggy upstream emitting a
-        // 60 KB `error.message` / `error.code` / `error.type` /
-        // `error.param` would reach the customer envelope verbatim —
-        // the cap exists exactly to prevent that. AWS exception codes
-        // / Anthropic types / OpenAI codes are bounded vocabulary in
-        // practice but the cap applies defensively.
-        .map(|mut v| {
-            let cap = MAX_UPSTREAM_ERROR_MESSAGE_BYTES;
-            v.message = v.message.map(|m| truncate_lossy(&m, cap));
-            v.kind = v.kind.map(|k| truncate_lossy(&k, cap));
-            v.code = v.code.map(|c| truncate_lossy(&c, cap));
-            v.param = v.param.map(|p| truncate_lossy(&p, cap));
-            v
-        });
-    let message = parsed
-        .as_ref()
-        .and_then(|v| v.message.clone())
-        .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
-    BridgeError::UpstreamStatus {
-        status: status.as_u16(),
-        message: truncate_lossy(&message, MAX_UPSTREAM_ERROR_MESSAGE_BYTES),
-        parsed: parsed.map(Box::new),
-        wire,
-        retry_after,
-        diagnostic: None,
-    }
-    .with_body_read_error(read_error)
+    upstream_status_of_body(status.as_u16(), &body, retry_after, wire, parse)
+        .with_body_read_error(read_error)
+}
+
+/// Truncate every parsed string at the same cap as the outer `message`.
+/// Otherwise a hostile or buggy upstream emitting a 60 KB `error.message` /
+/// `error.code` / `error.type` / `error.param` would reach the customer
+/// envelope verbatim — the cap exists exactly to prevent that. AWS exception
+/// codes / Anthropic types / OpenAI codes are bounded vocabulary in practice
+/// but the cap applies defensively.
+fn cap_error_view(mut v: UpstreamErrorView) -> UpstreamErrorView {
+    let cap = MAX_UPSTREAM_ERROR_MESSAGE_BYTES;
+    v.message = v.message.map(|m| truncate_lossy(&m, cap));
+    v.kind = v.kind.map(|k| truncate_lossy(&k, cap));
+    v.code = v.code.map(|c| truncate_lossy(&c, cap));
+    v.param = v.param.map(|p| truncate_lossy(&p, cap));
+    v
 }
 
 /// The human-readable message of an upstream error body: `error.message`
 /// (the OpenAI / Google / Azure envelope), a top-level `message` (AWS), a
-/// bare-string `error`, or else the body text itself — truncated at
+/// bare-string `error`, a `detail` string or `detail.message` (FastAPI-style
+/// servers), or else the body text itself — truncated at
 /// [`MAX_UPSTREAM_ERROR_MESSAGE_BYTES`]. The caller receives it as the
 /// upstream wrote it.
 pub fn upstream_error_message(body: &[u8]) -> String {
-    let parsed: Option<serde_json::Value> = serde_json::from_slice(body).ok();
-    let text = |v: Option<&serde_json::Value>| v.and_then(|m| m.as_str()).map(str::to_string);
-    let message = parsed.as_ref().and_then(|v| {
-        text(v.get("error").and_then(|e| e.get("message")))
-            .or_else(|| text(v.get("message")))
-            .or_else(|| text(v.get("error")))
-    });
-    let message = message.unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
-    truncate_lossy(&message, MAX_UPSTREAM_ERROR_MESSAGE_BYTES)
+    upstream_error_text(body).unwrap_or_else(|| {
+        truncate_lossy(
+            &String::from_utf8_lossy(body),
+            MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
+        )
+    })
+}
+
+/// The text [`upstream_error_message`] reads out of a JSON error body, when the
+/// body carries it in one of the shapes that function names.
+pub fn upstream_error_text(body: &[u8]) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let fields = [
+        parsed.get("error").and_then(|e| e.get("message")),
+        parsed.get("message"),
+        parsed.get("error"),
+        parsed.get("detail"),
+        parsed.get("detail").and_then(|d| d.get("message")),
+    ];
+    let texts = || fields.iter().filter_map(|v| v.and_then(|m| m.as_str()));
+    // A blank field does not hide the text a later one carries.
+    texts()
+        .find(|text| !text.trim().is_empty())
+        .or_else(|| texts().next())
+        .map(|message| truncate_lossy(message, MAX_UPSTREAM_ERROR_MESSAGE_BYTES))
 }
 
 /// Whether a top-level `error` value reports a failure: a non-empty
@@ -1248,7 +1299,7 @@ mod tests {
             in_band(serde_json::json!({"error": {"message": "", "code": "overloaded"}}));
         assert_eq!(
             with_code.to_string(),
-            "upstream reported an in-band stream error with no message: overloaded"
+            "upstream reported an in-band error with no message: overloaded"
         );
         assert_eq!(
             with_code.stream_frame_message(),
@@ -1262,14 +1313,26 @@ mod tests {
         };
         assert_eq!(
             bare.to_string(),
-            "upstream reported an in-band stream error with no message"
+            "upstream reported an in-band error with no message"
         );
         let named = in_band(serde_json::json!({"error": {"message": "boom"}}));
         assert_eq!(
             named.to_string(),
+            "upstream reported an in-band error: boom"
+        );
+        assert_eq!(
+            named.stream_frame_message(),
             "upstream reported an in-band stream error: boom"
         );
-        assert_eq!(named.stream_frame_message(), named.to_string());
+    }
+
+    #[test]
+    fn a_blank_field_does_not_hide_the_text_of_a_later_one() {
+        assert_eq!(
+            upstream_error_message(br#"{"message":"","error":"quota exceeded"}"#),
+            "quota exceeded"
+        );
+        assert_eq!(upstream_error_message(br#"{"message":""}"#), "");
     }
 
     /// The wording of a blank message is the error's `Display`, and its

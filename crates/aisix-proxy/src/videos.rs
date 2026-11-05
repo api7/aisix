@@ -993,42 +993,57 @@ fn nonempty_str(v: Option<&serde_json::Value>) -> Option<&str> {
 
 /// Best-effort extraction of a vendor error envelope's message from a
 /// non-2xx upstream body. DashScope puts `{code, message}` at the top level;
-/// the OpenAI-style vendors nest `{error: {code, message}}`. Falls back to a
-/// generic marker for non-JSON or fieldless bodies so a typed error is always
-/// producible. Shared by the JSON task calls ([`provider_call`]) and the
+/// the OpenAI-style vendors nest `{error: {code, message}}`; any other shape the
+/// shared reader knows reads as it does on the row. Falls back to a generic
+/// marker for non-JSON or fieldless bodies so a typed error is always producible. Shared by the JSON task calls ([`provider_call`]) and the
 /// content-proxy path ([`proxy_content`]) — both must map a non-2xx upstream
 /// to a typed error rather than surfacing the raw body.
 fn parse_provider_error_message(bytes: &[u8]) -> String {
-    vendor_error_message(bytes).unwrap_or_else(|| "upstream error".to_string())
+    vendor_error_message(bytes)
+        .or_else(|| aisix_gateway::upstream_error_text(bytes).filter(|text| !text.is_empty()))
+        .unwrap_or_else(|| "upstream error".to_string())
 }
 
 /// The typed error of a non-2xx: the caller reads
 /// [`parse_provider_error_message`], the row and the access log what the body
 /// actually said.
 fn provider_status_error(status: u16, bytes: &[u8]) -> aisix_gateway::BridgeError {
-    let detail =
-        vendor_error_message(bytes).unwrap_or_else(|| aisix_gateway::bounded_error_text(bytes));
     aisix_gateway::BridgeError::upstream_status(status, parse_provider_error_message(bytes))
-        .with_telemetry_detail(&detail)
+        .with_telemetry_detail(&provider_error_detail(bytes))
+}
+
+/// What the row and the access log report: the upstream's message, or a
+/// vendor's bare code when that is all it said.
+fn provider_error_detail(bytes: &[u8]) -> String {
+    match vendor_error_fields(bytes) {
+        (_, Some(msg)) => msg,
+        (Some(code), None) => code,
+        (None, None) => aisix_gateway::upstream_error_message(bytes),
+    }
 }
 
 fn vendor_error_message(bytes: &[u8]) -> Option<String> {
-    let parsed: Option<serde_json::Value> = serde_json::from_slice(bytes).ok();
-    parsed.and_then(|p| {
-        let scope = if p.get("error").is_some() {
-            p.get("error").cloned().unwrap_or_default()
-        } else {
-            p
-        };
-        let code = nonempty_str(scope.get("code")).map(str::to_string);
-        let msg = nonempty_str(scope.get("message")).map(str::to_string);
-        match (code, msg) {
-            (Some(code), Some(msg)) => Some(format!("{code}: {msg}")),
-            (None, Some(msg)) => Some(msg),
-            (Some(code), None) => Some(code),
-            (None, None) => None,
-        }
-    })
+    let text = match vendor_error_fields(bytes) {
+        (Some(code), Some(msg)) => format!("{code}: {msg}"),
+        (None, Some(msg)) => msg,
+        (Some(code), None) => code,
+        (None, None) => return None,
+    };
+    Some(aisix_gateway::truncate_lossy(
+        &text,
+        aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
+    ))
+}
+
+fn vendor_error_fields(bytes: &[u8]) -> (Option<String>, Option<String>) {
+    let Ok(p) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return (None, None);
+    };
+    let scope = p.get("error").unwrap_or(&p);
+    (
+        nonempty_str(scope.get("code")).map(str::to_string),
+        nonempty_str(scope.get("message")).map(str::to_string),
+    )
 }
 
 // ─────────────────────── resolved dispatch target ───────────────────────
@@ -3307,6 +3322,18 @@ mod tests {
                     .unwrap();
             assert_eq!(poll.status(), StatusCode::OK);
         }
+    }
+
+    #[test]
+    fn a_vendors_error_text_reaches_the_caller_capped() {
+        let long = "x".repeat(5000);
+        let body = serde_json::json!({"error": {"code": long, "message": long}}).to_string();
+        let text = parse_provider_error_message(body.as_bytes());
+        assert!(
+            text.len() <= aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES + "…".len(),
+            "{} bytes",
+            text.len()
+        );
     }
 
     #[tokio::test]

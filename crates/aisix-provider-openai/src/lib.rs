@@ -17,4 +17,7 @@ pub mod overrides;
 pub mod reasoning;
 pub mod wire;
 
-pub use bridge::{close_strict_response_format_schema, OpenAiBridge, OPENAI_DEFAULT_BASE};
+pub use bridge::{
+    close_strict_response_format_schema, held_route_http_error, parse_openai_error_envelope,
+    OpenAiBridge, OPENAI_DEFAULT_BASE,
+};

@@ -511,7 +511,7 @@ describe("error_source on the request counters", () => {
       ws.on("close", () => resolve());
       ws.on("error", reject);
     });
-    await expectSource({ endpoint: "/v1/realtime", status: "502" }, "upstream");
+    await expectSource({ endpoint: "/v1/realtime", status: "400" }, "upstream");
 
     const mcp = await fetch(`${app!.proxyUrl}/mcp`, {
       method: "POST",

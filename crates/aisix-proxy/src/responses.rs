@@ -1428,10 +1428,10 @@ async fn responses_to_target(
     let status = upstream_resp.status();
 
     if !status.is_success() {
-        let err = aisix_gateway::upstream_status_from_response(
+        let err = aisix_gateway::upstream_error_within(
+            connect_deadline,
             upstream_resp,
-            aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES,
-            aisix_gateway::bounded_error_text,
+            aisix_provider_openai::held_route_http_error,
         )
         .await;
         if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())

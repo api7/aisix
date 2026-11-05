@@ -853,7 +853,7 @@ describe("failure rows carry request and response bodies", () => {
   test.each([
     ["a non-JSON body", "row-video-text", 502, "upstream error", "upstream returned HTTP 500: sentinel video gateway page"],
     ["an empty body", "row-video-empty", 502, "upstream error", NO_DETAIL(500)],
-    ["a vendor envelope", "row-video-json", 400, "bad: sentinel-video", "upstream returned HTTP 400: bad: sentinel-video"],
+    ["a vendor envelope", "row-video-json", 400, "bad: sentinel-video", "upstream returned HTTP 400: sentinel-video"],
   ] as const)(
     "videos: %s keeps the caller answer; the row reports what the upstream said",
     async (_what, model, status, clientText, rowMessage) => {
@@ -999,7 +999,7 @@ describe("failure rows carry request and response bodies", () => {
     expect(JSON.parse(row.get("response")!)).toEqual(JSON.parse(body));
   });
 
-  test("realtime: an upstream that refuses the socket has a row naming the transport failure", async () => {
+  test("realtime: an upstream that refuses the socket has a row naming its status", async () => {
     if (!etcdReachable) return;
     const requestId = await new Promise<string>((resolve, reject) => {
       const ws = new WsClient(
@@ -1014,8 +1014,8 @@ describe("failure rows carry request and response bodies", () => {
       ws.on("error", reject);
     });
     const row = await rowOf(requestId, "the failed realtime row");
-    expect(row.get("status_code")).toBe("502");
-    expect(row.get("error_class")).toBe("transport");
+    expect(row.get("status_code")).toBe("400");
+    expect(row.get("error_class")).toBe("upstream_status");
     expect(row.get("response")).toBeTruthy();
   });
 

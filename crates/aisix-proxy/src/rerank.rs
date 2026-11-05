@@ -637,12 +637,7 @@ async fn dispatch(
                                 tracker,
                                 model_id,
                                 cooldown_cfg,
-                                aisix_gateway::upstream_status_from_response(
-                                    upstream_resp,
-                                    aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES,
-                                    aisix_gateway::bounded_error_text,
-                                )
-                                .await,
+                                aisix_provider_openai::held_route_http_error(upstream_resp).await,
                             ));
                         }
 

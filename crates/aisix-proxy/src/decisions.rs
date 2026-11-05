@@ -548,11 +548,10 @@ async fn dispatch(
                         tracker,
                         model_id,
                         cooldown_cfg,
-                        // Whole: the message is parsed out of the JSON.
-                        aisix_gateway::upstream_status_from_response(
+                        aisix_gateway::upstream_status_parsed_from_response(
                             upstream_resp,
-                            usize::MAX,
-                            |body| upstream_error_message(body).chars().take(1024).collect(),
+                            aisix_gateway::UpstreamWire::OpenAI,
+                            decision_error_view,
                         )
                         .await,
                     )));
@@ -783,28 +782,17 @@ fn foundry_root(api_base: &str) -> &str {
     base
 }
 
-/// A readable message out of a decision upstream's error body.
-///
-/// The shapes in use: TypeSafe answers `{detail: string}` or `{detail:
-/// {error_type, message}}`; OpenAI and Foundry `{error: {message, …}}`;
-/// OpenRouter the same, except that its validation failures put a
-/// JSON-encoded list of issues in `error.message`.
-fn upstream_error_message(body: &[u8]) -> String {
-    let Ok(v) = serde_json::from_slice::<Value>(body) else {
-        return String::from_utf8_lossy(body).into_owned();
-    };
-    if let Some(message) = v.pointer("/error/message").and_then(Value::as_str) {
-        return readable_issue_list(message).unwrap_or_else(|| message.to_string());
-    }
-    match v.get("detail") {
-        Some(Value::String(detail)) => detail.clone(),
-        Some(detail) => detail
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| detail.to_string()),
-        None => String::from_utf8_lossy(body).into_owned(),
-    }
+/// The OpenAI envelope of a decision upstream's error body, as OpenAI, Foundry
+/// and OpenRouter send it, except that OpenRouter's validation failures put a
+/// JSON-encoded list of issues in `error.message`. TypeSafe's `{detail: string}`
+/// and `{detail: {error_type, message}}` are not an envelope, and the shared
+/// reader takes their text.
+fn decision_error_view(body: &[u8]) -> Option<aisix_gateway::UpstreamErrorView> {
+    let mut view = aisix_provider_openai::parse_openai_error_envelope(body)?;
+    view.message = view
+        .message
+        .map(|message| readable_issue_list(&message).unwrap_or(message));
+    Some(view)
 }
 
 /// `path.to.field: message; …` for a message that is itself a JSON list of
@@ -1011,30 +999,21 @@ mod tests {
     }
 
     #[test]
-    fn upstream_error_messages_are_read_from_each_shape() {
+    fn a_decision_upstreams_issue_list_is_made_readable() {
+        let message = |body: &[u8]| decision_error_view(body).and_then(|v| v.message);
         assert_eq!(
-            upstream_error_message(br#"{"detail":"Noul question must have criteria"}"#),
-            "Noul question must have criteria"
-        );
-        assert_eq!(
-            upstream_error_message(
-                br#"{"detail":{"error_type":"api_usage_error","message":"Invalid request."}}"#
-            ),
-            "Invalid request."
-        );
-        assert_eq!(
-            upstream_error_message(
+            message(
                 br#"{"error":{"message":"Missing required parameter","type":"invalid_request_error"}}"#
-            ),
-            "Missing required parameter"
+            )
+            .as_deref(),
+            Some("Missing required parameter")
         );
         let openrouter = serde_json::json!({"error": {"code": 400, "message":
             "[{\"code\":\"invalid_union\",\"path\":[\"questions\",\"is_bug\",\"instructions\"],\"message\":\"Invalid input\"}]"}});
         assert_eq!(
-            upstream_error_message(openrouter.to_string().as_bytes()),
-            "questions.is_bug.instructions: Invalid input"
+            message(openrouter.to_string().as_bytes()).as_deref(),
+            Some("questions.is_bug.instructions: Invalid input")
         );
-        assert_eq!(upstream_error_message(b"bad gateway"), "bad gateway");
     }
 
     /// A Foundry key whose secret is the Entra ID client-credentials shape

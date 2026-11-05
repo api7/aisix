@@ -521,7 +521,12 @@ impl Bridge for AnthropicBridge {
         aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
-            return Err(map_http_error(status, resp).await);
+            return Err(
+                aisix_gateway::upstream_error_within(ctx.deadline, resp, |resp| {
+                    map_http_error(status, resp)
+                })
+                .await,
+            );
         }
 
         let byte_stream = resp.bytes_stream();

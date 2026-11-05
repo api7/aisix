@@ -291,6 +291,18 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
     .await
 }
 
+/// The error of a non-2xx answer on a route that sends the request itself
+/// rather than through a bridge (`/v1/responses` native, rerank, audio, image
+/// edits): what [`map_http_error`] gives chat, for one read of the body.
+pub async fn held_route_http_error(resp: reqwest::Response) -> BridgeError {
+    aisix_gateway::upstream_status_parsed_from_response(
+        resp,
+        aisix_gateway::UpstreamWire::OpenAI,
+        parse_openai_error_envelope,
+    )
+    .await
+}
+
 /// Parse the canonical OpenAI error envelope:
 ///
 /// ```json
@@ -302,7 +314,7 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
 /// and emits a generic `upstream_error` envelope.
 ///
 /// Reference: <https://platform.openai.com/docs/guides/error-codes/api-errors>
-fn parse_openai_error_envelope(body: &[u8]) -> Option<aisix_gateway::UpstreamErrorView> {
+pub fn parse_openai_error_envelope(body: &[u8]) -> Option<aisix_gateway::UpstreamErrorView> {
     #[derive(serde::Deserialize)]
     struct Outer {
         error: Inner,
@@ -810,7 +822,12 @@ impl Bridge for OpenAiBridge {
         aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
-            return Err(map_http_error(status, resp).await);
+            return Err(
+                aisix_gateway::upstream_error_within(ctx.deadline, resp, |resp| {
+                    map_http_error(status, resp)
+                })
+                .await,
+            );
         }
 
         // Snapshot the response-side override knobs onto the stream

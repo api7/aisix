@@ -327,7 +327,12 @@ async fn http_error(resp: reqwest::Response, started: Instant) -> BridgeError {
         read_error,
     } = aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
     let parsed: Option<Value> = serde_json::from_slice(&body).ok();
-    let field = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    let field = |v: &Value, k: &str| {
+        v.get(k)
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_string)
+    };
     let error_obj = parsed
         .as_ref()
         .and_then(|v| v.get("error"))
@@ -340,7 +345,7 @@ async fn http_error(resp: reqwest::Response, started: Instant) -> BridgeError {
                 .and_then(|v| field(v, "message").or_else(|| field(v, "Message")))
         })
         .or_else(|| parsed.as_ref().and_then(|v| field(v, "error")))
-        .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
+        .unwrap_or_else(|| aisix_gateway::upstream_error_message(&body));
     let code = error_obj.and_then(|e| field(e, "code"));
     let kind = errortype.or_else(|| error_obj.and_then(|e| field(e, "type")).or(code.clone()));
     crate::errors::upstream_error(status, kind, code, message, retry_after, started)
@@ -444,7 +449,10 @@ async fn send(
     .await?;
     aisix_gateway::note_upstream_response(resp.headers());
     if !resp.status().is_success() {
-        return Err(http_error(resp, started).await);
+        return Err(
+            aisix_gateway::upstream_error_within(deadline, resp, |resp| http_error(resp, started))
+                .await,
+        );
     }
     Ok((resp, started, deadline))
 }

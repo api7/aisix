@@ -873,6 +873,14 @@ fn gateway_base(uri: &axum::http::Uri, headers: &HeaderMap) -> Option<String> {
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
+        // A chain of proxies lists its hops; the first is what the client used.
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .and_then(|v| {
+            ["http", "https"]
+                .into_iter()
+                .find(|scheme| v.eq_ignore_ascii_case(scheme))
+        })
         .unwrap_or("https");
     Some(format!("{scheme}://{host}"))
 }

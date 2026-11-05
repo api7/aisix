@@ -1388,7 +1388,11 @@ async fn anthropic_passthrough_dispatch(
             let status = upstream_resp.status();
 
             if !status.is_success() {
-                let err = aisix_provider_anthropic::map_http_error(status, upstream_resp).await;
+                let err =
+                    aisix_gateway::upstream_error_within(connect_deadline, upstream_resp, |resp| {
+                        aisix_provider_anthropic::map_http_error(status, resp)
+                    })
+                    .await;
                 // Apply the cross-request cooldown contract to the
                 // Anthropic-passthrough path too — without this, a 401 / 429 /
                 // 5xx via /v1/messages would never mark the direct model and
