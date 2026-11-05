@@ -615,9 +615,8 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
         bytes: body,
         read_error,
     } = aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
-    // Skip the serde parse on non-JSON bodies (HTML / text error pages
-    // from a fronting WAF or load balancer). Same guard as
-    // `capture_upstream_error_http`.
+    // Only a body labelled JSON is read for `error.status`; this is Vertex's own
+    // check, and `capture_upstream_error_http` parses whatever the label says.
     let kind = is_json.then(|| parse_vertex_error_status(&body)).flatten();
     let message = aisix_gateway::upstream_error_message(&body);
     let parsed = kind.as_ref().map(|_| {
