@@ -153,46 +153,149 @@ fn client_requested_beta_realtime(headers: &HeaderMap) -> bool {
 
 type UpstreamDial = Result<
     (
-        tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<aisix_gateway::upstream_dial::UpstreamStream>,
-        >,
+        tokio_tungstenite::WebSocketStream<HandedBack>,
         tokio_tungstenite::tungstenite::handshake::client::Response,
     ),
-    tokio_tungstenite::tungstenite::Error,
+    DialFailure,
 >;
 
-/// What a failed dial reports. An upgrade the upstream answered with an error
-/// reads as an HTTP route's upstream failure, the OpenAI envelope included. A
-/// body that did not arrive whole is named in the row, and leaves the caller
-/// the status fallback.
-fn connect_failure(err: &tokio_tungstenite::tungstenite::Error) -> aisix_gateway::BridgeError {
-    match err {
-        tokio_tungstenite::tungstenite::Error::Http(response) => {
-            let status = response.status().as_u16();
-            let retry_after = aisix_gateway::parse_retry_after(response.headers());
-            let wire = aisix_gateway::UpstreamWire::OpenAI;
-            match complete_handshake_body(response) {
-                Some(body) => aisix_gateway::upstream_status_of_body(
-                    status,
-                    &body,
-                    retry_after,
-                    wire,
-                    aisix_provider_openai::parse_openai_error_envelope,
-                ),
-                None => aisix_gateway::BridgeError::UpstreamStatus {
-                    status,
-                    message: String::new(),
-                    parsed: None,
-                    wire,
-                    retry_after,
-                    diagnostic: Some(format!(
-                        "upstream returned HTTP {status} during the realtime handshake"
-                    )),
-                },
-            }
-        }
-        other => aisix_gateway::BridgeError::Transport(aisix_gateway::error_with_causes(other)),
+/// A dial that opened no session, with the stream when the handshake got far
+/// enough to have one to give back.
+struct DialFailure {
+    error: tokio_tungstenite::tungstenite::Error,
+    stream: Option<aisix_gateway::upstream_dial::UpstreamStream>,
+}
+
+/// The dial's stream, handed back when the handshake drops it. tungstenite keeps
+/// only the bytes that came with a refused upgrade's response head and drops the
+/// stream, so the rest of the body can only be read from here.
+struct HandedBack {
+    stream: Option<aisix_gateway::upstream_dial::UpstreamStream>,
+    back: Option<tokio::sync::oneshot::Sender<aisix_gateway::upstream_dial::UpstreamStream>>,
+}
+
+impl HandedBack {
+    fn io(
+        self: std::pin::Pin<&mut Self>,
+    ) -> std::pin::Pin<&mut aisix_gateway::upstream_dial::UpstreamStream> {
+        std::pin::Pin::new(
+            self.get_mut()
+                .stream
+                .as_mut()
+                .expect("the stream leaves only on drop"),
+        )
     }
+}
+
+impl Drop for HandedBack {
+    fn drop(&mut self) {
+        if let (Some(stream), Some(back)) = (self.stream.take(), self.back.take()) {
+            // No receiver once the upgrade succeeded: the stream just closes.
+            let _ = back.send(stream);
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for HandedBack {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.io().poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for HandedBack {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.io().poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.io().poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.io().poll_shutdown(cx)
+    }
+}
+
+/// What a refused upgrade answered, for the failure row.
+struct RefusedResponse {
+    headers: HeaderMap,
+    body: bytes::Bytes,
+}
+
+/// What a failed dial reports. An upgrade the upstream answered with an error
+/// reads as an HTTP route's upstream failure, the OpenAI envelope included, and
+/// comes with what it answered. A dial past its budget is a timeout, as it is on
+/// those routes: their `reqwest::Error::is_timeout` also takes the kernel's
+/// `ETIMEDOUT` for one.
+async fn connect_failure(
+    failure: DialFailure,
+    elapsed: Duration,
+    read_budget: Option<Duration>,
+    request_id: &str,
+    client_gone: impl std::future::Future<Output = ()>,
+) -> (BridgeError, Option<RefusedResponse>) {
+    use tokio_tungstenite::tungstenite::Error;
+    let response = match failure.error {
+        Error::Http(response) => response,
+        Error::Io(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            let error = BridgeError::Timeout {
+                elapsed_ms: elapsed.as_millis() as u64,
+                cause: aisix_gateway::error_with_causes(&e),
+            };
+            return (error, None);
+        }
+        other => {
+            let error = BridgeError::Transport(aisix_gateway::error_with_causes(&other));
+            return (error, None);
+        }
+    };
+    let status = response.status().as_u16();
+    let retry_after = aisix_gateway::parse_retry_after(response.headers());
+    let wire = aisix_gateway::UpstreamWire::OpenAI;
+    let body = read_refused_body(&response, failure.stream, read_budget, client_gone).await;
+    if let Some(reason) = &body.read_error {
+        tracing::warn!(status, request_id, %reason, "failed to read upstream error response body");
+    }
+    let error = if body.read_error.is_none() && body.bytes.iter().all(u8::is_ascii_whitespace) {
+        BridgeError::UpstreamStatus {
+            status,
+            message: String::new(),
+            parsed: None,
+            wire,
+            retry_after,
+            diagnostic: Some(format!(
+                "upstream returned HTTP {status} during the realtime handshake"
+            )),
+        }
+    } else {
+        aisix_gateway::upstream_status_of_body(
+            status,
+            body.whole(),
+            retry_after,
+            wire,
+            aisix_provider_openai::parse_openai_error_envelope,
+        )
+        .with_body_read_error(body.read_error.clone())
+    };
+    let refused = RefusedResponse {
+        headers: response.headers().clone(),
+        body: body.bytes,
+    };
+    (error, Some(refused))
 }
 
 /// The session's `error` frame for a failed dial: an upstream's answer in the
@@ -213,50 +316,128 @@ fn connect_failure_frame(err: &ProxyError) -> String {
     serde_json::json!({ "type": "error", "error": error }).to_string()
 }
 
-/// The refused upgrade's body, when all of it is known to have arrived.
-/// tungstenite hands over the raw bytes that came with the response head and
-/// drops the socket, so a later part is lost and chunked framing is left in.
-/// Only a `Content-Length` they satisfy, or the terminating chunk, says they
-/// are the whole body.
-fn complete_handshake_body(
+/// The refused upgrade's body, up to the bound and the time limit of an HTTP
+/// route's error body, or until the client leaves, which on this detached task
+/// would otherwise cancel nothing. A compressed one stays unread: the handshake
+/// asks for no encoding and nothing here decodes one.
+async fn read_refused_body(
     response: &tokio_tungstenite::tungstenite::handshake::client::Response,
-) -> Option<std::borrow::Cow<'_, [u8]>> {
+    stream: Option<aisix_gateway::upstream_dial::UpstreamStream>,
+    budget: Option<Duration>,
+    client_gone: impl std::future::Future<Output = ()>,
+) -> aisix_gateway::UpstreamErrorBody {
     let headers = response.headers();
-    if headers.contains_key(axum::http::header::CONTENT_ENCODING) {
-        return None;
+    let coding = headers
+        .get(axum::http::header::TRANSFER_ENCODING)
+        .map(|v| v.to_str().unwrap_or_default());
+    let chunked = coding.is_some_and(|c| c.eq_ignore_ascii_case("chunked"));
+    let other_coding = coding.is_some_and(|c| !chunked && !c.eq_ignore_ascii_case("identity"));
+    if other_coding || headers.contains_key(axum::http::header::CONTENT_ENCODING) {
+        return aisix_gateway::UpstreamErrorBody {
+            bytes: bytes::Bytes::new(),
+            read_error: None,
+        };
     }
-    let raw = response.body().as_deref()?;
-    let body = if headers.contains_key(axum::http::header::TRANSFER_ENCODING) {
-        std::borrow::Cow::Owned(decode_whole_chunked(raw)?)
+    let declared = if matches!(response.status().as_u16(), 204 | 304) {
+        Some(0)
     } else {
-        let declared: usize = headers
-            .get(axum::http::header::CONTENT_LENGTH)?
-            .to_str()
-            .ok()?
-            .parse()
-            .ok()?;
-        if declared != raw.len() {
-            return None;
-        }
-        std::borrow::Cow::Borrowed(raw)
+        headers
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()?.parse::<usize>().ok())
     };
-    (!body.iter().all(u8::is_ascii_whitespace)).then_some(body)
+    let mut raw = response.body().clone().unwrap_or_default();
+    let read = read_body_framing(&mut raw, chunked, declared, stream);
+    let timed = async {
+        match budget {
+            Some(budget) => tokio::time::timeout(budget, read)
+                .await
+                .unwrap_or_else(|_| Err(format!("timed out after {}ms", budget.as_millis()))),
+            None => read.await,
+        }
+    };
+    let read_error = tokio::select! {
+        outcome = timed => outcome.err(),
+        () = client_gone => Some("the client closed the session".to_string()),
+    };
+    let mut body = if chunked {
+        decode_chunked(&raw).map_or_else(Vec::new, |(body, _)| body)
+    } else {
+        raw
+    };
+    if let Some(declared) = declared {
+        body.truncate(declared);
+    }
+    body.truncate(aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES);
+    aisix_gateway::UpstreamErrorBody {
+        bytes: body.into(),
+        read_error,
+    }
 }
 
-/// The payload of a chunked body, `None` unless it ends in its last chunk.
-fn decode_whole_chunked(mut raw: &[u8]) -> Option<Vec<u8>> {
+/// Read into `raw` by the framing the head declares: `Content-Length`, chunked,
+/// or up to the end of the connection. Nothing past the bound is read, so a
+/// longer body reads as an HTTP route's does once cut at the same bound.
+async fn read_body_framing(
+    raw: &mut Vec<u8>,
+    chunked: bool,
+    declared: Option<usize>,
+    mut stream: Option<aisix_gateway::upstream_dial::UpstreamStream>,
+) -> Result<(), String> {
+    use tokio::io::AsyncReadExt as _;
+    const LIMIT: usize = aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES;
+    let mut buf = [0u8; 8 * 1024];
+    loop {
+        if chunked {
+            match decode_chunked(raw) {
+                Some((_, true)) => return Ok(()),
+                Some((body, false)) if body.len() >= LIMIT => return Ok(()),
+                // Room for a body in one-byte chunks; only broken framing gets here.
+                Some(_) if raw.len() < 8 * LIMIT => {}
+                _ => return Err("malformed chunked body".to_string()),
+            }
+        } else if raw.len() >= declared.unwrap_or(LIMIT).min(LIMIT) {
+            return Ok(());
+        }
+        let read = match stream.as_mut() {
+            Some(stream) => stream.read(&mut buf).await,
+            None => Ok(0),
+        };
+        match read {
+            Ok(0) if chunked || declared.is_some() => {
+                return Err("the connection closed before the whole body arrived".to_string())
+            }
+            Ok(0) => return Ok(()),
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// The payload of the chunked bytes so far, and whether they reached the last
+/// chunk. `None` when they are not chunked framing.
+fn decode_chunked(mut raw: &[u8]) -> Option<(Vec<u8>, bool)> {
     let mut body = Vec::new();
     loop {
-        let line_end = raw.windows(2).position(|w| w == b"\r\n")?;
+        let Some(line_end) = raw.windows(2).position(|w| w == b"\r\n") else {
+            return Some((body, false));
+        };
         let size = std::str::from_utf8(&raw[..line_end]).ok()?;
         let size = size.split(';').next()?.trim();
         let size = usize::from_str_radix(size, 16).ok()?;
         raw = &raw[line_end + 2..];
         if size == 0 {
-            return Some(body);
+            return Some((body, true));
         }
-        body.extend_from_slice(raw.get(..size)?);
-        raw = raw.get(size..)?.strip_prefix(b"\r\n")?;
+        if raw.len() < size {
+            body.extend_from_slice(raw);
+            return Some((body, false));
+        }
+        body.extend_from_slice(&raw[..size]);
+        raw = &raw[size..];
+        if raw.len() < 2 {
+            return Some((body, false));
+        }
+        raw = raw.strip_prefix(b"\r\n")?;
     }
 }
 
@@ -284,9 +465,8 @@ async fn connect_upstream(
 ///
 /// The budget covers the WHOLE dial — DNS, TCP, any proxy tunnel, TLS
 /// *and* the WebSocket handshake exchange — where the HTTP routes'
-/// `connect_timeout` stops at the end of TLS. tokio-tungstenite exposes
-/// no seam between those phases, and the extra phase is the one that matters most here: an
-/// upstream that completes TLS and then never answers the upgrade is as
+/// `connect_timeout` stops at the end of TLS. The extra phase is the one
+/// that matters most here: an upstream that completes TLS and then never answers the upgrade is as
 /// stuck as one that never answers the SYN, and nothing downstream
 /// bounds it — the session's idle deadline only starts once the socket
 /// is up. Left unbounded the upgrade hangs until the kernel exhausts its
@@ -295,6 +475,7 @@ async fn connect_upstream_within(
     budget: Option<Duration>,
     request: tokio_tungstenite::tungstenite::handshake::client::Request,
 ) -> UpstreamDial {
+    let (back, mut handed_back) = tokio::sync::oneshot::channel();
     let dial = async {
         let uri = request.uri();
         let secure = match uri.scheme_str() {
@@ -312,26 +493,33 @@ async fn connect_upstream_within(
                 tokio_tungstenite::tungstenite::error::UrlError::NoHostName,
             ))?;
         let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
-        let stream = aisix_gateway::upstream_dial::connect(host, port, secure).await?;
-        let connector = tokio_tungstenite::Connector::Rustls(
-            aisix_gateway::upstream_tls::rustls_client_config(),
-        );
-        tokio_tungstenite::client_async_tls_with_config(request, stream, None, Some(connector))
+        let mut stream = aisix_gateway::upstream_dial::connect(host, port, secure).await?;
+        if secure {
+            stream = aisix_gateway::upstream_dial::connect_tls(stream, host).await?;
+        }
+        let stream = HandedBack {
+            stream: Some(stream),
+            back: Some(back),
+        };
+        tokio_tungstenite::client_async_with_config(request, stream, None).await
+    };
+    let outcome = match budget {
+        None => dial.await,
+        Some(budget) => tokio::time::timeout(budget, dial)
             .await
+            .unwrap_or_else(|_| {
+                Err(tokio_tungstenite::tungstenite::Error::Io(
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("upstream connect exceeded upstream.connect_timeout ({budget:?})"),
+                    ),
+                ))
+            }),
     };
-    let Some(budget) = budget else {
-        return dial.await;
-    };
-    tokio::time::timeout(budget, dial)
-        .await
-        .unwrap_or_else(|_| {
-            Err(tokio_tungstenite::tungstenite::Error::Io(
-                std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("upstream connect exceeded upstream.connect_timeout ({budget:?})"),
-                ),
-            ))
-        })
+    outcome.map_err(|error| DialFailure {
+        error,
+        stream: handed_back.try_recv().ok(),
+    })
 }
 
 pub(crate) async fn realtime(
@@ -422,6 +610,7 @@ pub(crate) async fn realtime(
                 api_key_id,
                 None,
                 Some(&err),
+                None,
                 None,
             );
             // Count the refusal like every other pre-dispatch rejection
@@ -899,22 +1088,51 @@ async fn run_session(
     // attribution scope that measures every other family.
     let dial_started = Instant::now();
     let mut upstream_response_headers = std::collections::BTreeMap::new();
-    let upstream = match connect_upstream(upstream_request).await {
+    // Stream idle deadline, resolved model → `upstream.stream_timeout_ms`
+    // / `timeout_ms`. Realtime sessions are long-lived by design, so the
+    // deployment default (6000 s) only reaps sessions with no traffic in
+    // either direction for that long; `timeout: 0` on the model lifts it.
+    // It is also the bound on reading a refused upgrade's body, as a
+    // streaming HTTP route's error body has its stream budget.
+    let idle_cap =
+        crate::routing::effective_timeouts(&model_entry.value, None, state.default_timeouts).stream;
+    let (upstream, upgrade_request_id) = match connect_upstream(upstream_request).await {
         Ok((ws, resp)) => {
-            // A completed upgrade answers `101`, which is a success; the
-            // deployment families classify by HTTP outcome, so it counts as
-            // a `200`.
-            crate::attempt::RoutingTelemetry::record_deployment(&state, &model_entry.id, 200);
+            let upgrade_request_id = crate::usage_attr::sanitize_provider_response_id(
+                &aisix_gateway::provider_request_id(resp.headers()),
+            );
             let names = crate::client_ip::exported_header_names(&state.snapshot.load(), true);
             if !names.is_empty() {
                 upstream_response_headers =
                     aisix_gateway::capture_header_values(resp.headers(), &names);
             }
-            ws
+            (ws, upgrade_request_id)
         }
-        Err(e) => {
-            tracing::warn!(error = %e, model = %requested_model, "realtime upstream connect failed");
-            let connect_err = connect_failure(&e);
+        Err(failure) => {
+            tracing::warn!(error = %failure.error, model = %requested_model, "realtime upstream connect failed");
+            let client_gone = async {
+                while let Some(Ok(message)) = client_rx.next().await {
+                    if matches!(message, AxMessage::Close(_)) {
+                        break;
+                    }
+                }
+            };
+            let (connect_err, refused) = connect_failure(
+                failure,
+                dial_started.elapsed(),
+                idle_cap,
+                &request_id,
+                client_gone,
+            )
+            .await;
+            let provider_request_id = refused
+                .as_ref()
+                .map(|r| {
+                    crate::usage_attr::sanitize_provider_response_id(
+                        &aisix_gateway::provider_request_id(&r.headers),
+                    )
+                })
+                .unwrap_or_default();
             let status = connect_err.http_status();
             crate::attempt::RoutingTelemetry::record_deployment(&state, &model_entry.id, status);
             // `note_failure` hands the error back, so the same value that
@@ -944,6 +1162,9 @@ async fn run_session(
                 Some((&provider_label, &requested_model)),
                 Some(&connect_err),
                 None,
+                Some(&provider_request_id)
+                    .filter(|id| !id.is_empty())
+                    .map(String::as_str),
             );
             // One load shared by the ProviderKey resolution below and the
             // usage event, like the session's own terminal path (#941) —
@@ -998,16 +1219,37 @@ async fn run_session(
             // Realtime serves only direct models, so the entry is the target.
             event.model_id = model_entry.id.clone();
             event.requested_model_id = model_entry.id.clone();
+            event.provider_request_id = provider_request_id;
             let model = crate::usage_attr::usage_event_model_label(&snap, &requested_model);
+            let unresolved_pk = crate::usage_attr::ResolvedPk::unresolved();
+            let labels = crate::usage_attr::usage_event_labels(&model, &unresolved_pk);
+            if let Some(refused) = &refused {
+                let names = crate::client_ip::exported_header_names(&snap, true);
+                if !names.is_empty() {
+                    event.upstream_response_headers =
+                        aisix_gateway::capture_header_values(&refused.headers, &names);
+                }
+                event.upstream_latency_ms = crate::attempt::measured_ms(dial_started.elapsed());
+                let content = upstream_failure_content(&snap, &refused.body);
+                crate::usage_attr::emit_usage(
+                    &state,
+                    &snap,
+                    crate::operation::REALTIME,
+                    event,
+                    labels,
+                    content.as_ref(),
+                    client.trace.as_ref(),
+                    /* terminal */ true,
+                    /* dispatched */ true,
+                );
+                return;
+            }
             crate::usage_attr::emit_prepared_usage_event(
                 &state,
                 &snap,
                 crate::operation::REALTIME,
                 event,
-                crate::usage_attr::usage_event_labels(
-                    &model,
-                    &crate::usage_attr::ResolvedPk::unresolved(),
-                ),
+                labels,
                 client.trace.as_ref(),
             );
             return;
@@ -1031,12 +1273,7 @@ async fn run_session(
     // (`downstream_remote_disconnect` and friends) the issue asks for
     // separately, which needs its own status decision.
     let mut session_error: Option<ProxyError> = None;
-    // Stream idle deadline, resolved model → `upstream.stream_timeout_ms`
-    // / `timeout_ms`. Realtime sessions are long-lived by design, so the
-    // deployment default (6000 s) only reaps sessions with no traffic in
-    // either direction for that long; `timeout: 0` on the model lifts it.
-    let idle_cap =
-        crate::routing::effective_timeouts(&model_entry.value, None, state.default_timeouts).stream;
+    let mut opening = SessionOpening::default();
 
     loop {
         let next = async {
@@ -1124,18 +1361,27 @@ async fn run_session(
                             }
                         }
                     });
-                    close_upstream(&mut up_tx, &mut up_rx, frame, &mut usage).await;
+                    close_upstream(&mut up_tx, &mut up_rx, frame, |text| {
+                        usage.absorb(text);
+                        opening.observe(&state, &model_entry.id, Some(text));
+                    })
+                    .await;
                     break;
                 }
                 Some(Ok(_)) => {} // ping/pong handled by the transports
                 Some(Err(_)) | None => {
-                    close_upstream(&mut up_tx, &mut up_rx, None, &mut usage).await;
+                    close_upstream(&mut up_tx, &mut up_rx, None, |text| {
+                        usage.absorb(text);
+                        opening.observe(&state, &model_entry.id, Some(text));
+                    })
+                    .await;
                     break;
                 }
             },
             Dir::FromUpstream(m) => match m {
                 Some(Ok(TgMessage::Text(text))) => {
                     usage.absorb(&text);
+                    opening.observe(&state, &model_entry.id, Some(&text));
                     if !chain.is_empty() {
                         if let Some(resp) = guardrail_block_event(
                             &chain,
@@ -1165,6 +1411,7 @@ async fn run_session(
                     }
                 }
                 Some(Ok(TgMessage::Binary(b))) => {
+                    opening.observe(&state, &model_entry.id, None);
                     if client_tx.send(AxMessage::Binary(b)).await.is_err() {
                         break;
                     }
@@ -1174,20 +1421,32 @@ async fn run_session(
                         Some(f) => UpstreamEnd::Close(f.code.into(), &f.reason),
                         None => UpstreamEnd::NoStatus,
                     };
-                    close_client_after_upstream(&mut client_tx, end).await;
+                    close_client_after_upstream(&mut client_tx, end, opening.refused()).await;
                     break;
                 }
                 Some(Ok(_)) => {} // ping/pong/raw frames
                 Some(Err(e)) => {
                     tracing::debug!(error = %e, "realtime upstream stream error");
                     let error = aisix_gateway::error_with_causes(&e);
-                    close_client_after_upstream(&mut client_tx, UpstreamEnd::Failed(&error)).await;
-                    close_status = 502;
-                    session_error = Some(ProxyError::Bridge(BridgeError::Transport(error)));
+                    close_client_after_upstream(
+                        &mut client_tx,
+                        UpstreamEnd::Failed(&error),
+                        opening.refused(),
+                    )
+                    .await;
+                    if !opening.refused() {
+                        close_status = 502;
+                        session_error = Some(ProxyError::Bridge(BridgeError::Transport(error)));
+                    }
                     break;
                 }
                 None => {
-                    close_client_after_upstream(&mut client_tx, UpstreamEnd::Dropped).await;
+                    close_client_after_upstream(
+                        &mut client_tx,
+                        UpstreamEnd::Dropped,
+                        opening.refused(),
+                    )
+                    .await;
                     break;
                 }
             },
@@ -1197,6 +1456,40 @@ async fn run_session(
     // Every other way out of the loop leaves the upstream half open: send
     // its Close, or flush the reply to the one it sent.
     let _ = tokio::time::timeout(UPSTREAM_CLOSE_ACK, up_tx.close()).await;
+
+    // Whoever hung up first, a session that only ever reported an error failed.
+    // Anything that already named the session's end (a guardrail, the idle
+    // deadline) keeps it.
+    let refusal = if session_error.is_none() {
+        opening.refusal.take()
+    } else {
+        None
+    };
+    let mut refusal_frame = None;
+    if let Some(refusal) = refusal {
+        close_status = refusal.error.http_status();
+        crate::attempt::RoutingTelemetry::record_deployment(&state, &model_entry.id, close_status);
+        session_error = Some(ProxyError::Bridge(crate::cooldown::note_failure(
+            &state.runtime_status,
+            &model_entry.id,
+            model_entry.value.cooldown.as_ref(),
+            refusal.error,
+        )));
+        refusal_frame = Some(refusal.frame);
+    } else if !opening.usable {
+        // No frame took this sample. A session that an upstream failure ended
+        // says so; otherwise the upgrade itself was the success.
+        let upstream_failed = session_error
+            .as_ref()
+            .is_some_and(|e| crate::attempt::error_source(e) == aisix_obs::ErrorSource::Upstream);
+        let status = if upstream_failed { close_status } else { 200 };
+        crate::attempt::RoutingTelemetry::record_deployment(&state, &model_entry.id, status);
+    }
+    let provider_request_id = if refusal_frame.is_some() {
+        upgrade_request_id
+    } else {
+        String::new()
+    };
 
     let elapsed = started.elapsed();
     let total_tokens = usage.input_tokens + usage.output_tokens;
@@ -1211,6 +1504,7 @@ async fn run_session(
         Some((&provider_label, &requested_model)),
         session_error.as_ref(),
         Some((usage.input_tokens, usage.output_tokens)),
+        Some(provider_request_id.as_str()).filter(|id| !id.is_empty()),
     );
     // A realtime session can run for minutes, so its terminal emits read a
     // FRESH snapshot rather than the one `prepare` resolved against (#941) —
@@ -1254,6 +1548,7 @@ async fn run_session(
         // chokepoint cannot read it off the attribution cell; realtime
         // serves direct models only, which address themselves.
         requested_model_id: model_entry.id.clone(),
+        provider_request_id,
         prompt_tokens: usage.input_tokens.min(u32::MAX as u64) as u32,
         completion_tokens: usage.output_tokens.min(u32::MAX as u64) as u32,
         total_tokens: usage.upstream_total.recorded(),
@@ -1308,13 +1603,16 @@ async fn run_session(
     crate::usage_attr::apply_caller_identity(&mut event, auth.jwt.as_ref(), &auth.caller());
     let usage_model =
         crate::usage_attr::usage_event_model_label(&snap, &event.requested_model).into_owned();
+    let content = refusal_frame
+        .as_deref()
+        .and_then(|frame| upstream_failure_content(&snap, frame.as_bytes()));
     crate::usage_attr::emit_usage(
         &state,
         &snap,
         crate::operation::REALTIME,
         event.clone(),
         crate::usage_attr::usage_event_labels(&usage_model, &pk),
-        None,
+        content.as_ref(),
         client.trace.as_ref(),
         /* terminal */ true,
         /* dispatched */ true,
@@ -1349,18 +1647,106 @@ async fn run_session(
     );
 }
 
+/// The response column of a failure row, under a full-content export only.
+fn upstream_failure_content(
+    snap: &aisix_core::AisixSnapshot,
+    body: &[u8],
+) -> Option<aisix_obs::CapturedContent> {
+    if body.is_empty() {
+        return None;
+    }
+    let cap = crate::usage_attr::content_cap(snap)?;
+    Some(aisix_obs::CapturedContent::new(
+        "",
+        &String::from_utf8_lossy(body),
+        cap as usize,
+    ))
+}
+
+/// An upstream that completes the upgrade and then reports an error instead of
+/// opening a session, which is how OpenAI answers a wrong key, a model it does
+/// not serve, or the beta header.
+struct SessionRefusal {
+    error: BridgeError,
+    frame: String,
+}
+
+/// How far a session has opened. It is usable from the first frame that is not
+/// an `error` event: OpenAI's is `session.created`, but a compatible server need
+/// not open with that, and an error after it is one the session survives.
+#[derive(Default)]
+struct SessionOpening {
+    usable: bool,
+    refusal: Option<SessionRefusal>,
+}
+
+impl SessionOpening {
+    /// Note one upstream frame, `text` being `None` for a binary one. The first
+    /// usable frame is what counts the upgrade as a deployment success.
+    fn observe(&mut self, state: &ProxyState, model_id: &str, text: Option<&str>) {
+        if self.usable {
+            return;
+        }
+        match text.and_then(session_refusal_error) {
+            Some(error) => {
+                if self.refusal.is_none() {
+                    self.refusal = Some(SessionRefusal {
+                        error,
+                        frame: text.unwrap_or_default().to_string(),
+                    });
+                }
+            }
+            None => {
+                self.usable = true;
+                self.refusal = None;
+                // A completed upgrade answers `101`, which is a success; the
+                // deployment families classify by HTTP outcome, so it counts
+                // as a `200`.
+                crate::attempt::RoutingTelemetry::record_deployment(state, model_id, 200);
+            }
+        }
+    }
+
+    fn refused(&self) -> bool {
+        self.refusal.is_some()
+    }
+}
+
+/// The failure an `error` event reports. No HTTP status comes with it, so the
+/// status is read off OpenAI's event vocabulary, the same `type` and `code` its
+/// HTTP errors use; anything else has none and renders as a 502.
+fn session_refusal_error(text: &str) -> Option<BridgeError> {
+    let event = serde_json::from_str::<Value>(text).ok()?;
+    if event.get("type").and_then(Value::as_str) != Some("error") {
+        return None;
+    }
+    let mut error = crate::responses::responses_in_band_error(&event)?;
+    if let BridgeError::UpstreamInBand { status, parsed, .. } = &mut error {
+        let view = parsed.as_deref();
+        let code = view.and_then(|v| v.code.as_deref());
+        let kind = view.and_then(|v| v.kind.as_deref());
+        *status = status.or(match (code, kind) {
+            (Some("invalid_api_key"), _) => Some(401),
+            (Some("rate_limit_exceeded" | "insufficient_quota"), _) => Some(429),
+            (_, Some("invalid_request_error")) => Some(400),
+            _ => None,
+        });
+    }
+    Some(error)
+}
+
 /// How long a session that the client closed waits for the upstream to
 /// acknowledge its own close before dropping the connection.
 const UPSTREAM_CLOSE_ACK: Duration = Duration::from_secs(2);
 
 /// Close the upstream socket and wait, briefly, for its acknowledgement,
-/// so the upstream sees a completed handshake rather than a reset. Usage
-/// in the frames that arrive meanwhile (a response finishing) still counts.
+/// so the upstream sees a completed handshake rather than a reset. A text frame
+/// that arrives meanwhile (a response finishing) still goes to `on_text`.
 async fn close_upstream<T, R>(
     up_tx: &mut T,
     up_rx: &mut R,
     frame: Option<TgCloseFrame<'static>>,
-    usage: &mut SessionUsage,
+    mut on_text: impl FnMut(&str),
 ) where
     T: futures::Sink<TgMessage> + Unpin,
     R: futures::Stream<Item = Result<TgMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
@@ -1371,7 +1757,7 @@ async fn close_upstream<T, R>(
     let _ = tokio::time::timeout(UPSTREAM_CLOSE_ACK, async {
         while let Some(Ok(m)) = up_rx.next().await {
             match m {
-                TgMessage::Text(text) => usage.absorb(&text),
+                TgMessage::Text(text) => on_text(&text),
                 TgMessage::Close(_) => break,
                 _ => {}
             }
@@ -1411,8 +1797,9 @@ const LIBRARY_REJECTED_CLOSE: (u16, &str) = (1002, "Protocol violation");
 /// Relay the upstream's end of the session to the client: its code and
 /// reason when the upstream closed with one that may be sent, 1011
 /// otherwise. An end other than a normal close is preceded by a Realtime
-/// `error` event describing it, since many clients surface only events.
-async fn close_client_after_upstream<S>(client_tx: &mut S, end: UpstreamEnd<'_>)
+/// `error` event describing it, since many clients surface only events, unless
+/// the upstream's own error event already told the client (`refused`).
+async fn close_client_after_upstream<S>(client_tx: &mut S, end: UpstreamEnd<'_>, refused: bool)
 where
     S: futures::Sink<AxMessage> + Unpin,
 {
@@ -1456,7 +1843,7 @@ where
             Some("upstream websocket connection ended without a close frame".to_string()),
         ),
     };
-    if let Some(message) = message {
+    if let Some(message) = message.filter(|_| !refused) {
         let event = serde_json::json!({
             "type": "error",
             "error": { "type": "server_error", "message": message }
@@ -1554,6 +1941,7 @@ fn emit_access_log(
     // The session's `(input, output)` totals, the same figures its usage
     // event records. `None` before a session ran.
     tokens: Option<(u64, u64)>,
+    provider_request_id: Option<&str>,
 ) {
     // A session that counted nothing carries no token columns, as on every
     // other line.
@@ -1583,7 +1971,7 @@ fn emit_access_log(
         // `input_tokens`, so the cache-inclusive total is the plain sum.
         total_tokens: tokens.map(|(input, output)| input + output),
         request_id,
-        provider_request_id: None,
+        provider_request_id,
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
@@ -1600,23 +1988,31 @@ fn emit_access_log(
 mod tests {
     /// tungstenite gives a refused upgrade only the bytes that came with its
     /// head, undecoded. Only a body they demonstrably complete is quoted.
-    #[test]
-    fn a_refused_upgrade_quotes_only_a_body_that_arrived_whole() {
-        let refused = |headers: &[(&str, &str)], body: Option<&[u8]>| {
+    #[tokio::test]
+    async fn a_refused_upgrade_quotes_only_a_body_that_arrived_whole() {
+        // With no stream left to read, what came with the head is all there is.
+        async fn refused(headers: &[(&str, &str)], body: Option<&[u8]>) -> String {
             let mut response = axum::http::Response::builder().status(400);
             for (name, value) in headers {
                 response = response.header(*name, *value);
             }
-            super::connect_failure(&tokio_tungstenite::tungstenite::Error::Http(
-                response.body(body.map(<[u8]>::to_vec)).unwrap(),
-            ))
-            .to_string()
-        };
+            let failure = super::DialFailure {
+                error: tokio_tungstenite::tungstenite::Error::Http(
+                    response.body(body.map(<[u8]>::to_vec)).unwrap(),
+                ),
+                stream: None,
+            };
+            super::connect_failure(failure, Duration::ZERO, None, "req", std::future::pending())
+                .await
+                .0
+                .to_string()
+        }
         let whole = br#"{"error":{"message":"bad session"}}"#;
+        let quoted = "upstream returned HTTP 400: bad session";
         let length = whole.len().to_string();
         assert_eq!(
-            refused(&[("content-length", &length)], Some(whole)),
-            "upstream returned HTTP 400: bad session"
+            refused(&[("content-length", &length)], Some(whole)).await,
+            quoted
         );
         let json = String::from_utf8_lossy(whole);
         let chunked = format!("{:x}\r\n{json}\r\n0\r\n\r\n", whole.len());
@@ -1624,10 +2020,33 @@ mod tests {
             refused(
                 &[("transfer-encoding", "chunked")],
                 Some(chunked.as_bytes())
-            ),
-            "upstream returned HTTP 400: bad session"
+            )
+            .await,
+            quoted
         );
-        let in_handshake = "upstream returned HTTP 400 during the realtime handshake";
+        assert_eq!(
+            refused(&[], Some(whole)).await,
+            quoted,
+            "up to the end of the connection"
+        );
+
+        let one_byte_chunks: String = "x"
+            .repeat(30_000)
+            .chars()
+            .map(|c| format!("1\r\n{c}\r\n"))
+            .collect();
+        assert_eq!(
+            refused(
+                &[("transfer-encoding", "chunked")],
+                Some(format!("{one_byte_chunks}0\r\n\r\n").as_bytes())
+            )
+            .await,
+            format!("upstream returned HTTP 400: {}…", "x".repeat(1024)),
+            "framing that outweighs its payload is still framing"
+        );
+
+        let cut = "upstream returned HTTP 400: failed to read response body: \
+                   the connection closed before the whole body arrived";
         for (what, headers, body) in [
             (
                 "detail still on its way",
@@ -1645,20 +2064,29 @@ mod tests {
                 Some(&b"23\r\n{\"error\":{\"mess"[..]),
             ),
             (
-                "a later chunk cut short",
-                vec![("transfer-encoding", "chunked")],
-                Some(&b"3\r\nabc\r\n5\r\nde"[..]),
-            ),
-            (
                 "a chunked body with no last chunk",
                 vec![("transfer-encoding", "chunked")],
                 Some(&b"3\r\nabc\r\n"[..]),
             ),
-            ("no length to check against", vec![], Some(&whole[..])),
+        ] {
+            assert_eq!(refused(&headers, body).await, cut, "{what}");
+        }
+        assert_eq!(
+            refused(&[("transfer-encoding", "chunked")], Some(b"zz\r\nabc")).await,
+            "upstream returned HTTP 400: failed to read response body: malformed chunked body"
+        );
+
+        let in_handshake = "upstream returned HTTP 400 during the realtime handshake";
+        for (what, headers, body) in [
             (
                 "compressed",
                 vec![("content-length", "4"), ("content-encoding", "gzip")],
                 Some(&b"\x1f\x8b\x08\x00"[..]),
+            ),
+            (
+                "compressed in transfer",
+                vec![("transfer-encoding", "gzip, chunked")],
+                Some(&b"4\r\n\x1f\x8b\x08\x00\r\n0\r\n\r\n"[..]),
             ),
             ("nothing kept", vec![("content-length", "0")], None),
             (
@@ -1667,7 +2095,7 @@ mod tests {
                 Some(&b""[..]),
             ),
         ] {
-            assert_eq!(refused(&headers, body), in_handshake, "{what}");
+            assert_eq!(refused(&headers, body).await, in_handshake, "{what}");
         }
     }
 
@@ -1795,11 +2223,24 @@ mod tests {
         .expect("the dial must end on its own budget")
         .err()
         .expect("a silent upstream cannot complete the handshake");
+        let (failure, refused) = connect_failure(
+            err,
+            Duration::from_millis(300),
+            None,
+            "req",
+            std::future::pending(),
+        )
+        .await;
+        assert!(refused.is_none());
         assert!(
-            matches!(&err, tokio_tungstenite::tungstenite::Error::Io(e)
-                if e.kind() == std::io::ErrorKind::TimedOut),
-            "the failure must reach `run_session`'s upstream-connect branch \
-             as a transport error, not as something it reports differently: {err}"
+            matches!(
+                &failure,
+                BridgeError::Timeout {
+                    elapsed_ms: 300,
+                    ..
+                }
+            ),
+            "the dial's budget must report as a timeout: {failure}"
         );
     }
 
