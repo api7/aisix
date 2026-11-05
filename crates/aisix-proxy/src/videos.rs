@@ -1511,13 +1511,14 @@ impl Telemetry<'_> {
         );
     }
 
-    /// A follow-up route's failure before the video id named a usable target:
-    /// no model to label it with, and the id itself is caller-controlled text.
-    fn finish_unresolved(&self, err: ProxyError) -> Response {
+    /// A failure before the request had a target. `model` is the row it got
+    /// as far as, if any; a video id itself is caller-controlled text and
+    /// never a label.
+    fn finish_without_target(&self, err: ProxyError, model: Option<&str>) -> Response {
         self.finish(
             err.status().as_u16(),
             "unknown",
-            crate::usage_attr::UNRESOLVED_MODEL_LABEL,
+            model.unwrap_or(crate::usage_attr::UNRESOLVED_MODEL_LABEL),
             Some(&err),
         );
         err.into_response()
@@ -1660,13 +1661,7 @@ pub async fn create_video(
             // invalid_request_error, not axum's stock 422.
             let err =
                 crate::error::proxy_error_from_json_rejection(rej, state.request_body_limit_bytes);
-            telemetry.finish(
-                err.status().as_u16(),
-                "unknown",
-                crate::usage_attr::UNRESOLVED_MODEL_LABEL,
-                Some(&err),
-            );
-            return err.into_response();
+            return telemetry.finish_without_target(err, None);
         }
     };
     let model_name = body.model.clone();
@@ -2071,21 +2066,33 @@ fn resolve_get_target(
     auth: &AuthenticatedKey,
     video_id: &str,
     client_ctx: &ClientContext,
-) -> Result<(VideoTarget, String, String), ProxyError> {
-    let (entry_id, alias, task_id) =
-        decode_video_id(video_id).ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
-    let model_entry = snapshot
-        .models
-        .get_by_id(&entry_id)
-        .ok_or_else(|| ProxyError::VideoNotFound(video_id.to_string()))?;
+) -> Result<(VideoTarget, String, String), GetTargetFailure> {
+    let not_found = || GetTargetFailure {
+        err: ProxyError::VideoNotFound(video_id.to_string()),
+        model: None,
+    };
+    let (entry_id, alias, task_id) = decode_video_id(video_id).ok_or_else(not_found)?;
+    let model_entry = snapshot.models.get_by_id(&entry_id).ok_or_else(not_found)?;
+    let display_name = model_entry.value.display_name.clone();
     match resolve_video_target(snapshot, auth, model_entry, &alias, client_ctx) {
         Ok(Ok(target)) => Ok((target, task_id, alias)),
         // Unsupported provider → uniform 404 (oracle fold, see above).
-        Ok(Err(_)) => Err(ProxyError::VideoNotFound(video_id.to_string())),
+        Ok(Err(_)) => Err(not_found()),
         // ACL denial → uniform 404 (oracle fold, see above).
-        Err(ProxyError::ModelForbidden(_)) => Err(ProxyError::VideoNotFound(video_id.to_string())),
-        Err(e) => Err(e),
+        Err(ProxyError::ModelForbidden(_)) => Err(not_found()),
+        Err(err) => Err(GetTargetFailure {
+            err,
+            model: Some(display_name),
+        }),
     }
+}
+
+/// Why a follow-up route has no target, and the model its telemetry names:
+/// `None` for the outcomes answered as a uniform 404, so an id probing a
+/// row the caller cannot use does not count as that row's traffic.
+struct GetTargetFailure {
+    err: ProxyError,
+    model: Option<String>,
 }
 
 /// Whether `group` names a Model Group with `target` among its targets.
@@ -2123,7 +2130,9 @@ pub async fn get_video(
     let (target, task_id, requested_alias) =
         match resolve_get_target(&snapshot, &auth, &video_id, &client) {
             Ok(resolved) => resolved,
-            Err(err) => return telemetry.finish_unresolved(err),
+            Err(failure) => {
+                return telemetry.finish_without_target(failure.err, failure.model.as_deref())
+            }
         };
 
     let result: Result<Response, ProxyError> = async {
@@ -2199,7 +2208,9 @@ pub async fn video_content(
 
     let (target, task_id, _) = match resolve_get_target(&snapshot, &auth, &video_id, &client) {
         Ok(resolved) => resolved,
-        Err(err) => return telemetry.finish_unresolved(err),
+        Err(failure) => {
+            return telemetry.finish_without_target(failure.err, failure.model.as_deref())
+        }
     };
 
     let result: Result<(Response, bool), ProxyError> = async {

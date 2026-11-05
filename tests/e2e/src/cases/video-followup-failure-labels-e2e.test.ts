@@ -24,7 +24,10 @@ const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
 const VIDEO_REFUSED = "followup-video-refused";
 const VIDEO_PENDING = "followup-video-pending";
+const VIDEO_IP_LOCKED = "followup-video-ip-locked";
 const REALTIME_MODEL = "followup-realtime";
+const REALTIME_NO_PROTOCOL = "followup-realtime-no-protocol";
+const REALTIME_WILDCARD = "followup-wild/*";
 const REQUESTS = "aisix_requests_total";
 
 function field(line: string, name: string): string | undefined {
@@ -38,6 +41,7 @@ describe("failure labels on the routes that resolve their model mid-request", ()
   let etcdReachable = false;
   let refusedId = "";
   let pendingId = "";
+  let ipLockedId = "";
   const upstreams: OpenAiUpstream[] = [];
 
   const videoId = (modelId: string, alias: string, task: string) =>
@@ -66,13 +70,16 @@ describe("failure labels on the routes that resolve their model mid-request", ()
       });
       ws.on("unexpected-response", (_req, res) => {
         res.resume();
+        ws.terminate();
         resolve({
           status: res.statusCode ?? 0,
           requestId: String(res.headers["x-aisix-request-id"] ?? ""),
         });
       });
       ws.on("open", () => reject(new Error("the handshake was not refused")));
-      ws.on("error", reject);
+      ws.on("error", (err) => {
+        if (ws.readyState !== WebSocket.CLOSING) reject(err);
+      });
     });
 
   beforeAll(async () => {
@@ -93,7 +100,7 @@ describe("failure labels on the routes that resolve their model mid-request", ()
     });
     upstreams.push(refusing, pending);
 
-    const seedVideoModel = async (name: string, apiBase: string) => {
+    const seedVideoModel = async (name: string, apiBase: string, extra: Record<string, unknown> = {}) => {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
         secret: "sk-mock",
@@ -105,10 +112,15 @@ describe("failure labels on the routes that resolve their model mid-request", ()
         provider: "zhipuai",
         model_name: `${name}-upstream`,
         provider_key_id: pk.id,
+        ...extra,
       });
     };
     const refusedModel = await seedVideoModel(VIDEO_REFUSED, refusing.baseUrl);
     const pendingModel = await seedVideoModel(VIDEO_PENDING, pending.baseUrl);
+    const ipLockedModel = await seedVideoModel(VIDEO_IP_LOCKED, refusing.baseUrl, {
+      allowed_cidrs: ["203.0.113.0/24"],
+    });
+    ipLockedId = videoId(ipLockedModel.id, VIDEO_IP_LOCKED, "task-1");
     refusedId = videoId(refusedModel.id, VIDEO_REFUSED, "task-1");
     pendingId = videoId(pendingModel.id, VIDEO_PENDING, "task-1");
 
@@ -125,11 +137,41 @@ describe("failure labels on the routes that resolve their model mid-request", ()
       provider_key_id: realtimePk.id,
     });
 
-    await seed.createApiKey({ key_hash: sha256(CALLER), allowed_models: ["*"] });
-    await seed.createApiKey({ key_hash: sha256(REALTIME_DENIED_CALLER), allowed_models: [VIDEO_REFUSED] });
+    await seed.createModel({
+      display_name: REALTIME_WILDCARD,
+      provider: "openai",
+      model_name: "*",
+      provider_key_id: realtimePk.id,
+    });
+    const noProtocolPk = await seed.createProviderKey({
+      display_name: `${REALTIME_NO_PROTOCOL}-pk`,
+      secret: "sk-mock",
+      api_base: refusing.baseUrl,
+      provider: "anthropic",
+      adapter: "anthropic",
+    });
+    await seed.createModel({
+      display_name: REALTIME_NO_PROTOCOL,
+      provider: "anthropic",
+      model_name: "claude-mock",
+      provider_key_id: noProtocolPk.id,
+    });
 
-    await waitConfigPropagation(async () => (await getVideo(pendingId)).status === 200);
-    await waitConfigPropagation(async () => (await refusedHandshake(REALTIME_MODEL)).status === 403);
+    await seed.createApiKey({ key_hash: sha256(CALLER), allowed_models: ["*"] });
+    await seed.createApiKey({
+      key_hash: sha256(REALTIME_DENIED_CALLER),
+      allowed_models: [VIDEO_REFUSED, REALTIME_NO_PROTOCOL],
+    });
+
+    // The keys were seeded last, so a key that authenticates means every row
+    // before it has arrived.
+    await waitConfigPropagation(async () => {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${REALTIME_DENIED_CALLER}` },
+      });
+      await res.text();
+      return res.status === 200;
+    });
   }, 60_000);
 
   afterAll(async () => {
@@ -172,6 +214,19 @@ describe("failure labels on the routes that resolve their model mid-request", ()
     ).toBe(1);
   });
 
+  test("a poll the model's IP restriction refuses carries the model", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const before = await scrapeMetrics(app.metricsUrl);
+
+    const { status, requestId } = await getVideo(ipLockedId);
+    expect(status).toBe(403);
+
+    expect(field(await lineOf(requestId), "requested_model")).toBe(VIDEO_IP_LOCKED);
+    const after = await scrapeMetrics(app.metricsUrl);
+    expect(metricDelta(before, after, REQUESTS, { model: VIDEO_IP_LOCKED, status: "403" })).toBe(1);
+    expect(metricDelta(before, after, REQUESTS, { model: "unresolved" })).toBe(0);
+  });
+
   test.each([
     ["an id the gateway never minted", () => "not-a-video-id"],
     ["an id naming no configured model", () => videoId("00000000-0000-4000-8000-000000000000", "gone", "task-1")],
@@ -194,14 +249,43 @@ describe("failure labels on the routes that resolve their model mid-request", ()
     const { status, requestId } = await refusedHandshake(REALTIME_MODEL);
     expect(status).toBe(403);
 
+    expect(field(await lineOf(requestId), "requested_model")).toBe(REALTIME_MODEL);
+    const after = await scrapeMetrics(app.metricsUrl);
+    expect(metricDelta(before, after, REQUESTS, { model: REALTIME_MODEL, status: "403" })).toBe(1);
+    expect(metricDelta(before, after, REQUESTS, { model: "unresolved" })).toBe(0);
+  });
+
+  test("a realtime refusal after the target was selected names the target too", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const before = await scrapeMetrics(app.metricsUrl);
+
+    const { status, requestId } = await refusedHandshake(REALTIME_NO_PROTOCOL);
+    expect(status).toBe(400);
+
     const line = await lineOf(requestId);
-    expect(field(line, "requested_model")).toBe(REALTIME_MODEL);
-    expect(field(line, "provider")).toBe("openai");
+    expect(field(line, "requested_model")).toBe(REALTIME_NO_PROTOCOL);
+    expect(field(line, "provider")).toBe("anthropic");
     const after = await scrapeMetrics(app.metricsUrl);
     expect(
-      metricDelta(before, after, REQUESTS, { provider: "openai", model: REALTIME_MODEL, status: "403" }),
+      metricDelta(before, after, "aisix_proxy_requests_total", {
+        provider: "anthropic",
+        model: REALTIME_NO_PROTOCOL,
+        upstream_model: "claude-mock",
+        provider_key_name: `${REALTIME_NO_PROTOCOL}-pk`,
+        status: "400",
+      }),
     ).toBe(1);
-    expect(metricDelta(before, after, REQUESTS, { model: "unresolved" })).toBe(0);
+  });
+
+  test("a realtime refusal on a wildcard row labels the row, not the caller's name", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const before = await scrapeMetrics(app.metricsUrl);
+
+    const { status } = await refusedHandshake("followup-wild/minted-by-caller");
+    expect(status).toBe(403);
+
+    const after = await scrapeMetrics(app.metricsUrl);
+    expect(metricDelta(before, after, REQUESTS, { model: REALTIME_WILDCARD, status: "403" })).toBe(1);
   });
 
   test("a realtime handshake naming no configured model stays unresolved", async (ctx) => {
