@@ -991,59 +991,50 @@ fn nonempty_str(v: Option<&serde_json::Value>) -> Option<&str> {
     v.and_then(|v| v.as_str()).filter(|s| !s.is_empty())
 }
 
-/// Best-effort extraction of a vendor error envelope's message from a
-/// non-2xx upstream body. DashScope puts `{code, message}` at the top level;
-/// the OpenAI-style vendors nest `{error: {code, message}}`; any other shape the
-/// shared reader knows reads as it does on the row. Falls back to a generic
-/// marker for non-JSON or fieldless bodies so a typed error is always producible. Shared by the JSON task calls ([`provider_call`]) and the
-/// content-proxy path ([`proxy_content`]) — both must map a non-2xx upstream
-/// to a typed error rather than surfacing the raw body.
-fn parse_provider_error_message(bytes: &[u8]) -> String {
-    vendor_error_message(bytes)
-        .or_else(|| aisix_gateway::upstream_error_text(bytes).filter(|text| !text.is_empty()))
-        .unwrap_or_else(|| "upstream error".to_string())
-}
-
-/// The typed error of a non-2xx: the caller reads
-/// [`parse_provider_error_message`], the row and the access log what the body
-/// actually said.
-fn provider_status_error(status: u16, bytes: &[u8]) -> aisix_gateway::BridgeError {
-    aisix_gateway::BridgeError::upstream_status(status, parse_provider_error_message(bytes))
-        .with_telemetry_detail(&provider_error_detail(bytes))
-}
-
-/// What the row and the access log report: the upstream's message, or a
-/// vendor's bare code when that is all it said.
-fn provider_error_detail(bytes: &[u8]) -> String {
-    match vendor_error_fields(bytes) {
-        (_, Some(msg)) => msg,
-        (Some(code), None) => code,
-        (None, None) => aisix_gateway::upstream_error_message(bytes),
+/// The envelope of a non-2xx: OpenAI's, or the top-level `{code, message}`
+/// DashScope answers with instead. Any other shape's text is the shared
+/// reader's, and carries no code.
+fn video_error_view(body: &[u8]) -> Option<aisix_gateway::UpstreamErrorView> {
+    fn text(v: Option<&serde_json::Value>) -> Option<String> {
+        match v? {
+            serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            _ => None,
+        }
     }
+    if let Some(view) = aisix_provider_openai::parse_openai_error_envelope(body) {
+        return Some(view);
+    }
+    let top: serde_json::Value = serde_json::from_slice(body).ok()?;
+    Some(aisix_gateway::UpstreamErrorView {
+        code: Some(text(top.get("code"))?),
+        param: text(top.get("param")),
+        ..Default::default()
+    })
 }
 
-fn vendor_error_message(bytes: &[u8]) -> Option<String> {
-    let text = match vendor_error_fields(bytes) {
-        (Some(code), Some(msg)) => format!("{code}: {msg}"),
-        (None, Some(msg)) => msg,
-        (Some(code), None) => code,
-        (None, None) => return None,
-    };
-    Some(aisix_gateway::truncate_lossy(
-        &text,
-        aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
-    ))
-}
-
-fn vendor_error_fields(bytes: &[u8]) -> (Option<String>, Option<String>) {
-    let Ok(p) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return (None, None);
-    };
-    let scope = p.get("error").unwrap_or(&p);
-    (
-        nonempty_str(scope.get("code")).map(str::to_string),
-        nonempty_str(scope.get("message")).map(str::to_string),
-    )
+/// The typed error of a non-2xx body, read as a bridge reads chat's. Past the
+/// error-body cap it is not parsed, however much of it was read. A vendor's
+/// bare code is no text for the caller, who gets it as `code`, but it is all
+/// the row and the access log have to report.
+fn provider_status_error(
+    status: u16,
+    body: &[u8],
+    retry_after: Option<Duration>,
+) -> aisix_gateway::BridgeError {
+    let body = &body[..body.len().min(aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES)];
+    let err = aisix_gateway::upstream_status_of_body(
+        status,
+        body,
+        retry_after,
+        aisix_gateway::UpstreamWire::OpenAI,
+        video_error_view,
+    );
+    let has_text = aisix_gateway::upstream_error_text(body).is_some_and(|t| !t.trim().is_empty());
+    match video_error_view(body).and_then(|view| view.code) {
+        Some(code) if !has_text => err.with_telemetry_detail(&code),
+        _ => err,
+    }
 }
 
 // ─────────────────────── resolved dispatch target ───────────────────────
@@ -1324,6 +1315,7 @@ fn provider_call_once<'a>(
         aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status().as_u16();
         let is_success = (200..300).contains(&status);
+        let retry_after = aisix_gateway::parse_retry_after(resp.headers());
         let bytes = resp.bytes().await.map_err(|e| {
             note(if is_success {
                 aisix_gateway::upstream_body_read_error(&e)
@@ -1334,7 +1326,7 @@ fn provider_call_once<'a>(
 
         if !is_success {
             aisix_gateway::note_upstream_error_body(&bytes);
-            return Err(note(provider_status_error(status, &bytes)));
+            return Err(note(provider_status_error(status, &bytes, retry_after)));
         }
 
         serde_json::from_slice(&bytes).map_err(|e| {
@@ -1439,13 +1431,14 @@ async fn proxy_content(
     if !status.is_success() {
         // Status checked BEFORE any body is constructed: an expired /
         // not-ready content URL must surface as a typed error envelope, never
-        // as a truncated `video/mp4` stream. The error body is small — read
-        // it whole to recover the vendor message, but bound the read by the
-        // same per-request budget so a non-2xx upstream that then stalls its
-        // error body cannot hang the handler (the success path is already
+        // as a truncated `video/mp4` stream. Bound the read of the error body
+        // by the same per-request budget so a non-2xx upstream that then
+        // stalls it cannot hang the handler (the success path is already
         // bounded per-chunk; this closes the error branch).
         let code = status.as_u16();
-        let read = aisix_gateway::read_body_capped(resp, usize::MAX);
+        let retry_after = aisix_gateway::parse_retry_after(resp.headers());
+        let read =
+            aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES);
         let body = match stream_budget {
             Some(d) => tokio::time::timeout(d, read).await.unwrap_or_else(|_| {
                 let reason = format!("timed out after {}ms", d.as_millis());
@@ -1457,7 +1450,8 @@ async fn proxy_content(
             }),
             None => read.await,
         };
-        let err = provider_status_error(code, body.whole()).with_body_read_error(body.read_error);
+        let err = provider_status_error(code, body.whole(), retry_after)
+            .with_body_read_error(body.read_error);
         return Err(ProxyError::Bridge(note(err)));
     }
 
@@ -3324,18 +3318,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_vendors_error_text_reaches_the_caller_capped() {
-        let long = "x".repeat(5000);
-        let body = serde_json::json!({"error": {"code": long, "message": long}}).to_string();
-        let text = parse_provider_error_message(body.as_bytes());
-        assert!(
-            text.len() <= aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES + "…".len(),
-            "{} bytes",
-            text.len()
-        );
-    }
-
     #[tokio::test]
     async fn upstream_4xx_maps_to_error_envelope() {
         let upstream = MockServer::builder().start().await;
@@ -3359,12 +3341,14 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let v = body_json(resp).await;
-        // Wire=Unknown 4xx keeps the upstream message under the generic
-        // upstream_error type (error.rs render rules).
-        assert!(v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("duration out of range"));
+        assert_eq!(
+            v["error"],
+            serde_json::json!({
+                "message": "duration out of range",
+                "type": "upstream_error",
+                "code": "InvalidParameter",
+            })
+        );
     }
 
     /// HIGH-1 (PR #811 audit): a GET on an id that resolves to a
@@ -3939,10 +3923,14 @@ mod tests {
         .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let v = body_json(resp).await;
-        assert!(v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("model parameter invalid"));
+        assert_eq!(
+            v["error"],
+            serde_json::json!({
+                "message": "model parameter invalid",
+                "type": "upstream_error",
+                "code": "1210",
+            })
+        );
     }
 
     // ──────────────────── Runway (Gen / Veo) journey ────────────────────
@@ -4377,10 +4365,14 @@ mod tests {
             "an upstream content error must not be labelled video/mp4"
         );
         let v = body_json(resp).await;
-        assert!(v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("download URL has expired"));
+        assert_eq!(
+            v["error"],
+            serde_json::json!({
+                "message": "download URL has expired",
+                "type": "upstream_error",
+                "code": "expired",
+            })
+        );
     }
 
     /// AISIX-Cloud#1330 / #1024: a guardrail BLOCK leaves this handler
