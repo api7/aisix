@@ -553,6 +553,7 @@ pub(crate) async fn realtime(
     // generations. The detached session's terminal emit deliberately reads
     // a fresh one — it can run for minutes.
     let snapshot = state.snapshot.load();
+    let mut addressed = None;
     let outcome = match ws {
         Ok(ws) => match authenticate(&state, &headers, &client).await {
             Ok(auth) => {
@@ -560,10 +561,18 @@ pub(crate) async fn realtime(
                 // auth extractor; do the same here so the session clone
                 // and the error emits below attribute the JWT identity.
                 client.jwt = auth.jwt.clone();
-                prepare(&state, &snapshot, &params, &headers, &client, auth.clone())
-                    .await
-                    .map(|prep| (ws, prep))
-                    .map_err(|err| (Some(auth), err))
+                prepare(
+                    &state,
+                    &snapshot,
+                    &params,
+                    &headers,
+                    &client,
+                    auth.clone(),
+                    &mut addressed,
+                )
+                .await
+                .map(|prep| (ws, prep))
+                .map_err(|err| (Some(auth), err))
             }
             Err(err) => Err((None, err)),
         },
@@ -603,22 +612,28 @@ pub(crate) async fn realtime(
         Err((auth, err)) => {
             let status = err.status().as_u16();
             let api_key_id = auth.as_ref().map(|a| a.entry.id.as_str());
+            let provider_label = addressed
+                .as_ref()
+                .map(|entry| entry.value.provider.clone().unwrap_or_default());
+            let requested_model = params.get("model").map(|m| m.trim());
             emit_access_log(
                 &method,
                 status,
                 started.elapsed(),
                 &request_id,
                 api_key_id,
-                None,
+                provider_label.as_deref().zip(requested_model),
                 Some(&err),
                 None,
                 None,
             );
-            // Count the refusal like every other pre-dispatch rejection
-            // (unresolved labels, same as `reject_before_dispatch`) — logs
-            // and the request-rate metrics must not disagree about whether
-            // these requests exist. Authentication may not have run, so the
-            // caller is attributed only when a key was resolved (#932).
+            // Count the refusal like every other pre-dispatch rejection —
+            // logs and the request-rate metrics must not disagree about
+            // whether these requests exist. It carries the labels a session
+            // on this model would once `prepare` found the model, unresolved
+            // ones (same as `reject_before_dispatch`) before that.
+            // Authentication may not have run, so the caller is attributed
+            // only when a key was resolved (#932).
             crate::request_metrics::record(
                 &state,
                 "/v1/realtime",
@@ -627,7 +642,15 @@ pub(crate) async fn realtime(
                     None => crate::request_metrics::Caller::unattributed(None),
                 },
                 crate::request_metrics::Upstream {
-                    model: crate::usage_attr::UNRESOLVED_MODEL_LABEL,
+                    provider: provider_label
+                        .as_deref()
+                        .filter(|p| !p.is_empty())
+                        .unwrap_or(crate::request_metrics::UNKNOWN),
+                    model: addressed
+                        .as_ref()
+                        .map_or(crate::usage_attr::UNRESOLVED_MODEL_LABEL, |entry| {
+                            entry.value.display_name.as_str()
+                        }),
                     ..Default::default()
                 },
                 status,
@@ -681,6 +704,8 @@ async fn prepare(
     headers: &HeaderMap,
     client: &ClientContext,
     auth: AuthenticatedKey,
+    // The model once found, for the telemetry of a refusal after that point.
+    addressed: &mut Option<std::sync::Arc<aisix_core::ResourceEntry<aisix_core::Model>>>,
 ) -> Result<Prepared, ProxyError> {
     let beta_realtime = client_requested_beta_realtime(headers);
     let requested_model = params
@@ -697,6 +722,7 @@ async fn prepare(
 
     let model_entry = crate::model_resolve::resolve_model(snapshot, &requested_model)
         .ok_or_else(|| ProxyError::ModelNotFound(requested_model.to_string()))?;
+    *addressed = Some(model_entry.clone());
     if !auth.key().can_access(snapshot, &requested_model) {
         return Err(ProxyError::ModelForbidden(requested_model.to_string()));
     }

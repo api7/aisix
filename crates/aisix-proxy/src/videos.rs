@@ -1511,6 +1511,18 @@ impl Telemetry<'_> {
         );
     }
 
+    /// A follow-up route's failure before the video id named a usable target:
+    /// no model to label it with, and the id itself is caller-controlled text.
+    fn finish_unresolved(&self, err: ProxyError) -> Response {
+        self.finish(
+            err.status().as_u16(),
+            "unknown",
+            crate::usage_attr::UNRESOLVED_MODEL_LABEL,
+            Some(&err),
+        );
+        err.into_response()
+    }
+
     /// [`Self::finish`] for the submit, whose dispatch can fail over to
     /// another Model Group target: the access log carries its routing
     /// summary, the request series its `is_fallback`.
@@ -2108,9 +2120,13 @@ pub async fn get_video(
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
 
-    let result: Result<(Response, String, String), ProxyError> = async {
-        let (target, task_id, requested_alias) =
-            resolve_get_target(&snapshot, &auth, &video_id, &client)?;
+    let (target, task_id, requested_alias) =
+        match resolve_get_target(&snapshot, &auth, &video_id, &client) {
+            Ok(resolved) => resolved,
+            Err(err) => return telemetry.finish_unresolved(err),
+        };
+
+    let result: Result<Response, ProxyError> = async {
         // Poll traffic is exempt from model-level limits BY DESIGN
         // (AISIX-Cloud#1118 decision 3): a client polling a task it
         // already paid an RPM slot to submit must not starve itself.
@@ -2138,26 +2154,18 @@ pub async fn get_video(
                 target.display_name()
             };
         let video = video_object_from_poll(&video_id, echoed, &poll);
-        Ok((
-            Json(video).into_response(),
-            target.provider_label.clone(),
-            target.display_name().to_string(),
-        ))
+        Ok(Json(video).into_response())
     }
     .await;
 
+    let (provider, model_label) = (&target.provider_label, target.display_name());
     match result {
-        Ok((resp, provider, model_label)) => {
-            telemetry.finish(resp.status().as_u16(), &provider, &model_label, None);
+        Ok(resp) => {
+            telemetry.finish(resp.status().as_u16(), provider, model_label, None);
             resp
         }
         Err(err) => {
-            telemetry.finish(
-                err.status().as_u16(),
-                "unknown",
-                crate::usage_attr::UNRESOLVED_MODEL_LABEL,
-                Some(&err),
-            );
+            telemetry.finish(err.status().as_u16(), provider, model_label, Some(&err));
             err.into_response()
         }
     }
@@ -2189,8 +2197,12 @@ pub async fn video_content(
     // One snapshot for the whole request (#941) — see `embeddings`.
     let snapshot = state.snapshot.load();
 
-    let result: Result<(Response, String, String, bool), ProxyError> = async {
-        let (target, task_id, _) = resolve_get_target(&snapshot, &auth, &video_id, &client)?;
+    let (target, task_id, _) = match resolve_get_target(&snapshot, &auth, &video_id, &client) {
+        Ok(resolved) => resolved,
+        Err(err) => return telemetry.finish_unresolved(err),
+    };
+
+    let result: Result<(Response, bool), ProxyError> = async {
         // Same model-layer exemption as the poll route (see get_video).
         let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
         crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_id)?;
@@ -2265,28 +2277,19 @@ pub async fn video_content(
                 )));
             }
         };
-        Ok((
-            response,
-            target.provider_label.clone(),
-            target.display_name().to_string(),
-            relays_body,
-        ))
+        Ok((response, relays_body))
     }
     .await;
 
+    let (provider, model_label) = (&target.provider_label, target.display_name());
     match result {
-        Ok((resp, provider, model_label, relays_body)) => {
+        Ok((resp, relays_body)) => {
             telemetry.duration_spans_body = relays_body;
-            telemetry.finish(resp.status().as_u16(), &provider, &model_label, None);
+            telemetry.finish(resp.status().as_u16(), provider, model_label, None);
             resp
         }
         Err(err) => {
-            telemetry.finish(
-                err.status().as_u16(),
-                "unknown",
-                crate::usage_attr::UNRESOLVED_MODEL_LABEL,
-                Some(&err),
-            );
+            telemetry.finish(err.status().as_u16(), provider, model_label, Some(&err));
             err.into_response()
         }
     }
