@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { WebSocket } from "ws";
@@ -25,6 +26,11 @@ const CALLER = "sk-error-text-caller";
 const LOGSTORE = "error-text-rows";
 const TEXT = "sentinel upstream failure text";
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+const HUGE_BODY_BYTES = 256 * 1024 * 1024;
+const peakRssBytes = async (pid: number) => {
+  const status = await readFile(`/proc/${pid}/status`, "utf8");
+  return Number(/^VmHWM:\s+(\d+) kB/m.exec(status)![1]) * 1024;
+};
 
 const openAiEnvelope = (status: number) =>
   JSON.stringify({
@@ -122,14 +128,19 @@ describe("an upstream's failure reads the same on every route that sends its own
   // on the content download.
   async function videoTaskUpstream(
     failing: "poll" | "content",
-    failure: { status: number; body: string; headers?: Record<string, string> },
+    failure: { status: number; body: string; headers?: Record<string, string>; cutOff?: boolean },
   ): Promise<string> {
     const server = createServer((req, res) => {
       req.resume();
       req.on("end", () => {
         const fail = () => {
-          res.writeHead(failure.status, { "content-type": "application/json", ...failure.headers });
-          res.end(failure.body);
+          res.writeHead(failure.status, {
+            "content-type": "application/json",
+            ...(failure.cutOff ? { "content-length": "4096" } : {}),
+            ...failure.headers,
+          });
+          if (failure.cutOff) res.write(failure.body, () => res.destroy());
+          else res.end(failure.body);
         };
         const task = (status: string) => {
           res.writeHead(200, { "content-type": "application/json" });
@@ -138,6 +149,24 @@ describe("an upstream's failure reads the same on every route that sends its own
         if (req.method === "POST") return task("queued");
         if (req.url?.endsWith("/content")) return fail();
         return failing === "poll" ? fail() : task("completed");
+      });
+    });
+    servers.push(server);
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  }
+
+  // A failure body sent in chunks, so nothing but the gateway holds it whole.
+  async function hugeBodyUpstream(status: number, bytes: number): Promise<string> {
+    const chunk = Buffer.alloc(1024 * 1024, "x");
+    const server = createServer((req, res) => {
+      req.resume();
+      req.on("end", async () => {
+        res.writeHead(status, { "content-type": "application/json", "content-length": String(bytes) });
+        for (let sent = 0; sent < bytes; sent += chunk.length) {
+          if (!res.write(chunk)) await new Promise((r) => res.once("drain", r));
+        }
+        res.end();
       });
     });
     servers.push(server);
@@ -250,6 +279,8 @@ describe("an upstream's failure reads the same on every route that sends its own
     });
     await model("openai-past-the-cap", "openai", `${await fixedUpstream(400, padded)}/v1`);
     names.push("openai-past-the-cap");
+    await model("video-huge-body", "openai", `${await hugeBodyUpstream(400, HUGE_BODY_BYTES)}/v1`);
+    names.push("video-huge-body");
     await model(
       "cohere-top-level",
       "cohere",
@@ -302,6 +333,8 @@ describe("an upstream's failure reads the same on every route that sends its own
         ["server", { status: 500, body: openAiEnvelope(500) }],
         ["html", { status: 503, body: HTML }],
         ["rate-limited", { status: 429, body: openAiEnvelope(429), headers: { "retry-after": "7" } }],
+        ["cut", { status: 500, body: '{"error":{"mess', cutOff: true }],
+        ["cut-rate-limited", { status: 429, body: '{"error":{"mess', headers: { "retry-after": "7" }, cutOff: true }],
       ] as const) {
         const name = `video-${leg}-${shape}`;
         await model(name, "openai", `${await videoTaskUpstream(leg, failure)}/v1`);
@@ -884,6 +917,15 @@ describe("an upstream's failure reads the same on every route that sends its own
       expect(Buffer.byteLength(String(got.body.error.message))).toBeLessThanOrEqual(1024 + 3);
     });
 
+    test("a body far past the error-body cap is not held in memory", async () => {
+      if (!etcdReachable) return;
+      const before = await peakRssBytes(app!.pid);
+      const got = await submit("video-huge-body");
+      expect(got.status).toBe(400);
+      expect(Buffer.byteLength(String(got.body.error.message))).toBeLessThanOrEqual(1024 + 3);
+      expect((await peakRssBytes(app!.pid)) - before).toBeLessThan(HUGE_BODY_BYTES / 4);
+    });
+
     describe.each(["poll", "content"] as const)("the %s route of a task that exists", (leg) => {
       const follow = async (model: string) => {
         const submitted = await fetch(`${app!.proxyUrl}/v1/videos`, json({ model, prompt: "hi" }));
@@ -932,6 +974,23 @@ describe("an upstream's failure reads the same on every route that sends its own
       test("a 429 keeps the upstream's Retry-After", async () => {
         if (!etcdReachable) return;
         const got = await follow(`video-${leg}-rate-limited`);
+        expect(got.status).toBe(429);
+        expect(got.retryAfter).toBe("7");
+      });
+
+      test("a body cut off answers its status, not the fragment", async () => {
+        if (!etcdReachable) return;
+        const got = await follow(`video-${leg}-cut`);
+        expect(got.status).toBe(502);
+        expect(got.body.error).toEqual({
+          message: "upstream returned 500 Internal Server Error",
+          type: "upstream_error",
+        });
+      });
+
+      test("a 429 cut off keeps the upstream's Retry-After", async () => {
+        if (!etcdReachable) return;
+        const got = await follow(`video-${leg}-cut-rate-limited`);
         expect(got.status).toBe(429);
         expect(got.retryAfter).toBe("7");
       });

@@ -1005,23 +1005,6 @@ fn video_error_view(body: &[u8]) -> Option<aisix_gateway::UpstreamErrorView> {
     })
 }
 
-/// The typed error of a non-2xx body, read as a bridge reads chat's. Past the
-/// error-body cap it is not parsed, however much of it was read.
-fn provider_status_error(
-    status: u16,
-    body: &[u8],
-    retry_after: Option<Duration>,
-) -> aisix_gateway::BridgeError {
-    let body = &body[..body.len().min(aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES)];
-    aisix_gateway::upstream_status_of_body(
-        status,
-        body,
-        retry_after,
-        aisix_gateway::UpstreamWire::OpenAI,
-        video_error_view,
-    )
-}
-
 // ─────────────────────── resolved dispatch target ───────────────────────
 
 /// Everything the three handlers need after resolving a Model for the
@@ -1207,8 +1190,8 @@ fn note_deployment(
 /// submit, the next target of a Model Group).
 ///
 /// The submit POST creates a PAID generation task, so a failure after the
-/// upstream returned its status (a body-read or parse failure —
-/// `UpstreamDecode`) must not be replayed: the task exists upstream, its id
+/// upstream answered 2xx (a body-read or parse failure — `UpstreamDecode`)
+/// must not be replayed: the task exists upstream, its id
 /// was in the lost body, and a retry would start a second one the caller
 /// also can't see. Send-phase transport failures stay retryable for POST
 /// too — whether the request arrived is unknowable, and the provider SDKs
@@ -1221,8 +1204,8 @@ fn retry_permit(method: &reqwest::Method, e: &aisix_gateway::BridgeError) -> boo
 /// One provider HTTP round-trip: Bearer auth (all three vendors),
 /// provider-specific submit headers, the given E2E timeout, cooldown
 /// accounting on transport failures (parity with jobs / passthrough,
-/// #701). Non-2xx responses map to `BridgeError::UpstreamStatus` through
-/// [`provider_status_error`]. `note` stays per attempt (see rerank.rs).
+/// #701). Non-2xx responses map to `BridgeError::UpstreamStatus` as a bridge
+/// reads chat's. `note` stays per attempt (see rerank.rs).
 fn provider_call_once<'a>(
     state: &'a ProxyState,
     target: &'a VideoTarget,
@@ -1296,21 +1279,20 @@ fn provider_call_once<'a>(
             .await
             .map_err(|e| note(crate::dispatch::reqwest_error_to_bridge(&e, started)))?;
         aisix_gateway::note_upstream_response(resp.headers());
-        let status = resp.status().as_u16();
-        let is_success = (200..300).contains(&status);
-        let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-        let bytes = resp.bytes().await.map_err(|e| {
-            note(if is_success {
-                aisix_gateway::upstream_body_read_error(&e)
-            } else {
-                aisix_gateway::BridgeError::upstream_body_unread(status, &e)
-            })
-        })?;
-
-        if !is_success {
-            aisix_gateway::note_upstream_error_body(&bytes);
-            return Err(note(provider_status_error(status, &bytes, retry_after)));
+        if !resp.status().is_success() {
+            return Err(note(
+                aisix_gateway::upstream_status_parsed_from_response(
+                    resp,
+                    aisix_gateway::UpstreamWire::OpenAI,
+                    video_error_view,
+                )
+                .await,
+            ));
         }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| note(aisix_gateway::upstream_body_read_error(&e)))?;
 
         serde_json::from_slice(&bytes).map_err(|e| {
             aisix_gateway::BridgeError::UpstreamDecode(format!(
@@ -1418,14 +1400,12 @@ async fn proxy_content(
         // per-request budget so a non-2xx upstream that then stalls its error
         // body cannot hang the handler (the success path is already bounded
         // per-chunk; this closes the error branch).
-        let err = aisix_gateway::upstream_error_within(stream_budget, resp, |resp| async move {
-            let code = resp.status().as_u16();
-            let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-            let body =
-                aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES)
-                    .await;
-            provider_status_error(code, body.whole(), retry_after)
-                .with_body_read_error(body.read_error)
+        let err = aisix_gateway::upstream_error_within(stream_budget, resp, |resp| {
+            aisix_gateway::upstream_status_parsed_from_response(
+                resp,
+                aisix_gateway::UpstreamWire::OpenAI,
+                video_error_view,
+            )
         })
         .await;
         return Err(ProxyError::Bridge(note(err)));

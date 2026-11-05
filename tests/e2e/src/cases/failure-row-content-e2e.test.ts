@@ -868,14 +868,16 @@ describe("failure rows carry request and response bodies", () => {
     },
   );
 
-  test("videos: a body cut off answers as an unparseable body; the row names the read failure", async () => {
+  test("videos: a body cut off answers its status as the other routes do; the row names the read failure", async () => {
     if (!etcdReachable) return;
     const res = await post("/v1/videos", { model: "row-video-cut", prompt: "video-cut-prompt" });
     const body = await res.text();
     expect(res.status).toBe(502);
-    expect(clientMessage(body)).toMatch(/^upstream returned an unparseable body: /);
+    expect(clientMessage(body)).toBe(STATUS_FALLBACK);
+    expect((JSON.parse(body) as { error: { type: string } }).error.type).toBe("upstream_error");
     const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the cut video row");
     expect(row.get("error_message")).toMatch(READ_FAILURE(502));
+    expect(row.get("response")).toContain("sentinel-cut");
   });
 
   // Every route family: the request body, and the upstream's own answer as it
