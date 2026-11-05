@@ -117,6 +117,11 @@ const eventOf = (type: string, code: string, message: string) => ({
 });
 const WRONG_KEY = eventOf("invalid_request_error", "invalid_api_key", "Incorrect API key provided: sentinel.");
 const BAD_MODEL = eventOf("invalid_request_error", "invalid_model", "Model sentinel is not supported.");
+const MODEL_NOT_FOUND = eventOf(
+  "invalid_request_error",
+  "model_not_found",
+  "The model `sentinel` does not exist or you do not have access to it.",
+);
 const RATE_LIMITED = eventOf("rate_limit_error", "rate_limit_exceeded", "Slow down, sentinel.");
 const NO_QUOTA = eventOf("insufficient_quota", "insufficient_quota", "Out of quota, sentinel.");
 const OTHER = eventOf("server_error", "sentinel_unknown", "Something broke, sentinel.");
@@ -125,6 +130,8 @@ const CREATED = { type: "session.created", session: { id: "sess_1", model: "m" }
 const SESSIONS: Record<string, Step[]> = {
   "wrong-key": [{ frame: WRONG_KEY }, { wait: 200 }, { close: [3000, "invalid_request_error.invalid_api_key"] }],
   "bad-model": [{ frame: BAD_MODEL }, { wait: 200 }, { close: [4000, "invalid_request_error.invalid_model"] }],
+  "model-not-found": [{ frame: MODEL_NOT_FOUND }, { wait: 200 }, { close: [4004, "invalid_request_error.model_not_found"] }],
+  "other-invalid-request": [{ frame: RECOVERABLE }, { close: [4000, "invalid_request_error.invalid_json"] }],
   "rate-limited": [{ frame: RATE_LIMITED }, { close: [4000, "rate_limit_error.rate_limit_exceeded"] }],
   "no-quota": [{ frame: NO_QUOTA }, { close: [4000, "insufficient_quota"] }],
   "other-error": [{ frame: OTHER }, { close: [4000, "server_error"] }],
@@ -519,7 +526,9 @@ describe("a realtime session the upstream never let start", () => {
   describe("an upstream that reports an error and closes before the session is usable", () => {
     test.each<[string, typeof WRONG_KEY, number, string, number, string]>([
       ["wrong-key", WRONG_KEY, 401, "client_error", 3000, "invalid_request_error.invalid_api_key"],
-      ["bad-model", BAD_MODEL, 400, "client_error", 4000, "invalid_request_error.invalid_model"],
+      ["bad-model", BAD_MODEL, 404, "client_error", 4000, "invalid_request_error.invalid_model"],
+      ["model-not-found", MODEL_NOT_FOUND, 404, "client_error", 4004, "invalid_request_error.model_not_found"],
+      ["other-invalid-request", RECOVERABLE, 400, "client_error", 4000, "invalid_request_error.invalid_json"],
       ["rate-limited", RATE_LIMITED, 429, "rate_limited", 4000, "rate_limit_error.rate_limit_exceeded"],
       ["no-quota", NO_QUOTA, 429, "rate_limited", 4000, "insufficient_quota"],
       ["other-error", OTHER, 502, "upstream_error", 4000, "server_error"],
@@ -557,7 +566,7 @@ describe("a realtime session the upstream never let start", () => {
       const got = await session("error-then-normal-close");
       expect(got.frames).toEqual([BAD_MODEL]);
       expect(got.code).toBe(1000);
-      expect((await row(got.requestId)).get("status_code")).toBe("400");
+      expect((await row(got.requestId)).get("status_code")).toBe("404");
     });
 
     test("an error followed by a dropped connection adds no gateway frame", async () => {
@@ -566,7 +575,7 @@ describe("a realtime session the upstream never let start", () => {
       expect(got.frames).toEqual([BAD_MODEL]);
       expect(got.code).toBe(1011);
       const failure = await row(got.requestId);
-      expect(failure.get("status_code")).toBe("400");
+      expect(failure.get("status_code")).toBe("404");
       expect(failure.get("error_class")).toBe("upstream_in_band");
     });
 

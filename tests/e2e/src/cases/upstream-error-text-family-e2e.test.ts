@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { WebSocket } from "ws";
@@ -25,6 +26,11 @@ const CALLER = "sk-error-text-caller";
 const LOGSTORE = "error-text-rows";
 const TEXT = "sentinel upstream failure text";
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+const HUGE_BODY_BYTES = 256 * 1024 * 1024;
+const peakRssBytes = async (pid: number) => {
+  const status = await readFile(`/proc/${pid}/status`, "utf8");
+  return Number(/^VmHWM:\s+(\d+) kB/m.exec(status)![1]) * 1024;
+};
 
 const openAiEnvelope = (status: number) =>
   JSON.stringify({
@@ -36,6 +42,62 @@ const openAiEnvelope = (status: number) =>
     },
   });
 
+// What real Azure OpenAI answers: a missing deployment comes with no
+// Content-Type, a rejected parameter with one.
+const AZURE_NO_DEPLOYMENT_TEXT = "The API deployment for this resource does not exist.";
+const AZURE_NO_DEPLOYMENT = JSON.stringify(
+  {
+    error: { type: "invalid_request_error", code: "DeploymentNotFound", message: AZURE_NO_DEPLOYMENT_TEXT },
+  },
+  null,
+  2,
+);
+const AZURE_BAD_PARAM_TEXT = "Invalid 'temperature': decimal above maximum value.";
+const AZURE_BAD_PARAM = JSON.stringify({
+  error: {
+    message: AZURE_BAD_PARAM_TEXT,
+    type: "invalid_request_error",
+    param: "temperature",
+    code: "decimal_above_max_value",
+  },
+});
+
+// What each video provider answered a request for a model it does not have.
+const VIDEO_PROVIDER_ANSWERS: [string, string, number, string][] = [
+  [
+    "real-dashscope",
+    "alibaba",
+    400,
+    JSON.stringify({ code: "InvalidParameter", message: "Model not exist.", request_id: "r-1" }),
+  ],
+  [
+    "real-zhipu",
+    "zhipuai",
+    400,
+    JSON.stringify({ error: { code: "1211", message: "模型不存在，请检查模型代码。" } }),
+  ],
+  [
+    "real-ark",
+    "volcengine",
+    404,
+    JSON.stringify({
+      error: {
+        code: "InvalidEndpointOrModel.NotFound",
+        message: "The model or endpoint qa-video-nope does not exist",
+        param: "",
+        type: "Not Found",
+      },
+    }),
+  ],
+  [
+    "real-runway",
+    "runwayml",
+    400,
+    JSON.stringify({ error: "Validation of body failed", issues: [{ path: ["model"] }] }),
+  ],
+  ["real-openai-empty", "openai", 404, ""],
+];
+
 describe("an upstream's failure reads the same on every route that sends its own request", () => {
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
@@ -43,12 +105,68 @@ describe("an upstream's failure reads the same on every route that sends its own
   const servers: Server[] = [];
   let cooldownModelIds: Record<string, string> = {};
 
-  async function fixedUpstream(status: number, body: string): Promise<string> {
+  async function fixedUpstream(
+    status: number,
+    body: string,
+    headers: Record<string, string> = {},
+    contentType: string | null = "application/json",
+  ): Promise<string> {
     const server = createServer((req, res) => {
       req.resume();
       req.on("end", () => {
-        res.writeHead(status, { "content-type": "application/json" });
+        res.writeHead(status, contentType ? { "content-type": contentType, ...headers } : headers);
         res.end(body);
+      });
+    });
+    servers.push(server);
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  }
+
+  // A video task that exists: the submit succeeds, and the follow-up routes
+  // answer `failure` either on the poll or, once the task reads as completed,
+  // on the content download.
+  async function videoTaskUpstream(
+    failing: "poll" | "content",
+    failure: { status: number; body: string; headers?: Record<string, string>; cutOff?: boolean },
+  ): Promise<string> {
+    const server = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        const fail = () => {
+          res.writeHead(failure.status, {
+            "content-type": "application/json",
+            ...(failure.cutOff ? { "content-length": "4096" } : {}),
+            ...failure.headers,
+          });
+          if (failure.cutOff) res.write(failure.body, () => res.destroy());
+          else res.end(failure.body);
+        };
+        const task = (status: string) => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ id: "video_x", object: "video", model: "m", status }));
+        };
+        if (req.method === "POST") return task("queued");
+        if (req.url?.endsWith("/content")) return fail();
+        return failing === "poll" ? fail() : task("completed");
+      });
+    });
+    servers.push(server);
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    return `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  }
+
+  // A failure body sent in chunks, so nothing but the gateway holds it whole.
+  async function hugeBodyUpstream(status: number, bytes: number): Promise<string> {
+    const chunk = Buffer.alloc(1024 * 1024, "x");
+    const server = createServer((req, res) => {
+      req.resume();
+      req.on("end", async () => {
+        res.writeHead(status, { "content-type": "application/json", "content-length": String(bytes) });
+        for (let sent = 0; sent < bytes; sent += chunk.length) {
+          if (!res.write(chunk)) await new Promise((r) => res.once("drain", r));
+        }
+        res.end();
       });
     });
     servers.push(server);
@@ -130,6 +248,25 @@ describe("an upstream's failure reads the same on every route that sends its own
       ).id;
       names.push(name);
     }
+    {
+      const pk = await seed.createProviderKey({
+        display_name: "video-cooldown-retry-after-pk",
+        secret: "sk-mock",
+        provider: "openai",
+        api_base: `${await fixedUpstream(429, openAiEnvelope(429), { "retry-after": "180" })}/v1`,
+      });
+      const name = "video-cooldown-retry-after";
+      cooledModels[name] = (
+        await seed.createModel({
+          display_name: name,
+          provider: "openai",
+          model_name: "m",
+          provider_key_id: pk.id,
+          cooldown: { enabled: true },
+        })
+      ).id;
+      names.push(name);
+    }
     cooldownModelIds = cooledModels;
     for (const status of [401, 429]) {
       const name = `openai-${status}`;
@@ -142,6 +279,8 @@ describe("an upstream's failure reads the same on every route that sends its own
     });
     await model("openai-past-the-cap", "openai", `${await fixedUpstream(400, padded)}/v1`);
     names.push("openai-past-the-cap");
+    await model("video-huge-body", "openai", `${await hugeBodyUpstream(400, HUGE_BODY_BYTES)}/v1`);
+    names.push("video-huge-body");
     await model(
       "cohere-top-level",
       "cohere",
@@ -158,6 +297,50 @@ describe("an upstream's failure reads the same on every route that sends its own
       `${await fixedUpstream(400, JSON.stringify({ code: "vendor_code", message: "" }))}/v1`,
     );
     names.push("cohere-top-level", "video-envelope", "video-code-only");
+    const HTML = "<html><body>bad gateway page</body></html>";
+    for (const status of [400, 503]) {
+      await model(`openai-html-${status}`, "openai", `${await fixedUpstream(status, HTML)}/v1`);
+      await model(`openai-empty-${status}`, "openai", `${await fixedUpstream(status, "")}/v1`);
+      names.push(`openai-html-${status}`, `openai-empty-${status}`);
+    }
+    await model(
+      "openai-retry-after",
+      "openai",
+      `${await fixedUpstream(429, openAiEnvelope(429), { "retry-after": "7" })}/v1`,
+    );
+    names.push("openai-retry-after");
+    await model(
+      "alibaba-top-level",
+      "alibaba",
+      await fixedUpstream(
+        400,
+        JSON.stringify({ code: "InvalidParameter", message: `${TEXT} dashscope`, request_id: "r-1" }),
+      ),
+    );
+    await model(
+      "alibaba-top-level-500",
+      "alibaba",
+      await fixedUpstream(500, JSON.stringify({ code: "InternalError", message: `${TEXT} dashscope` })),
+    );
+    names.push("alibaba-top-level", "alibaba-top-level-500");
+    for (const [name, provider, status, body] of VIDEO_PROVIDER_ANSWERS) {
+      await model(name, provider, await fixedUpstream(status, body));
+      names.push(name);
+    }
+    for (const leg of ["poll", "content"] as const) {
+      for (const [shape, failure] of [
+        ["envelope", { status: 400, body: openAiEnvelope(400) }],
+        ["server", { status: 500, body: openAiEnvelope(500) }],
+        ["html", { status: 503, body: HTML }],
+        ["rate-limited", { status: 429, body: openAiEnvelope(429), headers: { "retry-after": "7" } }],
+        ["cut", { status: 500, body: '{"error":{"mess', cutOff: true }],
+        ["cut-rate-limited", { status: 429, body: '{"error":{"mess', headers: { "retry-after": "7" }, cutOff: true }],
+      ] as const) {
+        const name = `video-${leg}-${shape}`;
+        await model(name, "openai", `${await videoTaskUpstream(leg, failure)}/v1`);
+        names.push(name);
+      }
+    }
     for (const [shape, body] of [
       ["top-level", { message: `${TEXT} other shape` }],
       ["string", { error: `${TEXT} other shape` }],
@@ -175,6 +358,8 @@ describe("an upstream's failure reads the same on every route that sends its own
       ["refused-429", 429, openAiEnvelope(429)],
       ["refused-500", 500, openAiEnvelope(500)],
       ["refused-500-empty", 500, ""],
+      ["refused-200-empty", 200, ""],
+      ["refused-302-empty", 302, ""],
       ["refused-200-body", 200, `${TEXT} not an upgrade`],
       ["refused-200-long", 200, "x".repeat(2048)],
     ] as const) {
@@ -183,24 +368,32 @@ describe("an upstream's failure reads the same on every route that sends its own
     }
     await model("refused-no-answer", "openai", "http://127.0.0.1:1/v1");
     names.push("refused-no-answer");
-    const azurePk = await seed.createProviderKey({
-      display_name: "refused-azure-404-pk",
-      secret: "sk-mock",
-      provider: "azure-openai",
-      adapter: "azure-openai",
-      api_base: await fixedUpstream(
+    for (const [name, status, body, contentType] of [
+      [
+        "refused-azure-404",
         404,
         JSON.stringify({ error: { code: "DeploymentNotFound", message: `${TEXT} azure` } }),
-      ),
-    });
-    await seed.createModel({
-      display_name: "refused-azure-404",
-      provider: "azure-openai",
-      model_name: "m",
-      provider_key_id: azurePk.id,
-      cooldown: { enabled: false },
-    });
-    names.push("refused-azure-404");
+        "application/json",
+      ],
+      ["azure-no-deployment", 404, AZURE_NO_DEPLOYMENT, null],
+      ["azure-bad-param", 400, AZURE_BAD_PARAM, "application/json"],
+    ] as const) {
+      const pk = await seed.createProviderKey({
+        display_name: `${name}-pk`,
+        secret: "sk-mock",
+        provider: "azure-openai",
+        adapter: "azure-openai",
+        api_base: await fixedUpstream(status, body, {}, contentType),
+      });
+      await seed.createModel({
+        display_name: name,
+        provider: "azure-openai",
+        model_name: "m",
+        provider_key_id: pk.id,
+        cooldown: { enabled: false },
+      });
+      names.push(name);
+    }
     await seed.createApiKey({ key_hash: sha256(CALLER), allowed_routes: ["*"], allowed_models: names });
 
     await waitConfigPropagation(async () => {
@@ -277,6 +470,7 @@ describe("an upstream's failure reads the same on every route that sends its own
     ["image edits", "/v1/images/edits", (model) => multipart({ model, prompt: "hi" }), "openai"],
     ["native responses", "/v1/responses", (model) => json({ model, input: "hi" }), "openai"],
     ["streaming native responses", "/v1/responses", (model) => json({ model, input: "hi", stream: true }), "openai"],
+    ["videos", "/v1/videos", (model) => json({ model, prompt: "hi" }), "openai"],
   ];
 
   describe.each([500, 400])("on an upstream %i", (upstream) => {
@@ -374,7 +568,21 @@ describe("an upstream's failure reads the same on every route that sends its own
         { type: "upstream_error", message: "upstream returned 500 Internal Server Error" },
         502,
         "upstream_status",
-        "upstream returned HTTP 500 during the realtime handshake",
+        "upstream returned HTTP 500 with no error detail in the response",
+      ],
+      [
+        "refused-200-empty",
+        { type: "upstream_error", message: "upstream returned 200 OK" },
+        502,
+        "upstream_status",
+        "upstream returned HTTP 200 during the realtime handshake",
+      ],
+      [
+        "refused-302-empty",
+        { type: "upstream_error", message: "upstream returned 302 Found" },
+        502,
+        "upstream_status",
+        "upstream returned HTTP 302 during the realtime handshake",
       ],
       [
         "refused-200-body",
@@ -400,6 +608,20 @@ describe("an upstream's failure reads the same on every route that sends its own
       expect(row.get("status_code")).toBe(String(status));
       expect(row.get("error_class")).toBe(errorClass);
       expect(row.get("error_message")).toBe(rowText);
+    });
+
+    test("an empty error body records the text chat records", async () => {
+      if (!etcdReachable) return;
+      const chat = await send(
+        "/v1/chat/completions",
+        json({ model: "refused-500-empty", messages: [{ role: "user", content: "hi" }] }),
+      );
+      const got = await refusal("refused-500-empty");
+      expect((got.frames[0] as { error: unknown }).error).toEqual(chat.body.error);
+      const realtimeRow = await finalRow(got.requestId, "the realtime row");
+      const chatRow = await finalRow(chat.requestId, "the chat row");
+      expect(realtimeRow.get("error_message")).toBe(chatRow.get("error_message"));
+      expect(JSON.parse(realtimeRow.get("response")!).error.message).toBe(chatRow.get("error_message"));
     });
 
     test("a body that is no error is quoted within the usual bound", async () => {
@@ -443,6 +665,46 @@ describe("an upstream's failure reads the same on every route that sends its own
       await refusedHandshake("realtime-cooldown-400");
       expect((await status("realtime-cooldown-400")).status).not.toBe("cooldown");
     });
+  });
+
+  describe.each([
+    ["chat", "/v1/chat/completions", { messages: [{ role: "user", content: "hi" }] }],
+    ["chat streamed", "/v1/chat/completions", { messages: [{ role: "user", content: "hi" }], stream: true }],
+    ["responses", "/v1/responses", { input: "hi" }],
+    ["responses streamed", "/v1/responses", { input: "hi", stream: true }],
+  ] as const)("azure 4xx on %s", (_what, path, payload) => {
+    test("a missing deployment answers model_not_found", async () => {
+      if (!etcdReachable) return;
+      const got = await send(path, json({ model: "azure-no-deployment", ...payload }));
+      expect(got.status).toBe(404);
+      expect(got.body.error).toEqual({
+        message: AZURE_NO_DEPLOYMENT_TEXT,
+        type: "upstream_error",
+        code: "model_not_found",
+      });
+    });
+
+    test("any other code passes through with its param", async () => {
+      if (!etcdReachable) return;
+      const got = await send(path, json({ model: "azure-bad-param", ...payload }));
+      expect(got.status).toBe(400);
+      expect(got.body.error).toEqual({
+        message: AZURE_BAD_PARAM_TEXT,
+        type: "upstream_error",
+        code: "decimal_above_max_value",
+        param: "temperature",
+      });
+    });
+  });
+
+  test("azure 4xx on messages keeps the upstream's text under its status-mapped type", async () => {
+    if (!etcdReachable) return;
+    const got = await send(
+      "/v1/messages",
+      json({ model: "azure-no-deployment", messages: [{ role: "user", content: "hi" }], max_tokens: 5 }),
+    );
+    expect(got.status).toBe(404);
+    expect(got.body.error).toEqual({ type: "not_found_error", message: AZURE_NO_DEPLOYMENT_TEXT });
   });
 
   test("a top-level message is read out of the body too", async () => {
@@ -498,21 +760,240 @@ describe("an upstream's failure reads the same on every route that sends its own
     );
   });
 
-  test("videos: a vendor's bare code stays in the row", async () => {
-    if (!etcdReachable) return;
-    const got = await send("/v1/videos", json({ model: "video-code-only", prompt: "hi" }));
-    expect(got.body.error.message).toBe("vendor_code");
-    expect(await rowMessage(got.requestId, "the code-only row")).toBe(
-      "upstream returned HTTP 400: vendor_code",
-    );
-  });
+  describe("videos", () => {
+    const chatOn = (model: string) =>
+      send("/v1/chat/completions", json({ model, messages: [{ role: "user", content: "hi" }] }));
+    const submit = (model: string) => send("/v1/videos", json({ model, prompt: "hi" }));
 
-  test("videos: the row carries the upstream's message; the caller keeps the vendor code", async () => {
-    if (!etcdReachable) return;
-    const got = await send("/v1/videos", json({ model: "video-envelope", prompt: "hi" }));
-    expect(got.body.error.message).toBe(`vendor_code: ${TEXT} video`);
-    expect(await rowMessage(got.requestId, "the video row")).toBe(
-      `upstream returned HTTP 400: ${TEXT} video`,
-    );
+    test("a vendor's bare code is the caller's code; the row reads as chat's", async () => {
+      if (!etcdReachable) return;
+      const got = await submit("video-code-only");
+      expect(got.status).toBe(400);
+      expect(got.body.error).toEqual({
+        message: "upstream returned 400 Bad Request",
+        type: "upstream_error",
+        code: "vendor_code",
+      });
+      const chat = await chatOn("video-code-only");
+      expect(await rowMessage(got.requestId, "the code-only row")).toBe(
+        await rowMessage(chat.requestId, "chat's code-only row"),
+      );
+    });
+
+    test("a vendor code leaves the message alone and reaches the caller as its code", async () => {
+      if (!etcdReachable) return;
+      const got = await submit("video-envelope");
+      expect(got.body.error).toEqual({
+        message: `${TEXT} video`,
+        type: "upstream_error",
+        code: "vendor_code",
+      });
+      expect(await rowMessage(got.requestId, "the video row")).toBe(
+        `upstream returned HTTP 400: ${TEXT} video`,
+      );
+    });
+
+    test("DashScope's top-level code and message read like an envelope's", async () => {
+      if (!etcdReachable) return;
+      const got = await submit("alibaba-top-level");
+      expect(got.status).toBe(400);
+      expect(got.body.error).toEqual({
+        message: `${TEXT} dashscope`,
+        type: "upstream_error",
+        code: "InvalidParameter",
+      });
+    });
+
+    test("DashScope's 5xx carries its text and no code", async () => {
+      if (!etcdReachable) return;
+      const got = await submit("alibaba-top-level-500");
+      expect(got.status).toBe(502);
+      expect(got.body.error).toEqual({ message: `${TEXT} dashscope`, type: "upstream_error" });
+    });
+
+    test("DashScope's model-not-found carries its code at the top level", async () => {
+      if (!etcdReachable) return;
+      const got = await submit("real-dashscope");
+      expect(got.status).toBe(400);
+      expect(got.body.error).toEqual({
+        message: "Model not exist.",
+        type: "upstream_error",
+        code: "InvalidParameter",
+      });
+    });
+
+    test.each([
+      [
+        "Zhipu's model-not-found",
+        "real-zhipu",
+        400,
+        { message: "模型不存在，请检查模型代码。", type: "upstream_error", code: "1211" },
+      ],
+      [
+        "Ark's model-not-found",
+        "real-ark",
+        404,
+        {
+          message: "The model or endpoint qa-video-nope does not exist",
+          type: "upstream_error",
+          code: "InvalidEndpointOrModel.NotFound",
+          param: "",
+        },
+      ],
+      [
+        "Runway's validation failure",
+        "real-runway",
+        400,
+        { message: "Validation of body failed", type: "upstream_error" },
+      ],
+      [
+        "OpenAI's empty 404",
+        "real-openai-empty",
+        404,
+        { message: "upstream returned 404 Not Found", type: "upstream_error" },
+      ],
+    ] as const)("%s answers what chat answers", async (_what, model, status, error) => {
+      if (!etcdReachable) return;
+      const got = await submit(model);
+      expect(got.status).toBe(status);
+      expect(got.body.error).toEqual(error);
+      const chat = await chatOn(model);
+      expect(chat.status).toBe(got.status);
+      expect(chat.body).toEqual(got.body);
+    });
+
+    test.each([
+      ["a page that is no JSON on a 4xx", "openai-html-400"],
+      ["a page that is no JSON on a 5xx", "openai-html-503"],
+      ["an empty body on a 4xx", "openai-empty-400"],
+      ["an empty body on a 5xx", "openai-empty-503"],
+      ["a body past the error-body cap", "openai-past-the-cap"],
+    ])("%s answers what chat answers", async (_what, model) => {
+      if (!etcdReachable) return;
+      const chat = await chatOn(model);
+      const got = await submit(model);
+      expect(got.status).toBe(chat.status);
+      expect(got.body).toEqual(chat.body);
+      expect(got.body.error.message).not.toBe("upstream error");
+      expect(await rowMessage(got.requestId, "the video row")).toBe(
+        await rowMessage(chat.requestId, "chat's row"),
+      );
+    });
+
+    test("an upstream's Retry-After reaches the caller as chat's does", async () => {
+      if (!etcdReachable) return;
+      const chat = await fetch(
+        `${app!.proxyUrl}/v1/chat/completions`,
+        json({ model: "openai-retry-after", messages: [{ role: "user", content: "hi" }] }),
+      );
+      const got = await fetch(
+        `${app!.proxyUrl}/v1/videos`,
+        json({ model: "openai-retry-after", prompt: "hi" }),
+      );
+      expect(got.status).toBe(429);
+      expect(chat.headers.get("retry-after")).toBe("7");
+      expect(got.headers.get("retry-after")).toBe("7");
+      expect(await got.json()).toEqual(await chat.json());
+    });
+
+    test("an upstream's Retry-After sets the model's cooldown", async () => {
+      if (!etcdReachable) return;
+      const before = Date.now() / 1000;
+      const got = await submit("video-cooldown-retry-after");
+      expect(got.status).toBe(429);
+      const rows = await new AdminClient(app!.adminUrl, app!.adminKey, app!.metricsUrl).listModelStatuses();
+      const row = rows.find((r) => r.id === cooldownModelIds["video-cooldown-retry-after"])!;
+      expect(row.status).toBe("cooldown");
+      const until = row.cooldown_until as unknown as { secs_since_epoch: number };
+      expect(until.secs_since_epoch - before).toBeGreaterThan(120);
+    });
+
+    test("a body past the error-body cap is not parsed", async () => {
+      if (!etcdReachable) return;
+      const got = await submit("openai-past-the-cap");
+      expect(got.status).toBe(400);
+      expect(got.body.error.code).toBeUndefined();
+      expect(got.body.error.message).toEqual(expect.stringMatching(/^\{"error":/));
+      expect(Buffer.byteLength(String(got.body.error.message))).toBeLessThanOrEqual(1024 + 3);
+    });
+
+    test.skipIf(process.platform !== "linux")("a body far past the error-body cap is not held in memory", async () => {
+      if (!etcdReachable) return;
+      const before = await peakRssBytes(app!.pid);
+      const got = await submit("video-huge-body");
+      expect(got.status).toBe(400);
+      expect(Buffer.byteLength(String(got.body.error.message))).toBeLessThanOrEqual(1024 + 3);
+      expect((await peakRssBytes(app!.pid)) - before).toBeLessThan(HUGE_BODY_BYTES / 4);
+    });
+
+    describe.each(["poll", "content"] as const)("the %s route of a task that exists", (leg) => {
+      const follow = async (model: string) => {
+        const submitted = await fetch(`${app!.proxyUrl}/v1/videos`, json({ model, prompt: "hi" }));
+        expect(submitted.status).toBe(200);
+        const { id } = (await submitted.json()) as { id: string };
+        const res = await fetch(
+          `${app!.proxyUrl}/v1/videos/${id}${leg === "content" ? "/content" : ""}`,
+          { headers: { authorization: `Bearer ${CALLER}` } },
+        );
+        return {
+          status: res.status,
+          retryAfter: res.headers.get("retry-after"),
+          body: (await res.json()) as { error: Record<string, unknown> },
+        };
+      };
+
+      test("a 4xx carries the upstream's text, code and param", async () => {
+        if (!etcdReachable) return;
+        const got = await follow(`video-${leg}-envelope`);
+        expect(got.status).toBe(400);
+        expect(got.body.error).toEqual({
+          message: `${TEXT} 400`,
+          type: "upstream_error",
+          code: "sentinel_code_400",
+          param: "sentinel_param_400",
+        });
+      });
+
+      test("a 5xx carries the upstream's text alone", async () => {
+        if (!etcdReachable) return;
+        const got = await follow(`video-${leg}-server`);
+        expect(got.status).toBe(502);
+        expect(got.body.error).toEqual({ message: `${TEXT} 500`, type: "upstream_error" });
+      });
+
+      test("a page that is no JSON is returned as text", async () => {
+        if (!etcdReachable) return;
+        const got = await follow(`video-${leg}-html`);
+        expect(got.status).toBe(502);
+        expect(got.body.error).toEqual({
+          message: "<html><body>bad gateway page</body></html>",
+          type: "upstream_error",
+        });
+      });
+
+      test("a 429 keeps the upstream's Retry-After", async () => {
+        if (!etcdReachable) return;
+        const got = await follow(`video-${leg}-rate-limited`);
+        expect(got.status).toBe(429);
+        expect(got.retryAfter).toBe("7");
+      });
+
+      test("a body cut off answers its status, not the fragment", async () => {
+        if (!etcdReachable) return;
+        const got = await follow(`video-${leg}-cut`);
+        expect(got.status).toBe(502);
+        expect(got.body.error).toEqual({
+          message: "upstream returned 500 Internal Server Error",
+          type: "upstream_error",
+        });
+      });
+
+      test("a 429 cut off keeps the upstream's Retry-After", async () => {
+        if (!etcdReachable) return;
+        const got = await follow(`video-${leg}-cut-rate-limited`);
+        expect(got.status).toBe(429);
+        expect(got.retryAfter).toBe("7");
+      });
+    });
   });
 });

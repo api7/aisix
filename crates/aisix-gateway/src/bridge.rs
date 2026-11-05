@@ -365,8 +365,7 @@ pub enum BridgeError {
         retry_after: Option<Duration>,
         /// What `Display` says instead of the `message` wording, when the
         /// caller's text is not the diagnosis. See
-        /// [`with_body_read_error`](Self::with_body_read_error) and
-        /// [`with_telemetry_detail`](Self::with_telemetry_detail).
+        /// [`with_body_read_error`](Self::with_body_read_error).
         diagnostic: Option<String>,
     },
     /// A non-2xx whose body could not be read, on a route that reports that
@@ -528,18 +527,6 @@ impl BridgeError {
         self
     }
 
-    /// Have `Display` report `detail` as this `UpstreamStatus`'s message, for
-    /// a route whose caller is sent other text than what the upstream said.
-    pub fn with_telemetry_detail(mut self, detail: &str) -> Self {
-        if let Self::UpstreamStatus {
-            status, diagnostic, ..
-        } = &mut self
-        {
-            *diagnostic = Some(upstream_status_display(*status, detail, None));
-        }
-        self
-    }
-
     /// The [`UpstreamBodyUnread`](Self::UpstreamBodyUnread) of a failed read.
     pub fn upstream_body_unread(status: u16, err: &reqwest::Error) -> Self {
         let reason = crate::upstream_http::transport_error_message(err);
@@ -683,12 +670,6 @@ pub fn parse_retry_after(headers: &http::HeaderMap) -> Option<Duration> {
 /// [`BridgeError::UpstreamStatus`] with a best-effort parsed view of
 /// the envelope.
 ///
-/// The `parse` closure runs only when the response declares an
-/// `application/json` content-type — this guards against fronting WAFs
-/// or load balancers returning HTML error pages that would otherwise be
-/// fed to a JSON parser and either fail expensively or surface
-/// nonsensical fragments.
-///
 /// `parse` returning `None` is treated as "envelope shape unknown"; the
 /// message then comes from [`upstream_error_message`], which reads the other
 /// shapes an upstream's text arrives in and keeps a non-JSON body as sent.
@@ -749,7 +730,7 @@ pub fn upstream_error_message(body: &[u8]) -> String {
 
 /// The text [`upstream_error_message`] reads out of a JSON error body, when the
 /// body carries it in one of the shapes that function names.
-pub fn upstream_error_text(body: &[u8]) -> Option<String> {
+fn upstream_error_text(body: &[u8]) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
     let fields = [
         parsed.get("error").and_then(|e| e.get("message")),
@@ -929,7 +910,7 @@ impl UpstreamErrorBody {
 /// full-content exports ([`crate::response_tap::note_upstream_error_body`])
 /// and logs a failed read.
 ///
-/// Public so non-OpenAI / non-Anthropic bridges (Vertex, Azure) can
+/// Public so non-OpenAI / non-Anthropic bridges (Vertex) can
 /// enforce the same cap when they need a custom parse path (e.g.
 /// extracting only `kind` from the upstream envelope while suppressing
 /// the `message` for operator-taxonomy redaction).
@@ -972,9 +953,8 @@ pub async fn read_body_capped(resp: reqwest::Response, limit: usize) -> Upstream
 /// allows a trailing `; charset=…` parameter, so a prefix match is the
 /// right shape here — exact equality misses `application/json; charset=utf-8`).
 ///
-/// Public so non-OpenAI / non-Anthropic bridges (Vertex, Azure) can
-/// apply the same JSON-only guard when they need a custom parse path
-/// that doesn't route through [`capture_upstream_error_http`].
+/// Public so a bridge with a custom parse path that doesn't route through
+/// [`capture_upstream_error_http`] can apply a JSON-only guard, as Vertex does.
 pub fn content_type_is_json(ct: &str) -> bool {
     let ct = ct.trim_start();
     ct.starts_with("application/json")
@@ -1357,18 +1337,6 @@ mod tests {
             unreachable!()
         };
         assert_eq!(message, "fragment");
-        assert_eq!(
-            BridgeError::upstream_status(502, "upstream error")
-                .with_telemetry_detail("real detail")
-                .to_string(),
-            "upstream returned HTTP 502: real detail"
-        );
-        assert_eq!(
-            BridgeError::upstream_status(502, "upstream error")
-                .with_telemetry_detail("")
-                .to_string(),
-            "upstream returned HTTP 502 with no error detail in the response"
-        );
         // An error frame keeps the plain wording whatever `Display` says.
         assert_eq!(
             BridgeError::upstream_status(500, "").stream_frame_message(),

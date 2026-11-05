@@ -270,7 +270,8 @@ async fn connect_failure(
     if let Some(reason) = &body.read_error {
         tracing::warn!(status, request_id, %reason, "failed to read upstream error response body");
     }
-    let error = if body.read_error.is_none() && body.bytes.iter().all(u8::is_ascii_whitespace) {
+    let blank = body.read_error.is_none() && body.bytes.iter().all(u8::is_ascii_whitespace);
+    let error = if status < 400 && blank {
         BridgeError::UpstreamStatus {
             status,
             message: String::new(),
@@ -1727,6 +1728,7 @@ fn session_refusal_error(text: &str) -> Option<BridgeError> {
         let kind = view.and_then(|v| v.kind.as_deref());
         *status = status.or(match (code, kind) {
             (Some("invalid_api_key"), _) => Some(401),
+            (Some("invalid_model" | "model_not_found"), _) => Some(404),
             (Some("rate_limit_exceeded" | "insufficient_quota"), _) => Some(429),
             (_, Some("invalid_request_error")) => Some(400),
             _ => None,
@@ -1992,7 +1994,14 @@ mod tests {
     async fn a_refused_upgrade_quotes_only_a_body_that_arrived_whole() {
         // With no stream left to read, what came with the head is all there is.
         async fn refused(headers: &[(&str, &str)], body: Option<&[u8]>) -> String {
-            let mut response = axum::http::Response::builder().status(400);
+            refused_with(400, headers, body).await
+        }
+        async fn refused_with(
+            status: u16,
+            headers: &[(&str, &str)],
+            body: Option<&[u8]>,
+        ) -> String {
+            let mut response = axum::http::Response::builder().status(status);
             for (name, value) in headers {
                 response = response.header(*name, *value);
             }
@@ -2076,7 +2085,7 @@ mod tests {
             "upstream returned HTTP 400: failed to read response body: malformed chunked body"
         );
 
-        let in_handshake = "upstream returned HTTP 400 during the realtime handshake";
+        let no_detail = "upstream returned HTTP 400 with no error detail in the response";
         for (what, headers, body) in [
             (
                 "compressed",
@@ -2095,7 +2104,27 @@ mod tests {
                 Some(&b""[..]),
             ),
         ] {
-            assert_eq!(refused(&headers, body).await, in_handshake, "{what}");
+            assert_eq!(refused(&headers, body).await, no_detail, "{what}");
+        }
+
+        let empty = [("content-length", "0")];
+        assert_eq!(
+            refused_with(500, &empty, Some(b"")).await,
+            "upstream returned HTTP 500 with no error detail in the response"
+        );
+        for status in [200, 302] {
+            let in_handshake =
+                format!("upstream returned HTTP {status} during the realtime handshake");
+            assert_eq!(refused_with(status, &empty, Some(b"")).await, in_handshake);
+            assert_eq!(
+                refused_with(
+                    status,
+                    &[("content-length", "4"), ("content-encoding", "gzip")],
+                    Some(b"\x1f\x8b\x08\x00"),
+                )
+                .await,
+                in_handshake
+            );
         }
     }
 

@@ -503,8 +503,22 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
 /// Map an Azure HTTP error response to a [`BridgeError::UpstreamStatus`]
 /// carrying Azure's own error message.
 ///
-/// `error.code` is read into [`UpstreamErrorView::kind`] so the
-/// envelope-translation layer can derive an OpenAI `code`.
+/// The envelope is parsed whatever the `Content-Type`: Azure answers a
+/// missing deployment with a JSON body and no such header.
+async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
+    aisix_gateway::capture_upstream_error_http(
+        status,
+        resp,
+        aisix_gateway::UpstreamWire::AzureOpenAI,
+        parse_azure_error_envelope,
+    )
+    .await
+}
+
+/// The OpenAI envelope, with Azure's code in both `kind` and `code`: Azure's
+/// `error.type` is not what the translation table keys on, so the renderer can
+/// override the code with a derived one (`DeploymentNotFound`) or pass it
+/// through (`rate_limit_exceeded`).
 ///
 /// Azure-specific quirk: content-policy violations nest under
 /// `error.inner_error.code` *or* `error.innererror.code` (Azure emits
@@ -512,55 +526,13 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
 /// `"ResponsibleAIPolicyViolation"` on the inner code overrides the
 /// outer `code` so the gateway can recognise the policy hit even when
 /// the outer code is the generic `invalid_request_error`.
-async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
-    let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-    let is_json = aisix_gateway::response_is_json(&resp);
-    let aisix_gateway::UpstreamErrorBody {
-        bytes: body,
-        read_error,
-    } = aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
-    // Skip the serde parse on non-JSON bodies (HTML error page from a
-    // load-balancer / front door). Same guard as
-    // `capture_upstream_error_http`.
-    let kind = is_json.then(|| parse_azure_error_code(&body)).flatten();
-    let message = aisix_gateway::upstream_error_message(&body);
-    // Azure's envelope only has a single `error.code` field (no
-    // separate `type`). Downstream OpenAI clients expect both
-    // `error.type` AND `error.code` — populate both `kind` and `code`
-    // from the upstream token so the translation layer can either
-    // pass it through (for OpenAI-compat tokens like
-    // `rate_limit_exceeded`) or override with a derived code (for
-    // Azure-specific tokens like `DeploymentNotFound`).
-    let parsed = kind.as_ref().map(|k| {
-        Box::new(aisix_gateway::UpstreamErrorView {
-            kind: Some(k.clone()),
-            message: (!message.is_empty()).then(|| message.clone()),
-            code: Some(k.clone()),
-            param: None,
-        })
-    });
-    BridgeError::UpstreamStatus {
-        status: status.as_u16(),
-        message,
-        parsed,
-        wire: aisix_gateway::UpstreamWire::AzureOpenAI,
-        retry_after,
-        diagnostic: None,
-    }
-    .with_body_read_error(read_error)
-}
-
-/// Extract the Azure error code from the envelope, applying the
-/// `inner_error` / `innererror` content-policy quirk.
-fn parse_azure_error_code(body: &[u8]) -> Option<String> {
+fn parse_azure_error_envelope(body: &[u8]) -> Option<aisix_gateway::UpstreamErrorView> {
     #[derive(serde::Deserialize)]
     struct Outer {
         error: Inner,
     }
     #[derive(serde::Deserialize)]
     struct Inner {
-        code: Option<String>,
-        #[serde(rename = "inner_error")]
         inner_error: Option<InnerInner>,
         innererror: Option<InnerInner>,
     }
@@ -568,19 +540,19 @@ fn parse_azure_error_code(body: &[u8]) -> Option<String> {
     struct InnerInner {
         code: Option<String>,
     }
-    let outer: Outer = serde_json::from_slice(body).ok()?;
-    let inner_code = outer
-        .error
-        .inner_error
-        .as_ref()
-        .or(outer.error.innererror.as_ref())
-        .and_then(|i| i.code.clone());
-    // Content-policy violation on `inner_error` overrides the outer
-    // generic code.
-    if inner_code.as_deref() == Some("ResponsibleAIPolicyViolation") {
-        return inner_code;
+    const POLICY_VIOLATION: &str = "ResponsibleAIPolicyViolation";
+    let mut view = aisix_provider_openai::parse_openai_error_envelope(body)?;
+    let inner_code = serde_json::from_slice::<Outer>(body).ok().and_then(|o| {
+        o.error
+            .inner_error
+            .or(o.error.innererror)
+            .and_then(|i| i.code)
+    });
+    if inner_code.as_deref() == Some(POLICY_VIOLATION) {
+        view.code = inner_code;
     }
-    outer.error.code
+    view.kind = view.code.clone();
+    Some(view)
 }
 
 /// Wrap a future in the optional deadline. `None` → no timeout.
@@ -2059,8 +2031,8 @@ mod tests {
         }
     }
 
-    /// Copilot review (PR #323): Azure's envelope only has `error.code`
-    /// (no separate `type`). For OpenAI-compatible tokens that Azure
+    /// Copilot review (PR #323): the translation table keys on Azure's
+    /// `error.code`, not its `type`. For OpenAI-compatible tokens that Azure
     /// inherits unchanged (e.g. `rate_limit_exceeded`), the bridge
     /// must populate BOTH `parsed.kind` AND `parsed.code` from the
     /// upstream — otherwise the downstream OpenAI client receives
@@ -2096,13 +2068,10 @@ mod tests {
         }
     }
 
-    /// Copilot review (PR #323): when upstream returns a non-JSON
-    /// body (HTML error page from Azure Front Door, etc.), the parser
-    /// must skip the serde attempt rather than try to deserialize
-    /// `<html>...</html>` as JSON. Same content-type guard as
-    /// `capture_upstream_error_http`.
+    /// A non-JSON body (HTML error page from Azure Front Door, etc.)
+    /// yields no parsed view.
     #[tokio::test]
-    async fn chat_400_non_json_body_skips_envelope_parse() {
+    async fn chat_400_non_json_body_has_no_parsed_view() {
         let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
