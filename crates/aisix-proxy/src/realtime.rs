@@ -1201,7 +1201,8 @@ async fn run_session(
                 crate::request_metrics::Caller::new(&auth),
                 crate::request_metrics::Upstream {
                     provider: &provider_label,
-                    model: &model_entry.value.display_name,
+                    // The requested string, as in the session's own emit below.
+                    model: &requested_model,
                     upstream_model: model_entry
                         .value
                         .upstream_model()
@@ -1539,7 +1540,9 @@ async fn run_session(
         crate::request_metrics::Caller::new(&auth),
         crate::request_metrics::Upstream {
             provider: &provider_label,
-            model: &model_entry.value.display_name,
+            // The requested string so the emit chokepoint folds a
+            // wildcard-served alias's pair to the row's identities (#451).
+            model: &requested_model,
             // AISIX-Cloud#1325: a session that ends on an upstream error
             // still names the key it was talking to — these two used to be
             // `unknown` on every realtime sample, success included.

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { WebSocket } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import {
   EtcdClient,
   metricDelta,
@@ -28,6 +28,7 @@ const VIDEO_IP_LOCKED = "followup-video-ip-locked";
 const REALTIME_MODEL = "followup-realtime";
 const REALTIME_NO_PROTOCOL = "followup-realtime-no-protocol";
 const REALTIME_WILDCARD = "followup-wild/*";
+const REALTIME_SESSION_WILDCARD = "followup-session/*";
 const REQUESTS = "aisix_requests_total";
 
 function field(line: string, name: string): string | undefined {
@@ -43,6 +44,7 @@ describe("failure labels on the routes that resolve their model mid-request", ()
   let pendingId = "";
   let ipLockedId = "";
   const upstreams: OpenAiUpstream[] = [];
+  let sessionUpstream: WebSocketServer | undefined;
 
   const videoId = (modelId: string, alias: string, task: string) =>
     Buffer.from(`${modelId}:${Buffer.from(alias).toString("base64url")}:${task}`).toString("base64url");
@@ -157,6 +159,22 @@ describe("failure labels on the routes that resolve their model mid-request", ()
       provider_key_id: noProtocolPk.id,
     });
 
+    sessionUpstream = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    await new Promise<void>((r) => sessionUpstream!.once("listening", () => r()));
+    const sessionPort = (sessionUpstream.address() as { port: number }).port;
+    const sessionPk = await seed.createProviderKey({
+      display_name: "followup-session-pk",
+      secret: "sk-mock",
+      api_base: `http://127.0.0.1:${sessionPort}/v1`,
+      provider: "openai",
+    });
+    await seed.createModel({
+      display_name: REALTIME_SESSION_WILDCARD,
+      provider: "openai",
+      model_name: "*",
+      provider_key_id: sessionPk.id,
+    });
+
     await seed.createApiKey({ key_hash: sha256(CALLER), allowed_models: ["*"] });
     await seed.createApiKey({
       key_hash: sha256(REALTIME_DENIED_CALLER),
@@ -176,6 +194,7 @@ describe("failure labels on the routes that resolve their model mid-request", ()
 
   afterAll(async () => {
     await app?.exit();
+    sessionUpstream?.close();
     await Promise.all(upstreams.map((u) => u.close()));
   });
 
@@ -286,6 +305,53 @@ describe("failure labels on the routes that resolve their model mid-request", ()
 
     const after = await scrapeMetrics(app.metricsUrl);
     expect(metricDelta(before, after, REQUESTS, { model: REALTIME_WILDCARD, status: "403" })).toBe(1);
+  });
+
+  // A wildcard row serves any suffix the caller invents, so the suffix must not
+  // reach a label through `upstream_model` either (#451).
+  const wildcardSeries = async (row: string, status: string) =>
+    (await scrapeMetrics(app!.metricsUrl)).filter(
+      (s) => s.name === "aisix_proxy_requests_total" && s.labels.model === row && s.labels.status === status,
+    );
+
+  const sessionUntilClosed = (model: string, { hangUp }: { hangUp: boolean }) =>
+    new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(`${app!.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=${model}`, {
+        headers: { authorization: `Bearer ${CALLER}` },
+      });
+      ws.on("open", () => {
+        if (hangUp) ws.close();
+      });
+      ws.on("close", () => resolve());
+      ws.on("unexpected-response", (_req, res) => reject(new Error(`handshake answered ${res.statusCode}`)));
+      ws.on("error", reject);
+    });
+
+  test("a wildcard row's refused upstream handshakes share one series", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    // The gateway upgrades the caller first, then closes once the upstream refuses.
+    await sessionUntilClosed("followup-wild/suffix-one", { hangUp: false });
+    await sessionUntilClosed("followup-wild/suffix-two", { hangUp: false });
+
+    await expect
+      .poll(async () => (await wildcardSeries(REALTIME_WILDCARD, "400")).reduce((n, s) => n + s.value, 0))
+      .toBe(2);
+    const series = await wildcardSeries(REALTIME_WILDCARD, "400");
+    expect(series.map((s) => s.labels.upstream_model)).toEqual(["*"]);
+  });
+
+  test("a wildcard row's sessions share one series", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+
+    await sessionUntilClosed("followup-session/suffix-one", { hangUp: true });
+    await sessionUntilClosed("followup-session/suffix-two", { hangUp: true });
+
+    await expect
+      .poll(async () => (await wildcardSeries(REALTIME_SESSION_WILDCARD, "200")).reduce((n, s) => n + s.value, 0))
+      .toBe(2);
+    const series = await wildcardSeries(REALTIME_SESSION_WILDCARD, "200");
+    expect(series.map((s) => s.labels.upstream_model)).toEqual(["*"]);
   });
 
   test("a realtime handshake naming no configured model stays unresolved", async (ctx) => {
