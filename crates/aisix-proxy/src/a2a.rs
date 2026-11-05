@@ -735,6 +735,7 @@ async fn dispatch_stream(
 /// Serve the upstream agent's card at `/a2a/:agent/.well-known/agent-card.json`,
 /// rewriting its advertised service `url` to point back at this gateway so
 /// callers discover the agent through `/a2a/<agent>`.
+#[allow(clippy::too_many_arguments)]
 pub async fn a2a_agent_card(
     auth: AuthenticatedKey,
     AisixPath(agent): AisixPath<String>,
