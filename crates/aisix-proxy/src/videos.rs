@@ -1006,10 +1006,8 @@ fn parse_provider_error_message(bytes: &[u8]) -> String {
 /// [`parse_provider_error_message`], the row and the access log what the body
 /// actually said.
 fn provider_status_error(status: u16, bytes: &[u8]) -> aisix_gateway::BridgeError {
-    let detail =
-        vendor_error_message(bytes).unwrap_or_else(|| aisix_gateway::bounded_error_text(bytes));
     aisix_gateway::BridgeError::upstream_status(status, parse_provider_error_message(bytes))
-        .with_telemetry_detail(&detail)
+        .with_telemetry_detail(&aisix_gateway::upstream_error_message(bytes))
 }
 
 fn vendor_error_message(bytes: &[u8]) -> Option<String> {

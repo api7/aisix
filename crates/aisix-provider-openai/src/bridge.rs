@@ -291,6 +291,18 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
     .await
 }
 
+/// The error of a non-2xx answer on a route that sends the request itself
+/// rather than through a bridge (`/v1/responses` native, rerank, audio, image
+/// edits): what [`map_http_error`] gives chat, for one read of the body.
+pub async fn held_route_http_error(resp: reqwest::Response) -> BridgeError {
+    aisix_gateway::upstream_status_parsed_from_response(
+        resp,
+        aisix_gateway::UpstreamWire::OpenAI,
+        parse_openai_error_envelope,
+    )
+    .await
+}
+
 /// Parse the canonical OpenAI error envelope:
 ///
 /// ```json

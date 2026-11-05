@@ -589,11 +589,6 @@ fn in_band_display(message: &str, parsed: Option<&UpstreamErrorView>) -> String 
     }
 }
 
-/// A non-JSON-aware route's error message: the body text as sent, bounded.
-pub fn bounded_error_text(body: &[u8]) -> String {
-    String::from_utf8_lossy(body).chars().take(1024).collect()
-}
-
 /// Read a non-2xx answer a proxy route holds itself into an `UpstreamStatus`
 /// with no parsed envelope, `message` deriving its text from the body. A body
 /// that could not be read whole gives `message` nothing: these routes answer
@@ -609,6 +604,36 @@ pub async fn upstream_status_from_response(
     let text = message(body.whole());
     BridgeError::upstream_status_with_retry_after(status, text, retry_after)
         .with_body_read_error(body.read_error)
+}
+
+/// Read a non-2xx answer a proxy route holds itself into the
+/// `UpstreamStatus` a bridge would give it: the envelope `parse` recognises
+/// for the client's `code` and `param`, and the upstream's own text as the
+/// message whichever shape carried it. A body that could not be read whole
+/// parses to nothing, so these routes answer such a failure with the status
+/// fallback, not with a fragment.
+pub async fn upstream_status_parsed_from_response(
+    resp: reqwest::Response,
+    wire: UpstreamWire,
+    parse: impl FnOnce(&[u8]) -> Option<UpstreamErrorView>,
+) -> BridgeError {
+    let status = resp.status().as_u16();
+    let retry_after = parse_retry_after(resp.headers());
+    let body = read_body_capped(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    let parsed = parse(body.whole()).map(cap_error_view);
+    let message = parsed
+        .as_ref()
+        .and_then(|v| v.message.clone())
+        .unwrap_or_else(|| upstream_error_message(body.whole()));
+    BridgeError::UpstreamStatus {
+        status,
+        message,
+        parsed: parsed.map(Box::new),
+        wire,
+        retry_after,
+        diagnostic: None,
+    }
+    .with_body_read_error(body.read_error)
 }
 
 /// Parse the `Retry-After` response header into a Duration.
@@ -667,22 +692,7 @@ pub async fn capture_upstream_error_http(
     // provider's `{"error": {...}}` shape and returns `None` on any
     // non-matching body (HTML error pages, plain text, 5xx bodies), so
     // attempting it unconditionally is safe and strictly more robust.
-    let parsed = parse(&body)
-        // Truncate every parsed string at the same cap as the outer
-        // `message`. Otherwise a hostile or buggy upstream emitting a
-        // 60 KB `error.message` / `error.code` / `error.type` /
-        // `error.param` would reach the customer envelope verbatim —
-        // the cap exists exactly to prevent that. AWS exception codes
-        // / Anthropic types / OpenAI codes are bounded vocabulary in
-        // practice but the cap applies defensively.
-        .map(|mut v| {
-            let cap = MAX_UPSTREAM_ERROR_MESSAGE_BYTES;
-            v.message = v.message.map(|m| truncate_lossy(&m, cap));
-            v.kind = v.kind.map(|k| truncate_lossy(&k, cap));
-            v.code = v.code.map(|c| truncate_lossy(&c, cap));
-            v.param = v.param.map(|p| truncate_lossy(&p, cap));
-            v
-        });
+    let parsed = parse(&body).map(cap_error_view);
     let message = parsed
         .as_ref()
         .and_then(|v| v.message.clone())
@@ -696,6 +706,21 @@ pub async fn capture_upstream_error_http(
         diagnostic: None,
     }
     .with_body_read_error(read_error)
+}
+
+/// Truncate every parsed string at the same cap as the outer `message`.
+/// Otherwise a hostile or buggy upstream emitting a 60 KB `error.message` /
+/// `error.code` / `error.type` / `error.param` would reach the customer
+/// envelope verbatim — the cap exists exactly to prevent that. AWS exception
+/// codes / Anthropic types / OpenAI codes are bounded vocabulary in practice
+/// but the cap applies defensively.
+fn cap_error_view(mut v: UpstreamErrorView) -> UpstreamErrorView {
+    let cap = MAX_UPSTREAM_ERROR_MESSAGE_BYTES;
+    v.message = v.message.map(|m| truncate_lossy(&m, cap));
+    v.kind = v.kind.map(|k| truncate_lossy(&k, cap));
+    v.code = v.code.map(|c| truncate_lossy(&c, cap));
+    v.param = v.param.map(|p| truncate_lossy(&p, cap));
+    v
 }
 
 /// The human-readable message of an upstream error body: `error.message`
