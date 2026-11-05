@@ -790,21 +790,10 @@ fn foundry_root(api_base: &str) -> &str {
 /// OpenRouter the same, except that its validation failures put a
 /// JSON-encoded list of issues in `error.message`.
 fn upstream_error_message(body: &[u8]) -> String {
-    let Ok(v) = serde_json::from_slice::<Value>(body) else {
-        return String::from_utf8_lossy(body).into_owned();
-    };
-    if let Some(message) = v.pointer("/error/message").and_then(Value::as_str) {
-        return readable_issue_list(message).unwrap_or_else(|| message.to_string());
-    }
-    match v.get("detail") {
-        Some(Value::String(detail)) => detail.clone(),
-        Some(detail) => detail
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| detail.to_string()),
-        None => String::from_utf8_lossy(body).into_owned(),
-    }
+    let issues = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| readable_issue_list(v.pointer("/error/message")?.as_str()?));
+    issues.unwrap_or_else(|| aisix_gateway::upstream_error_message(body))
 }
 
 /// `path.to.field: message; …` for a message that is itself a JSON list of

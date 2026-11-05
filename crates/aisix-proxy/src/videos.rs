@@ -1007,26 +1007,37 @@ fn parse_provider_error_message(bytes: &[u8]) -> String {
 /// actually said.
 fn provider_status_error(status: u16, bytes: &[u8]) -> aisix_gateway::BridgeError {
     aisix_gateway::BridgeError::upstream_status(status, parse_provider_error_message(bytes))
-        .with_telemetry_detail(&aisix_gateway::upstream_error_message(bytes))
+        .with_telemetry_detail(&provider_error_detail(bytes))
+}
+
+/// What the row and the access log report: the upstream's message, or a
+/// vendor's bare code when that is all it said.
+fn provider_error_detail(bytes: &[u8]) -> String {
+    match vendor_error_fields(bytes) {
+        (_, Some(msg)) => msg,
+        (Some(code), None) => code,
+        (None, None) => aisix_gateway::upstream_error_message(bytes),
+    }
 }
 
 fn vendor_error_message(bytes: &[u8]) -> Option<String> {
-    let parsed: Option<serde_json::Value> = serde_json::from_slice(bytes).ok();
-    parsed.and_then(|p| {
-        let scope = if p.get("error").is_some() {
-            p.get("error").cloned().unwrap_or_default()
-        } else {
-            p
-        };
-        let code = nonempty_str(scope.get("code")).map(str::to_string);
-        let msg = nonempty_str(scope.get("message")).map(str::to_string);
-        match (code, msg) {
-            (Some(code), Some(msg)) => Some(format!("{code}: {msg}")),
-            (None, Some(msg)) => Some(msg),
-            (Some(code), None) => Some(code),
-            (None, None) => None,
-        }
-    })
+    match vendor_error_fields(bytes) {
+        (Some(code), Some(msg)) => Some(format!("{code}: {msg}")),
+        (None, Some(msg)) => Some(msg),
+        (Some(code), None) => Some(code),
+        (None, None) => None,
+    }
+}
+
+fn vendor_error_fields(bytes: &[u8]) -> (Option<String>, Option<String>) {
+    let Ok(p) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return (None, None);
+    };
+    let scope = p.get("error").unwrap_or(&p);
+    (
+        nonempty_str(scope.get("code")).map(str::to_string),
+        nonempty_str(scope.get("message")).map(str::to_string),
+    )
 }
 
 // ─────────────────────── resolved dispatch target ───────────────────────

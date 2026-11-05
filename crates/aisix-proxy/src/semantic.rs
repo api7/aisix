@@ -141,6 +141,7 @@ impl DecisionFailure {
                 | BridgeError::UpstreamBodyUnread { .. }
                 | BridgeError::TokenExchangeDecode(_)
                 | BridgeError::Transport(_)
+                | BridgeError::UpstreamUpgradeRefused(_)
                 | BridgeError::StreamAborted,
             )) => Self::EmbeddingUpstream,
             EmbedTextsError::Dispatch(_) | EmbedTextsError::UnusableResponse(_) => {

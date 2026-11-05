@@ -116,7 +116,22 @@ describe("an upstream's failure reads the same on every route that sends its own
       "openai",
       `${await fixedUpstream(400, JSON.stringify({ error: { code: "vendor_code", message: `${TEXT} video` } }))}/v1`,
     );
-    names.push("cohere-top-level", "video-envelope");
+    await model(
+      "video-code-only",
+      "openai",
+      `${await fixedUpstream(400, JSON.stringify({ code: "vendor_code", message: "" }))}/v1`,
+    );
+    names.push("cohere-top-level", "video-envelope", "video-code-only");
+    for (const [shape, body] of [
+      ["top-level", { message: `${TEXT} other shape` }],
+      ["string", { error: `${TEXT} other shape` }],
+      ["detail", { detail: `${TEXT} other shape` }],
+    ] as const) {
+      const base = await fixedUpstream(400, JSON.stringify(body));
+      await model(`openai-${shape}`, "openai", `${base}/v1`);
+      await model(`anthropic-${shape}`, "anthropic", base);
+      names.push(`openai-${shape}`, `anthropic-${shape}`);
+    }
     await seed.createApiKey({ key_hash: sha256(CALLER), allowed_routes: ["*"], allowed_models: names });
 
     await waitConfigPropagation(async () => {
@@ -124,20 +139,12 @@ describe("an upstream's failure reads the same on every route that sends its own
         headers: { authorization: `Bearer ${CALLER}` },
       });
       const { data } = (await res.json()) as { data?: unknown[] };
-      if (data?.length !== names.length) return false;
-      const routed = await Promise.all(
-        [500, 400].map((status) =>
-          fetch(`${app!.proxyUrl}/passthrough-${status}/probe`, {
-            headers: { authorization: `Bearer ${CALLER}` },
-          }).then((r) => r.status === status),
-        ),
-      );
-      return routed.every(Boolean);
+      return data?.length === names.length;
     });
   });
 
   afterAll(async () => {
-    await app?.stop();
+    await app?.exit();
     await sls?.close();
     for (const s of servers) s.close();
   });
@@ -232,7 +239,7 @@ describe("an upstream's failure reads the same on every route that sends its own
         ws.on("error", reject);
       });
       expect(await rowMessage(requestId, "the realtime row")).toBe(
-        `transport error: upstream returned HTTP ${upstream}: ${TEXT} ${upstream}`,
+        `upstream returned HTTP ${upstream}: ${TEXT} ${upstream}`,
       );
     });
   });
@@ -243,6 +250,46 @@ describe("an upstream's failure reads the same on every route that sends its own
     expect(got.body.error.message).toBe(`${TEXT} top-level`);
     expect(await rowMessage(got.requestId, "the top-level row")).toBe(
       `upstream returned HTTP 400: ${TEXT} top-level`,
+    );
+  });
+
+  const messages = [{ role: "user", content: "hi" }];
+  describe.each(["top-level", "string", "detail"])("a body with a %s message", (shape) => {
+    test.each([
+      ["chat", "/v1/chat/completions", "openai", { messages }],
+      ["chat to anthropic", "/v1/chat/completions", "anthropic", { messages }],
+      ["completions", "/v1/completions", "openai", { prompt: "hi" }],
+      ["embeddings", "/v1/embeddings", "openai", { input: "hi" }],
+      ["image generations", "/v1/images/generations", "openai", { prompt: "hi" }],
+      ["messages", "/v1/messages", "openai", { messages, max_tokens: 5 }],
+      ["native messages", "/v1/messages", "anthropic", { messages, max_tokens: 5 }],
+      ["count_tokens", "/v1/messages/count_tokens", "anthropic", { messages }],
+      ["bridged responses", "/v1/responses", "anthropic", { input: "hi" }],
+      ["native responses", "/v1/responses", "openai", { input: "hi" }],
+      ["rerank", "/v1/rerank", "openai", { query: "q", documents: ["a"] }],
+      ["speech", "/v1/audio/speech", "openai", { input: "hi", voice: "alloy" }],
+      [
+        "decisions",
+        "/v1/decisions",
+        "openai",
+        { input: "hi", questions: [{ type: "predicate", name: "q", instructions: "i" }] },
+      ],
+    ] as const)("%s reads its text", async (_what, path, provider, payload) => {
+      if (!etcdReachable) return;
+      const got = await send(path, json({ model: `${provider}-${shape}`, ...payload }));
+      expect(got.body.error.message).toBe(`${TEXT} other shape`);
+      expect(await rowMessage(got.requestId, "the row")).toBe(
+        `upstream returned HTTP 400: ${TEXT} other shape`,
+      );
+    });
+  });
+
+  test("videos: a vendor's bare code stays in the row", async () => {
+    if (!etcdReachable) return;
+    const got = await send("/v1/videos", json({ model: "video-code-only", prompt: "hi" }));
+    expect(got.body.error.message).toBe("vendor_code");
+    expect(await rowMessage(got.requestId, "the code-only row")).toBe(
+      "upstream returned HTTP 400: vendor_code",
     );
   });
 

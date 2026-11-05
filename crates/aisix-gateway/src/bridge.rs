@@ -474,6 +474,11 @@ pub enum BridgeError {
     InvalidUpstreamCredentials(String),
     #[error("transport error: {0}")]
     Transport(String),
+    /// A WebSocket upgrade the upstream answered with an HTTP error. Classed
+    /// with [`Transport`](Self::Transport), but the text is what the upstream
+    /// said, in the wording of an HTTP route's upstream failure.
+    #[error("{0}")]
+    UpstreamUpgradeRefused(String),
     #[error("upstream cancelled the response mid-stream")]
     StreamAborted,
 }
@@ -620,11 +625,24 @@ pub async fn upstream_status_parsed_from_response(
     let status = resp.status().as_u16();
     let retry_after = parse_retry_after(resp.headers());
     let body = read_body_capped(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
-    let parsed = parse(body.whole()).map(cap_error_view);
+    upstream_status_of_body(status, body.whole(), retry_after, wire, parse)
+        .with_body_read_error(body.read_error)
+}
+
+/// The `UpstreamStatus` of an error body: `parse`'s view of the envelope, and
+/// its message or else what [`upstream_error_message`] reads out of the body.
+fn upstream_status_of_body(
+    status: u16,
+    body: &[u8],
+    retry_after: Option<Duration>,
+    wire: UpstreamWire,
+    parse: impl FnOnce(&[u8]) -> Option<UpstreamErrorView>,
+) -> BridgeError {
+    let parsed = parse(body).map(cap_error_view);
     let message = parsed
         .as_ref()
         .and_then(|v| v.message.clone())
-        .unwrap_or_else(|| upstream_error_message(body.whole()));
+        .unwrap_or_else(|| upstream_error_message(body));
     BridgeError::UpstreamStatus {
         status,
         message,
@@ -633,7 +651,6 @@ pub async fn upstream_status_parsed_from_response(
         retry_after,
         diagnostic: None,
     }
-    .with_body_read_error(body.read_error)
 }
 
 /// Parse the `Retry-After` response header into a Duration.
@@ -668,9 +685,8 @@ pub fn parse_retry_after(headers: &http::HeaderMap) -> Option<Duration> {
 /// nonsensical fragments.
 ///
 /// `parse` returning `None` is treated as "envelope shape unknown"; the
-/// fallback in that case is the truncated raw body string in
-/// [`BridgeError::UpstreamStatus::message`], same as for non-JSON
-/// bodies.
+/// message then comes from [`upstream_error_message`], which reads the other
+/// shapes an upstream's text arrives in and keeps a non-JSON body as sent.
 pub async fn capture_upstream_error_http(
     status: http::StatusCode,
     resp: reqwest::Response,
@@ -692,20 +708,8 @@ pub async fn capture_upstream_error_http(
     // provider's `{"error": {...}}` shape and returns `None` on any
     // non-matching body (HTML error pages, plain text, 5xx bodies), so
     // attempting it unconditionally is safe and strictly more robust.
-    let parsed = parse(&body).map(cap_error_view);
-    let message = parsed
-        .as_ref()
-        .and_then(|v| v.message.clone())
-        .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
-    BridgeError::UpstreamStatus {
-        status: status.as_u16(),
-        message: truncate_lossy(&message, MAX_UPSTREAM_ERROR_MESSAGE_BYTES),
-        parsed: parsed.map(Box::new),
-        wire,
-        retry_after,
-        diagnostic: None,
-    }
-    .with_body_read_error(read_error)
+    upstream_status_of_body(status.as_u16(), &body, retry_after, wire, parse)
+        .with_body_read_error(read_error)
 }
 
 /// Truncate every parsed string at the same cap as the outer `message`.
@@ -725,7 +729,8 @@ fn cap_error_view(mut v: UpstreamErrorView) -> UpstreamErrorView {
 
 /// The human-readable message of an upstream error body: `error.message`
 /// (the OpenAI / Google / Azure envelope), a top-level `message` (AWS), a
-/// bare-string `error`, or else the body text itself — truncated at
+/// bare-string `error`, a `detail` string or `detail.message` (FastAPI-style
+/// servers), or else the body text itself — truncated at
 /// [`MAX_UPSTREAM_ERROR_MESSAGE_BYTES`]. The caller receives it as the
 /// upstream wrote it.
 pub fn upstream_error_message(body: &[u8]) -> String {
@@ -735,6 +740,8 @@ pub fn upstream_error_message(body: &[u8]) -> String {
         text(v.get("error").and_then(|e| e.get("message")))
             .or_else(|| text(v.get("message")))
             .or_else(|| text(v.get("error")))
+            .or_else(|| text(v.get("detail")))
+            .or_else(|| text(v.get("detail").and_then(|d| d.get("message"))))
     });
     let message = message.unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
     truncate_lossy(&message, MAX_UPSTREAM_ERROR_MESSAGE_BYTES)
@@ -1017,7 +1024,7 @@ impl BridgeError {
             BridgeError::InvalidUpstreamConfig(_) | BridgeError::InvalidRequest(_) => 400,
             BridgeError::RequestTooLarge { .. } => 413,
             BridgeError::InvalidUpstreamCredentials(_) => 401,
-            BridgeError::Transport(_) => 502,
+            BridgeError::Transport(_) | BridgeError::UpstreamUpgradeRefused(_) => 502,
             BridgeError::StreamAborted => 502,
         }
     }
@@ -1049,6 +1056,7 @@ impl BridgeError {
             | BridgeError::TokenExchangeDecode(_)
             | BridgeError::UpstreamInBand { .. }
             | BridgeError::Transport(_)
+            | BridgeError::UpstreamUpgradeRefused(_)
             | BridgeError::StreamAborted => true,
             BridgeError::Config(_)
             | BridgeError::UnsupportedCapability(_)
@@ -1073,7 +1081,7 @@ impl BridgeError {
             | BridgeError::InvalidRequest(_)
             | BridgeError::RequestTooLarge { .. } => "invalid_request_error",
             BridgeError::InvalidUpstreamCredentials(_) => "authentication_error",
-            BridgeError::Transport(_) => "transport_error",
+            BridgeError::Transport(_) | BridgeError::UpstreamUpgradeRefused(_) => "transport_error",
             BridgeError::StreamAborted => "stream_aborted",
         }
     }

@@ -120,6 +120,7 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
         BridgeError::Timeout { .. }
         | BridgeError::TokenExchangeDecode(_)
         | BridgeError::Transport(_)
+        | BridgeError::UpstreamUpgradeRefused(_)
         | BridgeError::Config(_)
         | BridgeError::StreamAborted => true,
     }

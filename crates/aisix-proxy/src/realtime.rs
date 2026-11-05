@@ -165,16 +165,20 @@ type UpstreamDial = Result<
 /// names its status, and what it said when that arrived whole, in the wording
 /// of an HTTP route's upstream failure; the caller's frame is fixed text either
 /// way.
-fn connect_failure_text(err: &tokio_tungstenite::tungstenite::Error) -> String {
+fn connect_failure(err: &tokio_tungstenite::tungstenite::Error) -> aisix_gateway::BridgeError {
     match err {
         tokio_tungstenite::tungstenite::Error::Http(response) => {
             let status = response.status().as_u16();
-            match complete_handshake_body(response) {
-                Some(body) => crate::attempt::relayed_failure(status, &body).1,
-                None => format!("upstream returned HTTP {status} during the realtime handshake"),
-            }
+            aisix_gateway::BridgeError::UpstreamUpgradeRefused(
+                match complete_handshake_body(response) {
+                    Some(body) => crate::attempt::relayed_failure(status, &body).1,
+                    None => {
+                        format!("upstream returned HTTP {status} during the realtime handshake")
+                    }
+                },
+            )
         }
-        other => aisix_gateway::error_with_causes(other),
+        other => aisix_gateway::BridgeError::Transport(aisix_gateway::error_with_causes(other)),
     }
 }
 
@@ -906,7 +910,7 @@ async fn run_session(
                 &state.runtime_status,
                 &model_entry.id,
                 model_entry.value.cooldown.as_ref(),
-                aisix_gateway::BridgeError::Transport(connect_failure_text(&e)),
+                connect_failure(&e),
             ));
             emit_access_log(
                 &Method::GET,
@@ -1580,9 +1584,10 @@ mod tests {
             for (name, value) in headers {
                 response = response.header(*name, *value);
             }
-            super::connect_failure_text(&tokio_tungstenite::tungstenite::Error::Http(
+            super::connect_failure(&tokio_tungstenite::tungstenite::Error::Http(
                 response.body(body.map(<[u8]>::to_vec)).unwrap(),
             ))
+            .to_string()
         };
         let whole = br#"{"error":{"message":"bad session"}}"#;
         let length = whole.len().to_string();

@@ -118,7 +118,9 @@ pub fn decide_cooldown(
         BridgeError::Timeout { .. } if cfg.trigger_on_timeout_or_default() => {
             Some((default_ttl, "request_timeout"))
         }
-        BridgeError::Transport(_) | BridgeError::StreamAborted
+        BridgeError::Transport(_)
+        | BridgeError::UpstreamUpgradeRefused(_)
+        | BridgeError::StreamAborted
             if cfg.trigger_on_transport_or_default() =>
         {
             Some((default_ttl, "transport_error"))

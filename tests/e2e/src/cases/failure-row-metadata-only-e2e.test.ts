@@ -409,7 +409,7 @@ describe("failure rows name the failure under metadata_only", () => {
       if (!etcdReachable) return ctx.skip();
       const row = await refusedRealtime(model);
       expect(row.get("error_message")).toBe(
-        `transport error: upstream returned HTTP 400: ${SENTINEL}`,
+        `upstream returned HTTP 400: ${SENTINEL}`,
       );
     },
   );
@@ -418,7 +418,7 @@ describe("failure rows name the failure under metadata_only", () => {
     if (!etcdReachable) return ctx.skip();
     const row = await refusedRealtime("meta-realtime-late-detail");
     expect(row.get("error_message")).toBe(
-      "transport error: upstream returned HTTP 400 during the realtime handshake",
+      "upstream returned HTTP 400 during the realtime handshake",
     );
   });
 
