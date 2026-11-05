@@ -58,7 +58,14 @@ describe("the served agent card's scheme", () => {
       allowed_models: [],
       allowed_agents: ["*"],
     });
-    await waitConfigPropagation(async () => (await card(app!.proxyUrl)).status === 200);
+    // Seeded last, so its key authenticating implies the agent has arrived too.
+    await waitConfigPropagation(async () => {
+      const res = await request(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${KEY}` },
+      });
+      await res.body.dump();
+      return res.statusCode === 200;
+    });
   }, 60_000);
 
   afterAll(async () => {
