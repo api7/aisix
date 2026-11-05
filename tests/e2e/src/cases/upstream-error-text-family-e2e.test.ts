@@ -36,6 +36,26 @@ const openAiEnvelope = (status: number) =>
     },
   });
 
+// What real Azure OpenAI answers: a missing deployment comes with no
+// Content-Type, a rejected parameter with one.
+const AZURE_NO_DEPLOYMENT_TEXT = "The API deployment for this resource does not exist.";
+const AZURE_NO_DEPLOYMENT = JSON.stringify(
+  {
+    error: { type: "invalid_request_error", code: "DeploymentNotFound", message: AZURE_NO_DEPLOYMENT_TEXT },
+  },
+  null,
+  2,
+);
+const AZURE_BAD_PARAM_TEXT = "Invalid 'temperature': decimal above maximum value.";
+const AZURE_BAD_PARAM = JSON.stringify({
+  error: {
+    message: AZURE_BAD_PARAM_TEXT,
+    type: "invalid_request_error",
+    param: "temperature",
+    code: "decimal_above_max_value",
+  },
+});
+
 // What each video provider answered a request for a model it does not have.
 const VIDEO_PROVIDER_ANSWERS: [string, string, number, string][] = [
   [
@@ -83,11 +103,12 @@ describe("an upstream's failure reads the same on every route that sends its own
     status: number,
     body: string,
     headers: Record<string, string> = {},
+    contentType: string | null = "application/json",
   ): Promise<string> {
     const server = createServer((req, res) => {
       req.resume();
       req.on("end", () => {
-        res.writeHead(status, { "content-type": "application/json", ...headers });
+        res.writeHead(status, contentType ? { "content-type": contentType, ...headers } : headers);
         res.end(body);
       });
     });
@@ -330,6 +351,26 @@ describe("an upstream's failure reads the same on every route that sends its own
       cooldown: { enabled: false },
     });
     names.push("refused-azure-404");
+    for (const [name, status, body, contentType] of [
+      ["azure-no-deployment", 404, AZURE_NO_DEPLOYMENT, null],
+      ["azure-bad-param", 400, AZURE_BAD_PARAM, "application/json"],
+    ] as const) {
+      const pk = await seed.createProviderKey({
+        display_name: `${name}-pk`,
+        secret: "sk-mock",
+        provider: "azure-openai",
+        adapter: "azure-openai",
+        api_base: await fixedUpstream(status, body, {}, contentType),
+      });
+      await seed.createModel({
+        display_name: name,
+        provider: "azure-openai",
+        model_name: "m",
+        provider_key_id: pk.id,
+        cooldown: { enabled: false },
+      });
+      names.push(name);
+    }
     await seed.createApiKey({ key_hash: sha256(CALLER), allowed_routes: ["*"], allowed_models: names });
 
     await waitConfigPropagation(async () => {
@@ -572,6 +613,36 @@ describe("an upstream's failure reads the same on every route that sends its own
       if (!etcdReachable) return;
       await refusedHandshake("realtime-cooldown-400");
       expect((await status("realtime-cooldown-400")).status).not.toBe("cooldown");
+    });
+  });
+
+  describe.each([
+    ["chat", "/v1/chat/completions", { messages: [{ role: "user", content: "hi" }] }],
+    ["chat streamed", "/v1/chat/completions", { messages: [{ role: "user", content: "hi" }], stream: true }],
+    ["responses", "/v1/responses", { input: "hi" }],
+    ["responses streamed", "/v1/responses", { input: "hi", stream: true }],
+  ] as const)("azure 4xx on %s", (_what, path, payload) => {
+    test("a missing deployment answers model_not_found", async () => {
+      if (!etcdReachable) return;
+      const got = await send(path, json({ model: "azure-no-deployment", ...payload }));
+      expect(got.status).toBe(404);
+      expect(got.body.error).toEqual({
+        message: AZURE_NO_DEPLOYMENT_TEXT,
+        type: "upstream_error",
+        code: "model_not_found",
+      });
+    });
+
+    test("any other code passes through with its param", async () => {
+      if (!etcdReachable) return;
+      const got = await send(path, json({ model: "azure-bad-param", ...payload }));
+      expect(got.status).toBe(400);
+      expect(got.body.error).toEqual({
+        message: AZURE_BAD_PARAM_TEXT,
+        type: "upstream_error",
+        code: "decimal_above_max_value",
+        param: "temperature",
+      });
     });
   });
 
