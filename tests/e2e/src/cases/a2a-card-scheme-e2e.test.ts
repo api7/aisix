@@ -1,9 +1,4 @@
-import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { Agent, request } from "undici";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -15,36 +10,23 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// The agent card a gateway serves advertises the scheme the request actually
-// arrived with: what a proxy in front says it was, or else the listener's own.
+// The agent card a gateway serves advertises what X-Forwarded-Proto says, and
+// https when it says nothing usable.
 
 const KEY = "sk-a2a-card-scheme";
 const AGENT = "scheme-agent";
 
 describe("the served agent card's scheme", () => {
-  const insecure = new Agent({ connect: { rejectUnauthorized: false } });
   let app: SpawnedApp | undefined;
   let upstream: A2aUpstream | undefined;
-  let dir: string | undefined;
   let etcdReachable = false;
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
-    dir = await mkdtemp(join(tmpdir(), "aisix-a2a-card-scheme-e2e-"));
-    const certFile = join(dir, "server.crt");
-    const keyFile = join(dir, "server.key");
-    execFileSync("openssl", [
-      "req", "-x509", "-newkey", "rsa:2048",
-      "-keyout", keyFile, "-out", certFile,
-      "-days", "1", "-nodes",
-      "-subj", "/CN=127.0.0.1",
-      "-addext", "subjectAltName=IP:127.0.0.1",
-    ], { stdio: "ignore" });
-
     upstream = await startA2aUpstream({ cardMount: "origin" });
-    app = await spawnApp({ proxyListeners: [{}, { tls: { cert_file: certFile, key_file: keyFile } }] });
+    app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
     await seed.update("a2a_agents", randomUUID(), {
       name: AGENT,
@@ -60,67 +42,39 @@ describe("the served agent card's scheme", () => {
     });
     // Seeded last, so its key authenticating implies the agent has arrived too.
     await waitConfigPropagation(async () => {
-      const res = await request(`${app!.proxyUrl}/v1/models`, {
+      const res = await fetch(`${app!.proxyUrl}/v1/models`, {
         headers: { authorization: `Bearer ${KEY}` },
       });
-      await res.body.dump();
-      return res.statusCode === 200;
+      return res.status === 200;
     });
   }, 60_000);
 
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
-    await insecure.close();
-    if (dir) await rm(dir, { recursive: true, force: true });
   });
 
-  async function card(base: string, headers: Record<string, string> = {}) {
-    const res = await request(`${base}/a2a/${AGENT}/.well-known/agent-card.json`, {
-      dispatcher: insecure,
-      headers: { authorization: `Bearer ${KEY}`, ...headers },
+  async function cardUrl(forwarded?: string) {
+    const res = await fetch(`${app!.proxyUrl}/a2a/${AGENT}/.well-known/agent-card.json`, {
+      headers: {
+        authorization: `Bearer ${KEY}`,
+        ...(forwarded === undefined ? {} : { "x-forwarded-proto": forwarded }),
+      },
     });
-    const text = await res.body.text();
-    return {
-      status: res.statusCode,
-      url: res.statusCode === 200 ? (JSON.parse(text) as { url: string }).url : text,
-    };
+    expect(res.status).toBe(200);
+    return ((await res.json()) as { url: string }).url;
   }
 
-  const authority = (base: string) => new URL(base).host;
-
-  test("over plain HTTP with no proxy in front it is http", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const base = app.proxyUrls[0];
-    expect((await card(base)).url).toBe(`http://${authority(base)}/a2a/${AGENT}`);
-  });
-
-  test("over TLS with no proxy in front it is https", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const base = app.proxyUrls[1];
-    expect((await card(base)).url).toBe(`https://${authority(base)}/a2a/${AGENT}`);
-  });
-
-  test("what a TLS-terminating proxy says wins over the listener's plain HTTP", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const base = app.proxyUrls[0];
-    expect((await card(base, { "x-forwarded-proto": "https" })).url).toBe(
-      `https://${authority(base)}/a2a/${AGENT}`,
-    );
-  });
-
-  test("a chain of proxies is read by its first hop, and a value that is no scheme is ignored", async (ctx) => {
-    if (!etcdReachable || !app) return ctx.skip();
-    const base = app.proxyUrls[0];
-    for (const chain of ["https, http", "HTTPS"]) {
-      expect((await card(base, { "x-forwarded-proto": chain })).url).toBe(
-        `https://${authority(base)}/a2a/${AGENT}`,
-      );
-    }
-    for (const notAScheme of ["", "ftp"]) {
-      expect((await card(base, { "x-forwarded-proto": notAScheme })).url).toBe(
-        `http://${authority(base)}/a2a/${AGENT}`,
-      );
-    }
+  test.each<[string, string | undefined, string]>([
+    ["absent", undefined, "https"],
+    ["http", "http", "http"],
+    ["https", "https", "https"],
+    ["http in capitals", "HTTP", "http"],
+    ["a chain of proxies, by its first hop", "http, https", "http"],
+    ["empty", "", "https"],
+    ["no scheme it can advertise", "ftp", "https"],
+  ])("X-Forwarded-Proto %s", async (_what, forwarded, scheme) => {
+    if (!etcdReachable || !app) return;
+    expect(await cardUrl(forwarded)).toBe(`${scheme}://${new URL(app.proxyUrl).host}/a2a/${AGENT}`);
   });
 });

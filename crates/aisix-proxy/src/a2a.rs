@@ -735,7 +735,6 @@ async fn dispatch_stream(
 /// Serve the upstream agent's card at `/a2a/:agent/.well-known/agent-card.json`,
 /// rewriting its advertised service `url` to point back at this gateway so
 /// callers discover the agent through `/a2a/<agent>`.
-#[allow(clippy::too_many_arguments)]
 pub async fn a2a_agent_card(
     auth: AuthenticatedKey,
     AisixPath(agent): AisixPath<String>,
@@ -744,11 +743,9 @@ pub async fn a2a_agent_card(
     headers: HeaderMap,
     method: axum::http::Method,
     request_id: Option<axum::Extension<crate::request_id::RequestId>>,
-    downstream: Option<axum::Extension<crate::request_id::DownstreamScheme>>,
 ) -> Response {
     let started = Instant::now();
-    let arrived_over = downstream.map_or("http", |scheme| scheme.0 .0);
-    let response = agent_card(&auth, &agent, &state, &uri, &headers, arrived_over).await;
+    let response = agent_card(&auth, &agent, &state, &uri, &headers).await;
     crate::reject::emit_unrouted_access_log(
         method.as_str(),
         uri.path(),
@@ -777,7 +774,6 @@ async fn agent_card(
     state: &ProxyState,
     uri: &axum::http::Uri,
     headers: &HeaderMap,
-    arrived_over: &str,
 ) -> Response {
     // Discovery files no usage row on any outcome, and it normalizes to the
     // same `/a2a` label the calls do — so it has to say so, or a caller that
@@ -799,7 +795,7 @@ async fn agent_card(
     // Resolved BEFORE the upstream is contacted: without a public base there is
     // no card this gateway can serve, and finding that out after the fetch only
     // wastes an upstream round trip.
-    let Some(base) = gateway_base(uri, headers, arrived_over) else {
+    let Some(base) = gateway_base(uri, headers) else {
         tracing::warn!(
             agent = %agent,
             "cannot derive the gateway's public base for an A2A agent card; refusing to serve one"
@@ -857,8 +853,8 @@ fn rewrite_card_urls(card: &mut aisix_a2a::AgentCard, gateway_url: &str) {
 }
 
 /// Reconstruct the gateway's public base (`scheme://host`) for a request: the
-/// authority, and `X-Forwarded-Proto` when a proxy set it, or else the scheme of
-/// the listener the request arrived on.
+/// authority, and `X-Forwarded-Proto` when a proxy set it (defaulting to
+/// `https`).
 ///
 /// The authority comes from the `Host` header, falling back to the request
 /// URI's own authority. HTTP/2 carries it there as the `:authority`
@@ -868,7 +864,7 @@ fn rewrite_card_urls(card: &mut aisix_a2a::AgentCard, gateway_url: &str) {
 ///
 /// `None` means no card can be served: the caller must fail rather than hand
 /// back a card still advertising the upstream's own address.
-fn gateway_base(uri: &axum::http::Uri, headers: &HeaderMap, arrived_over: &str) -> Option<String> {
+fn gateway_base(uri: &axum::http::Uri, headers: &HeaderMap) -> Option<String> {
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
@@ -885,7 +881,7 @@ fn gateway_base(uri: &axum::http::Uri, headers: &HeaderMap, arrived_over: &str) 
                 .into_iter()
                 .find(|scheme| v.eq_ignore_ascii_case(scheme))
         })
-        .unwrap_or(arrived_over);
+        .unwrap_or("https");
     Some(format!("{scheme}://{host}"))
 }
 
@@ -1212,20 +1208,18 @@ mod tests {
     }
 
     #[test]
-    fn gateway_base_uses_forwarded_proto_then_the_listeners_scheme() {
+    fn gateway_base_uses_forwarded_proto_then_defaults_https() {
         let uri = axum::http::Uri::from_static("/a2a/x/.well-known/agent-card.json");
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, "gw.example.com".parse().unwrap());
-        for arrived_over in ["http", "https"] {
-            assert_eq!(
-                gateway_base(&uri, &headers, arrived_over),
-                Some(format!("{arrived_over}://gw.example.com"))
-            );
-        }
-        headers.insert("x-forwarded-proto", "https".parse().unwrap());
         assert_eq!(
-            gateway_base(&uri, &headers, "http").as_deref(),
+            gateway_base(&uri, &headers).as_deref(),
             Some("https://gw.example.com")
+        );
+        headers.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert_eq!(
+            gateway_base(&uri, &headers).as_deref(),
+            Some("http://gw.example.com")
         );
     }
 
@@ -1238,14 +1232,14 @@ mod tests {
         // upstream's address.
         let h2_uri = axum::http::Uri::from_static("https://gw.example.com/a2a/x");
         assert_eq!(
-            gateway_base(&h2_uri, &HeaderMap::new(), "https").as_deref(),
+            gateway_base(&h2_uri, &HeaderMap::new()).as_deref(),
             Some("https://gw.example.com")
         );
         // An empty Host does not shadow a usable authority either.
         let mut empty_host = HeaderMap::new();
         empty_host.insert(header::HOST, "".parse().unwrap());
         assert_eq!(
-            gateway_base(&h2_uri, &empty_host, "https").as_deref(),
+            gateway_base(&h2_uri, &empty_host).as_deref(),
             Some("https://gw.example.com")
         );
     }
@@ -1253,7 +1247,7 @@ mod tests {
     #[test]
     fn gateway_base_is_none_without_any_authority() {
         let origin_form = axum::http::Uri::from_static("/a2a/x/.well-known/agent-card.json");
-        assert_eq!(gateway_base(&origin_form, &HeaderMap::new(), "https"), None);
+        assert_eq!(gateway_base(&origin_form, &HeaderMap::new()), None);
     }
 
     /// A local agent that answers `message/stream` with SSE and then keeps the
@@ -2342,7 +2336,7 @@ mod tests {
         let card: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         // The advertised service URL is rewritten to the gateway; the caller's
         // Host is reflected and every other card field is preserved.
-        assert_eq!(card["url"], "http://a2a.aisix.example.com/a2a/invoice");
+        assert_eq!(card["url"], "https://a2a.aisix.example.com/a2a/invoice");
         assert_eq!(card["name"], "Invoice Agent");
         assert_eq!(card["version"], "2.1.0");
         assert_eq!(card["skills"][0]["id"], "extract");

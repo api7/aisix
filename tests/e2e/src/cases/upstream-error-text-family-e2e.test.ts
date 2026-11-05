@@ -5,9 +5,11 @@ import { WebSocket } from "ws";
 import {
   AdminClient,
   EtcdClient,
+  scrapeMetrics,
   SeedClient,
   spawnApp,
   startMockSls,
+  sumMetric,
   waitConfigPropagation,
   waitForLogLine,
   waitForSlsLog,
@@ -129,6 +131,11 @@ describe("an upstream's failure reads the same on every route that sends its own
       names.push(name);
     }
     cooldownModelIds = cooledModels;
+    for (const status of [401, 429]) {
+      const name = `openai-${status}`;
+      await model(name, "openai", `${await fixedUpstream(status, openAiEnvelope(status))}/v1`);
+      names.push(name);
+    }
     const padded = JSON.stringify({
       error: { message: `${TEXT} padded`, code: "padded_code" },
       padding: "x".repeat(100 * 1024),
@@ -277,6 +284,27 @@ describe("an upstream's failure reads the same on every route that sends its own
       expect(row.get("error_message")).toBe(`upstream returned HTTP ${upstream}: ${TEXT} ${upstream}`);
       expect(row.get("error_class")).toBe("upstream_status");
     });
+  });
+
+  test.each<[number, string]>([
+    [401, "client_error"],
+    [429, "rate_limited"],
+    [500, "upstream_error"],
+    [400, "client_error"],
+  ])("a realtime handshake refused with %i is recorded under that status", async (upstream, outcome) => {
+    if (!etcdReachable) return;
+    const model = `openai-${upstream}`;
+    const requestId = await refusedHandshake(model);
+    const row = await finalRow(requestId, "the realtime row");
+    expect(row.get("status_code")).toBe(String(upstream));
+    await waitForLogLine(
+      app!,
+      (l) => l.includes(requestId) && l.includes(`status_code=${upstream}`),
+      "the realtime access-log line",
+    );
+    const metrics = await scrapeMetrics(app!.metricsUrl);
+    expect(sumMetric(metrics, "aisix_proxy_requests_total", { model, status: String(upstream) })).toBeGreaterThan(0);
+    expect(sumMetric(metrics, "aisix_requests_total", { model, status: String(upstream), outcome })).toBeGreaterThan(0);
   });
 
   describe("a refused realtime handshake cools its model down as any upstream status does", () => {

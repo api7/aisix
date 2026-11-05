@@ -398,7 +398,7 @@ describe("failure rows name the failure under metadata_only", () => {
       ws.on("error", reject);
     });
     const row = await rowOf(requestId, "the realtime row");
-    expect(row.get("status_code")).toBe("502");
+    expect(row.get("status_code")).toBe("400");
     expect(row.get("error_class")).toBe("upstream_status");
     return row;
   }

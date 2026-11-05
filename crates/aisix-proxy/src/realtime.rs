@@ -191,6 +191,16 @@ fn connect_failure(err: &tokio_tungstenite::tungstenite::Error) -> aisix_gateway
     }
 }
 
+/// The status a failed dial is recorded under: the upstream's own when it
+/// refused the upgrade with an error. A dial that got no answer, or a 2xx or 3xx
+/// that is no upgrade, is still a failure and must not read as a success.
+fn recorded_connect_status(err: &aisix_gateway::BridgeError) -> u16 {
+    match err {
+        aisix_gateway::BridgeError::UpstreamStatus { status, .. } if *status >= 400 => *status,
+        _ => 502,
+    }
+}
+
 /// The refused upgrade's body, when all of it is known to have arrived.
 /// tungstenite hands over the raw bytes that came with the response head and
 /// drops the socket, so a later part is lost and chunked framing is left in.
@@ -892,8 +902,9 @@ async fn run_session(
         }
         Err(e) => {
             tracing::warn!(error = %e, model = %requested_model, "realtime upstream connect failed");
-            // The same 502 the request families record for this failure.
-            crate::attempt::RoutingTelemetry::record_deployment(&state, &model_entry.id, 502);
+            let connect_err = connect_failure(&e);
+            let status = recorded_connect_status(&connect_err);
+            crate::attempt::RoutingTelemetry::record_deployment(&state, &model_entry.id, status);
             let _ = client_tx
                 .send(AxMessage::Text(
                     serde_json::json!({
@@ -919,11 +930,11 @@ async fn run_session(
                 &state.runtime_status,
                 &model_entry.id,
                 model_entry.value.cooldown.as_ref(),
-                connect_failure(&e),
+                connect_err,
             ));
             emit_access_log(
                 &Method::GET,
-                502,
+                status,
                 started.elapsed(),
                 &request_id,
                 Some(&auth.entry.id),
@@ -959,7 +970,7 @@ async fn run_session(
                     pk: pk.labels(),
                     ..Default::default()
                 },
-                502,
+                status,
                 aisix_obs::ErrorSource::Upstream,
                 started.elapsed(),
             );
@@ -968,7 +979,7 @@ async fn run_session(
                 &request_id,
                 &requested_model,
                 &auth.entry.id,
-                502,
+                status,
                 crate::usage_attr::EventError::of(&connect_err),
                 // Failing to open the upstream socket is not a guardrail
                 // decision, whatever the chain went on to allow.

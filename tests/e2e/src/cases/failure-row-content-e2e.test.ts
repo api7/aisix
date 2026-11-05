@@ -1014,7 +1014,7 @@ describe("failure rows carry request and response bodies", () => {
       ws.on("error", reject);
     });
     const row = await rowOf(requestId, "the failed realtime row");
-    expect(row.get("status_code")).toBe("502");
+    expect(row.get("status_code")).toBe("400");
     expect(row.get("error_class")).toBe("upstream_status");
     expect(row.get("response")).toBeTruthy();
   });
