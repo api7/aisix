@@ -1570,8 +1570,8 @@ async fn multipart_dispatch(
                                 cooldown_cfg,
                                 aisix_gateway::upstream_error_within(
                                     connect_deadline,
-                                    status,
-                                    aisix_provider_openai::held_route_http_error(resp),
+                                    resp,
+                                    aisix_provider_openai::held_route_http_error,
                                 )
                                 .await,
                             ));
@@ -2376,8 +2376,8 @@ async fn speech_dispatch(
                             cooldown_cfg,
                             aisix_gateway::upstream_error_within(
                                 stream_budget,
-                                status,
-                                aisix_provider_openai::held_route_http_error(resp),
+                                resp,
+                                aisix_provider_openai::held_route_http_error,
                             )
                             .await,
                         ));

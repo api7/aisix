@@ -1036,9 +1036,12 @@ fn vendor_error_fields(bytes: &[u8]) -> (Option<String>, Option<String>) {
         return (None, None);
     };
     let scope = p.get("error").unwrap_or(&p);
+    let capped = |text: &str| {
+        aisix_gateway::truncate_lossy(text, aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES)
+    };
     (
-        nonempty_str(scope.get("code")).map(str::to_string),
-        nonempty_str(scope.get("message")).map(str::to_string),
+        nonempty_str(scope.get("code")).map(capped),
+        nonempty_str(scope.get("message")).map(capped),
     )
 }
 
@@ -3318,6 +3321,13 @@ mod tests {
                     .unwrap();
             assert_eq!(poll.status(), StatusCode::OK);
         }
+    }
+
+    #[test]
+    fn a_vendors_error_text_reaches_the_caller_capped() {
+        let body = serde_json::json!({"error": {"message": "x".repeat(5000)}}).to_string();
+        let text = parse_provider_error_message(body.as_bytes());
+        assert!(text.len() < 2000, "{} bytes", text.len());
     }
 
     #[tokio::test]

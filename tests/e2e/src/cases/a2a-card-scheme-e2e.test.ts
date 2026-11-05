@@ -101,4 +101,17 @@ describe("the served agent card's scheme", () => {
       `https://${authority(base)}/a2a/${AGENT}`,
     );
   });
+
+  test("a chain of proxies is read by its first hop, and a value that is no scheme is ignored", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const base = app.proxyUrls[0];
+    expect((await card(base, { "x-forwarded-proto": "https, http" })).url).toBe(
+      `https://${authority(base)}/a2a/${AGENT}`,
+    );
+    for (const notAScheme of ["", "ftp"]) {
+      expect((await card(base, { "x-forwarded-proto": notAScheme })).url).toBe(
+        `http://${authority(base)}/a2a/${AGENT}`,
+      );
+    }
+  });
 });

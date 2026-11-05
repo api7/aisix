@@ -592,22 +592,27 @@ fn in_band_display(message: &str, parsed: Option<&UpstreamErrorView>) -> String 
 
 /// Bound `read`, the read of a non-2xx body, by `deadline` on a path whose
 /// request-level deadline ended with the response head, as a streaming one's
-/// does: an upstream that stalls after its headers cannot hold the caller past
-/// the budget. Past it the status is still known, so the answer is that status
-/// with nothing read, the failure of a body cut off mid-read.
-pub async fn upstream_error_within(
+/// does: an upstream that stalls after its headers holds the caller for one more
+/// budget at most. Past it the head is still known, so the answer is its status
+/// and `Retry-After` with nothing read, the failure of a body cut off mid-read.
+pub async fn upstream_error_within<F: std::future::Future<Output = BridgeError>>(
     deadline: Option<Duration>,
-    status: http::StatusCode,
-    read: impl std::future::Future<Output = BridgeError>,
+    resp: reqwest::Response,
+    read: impl FnOnce(reqwest::Response) -> F,
 ) -> BridgeError {
     let Some(d) = deadline else {
-        return read.await;
+        return read(resp).await;
     };
-    tokio::time::timeout(d, read).await.unwrap_or_else(|_| {
-        let reason = format!("timed out after {}ms", d.as_millis());
-        crate::response_tap::warn_error_body_unread(status.as_u16(), &reason);
-        BridgeError::upstream_status(status.as_u16(), "").with_body_read_error(Some(reason))
-    })
+    let status = resp.status().as_u16();
+    let retry_after = parse_retry_after(resp.headers());
+    tokio::time::timeout(d, read(resp))
+        .await
+        .unwrap_or_else(|_| {
+            let reason = format!("timed out after {}ms", d.as_millis());
+            crate::response_tap::warn_error_body_unread(status, &reason);
+            BridgeError::upstream_status_with_retry_after(status, "", retry_after)
+                .with_body_read_error(Some(reason))
+        })
 }
 
 /// Read a non-2xx answer a proxy route holds itself into the
@@ -745,13 +750,19 @@ pub fn upstream_error_message(body: &[u8]) -> String {
 /// body carries it in one of the shapes that function names.
 pub fn upstream_error_text(body: &[u8]) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let text = |v: Option<&serde_json::Value>| v.and_then(|m| m.as_str()).map(str::to_string);
-    text(parsed.get("error").and_then(|e| e.get("message")))
-        .or_else(|| text(parsed.get("message")))
-        .or_else(|| text(parsed.get("error")))
-        .or_else(|| text(parsed.get("detail")))
-        .or_else(|| text(parsed.get("detail").and_then(|d| d.get("message"))))
-        .map(|message| truncate_lossy(&message, MAX_UPSTREAM_ERROR_MESSAGE_BYTES))
+    let fields = [
+        parsed.get("error").and_then(|e| e.get("message")),
+        parsed.get("message"),
+        parsed.get("error"),
+        parsed.get("detail"),
+        parsed.get("detail").and_then(|d| d.get("message")),
+    ];
+    let texts = || fields.iter().filter_map(|v| v.and_then(|m| m.as_str()));
+    // A blank field does not hide the text a later one carries.
+    texts()
+        .find(|text| !text.trim().is_empty())
+        .or_else(|| texts().next())
+        .map(|message| truncate_lossy(message, MAX_UPSTREAM_ERROR_MESSAGE_BYTES))
 }
 
 /// Whether a top-level `error` value reports a failure: a non-empty
@@ -1312,6 +1323,15 @@ mod tests {
             named.stream_frame_message(),
             "upstream reported an in-band stream error: boom"
         );
+    }
+
+    #[test]
+    fn a_blank_field_does_not_hide_the_text_of_a_later_one() {
+        assert_eq!(
+            upstream_error_message(br#"{"message":"","error":"quota exceeded"}"#),
+            "quota exceeded"
+        );
+        assert_eq!(upstream_error_message(br#"{"message":""}"#), "");
     }
 
     /// The wording of a blank message is the error's `Display`, and its

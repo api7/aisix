@@ -1326,12 +1326,12 @@ impl VertexBridge {
         aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
-            return Err(aisix_gateway::upstream_error_within(
-                ctx.deadline,
-                status,
-                map_http_error(status, resp),
-            )
-            .await);
+            return Err(
+                aisix_gateway::upstream_error_within(ctx.deadline, resp, |resp| {
+                    map_http_error(status, resp)
+                })
+                .await,
+            );
         }
 
         // Native Anthropic SSE → ChatChunk, driven by the shared
@@ -1540,12 +1540,12 @@ impl VertexBridge {
         aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
-            return Err(aisix_gateway::upstream_error_within(
-                ctx.deadline,
-                status,
-                map_http_error(status, resp),
-            )
-            .await);
+            return Err(
+                aisix_gateway::upstream_error_within(ctx.deadline, resp, |resp| {
+                    map_http_error(status, resp)
+                })
+                .await,
+            );
         }
 
         let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
@@ -1787,12 +1787,12 @@ impl VertexBridge {
         aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
-            return Err(aisix_gateway::upstream_error_within(
-                ctx.deadline,
-                status,
-                map_http_error(status, resp),
-            )
-            .await);
+            return Err(
+                aisix_gateway::upstream_error_within(ctx.deadline, resp, |resp| {
+                    map_http_error(status, resp)
+                })
+                .await,
+            );
         }
 
         let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
@@ -1926,12 +1926,12 @@ impl VertexBridge {
         aisix_gateway::note_upstream_response(resp.headers());
         let status = resp.status();
         if !status.is_success() {
-            return Err(aisix_gateway::upstream_error_within(
-                ctx.deadline,
-                status,
-                map_http_error(status, resp),
-            )
-            .await);
+            return Err(
+                aisix_gateway::upstream_error_within(ctx.deadline, resp, |resp| {
+                    map_http_error(status, resp)
+                })
+                .await,
+            );
         }
 
         let upstream_id_owned = upstream_id.to_string();

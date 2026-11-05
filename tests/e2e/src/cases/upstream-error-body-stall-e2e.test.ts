@@ -1,7 +1,14 @@
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { EtcdClient, SeedClient, spawnApp, waitConfigPropagation, type SpawnedApp } from "../harness/index.js";
+import {
+  EtcdClient,
+  SeedClient,
+  spawnApp,
+  waitConfigPropagation,
+  waitForLogLine,
+  type SpawnedApp,
+} from "../harness/index.js";
 
 // An upstream that answers a failure status, sends part of the body and then
 // goes silent must not hold the caller past the model's budget.
@@ -15,6 +22,7 @@ describe("an upstream that stalls its error body", () => {
   let app: SpawnedApp | undefined;
   let etcdReachable = false;
   let upstream: Server | undefined;
+  let rateLimited: Server | undefined;
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -28,26 +36,43 @@ describe("an upstream that stalls its error body", () => {
     await new Promise<void>((r) => upstream!.listen(0, "127.0.0.1", r));
     const base = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
 
-    app = await spawnApp({});
+    rateLimited = createServer((req, res) => {
+      req.resume();
+      res.writeHead(429, { "content-type": "application/json", "content-length": "1000", "retry-after": "7" });
+      res.write('{"error":{"mess');
+    });
+    await new Promise<void>((r) => rateLimited!.listen(0, "127.0.0.1", r));
+    const rateLimitedBase = `http://127.0.0.1:${(rateLimited.address() as { port: number }).port}/v1`;
+
+    app = await spawnApp({ extraEnv: { RUST_LOG: "info" } });
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const names: string[] = [];
     for (const [name, provider, modelName] of [
       ["stall-openai", "openai", "m"],
+      ["stall-429", "openai", "m"],
+      ["stall-azure", "azure-openai", "m"],
+      ["stall-vertex-gemini", "google", "gemini-2.5-flash"],
+      ["stall-vertex-claude", "google", "claude-sonnet-4-5"],
       ["stall-anthropic", "anthropic", "m"],
       ["stall-cohere", "cohere", "m"],
       ["stall-bedrock-converse", "bedrock", "anthropic.claude-3-5-haiku-20241022-v1:0"],
       ["stall-bedrock-chat", "bedrock", "global.openai.gpt-6.1-sol"],
     ] as const) {
       const bedrock = provider === "bedrock";
+      const vertex = provider === "google";
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
         secret: bedrock
           ? JSON.stringify({ access_key_id: "AKIA-stall", secret_access_key: "sk-stall", region: "us-east-1" })
-          : "sk-mock",
+          : vertex
+            ? JSON.stringify({ access_token: "ya29.stall", project: "proj-e2e", region: "us-central1" })
+            : "sk-mock",
         provider,
         ...(provider === "cohere" ? { adapter: "openai" } : {}),
         ...(bedrock ? { adapter: "bedrock" } : {}),
-        api_base: provider === "openai" ? `${base}/v1` : base,
+        ...(vertex ? { adapter: "vertex" } : {}),
+        ...(provider === "azure-openai" ? { adapter: "azure-openai" } : {}),
+        api_base: name === "stall-429" ? rateLimitedBase : provider === "openai" ? `${base}/v1` : base,
       });
       await seed.createModel({
         display_name: name,
@@ -74,6 +99,8 @@ describe("an upstream that stalls its error body", () => {
     await app?.exit();
     upstream?.closeAllConnections();
     upstream?.close();
+    rateLimited?.closeAllConnections();
+    rateLimited?.close();
   });
 
   const json = (body: unknown): RequestInit => ({
@@ -111,6 +138,10 @@ describe("an upstream that stalls its error body", () => {
     ["image generations", "/v1/images/generations", () => json({ model: "stall-openai", prompt: "hi" })],
     ["decisions", "/v1/decisions", () => json({ model: "stall-openai", input: "hi", questions: [{ type: "predicate", name: "q", instructions: "i" }] })],
     ["videos", "/v1/videos", () => json({ model: "stall-openai", prompt: "hi" })],
+    ["streaming chat to azure", "/v1/chat/completions", () => json({ model: "stall-azure", messages, stream: true })],
+    ["streaming chat to vertex gemini", "/v1/chat/completions", () => json({ model: "stall-vertex-gemini", messages, stream: true })],
+    ["streaming chat to vertex claude", "/v1/chat/completions", () => json({ model: "stall-vertex-claude", messages, stream: true })],
+    ["streaming native messages on vertex", "/v1/messages", () => json({ model: "stall-vertex-claude", messages, max_tokens: 5, stream: true })],
     ["streaming bedrock converse", "/v1/chat/completions", () => json({ model: "stall-bedrock-converse", messages, stream: true })],
     ["bedrock converse", "/v1/chat/completions", () => json({ model: "stall-bedrock-converse", messages })],
     ["streaming bedrock chat endpoint", "/v1/chat/completions", () => json({ model: "stall-bedrock-chat", messages, stream: true })],
@@ -124,5 +155,24 @@ describe("an upstream that stalls its error body", () => {
     });
     await res.text();
     expect(res.status).toBeGreaterThanOrEqual(500);
+  }, 20000);
+
+  test("what the response head said survives the stalled body, and the record names the stall", async () => {
+    if (!etcdReachable) return;
+    const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
+      ...json({ model: "stall-429", messages, stream: true }),
+      signal: AbortSignal.timeout(CLIENT_GIVES_UP_MS),
+    });
+    await res.text();
+    expect(res.status).toBe(429);
+    expect(res.headers.get("retry-after")).toBe("7");
+    const requestId = res.headers.get("x-aisix-request-id")!;
+    await waitForLogLine(
+      app!,
+      (l) =>
+        l.includes(requestId) &&
+        l.includes(`upstream returned HTTP 429: failed to read response body: timed out after ${BUDGET_MS}ms`),
+      "the stalled request's access-log line",
+    );
   }, 20000);
 });
