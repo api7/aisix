@@ -162,47 +162,55 @@ type UpstreamDial = Result<
 >;
 
 /// What a failed dial reports. An upgrade the upstream answered with an error
-/// names its status, and what it said when that arrived whole, in the wording
-/// of an HTTP route's upstream failure; the caller's frame is fixed text either
-/// way.
+/// reads as an HTTP route's upstream failure, the OpenAI envelope included. A
+/// body that did not arrive whole is named in the row, and leaves the caller
+/// the status fallback.
 fn connect_failure(err: &tokio_tungstenite::tungstenite::Error) -> aisix_gateway::BridgeError {
     match err {
         tokio_tungstenite::tungstenite::Error::Http(response) => {
             let status = response.status().as_u16();
-            let (message, diagnostic) = match complete_handshake_body(response) {
-                Some(body) => (aisix_gateway::upstream_error_message(&body), None),
-                None => (
-                    String::new(),
-                    Some(format!(
+            let retry_after = aisix_gateway::parse_retry_after(response.headers());
+            let wire = aisix_gateway::UpstreamWire::OpenAI;
+            match complete_handshake_body(response) {
+                Some(body) => aisix_gateway::upstream_status_of_body(
+                    status,
+                    &body,
+                    retry_after,
+                    wire,
+                    aisix_provider_openai::parse_openai_error_envelope,
+                ),
+                None => aisix_gateway::BridgeError::UpstreamStatus {
+                    status,
+                    message: String::new(),
+                    parsed: None,
+                    wire,
+                    retry_after,
+                    diagnostic: Some(format!(
                         "upstream returned HTTP {status} during the realtime handshake"
                     )),
-                ),
-            };
-            aisix_gateway::BridgeError::UpstreamStatus {
-                status,
-                message,
-                parsed: None,
-                wire: aisix_gateway::UpstreamWire::Unknown,
-                retry_after: aisix_gateway::parse_retry_after(response.headers()),
-                diagnostic,
+                },
             }
         }
         other => aisix_gateway::BridgeError::Transport(aisix_gateway::error_with_causes(other)),
     }
 }
 
-/// The status a failed dial is recorded under: the upstream's own when it
-/// refused the upgrade with an error. A dial that got no answer, or a 2xx or 3xx
-/// that is no upgrade, is still a failure and must not read as a success.
-fn recorded_connect_status(err: &aisix_gateway::BridgeError) -> u16 {
-    match err {
-        aisix_gateway::BridgeError::UpstreamStatus { status, .. }
-            if (400..=599).contains(status) =>
-        {
-            *status
+/// The session's `error` frame for a failed dial: an upstream's answer in the
+/// envelope an HTTP route would send, fixed text when there was no answer.
+fn connect_failure_frame(err: &ProxyError) -> String {
+    let error = match err {
+        ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamStatus { .. }) => {
+            err.envelope().error
         }
-        _ => 502,
-    }
+        _ => {
+            crate::error::ErrorEnvelope::new(
+                "failed to connect to the upstream realtime endpoint",
+                "upstream_error",
+            )
+            .error
+        }
+    };
+    serde_json::json!({ "type": "error", "error": error }).to_string()
 }
 
 /// The refused upgrade's body, when all of it is known to have arrived.
@@ -907,19 +915,19 @@ async fn run_session(
         Err(e) => {
             tracing::warn!(error = %e, model = %requested_model, "realtime upstream connect failed");
             let connect_err = connect_failure(&e);
-            let status = recorded_connect_status(&connect_err);
+            let status = connect_err.http_status();
             crate::attempt::RoutingTelemetry::record_deployment(&state, &model_entry.id, status);
+            // `note_failure` hands the error back, so the same value that
+            // drove the cooldown decision also names the failure to the
+            // caller and in the access log instead of being rebuilt.
+            let connect_err = ProxyError::Bridge(crate::cooldown::note_failure(
+                &state.runtime_status,
+                &model_entry.id,
+                model_entry.value.cooldown.as_ref(),
+                connect_err,
+            ));
             let _ = client_tx
-                .send(AxMessage::Text(
-                    serde_json::json!({
-                        "type": "error",
-                        "error": {
-                            "type": "upstream_error",
-                            "message": "failed to connect to the upstream realtime endpoint"
-                        }
-                    })
-                    .to_string(),
-                ))
+                .send(AxMessage::Text(connect_failure_frame(&connect_err)))
                 .await;
             let _ = client_tx
                 .send(AxMessage::Close(Some(CloseFrame {
@@ -927,15 +935,6 @@ async fn run_session(
                     reason: "upstream connect failed".into(),
                 })))
                 .await;
-            // `note_failure` hands the error back, so the same value that
-            // drove the cooldown decision also names the failure in the
-            // access log instead of being rebuilt.
-            let connect_err = ProxyError::Bridge(crate::cooldown::note_failure(
-                &state.runtime_status,
-                &model_entry.id,
-                model_entry.value.cooldown.as_ref(),
-                connect_err,
-            ));
             emit_access_log(
                 &Method::GET,
                 status,
