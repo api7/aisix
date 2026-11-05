@@ -18,7 +18,9 @@
 #
 # pgo runs the three phases, FAIL-CLOSED — any phase failing fails the script
 # and no binary is staged:
-#   A. instrumented build (-Cprofile-generate) in target-pgo-gen/;
+#   A. instrumented build (-Cprofile-generate) in target-pgo-gen/; on arm64 it
+#      uses about 20 GB of RAM plus swap, and running short shows up as a
+#      killed build with no compile error;
 #   B. train.sh drives the committed shape matrix through it and merges the
 #      .profraw files with the pinned toolchain's own llvm-profdata;
 #   C. optimized build (-Cprofile-use) in target-pgo/, so profile builds never
