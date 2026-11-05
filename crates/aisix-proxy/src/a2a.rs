@@ -880,7 +880,11 @@ fn gateway_base(uri: &axum::http::Uri, headers: &HeaderMap, arrived_over: &str) 
         // A chain of proxies lists its hops; the first is what the client used.
         .and_then(|v| v.split(',').next())
         .map(str::trim)
-        .filter(|scheme| matches!(*scheme, "http" | "https"))
+        .and_then(|v| {
+            ["http", "https"]
+                .into_iter()
+                .find(|scheme| v.eq_ignore_ascii_case(scheme))
+        })
         .unwrap_or(arrived_over);
     Some(format!("{scheme}://{host}"))
 }
