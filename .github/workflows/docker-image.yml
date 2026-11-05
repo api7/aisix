@@ -181,6 +181,22 @@ jobs:
           shared-key: docker-image-${{ matrix.arch }}-${{ steps.pgomode.outputs.profile }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Phase A's fat-LTO build of the instrumented binary uses about 20 GB of
+      # RAM plus swap on arm64, past the runner's 16 GB + 3 GB. Without this
+      # step the arm64 leg ends in exit 143 with no compile error and no OOM
+      # line in its log (what sends the signal has not been observed). Swap
+      # changes where rustc's memory lives, not what it emits. A PGO build
+      # only: `-rc.N` fat-LTO and thin builds pass on arm64 without it.
+      - name: Add swap for the PGO build
+        if: steps.pgomode.outputs.value == 'on'
+        run: |
+          set -eux
+          sudo fallocate -l 16G /swapfile-pgo
+          sudo chmod 600 /swapfile-pgo
+          sudo mkswap /swapfile-pgo
+          sudo swapon /swapfile-pgo
+          swapon --show
+
       # Same short sha the `type=sha,prefix=sha-` tag uses, stamped into
       # the binary so a DP reports `<version>+sha-<short>` (release) or
       # `dev+sha-<short>` and operators can match a node to its image tag.
