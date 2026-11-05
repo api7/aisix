@@ -355,6 +355,34 @@ describe("an upstream 200 that reports a failure in its body", () => {
     stream,
   });
 
+  test.each<[string, string, Record<string, unknown>, string]>([
+    ["chat/completions", "/v1/chat/completions", chat("ib-chat-ns", false), PROVIDER_MESSAGE],
+    ["embeddings", "/v1/embeddings", { model: "ib-embed-ns", input: "hi" }, PROVIDER_MESSAGE],
+    ["completions", "/v1/completions", { model: "ib-chat-ns", prompt: "hi" }, PROVIDER_MESSAGE],
+    ["image generations", "/v1/images/generations", { model: "ib-chat-ns", prompt: "hi" }, PROVIDER_MESSAGE],
+    ["translated responses", "/v1/responses", { model: "ib-responses-bridge-ns", input: "hi" }, PROVIDER_MESSAGE],
+    ["native responses", "/v1/responses", { model: "ib-responses-native-bare-ns", input: "hi" }, PROVIDER_MESSAGE],
+    [
+      "native messages",
+      "/v1/messages",
+      { model: "ib-messages-native-ns", max_tokens: 64, messages: [{ role: "user", content: "hi" }] },
+      "Overloaded right now",
+    ],
+    [
+      "count_tokens",
+      "/v1/messages/count_tokens",
+      { model: "ib-messages-native-ns", messages: [{ role: "user", content: "hi" }] },
+      "Overloaded right now",
+    ],
+  ])("%s: a failure in a whole body is not recorded as a stream's", async (_what, path, body, message) => {
+    if (!etcdReachable || !app || !sls) return;
+    const res = await post(path, body);
+    expect(res.text).toContain(message);
+    const row = await usageRow(res.requestId);
+    expect(row.get("error_class")).toBe("upstream_in_band");
+    expect(row.get("error_message")).toBe(`upstream reported an in-band error: ${message}`);
+  });
+
   test("chat/completions: a bare error body is a 502 carrying the provider's message", async (ctx) => {
     if (!etcdReachable || !app || !sls) return ctx.skip();
     const res = await post("/v1/chat/completions", chat("ib-chat-ns", false));

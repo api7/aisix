@@ -999,7 +999,7 @@ describe("failure rows carry request and response bodies", () => {
     expect(JSON.parse(row.get("response")!)).toEqual(JSON.parse(body));
   });
 
-  test("realtime: an upstream that refuses the socket has a row naming the transport failure", async () => {
+  test("realtime: an upstream that refuses the socket has a row naming its status", async () => {
     if (!etcdReachable) return;
     const requestId = await new Promise<string>((resolve, reject) => {
       const ws = new WsClient(
@@ -1015,7 +1015,7 @@ describe("failure rows carry request and response bodies", () => {
     });
     const row = await rowOf(requestId, "the failed realtime row");
     expect(row.get("status_code")).toBe("502");
-    expect(row.get("error_class")).toBe("transport");
+    expect(row.get("error_class")).toBe("upstream_status");
     expect(row.get("response")).toBeTruthy();
   });
 

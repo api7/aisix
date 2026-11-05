@@ -333,7 +333,7 @@ pub(crate) fn routing_error_class(err: &BridgeError) -> &'static str {
             "invalid_request_error"
         }
         BridgeError::InvalidUpstreamCredentials(_) => "invalid_credentials",
-        BridgeError::Transport(_) | BridgeError::UpstreamUpgradeRefused(_) => "transport",
+        BridgeError::Transport(_) => "transport",
         BridgeError::StreamAborted => "stream_aborted",
     }
 }
@@ -675,7 +675,6 @@ mod tests {
                 cause: String::new(),
             },
             BridgeError::upstream_status(502, "bad gateway"),
-            BridgeError::UpstreamUpgradeRefused("upstream returned HTTP 400: refused".into()),
             BridgeError::UpstreamDecode("unparseable body".into()),
             BridgeError::TokenExchangeDecode("unparseable token".into()),
             BridgeError::UpstreamInBand {
@@ -710,7 +709,6 @@ mod tests {
         let expected = [
             ("timeout", "timeout"),
             ("upstream_status", "upstream_error"),
-            ("transport", "transport_error"),
             ("upstream_decode", "upstream_decode_error"),
             ("upstream_decode", "upstream_decode_error"),
             ("upstream_in_band", "upstream_in_band_error"),
@@ -761,9 +759,7 @@ mod tests {
                 | BridgeError::UpstreamBodyUnread { .. }
                 | BridgeError::TokenExchangeDecode(_) => (true, "upstream_decode"),
                 BridgeError::UpstreamInBand { .. } => (true, "upstream_in_band"),
-                BridgeError::Transport(_) | BridgeError::UpstreamUpgradeRefused(_) => {
-                    (true, "transport")
-                }
+                BridgeError::Transport(_) => (true, "transport"),
                 BridgeError::StreamAborted => (true, "stream_aborted"),
                 BridgeError::Config(_) => (false, "config"),
                 // Raised by the `Bridge` default impl itself, so no request

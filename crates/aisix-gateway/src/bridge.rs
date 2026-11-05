@@ -474,11 +474,6 @@ pub enum BridgeError {
     InvalidUpstreamCredentials(String),
     #[error("transport error: {0}")]
     Transport(String),
-    /// A WebSocket upgrade the upstream answered with an HTTP error. Classed
-    /// with [`Transport`](Self::Transport), but the text is what the upstream
-    /// said, in the wording of an HTTP route's upstream failure.
-    #[error("{0}")]
-    UpstreamUpgradeRefused(String),
     #[error("upstream cancelled the response mid-stream")]
     StreamAborted,
 }
@@ -564,7 +559,7 @@ impl BridgeError {
                 status, message, ..
             } => format!("upstream returned HTTP {status}: {message}"),
             Self::UpstreamInBand { message, .. } => {
-                format!("{IN_BAND_STREAM_ERROR}: {message}")
+                format!("upstream reported an in-band stream error: {message}")
             }
             other => other.to_string(),
         }
@@ -581,34 +576,38 @@ fn upstream_status_display(status: u16, message: &str, diagnostic: Option<&str>)
     }
 }
 
-const IN_BAND_STREAM_ERROR: &str = "upstream reported an in-band stream error";
+/// Says nothing of a stream: a whole 2xx body reports a failure this way too.
+const IN_BAND_ERROR: &str = "upstream reported an in-band error";
 
 fn in_band_display(message: &str, parsed: Option<&UpstreamErrorView>) -> String {
     if !message.chars().all(|c| c.is_control() || c.is_whitespace()) {
-        return format!("{IN_BAND_STREAM_ERROR}: {message}");
+        return format!("{IN_BAND_ERROR}: {message}");
     }
     let named = parsed.and_then(|p| p.code.as_deref().or(p.kind.as_deref()));
     match named {
-        Some(name) => format!("{IN_BAND_STREAM_ERROR} with no message: {name}"),
-        None => format!("{IN_BAND_STREAM_ERROR} with no message"),
+        Some(name) => format!("{IN_BAND_ERROR} with no message: {name}"),
+        None => format!("{IN_BAND_ERROR} with no message"),
     }
 }
 
-/// Read a non-2xx answer a proxy route holds itself into an `UpstreamStatus`
-/// with no parsed envelope, `message` deriving its text from the body. A body
-/// that could not be read whole gives `message` nothing: these routes answer
-/// such a failure with the status fallback, not with a fragment.
-pub async fn upstream_status_from_response(
-    resp: reqwest::Response,
-    limit: usize,
-    message: impl FnOnce(&[u8]) -> String,
+/// Bound `read`, the read of a non-2xx body, by `deadline` on a path whose
+/// request-level deadline ended with the response head, as a streaming one's
+/// does: an upstream that stalls after its headers cannot hold the caller past
+/// the budget. Past it the status is still known, so the answer is that status
+/// with nothing read, the failure of a body cut off mid-read.
+pub async fn upstream_error_within(
+    deadline: Option<Duration>,
+    status: http::StatusCode,
+    read: impl std::future::Future<Output = BridgeError>,
 ) -> BridgeError {
-    let status = resp.status().as_u16();
-    let retry_after = parse_retry_after(resp.headers());
-    let body = read_body_capped(resp, limit).await;
-    let text = message(body.whole());
-    BridgeError::upstream_status_with_retry_after(status, text, retry_after)
-        .with_body_read_error(body.read_error)
+    let Some(d) = deadline else {
+        return read.await;
+    };
+    tokio::time::timeout(d, read).await.unwrap_or_else(|_| {
+        let reason = format!("timed out after {}ms", d.as_millis());
+        crate::response_tap::warn_error_body_unread(status.as_u16(), &reason);
+        BridgeError::upstream_status(status.as_u16(), "").with_body_read_error(Some(reason))
+    })
 }
 
 /// Read a non-2xx answer a proxy route holds itself into the
@@ -734,17 +733,25 @@ fn cap_error_view(mut v: UpstreamErrorView) -> UpstreamErrorView {
 /// [`MAX_UPSTREAM_ERROR_MESSAGE_BYTES`]. The caller receives it as the
 /// upstream wrote it.
 pub fn upstream_error_message(body: &[u8]) -> String {
-    let parsed: Option<serde_json::Value> = serde_json::from_slice(body).ok();
+    upstream_error_text(body).unwrap_or_else(|| {
+        truncate_lossy(
+            &String::from_utf8_lossy(body),
+            MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
+        )
+    })
+}
+
+/// The text [`upstream_error_message`] reads out of a JSON error body, when the
+/// body carries it in one of the shapes that function names.
+pub fn upstream_error_text(body: &[u8]) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
     let text = |v: Option<&serde_json::Value>| v.and_then(|m| m.as_str()).map(str::to_string);
-    let message = parsed.as_ref().and_then(|v| {
-        text(v.get("error").and_then(|e| e.get("message")))
-            .or_else(|| text(v.get("message")))
-            .or_else(|| text(v.get("error")))
-            .or_else(|| text(v.get("detail")))
-            .or_else(|| text(v.get("detail").and_then(|d| d.get("message"))))
-    });
-    let message = message.unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
-    truncate_lossy(&message, MAX_UPSTREAM_ERROR_MESSAGE_BYTES)
+    text(parsed.get("error").and_then(|e| e.get("message")))
+        .or_else(|| text(parsed.get("message")))
+        .or_else(|| text(parsed.get("error")))
+        .or_else(|| text(parsed.get("detail")))
+        .or_else(|| text(parsed.get("detail").and_then(|d| d.get("message"))))
+        .map(|message| truncate_lossy(&message, MAX_UPSTREAM_ERROR_MESSAGE_BYTES))
 }
 
 /// Whether a top-level `error` value reports a failure: a non-empty
@@ -1024,7 +1031,7 @@ impl BridgeError {
             BridgeError::InvalidUpstreamConfig(_) | BridgeError::InvalidRequest(_) => 400,
             BridgeError::RequestTooLarge { .. } => 413,
             BridgeError::InvalidUpstreamCredentials(_) => 401,
-            BridgeError::Transport(_) | BridgeError::UpstreamUpgradeRefused(_) => 502,
+            BridgeError::Transport(_) => 502,
             BridgeError::StreamAborted => 502,
         }
     }
@@ -1056,7 +1063,6 @@ impl BridgeError {
             | BridgeError::TokenExchangeDecode(_)
             | BridgeError::UpstreamInBand { .. }
             | BridgeError::Transport(_)
-            | BridgeError::UpstreamUpgradeRefused(_)
             | BridgeError::StreamAborted => true,
             BridgeError::Config(_)
             | BridgeError::UnsupportedCapability(_)
@@ -1081,7 +1087,7 @@ impl BridgeError {
             | BridgeError::InvalidRequest(_)
             | BridgeError::RequestTooLarge { .. } => "invalid_request_error",
             BridgeError::InvalidUpstreamCredentials(_) => "authentication_error",
-            BridgeError::Transport(_) | BridgeError::UpstreamUpgradeRefused(_) => "transport_error",
+            BridgeError::Transport(_) => "transport_error",
             BridgeError::StreamAborted => "stream_aborted",
         }
     }
@@ -1281,7 +1287,7 @@ mod tests {
             in_band(serde_json::json!({"error": {"message": "", "code": "overloaded"}}));
         assert_eq!(
             with_code.to_string(),
-            "upstream reported an in-band stream error with no message: overloaded"
+            "upstream reported an in-band error with no message: overloaded"
         );
         assert_eq!(
             with_code.stream_frame_message(),
@@ -1295,14 +1301,17 @@ mod tests {
         };
         assert_eq!(
             bare.to_string(),
-            "upstream reported an in-band stream error with no message"
+            "upstream reported an in-band error with no message"
         );
         let named = in_band(serde_json::json!({"error": {"message": "boom"}}));
         assert_eq!(
             named.to_string(),
+            "upstream reported an in-band error: boom"
+        );
+        assert_eq!(
+            named.stream_frame_message(),
             "upstream reported an in-band stream error: boom"
         );
-        assert_eq!(named.stream_frame_message(), named.to_string());
     }
 
     /// The wording of a blank message is the error's `Display`, and its

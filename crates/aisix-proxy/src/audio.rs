@@ -1568,7 +1568,12 @@ async fn multipart_dispatch(
                                 tracker,
                                 model_id,
                                 cooldown_cfg,
-                                aisix_provider_openai::held_route_http_error(resp).await,
+                                aisix_gateway::upstream_error_within(
+                                    connect_deadline,
+                                    status,
+                                    aisix_provider_openai::held_route_http_error(resp),
+                                )
+                                .await,
                             ));
                         }
 
@@ -2369,7 +2374,12 @@ async fn speech_dispatch(
                             tracker,
                             model_id,
                             cooldown_cfg,
-                            aisix_provider_openai::held_route_http_error(resp).await,
+                            aisix_gateway::upstream_error_within(
+                                stream_budget,
+                                status,
+                                aisix_provider_openai::held_route_http_error(resp),
+                            )
+                            .await,
                         ));
                     }
                     Ok(resp)

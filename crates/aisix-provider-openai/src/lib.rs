@@ -18,5 +18,6 @@ pub mod reasoning;
 pub mod wire;
 
 pub use bridge::{
-    close_strict_response_format_schema, held_route_http_error, OpenAiBridge, OPENAI_DEFAULT_BASE,
+    close_strict_response_format_schema, held_route_http_error, parse_openai_error_envelope,
+    OpenAiBridge, OPENAI_DEFAULT_BASE,
 };

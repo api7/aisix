@@ -993,13 +993,15 @@ fn nonempty_str(v: Option<&serde_json::Value>) -> Option<&str> {
 
 /// Best-effort extraction of a vendor error envelope's message from a
 /// non-2xx upstream body. DashScope puts `{code, message}` at the top level;
-/// the OpenAI-style vendors nest `{error: {code, message}}`. Falls back to a
-/// generic marker for non-JSON or fieldless bodies so a typed error is always
-/// producible. Shared by the JSON task calls ([`provider_call`]) and the
+/// the OpenAI-style vendors nest `{error: {code, message}}`; any other shape the
+/// shared reader knows reads as it does on the row. Falls back to a generic
+/// marker for non-JSON or fieldless bodies so a typed error is always producible. Shared by the JSON task calls ([`provider_call`]) and the
 /// content-proxy path ([`proxy_content`]) — both must map a non-2xx upstream
 /// to a typed error rather than surfacing the raw body.
 fn parse_provider_error_message(bytes: &[u8]) -> String {
-    vendor_error_message(bytes).unwrap_or_else(|| "upstream error".to_string())
+    vendor_error_message(bytes)
+        .or_else(|| aisix_gateway::upstream_error_text(bytes).filter(|text| !text.is_empty()))
+        .unwrap_or_else(|| "upstream error".to_string())
 }
 
 /// The typed error of a non-2xx: the caller reads

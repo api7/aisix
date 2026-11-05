@@ -3,6 +3,7 @@ import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { WebSocket } from "ws";
 import {
+  AdminClient,
   EtcdClient,
   SeedClient,
   spawnApp,
@@ -38,6 +39,7 @@ describe("an upstream's failure reads the same on every route that sends its own
   let sls: MockSls | undefined;
   let etcdReachable = false;
   const servers: Server[] = [];
+  let cooldownModelIds: Record<string, string> = {};
 
   async function fixedUpstream(status: number, body: string): Promise<string> {
     const server = createServer((req, res) => {
@@ -106,6 +108,33 @@ describe("an upstream's failure reads the same on every route that sends its own
         provider_key_id: pkId,
       });
     }
+    const cooledModels: Record<string, string> = {};
+    for (const status of [400, 503]) {
+      const pk = await seed.createProviderKey({
+        display_name: `realtime-cooldown-${status}-pk`,
+        secret: "sk-mock",
+        provider: "openai",
+        api_base: `${await fixedUpstream(status, openAiEnvelope(status))}/v1`,
+      });
+      const name = `realtime-cooldown-${status}`;
+      cooledModels[name] = (
+        await seed.createModel({
+          display_name: name,
+          provider: "openai",
+          model_name: "m",
+          provider_key_id: pk.id,
+          cooldown: { enabled: true },
+        })
+      ).id;
+      names.push(name);
+    }
+    cooldownModelIds = cooledModels;
+    const padded = JSON.stringify({
+      error: { message: `${TEXT} padded`, code: "padded_code" },
+      padding: "x".repeat(100 * 1024),
+    });
+    await model("openai-past-the-cap", "openai", `${await fixedUpstream(400, padded)}/v1`);
+    names.push("openai-past-the-cap");
     await model(
       "cohere-top-level",
       "cohere",
@@ -126,6 +155,7 @@ describe("an upstream's failure reads the same on every route that sends its own
       ["top-level", { message: `${TEXT} other shape` }],
       ["string", { error: `${TEXT} other shape` }],
       ["detail", { detail: `${TEXT} other shape` }],
+      ["detail-object", { detail: { message: `${TEXT} other shape` } }],
     ] as const) {
       const base = await fixedUpstream(400, JSON.stringify(body));
       await model(`openai-${shape}`, "openai", `${base}/v1`);
@@ -170,17 +200,33 @@ describe("an upstream's failure reads the same on every route that sends its own
     };
   }
 
+  const finalRow = (requestId: string, what: string) =>
+    waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (l) => l.get("request_id") === requestId && l.get("is_final_attempt") === "true",
+      what,
+    );
   const rowMessage = async (requestId: string, what: string) =>
-    (
-      await waitForSlsLog(
-        sls!,
-        LOGSTORE,
-        (l) => l.get("request_id") === requestId && l.get("is_final_attempt") === "true",
-        what,
-      )
-    ).get("error_message");
+    (await finalRow(requestId, what)).get("error_message");
 
+  const refusedHandshake = (model: string) =>
+    new Promise<string>((resolve, reject) => {
+      const ws = new WebSocket(
+        `${app!.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=${model}`,
+        { headers: { authorization: `Bearer ${CALLER}` } },
+      );
+      let id = "";
+      ws.on("upgrade", (res) => {
+        id = String(res.headers["x-aisix-request-id"] ?? "");
+      });
+      ws.on("close", () => resolve(id));
+      ws.on("error", reject);
+    });
+
+  const DECISION_QUESTIONS = [{ type: "predicate", name: "q", instructions: "i" }];
   const ROUTES: [string, string, (model: string) => RequestInit, "openai" | "cohere"][] = [
+    ["decisions", "/v1/decisions", (model) => json({ model, input: "hi", questions: DECISION_QUESTIONS }), "openai"],
     ["rerank", "/v1/rerank", (model) => json({ model, query: "q", documents: ["a"] }), "openai"],
     ["cohere rerank", "/v1/rerank", (model) => json({ model, query: "q", documents: ["a"] }), "cohere"],
     ["speech", "/v1/audio/speech", (model) => json({ model, input: "hi", voice: "alloy" }), "openai"],
@@ -224,23 +270,33 @@ describe("an upstream's failure reads the same on every route that sends its own
       );
     });
 
-    test("a realtime handshake records the upstream's text", async () => {
+    test("a realtime handshake records the upstream's text and status class", async () => {
       if (!etcdReachable) return;
-      const requestId = await new Promise<string>((resolve, reject) => {
-        const ws = new WebSocket(
-          `${app!.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=openai-${upstream}`,
-          { headers: { authorization: `Bearer ${CALLER}` } },
-        );
-        let id = "";
-        ws.on("upgrade", (res) => {
-          id = String(res.headers["x-aisix-request-id"] ?? "");
-        });
-        ws.on("close", () => resolve(id));
-        ws.on("error", reject);
-      });
-      expect(await rowMessage(requestId, "the realtime row")).toBe(
-        `upstream returned HTTP ${upstream}: ${TEXT} ${upstream}`,
-      );
+      const requestId = await refusedHandshake(`openai-${upstream}`);
+      const row = await finalRow(requestId, "the realtime row");
+      expect(row.get("error_message")).toBe(`upstream returned HTTP ${upstream}: ${TEXT} ${upstream}`);
+      expect(row.get("error_class")).toBe("upstream_status");
+    });
+  });
+
+  describe("a refused realtime handshake cools its model down as any upstream status does", () => {
+    const status = async (name: string) => {
+      const rows = await new AdminClient(app!.adminUrl, app!.adminKey, app!.metricsUrl).listModelStatuses();
+      return rows.find((row) => row.id === cooldownModelIds[name])!;
+    };
+
+    test("a status on the trigger list cools it down, named for the status", async () => {
+      if (!etcdReachable) return;
+      await refusedHandshake("realtime-cooldown-503");
+      const row = await status("realtime-cooldown-503");
+      expect(row.status).toBe("cooldown");
+      expect(row.status_reason).toBe("upstream_server_error");
+    });
+
+    test("a status off the trigger list does not", async () => {
+      if (!etcdReachable) return;
+      await refusedHandshake("realtime-cooldown-400");
+      expect((await status("realtime-cooldown-400")).status).not.toBe("cooldown");
     });
   });
 
@@ -254,7 +310,7 @@ describe("an upstream's failure reads the same on every route that sends its own
   });
 
   const messages = [{ role: "user", content: "hi" }];
-  describe.each(["top-level", "string", "detail"])("a body with a %s message", (shape) => {
+  describe.each(["top-level", "string", "detail", "detail-object"])("a body with a %s message", (shape) => {
     test.each([
       ["chat", "/v1/chat/completions", "openai", { messages }],
       ["chat to anthropic", "/v1/chat/completions", "anthropic", { messages }],
@@ -268,12 +324,8 @@ describe("an upstream's failure reads the same on every route that sends its own
       ["native responses", "/v1/responses", "openai", { input: "hi" }],
       ["rerank", "/v1/rerank", "openai", { query: "q", documents: ["a"] }],
       ["speech", "/v1/audio/speech", "openai", { input: "hi", voice: "alloy" }],
-      [
-        "decisions",
-        "/v1/decisions",
-        "openai",
-        { input: "hi", questions: [{ type: "predicate", name: "q", instructions: "i" }] },
-      ],
+      ["videos", "/v1/videos", "openai", { prompt: "hi" }],
+      ["decisions", "/v1/decisions", "openai", { input: "hi", questions: DECISION_QUESTIONS }],
     ] as const)("%s reads its text", async (_what, path, provider, payload) => {
       if (!etcdReachable) return;
       const got = await send(path, json({ model: `${provider}-${shape}`, ...payload }));
@@ -282,6 +334,23 @@ describe("an upstream's failure reads the same on every route that sends its own
         `upstream returned HTTP 400: ${TEXT} other shape`,
       );
     });
+  });
+
+  test("decisions: a body past the error-body cap answers what chat answers", async () => {
+    if (!etcdReachable) return;
+    const chat = await send(
+      "/v1/chat/completions",
+      json({ model: "openai-past-the-cap", messages }),
+    );
+    const got = await send(
+      "/v1/decisions",
+      json({ model: "openai-past-the-cap", input: "hi", questions: DECISION_QUESTIONS }),
+    );
+    expect(got.status).toBe(chat.status);
+    expect(got.body).toEqual(chat.body);
+    expect(await rowMessage(got.requestId, "the capped row")).toBe(
+      await rowMessage(chat.requestId, "chat's capped row"),
+    );
   });
 
   test("videos: a vendor's bare code stays in the row", async () => {

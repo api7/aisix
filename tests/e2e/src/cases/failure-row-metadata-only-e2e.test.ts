@@ -399,7 +399,7 @@ describe("failure rows name the failure under metadata_only", () => {
     });
     const row = await rowOf(requestId, "the realtime row");
     expect(row.get("status_code")).toBe("502");
-    expect(row.get("error_class")).toBe("transport");
+    expect(row.get("error_class")).toBe("upstream_status");
     return row;
   }
 
@@ -432,7 +432,7 @@ describe("failure rows name the failure under metadata_only", () => {
     const row = await rowOf(r.requestId, "the blank in-band row");
     expect(row.get("error_class")).toBe("upstream_in_band");
     expect(row.get("error_message")).toBe(
-      "upstream reported an in-band stream error with no message: overloaded",
+      "upstream reported an in-band error with no message: overloaded",
     );
   });
 
@@ -448,7 +448,7 @@ describe("failure rows name the failure under metadata_only", () => {
     expect(r.text).not.toContain("with no message");
     const row = await rowOf(r.requestId, "the mid-stream in-band row");
     expect(row.get("error_message")).toBe(
-      "upstream reported an in-band stream error with no message: overloaded",
+      "upstream reported an in-band error with no message: overloaded",
     );
   });
 

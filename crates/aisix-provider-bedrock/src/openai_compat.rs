@@ -443,8 +443,14 @@ async fn send(
     })
     .await?;
     aisix_gateway::note_upstream_response(resp.headers());
-    if !resp.status().is_success() {
-        return Err(http_error(resp, started).await);
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(aisix_gateway::upstream_error_within(
+            deadline,
+            status,
+            http_error(resp, started),
+        )
+        .await);
     }
     Ok((resp, started, deadline))
 }

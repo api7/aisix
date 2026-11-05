@@ -169,14 +169,23 @@ fn connect_failure(err: &tokio_tungstenite::tungstenite::Error) -> aisix_gateway
     match err {
         tokio_tungstenite::tungstenite::Error::Http(response) => {
             let status = response.status().as_u16();
-            aisix_gateway::BridgeError::UpstreamUpgradeRefused(
-                match complete_handshake_body(response) {
-                    Some(body) => crate::attempt::relayed_failure(status, &body).1,
-                    None => {
-                        format!("upstream returned HTTP {status} during the realtime handshake")
-                    }
-                },
-            )
+            let (message, diagnostic) = match complete_handshake_body(response) {
+                Some(body) => (aisix_gateway::upstream_error_message(&body), None),
+                None => (
+                    String::new(),
+                    Some(format!(
+                        "upstream returned HTTP {status} during the realtime handshake"
+                    )),
+                ),
+            };
+            aisix_gateway::BridgeError::UpstreamStatus {
+                status,
+                message,
+                parsed: None,
+                wire: aisix_gateway::UpstreamWire::Unknown,
+                retry_after: aisix_gateway::parse_retry_after(response.headers()),
+                diagnostic,
+            }
         }
         other => aisix_gateway::BridgeError::Transport(aisix_gateway::error_with_causes(other)),
     }
