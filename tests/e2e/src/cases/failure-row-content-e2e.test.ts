@@ -851,11 +851,11 @@ describe("failure rows carry request and response bodies", () => {
   });
 
   test.each([
-    ["a non-JSON body", "row-video-text", 502, "upstream error", "upstream returned HTTP 500: sentinel video gateway page"],
-    ["an empty body", "row-video-empty", 502, "upstream error", NO_DETAIL(500)],
-    ["a vendor envelope", "row-video-json", 400, "bad: sentinel-video", "upstream returned HTTP 400: sentinel-video"],
+    ["a non-JSON body", "row-video-text", 502, "sentinel video gateway page", "upstream returned HTTP 500: sentinel video gateway page"],
+    ["an empty body", "row-video-empty", 502, "upstream returned 500 Internal Server Error", NO_DETAIL(500)],
+    ["a vendor envelope", "row-video-json", 400, "sentinel-video", "upstream returned HTTP 400: sentinel-video"],
   ] as const)(
-    "videos: %s keeps the caller answer; the row reports what the upstream said",
+    "videos: %s reaches the caller as text; the row reports what the upstream said",
     async (_what, model, status, clientText, rowMessage) => {
       if (!etcdReachable) return;
       const res = await post("/v1/videos", { model, prompt: "video-fail-prompt" });

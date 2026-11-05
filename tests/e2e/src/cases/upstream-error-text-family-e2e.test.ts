@@ -162,6 +162,25 @@ describe("an upstream's failure reads the same on every route that sends its own
       ).id;
       names.push(name);
     }
+    {
+      const pk = await seed.createProviderKey({
+        display_name: "video-cooldown-retry-after-pk",
+        secret: "sk-mock",
+        provider: "openai",
+        api_base: `${await fixedUpstream(429, openAiEnvelope(429), { "retry-after": "180" })}/v1`,
+      });
+      const name = "video-cooldown-retry-after";
+      cooledModels[name] = (
+        await seed.createModel({
+          display_name: name,
+          provider: "openai",
+          model_name: "m",
+          provider_key_id: pk.id,
+          cooldown: { enabled: true },
+        })
+      ).id;
+      names.push(name);
+    }
     cooldownModelIds = cooledModels;
     for (const status of [401, 429]) {
       const name = `openai-${status}`;
@@ -215,7 +234,17 @@ describe("an upstream's failure reads the same on every route that sends its own
       "alibaba",
       await fixedUpstream(500, JSON.stringify({ code: "InternalError", message: `${TEXT} dashscope` })),
     );
-    names.push("alibaba-top-level", "alibaba-top-level-500");
+    await model(
+      "video-numeric-code",
+      "openai",
+      `${await fixedUpstream(400, JSON.stringify({ code: 400, message: `${TEXT} numeric` }))}/v1`,
+    );
+    await model(
+      "video-code-no-message",
+      "openai",
+      `${await fixedUpstream(400, JSON.stringify({ code: "vendor_code" }))}/v1`,
+    );
+    names.push("alibaba-top-level", "alibaba-top-level-500", "video-numeric-code", "video-code-no-message");
     for (const leg of ["poll", "content"] as const) {
       for (const [shape, failure] of [
         ["envelope", { status: 400, body: openAiEnvelope(400) }],
@@ -619,6 +648,24 @@ describe("an upstream's failure reads the same on every route that sends its own
       expect(got.body.error).toEqual({ message: `${TEXT} dashscope`, type: "upstream_error" });
     });
 
+    test("a number at the top level is no vendor code", async () => {
+      if (!etcdReachable) return;
+      const chat = await chatOn("video-numeric-code");
+      const got = await submit("video-numeric-code");
+      expect(got.body.error).toEqual({ message: `${TEXT} numeric`, type: "upstream_error" });
+      expect(got.body).toEqual(chat.body);
+    });
+
+    test("a code with no message key carries the code and the body as text", async () => {
+      if (!etcdReachable) return;
+      const got = await submit("video-code-no-message");
+      expect(got.body.error).toEqual({
+        message: JSON.stringify({ code: "vendor_code" }),
+        type: "upstream_error",
+        code: "vendor_code",
+      });
+    });
+
     test.each([
       ["a page that is no JSON on a 4xx", "openai-html-400"],
       ["a page that is no JSON on a 5xx", "openai-html-503"],
@@ -651,6 +698,27 @@ describe("an upstream's failure reads the same on every route that sends its own
       expect(chat.headers.get("retry-after")).toBe("7");
       expect(got.headers.get("retry-after")).toBe("7");
       expect(await got.json()).toEqual(await chat.json());
+    });
+
+    test("an upstream's Retry-After sets the model's cooldown", async () => {
+      if (!etcdReachable) return;
+      const before = Date.now() / 1000;
+      const got = await submit("video-cooldown-retry-after");
+      expect(got.status).toBe(429);
+      const rows = await new AdminClient(app!.adminUrl, app!.adminKey, app!.metricsUrl).listModelStatuses();
+      const row = rows.find((r) => r.id === cooldownModelIds["video-cooldown-retry-after"])!;
+      expect(row.status).toBe("cooldown");
+      const until = row.cooldown_until as unknown as { secs_since_epoch: number };
+      expect(until.secs_since_epoch - before).toBeGreaterThan(120);
+    });
+
+    test("a body past the error-body cap is not parsed", async () => {
+      if (!etcdReachable) return;
+      const got = await submit("openai-past-the-cap");
+      expect(got.status).toBe(400);
+      expect(got.body.error.code).toBeUndefined();
+      expect(got.body.error.message).toEqual(expect.stringMatching(/^\{"error":/));
+      expect(Buffer.byteLength(String(got.body.error.message))).toBeLessThanOrEqual(1024 + 3);
     });
 
     describe.each(["poll", "content"] as const)("the %s route of a task that exists", (leg) => {

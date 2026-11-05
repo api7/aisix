@@ -992,23 +992,17 @@ fn nonempty_str(v: Option<&serde_json::Value>) -> Option<&str> {
 }
 
 /// The envelope of a non-2xx: OpenAI's, or the top-level `{code, message}`
-/// DashScope answers with instead. Any other shape's text is the shared
-/// reader's, and carries no code.
+/// DashScope answers with instead. A top-level `code` counts only as a string:
+/// a number there is as often an HTTP status or a success sentinel. Any other
+/// shape's text is the shared reader's, and carries no code.
 fn video_error_view(body: &[u8]) -> Option<aisix_gateway::UpstreamErrorView> {
-    fn text(v: Option<&serde_json::Value>) -> Option<String> {
-        match v? {
-            serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            _ => None,
-        }
-    }
     if let Some(view) = aisix_provider_openai::parse_openai_error_envelope(body) {
         return Some(view);
     }
     let top: serde_json::Value = serde_json::from_slice(body).ok()?;
     Some(aisix_gateway::UpstreamErrorView {
-        code: Some(text(top.get("code"))?),
-        param: text(top.get("param")),
+        code: Some(nonempty_str(top.get("code"))?.to_string()),
+        param: nonempty_str(top.get("param")).map(str::to_string),
         ..Default::default()
     })
 }
@@ -1031,9 +1025,15 @@ fn provider_status_error(
         video_error_view,
     );
     let has_text = aisix_gateway::upstream_error_text(body).is_some_and(|t| !t.trim().is_empty());
-    match video_error_view(body).and_then(|view| view.code) {
-        Some(code) if !has_text => err.with_telemetry_detail(&code),
-        _ => err,
+    let code = match &err {
+        aisix_gateway::BridgeError::UpstreamStatus {
+            parsed: Some(view), ..
+        } if !has_text => view.code.clone(),
+        _ => None,
+    };
+    match code {
+        Some(code) => err.with_telemetry_detail(&code),
+        None => err,
     }
 }
 
@@ -1236,10 +1236,8 @@ fn retry_permit(method: &reqwest::Method, e: &aisix_gateway::BridgeError) -> boo
 /// One provider HTTP round-trip: Bearer auth (all three vendors),
 /// provider-specific submit headers, the given E2E timeout, cooldown
 /// accounting on transport failures (parity with jobs / passthrough,
-/// #701). Non-2xx responses map to `BridgeError::UpstreamStatus`
-/// carrying the upstream `message` (4xx pass through the standard
-/// envelope; 5xx bodies are redacted by the shared renderer in
-/// error.rs). `note` stays per attempt (see rerank.rs).
+/// #701). Non-2xx responses map to `BridgeError::UpstreamStatus` through
+/// [`provider_status_error`]. `note` stays per attempt (see rerank.rs).
 fn provider_call_once<'a>(
     state: &'a ProxyState,
     target: &'a VideoTarget,
@@ -1431,27 +1429,20 @@ async fn proxy_content(
     if !status.is_success() {
         // Status checked BEFORE any body is constructed: an expired /
         // not-ready content URL must surface as a typed error envelope, never
-        // as a truncated `video/mp4` stream. Bound the read of the error body
-        // by the same per-request budget so a non-2xx upstream that then
-        // stalls it cannot hang the handler (the success path is already
-        // bounded per-chunk; this closes the error branch).
-        let code = status.as_u16();
-        let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-        let read =
-            aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES);
-        let body = match stream_budget {
-            Some(d) => tokio::time::timeout(d, read).await.unwrap_or_else(|_| {
-                let reason = format!("timed out after {}ms", d.as_millis());
-                aisix_gateway::warn_error_body_unread(code, &reason);
-                aisix_gateway::UpstreamErrorBody {
-                    bytes: bytes::Bytes::new(),
-                    read_error: Some(reason),
-                }
-            }),
-            None => read.await,
-        };
-        let err = provider_status_error(code, body.whole(), retry_after)
-            .with_body_read_error(body.read_error);
+        // as a truncated `video/mp4` stream. The read is bounded by the same
+        // per-request budget so a non-2xx upstream that then stalls its error
+        // body cannot hang the handler (the success path is already bounded
+        // per-chunk; this closes the error branch).
+        let err = aisix_gateway::upstream_error_within(stream_budget, resp, |resp| async move {
+            let code = resp.status().as_u16();
+            let retry_after = aisix_gateway::parse_retry_after(resp.headers());
+            let body =
+                aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES)
+                    .await;
+            provider_status_error(code, body.whole(), retry_after)
+                .with_body_read_error(body.read_error)
+        })
+        .await;
         return Err(ProxyError::Bridge(note(err)));
     }
 
@@ -3316,6 +3307,24 @@ mod tests {
                     .unwrap();
             assert_eq!(poll.status(), StatusCode::OK);
         }
+    }
+
+    #[test]
+    fn a_vendors_bare_code_reaches_the_row_capped() {
+        let long = "x".repeat(5000);
+        let body = serde_json::json!({"code": long, "message": ""}).to_string();
+        let row = provider_status_error(400, body.as_bytes(), None).to_string();
+        assert!(row.contains("xxx"), "{row}");
+        assert!(
+            row.len() <= aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES + 64,
+            "{} bytes",
+            row.len()
+        );
+    }
+
+    #[test]
+    fn a_number_at_the_top_level_is_no_vendor_code() {
+        assert_eq!(video_error_view(br#"{"code":400,"message":"m"}"#), None);
     }
 
     #[tokio::test]
