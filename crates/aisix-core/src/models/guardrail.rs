@@ -973,7 +973,11 @@ pub struct SemanticConfig {
 /// alongside its example list, so nothing an operator saves today lands
 /// here — this exists for rows written before that requirement, which
 /// enforce 0.75 and must go on enforcing it until the control plane's
-/// backfill rewrites them. Retire it once no unmigrated row remains.
+/// backfill rewrites them. The value can go in the release that re-runs that
+/// backfill with the floor past the last control plane that accepted a
+/// populated example list without its threshold (v0.13.0; v1.0.0 requires it).
+/// The field stays defaulted, because a direction with no example list still
+/// omits its key.
 fn default_semantic_threshold() -> f32 {
     0.75
 }

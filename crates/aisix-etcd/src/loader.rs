@@ -1512,7 +1512,7 @@ mod tests {
     //
     // provider_key `secret`→`api_key` and mcp_server / a2a_agent
     // `display_name`→`name`: documents written under the former names
-    // (existing etcd data, current control-plane writes) and documents
+    // (existing etcd data a control plane left before 1.8.0) and documents
     // written under the canonical names must BOTH pass this loader's
     // schema gate and serde parse. A regression here silently drops
     // resources from the snapshot in managed mode.

@@ -5549,7 +5549,7 @@ mod tests {
     //
     // provider_key `secret`→`api_key` and mcp_server / a2a_agent
     // `display_name`→`name`: the generated schema must accept both
-    // spellings (stored documents and current control-plane writes still
+    // spellings (documents a control plane wrote before 1.8.0 can still
     // carry the former names), require at least one, and keep rejecting
     // unknown fields. A document carrying both spellings passes the
     // schema and is rejected by serde's duplicate-field check — that
