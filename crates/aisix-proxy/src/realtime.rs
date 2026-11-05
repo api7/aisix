@@ -196,7 +196,11 @@ fn connect_failure(err: &tokio_tungstenite::tungstenite::Error) -> aisix_gateway
 /// that is no upgrade, is still a failure and must not read as a success.
 fn recorded_connect_status(err: &aisix_gateway::BridgeError) -> u16 {
     match err {
-        aisix_gateway::BridgeError::UpstreamStatus { status, .. } if *status >= 400 => *status,
+        aisix_gateway::BridgeError::UpstreamStatus { status, .. }
+            if (400..=599).contains(status) =>
+        {
+            *status
+        }
         _ => 502,
     }
 }

@@ -646,6 +646,7 @@ fn upstream_status_of_body(
     let message = parsed
         .as_ref()
         .and_then(|v| v.message.clone())
+        .filter(|message| !message.trim().is_empty())
         .unwrap_or_else(|| upstream_error_message(body));
     BridgeError::UpstreamStatus {
         status,

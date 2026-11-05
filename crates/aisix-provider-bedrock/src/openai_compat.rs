@@ -327,7 +327,12 @@ async fn http_error(resp: reqwest::Response, started: Instant) -> BridgeError {
         read_error,
     } = aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
     let parsed: Option<Value> = serde_json::from_slice(&body).ok();
-    let field = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    let field = |v: &Value, k: &str| {
+        v.get(k)
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_string)
+    };
     let error_obj = parsed
         .as_ref()
         .and_then(|v| v.get("error"))

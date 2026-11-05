@@ -163,6 +163,7 @@ describe("an upstream's failure reads the same on every route that sends its own
       ["string", { error: `${TEXT} other shape` }],
       ["detail", { detail: `${TEXT} other shape` }],
       ["detail-object", { detail: { message: `${TEXT} other shape` } }],
+      ["blank-envelope", { error: { message: "" }, detail: `${TEXT} other shape` }],
     ] as const) {
       const base = await fixedUpstream(400, JSON.stringify(body));
       await model(`openai-${shape}`, "openai", `${base}/v1`);
@@ -303,7 +304,7 @@ describe("an upstream's failure reads the same on every route that sends its own
       "the realtime access-log line",
     );
     const metrics = await scrapeMetrics(app!.metricsUrl);
-    expect(sumMetric(metrics, "aisix_proxy_requests_total", { model, status: String(upstream) })).toBeGreaterThan(0);
+    expect(sumMetric(metrics, "aisix_proxy_requests_total", { endpoint: "/v1/realtime", status: String(upstream) })).toBeGreaterThan(0);
     expect(sumMetric(metrics, "aisix_requests_total", { model, status: String(upstream), outcome })).toBeGreaterThan(0);
   });
 
@@ -338,7 +339,7 @@ describe("an upstream's failure reads the same on every route that sends its own
   });
 
   const messages = [{ role: "user", content: "hi" }];
-  describe.each(["top-level", "string", "detail", "detail-object"])("a body with a %s message", (shape) => {
+  describe.each(["top-level", "string", "detail", "detail-object", "blank-envelope"])("a body with a %s message", (shape) => {
     test.each([
       ["chat", "/v1/chat/completions", "openai", { messages }],
       ["chat to anthropic", "/v1/chat/completions", "anthropic", { messages }],

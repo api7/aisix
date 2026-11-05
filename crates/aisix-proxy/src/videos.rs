@@ -1023,12 +1023,16 @@ fn provider_error_detail(bytes: &[u8]) -> String {
 }
 
 fn vendor_error_message(bytes: &[u8]) -> Option<String> {
-    match vendor_error_fields(bytes) {
-        (Some(code), Some(msg)) => Some(format!("{code}: {msg}")),
-        (None, Some(msg)) => Some(msg),
-        (Some(code), None) => Some(code),
-        (None, None) => None,
-    }
+    let text = match vendor_error_fields(bytes) {
+        (Some(code), Some(msg)) => format!("{code}: {msg}"),
+        (None, Some(msg)) => msg,
+        (Some(code), None) => code,
+        (None, None) => return None,
+    };
+    Some(aisix_gateway::truncate_lossy(
+        &text,
+        aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
+    ))
 }
 
 fn vendor_error_fields(bytes: &[u8]) -> (Option<String>, Option<String>) {
@@ -1036,12 +1040,9 @@ fn vendor_error_fields(bytes: &[u8]) -> (Option<String>, Option<String>) {
         return (None, None);
     };
     let scope = p.get("error").unwrap_or(&p);
-    let capped = |text: &str| {
-        aisix_gateway::truncate_lossy(text, aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES)
-    };
     (
-        nonempty_str(scope.get("code")).map(capped),
-        nonempty_str(scope.get("message")).map(capped),
+        nonempty_str(scope.get("code")).map(str::to_string),
+        nonempty_str(scope.get("message")).map(str::to_string),
     )
 }
 
@@ -3325,9 +3326,14 @@ mod tests {
 
     #[test]
     fn a_vendors_error_text_reaches_the_caller_capped() {
-        let body = serde_json::json!({"error": {"message": "x".repeat(5000)}}).to_string();
+        let long = "x".repeat(5000);
+        let body = serde_json::json!({"error": {"code": long, "message": long}}).to_string();
         let text = parse_provider_error_message(body.as_bytes());
-        assert!(text.len() < 2000, "{} bytes", text.len());
+        assert!(
+            text.len() <= aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES + "…".len(),
+            "{} bytes",
+            text.len()
+        );
     }
 
     #[tokio::test]
