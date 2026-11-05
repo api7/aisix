@@ -325,6 +325,8 @@ describe("an upstream's failure reads the same on every route that sends its own
       ["refused-429", 429, openAiEnvelope(429)],
       ["refused-500", 500, openAiEnvelope(500)],
       ["refused-500-empty", 500, ""],
+      ["refused-200-empty", 200, ""],
+      ["refused-302-empty", 302, ""],
       ["refused-200-body", 200, `${TEXT} not an upgrade`],
       ["refused-200-long", 200, "x".repeat(2048)],
     ] as const) {
@@ -533,7 +535,21 @@ describe("an upstream's failure reads the same on every route that sends its own
         { type: "upstream_error", message: "upstream returned 500 Internal Server Error" },
         502,
         "upstream_status",
-        "upstream returned HTTP 500 during the realtime handshake",
+        "upstream returned HTTP 500 with no error detail in the response",
+      ],
+      [
+        "refused-200-empty",
+        { type: "upstream_error", message: "upstream returned 200 OK" },
+        502,
+        "upstream_status",
+        "upstream returned HTTP 200 during the realtime handshake",
+      ],
+      [
+        "refused-302-empty",
+        { type: "upstream_error", message: "upstream returned 302 Found" },
+        502,
+        "upstream_status",
+        "upstream returned HTTP 302 during the realtime handshake",
       ],
       [
         "refused-200-body",
@@ -559,6 +575,20 @@ describe("an upstream's failure reads the same on every route that sends its own
       expect(row.get("status_code")).toBe(String(status));
       expect(row.get("error_class")).toBe(errorClass);
       expect(row.get("error_message")).toBe(rowText);
+    });
+
+    test("an empty error body reads on the row as chat's does", async () => {
+      if (!etcdReachable) return;
+      const chat = await send(
+        "/v1/chat/completions",
+        json({ model: "refused-500-empty", messages: [{ role: "user", content: "hi" }] }),
+      );
+      const got = await refusal("refused-500-empty");
+      expect((got.frames[0] as { error: unknown }).error).toEqual(chat.body.error);
+      const realtimeRow = await finalRow(got.requestId, "the realtime row");
+      const chatRow = await finalRow(chat.requestId, "the chat row");
+      expect(realtimeRow.get("error_message")).toBe(chatRow.get("error_message"));
+      expect(JSON.parse(realtimeRow.get("response")!).error.message).toBe(chatRow.get("error_message"));
     });
 
     test("a body that is no error is quoted within the usual bound", async () => {
