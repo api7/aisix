@@ -917,7 +917,7 @@ describe("an upstream's failure reads the same on every route that sends its own
       expect(Buffer.byteLength(String(got.body.error.message))).toBeLessThanOrEqual(1024 + 3);
     });
 
-    test("a body far past the error-body cap is not held in memory", async () => {
+    test.skipIf(process.platform !== "linux")("a body far past the error-body cap is not held in memory", async () => {
       if (!etcdReachable) return;
       const before = await peakRssBytes(app!.pid);
       const got = await submit("video-huge-body");

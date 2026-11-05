@@ -730,7 +730,7 @@ pub fn upstream_error_message(body: &[u8]) -> String {
 
 /// The text [`upstream_error_message`] reads out of a JSON error body, when the
 /// body carries it in one of the shapes that function names.
-pub fn upstream_error_text(body: &[u8]) -> Option<String> {
+fn upstream_error_text(body: &[u8]) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
     let fields = [
         parsed.get("error").and_then(|e| e.get("message")),
