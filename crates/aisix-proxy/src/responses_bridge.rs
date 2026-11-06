@@ -260,9 +260,10 @@ fn append_input_item(messages: &mut Vec<ChatMessage>, item: &Value) {
     }
 }
 
-/// The chat name a replayed call goes back under: a call to a namespace
-/// sub-tool carries its `namespace`, and the model was offered that
-/// sub-tool under the flattened name (see [`namespace_chat_tool_name`]).
+/// The chat name a replayed call or a `tool_choice` names a tool by: one
+/// naming a namespace sub-tool carries its `namespace`, and the model was
+/// offered that sub-tool under the flattened name (see
+/// [`namespace_chat_tool_name`]).
 fn qualified_tool_name(item: &Value, name: &str) -> String {
     match item
         .get("namespace")
@@ -1040,16 +1041,7 @@ fn responses_tool_choice_to_chat(tc: &Value) -> Option<Value> {
         Value::String(s) => Some(Value::String(s.clone())),
         Value::Object(o) => match o.get("type").and_then(|v| v.as_str())? {
             "function" | "custom" | "tool" => {
-                let name = o.get("name").and_then(|v| v.as_str())?;
-                // A namespace sub-tool was offered under its flattened name.
-                let name = match o
-                    .get("namespace")
-                    .and_then(Value::as_str)
-                    .filter(|ns| !ns.is_empty())
-                {
-                    Some(namespace) => namespace_chat_tool_name(namespace, name),
-                    None => name.to_string(),
-                };
+                let name = qualified_tool_name(tc, o.get("name").and_then(|v| v.as_str())?);
                 Some(json!({"type": "function", "function": {"name": name}}))
             }
             "any" => Some(Value::String("required".to_string())),
