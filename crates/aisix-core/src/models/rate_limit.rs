@@ -203,4 +203,34 @@ mod tests {
         let rl: RateLimit = serde_json::from_str(r#"{"rpm": 10, "extra": 1}"#).unwrap();
         assert_eq!(rl.rpm, Some(10));
     }
+
+    #[test]
+    fn window_type_defaults_to_fixed_and_serialises_only_when_sliding() {
+        let rl: RateLimit = serde_json::from_str(r#"{"rpm": 10}"#).unwrap();
+        assert_eq!(rl.window_type, RateLimitWindowType::Fixed);
+        assert!(serde_json::to_value(&rl)
+            .unwrap()
+            .get("window_type")
+            .is_none());
+
+        let rl: RateLimit =
+            serde_json::from_str(r#"{"rpm": 10, "window_type": "sliding"}"#).unwrap();
+        assert_eq!(rl.window_type, RateLimitWindowType::Sliding);
+        assert_eq!(serde_json::to_value(&rl).unwrap()["window_type"], "sliding");
+        // A window type alone limits nothing.
+        assert!(RateLimit {
+            window_type: RateLimitWindowType::Sliding,
+            ..Default::default()
+        }
+        .is_unrestricted());
+    }
+
+    #[test]
+    fn mcp_limit_carries_its_window_type_into_the_limiter_shape() {
+        let mcp: McpRateLimit =
+            serde_json::from_str(r#"{"rph": 3, "window_type": "sliding"}"#).unwrap();
+        let rl = RateLimit::from(&mcp);
+        assert_eq!(rl.rph, Some(3));
+        assert_eq!(rl.window_type, RateLimitWindowType::Sliding);
+    }
 }
