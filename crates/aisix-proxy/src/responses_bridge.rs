@@ -276,7 +276,7 @@ fn qualified_tool_name(item: &Value, name: &str) -> String {
 }
 
 /// The request's tool declarations, top-level and `additional_tools` alike.
-fn declared_tools(body: &Value) -> Vec<&Value> {
+fn declared_tools(body: &Value) -> Vec<std::borrow::Cow<'_, Value>> {
     aisix_gateway::tool_calls::responses_declared_tools(body.get("tools"), body.get("input"))
 }
 
@@ -682,23 +682,23 @@ fn responses_text_format_to_response_format(text: &Value) -> Option<Value> {
 ///     named `<namespace>__<tool>` (see [`namespace_chat_tool_name`]) and
 ///     described by the namespace's description followed by the sub-tool's
 ///     own. A sub-tool whose flattened name is already a top-level
-///     function's is left out, so the model is never offered two tools
-///     under one name.
+///     function or custom tool's is left out, so the model is never offered
+///     two tools under one name.
 ///   * hosted tools (`web_search*`, `file_search`, `code_interpreter`,
 ///     `mcp`, `computer_use*`, `image_generation`, …) have no chat
 ///     equivalent and are dropped.
 ///
 /// Returns `None` when nothing translates so the field stays absent from
 /// the wire.
-fn responses_tools_to_chat(tools: &[&Value]) -> Option<Value> {
-    let top_level_functions = top_level_function_names(tools);
+fn responses_tools_to_chat(tools: &[std::borrow::Cow<'_, Value>]) -> Option<Value> {
+    let top_level_names = top_level_tool_names(tools);
     let out: Vec<Value> = tools
         .iter()
         .flat_map(|t| -> Vec<Value> {
             match t.get("type").and_then(|v| v.as_str()) {
                 Some("function") => function_chat_tool(t, None).into_iter().collect(),
                 Some("namespace") => namespace_members(t)
-                    .filter(|(chat_name, _, _)| !top_level_functions.contains(chat_name.as_str()))
+                    .filter(|(chat_name, _, _)| !top_level_names.contains(chat_name.as_str()))
                     .filter_map(|(chat_name, member, description)| {
                         let rename = Some((chat_name, description));
                         if is_custom(member) {
@@ -750,11 +750,19 @@ fn namespace_chat_tool_name(namespace: &str, tool: &str) -> String {
     format!("{namespace}__{tool}")
 }
 
-/// Names of the top-level `function` tools a request declared.
-fn top_level_function_names<'a>(tools: &[&'a Value]) -> std::collections::BTreeSet<&'a str> {
+/// Names of the top-level `function` and `custom` tools a request declared:
+/// each is offered to the model under its own name.
+fn top_level_tool_names<'a>(
+    tools: &'a [std::borrow::Cow<'_, Value>],
+) -> std::collections::BTreeSet<&'a str> {
     tools
         .iter()
-        .filter(|t| t.get("type").and_then(Value::as_str) == Some("function"))
+        .filter(|t| {
+            matches!(
+                t.get("type").and_then(Value::as_str),
+                Some("function" | "custom")
+            )
+        })
         .filter_map(|t| t.get("name").and_then(Value::as_str))
         .collect()
 }
@@ -970,13 +978,15 @@ impl ResponsesReplyContext {
 
 /// The chat function names a model may call a namespace sub-tool by, each
 /// mapped to the sub-tool: the flattened name it was
-/// offered under, and — when no top-level function and no other namespace
-/// uses it — the sub-tool's bare name, which a model sometimes answers with
-/// instead. A flattened name that collides with a top-level function was
-/// never offered (see [`responses_tools_to_chat`]) and maps to nothing, so
-/// a call to that function stays a plain `function_call`.
-fn namespace_tool_map(tools: &[&Value]) -> std::collections::BTreeMap<String, NamespaceMember> {
-    let top_level = top_level_function_names(tools);
+/// offered under, and — when no top-level tool and no other namespace uses
+/// it — the sub-tool's bare name, which a model sometimes answers with
+/// instead. A flattened name that collides with a top-level tool was never
+/// offered (see [`responses_tools_to_chat`]) and maps to nothing, so a call
+/// to that name stays the top-level tool's.
+fn namespace_tool_map(
+    tools: &[std::borrow::Cow<'_, Value>],
+) -> std::collections::BTreeMap<String, NamespaceMember> {
+    let top_level = top_level_tool_names(tools);
     let members: Vec<NamespaceMember> = tools
         .iter()
         .filter(|t| t.get("type").and_then(Value::as_str) == Some("namespace"))
@@ -5807,6 +5817,63 @@ mod tests {
                 custom: false,
                 name: "wait",
                 namespace: Some("functions")
+            }
+        );
+    }
+
+    /// The Codex CLI re-declares a tool whose schema changed in a later
+    /// `additional_tools` item and leaves the earlier one in the history:
+    /// the model is offered the tool once, under the later schema.
+    #[test]
+    fn a_tool_redeclared_with_a_new_schema_is_offered_once_with_it() {
+        let mut body = codex_lite_body();
+        body["input"].as_array_mut().unwrap().push(json!(
+            {"type": "additional_tools", "role": "developer", "tools": [
+                {"type": "namespace", "name": "functions", "description": "Tools.", "tools": [
+                    {"type": "custom", "name": "exec", "description": "Run code, v2."},
+                ]},
+            ]}
+        ));
+        let chat = responses_request_to_chat("m", &body);
+        let tools = chat.extra["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["functions__exec", "functions__wait"]);
+        assert_eq!(
+            tools[0]["function"]["description"],
+            "Tools.\n\nRun code, v2."
+        );
+        // The bare name still maps back: it is declared once.
+        let reply = ResponsesReplyContext::from_request(&body);
+        assert_eq!(
+            reply.tool_call("exec"),
+            ReplyToolCall {
+                custom: true,
+                name: "exec",
+                namespace: Some("functions")
+            }
+        );
+    }
+
+    /// A top-level `custom` tool keeps its name over a namespace sub-tool
+    /// flattened onto the same one, as a top-level function does.
+    #[test]
+    fn a_flattened_name_taken_by_a_top_level_custom_tool_is_not_offered_twice() {
+        let body = json!({"input": "go", "tools": [
+            {"type": "custom", "name": "ns__a"},
+            {"type": "namespace", "name": "ns", "tools": [{"type": "custom", "name": "a"}]},
+        ]});
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(chat.extra["tools"].as_array().unwrap().len(), 1);
+        let reply = ResponsesReplyContext::from_request(&body);
+        assert_eq!(
+            reply.tool_call("ns__a"),
+            ReplyToolCall {
+                custom: true,
+                name: "ns__a",
+                namespace: None
             }
         );
     }

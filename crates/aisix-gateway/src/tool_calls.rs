@@ -24,10 +24,17 @@ use crate::{
 /// A client may declare its tools either way (the Codex CLI's lite mode
 /// sends no top-level list at all), so every reader that translates or
 /// counts a request's tools reads them through here.
+///
+/// A tool declared again replaces its earlier declaration and keeps the
+/// earlier one's position: the Codex CLI leaves each `additional_tools` item
+/// in the history and, when a tool's schema changes, appends another item
+/// re-declaring it. A namespace declared again is merged member by member,
+/// its header (description) taken from the later declaration. A tool without
+/// a name is kept as is.
 pub fn responses_declared_tools<'a>(
     tools: Option<&'a Value>,
     input: Option<&'a Value>,
-) -> Vec<&'a Value> {
+) -> Vec<Cow<'a, Value>> {
     let additional = input
         .and_then(Value::as_array)
         .into_iter()
@@ -35,12 +42,78 @@ pub fn responses_declared_tools<'a>(
         .filter(|item| is_responses_additional_tools_item(item))
         .filter_map(|item| item.get("tools").and_then(Value::as_array))
         .flatten();
-    tools
+    let declared = tools
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .chain(additional)
-        .collect()
+        .chain(additional);
+
+    let mut out: Vec<Cow<'a, Value>> = Vec::new();
+    let mut position: std::collections::HashMap<(bool, &'a str), usize> = Default::default();
+    for tool in declared {
+        let is_namespace = tool.get("type").and_then(Value::as_str) == Some("namespace");
+        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+            out.push(Cow::Borrowed(tool));
+            continue;
+        };
+        match position.get(&(is_namespace, name)) {
+            Some(&i) if is_namespace => {
+                let merged = merge_namespace(&out[i], tool);
+                out[i] = Cow::Owned(merged);
+            }
+            Some(&i) => out[i] = Cow::Borrowed(tool),
+            None => {
+                position.insert((is_namespace, name), out.len());
+                out.push(if is_namespace && has_repeated_member(tool) {
+                    Cow::Owned(merge_namespace(&json!({}), tool))
+                } else {
+                    Cow::Borrowed(tool)
+                });
+            }
+        }
+    }
+    out
+}
+
+fn namespace_members(namespace: &Value) -> &[Value] {
+    namespace
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+fn member_name(member: &Value) -> Option<&str> {
+    member.get("name").and_then(Value::as_str)
+}
+
+fn has_repeated_member(namespace: &Value) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    namespace_members(namespace)
+        .iter()
+        .filter_map(member_name)
+        .any(|name| !seen.insert(name))
+}
+
+/// `later` declared over `earlier`: `later`'s header, and `earlier`'s
+/// members with each one `later` declares again replaced in place and the
+/// new ones appended.
+fn merge_namespace(earlier: &Value, later: &Value) -> Value {
+    let mut members: Vec<Value> = Vec::new();
+    for member in namespace_members(earlier)
+        .iter()
+        .chain(namespace_members(later))
+    {
+        let existing = member_name(member)
+            .and_then(|name| members.iter().position(|m| member_name(m) == Some(name)));
+        match existing {
+            Some(i) => members[i] = member.clone(),
+            None => members.push(member.clone()),
+        }
+    }
+    let mut merged = later.clone();
+    merged["tools"] = Value::Array(members);
+    merged
 }
 
 /// A Responses `input` item that declares tools rather than carrying a turn.
@@ -405,6 +478,67 @@ pub fn blocks_scan_text<'a>(blocks: impl IntoIterator<Item = &'a Value>) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn declared(body: &Value) -> Vec<Value> {
+        responses_declared_tools(body.get("tools"), body.get("input"))
+            .into_iter()
+            .map(Cow::into_owned)
+            .collect()
+    }
+
+    /// A tool declared again replaces the earlier declaration in place; a
+    /// namespace declared again is merged member by member.
+    #[test]
+    fn a_redeclared_tool_replaces_the_earlier_declaration_in_place() {
+        let body = json!({
+            "tools": [{"type": "function", "name": "top", "description": "old"}],
+            "input": [
+                {"type": "additional_tools", "tools": [
+                    {"type": "namespace", "name": "functions", "description": "v1", "tools": [
+                        {"type": "custom", "name": "exec", "description": "old exec"},
+                        {"type": "function", "name": "wait"},
+                    ]},
+                    {"type": "web_search"},
+                ]},
+                {"role": "user", "content": "hi"},
+                {"type": "additional_tools", "tools": [
+                    {"type": "namespace", "name": "functions", "description": "v2", "tools": [
+                        {"type": "custom", "name": "exec", "description": "new exec"},
+                        {"type": "function", "name": "apply"},
+                    ]},
+                    {"type": "custom", "name": "top", "description": "new"},
+                    {"type": "web_search"},
+                ]},
+            ],
+        });
+        assert_eq!(
+            declared(&body),
+            vec![
+                json!({"type": "custom", "name": "top", "description": "new"}),
+                json!({"type": "namespace", "name": "functions", "description": "v2", "tools": [
+                    {"type": "custom", "name": "exec", "description": "new exec"},
+                    {"type": "function", "name": "wait"},
+                    {"type": "function", "name": "apply"},
+                ]}),
+                json!({"type": "web_search"}),
+                json!({"type": "web_search"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_member_repeated_inside_one_namespace_is_declared_once() {
+        let body = json!({"tools": [{"type": "namespace", "name": "ns", "tools": [
+            {"type": "function", "name": "a", "description": "first"},
+            {"type": "function", "name": "a", "description": "second"},
+        ]}]});
+        assert_eq!(
+            declared(&body),
+            vec![json!({"type": "namespace", "name": "ns", "tools": [
+                {"type": "function", "name": "a", "description": "second"},
+            ]})]
+        );
+    }
     use serde_json::json;
 
     #[test]

@@ -270,6 +270,36 @@ describe("/v1/responses bridge: tools declared in additional_tools input items",
     expect(completed?.data.response.output).toEqual(done);
   });
 
+  test("a tool re-declared with a new schema in a later item is offered once, with the new schema", async (ctx) => {
+    if (!etcdReachable || !app) return void ctx.skip();
+    // What Codex appends to the history when the shell tool's schema changes:
+    // the earlier declaration stays, the new one follows.
+    const exec2 = {
+      ...EXEC_TOOL,
+      description: "Run a shell command in the sandbox.",
+      format: { type: "grammar", syntax: "lark", definition: "start: CMD\nCMD: /[a-z ]+/" },
+    };
+    const res = await responses({
+      model: "lite-tools",
+      input: [
+        ADDITIONAL_TOOLS,
+        USER_TURN,
+        { type: "additional_tools", role: "developer", tools: [{ ...FUNCTIONS_NAMESPACE, tools: [exec2] }] },
+      ],
+      tool_choice: "auto",
+    });
+    expect(res.status).toBe(200);
+    const sent = dispatched("lite-tools");
+    expect(toolNames(sent)).toEqual(["functions__exec", "functions__wait"]);
+    const exec = sent.tools[0].function;
+    expect(exec.description).toContain("Run a shell command in the sandbox.");
+    expect(exec.description).toContain("CMD: /[a-z ]+/");
+    expect(exec.description).not.toContain("start: /.+/");
+    // The call still comes back under the declared name and namespace.
+    const body = (await res.json()) as Record<string, any>;
+    expect(body.output).toEqual(EXPECTED_CALLS.map((c) => ({ ...c, id: expect.any(String) })));
+  });
+
   test("additional_tools items and top-level tools all reach the upstream", async (ctx) => {
     if (!etcdReachable || !app) return void ctx.skip();
     const res = await responses({

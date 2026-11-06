@@ -447,14 +447,14 @@ fn responses_tool_definitions(body: &Value) -> Value {
         aisix_gateway::tool_calls::responses_declared_tools(body.get("tools"), body.get("input"));
     Value::Array(
         declared
-            .into_iter()
+            .iter()
             .flat_map(|t| match t.get("type").and_then(Value::as_str) {
                 Some("namespace") => t
                     .get("tools")
                     .and_then(Value::as_array)
                     .map(|members| members.iter().collect())
                     .unwrap_or_default(),
-                _ => vec![t],
+                _ => vec![t.as_ref()],
             })
             .cloned()
             .collect(),
@@ -1322,13 +1322,20 @@ mod tests {
         let namespaced = json!([{"type": "namespace", "name": "functions", "tools": members}]);
         let top_level = count(json!({"input": [user.clone()], "tools": namespaced.clone()}));
         let lite = count(json!({"input": [
-            {"type": "additional_tools", "role": "developer", "tools": namespaced},
+            {"type": "additional_tools", "role": "developer", "tools": namespaced.clone()},
             user.clone(),
+        ]}));
+        // Codex re-declaring a tool in a later item replaces it: counted once.
+        let redeclared = count(json!({"input": [
+            {"type": "additional_tools", "role": "developer", "tools": namespaced.clone()},
+            user.clone(),
+            {"type": "additional_tools", "role": "developer", "tools": namespaced},
         ]}));
         let bare = count(json!({"input": [user]}));
         assert!(flat > bare);
         assert_eq!(top_level, flat);
         assert_eq!(lite, flat);
+        assert_eq!(redeclared, flat);
     }
 
     #[test]

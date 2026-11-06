@@ -833,10 +833,9 @@ fn responses_input(body: &Map<String, Value>) -> Option<Converted> {
         .get("instructions")
         .and_then(Value::as_str)
         .map(|s| vec![text_part(s)]);
-    let tools = openai_tool_definitions(aisix_gateway::tool_calls::responses_declared_tools(
-        body.get("tools"),
-        body.get("input"),
-    ));
+    let declared =
+        aisix_gateway::tool_calls::responses_declared_tools(body.get("tools"), body.get("input"));
+    let tools = openai_tool_definitions(declared.iter().map(AsRef::as_ref));
     Some((messages, system, Some(tools)))
 }
 
@@ -1006,6 +1005,22 @@ mod tests {
         assert_eq!(c.tool_definitions, top_level_only.tool_definitions);
         let tools: Value = serde_json::from_str(c.tool_definitions.as_deref().unwrap()).unwrap();
         assert_eq!(tools[1]["name"], "functions");
+    }
+
+    /// A tool declared again in a later `additional_tools` item replaces
+    /// the earlier declaration.
+    #[test]
+    fn responses_redeclared_tool_is_one_definition_with_the_later_schema() {
+        let body = json!({"input": [
+            {"type": "additional_tools", "tools": [{"type": "function", "name": "w", "description": "old"}]},
+            {"role": "user", "content": "hi"},
+            {"type": "additional_tools", "tools": [{"type": "function", "name": "w", "description": "new"}]}
+        ]});
+        let c = structured_content(PromptWire::OpenAiResponses, &body.to_string(), "", None, "");
+        assert_eq!(
+            c.tool_definitions.as_deref(),
+            Some(r#"[{"description":"new","name":"w","type":"function"}]"#)
+        );
     }
 
     #[test]
