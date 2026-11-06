@@ -19,6 +19,35 @@ use crate::{
     Role,
 };
 
+/// The tool declarations of a Responses request: its top-level `tools`,
+/// then the `tools` of every `additional_tools` input item, in input order.
+/// A client may declare its tools either way (the Codex CLI's lite mode
+/// sends no top-level list at all), so every reader that translates or
+/// counts a request's tools reads them through here.
+pub fn responses_declared_tools<'a>(
+    tools: Option<&'a Value>,
+    input: Option<&'a Value>,
+) -> Vec<&'a Value> {
+    let additional = input
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| is_responses_additional_tools_item(item))
+        .filter_map(|item| item.get("tools").and_then(Value::as_array))
+        .flatten();
+    tools
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .chain(additional)
+        .collect()
+}
+
+/// A Responses `input` item that declares tools rather than carrying a turn.
+pub fn is_responses_additional_tools_item(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("additional_tools")
+}
+
 /// Separates a tool-call id from the thought signature appended to it.
 pub const THOUGHT_SIGNATURE_SEPARATOR: &str = "__thought__";
 

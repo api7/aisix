@@ -603,27 +603,28 @@ fn tool_definition(
 }
 
 fn openai_tools(tools: Option<&Value>) -> Option<Vec<Value>> {
-    let tools = tools?.as_array()?;
-    Some(
-        tools
-            .iter()
-            .filter_map(|t| {
-                let kind = t.get("type").and_then(Value::as_str)?;
-                // Chat nests the function; Responses flattens it.
-                let def = t.get("function").unwrap_or(t);
-                let name = def
-                    .get("name")
-                    .or_else(|| t.get("name"))
-                    .and_then(Value::as_str)?;
-                Some(tool_definition(
-                    kind,
-                    name,
-                    def.get("description"),
-                    def.get("parameters"),
-                ))
-            })
-            .collect(),
-    )
+    Some(openai_tool_definitions(tools?.as_array()?))
+}
+
+fn openai_tool_definitions<'a>(tools: impl IntoIterator<Item = &'a Value>) -> Vec<Value> {
+    tools
+        .into_iter()
+        .filter_map(|t| {
+            let kind = t.get("type").and_then(Value::as_str)?;
+            // Chat nests the function; Responses flattens it.
+            let def = t.get("function").unwrap_or(t);
+            let name = def
+                .get("name")
+                .or_else(|| t.get("name"))
+                .and_then(Value::as_str)?;
+            Some(tool_definition(
+                kind,
+                name,
+                def.get("description"),
+                def.get("parameters"),
+            ))
+        })
+        .collect()
 }
 
 fn openai_chat_input(body: &Map<String, Value>) -> Option<Converted> {
@@ -815,6 +816,9 @@ fn responses_input(body: &Map<String, Value>) -> Option<Converted> {
                     // A reference names an earlier item without saying
                     // whose it was: no role can be claimed for it.
                     Some("item_reference") => return None,
+                    // Tool declarations, not a turn: they are read into the
+                    // tool definitions below.
+                    Some("additional_tools") => {}
                     // Reasoning items and server-side tool calls replayed
                     // from an earlier turn are the model's own output: the
                     // item itself, as a generic part of an assistant turn.
@@ -829,7 +833,11 @@ fn responses_input(body: &Map<String, Value>) -> Option<Converted> {
         .get("instructions")
         .and_then(Value::as_str)
         .map(|s| vec![text_part(s)]);
-    Some((messages, system, openai_tools(body.get("tools"))))
+    let tools = openai_tool_definitions(aisix_gateway::tool_calls::responses_declared_tools(
+        body.get("tools"),
+        body.get("input"),
+    ));
+    Some((messages, system, Some(tools)))
 }
 
 fn completions_input(body: &Map<String, Value>) -> Option<Converted> {
@@ -965,6 +973,39 @@ mod tests {
                 {"type": "text", "content": "answer"}
             ])
         );
+    }
+
+    /// Tools declared in an `additional_tools` input item are tool
+    /// definitions, read the same way as the top-level ones and listed
+    /// after them; the item itself is not a turn of the conversation.
+    #[test]
+    fn responses_additional_tools_are_tool_definitions_not_messages() {
+        let namespace = json!({"type": "namespace", "name": "functions", "description": "Tools.",
+            "tools": [{"type": "custom", "name": "exec"}]});
+        let body = json!({
+            "input": [
+                {"type": "additional_tools", "role": "developer", "id": "at_1", "tools": [namespace]},
+                {"role": "user", "content": "hi"}
+            ],
+            "tools": [{"type": "function", "name": "w"}]
+        });
+        let c = structured_content(PromptWire::OpenAiResponses, &body.to_string(), "", None, "");
+        let input: Value = serde_json::from_str(c.input_messages.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            input,
+            json!([{"role": "user", "parts": [{"type": "text", "content": "hi"}]}])
+        );
+        let top_level_only = structured_content(
+            PromptWire::OpenAiResponses,
+            &json!({"input": "hi", "tools": [{"type": "function", "name": "w"}, namespace]})
+                .to_string(),
+            "",
+            None,
+            "",
+        );
+        assert_eq!(c.tool_definitions, top_level_only.tool_definitions);
+        let tools: Value = serde_json::from_str(c.tool_definitions.as_deref().unwrap()).unwrap();
+        assert_eq!(tools[1]["name"], "functions");
     }
 
     #[test]

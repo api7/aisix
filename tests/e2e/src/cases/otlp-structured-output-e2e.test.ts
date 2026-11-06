@@ -546,6 +546,40 @@ describe("OTLP output messages keep reasoning, text and tool calls apart", () =>
     ]);
   });
 
+  test("responses, tools declared in an additional_tools input item are tool definitions, not a turn", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const namespace = {
+      type: "namespace",
+      name: "functions",
+      description: "Tools available to the agent.",
+      tools: [{ type: "custom", name: "exec", description: "Run a shell command." }],
+    };
+    const { status, requestId } = await post("/v1/responses", {
+      model: "so-responses-stream",
+      stream: true,
+      tools: [{ type: "function", name: TOOL, description: "Look up the current weather", parameters: CHAT_TOOLS[0].function.parameters }],
+      input: [
+        { type: "additional_tools", role: "developer", id: "at_1", tools: [namespace] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "weather in Paris?" }] },
+      ],
+    });
+    expect(status).toBe(200);
+    const span = await operationSpan(requestId);
+    expect(JSON.parse(String(span.attributes["gen_ai.input.messages"]))).toEqual([
+      { role: "user", parts: [{ type: "text", content: "weather in Paris?" }] },
+    ]);
+    expect(JSON.parse(String(span.attributes["gen_ai.tool.definitions"]))).toEqual([
+      {
+        type: "function",
+        name: TOOL,
+        description: "Look up the current weather",
+        parameters: CHAT_TOOLS[0].function.parameters,
+      },
+      { type: "namespace", name: "functions", description: "Tools available to the agent." },
+    ]);
+    await expectSinksMatchSpan(requestId, span);
+  });
+
   test("responses, native buffered", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const { status, requestId } = await post("/v1/responses", {
