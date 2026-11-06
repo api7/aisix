@@ -141,7 +141,7 @@ pub struct SlidingWindowCounter {
 impl SlidingWindowCounter {
     pub fn new(window_secs: u64, step_secs: u64) -> Self {
         assert!(
-            step_secs > 0 && window_secs % step_secs == 0,
+            step_secs > 0 && window_secs.is_multiple_of(step_secs),
             "window must be a positive multiple of step"
         );
         let len = (window_secs / step_secs + 1) as usize;
