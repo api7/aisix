@@ -51,7 +51,10 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use redis::Script;
 
-use super::{local::LocalStore, token_dims, Dim, RateStore, StreamLeaseRefresh};
+use super::{
+    local::LocalStore, sliding_step_secs, token_dims, Dim, RateStore, StreamLeaseRefresh, DAY_SECS,
+    MINUTE_SECS,
+};
 use crate::error::{LimitDetail, RateLimitError};
 use crate::limiter::RateLimitStatus;
 
@@ -281,10 +284,11 @@ return 1
 macro_rules! add_tokens_lua {
     () => {
         r#"
-local function add_tokens(prefix, now, tokens, grace, sliding)
-  if sliding then
-    sw_add(prefix .. ':sw:tpm', now, 60, 10, tokens, grace)
-    sw_add(prefix .. ':sw:tpd', now, 86400, 3600, tokens, grace)
+-- tpm_step / tpd_step are the sliding sub-bucket lengths; 0 is fixed.
+local function add_tokens(prefix, now, tokens, grace, tpm_step, tpd_step)
+  if tpm_step > 0 then
+    sw_add(prefix .. ':sw:tpm', now, 60, tpm_step, tokens, grace)
+    sw_add(prefix .. ':sw:tpd', now, 86400, tpd_step, tokens, grace)
     return
   end
   for _, d in ipairs({{'tpm', 60}, {'tpd', 86400}}) do
@@ -302,7 +306,7 @@ end
 /// Post-deduct: add `tokens` to the tpm/tpd windows AND release the
 /// concurrency slot held by `member`. Both token windows are always
 /// touched (matching the local backend); an unread tpd counter just
-/// expires. ARGV: prefix, member, tokens, grace, sliding (`1`/`0`).
+/// expires. ARGV: prefix, member, tokens, grace, tpm step, tpd step (0 = fixed).
 const COMMIT_LUA: &str = concat!(
     sliding_lua!(),
     add_tokens_lua!(),
@@ -311,11 +315,12 @@ local prefix = ARGV[1]
 local member = ARGV[2]
 local tokens = tonumber(ARGV[3])
 local grace = tonumber(ARGV[4])
-local sliding = ARGV[5] == '1'
+local tpm_step = tonumber(ARGV[5])
+local tpd_step = tonumber(ARGV[6])
 local t = redis.call('TIME')
 local now = tonumber(t[1])
 if tokens > 0 then
-  add_tokens(prefix, now, tokens, grace, sliding)
+  add_tokens(prefix, now, tokens, grace, tpm_step, tpd_step)
 end
 redis.call('ZREM', prefix .. ':conc', member)
 return 1
@@ -323,7 +328,7 @@ return 1
 );
 
 /// Post-stream token add only (no concurrency change). ARGV: prefix,
-/// tokens, grace, sliding (`1`/`0`).
+/// tokens, grace, tpm step, tpd step (0 = fixed).
 const ADD_TOKENS_LUA: &str = concat!(
     sliding_lua!(),
     add_tokens_lua!(),
@@ -331,11 +336,12 @@ const ADD_TOKENS_LUA: &str = concat!(
 local prefix = ARGV[1]
 local tokens = tonumber(ARGV[2])
 local grace = tonumber(ARGV[3])
-local sliding = ARGV[4] == '1'
+local tpm_step = tonumber(ARGV[4])
+local tpd_step = tonumber(ARGV[5])
 local t = redis.call('TIME')
 local now = tonumber(t[1])
 if tokens > 0 then
-  add_tokens(prefix, now, tokens, grace, sliding)
+  add_tokens(prefix, now, tokens, grace, tpm_step, tpd_step)
 end
 return 1
 "#
@@ -343,14 +349,14 @@ return 1
 
 /// Read-only snapshot for headers: current-minute rpm/tpm counts +
 /// pruned concurrency count + seconds until each resets. ARGV: prefix,
-/// conc_ttl, sliding (`1`/`0`). Returns {rpm_used, tpm_used, in_flight,
+/// conc_ttl, minute step (0 = fixed). Returns {rpm_used, tpm_used, in_flight,
 /// rpm_reset, tpm_reset}.
 const PEEK_LUA: &str = concat!(
     sliding_lua!(),
     r#"
 local prefix = ARGV[1]
 local conc_ttl = tonumber(ARGV[2])
-local sliding = ARGV[3] == '1'
+local step = tonumber(ARGV[3])
 local t = redis.call('TIME')
 local now = tonumber(t[1])
 local conc_now = now + tonumber(t[2]) / 1000000
@@ -358,11 +364,11 @@ local conc_now = now + tonumber(t[2]) / 1000000
 -- prune a live member while a rolling upgrade is in progress.
 local conc_prune_before = math.floor(conc_now) - conc_ttl
 local rpm, tpm, rpm_reset, tpm_reset
-if sliding then
-  local used, counts, cur, lower = sw_read(prefix .. ':sw:rpm', now, 60, 10)
-  rpm, rpm_reset = used, sw_reset(counts, now, 60, 10, cur, lower)
-  used, counts, cur, lower = sw_read(prefix .. ':sw:tpm', now, 60, 10)
-  tpm, tpm_reset = used, sw_reset(counts, now, 60, 10, cur, lower)
+if step > 0 then
+  local used, counts, cur, lower = sw_read(prefix .. ':sw:rpm', now, 60, step)
+  rpm, rpm_reset = used, sw_reset(counts, now, 60, step, cur, lower)
+  used, counts, cur, lower = sw_read(prefix .. ':sw:tpm', now, 60, step)
+  tpm, tpm_reset = used, sw_reset(counts, now, 60, step, cur, lower)
 else
   local ws = now - (now % 60)
   rpm = tonumber(redis.call('GET', prefix .. ':rpm:' .. ws) or '0')
@@ -651,11 +657,13 @@ fn record_failure(metrics: &Option<Metrics>, op: &str) {
     }
 }
 
-fn sliding_flag(window_type: RateLimitWindowType) -> &'static str {
+/// Sub-bucket length of a minute/day window under `window_type`; 0 tells
+/// the scripts to count a fixed window.
+fn step_arg(window_type: RateLimitWindowType, window_secs: u64) -> u64 {
     if window_type.is_sliding() {
-        "1"
+        sliding_step_secs(window_secs)
     } else {
-        "0"
+        0
     }
 }
 
@@ -797,7 +805,8 @@ impl RateStore for RedisStore {
             .arg(member)
             .arg(tokens)
             .arg(self.grace)
-            .arg(sliding_flag(window_type))
+            .arg(step_arg(window_type, MINUTE_SECS))
+            .arg(step_arg(window_type, DAY_SECS))
             .invoke_async(&mut conn)
             .await;
         match res {
@@ -896,7 +905,8 @@ impl RateStore for RedisStore {
                     .arg(&prefix)
                     .arg(tokens)
                     .arg(grace)
-                    .arg(sliding_flag(window_type))
+                    .arg(step_arg(window_type, MINUTE_SECS))
+                    .arg(step_arg(window_type, DAY_SECS))
                     .invoke_async(&mut c)
                     .await;
                 if res.is_err() {
@@ -1004,7 +1014,7 @@ impl RateStore for RedisStore {
             .key(&prefix)
             .arg(&prefix)
             .arg(self.conc_ttl)
-            .arg(sliding_flag(limits.window_type))
+            .arg(step_arg(limits.window_type, MINUTE_SECS))
             .invoke_async(&mut conn)
             .await;
         match reply {

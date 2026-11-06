@@ -40,36 +40,28 @@ struct KeyState {
     in_flight: u32,
 }
 
-#[derive(Debug)]
+/// Each counter is allocated on first use, so a bucket holds rings only
+/// for the dimensions its limits actually count.
+#[derive(Debug, Default)]
 struct SlidingState {
-    rpm: SlidingWindowCounter,
-    rph: SlidingWindowCounter,
-    rpd: SlidingWindowCounter,
-    tpm: SlidingWindowCounter,
-    tpd: SlidingWindowCounter,
+    rpm: Option<SlidingWindowCounter>,
+    rph: Option<SlidingWindowCounter>,
+    rpd: Option<SlidingWindowCounter>,
+    tpm: Option<SlidingWindowCounter>,
+    tpd: Option<SlidingWindowCounter>,
 }
 
 impl SlidingState {
-    fn new() -> Self {
-        let counter = |window| SlidingWindowCounter::new(window, sliding_step_secs(window));
-        Self {
-            rpm: counter(MINUTE_SECS),
-            rph: counter(HOUR_SECS),
-            rpd: counter(DAY_SECS),
-            tpm: counter(MINUTE_SECS),
-            tpd: counter(DAY_SECS),
-        }
-    }
-
     fn counter(&mut self, name: &str) -> &mut SlidingWindowCounter {
-        match name {
-            DIM_RPM => &mut self.rpm,
-            DIM_RPH => &mut self.rph,
-            DIM_RPD => &mut self.rpd,
-            DIM_TPM => &mut self.tpm,
-            DIM_TPD => &mut self.tpd,
+        let (slot, window) = match name {
+            DIM_RPM => (&mut self.rpm, MINUTE_SECS),
+            DIM_RPH => (&mut self.rph, HOUR_SECS),
+            DIM_RPD => (&mut self.rpd, DAY_SECS),
+            DIM_TPM => (&mut self.tpm, MINUTE_SECS),
+            DIM_TPD => (&mut self.tpd, DAY_SECS),
             other => unreachable!("dimension {other} has no sliding window"),
-        }
+        };
+        slot.get_or_insert_with(|| SlidingWindowCounter::new(window, sliding_step_secs(window)))
     }
 }
 
@@ -100,9 +92,7 @@ impl KeyState {
     }
 
     fn sliding(&mut self, name: &str) -> &mut SlidingWindowCounter {
-        self.sliding
-            .get_or_insert_with(|| Box::new(SlidingState::new()))
-            .counter(name)
+        self.sliding.get_or_insert_with(Box::default).counter(name)
     }
 
     fn check_and_increment(&mut self, d: &Dim, now: u64) -> WindowCheck {
@@ -289,13 +279,12 @@ impl<C: Clock> RateStore for LocalStore<C> {
         let (rpm_used, rpm_reset_secs, tpm_used, tpm_reset_secs) =
             if limits.window_type.is_sliding() {
                 // Reset is when everything counted now has left the window.
-                let (rpm, tpm) = match s.sliding.as_deref() {
-                    Some(sl) => (
-                        (sl.rpm.current(now), sl.rpm.reset_secs(now)),
-                        (sl.tpm.current(now), sl.tpm.reset_secs(now)),
-                    ),
-                    None => ((0, 0), (0, 0)),
+                let read = |c: Option<&SlidingWindowCounter>| {
+                    c.map_or((0, 0), |c| (c.current(now), c.reset_secs(now)))
                 };
+                let sl = s.sliding.as_deref();
+                let rpm = read(sl.and_then(|sl| sl.rpm.as_ref()));
+                let tpm = read(sl.and_then(|sl| sl.tpm.as_ref()));
                 (rpm.0, rpm.1, tpm.0, tpm.1)
             } else {
                 // Seconds remaining in the current minute-window.
