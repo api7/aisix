@@ -403,6 +403,10 @@ fn count_responses_prompt(bpe: &CoreBPE, body: &Value) -> u32 {
         }
         Some(Value::Array(items)) => {
             for item in items {
+                // Tool declarations, counted with the request's tools below.
+                if aisix_gateway::tool_calls::is_responses_additional_tools_item(item) {
+                    continue;
+                }
                 n = n.saturating_add(TOKENS_PER_MESSAGE);
                 match item.get("role").and_then(|r| r.as_str()) {
                     Some(role) => {
@@ -425,12 +429,36 @@ fn count_responses_prompt(bpe: &CoreBPE, body: &Value) -> u32 {
         }
         _ => {}
     }
+    let tools = responses_tool_definitions(body);
     n.saturating_add(count_request_extra(
         bpe,
-        body.get("tools"),
+        Some(&tools),
         body.get("tool_choice"),
         has_system,
     ))
+}
+
+/// Every tool definition a Responses request declares, top-level and in
+/// `additional_tools` items alike, with each `namespace` tool's sub-tools
+/// standing in for the namespace: each sub-tool reaches the model as a tool
+/// of its own.
+fn responses_tool_definitions(body: &Value) -> Value {
+    let declared =
+        aisix_gateway::tool_calls::responses_declared_tools(body.get("tools"), body.get("input"));
+    Value::Array(
+        declared
+            .iter()
+            .flat_map(|t| match t.get("type").and_then(Value::as_str) {
+                Some("namespace") => t
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .map(|members| members.iter().collect())
+                    .unwrap_or_default(),
+                _ => vec![t.as_ref()],
+            })
+            .cloned()
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -1275,6 +1303,39 @@ mod tests {
         // The wire bytes of the same body count the same, parsed on demand.
         let wire = Estimator::new("gpt-4o", PromptInput::ResponsesWire(wire_bytes.into()));
         assert_eq!(wire.count_prompt(), expected);
+    }
+
+    /// Tools declared in an `additional_tools` input item count as tools,
+    /// exactly as if the request had declared them at the top level, and a
+    /// namespace counts each of its sub-tools, `custom` ones included.
+    #[test]
+    fn responses_prompt_counts_additional_tools_and_namespace_members() {
+        let members = json!([
+            {"type": "custom", "name": "exec", "description": "Run code."},
+            {"type": "function", "name": "wait", "description": "Wait.",
+             "parameters": {"type": "object", "properties": {"ms": {"type": "number"}}}},
+        ]);
+        let user = json!({"role": "user", "content": "hi"});
+        let count =
+            |body: Value| Estimator::new("gpt-4o", PromptInput::Responses(body)).count_prompt();
+        let flat = count(json!({"input": [user.clone()], "tools": members.clone()}));
+        let namespaced = json!([{"type": "namespace", "name": "functions", "tools": members}]);
+        let top_level = count(json!({"input": [user.clone()], "tools": namespaced.clone()}));
+        let lite = count(json!({"input": [
+            {"type": "additional_tools", "role": "developer", "tools": namespaced.clone()},
+            user.clone(),
+        ]}));
+        // Codex re-declaring a tool in a later item replaces it: counted once.
+        let redeclared = count(json!({"input": [
+            {"type": "additional_tools", "role": "developer", "tools": namespaced.clone()},
+            user.clone(),
+            {"type": "additional_tools", "role": "developer", "tools": namespaced},
+        ]}));
+        let bare = count(json!({"input": [user]}));
+        assert!(flat > bare);
+        assert_eq!(top_level, flat);
+        assert_eq!(lite, flat);
+        assert_eq!(redeclared, flat);
     }
 
     #[test]
