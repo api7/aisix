@@ -19,7 +19,7 @@
 # pgo runs the three phases, FAIL-CLOSED — any phase failing fails the script
 # and no binary is staged:
 #   A. instrumented build (-Cprofile-generate) in target-pgo-gen/, with
-#      LLVM's MachineOutliner off (see PGO_GEN_RUSTFLAGS below);
+#      LLVM's MachineOutliner off (see the phase A build line below);
 #   B. train.sh drives the committed shape matrix through it and merges the
 #      .profraw files with the pinned toolchain's own llvm-profdata;
 #   C. optimized build (-Cprofile-use) in target-pgo/, so profile builds never
@@ -82,9 +82,9 @@ case "$MODE" in
         # IR-level counters are placed, so turning it off here changes neither
         # what the profile records nor the shipped binary, which phase C still
         # builds with LLVM's defaults. x86 has no default outlining, so amd64
-        # is unaffected.
-        PGO_GEN_RUSTFLAGS="-Cprofile-generate=$PGO_DIR -Cllvm-args=-enable-machine-outliner=never"
-        RUSTFLAGS="$PGO_GEN_RUSTFLAGS" CARGO_TARGET_DIR="$ROOT/target-pgo-gen" \
+        # is unaffected. Measured and checked against LLVM's source on Rust
+        # 1.93.1 (LLVM 21); recheck on a toolchain bump.
+        RUSTFLAGS="-Cprofile-generate=$PGO_DIR -Cllvm-args=-enable-machine-outliner=never" CARGO_TARGET_DIR="$ROOT/target-pgo-gen" \
             cargo build --locked --release --bin aisix
         CARGO_TARGET_DIR="$ROOT/bench/pgo-training/trainer/target" cargo build --locked --release \
             --manifest-path bench/pgo-training/trainer/Cargo.toml
