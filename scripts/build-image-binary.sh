@@ -18,9 +18,8 @@
 #
 # pgo runs the three phases, FAIL-CLOSED — any phase failing fails the script
 # and no binary is staged:
-#   A. instrumented build (-Cprofile-generate) in target-pgo-gen/; on arm64 it
-#      uses about 20 GB of RAM plus swap, and running short shows up as a
-#      killed build with no compile error;
+#   A. instrumented build (-Cprofile-generate) in target-pgo-gen/, with
+#      LLVM's MachineOutliner off (see the phase A build line below);
 #   B. train.sh drives the committed shape matrix through it and merges the
 #      .profraw files with the pinned toolchain's own llvm-profdata;
 #   C. optimized build (-Cprofile-use) in target-pgo/, so profile builds never
@@ -74,7 +73,18 @@ case "$MODE" in
         ;;
     pgo)
         PGO_DIR="$ROOT/target-pgo-data"
-        RUSTFLAGS="-Cprofile-generate=$PGO_DIR" CARGO_TARGET_DIR="$ROOT/target-pgo-gen" \
+        # LLVM runs its MachineOutliner on AArch64 by default. It only
+        # outlines `minsize` functions (std's `#[optimize(size)]` cold paths),
+        # but as a module pass it holds every function's machine code until
+        # the whole module is done, and under fat LTO the module is the whole
+        # binary: the instrumented compile peaks near 19 GB on arm64 with it
+        # and about 9 GB without, as on amd64. The outliner runs after the
+        # IR-level counters are placed, so turning it off here changes neither
+        # what the profile records nor the shipped binary, which phase C still
+        # builds with LLVM's defaults. x86 has no default outlining, so amd64
+        # is unaffected. Measured and checked against LLVM's source on Rust
+        # 1.93.1 (LLVM 21); recheck on a toolchain bump.
+        RUSTFLAGS="-Cprofile-generate=$PGO_DIR -Cllvm-args=-enable-machine-outliner=never" CARGO_TARGET_DIR="$ROOT/target-pgo-gen" \
             cargo build --locked --release --bin aisix
         CARGO_TARGET_DIR="$ROOT/bench/pgo-training/trainer/target" cargo build --locked --release \
             --manifest-path bench/pgo-training/trainer/Cargo.toml
