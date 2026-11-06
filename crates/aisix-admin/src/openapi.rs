@@ -2287,6 +2287,10 @@ fn add_variant_titles(doc: &mut Value) {
             &["Fail", "Try anyway"],
         ),
         (
+            "/components/schemas/RateLimitWindowType/oneOf",
+            &["Fixed", "Sliding"],
+        ),
+        (
             "/components/schemas/RoutingStrategy/oneOf",
             &[
                 "Round robin",

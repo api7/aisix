@@ -545,9 +545,37 @@
           "format": "uint64",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "window_type": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RateLimitWindowType"
+            }
+          ],
+          "default": "fixed",
+          "description": "How the minute, hour, and day limits count. `rps` and `concurrency` are unaffected."
         }
       },
       "type": "object"
+    },
+    "RateLimitWindowType": {
+      "description": "Counting algorithm for the minute, hour, and day limits of a rate limit.",
+      "oneOf": [
+        {
+          "description": "Each window starts at a fixed boundary (the top of the minute, hour, or day, UTC) and its count resets to zero when the next one starts. A burst at the end of one window and another at the start of the next can therefore admit up to twice the limit within one window's length.",
+          "enum": [
+            "fixed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A rolling window. Usage is recorded in sub-buckets aligned to a fixed step: 10 seconds for `rpm` and `tpm`, 5 minutes for `rph`, and 1 hour for `rpd` and `tpd`. A request is checked against the sum of the current sub-bucket and the preceding sub-buckets that cover one full window, so no window-length interval ever admits more than the limit. Usage leaves the count between one window and one window plus one step after it was recorded.",
+          "enum": [
+            "sliding"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "Routing": {
       "additionalProperties": false,

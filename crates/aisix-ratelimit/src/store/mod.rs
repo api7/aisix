@@ -22,7 +22,7 @@
 
 use std::time::Duration;
 
-use aisix_core::RateLimit;
+use aisix_core::{RateLimit, RateLimitWindowType};
 use async_trait::async_trait;
 
 use crate::error::RateLimitError;
@@ -62,49 +62,68 @@ pub enum StreamLeaseRefresh {
     Unavailable,
 }
 
-/// A windowed request/token dimension active on a [`RateLimit`]:
-/// `(name, window_secs, limit)`. Shared by both stores so the Redis key
-/// layout and the local counter set never drift.
+/// A windowed request/token dimension active on a [`RateLimit`]. Shared
+/// by both stores so the Redis key layout and the local counter set never
+/// drift.
 pub(crate) struct Dim {
     pub name: &'static str,
     pub window_secs: u64,
     pub limit: u64,
+    /// Sub-bucket length when the dimension counts as a sliding window;
+    /// `None` for a fixed window.
+    pub step_secs: Option<u64>,
+}
+
+/// Sub-bucket length of a sliding window. Each is a whole fraction of its
+/// window so sub-buckets tile it exactly.
+pub(crate) const fn sliding_step_secs(window_secs: u64) -> u64 {
+    match window_secs {
+        MINUTE_SECS => 10,
+        HOUR_SECS => 300,
+        _ => HOUR_SECS,
+    }
+}
+
+fn dims(limits: &RateLimit, candidates: &[(&'static str, u64, Option<u64>)]) -> Vec<Dim> {
+    let sliding = limits.window_type.is_sliding();
+    candidates
+        .iter()
+        .filter_map(|&(name, window_secs, limit)| {
+            limit.map(|limit| Dim {
+                name,
+                window_secs,
+                limit,
+                // A one-second window has no useful sub-division, so `rps`
+                // stays fixed whatever `window_type` says.
+                step_secs: (sliding && window_secs != SECOND_SECS)
+                    .then(|| sliding_step_secs(window_secs)),
+            })
+        })
+        .collect()
 }
 
 /// Request-count dimensions (rps/rpm/rph/rpd) that carry a limit.
 pub(crate) fn request_dims(limits: &RateLimit) -> Vec<Dim> {
-    [
-        (DIM_RPS, SECOND_SECS, limits.rps),
-        (DIM_RPM, MINUTE_SECS, limits.rpm),
-        (DIM_RPH, HOUR_SECS, limits.rph),
-        (DIM_RPD, DAY_SECS, limits.rpd),
-    ]
-    .into_iter()
-    .filter_map(|(name, window_secs, limit)| {
-        limit.map(|limit| Dim {
-            name,
-            window_secs,
-            limit,
-        })
-    })
-    .collect()
+    dims(
+        limits,
+        &[
+            (DIM_RPS, SECOND_SECS, limits.rps),
+            (DIM_RPM, MINUTE_SECS, limits.rpm),
+            (DIM_RPH, HOUR_SECS, limits.rph),
+            (DIM_RPD, DAY_SECS, limits.rpd),
+        ],
+    )
 }
 
 /// Token-count dimensions (tpm/tpd) that carry a limit.
 pub(crate) fn token_dims(limits: &RateLimit) -> Vec<Dim> {
-    [
-        (DIM_TPM, MINUTE_SECS, limits.tpm),
-        (DIM_TPD, DAY_SECS, limits.tpd),
-    ]
-    .into_iter()
-    .filter_map(|(name, window_secs, limit)| {
-        limit.map(|limit| Dim {
-            name,
-            window_secs,
-            limit,
-        })
-    })
-    .collect()
+    dims(
+        limits,
+        &[
+            (DIM_TPM, MINUTE_SECS, limits.tpm),
+            (DIM_TPD, DAY_SECS, limits.tpd),
+        ],
+    )
 }
 
 /// Backend that holds the rate-limit counters for a bucket.
@@ -131,7 +150,9 @@ pub trait RateStore: Send + Sync + 'static {
     /// concurrency slot held by `member`. Like the local backend this
     /// always touches both token windows; the tpd counter is harmless
     /// when no tpd limit is configured (it simply expires unread).
-    async fn commit(&self, key: &str, tokens: u64, member: &str);
+    /// `window_type` is the one the bucket was acquired under, which
+    /// selects the counters the tokens land in.
+    async fn commit(&self, key: &str, tokens: u64, member: &str, window_type: RateLimitWindowType);
 
     /// Release the concurrency slot held by `member` without recording
     /// tokens. Sync so it can run from `Drop`; the Redis impl spawns a
@@ -142,7 +163,7 @@ pub trait RateStore: Send + Sync + 'static {
     /// Post-stream token accounting: add `tokens` to tpm/tpd only (no
     /// concurrency change). Sync so it can run from the synchronous SSE
     /// completion callback; the Redis impl makes it fire-and-forget.
-    fn add_tokens(&self, key: &str, tokens: u64);
+    fn add_tokens(&self, key: &str, tokens: u64, window_type: RateLimitWindowType);
 
     /// How often a live streaming reservation should renew its distributed
     /// concurrency lease. Local counters have no lease, so they opt out.

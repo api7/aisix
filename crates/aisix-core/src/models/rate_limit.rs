@@ -10,6 +10,10 @@
 //!
 //! Token-rate counters are minute/day only; there is no `tps` or `tph`
 //! field.
+//!
+//! `window_type: sliding` swaps the minute/hour/day windows for a rolling
+//! sum of epoch-aligned sub-buckets (see [`RateLimitWindowType`]); `rps`
+//! and `concurrency` are unaffected.
 
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +46,59 @@ pub struct RateLimit {
     /// Max concurrent in-flight requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u32>,
+
+    /// How the minute, hour, and day limits count. `rps` and `concurrency`
+    /// are unaffected.
+    #[serde(default, skip_serializing_if = "RateLimitWindowType::is_fixed")]
+    #[schemars(schema_with = "window_type_schema")]
+    pub window_type: RateLimitWindowType,
+}
+
+/// Counting algorithm for the minute, hour, and day limits of a rate limit.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitWindowType {
+    /// Each window starts at a fixed boundary (the top of the minute, hour,
+    /// or day, UTC) and its count resets to zero when the next one starts.
+    /// A burst at the end of one window and another at the start of the next
+    /// can therefore admit up to twice the limit within one window's length.
+    #[default]
+    Fixed,
+    /// A rolling window. Usage is recorded in sub-buckets aligned to a fixed
+    /// step: 10 seconds for `rpm` and `tpm`, 5 minutes for `rph`, and 1 hour
+    /// for `rpd` and `tpd`. A request is checked against the sum of the
+    /// current sub-bucket and the preceding sub-buckets that cover one full
+    /// window, so no window-length interval ever admits more than the limit.
+    /// Usage leaves the count between one window and one window plus one step
+    /// after it was recorded.
+    Sliding,
+}
+
+/// The derived schema carries no `default` for a field skipped when it holds
+/// its default, so state it explicitly.
+fn window_type_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+    use schemars::schema::{Schema, SchemaObject, SubschemaValidation};
+    let mut schema = SchemaObject {
+        subschemas: Some(Box::new(SubschemaValidation {
+            all_of: Some(vec![gen.subschema_for::<RateLimitWindowType>()]),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    schema.metadata().default = Some(serde_json::json!("fixed"));
+    Schema::Object(schema)
+}
+
+impl RateLimitWindowType {
+    pub const fn is_fixed(&self) -> bool {
+        matches!(self, Self::Fixed)
+    }
+
+    pub const fn is_sliding(&self) -> bool {
+        matches!(self, Self::Sliding)
+    }
 }
 
 impl RateLimit {
@@ -84,6 +141,12 @@ pub struct McpRateLimit {
     /// Max concurrent in-flight tool calls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<u32>,
+
+    /// How the minute, hour, and day limits count. `rps` and `concurrency`
+    /// are unaffected.
+    #[serde(default, skip_serializing_if = "RateLimitWindowType::is_fixed")]
+    #[schemars(schema_with = "window_type_schema")]
+    pub window_type: RateLimitWindowType,
 }
 
 impl McpRateLimit {
@@ -106,6 +169,7 @@ impl From<&McpRateLimit> for RateLimit {
             rph: mcp.rph,
             rpd: mcp.rpd,
             concurrency: mcp.concurrency,
+            window_type: mcp.window_type,
         }
     }
 }
@@ -138,5 +202,35 @@ mod tests {
         // schema validators in models/schema.rs).
         let rl: RateLimit = serde_json::from_str(r#"{"rpm": 10, "extra": 1}"#).unwrap();
         assert_eq!(rl.rpm, Some(10));
+    }
+
+    #[test]
+    fn window_type_defaults_to_fixed_and_serialises_only_when_sliding() {
+        let rl: RateLimit = serde_json::from_str(r#"{"rpm": 10}"#).unwrap();
+        assert_eq!(rl.window_type, RateLimitWindowType::Fixed);
+        assert!(serde_json::to_value(&rl)
+            .unwrap()
+            .get("window_type")
+            .is_none());
+
+        let rl: RateLimit =
+            serde_json::from_str(r#"{"rpm": 10, "window_type": "sliding"}"#).unwrap();
+        assert_eq!(rl.window_type, RateLimitWindowType::Sliding);
+        assert_eq!(serde_json::to_value(&rl).unwrap()["window_type"], "sliding");
+        // A window type alone limits nothing.
+        assert!(RateLimit {
+            window_type: RateLimitWindowType::Sliding,
+            ..Default::default()
+        }
+        .is_unrestricted());
+    }
+
+    #[test]
+    fn mcp_limit_carries_its_window_type_into_the_limiter_shape() {
+        let mcp: McpRateLimit =
+            serde_json::from_str(r#"{"rph": 3, "window_type": "sliding"}"#).unwrap();
+        let rl = RateLimit::from(&mcp);
+        assert_eq!(rl.rph, Some(3));
+        assert_eq!(rl.window_type, RateLimitWindowType::Sliding);
     }
 }

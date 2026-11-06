@@ -5589,7 +5589,7 @@ impl EnsembleSubcall {
 struct EnsembleCharge {
     state: ProxyState,
     /// The entry reservation's layers, which a completed run would commit.
-    entry_keys: Vec<String>,
+    entry_keys: Vec<aisix_ratelimit::BucketKey>,
     /// The panel's (or, abandoned, every returned sub-call's) usage.
     usage: aisix_gateway::chat::UsageStats,
     bounded_model: String,
@@ -5601,7 +5601,7 @@ impl EnsembleCharge {
     fn new(
         state: &ProxyState,
         snapshot: &AisixSnapshot,
-        entry_keys: Vec<String>,
+        entry_keys: Vec<aisix_ratelimit::BucketKey>,
         usage: aisix_gateway::chat::UsageStats,
         rows: &EnsembleRowCtx,
     ) -> Self {
@@ -5623,7 +5623,7 @@ impl EnsembleCharge {
     /// the judge's completion, or `StreamCompletion::default()` when the
     /// request was abandoned before the judge produced anything — which
     /// charges the panel alone and reports the request as a `499`.
-    fn settle_stream(&self, judge_keys: &[String], comp: &StreamCompletion) {
+    fn settle_stream(&self, judge_keys: &[aisix_ratelimit::BucketKey], comp: &StreamCompletion) {
         let state = &self.state;
         let limiter = &state.limiter;
         // Rate-limit accounting: the panel tokens (already round-tripped)
@@ -5784,7 +5784,7 @@ impl EnsembleCharge {
 pub(crate) struct PendingEnsemble {
     ctx: EnsembleRowCtx,
     /// The entry reservation's layers, which a completed run would charge.
-    entry_keys: Vec<String>,
+    entry_keys: Vec<aisix_ratelimit::BucketKey>,
     stream: bool,
     /// Filled by the executor as each sub-call returns.
     progress: Arc<crate::ensemble::EnsembleProgress>,

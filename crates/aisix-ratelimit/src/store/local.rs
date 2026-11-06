@@ -1,29 +1,30 @@
 //! In-process counter store — the historical, default backend.
 //!
 //! Behaviour-identical to the pre-#798 limiter: a `DashMap` of per-key
-//! fixed-window counters guarded by one `parking_lot::Mutex` each. State
+//! window counters guarded by one `parking_lot::Mutex` each. State
 //! is per-replica and not shared, so a multi-replica cluster multiplies
 //! every limit by the replica count — exactly what [`super::redis`]
 //! exists to fix. `member` is ignored here (concurrency is a plain
 //! `in_flight` counter).
 
-use aisix_core::{RateLimit, RateLimitScope};
+use aisix_core::{RateLimit, RateLimitScope, RateLimitWindowType};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
 use super::{
-    RateStore, DAY_SECS, DIM_RPD, DIM_RPH, DIM_RPM, DIM_RPS, DIM_TPD, DIM_TPM, HOUR_SECS,
-    MINUTE_SECS, SECOND_SECS,
+    request_dims, sliding_step_secs, token_dims, Dim, RateStore, DAY_SECS, DIM_RPD, DIM_RPH,
+    DIM_RPM, DIM_RPS, DIM_TPD, DIM_TPM, HOUR_SECS, MINUTE_SECS, SECOND_SECS,
 };
 use crate::clock::{Clock, SystemClock};
 use crate::error::{LimitDetail, RateLimitError};
 use crate::limiter::RateLimitStatus;
-use crate::window::{FixedWindowCounter, WindowCheck};
+use crate::window::{FixedWindowCounter, SlidingWindowCounter, WindowCheck};
 
 /// Per-key state guarded by a single mutex. Hot path locks once per
-/// request; each operation inside is O(1).
+/// request; each operation inside is O(1) for a fixed window and
+/// O(window / step) for a sliding one.
 #[derive(Debug)]
 struct KeyState {
     rps: FixedWindowCounter,
@@ -32,7 +33,36 @@ struct KeyState {
     rpd: FixedWindowCounter,
     tpm: FixedWindowCounter,
     tpd: FixedWindowCounter,
+    /// Allocated on first sliding use, so a bucket that only ever counts
+    /// fixed windows carries no sub-buckets. Separate from the fixed
+    /// counters: switching a limit's `window_type` starts from zero.
+    sliding: Option<Box<SlidingState>>,
     in_flight: u32,
+}
+
+/// Each counter is allocated on first use, so a bucket holds rings only
+/// for the dimensions its limits actually count.
+#[derive(Debug, Default)]
+struct SlidingState {
+    rpm: Option<SlidingWindowCounter>,
+    rph: Option<SlidingWindowCounter>,
+    rpd: Option<SlidingWindowCounter>,
+    tpm: Option<SlidingWindowCounter>,
+    tpd: Option<SlidingWindowCounter>,
+}
+
+impl SlidingState {
+    fn counter(&mut self, name: &str) -> &mut SlidingWindowCounter {
+        let (slot, window) = match name {
+            DIM_RPM => (&mut self.rpm, MINUTE_SECS),
+            DIM_RPH => (&mut self.rph, HOUR_SECS),
+            DIM_RPD => (&mut self.rpd, DAY_SECS),
+            DIM_TPM => (&mut self.tpm, MINUTE_SECS),
+            DIM_TPD => (&mut self.tpd, DAY_SECS),
+            other => unreachable!("dimension {other} has no sliding window"),
+        };
+        slot.get_or_insert_with(|| SlidingWindowCounter::new(window, sliding_step_secs(window)))
+    }
 }
 
 impl KeyState {
@@ -44,12 +74,66 @@ impl KeyState {
             rpd: FixedWindowCounter::new(DAY_SECS),
             tpm: FixedWindowCounter::new(MINUTE_SECS),
             tpd: FixedWindowCounter::new(DAY_SECS),
+            sliding: None,
             in_flight: 0,
+        }
+    }
+
+    fn fixed(&mut self, name: &str) -> &mut FixedWindowCounter {
+        match name {
+            DIM_RPS => &mut self.rps,
+            DIM_RPM => &mut self.rpm,
+            DIM_RPH => &mut self.rph,
+            DIM_RPD => &mut self.rpd,
+            DIM_TPM => &mut self.tpm,
+            DIM_TPD => &mut self.tpd,
+            other => unreachable!("unknown dimension {other}"),
+        }
+    }
+
+    fn sliding(&mut self, name: &str) -> &mut SlidingWindowCounter {
+        self.sliding.get_or_insert_with(Box::default).counter(name)
+    }
+
+    fn check_and_increment(&mut self, d: &Dim, now: u64) -> WindowCheck {
+        match d.step_secs {
+            None => self.fixed(d.name).check_and_increment(now, 1, d.limit),
+            Some(_) => self.sliding(d.name).check_and_increment(now, 1, d.limit),
+        }
+    }
+
+    fn decrement(&mut self, d: &Dim, now: u64) {
+        match d.step_secs {
+            None => self.fixed(d.name).decrement(now, 1),
+            Some(_) => self.sliding(d.name).decrement(now, 1),
+        }
+    }
+
+    fn current(&mut self, d: &Dim, now: u64) -> u64 {
+        match d.step_secs {
+            None => self.fixed(d.name).current(now),
+            Some(_) => self.sliding(d.name).current(now),
+        }
+    }
+
+    fn is_exceeded(&mut self, d: &Dim, now: u64) -> Option<u64> {
+        match d.step_secs {
+            None => self.fixed(d.name).is_exceeded(now, d.limit),
+            Some(_) => self.sliding(d.name).is_exceeded(now, d.limit),
+        }
+    }
+
+    fn add_tokens(&mut self, now: u64, tokens: u64, window_type: RateLimitWindowType) {
+        for name in [DIM_TPM, DIM_TPD] {
+            match window_type {
+                RateLimitWindowType::Fixed => self.fixed(name).add(now, tokens),
+                RateLimitWindowType::Sliding => self.sliding(name).add(now, tokens),
+            }
         }
     }
 }
 
-/// Per-process fixed-window store.
+/// Per-process window store.
 pub struct LocalStore<C: Clock = SystemClock> {
     states: DashMap<String, Arc<Mutex<KeyState>>>,
     clock: C,
@@ -108,20 +192,12 @@ impl<C: Clock> RateStore for LocalStore<C> {
         }
 
         // Token limits — checked but not incremented. We refuse new
-        // requests if the previous minute/day already overran the cap.
-        if let Some(max) = limits.tpm {
-            if let Some(retry) = s.tpm.is_exceeded(now, max) {
+        // requests if the window already reached the cap.
+        for d in token_dims(limits) {
+            if let Some(retry) = s.is_exceeded(&d, now) {
                 return Err(RateLimitError::Tokens {
                     scope: RateLimitScope::Tokens,
-                    detail: LimitDetail::window(DIM_TPM, max, s.tpm.current(now), retry),
-                });
-            }
-        }
-        if let Some(max) = limits.tpd {
-            if let Some(retry) = s.tpd.is_exceeded(now, max) {
-                return Err(RateLimitError::Tokens {
-                    scope: RateLimitScope::Tokens,
-                    detail: LimitDetail::window(DIM_TPD, max, s.tpd.current(now), retry),
+                    detail: LimitDetail::window(d.name, d.limit, s.current(&d, now), retry),
                 });
             }
         }
@@ -134,71 +210,14 @@ impl<C: Clock> RateStore for LocalStore<C> {
         // requests' increments survive.
         //
         // Each rejection first reads the refused window's own state for
-        // the 429's `x-ratelimit-*` headers. The read has to happen
-        // before the roll-backs below, and the result must be bound out
-        // of the `if let` scrutinee — an `if let` over the call itself
-        // would hold the counter borrowed across the body.
-        let mut rps_incremented = false;
-        if let Some(max) = limits.rps {
-            let check = s.rps.check_and_increment(now, 1, max);
-            if let WindowCheck::Full { retry_after_secs } = check {
+        // the 429's `x-ratelimit-*` headers, before the roll-backs.
+        let dims = request_dims(limits);
+        for (i, d) in dims.iter().enumerate() {
+            if let WindowCheck::Full { retry_after_secs } = s.check_and_increment(d, now) {
                 let detail =
-                    LimitDetail::window(DIM_RPS, max, s.rps.current(now), retry_after_secs);
-                return Err(RateLimitError::Requests {
-                    scope: RateLimitScope::Requests,
-                    detail,
-                });
-            }
-            rps_incremented = true;
-        }
-        let mut rpm_incremented = false;
-        if let Some(max) = limits.rpm {
-            let check = s.rpm.check_and_increment(now, 1, max);
-            if let WindowCheck::Full { retry_after_secs } = check {
-                let detail =
-                    LimitDetail::window(DIM_RPM, max, s.rpm.current(now), retry_after_secs);
-                if rps_incremented {
-                    s.rps.decrement(now, 1);
-                }
-                return Err(RateLimitError::Requests {
-                    scope: RateLimitScope::Requests,
-                    detail,
-                });
-            }
-            rpm_incremented = true;
-        }
-        let mut rph_incremented = false;
-        if let Some(max) = limits.rph {
-            let check = s.rph.check_and_increment(now, 1, max);
-            if let WindowCheck::Full { retry_after_secs } = check {
-                let detail =
-                    LimitDetail::window(DIM_RPH, max, s.rph.current(now), retry_after_secs);
-                if rpm_incremented {
-                    s.rpm.decrement(now, 1);
-                }
-                if rps_incremented {
-                    s.rps.decrement(now, 1);
-                }
-                return Err(RateLimitError::Requests {
-                    scope: RateLimitScope::Requests,
-                    detail,
-                });
-            }
-            rph_incremented = true;
-        }
-        if let Some(max) = limits.rpd {
-            let check = s.rpd.check_and_increment(now, 1, max);
-            if let WindowCheck::Full { retry_after_secs } = check {
-                let detail =
-                    LimitDetail::window(DIM_RPD, max, s.rpd.current(now), retry_after_secs);
-                if rph_incremented {
-                    s.rph.decrement(now, 1);
-                }
-                if rpm_incremented {
-                    s.rpm.decrement(now, 1);
-                }
-                if rps_incremented {
-                    s.rps.decrement(now, 1);
+                    LimitDetail::window(d.name, d.limit, s.current(d, now), retry_after_secs);
+                for earlier in &dims[..i] {
+                    s.decrement(earlier, now);
                 }
                 return Err(RateLimitError::Requests {
                     scope: RateLimitScope::Requests,
@@ -211,12 +230,17 @@ impl<C: Clock> RateStore for LocalStore<C> {
         Ok(())
     }
 
-    async fn commit(&self, key: &str, tokens: u64, _member: &str) {
+    async fn commit(
+        &self,
+        key: &str,
+        tokens: u64,
+        _member: &str,
+        window_type: RateLimitWindowType,
+    ) {
         let now = self.clock.unix_secs();
         let state = self.state_for(key);
         let mut s = state.lock();
-        s.tpm.add(now, tokens);
-        s.tpd.add(now, tokens);
+        s.add_tokens(now, tokens, window_type);
         s.in_flight = s.in_flight.saturating_sub(1);
     }
 
@@ -230,15 +254,14 @@ impl<C: Clock> RateStore for LocalStore<C> {
         }
     }
 
-    fn add_tokens(&self, key: &str, tokens: u64) {
+    fn add_tokens(&self, key: &str, tokens: u64, window_type: RateLimitWindowType) {
         if tokens == 0 {
             return;
         }
         let now = self.clock.unix_secs();
         let state = self.state_for(key);
         let mut s = state.lock();
-        s.tpm.add(now, tokens);
-        s.tpd.add(now, tokens);
+        s.add_tokens(now, tokens, window_type);
     }
 
     /// Never shrinks: a key's state is kept for the life of the process.
@@ -251,21 +274,36 @@ impl<C: Clock> RateStore for LocalStore<C> {
         let state = self.states.get(key)?;
         let mut s = state.lock();
 
-        let rpm_used = s.rpm.current(now);
-        let tpm_used = s.tpm.current(now);
         let in_flight = s.in_flight;
 
-        // Seconds remaining in the current minute-window. Zero if the
-        // window just started or has already rolled.
-        let minute_reset = MINUTE_SECS - (now % MINUTE_SECS);
+        let (rpm_used, rpm_reset_secs, tpm_used, tpm_reset_secs) =
+            if limits.window_type.is_sliding() {
+                // Reset is when everything counted now has left the window.
+                let read = |c: Option<&SlidingWindowCounter>| {
+                    c.map_or((0, 0), |c| (c.current(now), c.reset_secs(now)))
+                };
+                let sl = s.sliding.as_deref();
+                let rpm = read(sl.and_then(|sl| sl.rpm.as_ref()));
+                let tpm = read(sl.and_then(|sl| sl.tpm.as_ref()));
+                (rpm.0, rpm.1, tpm.0, tpm.1)
+            } else {
+                // Seconds remaining in the current minute-window.
+                let minute_reset = MINUTE_SECS - (now % MINUTE_SECS);
+                (
+                    s.rpm.current(now),
+                    minute_reset,
+                    s.tpm.current(now),
+                    minute_reset,
+                )
+            };
 
         Some(RateLimitStatus {
             rpm_limit: limits.rpm,
             rpm_used,
-            rpm_reset_secs: minute_reset,
+            rpm_reset_secs,
             tpm_limit: limits.tpm,
             tpm_used,
-            tpm_reset_secs: minute_reset,
+            tpm_reset_secs,
             concurrency_limit: limits.concurrency,
             in_flight,
         })

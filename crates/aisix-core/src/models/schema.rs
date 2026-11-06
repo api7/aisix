@@ -3635,6 +3635,42 @@ mod tests {
     }
 
     #[test]
+    fn window_type_is_accepted_on_every_windowed_limit_and_nowhere_else() {
+        let hash = "9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20";
+        for wt in ["fixed", "sliding"] {
+            validate_apikey(&json!({
+                "key_hash": hash,
+                "rate_limit": {"rph": 10, "window_type": wt},
+                "mcp_rate_limits": {"github": {"rpm": 1, "window_type": wt}},
+            }))
+            .unwrap();
+            validate_model(&json!({
+                "display_name": "m", "provider": "openai", "model_name": "gpt-4o",
+                "provider_key_id": "11111111-1111-1111-1111-111111111111",
+                "rate_limit": {"rpm": 10, "window_type": wt}
+            }))
+            .unwrap();
+            validate_rate_limit_policy(&json!({
+                "name": "p",
+                "conditions": [{"dimension": "team", "operator": "in", "value": ["t-1"]}],
+                "limits": {"rpm": 20, "window_type": wt}
+            }))
+            .unwrap();
+        }
+        assert!(validate_apikey(&json!({
+            "key_hash": hash,
+            "rate_limit": {"rpm": 1, "window_type": "rolling"},
+        }))
+        .is_err());
+        // The classic window/max_* policy shape does not take it.
+        assert!(validate_rate_limit_policy(&json!({
+            "name": "team-quota", "scope": "team", "scope_ref": "t",
+            "window": "minute", "max_requests": 100, "window_type": "sliding"
+        }))
+        .is_err());
+    }
+
+    #[test]
     fn apikey_mcp_access_block_passes() {
         let v = json!({
             "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",

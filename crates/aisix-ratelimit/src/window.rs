@@ -1,8 +1,10 @@
-//! Fixed-window counter.
+//! Window counters.
 //!
-//! A single counter that resets at the start of every new window. Used
-//! for both the per-minute and per-day dimensions; callers instantiate
-//! one per dimension with the matching `window_secs`.
+//! [`FixedWindowCounter`] is a single counter that resets at the start of
+//! every new window; callers instantiate one per dimension with the
+//! matching `window_secs`. [`SlidingWindowCounter`] is the
+//! `window_type: sliding` variant: epoch-aligned sub-buckets of `step_secs`
+//! summed over a rolling window.
 //!
 //! Not thread-safe on its own — the caller is expected to hold the
 //! `KeyState` guard before touching it. That keeps the hot path lock-
@@ -112,6 +114,144 @@ impl FixedWindowCounter {
         } else {
             None
         }
+    }
+}
+
+/// Rolling-window counter built from epoch-aligned sub-buckets.
+///
+/// A sub-bucket starts at a multiple of `step_secs`. The usage at `now` is
+/// the sum of every sub-bucket whose start is at or after
+/// `floor(now / step) * step - window`: the current sub-bucket plus the
+/// `window / step` whole ones before it. Every admission inside any
+/// `window`-long interval ending at `now` lands in one of those, so no such
+/// interval admits more than the limit. A unit recorded at `t` leaves the
+/// sum between `window` and `window + step` after `t`.
+///
+/// The ring holds exactly the sub-buckets that can be in the sum, so memory
+/// is bounded by `window / step + 1` and does not grow with the limit. The
+/// Redis backend's scripts implement the same arithmetic.
+#[derive(Debug)]
+pub struct SlidingWindowCounter {
+    window_secs: u64,
+    step_secs: u64,
+    /// `(sub-bucket start, count)`, indexed by `(start / step) % len`.
+    slots: Vec<(u64, u64)>,
+}
+
+impl SlidingWindowCounter {
+    pub fn new(window_secs: u64, step_secs: u64) -> Self {
+        assert!(
+            step_secs > 0 && window_secs.is_multiple_of(step_secs),
+            "window must be a positive multiple of step"
+        );
+        let len = (window_secs / step_secs + 1) as usize;
+        Self {
+            window_secs,
+            step_secs,
+            slots: vec![(0, 0); len],
+        }
+    }
+
+    fn current_start(&self, now_secs: u64) -> u64 {
+        (now_secs / self.step_secs) * self.step_secs
+    }
+
+    /// Count recorded in the sub-bucket starting at `start`, or zero when
+    /// its slot has since been reused for a newer one.
+    fn count_at(&self, start: u64) -> u64 {
+        let (slot_start, count) =
+            self.slots[((start / self.step_secs) as usize) % self.slots.len()];
+        if slot_start == start {
+            count
+        } else {
+            0
+        }
+    }
+
+    /// Starts of the sub-buckets in the sum at `now`, oldest first.
+    fn starts_in_window(&self, now_secs: u64) -> impl Iterator<Item = u64> {
+        let cur = self.current_start(now_secs);
+        let step = self.step_secs as usize;
+        (cur.saturating_sub(self.window_secs)..=cur).step_by(step)
+    }
+
+    fn current_slot(&mut self, now_secs: u64) -> &mut u64 {
+        let cur = self.current_start(now_secs);
+        let len = self.slots.len();
+        let slot = &mut self.slots[((cur / self.step_secs) as usize) % len];
+        if slot.0 != cur {
+            *slot = (cur, 0);
+        }
+        &mut slot.1
+    }
+
+    /// Seconds from `now` until enough of the oldest sub-buckets have left
+    /// the sum to drop it by at least `need`. At least 1.
+    fn secs_until_released(&self, now_secs: u64, need: u64) -> u64 {
+        let mut released = 0u64;
+        for start in self.starts_in_window(now_secs) {
+            released = released.saturating_add(self.count_at(start));
+            if released >= need {
+                let expiry = start + self.window_secs + self.step_secs;
+                return expiry.saturating_sub(now_secs).max(1);
+            }
+        }
+        // Unreachable while `need` never exceeds the sum; the whole window
+        // plus a step is the longest any recorded unit can stay counted.
+        (self.window_secs + self.step_secs).max(1)
+    }
+
+    /// Check whether `delta` more units fit under `limit`. If yes, record
+    /// them in the current sub-bucket; if not, report how long until enough
+    /// old sub-buckets expire for them to fit.
+    pub fn check_and_increment(&mut self, now_secs: u64, delta: u64, limit: u64) -> WindowCheck {
+        let used = self.current(now_secs);
+        let would_be = used.saturating_add(delta);
+        if would_be > limit {
+            return WindowCheck::Full {
+                retry_after_secs: self.secs_until_released(now_secs, would_be - limit),
+            };
+        }
+        *self.current_slot(now_secs) += delta;
+        WindowCheck::Ok
+    }
+
+    /// Record `delta` in the current sub-bucket without a check.
+    pub fn add(&mut self, now_secs: u64, delta: u64) {
+        let slot = self.current_slot(now_secs);
+        *slot = slot.saturating_add(delta);
+    }
+
+    /// Undo `delta` from the current sub-bucket, saturating at zero. Only
+    /// used to roll back an increment made at the same `now`.
+    pub fn decrement(&mut self, now_secs: u64, delta: u64) {
+        let slot = self.current_slot(now_secs);
+        *slot = slot.saturating_sub(delta);
+    }
+
+    /// Rolling usage at `now`.
+    pub fn current(&self, now_secs: u64) -> u64 {
+        self.starts_in_window(now_secs)
+            .map(|start| self.count_at(start))
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Like [`FixedWindowCounter::is_exceeded`]: usage at or past `limit`
+    /// is spent. The hint is how long until the sum drops below `limit`.
+    pub fn is_exceeded(&self, now_secs: u64, limit: u64) -> Option<u64> {
+        let used = self.current(now_secs);
+        (used >= limit).then(|| self.secs_until_released(now_secs, used - limit + 1))
+    }
+
+    /// Seconds until everything counted now has left the window, which is
+    /// when the counter is back to its initial state. Zero when nothing is
+    /// counted.
+    pub fn reset_secs(&self, now_secs: u64) -> u64 {
+        self.starts_in_window(now_secs)
+            .filter(|&start| self.count_at(start) > 0)
+            .last()
+            .map(|start| (start + self.window_secs + self.step_secs).saturating_sub(now_secs))
+            .unwrap_or(0)
     }
 }
 
@@ -240,5 +380,152 @@ mod tests {
         // would be 0, but we clamp to 1 so clients don't spin.
         let hint = w.is_exceeded(119, 100).unwrap();
         assert!(hint >= 1);
+    }
+
+    // --- SlidingWindowCounter ------------------------------------------
+
+    /// An epoch-aligned base well past zero, so `cur - window` never
+    /// saturates and every sub-bucket in the sum is a real one.
+    const T0: u64 = 1_700_000_000 - 1_700_000_000 % 3_600;
+
+    #[test]
+    fn sliding_sums_the_current_and_preceding_window_of_sub_buckets() {
+        let mut w = SlidingWindowCounter::new(60, 10);
+        w.add(T0 + 5, 1); // sub-bucket T0
+        w.add(T0 + 25, 2); // sub-bucket T0+20
+        w.add(T0 + 59, 4); // sub-bucket T0+50
+        assert_eq!(w.current(T0 + 59), 7);
+        // At T0+60..69 the sum starts at T0: all three still count.
+        assert_eq!(w.current(T0 + 69), 7);
+        // At T0+70 the sum starts at T0+10: the T0 sub-bucket left.
+        assert_eq!(w.current(T0 + 70), 6);
+        // At T0+90 it starts at T0+30: only T0+50 remains.
+        assert_eq!(w.current(T0 + 90), 4);
+        assert_eq!(w.current(T0 + 120), 0);
+    }
+
+    #[test]
+    fn sliding_refuses_a_burst_across_the_fixed_boundary() {
+        // A fixed window resets at T0+60 and admits 3 more at once; the
+        // sliding one keeps counting the 3 admitted just before it.
+        let mut fixed = FixedWindowCounter::new(60);
+        let mut sliding = SlidingWindowCounter::new(60, 10);
+        for _ in 0..3 {
+            assert_eq!(fixed.check_and_increment(T0 + 58, 1, 3), WindowCheck::Ok);
+            assert_eq!(sliding.check_and_increment(T0 + 58, 1, 3), WindowCheck::Ok);
+        }
+        assert_eq!(fixed.check_and_increment(T0 + 61, 1, 3), WindowCheck::Ok);
+        assert_eq!(
+            sliding.check_and_increment(T0 + 61, 1, 3),
+            // The three sit in sub-bucket T0+50, which leaves the sum at
+            // T0+50+60+10 = T0+120.
+            WindowCheck::Full {
+                retry_after_secs: 59
+            }
+        );
+    }
+
+    #[test]
+    fn sliding_retry_is_the_wait_for_just_enough_old_sub_buckets() {
+        let mut w = SlidingWindowCounter::new(60, 10);
+        w.add(T0 + 3, 1); // leaves at T0+70
+        w.add(T0 + 14, 2); // leaves at T0+80
+        w.add(T0 + 31, 2); // leaves at T0+100
+                           // Limit 5, used 5: one more needs 1 released → the T0 sub-bucket.
+        assert_eq!(
+            w.check_and_increment(T0 + 40, 1, 5),
+            WindowCheck::Full {
+                retry_after_secs: 30
+            }
+        );
+        // Limit 3: one more needs 3 released → T0 and T0+10 together.
+        assert_eq!(
+            w.check_and_increment(T0 + 40, 1, 3),
+            WindowCheck::Full {
+                retry_after_secs: 40
+            }
+        );
+        // Token form: used 5 against limit 4 needs the sum below 4, i.e.
+        // 2 released → T0 and T0+10.
+        assert_eq!(w.is_exceeded(T0 + 40, 4), Some(40));
+        assert_eq!(w.is_exceeded(T0 + 40, 6), None);
+        // Refusals record nothing.
+        assert_eq!(w.current(T0 + 40), 5);
+        // And the predicted instants are when it really admits again.
+        assert_eq!(
+            w.check_and_increment(T0 + 69, 1, 5),
+            WindowCheck::Full {
+                retry_after_secs: 1
+            }
+        );
+        assert_eq!(w.check_and_increment(T0 + 70, 1, 5), WindowCheck::Ok);
+    }
+
+    #[test]
+    fn sliding_release_is_never_before_the_window_and_at_most_a_step_after() {
+        for offset in 0..10 {
+            let mut w = SlidingWindowCounter::new(60, 10);
+            let at = T0 + offset;
+            assert_eq!(w.check_and_increment(at, 1, 1), WindowCheck::Ok);
+            let mut t = at + 1;
+            let mut hints = Vec::new();
+            while let WindowCheck::Full { retry_after_secs } = w.check_and_increment(t, 1, 1) {
+                hints.push((t, retry_after_secs));
+                t += 1;
+            }
+            // Every refusal's hint named exactly the second it admits again.
+            for (refused_at, hint) in hints {
+                assert_eq!(
+                    refused_at + hint,
+                    t,
+                    "offset {offset}, refused at {refused_at}"
+                );
+            }
+            let released_after = t - at;
+            assert!(
+                (60..=70).contains(&released_after),
+                "offset {offset}: released after {released_after}s"
+            );
+        }
+    }
+
+    #[test]
+    fn sliding_decrement_undoes_only_the_current_sub_bucket() {
+        let mut w = SlidingWindowCounter::new(60, 10);
+        w.add(T0, 3);
+        w.add(T0 + 10, 1);
+        w.decrement(T0 + 10, 1);
+        assert_eq!(w.current(T0 + 10), 3);
+        w.decrement(T0 + 10, 5);
+        assert_eq!(w.current(T0 + 10), 3, "saturates in its own sub-bucket");
+    }
+
+    #[test]
+    fn sliding_reset_is_when_the_newest_usage_leaves() {
+        let mut w = SlidingWindowCounter::new(60, 10);
+        assert_eq!(w.reset_secs(T0), 0, "nothing counted, nothing to wait for");
+        w.add(T0 + 2, 1);
+        w.add(T0 + 33, 1); // sub-bucket T0+30 leaves at T0+100
+        assert_eq!(w.reset_secs(T0 + 40), 60);
+        assert_eq!(w.reset_secs(T0 + 99), 1);
+        assert_eq!(w.reset_secs(T0 + 100), 0);
+    }
+
+    #[test]
+    fn sliding_storage_does_not_grow_with_use() {
+        let mut w = SlidingWindowCounter::new(3_600, 300);
+        for t in (0..20_000).step_by(7) {
+            w.add(T0 + t, 1_000);
+        }
+        assert_eq!(w.slots.len(), 13);
+        // Only the last 13 sub-buckets are in the sum.
+        let now = T0 + 19_999;
+        let cur = now - now % 300;
+        let expected: u64 = (0..20_000)
+            .step_by(7)
+            .filter(|t| T0 + t >= cur - 3_600)
+            .count() as u64
+            * 1_000;
+        assert_eq!(w.current(now), expected);
     }
 }
