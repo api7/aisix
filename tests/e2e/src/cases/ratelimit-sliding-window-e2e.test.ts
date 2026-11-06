@@ -225,16 +225,18 @@ describe("rate limit e2e: sliding window", () => {
     await sleepUntil(minute + WINDOW + 1);
     before = nowSecs();
     const acrossBoundary = await chat(RPM_CALLER);
+    const after = nowSecs();
     const reset = expectRefusal(acrossBoundary, {
       scope: "rpm",
       limit: 2,
       bucketStart: lastBucket,
       before,
-      after: nowSecs(),
+      after,
     });
 
-    // Retrying when told is admitted.
-    await sleepUntil(before + reset);
+    // Retrying when told is admitted. The gateway read its clock somewhere
+    // inside the request, so count the wait from its end.
+    await sleepUntil(after + reset);
     expect((await chat(RPM_CALLER)).status).toBe(200);
   }, 150_000);
 
