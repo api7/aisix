@@ -9,10 +9,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aisix_core::{RateLimit, RateLimitScope, RedisConnConfig, RedisMode};
+use aisix_core::{RateLimit, RateLimitScope, RateLimitWindowType, RedisConnConfig, RedisMode};
+
+const FIXED: RateLimitWindowType = RateLimitWindowType::Fixed;
 use aisix_obs::metrics::Metrics;
 use aisix_ratelimit::{
-    store::redis::DEFAULT_PREFIX, Limiter, MultiReservation, RateStore, RedisStore,
+    store::redis::DEFAULT_PREFIX, Limiter, MultiReservation, RateLimitError, RateStore, RedisStore,
     StreamLeaseRefresh,
 };
 
@@ -270,7 +272,7 @@ async fn token_usage_is_shared_across_replicas() {
     a.acquire(&key, &limits, "a-1")
         .await
         .expect("first allowed");
-    a.commit(&key, 1_500, "a-1").await;
+    a.commit(&key, 1_500, "a-1", FIXED).await;
 
     // B's pre-check sees tpm > 1000 on the shared counter → rejected.
     let err = b
@@ -305,7 +307,7 @@ async fn a_token_window_exactly_on_the_limit_refuses_the_next_request() {
     a.acquire(&key, &limits, "a-1")
         .await
         .expect("first allowed");
-    a.commit(&key, 1_000, "a-1").await; // the whole budget, exactly
+    a.commit(&key, 1_000, "a-1", FIXED).await; // the whole budget, exactly
 
     let err = b
         .acquire(&key, &limits, "b-1")
@@ -322,7 +324,7 @@ async fn a_token_window_exactly_on_the_limit_refuses_the_next_request() {
     a.acquire(&under, &limits, "a-2")
         .await
         .expect("first allowed");
-    a.commit(&under, 999, "a-2").await;
+    a.commit(&under, 999, "a-2", FIXED).await;
     b.acquire(&under, &limits, "b-2")
         .await
         .expect("one token of budget left still admits");
@@ -421,7 +423,7 @@ async fn refreshing_released_member_does_not_recreate_slot() {
     // `commit` removes the member synchronously in Redis and clears the
     // store's ownership record. A queued refresh must neither recreate it
     // nor convert this normal teardown into a terminal stream signal.
-    a.commit(&key, 0, "a-stream").await;
+    a.commit(&key, 0, "a-stream", FIXED).await;
     assert_eq!(
         a.refresh_stream_lease_outcome(&key, "a-stream").await,
         StreamLeaseRefresh::Unavailable,
@@ -674,7 +676,7 @@ async fn cluster_shared_counter_routes_multi_key_lua() {
         .await
         .expect("first allowed on cluster");
     // commit also runs a multi-key script on the same slot.
-    a.commit(&key, 10, "a-1").await;
+    a.commit(&key, 10, "a-1", FIXED).await;
     // Second replica is rejected by the shared rpm counter — assert the
     // specific rejection, not just any error (which would also pass on a
     // routing/connection failure and mask a real cluster regression).
@@ -1090,7 +1092,7 @@ async fn an_ambiguous_acquire_promotes_when_redis_confirms_the_member() {
         .acquire(&warmup_key, &limits, "warmup")
         .await
         .expect("warm acquire loads the Lua script");
-    store.commit(&warmup_key, 0, "warmup").await;
+    store.commit(&warmup_key, 0, "warmup", FIXED).await;
 
     let key = unique_key("ambiguous-stream-acquire");
     let member = "ambiguous-stream-member";
@@ -1279,7 +1281,7 @@ async fn a_store_that_never_connected_fails_open_and_attaches_later() {
         .expect("peek falls back to the local window");
     assert_eq!(status.rpm_limit, Some(1));
     assert_eq!(status.rpm_used, 1);
-    store.add_tokens(&key, 7);
+    store.add_tokens(&key, 7, FIXED);
     store.release(&key, "boot-1");
 
     // The degradation is counted, which is the only signal it produces
@@ -1327,7 +1329,7 @@ async fn wait_for_attach(store: &RedisStore, peer: &RedisStore) {
     };
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
-        store.add_tokens(&probe, 1);
+        store.add_tokens(&probe, 1, FIXED);
         tokio::time::sleep(Duration::from_millis(200)).await;
         if peer
             .peek(&probe, &limits)
@@ -1386,7 +1388,7 @@ async fn a_commit_after_the_backend_attaches_returns_the_local_slot() {
     wait_for_attach(&store, &peer).await;
 
     // Committed against the shared backend, which never held the member.
-    store.commit(&key, 0, "handover-1").await;
+    store.commit(&key, 0, "handover-1", FIXED).await;
 
     // Now force the store back onto the local counters and check the slot
     // came back. Without the release in `commit` this refuses.
@@ -1531,4 +1533,349 @@ async fn a_refused_credential_corrected_on_the_server_is_adopted_without_a_resta
         .arg(&user)
         .query_async::<()>(&mut handle)
         .await;
+}
+
+// --- window_type: sliding ------------------------------------------------
+
+fn sliding(limits: RateLimit) -> RateLimit {
+    RateLimit {
+        window_type: RateLimitWindowType::Sliding,
+        ..limits
+    }
+}
+
+async fn raw_conn(url: &str) -> redis::aio::MultiplexedConnection {
+    redis::Client::open(url)
+        .expect("raw Redis client")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("raw Redis connection")
+}
+
+/// Redis `TIME` seconds, waiting until at least `headroom` seconds remain
+/// in the current `step`-second sub-bucket so a test's acquires all land
+/// in the sub-bucket it computed.
+async fn server_now_with_headroom(
+    raw: &mut redis::aio::MultiplexedConnection,
+    step: u64,
+    headroom: u64,
+) -> u64 {
+    loop {
+        let time: Vec<String> = redis::cmd("TIME").query_async(raw).await.expect("TIME");
+        let now: u64 = time[0].parse().expect("TIME seconds");
+        if step - now % step > headroom {
+            return now;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn server_now(raw: &mut redis::aio::MultiplexedConnection) -> u64 {
+    let time: Vec<String> = redis::cmd("TIME").query_async(raw).await.expect("TIME");
+    time[0].parse().expect("TIME seconds")
+}
+
+async fn fixed_keys(raw: &mut redis::aio::MultiplexedConnection, key: &str) -> Vec<String> {
+    let mut found: Vec<String> = redis::cmd("KEYS")
+        .arg(format!("{DEFAULT_PREFIX}:{{{key}}}:*"))
+        .query_async(raw)
+        .await
+        .expect("KEYS");
+    found.retain(|k| !k.contains(":sw:"));
+    found.sort();
+    found
+}
+
+#[tokio::test]
+async fn sliding_rpm_is_shared_in_one_hash_under_the_bucket_tag() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let a = store(&url).await;
+    let b = store(&url).await;
+    let mut raw = raw_conn(&url).await;
+    let key = unique_key("sw-rpm");
+    let limits = sliding(RateLimit {
+        rpm: Some(2),
+        ..rl()
+    });
+
+    let now = server_now_with_headroom(&mut raw, 10, 3).await;
+    let cur = now - now % 10;
+    a.acquire(&key, &limits, "a-1").await.expect("first");
+    b.acquire(&key, &limits, "b-1").await.expect("second");
+    let err = a.acquire(&key, &limits, "a-2").await.unwrap_err();
+    let RateLimitError::Requests { detail, .. } = err else {
+        panic!("expected a request refusal, got {err:?}");
+    };
+    assert_eq!(detail.dimension, "rpm");
+    assert_eq!(detail.limit, 2);
+    assert_eq!(detail.remaining, 0);
+    // Both sit in sub-bucket `cur`, which leaves the sum at cur + 70.
+    let after = server_now(&mut raw).await;
+    assert!(
+        (cur + 70 - after..=cur + 70 - now).contains(&detail.reset_secs),
+        "reset {} not cur+70-now (now {now}, cur {cur})",
+        detail.reset_secs
+    );
+
+    let hash = format!("{DEFAULT_PREFIX}:{{{key}}}:sw:rpm");
+    let fields: std::collections::HashMap<String, u64> = redis::cmd("HGETALL")
+        .arg(&hash)
+        .query_async(&mut raw)
+        .await
+        .expect("HGETALL");
+    assert_eq!(fields, [(cur.to_string(), 2)].into_iter().collect());
+    let ttl: i64 = redis::cmd("TTL")
+        .arg(&hash)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!((60..=75).contains(&ttl), "ttl {ttl}");
+    // The fixed key space is untouched: switching window_type starts over.
+    assert!(fixed_keys(&mut raw, &key).await.is_empty());
+}
+
+#[tokio::test]
+async fn sliding_counts_older_sub_buckets_and_prunes_expired_ones() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let s = store(&url).await;
+    let mut raw = raw_conn(&url).await;
+    let key = unique_key("sw-seeded");
+    let hash = format!("{DEFAULT_PREFIX}:{{{key}}}:sw:rpm");
+    let limits = sliding(RateLimit {
+        rpm: Some(4),
+        ..rl()
+    });
+
+    let now = server_now_with_headroom(&mut raw, 10, 3).await;
+    let cur = now - now % 10;
+    // Earlier traffic: the oldest sub-bucket still in the sum, one in the
+    // middle, and one that has already left it.
+    let _: () = redis::cmd("HSET")
+        .arg(&hash)
+        .arg((cur - 60).to_string())
+        .arg(2)
+        .arg((cur - 30).to_string())
+        .arg(1)
+        .arg((cur - 70).to_string())
+        .arg(50)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+
+    s.acquire(&key, &limits, "m-1").await.expect("3 of 4 used");
+    let err = s.acquire(&key, &limits, "m-2").await.unwrap_err();
+    assert_eq!(err.detail().dimension, "rpm");
+    // Used 4: one more needs 1 released → the cur-60 sub-bucket, which
+    // leaves at cur + 10.
+    let after = server_now(&mut raw).await;
+    let reset = err.detail().reset_secs;
+    assert!(
+        (cur + 10 - after..=cur + 10 - now).contains(&reset),
+        "reset {reset} (now {now}, cur {cur})"
+    );
+    let gone: bool = redis::cmd("HEXISTS")
+        .arg(&hash)
+        .arg((cur - 70).to_string())
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(
+        !gone,
+        "a sub-bucket older than the window is pruned on write"
+    );
+}
+
+#[tokio::test]
+async fn sliding_tokens_land_in_their_own_sub_buckets() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let limiter = Limiter::with_store(Arc::new(store(&url).await));
+    let mut raw = raw_conn(&url).await;
+    let key = unique_key("sw-tokens");
+    let limits = sliding(RateLimit {
+        tpm: Some(100),
+        tpd: Some(10_000),
+        ..rl()
+    });
+
+    let now = server_now_with_headroom(&mut raw, 10, 3).await;
+    let cur = now - now % 10;
+    limiter
+        .pre_commit(&key, &limits)
+        .await
+        .unwrap()
+        .commit_tokens(60)
+        .await;
+    let held = MultiReservation::new(vec![limiter.pre_commit(&key, &limits).await.unwrap()]);
+    let buckets = held.keys();
+    drop(held.into_stream_hold());
+    limiter.add_tokens_post_stream(&buckets[0], 50);
+
+    let tpm = format!("{DEFAULT_PREFIX}:{{{key}}}:sw:tpm");
+    let tpd = format!("{DEFAULT_PREFIX}:{{{key}}}:sw:tpd");
+    // add_tokens is fire-and-forget.
+    let mut tpm_fields = std::collections::HashMap::<String, u64>::new();
+    for _ in 0..40 {
+        tpm_fields = redis::cmd("HGETALL")
+            .arg(&tpm)
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        if tpm_fields.get(&cur.to_string()) == Some(&110) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(tpm_fields, [(cur.to_string(), 110)].into_iter().collect());
+    let day_start = now - now % 3_600;
+    let tpd_fields: std::collections::HashMap<String, u64> = redis::cmd("HGETALL")
+        .arg(&tpd)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(
+        tpd_fields,
+        [(day_start.to_string(), 110)].into_iter().collect()
+    );
+
+    let err = limiter.pre_commit(&key, &limits).await.unwrap_err();
+    let RateLimitError::Tokens { detail, .. } = err else {
+        panic!("expected a token refusal, got {err:?}");
+    };
+    assert_eq!(detail.dimension, "tpm");
+    assert_eq!(detail.remaining, 0);
+    assert!(fixed_keys(&mut raw, &key).await.is_empty());
+}
+
+#[tokio::test]
+async fn sliding_peek_reports_rolling_usage_on_the_shared_backend() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let limiter = Limiter::with_store(Arc::new(store(&url).await));
+    let mut raw = raw_conn(&url).await;
+    let key = unique_key("sw-peek");
+    let limits = sliding(RateLimit {
+        rpm: Some(5),
+        tpm: Some(1_000),
+        ..rl()
+    });
+    let hash = format!("{DEFAULT_PREFIX}:{{{key}}}:sw:rpm");
+    let now = server_now_with_headroom(&mut raw, 10, 3).await;
+    let cur = now - now % 10;
+    let _: () = redis::cmd("HSET")
+        .arg(&hash)
+        .arg((cur - 40).to_string())
+        .arg(2)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    limiter
+        .pre_commit(&key, &limits)
+        .await
+        .unwrap()
+        .commit_tokens(30)
+        .await;
+    let s = limiter.peek(&key, &limits).await.unwrap();
+    let after = server_now(&mut raw).await;
+    assert_eq!(s.rpm_used, 3);
+    assert_eq!(s.rpm_remaining(), Some(2));
+    assert_eq!(s.tpm_used, 30);
+    // Empty again once sub-bucket `cur` leaves at cur + 70.
+    for reset in [s.rpm_reset_secs, s.tpm_reset_secs] {
+        assert!(
+            (cur + 70 - after..=cur + 70 - now).contains(&reset),
+            "reset {reset} (now {now}, cur {cur})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rps_stays_fixed_under_sliding_on_the_shared_backend() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let s = store(&url).await;
+    let mut raw = raw_conn(&url).await;
+    let key = unique_key("sw-rps");
+    let limits = sliding(RateLimit {
+        rps: Some(1),
+        ..rl()
+    });
+    wait_for_second_boundary().await;
+    s.acquire(&key, &limits, "r-1").await.expect("first");
+    let err = s.acquire(&key, &limits, "r-2").await.unwrap_err();
+    assert_eq!(err.detail().dimension, "rps");
+    assert_eq!(err.detail().reset_secs, 1);
+    let keys = fixed_keys(&mut raw, &key).await;
+    assert_eq!(keys.len(), 1, "{keys:?}");
+    assert!(keys[0].contains(":rps:"), "{keys:?}");
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    s.acquire(&key, &limits, "r-3").await.expect("next second");
+}
+
+#[tokio::test]
+async fn sliding_fails_open_to_local_sliding_counters() {
+    if redis_url().is_none() {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    }
+    let mut cfg = single("redis://127.0.0.1:1");
+    cfg.timeout_secs = 1;
+    let (s, unreachable) = RedisStore::connect_or_attach_later(&cfg)
+        .await
+        .expect("degraded, not fatal");
+    assert!(unreachable.is_some());
+    let key = unique_key("sw-degraded");
+    let limits = sliding(RateLimit {
+        rph: Some(1),
+        ..rl()
+    });
+    s.acquire(&key, &limits, "d-1").await.expect("first");
+    let err = s.acquire(&key, &limits, "d-2").await.unwrap_err();
+    assert_eq!(err.detail().dimension, "rph");
+    // A sliding rph releases between 1h and 1h05m after the request; a
+    // fixed one would report the wait to the top of the hour (≤ 1h).
+    assert!(err.detail().reset_secs > 3_600, "{:?}", err.detail());
+}
+
+/// The sliding hashes share the `{bucket}` tag, so every script still
+/// touches one slot. A key outside it would fail with CROSSSLOT and fall
+/// back to `b`'s empty local counters, which would admit.
+#[tokio::test]
+async fn cluster_sliding_window_routes_to_one_slot() {
+    let Some(cfg) = cluster_cfg() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_CLUSTER_NODES not set");
+        return;
+    };
+    let a = RedisStore::connect(&cfg).await.expect("cluster connect");
+    let b = RedisStore::connect(&cfg).await.expect("cluster connect");
+    let key = unique_key("cluster-sw");
+    let limits = sliding(RateLimit {
+        rpm: Some(1),
+        tpm: Some(1_000),
+        concurrency: Some(5),
+        ..rl()
+    });
+    a.acquire(&key, &limits, "a-1")
+        .await
+        .expect("first allowed");
+    a.commit(&key, 10, "a-1", RateLimitWindowType::Sliding)
+        .await;
+    let err = b
+        .acquire(&key, &limits, "b-1")
+        .await
+        .expect_err("second replica must be refused by the shared sliding rpm");
+    assert_eq!(err.detail().dimension, "rpm");
+    assert!(b.peek(&key, &limits).await.unwrap().tpm_used >= 10);
 }

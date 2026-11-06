@@ -11,6 +11,11 @@
 //! Cluster slot, keeping the per-bucket Lua atomic):
 //! - `aisix:rl:{<bucket>}:<rps|rpm|rph|rpd|tpm|tpd>:<window_start>` — plain
 //!   `INCR`/`GET` counters, `EXPIRE = window + grace`.
+//! - `aisix:rl:{<bucket>}:sw:<rpm|rph|rpd|tpm|tpd>` — a `window_type:
+//!   sliding` dimension: a HASH of `sub-bucket start → count`, read whole
+//!   (`HGETALL`) and summed over the rolling window, pruned of sub-buckets
+//!   older than the window on every write, `EXPIRE = window + step +
+//!   grace`. At most `window / step + 1` fields, whatever the limit.
 //! - `aisix:rl:{<bucket>}:conc` — a ZSET (`member → last-refresh time`) acting
 //!   as a crash-safe distributed semaphore: acquire prunes stale entries then
 //!   counts, so a slot leaked by a crashed/hung replica is reclaimed after its
@@ -39,7 +44,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use aisix_core::{RateLimit, RedisConnConfig};
+use aisix_core::{RateLimit, RateLimitWindowType, RedisConnConfig};
 use aisix_obs::metrics::Metrics;
 use aisix_redis::{ConnSlot, FailurePolicy};
 use async_trait::async_trait;
@@ -89,10 +94,74 @@ enum LeaseOwnership {
     Unknown,
 }
 
+/// Sliding-window arithmetic shared by the scripts below; mirrors
+/// [`crate::window::SlidingWindowCounter`] (sub-bucket starts are
+/// `now - now % step`, the sum covers starts in `[cur - window, cur]`).
+/// A macro rather than a `const` so `concat!` can prepend it.
+macro_rules! sliding_lua {
+    () => {
+        r#"
+local function sw_read(key, now, window, step)
+  local cur = now - (now % step)
+  local lower = cur - window
+  local flat = redis.call('HGETALL', key)
+  local counts = {}
+  local used = 0
+  for i = 1, #flat, 2 do
+    local start = tonumber(flat[i])
+    if start >= lower and start <= cur then
+      local n = tonumber(flat[i + 1])
+      counts[start] = n
+      used = used + n
+    end
+  end
+  return used, counts, cur, lower
+end
+
+-- Seconds until the oldest sub-buckets that sum to `need` have expired.
+local function sw_release(counts, now, window, step, cur, lower, need)
+  local released = 0
+  for start = lower, cur, step do
+    released = released + (counts[start] or 0)
+    if released >= need then
+      local r = start + window + step - now
+      if r < 1 then r = 1 end
+      return r
+    end
+  end
+  return window + step
+end
+
+-- Seconds until everything counted now has left the window; 0 if empty.
+local function sw_reset(counts, now, window, step, cur, lower)
+  for start = cur, lower, -step do
+    if (counts[start] or 0) > 0 then
+      return start + window + step - now
+    end
+  end
+  return 0
+end
+
+local function sw_add(key, now, window, step, delta, grace)
+  local cur = now - (now % step)
+  redis.call('HINCRBY', key, cur, delta)
+  for _, f in ipairs(redis.call('HKEYS', key)) do
+    if tonumber(f) < cur - window then
+      redis.call('HDEL', key, f)
+    end
+  end
+  redis.call('EXPIRE', key, window + step + grace)
+end
+"#
+    };
+}
+
 /// Atomic per-bucket acquire: concurrency gate + token check-only +
 /// request check-and-increment, all-or-nothing. See module docs for the
 /// key layout. Returns `{code, retry_after}`.
-const ACQUIRE_LUA: &str = r#"
+const ACQUIRE_LUA: &str = concat!(
+    sliding_lua!(),
+    r#"
 local prefix = ARGV[1]
 local member = ARGV[2]
 local conc_max = tonumber(ARGV[3])
@@ -119,48 +188,67 @@ if conc_max >= 0 then
   end
 end
 
+-- Each dimension is {name, window, limit, step}; step 0 is a fixed window.
 local idx = 7
 local nreq = tonumber(ARGV[idx]); idx = idx + 1
 local req = {}
 for i = 1, nreq do
-  req[i] = {ARGV[idx], tonumber(ARGV[idx+1]), tonumber(ARGV[idx+2])}
-  idx = idx + 3
+  req[i] = {ARGV[idx], tonumber(ARGV[idx+1]), tonumber(ARGV[idx+2]), tonumber(ARGV[idx+3])}
+  idx = idx + 4
 end
 local ntok = tonumber(ARGV[idx]); idx = idx + 1
 local tok = {}
 for i = 1, ntok do
-  tok[i] = {ARGV[idx], tonumber(ARGV[idx+1]), tonumber(ARGV[idx+2])}
-  idx = idx + 3
+  tok[i] = {ARGV[idx], tonumber(ARGV[idx+1]), tonumber(ARGV[idx+2]), tonumber(ARGV[idx+3])}
+  idx = idx + 4
 end
 
 for i = 1, ntok do
-  local name, window, limit = tok[i][1], tok[i][2], tok[i][3]
-  local ws = now - (now % window)
-  local cur = tonumber(redis.call('GET', prefix .. ':' .. name .. ':' .. ws) or '0')
-  -- `>=`, matching the local backend: a token window whose committed
-  -- usage has reached the cap is spent, not still admissible (#950).
-  if cur >= limit then
-    local retry = window - (now - ws); if retry < 1 then retry = 1 end
-    return {2, retry, i, limit, cur}
+  local name, window, limit, step = tok[i][1], tok[i][2], tok[i][3], tok[i][4]
+  if step > 0 then
+    local used, counts, cur, lower = sw_read(prefix .. ':sw:' .. name, now, window, step)
+    if used >= limit then
+      return {2, sw_release(counts, now, window, step, cur, lower, used - limit + 1), i, limit, used}
+    end
+  else
+    local ws = now - (now % window)
+    local cur = tonumber(redis.call('GET', prefix .. ':' .. name .. ':' .. ws) or '0')
+    -- `>=`, matching the local backend: a token window whose committed
+    -- usage has reached the cap is spent, not still admissible (#950).
+    if cur >= limit then
+      local retry = window - (now - ws); if retry < 1 then retry = 1 end
+      return {2, retry, i, limit, cur}
+    end
   end
 end
 
 for i = 1, nreq do
-  local name, window, limit = req[i][1], req[i][2], req[i][3]
-  local ws = now - (now % window)
-  local cur = tonumber(redis.call('GET', prefix .. ':' .. name .. ':' .. ws) or '0')
-  if cur + 1 > limit then
-    local retry = window - (now - ws); if retry < 1 then retry = 1 end
-    return {3, retry, i, limit, cur}
+  local name, window, limit, step = req[i][1], req[i][2], req[i][3], req[i][4]
+  if step > 0 then
+    local used, counts, cur, lower = sw_read(prefix .. ':sw:' .. name, now, window, step)
+    if used + 1 > limit then
+      return {3, sw_release(counts, now, window, step, cur, lower, used + 1 - limit), i, limit, used}
+    end
+  else
+    local ws = now - (now % window)
+    local cur = tonumber(redis.call('GET', prefix .. ':' .. name .. ':' .. ws) or '0')
+    if cur + 1 > limit then
+      local retry = window - (now - ws); if retry < 1 then retry = 1 end
+      return {3, retry, i, limit, cur}
+    end
   end
 end
 
 for i = 1, nreq do
-  local name, window = req[i][1], req[i][2]
-  local ws = now - (now % window)
-  local k = prefix .. ':' .. name .. ':' .. ws
-  if redis.call('INCR', k) == 1 then
-    redis.call('EXPIRE', k, window + grace)
+  local name, window, step = req[i][1], req[i][2], req[i][4]
+  if step > 0 then
+    sw_add(prefix .. ':sw:' .. name, now, window, step, 1, grace)
+  else
+    local ws = now - (now % window)
+    local k = prefix .. ':' .. name .. ':' .. ws
+    if redis.call('INCR', k) == 1 then
+      redis.call('EXPIRE', k, window + grace)
+    end
   end
 end
 if conc_max >= 0 then
@@ -168,7 +256,8 @@ if conc_max >= 0 then
   redis.call('EXPIRE', conc_key, conc_key_ttl)
 end
 return {0, 0, 0, 0, 0}
-"#;
+"#
+);
 
 /// Refresh one live streaming member's concurrency lease. The member must
 /// already exist: refresh racing stream teardown must not resurrect a member
@@ -188,69 +277,104 @@ redis.call('EXPIRE', conc_key, conc_key_ttl)
 return 1
 "#;
 
+/// Token add shared by the commit and post-stream scripts.
+macro_rules! add_tokens_lua {
+    () => {
+        r#"
+local function add_tokens(prefix, now, tokens, grace, sliding)
+  if sliding then
+    sw_add(prefix .. ':sw:tpm', now, 60, 10, tokens, grace)
+    sw_add(prefix .. ':sw:tpd', now, 86400, 3600, tokens, grace)
+    return
+  end
+  for _, d in ipairs({{'tpm', 60}, {'tpd', 86400}}) do
+    local ws = now - (now % d[2])
+    local k = prefix .. ':' .. d[1] .. ':' .. ws
+    if redis.call('INCRBY', k, tokens) == tokens then
+      redis.call('EXPIRE', k, d[2] + grace)
+    end
+  end
+end
+"#
+    };
+}
+
 /// Post-deduct: add `tokens` to the tpm/tpd windows AND release the
 /// concurrency slot held by `member`. Both token windows are always
 /// touched (matching the local backend); an unread tpd counter just
-/// expires. ARGV: prefix, member, tokens, grace.
-const COMMIT_LUA: &str = r#"
+/// expires. ARGV: prefix, member, tokens, grace, sliding (`1`/`0`).
+const COMMIT_LUA: &str = concat!(
+    sliding_lua!(),
+    add_tokens_lua!(),
+    r#"
 local prefix = ARGV[1]
 local member = ARGV[2]
 local tokens = tonumber(ARGV[3])
 local grace = tonumber(ARGV[4])
+local sliding = ARGV[5] == '1'
 local t = redis.call('TIME')
 local now = tonumber(t[1])
 if tokens > 0 then
-  for _, d in ipairs({{'tpm', 60}, {'tpd', 86400}}) do
-    local ws = now - (now % d[2])
-    local k = prefix .. ':' .. d[1] .. ':' .. ws
-    if redis.call('INCRBY', k, tokens) == tokens then
-      redis.call('EXPIRE', k, d[2] + grace)
-    end
-  end
+  add_tokens(prefix, now, tokens, grace, sliding)
 end
 redis.call('ZREM', prefix .. ':conc', member)
 return 1
-"#;
+"#
+);
 
 /// Post-stream token add only (no concurrency change). ARGV: prefix,
-/// tokens, grace.
-const ADD_TOKENS_LUA: &str = r#"
+/// tokens, grace, sliding (`1`/`0`).
+const ADD_TOKENS_LUA: &str = concat!(
+    sliding_lua!(),
+    add_tokens_lua!(),
+    r#"
 local prefix = ARGV[1]
 local tokens = tonumber(ARGV[2])
 local grace = tonumber(ARGV[3])
+local sliding = ARGV[4] == '1'
 local t = redis.call('TIME')
 local now = tonumber(t[1])
 if tokens > 0 then
-  for _, d in ipairs({{'tpm', 60}, {'tpd', 86400}}) do
-    local ws = now - (now % d[2])
-    local k = prefix .. ':' .. d[1] .. ':' .. ws
-    if redis.call('INCRBY', k, tokens) == tokens then
-      redis.call('EXPIRE', k, d[2] + grace)
-    end
-  end
+  add_tokens(prefix, now, tokens, grace, sliding)
 end
 return 1
-"#;
+"#
+);
 
 /// Read-only snapshot for headers: current-minute rpm/tpm counts +
-/// pruned concurrency count + seconds-to-minute-reset. ARGV: prefix,
-/// conc_ttl. Returns {rpm_used, tpm_used, in_flight, minute_reset}.
-const PEEK_LUA: &str = r#"
+/// pruned concurrency count + seconds until each resets. ARGV: prefix,
+/// conc_ttl, sliding (`1`/`0`). Returns {rpm_used, tpm_used, in_flight,
+/// rpm_reset, tpm_reset}.
+const PEEK_LUA: &str = concat!(
+    sliding_lua!(),
+    r#"
 local prefix = ARGV[1]
 local conc_ttl = tonumber(ARGV[2])
+local sliding = ARGV[3] == '1'
 local t = redis.call('TIME')
 local now = tonumber(t[1])
 local conc_now = now + tonumber(t[2]) / 1000000
 -- See ACQUIRE_LUA: use the same conservative boundary so header reads do not
 -- prune a live member while a rolling upgrade is in progress.
 local conc_prune_before = math.floor(conc_now) - conc_ttl
-local ws = now - (now % 60)
-local rpm = tonumber(redis.call('GET', prefix .. ':rpm:' .. ws) or '0')
-local tpm = tonumber(redis.call('GET', prefix .. ':tpm:' .. ws) or '0')
+local rpm, tpm, rpm_reset, tpm_reset
+if sliding then
+  local used, counts, cur, lower = sw_read(prefix .. ':sw:rpm', now, 60, 10)
+  rpm, rpm_reset = used, sw_reset(counts, now, 60, 10, cur, lower)
+  used, counts, cur, lower = sw_read(prefix .. ':sw:tpm', now, 60, 10)
+  tpm, tpm_reset = used, sw_reset(counts, now, 60, 10, cur, lower)
+else
+  local ws = now - (now % 60)
+  rpm = tonumber(redis.call('GET', prefix .. ':rpm:' .. ws) or '0')
+  tpm = tonumber(redis.call('GET', prefix .. ':tpm:' .. ws) or '0')
+  rpm_reset = 60 - (now % 60)
+  tpm_reset = rpm_reset
+end
 redis.call('ZREMRANGEBYSCORE', prefix .. ':conc', 0, '(' .. conc_prune_before)
 local inflight = redis.call('ZCARD', prefix .. ':conc')
-return {rpm, tpm, inflight, 60 - (now % 60)}
-"#;
+return {rpm, tpm, inflight, rpm_reset, tpm_reset}
+"#
+);
 
 pub struct RedisStore {
     conn: ConnSlot,
@@ -527,12 +651,21 @@ fn record_failure(metrics: &Option<Metrics>, op: &str) {
     }
 }
 
+fn sliding_flag(window_type: RateLimitWindowType) -> &'static str {
+    if window_type.is_sliding() {
+        "1"
+    } else {
+        "0"
+    }
+}
+
 fn push_dims(args: &mut Vec<String>, dims: &[Dim]) {
     args.push(dims.len().to_string());
     for d in dims {
         args.push(d.name.to_string());
         args.push(d.window_secs.to_string());
         args.push(d.limit.to_string());
+        args.push(d.step_secs.unwrap_or(0).to_string());
     }
 }
 
@@ -647,7 +780,7 @@ impl RateStore for RedisStore {
         }
     }
 
-    async fn commit(&self, key: &str, tokens: u64, member: &str) {
+    async fn commit(&self, key: &str, tokens: u64, member: &str, window_type: RateLimitWindowType) {
         self.lease_members
             .remove(&(key.to_string(), member.to_string()));
         let prefix = self.bucket_prefix(key);
@@ -655,7 +788,7 @@ impl RateStore for RedisStore {
             Ok(c) => c,
             Err(e) => {
                 self.note_failure("commit", &e);
-                return self.local.commit(key, tokens, member).await;
+                return self.local.commit(key, tokens, member, window_type).await;
             }
         };
         let res: Result<i64, redis::RedisError> = Script::new(COMMIT_LUA)
@@ -664,6 +797,7 @@ impl RateStore for RedisStore {
             .arg(member)
             .arg(tokens)
             .arg(self.grace)
+            .arg(sliding_flag(window_type))
             .invoke_async(&mut conn)
             .await;
         match res {
@@ -696,7 +830,7 @@ impl RateStore for RedisStore {
             Err(e) => {
                 self.note_failure("commit", &e);
                 self.conn.note_error().await;
-                self.local.commit(key, tokens, member).await;
+                self.local.commit(key, tokens, member, window_type).await;
             }
         }
     }
@@ -737,13 +871,13 @@ impl RateStore for RedisStore {
         }
     }
 
-    fn add_tokens(&self, key: &str, tokens: u64) {
+    fn add_tokens(&self, key: &str, tokens: u64, window_type: RateLimitWindowType) {
         if tokens == 0 {
             return;
         }
         // Best-effort fire-and-forget to Redis; also record locally so the
         // count is right if a later request falls back during an outage.
-        self.local.add_tokens(key, tokens);
+        self.local.add_tokens(key, tokens, window_type);
         let prefix = self.bucket_prefix(key);
         let grace = self.grace;
         let conn = self.conn.clone();
@@ -762,6 +896,7 @@ impl RateStore for RedisStore {
                     .arg(&prefix)
                     .arg(tokens)
                     .arg(grace)
+                    .arg(sliding_flag(window_type))
                     .invoke_async(&mut c)
                     .await;
                 if res.is_err() {
@@ -869,6 +1004,7 @@ impl RateStore for RedisStore {
             .key(&prefix)
             .arg(&prefix)
             .arg(self.conc_ttl)
+            .arg(sliding_flag(limits.window_type))
             .invoke_async(&mut conn)
             .await;
         match reply {
@@ -880,7 +1016,7 @@ impl RateStore for RedisStore {
                     rpm_reset_secs: v.get(3).copied().unwrap_or(0).max(0) as u64,
                     tpm_limit: limits.tpm,
                     tpm_used: v.get(1).copied().unwrap_or(0).max(0) as u64,
-                    tpm_reset_secs: v.get(3).copied().unwrap_or(0).max(0) as u64,
+                    tpm_reset_secs: v.get(4).copied().unwrap_or(0).max(0) as u64,
                     concurrency_limit: limits.concurrency,
                     in_flight: v.get(2).copied().unwrap_or(0).max(0) as u32,
                 })

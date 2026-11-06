@@ -22,9 +22,9 @@ mod window;
 pub use clock::{Clock, SystemClock, TestClock};
 pub use error::{LimitDetail, RateLimitError, CONCURRENCY_DIMENSION, CONCURRENCY_RETRY_AFTER_SECS};
 pub use limiter::{
-    Limiter, MultiReservation, RateLimitStatus, Reservation, StreamConcurrencyGuard,
+    BucketKey, Limiter, MultiReservation, RateLimitStatus, Reservation, StreamConcurrencyGuard,
 };
 pub use store::local::LocalStore;
 pub use store::redis::RedisStore;
 pub use store::{RateStore, StreamLeaseRefresh};
-pub use window::{FixedWindowCounter, WindowCheck};
+pub use window::{FixedWindowCounter, SlidingWindowCounter, WindowCheck};

@@ -94,7 +94,7 @@ pub use provider_key::{
     ApiEndpoint, ApiSurface, ParamConstraints, ProviderApis, ProviderKey, RequestOverrides,
     ResponseOverrides, StreamDoneMarker, TelemetryKind, TelemetryTags,
 };
-pub use rate_limit::{McpRateLimit, RateLimit};
+pub use rate_limit::{McpRateLimit, RateLimit, RateLimitWindowType};
 pub use rate_limit_policy::{PolicyScope, PolicyWindow, RateLimitPolicy};
 pub use routing::{
     default_hash_on, HashOnSource, HashOnType, Routing, RoutingStrategy, RoutingTarget,

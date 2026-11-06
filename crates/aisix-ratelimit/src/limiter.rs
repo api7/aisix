@@ -24,7 +24,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use aisix_core::RateLimit;
+use aisix_core::{RateLimit, RateLimitWindowType};
 
 use crate::clock::Clock;
 use crate::error::RateLimitError;
@@ -53,6 +53,15 @@ impl RateLimitStatus {
     pub fn tpm_remaining(&self) -> Option<u64> {
         self.tpm_limit.map(|lim| lim.saturating_sub(self.tpm_used))
     }
+}
+
+/// One reserved bucket, as the post-stream token accounting needs it: the
+/// bucket key and the window type its limits were reserved under, which
+/// selects the counters the streamed tokens land in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketKey {
+    pub key: String,
+    pub window_type: RateLimitWindowType,
 }
 
 /// Two-phase limiter over a shared or local [`RateStore`].
@@ -121,6 +130,7 @@ impl Limiter {
         Ok(Reservation {
             store: Arc::clone(&self.store),
             key: key.to_string(),
+            window_type: limits.window_type,
             member,
             has_concurrency_slot,
             refresh_task,
@@ -135,11 +145,12 @@ impl Limiter {
     /// concurrency slot is held by a [`StreamConcurrencyGuard`] and the
     /// tokens are accounted here when the terminal SSE usage frame lands
     /// (issue #108). No-op on zero tokens.
-    pub fn add_tokens_post_stream(&self, key: &str, tokens: u64) {
+    pub fn add_tokens_post_stream(&self, bucket: &BucketKey, tokens: u64) {
         if tokens == 0 {
             return;
         }
-        self.store.add_tokens(key, tokens);
+        self.store
+            .add_tokens(&bucket.key, tokens, bucket.window_type);
     }
 
     /// Snapshot of the current rate-limit state for a key, used to inject
@@ -226,6 +237,7 @@ impl Default for Limiter {
 pub struct Reservation {
     store: Arc<dyn RateStore>,
     key: String,
+    window_type: RateLimitWindowType,
     member: String,
     has_concurrency_slot: bool,
     /// Starts at successful acquire, rather than at the later SSE handoff:
@@ -258,7 +270,9 @@ impl Reservation {
     /// and releases the concurrency slot.
     pub async fn commit_tokens(mut self, tokens: u64) {
         self.stop_refresh();
-        self.store.commit(&self.key, tokens, &self.member).await;
+        self.store
+            .commit(&self.key, tokens, &self.member, self.window_type)
+            .await;
         self.committed = true;
     }
 }
@@ -293,8 +307,14 @@ impl MultiReservation {
     }
 
     /// Return owned keys for post-stream token accounting.
-    pub fn keys(&self) -> Vec<String> {
-        self.reservations.iter().map(|r| r.key.clone()).collect()
+    pub fn keys(&self) -> Vec<BucketKey> {
+        self.reservations
+            .iter()
+            .map(|r| BucketKey {
+                key: r.key.clone(),
+                window_type: r.window_type,
+            })
+            .collect()
     }
 
     /// Absorb another reservation's layers into this one, so a single
@@ -470,16 +490,22 @@ mod tests {
             self.inner.acquire(key, limits, member).await
         }
 
-        async fn commit(&self, key: &str, tokens: u64, member: &str) {
-            self.inner.commit(key, tokens, member).await;
+        async fn commit(
+            &self,
+            key: &str,
+            tokens: u64,
+            member: &str,
+            window_type: RateLimitWindowType,
+        ) {
+            self.inner.commit(key, tokens, member, window_type).await;
         }
 
         fn release(&self, key: &str, member: &str) {
             self.inner.release(key, member);
         }
 
-        fn add_tokens(&self, key: &str, tokens: u64) {
-            self.inner.add_tokens(key, tokens);
+        fn add_tokens(&self, key: &str, tokens: u64, window_type: RateLimitWindowType) {
+            self.inner.add_tokens(key, tokens, window_type);
         }
 
         fn stream_lease_refresh_interval(&self) -> Option<Duration> {
@@ -509,7 +535,19 @@ mod tests {
             tpm,
             tpd: None,
             concurrency,
+            window_type: RateLimitWindowType::Fixed,
         }
+    }
+
+    fn fixed_bucket(key: &str) -> BucketKey {
+        BucketKey {
+            key: key.to_string(),
+            window_type: RateLimitWindowType::Fixed,
+        }
+    }
+
+    fn key_names(keys: &[BucketKey]) -> Vec<&str> {
+        keys.iter().map(|b| b.key.as_str()).collect()
     }
 
     /// Helper for the rps/rph/compensator tests added by #426.
@@ -527,6 +565,7 @@ mod tests {
             tpm: None,
             tpd: None,
             concurrency: None,
+            window_type: RateLimitWindowType::Fixed,
         }
     }
 
@@ -839,6 +878,7 @@ mod tests {
             tpm: None,
             tpd: None,
             concurrency: None,
+            window_type: RateLimitWindowType::Fixed,
         };
         // Soak up 19 RPM = 19 RPD across two minutes so RPD is at 19.
         for i in 0..19 {
@@ -878,6 +918,7 @@ mod tests {
             tpm: None,
             tpd: None,
             concurrency: None,
+            window_type: RateLimitWindowType::Fixed,
         };
         for _ in 0..5 {
             let _r = limiter.pre_commit("k1", &l).await.unwrap();
@@ -909,7 +950,7 @@ mod tests {
             "TPM should be 0 right after pre_commit + drop",
         );
 
-        limiter.add_tokens_post_stream("k1", 750);
+        limiter.add_tokens_post_stream(&fixed_bucket("k1"), 750);
         assert_eq!(
             limiter.peek("k1", &l).await.unwrap().tpm_used,
             750,
@@ -921,7 +962,7 @@ mod tests {
     async fn add_tokens_post_stream_zero_is_a_noop() {
         let clock = TestClock::new(100);
         let limiter = Limiter::local_with_clock(clock);
-        limiter.add_tokens_post_stream("never-seen", 0);
+        limiter.add_tokens_post_stream(&fixed_bucket("never-seen"), 0);
         assert!(
             limiter
                 .peek("never-seen", &RateLimit::default())
@@ -940,7 +981,7 @@ mod tests {
         {
             let _r = limiter.pre_commit("k1", &l).await.unwrap();
         }
-        limiter.add_tokens_post_stream("k1", 1_500);
+        limiter.add_tokens_post_stream(&fixed_bucket("k1"), 1_500);
 
         let err = limiter.pre_commit("k1", &l).await.unwrap_err();
         assert!(
@@ -1079,7 +1120,7 @@ mod tests {
         let multi = MultiReservation::new(vec![r1, r2, r3]);
 
         let keys = multi.keys();
-        assert_eq!(keys, vec!["api_key:k1", "model:m1", "team:t1"]);
+        assert_eq!(key_names(&keys), vec!["api_key:k1", "model:m1", "team:t1"]);
     }
 
     #[tokio::test]
@@ -1093,7 +1134,7 @@ mod tests {
 
         let mut multi = MultiReservation::new(vec![main]);
         multi.merge(MultiReservation::new(vec![member]));
-        assert_eq!(multi.keys(), vec!["api_key:k1", "model:target"]);
+        assert_eq!(key_names(&multi.keys()), vec!["api_key:k1", "model:target"]);
 
         // One commit finalises both layers: tokens land on each and the
         // absorbed layer's concurrency slot is released.
@@ -1236,5 +1277,220 @@ mod tests {
         }
         let err = limiter.pre_commit("k1", &l).await.unwrap_err();
         assert!(matches!(err, RateLimitError::Requests { .. }));
+    }
+
+    // --- window_type: sliding ------------------------------------------
+
+    /// Top of an hour, UTC, far from epoch zero.
+    const HOUR0: u64 = 1_700_000_000 - 1_700_000_000 % 3_600;
+
+    fn sliding(mut l: RateLimit) -> RateLimit {
+        l.window_type = RateLimitWindowType::Sliding;
+        l
+    }
+
+    fn rph(limit: u64) -> RateLimit {
+        limits_full(None, None, Some(limit), None)
+    }
+
+    /// The reported shape: one request at 14:59:37, nine between 15:00:32
+    /// and 15:07:16, one at 15:23:10, against `rph: 10`. Any hour-long
+    /// interval ending at 15:23:10 already holds ten, so a rolling window
+    /// must refuse it; the fixed window counts only the nine since 15:00.
+    async fn replay_reported_timeline(l: &RateLimit) -> Result<(), RateLimitError> {
+        let clock = TestClock::new(0);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        // HOUR0 plays 15:00:00.
+        let at = |h: u64, m: u64, s: u64| HOUR0 + h * 3_600 + m * 60 + s - 15 * 3_600;
+        let admitted = [
+            at(14, 59, 37),
+            at(15, 0, 32),
+            at(15, 1, 20),
+            at(15, 2, 5),
+            at(15, 3, 0),
+            at(15, 4, 12),
+            at(15, 5, 1),
+            at(15, 5, 50),
+            at(15, 6, 30),
+            at(15, 7, 16),
+        ];
+        for t in admitted {
+            clock.set(t);
+            limiter
+                .pre_commit("timeline", l)
+                .await
+                .expect("within the limit");
+        }
+        clock.set(at(15, 23, 10));
+        limiter.pre_commit("timeline", l).await.map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn sliding_rph_refuses_the_reported_timeline_that_fixed_admits() {
+        replay_reported_timeline(&rph(10))
+            .await
+            .expect("fixed: 15:23:10 is the 10th request since 15:00");
+
+        let err = replay_reported_timeline(&sliding(rph(10)))
+            .await
+            .expect_err("sliding: the past hour already holds 10");
+        let RateLimitError::Requests { detail, .. } = err else {
+            panic!("expected a request refusal, got {err:?}");
+        };
+        assert_eq!(detail.dimension, "rph");
+        assert_eq!(detail.limit, 10);
+        assert_eq!(detail.remaining, 0);
+        // 14:59:37 sits in the 14:55 sub-bucket, which leaves the sum at
+        // 14:55 + 1h + 5min = 16:00:00 — 36m50s after 15:23:10.
+        assert_eq!(detail.reset_secs, 36 * 60 + 50);
+    }
+
+    #[tokio::test]
+    async fn sliding_rph_refuses_a_burst_right_after_the_top_of_the_hour() {
+        for (l, expect_admitted) in [(rph(10), true), (sliding(rph(10)), false)] {
+            let clock = TestClock::new(HOUR0 - 20);
+            let limiter = Limiter::local_with_clock(clock.clone());
+            for _ in 0..10 {
+                limiter.pre_commit("edge", &l).await.unwrap();
+            }
+            clock.set(HOUR0 + 1);
+            assert_eq!(
+                limiter.pre_commit("edge", &l).await.is_ok(),
+                expect_admitted,
+                "{:?}",
+                l.window_type
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sliding_refusal_reports_the_exact_wait_and_admits_then() {
+        let clock = TestClock::new(HOUR0 + 3);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let l = sliding(limits(Some(2), None, None));
+        limiter.pre_commit("k", &l).await.unwrap(); // sub-bucket HOUR0
+        clock.set(HOUR0 + 27);
+        limiter.pre_commit("k", &l).await.unwrap(); // sub-bucket HOUR0+20
+        clock.set(HOUR0 + 41);
+        let err = limiter.pre_commit("k", &l).await.unwrap_err();
+        // The HOUR0 sub-bucket leaves at HOUR0+70.
+        assert_eq!(err.retry_after_secs(), Some(29));
+        assert_eq!(err.detail().dimension, "rpm");
+        clock.set(HOUR0 + 69);
+        assert_eq!(
+            limiter
+                .pre_commit("k", &l)
+                .await
+                .unwrap_err()
+                .retry_after_secs(),
+            Some(1)
+        );
+        clock.set(HOUR0 + 70);
+        limiter.pre_commit("k", &l).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sliding_tokens_count_where_they_were_committed() {
+        let clock = TestClock::new(HOUR0 + 5);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let l = sliding(limits(None, Some(1_000), None));
+
+        let r = limiter.pre_commit("k", &l).await.unwrap();
+        r.commit_tokens(600).await; // sub-bucket HOUR0
+        clock.set(HOUR0 + 35);
+        let held = MultiReservation::new(vec![limiter.pre_commit("k", &l).await.unwrap()]);
+        let buckets = held.keys();
+        drop(held.into_stream_hold());
+        clock.set(HOUR0 + 45);
+        // A streamed response lands where the stream completed: HOUR0+40.
+        limiter.add_tokens_post_stream(&buckets[0], 500);
+
+        clock.set(HOUR0 + 65);
+        let err = limiter.pre_commit("k", &l).await.unwrap_err();
+        let RateLimitError::Tokens { detail, .. } = err else {
+            panic!("expected a token refusal, got {err:?}");
+        };
+        assert_eq!(detail.dimension, "tpm");
+        assert_eq!(detail.remaining, 0);
+        // 1100 ≥ 1000; dropping below needs the 600 at HOUR0 gone (HOUR0+70).
+        assert_eq!(detail.reset_secs, 5);
+
+        clock.set(HOUR0 + 70);
+        limiter.pre_commit("k", &l).await.unwrap();
+        // ...and a fixed window would have reset at HOUR0+60 instead.
+        let fixed = Limiter::local_with_clock(TestClock::new(HOUR0 + 5));
+        let lf = limits(None, Some(1_000), None);
+        fixed
+            .pre_commit("k", &lf)
+            .await
+            .unwrap()
+            .commit_tokens(1_100)
+            .await;
+        assert!(fixed.pre_commit("k", &lf).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rps_stays_a_one_second_fixed_window_under_sliding() {
+        let clock = TestClock::new(HOUR0 + 7);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let l = sliding(limits_full(Some(1), Some(100), None, None));
+        limiter.pre_commit("k", &l).await.unwrap();
+        let err = limiter.pre_commit("k", &l).await.unwrap_err();
+        assert_eq!(err.detail().dimension, "rps");
+        assert_eq!(err.retry_after_secs(), Some(1));
+        clock.advance(1);
+        limiter.pre_commit("k", &l).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sliding_rph_rejection_rolls_back_the_sliding_rpm_increment() {
+        let clock = TestClock::new(HOUR0 + 7);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let l = sliding(limits_full(None, Some(2), Some(1), None));
+        limiter.pre_commit("k", &l).await.unwrap();
+        let err = limiter.pre_commit("k", &l).await.unwrap_err();
+        assert_eq!(err.detail().dimension, "rph");
+        let s = limiter.peek("k", &l).await.unwrap();
+        assert_eq!(s.rpm_used, 1, "the refused request left no rpm count");
+    }
+
+    #[tokio::test]
+    async fn sliding_peek_reports_the_rolling_usage_and_full_reset() {
+        let clock = TestClock::new(HOUR0 + 3);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let l = sliding(limits(Some(5), Some(1_000), None));
+        limiter
+            .pre_commit("k", &l)
+            .await
+            .unwrap()
+            .commit_tokens(100)
+            .await;
+        clock.set(HOUR0 + 52);
+        limiter
+            .pre_commit("k", &l)
+            .await
+            .unwrap()
+            .commit_tokens(50)
+            .await;
+        clock.set(HOUR0 + 61);
+        let s = limiter.peek("k", &l).await.unwrap();
+        assert_eq!(s.rpm_used, 2);
+        assert_eq!(s.rpm_remaining(), Some(3));
+        assert_eq!(s.tpm_used, 150);
+        // Back to empty once the HOUR0+50 sub-bucket leaves at HOUR0+120.
+        assert_eq!(s.rpm_reset_secs, 59);
+        assert_eq!(s.tpm_reset_secs, 59);
+    }
+
+    #[tokio::test]
+    async fn switching_window_type_starts_the_count_from_zero() {
+        let clock = TestClock::new(HOUR0 + 3);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let fixed = limits(Some(1), None, None);
+        limiter.pre_commit("k", &fixed).await.unwrap();
+        assert!(limiter.pre_commit("k", &fixed).await.is_err());
+        let slid = sliding(fixed.clone());
+        limiter.pre_commit("k", &slid).await.unwrap();
+        assert!(limiter.pre_commit("k", &slid).await.is_err());
     }
 }
