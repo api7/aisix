@@ -35,6 +35,75 @@ pub enum McpError {
     /// can be refreshed.
     #[error("upstream MCP request failed: {0}")]
     Unauthorized(String),
+
+    /// An upstream failure with a known cause, reported on the request's
+    /// telemetry as a [`ToolCallFailure`]. `detail` holds the whole text for
+    /// the gateway's logs and stays there.
+    #[error("{detail}")]
+    Upstream {
+        failure: ToolCallFailure,
+        detail: String,
+    },
+}
+
+/// Why a `tools/call` failed upstream, as the request's telemetry reports it.
+/// The caller's response is not derived from this. The message is fixed text:
+/// what a tool or upstream said never goes into it, since the guardrails and
+/// the exporter's content mode only govern the captured tool result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallFailure {
+    /// The tool answered with `isError: true`.
+    ToolError,
+    /// The upstream answered with this HTTP status.
+    UpstreamStatus(u16),
+    Timeout,
+    /// The upstream could not be reached, or dropped the connection.
+    Transport,
+    /// The upstream answered with this JSON-RPC error code. The MCP client drops
+    /// the HTTP status of such an answer, so a non-2xx one reads the same way.
+    JsonRpc(i32),
+    /// The upstream answered with something the MCP client could not read.
+    Undecodable,
+    /// The credential for the upstream could not be obtained.
+    CredentialUnavailable,
+    /// The caller's MCP access rules do not permit the tool.
+    PermissionDenied,
+    /// The server does not have the tool.
+    ToolNotFound,
+}
+
+impl ToolCallFailure {
+    pub fn error_class(self) -> &'static str {
+        match self {
+            Self::ToolError => "tool_error",
+            Self::UpstreamStatus(_) => "upstream_status",
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::JsonRpc(_) => "upstream_in_band",
+            Self::Undecodable => "upstream_decode",
+            Self::CredentialUnavailable => "credential_error",
+            Self::PermissionDenied => "permission_denied",
+            Self::ToolNotFound => "tool_not_found",
+        }
+    }
+
+    pub fn error_message(self) -> String {
+        match self {
+            Self::ToolError => "MCP tool returned isError".to_string(),
+            Self::UpstreamStatus(status) => {
+                format!("upstream MCP server returned HTTP {status}")
+            }
+            Self::Timeout => "upstream MCP server timed out".to_string(),
+            Self::Transport => "upstream MCP server connection failed".to_string(),
+            Self::JsonRpc(code) => {
+                format!("upstream MCP server returned JSON-RPC error {code}")
+            }
+            Self::Undecodable => "upstream MCP server returned an undecodable response".to_string(),
+            Self::CredentialUnavailable => "MCP upstream credential unavailable".to_string(),
+            Self::PermissionDenied => "MCP tool access denied".to_string(),
+            Self::ToolNotFound => "MCP tool not found".to_string(),
+        }
+    }
 }
 
 impl From<UserOAuthFailure> for McpError {
@@ -56,6 +125,30 @@ impl From<TokenExchangeFailure> for McpError {
 }
 
 impl McpError {
+    /// The telemetry cause of this failure, when it has a known one.
+    pub fn tool_call_failure(&self) -> Option<ToolCallFailure> {
+        match self {
+            McpError::Upstream { failure, .. } => Some(*failure),
+            McpError::Unauthorized(_) => Some(ToolCallFailure::UpstreamStatus(401)),
+            McpError::TokenExchange(_) | McpError::UserOAuth(_) => {
+                Some(ToolCallFailure::CredentialUnavailable)
+            }
+            _ => None,
+        }
+    }
+
+    /// Mark a connect-time failure as the credential fetch's rather than the
+    /// upstream's: the MCP server was not contacted.
+    pub(crate) fn into_credential_failure(self) -> Self {
+        match self {
+            McpError::Connect(_) => McpError::Upstream {
+                failure: ToolCallFailure::CredentialUnavailable,
+                detail: self.to_string(),
+            },
+            other => other,
+        }
+    }
+
     /// Mark a token-exchange failure as one that followed upstream contact:
     /// the upstream rejected the previous token with a `401` and it was the
     /// re-exchange that failed.

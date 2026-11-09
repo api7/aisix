@@ -33,7 +33,7 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde_json::{json, Map, Value};
 
 use crate::bridge::{McpBridge, McpTool, McpToolResult, OAuthClientConfig};
-use crate::error::McpError;
+use crate::error::{McpError, ToolCallFailure};
 
 /// Header the API key is sent under for `auth_type: api_key` when the
 /// resource sets no `api_key_header`.
@@ -222,7 +222,11 @@ impl OpenApiBridge {
                     crate::oauth::get_or_fetch(&self.oauth_config()),
                 )
                 .await
-                .map_err(|_| tool_call_timed_out())??;
+                .map_err(|_| McpError::Upstream {
+                    failure: ToolCallFailure::CredentialUnavailable,
+                    detail: "fetching the upstream MCP credential timed out".to_string(),
+                })?
+                .map_err(McpError::into_credential_failure)?;
                 request.bearer_auth(token)
             }
             McpAuthType::OauthDelegate if claims("authorization") => request,
@@ -324,14 +328,7 @@ impl OpenApiBridge {
             let response = tokio::time::timeout_at(deadline, request.send())
                 .await
                 .map_err(|_| tool_call_timed_out())?
-                .map_err(|e| {
-                    McpError::Request(format!(
-                        "HTTP request failed: {}",
-                        crate::bridge::sanitize_error_message(
-                            &aisix_gateway::transport_error_message(&e.without_url())
-                        )
-                    ))
-                })?;
+                .map_err(|e| transport_error("HTTP request failed", e))?;
             if response.status() != reqwest::StatusCode::UNAUTHORIZED {
                 break response;
             }
@@ -352,29 +349,46 @@ impl OpenApiBridge {
         let body = tokio::time::timeout_at(deadline, response.text())
             .await
             .map_err(|_| tool_call_timed_out())?
-            .map_err(|e| {
-                McpError::Request(format!(
-                    "failed to read response: {}",
-                    crate::bridge::sanitize_error_message(&aisix_gateway::transport_error_message(
-                        &e.without_url()
-                    ))
-                ))
-            })?;
+            .map_err(|e| transport_error("failed to read response", e))?;
 
         if status.is_success() {
             Ok(McpToolResult {
                 content: json!([{ "type": "text", "text": body }]),
                 structured_content: None,
                 is_error: false,
+                upstream_status: None,
             })
         } else {
-            Ok(tool_error(format!("HTTP {}: {}", status.as_u16(), body)))
+            Ok(McpToolResult {
+                upstream_status: Some(status.as_u16()),
+                ..tool_error(format!("HTTP {}: {}", status.as_u16(), body))
+            })
         }
     }
 }
 
 fn tool_call_timed_out() -> McpError {
-    McpError::Request("tool call timed out".to_string())
+    McpError::Upstream {
+        failure: ToolCallFailure::Timeout,
+        detail: "upstream MCP request failed: tool call timed out".to_string(),
+    }
+}
+
+fn transport_error(context: &str, error: reqwest::Error) -> McpError {
+    let failure = if error.is_timeout() {
+        ToolCallFailure::Timeout
+    } else {
+        ToolCallFailure::Transport
+    };
+    McpError::Upstream {
+        failure,
+        detail: format!(
+            "upstream MCP request failed: {context}: {}",
+            crate::bridge::sanitize_error_message(&aisix_gateway::transport_error_message(
+                &error.without_url()
+            ))
+        ),
+    }
 }
 
 /// A tool-level error result (`isError: true` with a text message) — the
@@ -384,6 +398,7 @@ fn tool_error(text: String) -> McpToolResult {
         content: json!([{ "type": "text", "text": text }]),
         structured_content: None,
         is_error: true,
+        upstream_status: None,
     }
 }
 
@@ -452,7 +467,10 @@ impl McpBridge for OpenApiBridge {
         let tool = tools
             .iter()
             .find(|t| t.name == name)
-            .ok_or_else(|| McpError::Request(format!("unknown tool '{name}'")))?;
+            .ok_or_else(|| McpError::Upstream {
+                failure: ToolCallFailure::ToolNotFound,
+                detail: format!("upstream MCP request failed: unknown tool '{name}'"),
+            })?;
         self.execute(tool, &arguments, tokio::time::Instant::now() + self.timeout)
             .await
     }

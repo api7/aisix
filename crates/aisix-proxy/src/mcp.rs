@@ -540,6 +540,7 @@ async fn dispatch(
                     err.status().as_u16(),
                     Duration::ZERO,
                     Some(&err),
+                    None,
                     Vec::new(),
                     crate::redact::RedactionCounts::new(),
                     /* guardrail_chain */ None,
@@ -666,6 +667,7 @@ async fn dispatch(
                 StatusCode::OK.as_u16(),
                 Duration::ZERO,
                 Some(&refusal),
+                None,
                 monitor_hits,
                 crate::redact::RedactionCounts::new(),
                 guardrail_chain.as_ref(),
@@ -751,6 +753,7 @@ async fn dispatch(
                         StatusCode::OK.as_u16(),
                         Duration::ZERO,
                         Some(&refusal),
+                        None,
                         monitor_hits,
                         crate::redact::RedactionCounts::new(),
                         guardrail_chain.as_ref(),
@@ -817,6 +820,7 @@ async fn dispatch(
                         StatusCode::OK.as_u16(),
                         Duration::ZERO,
                         Some(&refusal),
+                        None,
                         monitor_hits,
                         redaction_counts,
                         guardrail_chain.as_ref(),
@@ -932,6 +936,7 @@ async fn dispatch(
     // it per session; the slot itself is shared, so this handle sees what the
     // handler writes.
     let tools_list_counts = gateway.tools_list_counts();
+    let tool_call_failure = gateway.tool_call_failure();
     // The deployment's body cap replaces rmcp's own 4 MiB default inside
     // the service; the proxy-level read above already enforced the same
     // limit, so the two layers can never disagree.
@@ -967,6 +972,7 @@ async fn dispatch(
                 response.status().as_u16(),
                 latency,
                 Some(&error),
+                None,
                 monitor_hits,
                 redaction_counts,
                 guardrail_chain.as_ref(),
@@ -998,6 +1004,7 @@ async fn dispatch(
                     failure: failure.failure,
                     server: server.to_owned(),
                 }),
+                None,
                 monitor_hits,
                 redaction_counts,
                 guardrail_chain.as_ref(),
@@ -1069,6 +1076,7 @@ async fn dispatch(
                                 "invalid upstream response".to_string(),
                             ),
                         )),
+                        None,
                         monitor_hits,
                         redaction_counts,
                         guardrail_chain.as_ref(),
@@ -1110,6 +1118,7 @@ async fn dispatch(
                         StatusCode::OK.as_u16(),
                         latency,
                         Some(&refusal),
+                        None,
                         monitor_hits,
                         redaction_counts,
                         guardrail_chain.as_ref(),
@@ -1158,6 +1167,7 @@ async fn dispatch(
             response.status().as_u16(),
             latency,
             transport_refusal.as_ref(),
+            tool_call_failure.get().copied(),
             monitor_hits,
             redaction_counts,
             guardrail_chain.as_ref(),
@@ -1781,6 +1791,10 @@ fn emit_tool_call_usage(
     // quota rejection) or an unusable upstream answer — named on the event
     // like every other surface names it.
     refusal: Option<&crate::error::ProxyError>,
+    // Why the upstream failed a call the caller still got an answer for.
+    // Fixed text only (`ToolCallFailure`), so the row says nothing the output
+    // guardrails or the exporter's content mode would have kept back.
+    tool_failure: Option<aisix_mcp::ToolCallFailure>,
     guardrail_monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     // Per-detector mask counts from the write-back passes (names only,
     // never values — #932 no-leak).
@@ -1817,10 +1831,13 @@ fn emit_tool_call_usage(
         request_headers: request_headers.clone(),
         guardrail_blocked: refusal.is_some_and(crate::error::ProxyError::is_guardrail_block),
         error_class: refusal
-            .map(|e| crate::attempt::error_class(e).to_string())
-            .unwrap_or_default(),
+            .map(crate::attempt::error_class)
+            .or(tool_failure.map(aisix_mcp::ToolCallFailure::error_class))
+            .unwrap_or_default()
+            .to_string(),
         error_message: refusal
             .map(crate::attempt::gateway_error_message)
+            .or(tool_failure.map(aisix_mcp::ToolCallFailure::error_message))
             .unwrap_or_default(),
         guardrail_monitor_hits,
         applied_guardrails: guardrail_chain

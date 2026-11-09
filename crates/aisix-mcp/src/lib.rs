@@ -29,7 +29,8 @@ pub use bridge::{
     RmcpBridge, UserOAuthCaller,
 };
 pub use error::{
-    McpError, TokenExchangeError, TokenExchangeFailure, UserOAuthError, UserOAuthFailure,
+    McpError, TokenExchangeError, TokenExchangeFailure, ToolCallFailure, UserOAuthError,
+    UserOAuthFailure,
 };
 pub use gateway::{
     streamable_http_service, strip_server_prefix, McpGateway, ToolAcl, ToolsListCounts,

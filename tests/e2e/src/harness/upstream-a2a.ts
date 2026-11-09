@@ -77,6 +77,10 @@ export interface A2aUpstreamOptions {
    * parses line by line cannot handle.
    */
   multiLineData?: boolean;
+  /** Answer every `message/*` call at HTTP 200 with this JSON-RPC error, on either transport. */
+  rpcError?: { code: number; message: string };
+  /** Leave a stream open after writing `rpcError`, as an agent that never hangs up does. */
+  holdStreamAfterRpcError?: boolean;
 }
 
 const PATH_PREFIX = "/v3/agents/serve/tenant-42";
@@ -138,6 +142,8 @@ export async function startA2aUpstream(
       wireShape: options.wireShape ?? "0.3",
       streamAnswer: options.streamAnswer ?? false,
       multiLineData: options.multiLineData ?? false,
+      rpcError: options.rpcError,
+      holdStreamAfterRpcError: options.holdStreamAfterRpcError ?? false,
     }).catch((err: unknown) => {
       // `handle` rejects on a malformed body, and on a write to an already
       // closed socket. Unhandled, that terminates the test process; worse, the
@@ -175,6 +181,8 @@ async function handle(
     wireShape: A2aWireShape;
     streamAnswer: boolean;
     multiLineData: boolean;
+    rpcError?: { code: number; message: string };
+    holdStreamAfterRpcError: boolean;
   },
 ): Promise<void> {
   const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
@@ -258,6 +266,18 @@ async function handle(
       ],
       skills: [{ id: "invoice", name: "Process invoice", tags: ["billing"] }],
     });
+    return;
+  }
+
+  if (req.method === "POST" && path === ctx.servicePath && ctx.rpcError) {
+    const rpc = { jsonrpc: "2.0", id: body?.id ?? null, error: ctx.rpcError };
+    if (typeof body?.method === "string" && STREAMING_METHODS.has(body.method)) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(`data: ${JSON.stringify(rpc)}\n\n`);
+      if (!ctx.holdStreamAfterRpcError) res.end();
+    } else {
+      send(200, rpc);
+    }
     return;
   }
 

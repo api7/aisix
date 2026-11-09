@@ -742,7 +742,7 @@ mod tests {
         let l = limits(Some(10), Some(1_000), None);
 
         let r1 = limiter.pre_commit("k1", &l).await.unwrap();
-        r1.commit_tokens(1_500).await; // overshoot — allowed for the in-flight request
+        r1.commit_tokens(1_500).await; // overshoot — allowed for a request already admitted
 
         // Next pre_commit sees tpm > 1000 and refuses.
         let err = limiter.pre_commit("k1", &l).await.unwrap_err();

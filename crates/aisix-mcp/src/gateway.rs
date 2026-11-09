@@ -53,7 +53,8 @@ use crate::bridge::{
     McpAuth, McpBridge,
 };
 use crate::error::{
-    McpError, TokenExchangeError, TokenExchangeFailure, UserOAuthError, UserOAuthFailure,
+    McpError, TokenExchangeError, TokenExchangeFailure, ToolCallFailure, UserOAuthError,
+    UserOAuthFailure,
 };
 use crate::openapi::OpenApiBridge;
 
@@ -497,6 +498,10 @@ pub struct McpGateway {
     /// The same, for an `oauth2_authorization_code` server: the HTTP status
     /// is where an MCP client looks for the sign-in challenge.
     user_oauth_failure: Arc<OnceLock<UserOAuthError>>,
+    /// Why the `tools/call` this gateway served failed, shared with every clone
+    /// like `tools_list`. Only the request's telemetry reads it; the caller's
+    /// answer is whatever the handler returned.
+    tool_call_failure: Arc<OnceLock<ToolCallFailure>>,
     /// When set, this gateway serves exactly one upstream under its **original**
     /// tool names: `tools/list` strips the `<server>__` namespace prefix and
     /// `tools/call` accepts both the bare and the prefixed form. ACL decisions
@@ -562,6 +567,7 @@ impl McpGateway {
             tools_list: Arc::new(OnceLock::new()),
             auth_failure: Arc::new(OnceLock::new()),
             user_oauth_failure: Arc::new(OnceLock::new()),
+            tool_call_failure: Arc::new(OnceLock::new()),
         }
     }
 
@@ -595,6 +601,12 @@ impl McpGateway {
     /// out the same way as [`McpGateway::token_exchange_failure`].
     pub fn user_oauth_failure(&self) -> Arc<OnceLock<UserOAuthError>> {
         self.user_oauth_failure.clone()
+    }
+
+    /// Handle on why this gateway's `tools/call` failed, cloned out
+    /// the same way as [`McpGateway::token_exchange_failure`].
+    pub fn tool_call_failure(&self) -> Arc<OnceLock<ToolCallFailure>> {
+        self.tool_call_failure.clone()
     }
 
     /// Whether the single upstream of a scoped gateway can be called for this
@@ -938,6 +950,9 @@ impl ServerHandler for McpGateway {
         // form so grants mean the same thing on every endpoint; the message
         // echoes the caller's own spelling.
         if !self.tool_acl.permits(&namespaced) {
+            let _ = self
+                .tool_call_failure
+                .set(ToolCallFailure::PermissionDenied);
             return Err(ErrorData::invalid_params(
                 format!("tool '{request_name}' is not available"),
                 None,
@@ -955,6 +970,9 @@ impl ServerHandler for McpGateway {
 
         let result = bridge.call_tool(tool, arguments).await.map_err(|error| {
             self.note_auth_failure(&error);
+            if let Some(failure) = error.tool_call_failure() {
+                let _ = self.tool_call_failure.set(failure);
+            }
             // Generic client-facing message; the upstream's detail (which may
             // include its URL) is logged server-side, not surfaced to the agent.
             tracing::warn!(
@@ -971,6 +989,13 @@ impl ServerHandler for McpGateway {
                 None,
             )
         })?;
+
+        if result.is_error {
+            let failure = result
+                .upstream_status
+                .map_or(ToolCallFailure::ToolError, ToolCallFailure::UpstreamStatus);
+            let _ = self.tool_call_failure.set(failure);
+        }
 
         // Always a final (`Complete`) response: the gateway never asks the
         // downstream agent for more input (MRTR stays un-relayed — see

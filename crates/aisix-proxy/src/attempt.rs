@@ -508,6 +508,7 @@ const UPSTREAM_ERROR_CLASSES: &[&str] = &[
     "upstream_in_band",
     "transport",
     "stream_aborted",
+    "tool_error",
 ];
 
 /// What ended a request whose record names `class` ([`error_class`], or the
@@ -880,6 +881,10 @@ mod tests {
             ErrorSource::None
         );
         assert_eq!(error_source_of_class(""), ErrorSource::None);
+        assert_eq!(error_source_of_class("tool_error"), ErrorSource::Upstream);
+        for gateway_own in ["credential_error", "permission_denied", "tool_not_found"] {
+            assert_eq!(error_source_of_class(gateway_own), ErrorSource::Aisix);
+        }
         assert_eq!(
             error_source_of_class("rate_limit_lease_lost"),
             ErrorSource::Aisix
