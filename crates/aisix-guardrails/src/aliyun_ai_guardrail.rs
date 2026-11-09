@@ -206,8 +206,7 @@ impl AliyunAiGuardrail {
                 let blocked = matches!(reply.suggestion.as_str(), "block" | "mask");
                 // Diagnostics land here, once, with the verdict known. A
                 // block is what an operator traces back from a caller's
-                // 422, so it logs at info (the default level); a clean
-                // pass stays at debug.
+                // 422, so it logs at info; a clean pass stays at debug.
                 if blocked {
                     tracing::info!(
                         guardrail_name = %self.row_name,

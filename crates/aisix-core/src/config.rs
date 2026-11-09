@@ -1264,8 +1264,9 @@ pub struct ObservabilityConfig {
     pub service_name: String,
     #[serde(default = "ObservabilityConfig::default_log_level")]
     pub log_level: String,
-    /// Write one access-log line per request. Off, no access-log line is
-    /// written whatever the log level; every other log line is unaffected.
+    /// Write one access-log line per request. On, the line is written
+    /// whatever the log level; off, it is never written. Every other log
+    /// line is unaffected.
     #[serde(default = "ObservabilityConfig::default_access_log")]
     pub access_log: bool,
     pub metrics: MetricsConfig,
@@ -1386,7 +1387,7 @@ impl ObservabilityConfig {
         "aisix".into()
     }
     fn default_log_level() -> String {
-        "info".into()
+        "warn".into()
     }
     const fn default_access_log() -> bool {
         true
@@ -5390,7 +5391,7 @@ admin:
 "#,
         );
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
-        assert_eq!(cfg.observability.log_level, "info");
+        assert_eq!(cfg.observability.log_level, "warn");
         assert_eq!(cfg.observability.service_name, "aisix");
         assert!(cfg.observability.access_log);
         assert_eq!(cfg.managed.mtls_dir, "/var/lib/aisix/mtls");

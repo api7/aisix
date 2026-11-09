@@ -183,8 +183,8 @@ impl AliyunTextModerationGuardrail {
                 // The upstream diagnostics land here, once, with the
                 // verdict known — rather than at each exit of `call()`,
                 // which can't see it. A block is what an operator traces
-                // back from a caller's 422, so it logs at info (the
-                // default level); a clean pass would be one line per
+                // back from a caller's 422, so it logs at info; a
+                // clean pass would be one line per
                 // request, so it stays at debug.
                 if blocked {
                     tracing::info!(

@@ -142,9 +142,8 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses:
 /// (AISIX-Cloud#1499).
 ///
 /// `request_id` is a field of the line itself, not only of the enclosing
-/// `request` span: that span is INFO-level, so at `log_level=warn` it is
-/// disabled and this line would otherwise carry no way back to the request
-/// (AISIX-Cloud#1136).
+/// `request` span, so this line keeps its way back to the request wherever
+/// it is emitted (AISIX-Cloud#1136).
 pub(crate) fn log_attempt_failure(
     request_id: &str,
     target_model: &str,

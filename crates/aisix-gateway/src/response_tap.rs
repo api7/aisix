@@ -179,7 +179,7 @@ pub fn note_upstream_error_body(body: &bytes::Bytes) {
 }
 
 /// Log an error response whose body could not be read. Names the request
-/// itself: the request span is off at the `warn` level this is meant to reach.
+/// itself rather than relying on the request span being attached here.
 pub fn warn_error_body_unread(status: u16, reason: &str) {
     let request_id = TAP
         .try_with(|tap| tap.request_id.clone())

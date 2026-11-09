@@ -220,7 +220,10 @@ pub(crate) async fn ensure_request_id(
         aisix_obs::RequestTraceBundle::new(remote).with_http_server(http),
     ));
 
-    let span = tracing::info_span!(
+    // ERROR, not INFO: a span below the filter's level is disabled, and with
+    // it the `peer` and ids on every line the request writes, access log and
+    // WARNs included. The span's level is never rendered, only its fields.
+    let span = tracing::error_span!(
         "request",
         request_id = %id,
         http_version = http_version_label(request.version()),
