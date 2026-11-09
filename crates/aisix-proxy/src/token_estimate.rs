@@ -1377,7 +1377,13 @@ mod tests {
         };
         let bare = count(json!({"input": [user.clone()]}));
         let declared = count(json!({"input": [user.clone()], "tools": [search.clone()]}));
+        let as_function = count(
+            json!({"input": [user.clone()], "tools": [{"type": "function",
+            "name": "tool_search", "description": search["description"],
+            "parameters": search["parameters"]}]}),
+        );
         assert!(declared > bare);
+        assert_eq!(declared, as_function);
         let loaded_none =
             count(json!({"input": [user.clone(), output(json!([]))], "tools": [search.clone()]}));
         let loaded = count(json!({"input": [user, output(json!([
