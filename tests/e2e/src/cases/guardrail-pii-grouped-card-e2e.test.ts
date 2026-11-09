@@ -13,8 +13,9 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// The built-in bank_card detector recognises a card however it is printed, and
-// the built-in detectors recognise a value written straight after Chinese text.
+// The built-in bank_card detector recognises a card however it is printed, a
+// grouped number only under a card's prefix, and the built-in detectors recognise
+// a value written straight after Chinese text.
 
 const MASK_CALLER = "sk-pii-card-mask";
 const BLOCK_CALLER = "sk-pii-card-block";
@@ -88,7 +89,7 @@ describe("bank_card recognises grouped numbers and values touching CJK text", ()
       },
     });
     upstream = await startOpenAiUpstream(answering("noted"));
-    leaky = await startOpenAiUpstream(answering("the card on file is 4111-1111-1111-1111."));
+    leaky = await startOpenAiUpstream(answering("the card on file is 6222 0212 3456 7890 128."));
     app = await spawnApp({
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
@@ -139,6 +140,15 @@ describe("bank_card recognises grouped numbers and values touching CJK text", ()
     modelIds["card-block-split"] = await splitStream(seed, "card-block-split", [
       "the card is 4111-1111-",
       "1111-1111 on file",
+    ]);
+
+    modelIds["card-mask-split-19"] = await splitStream(seed, "card-mask-split-19", [
+      "the card is 6222 0212 3456 7890 ",
+      "128 on file",
+    ]);
+    modelIds["card-block-split-19"] = await splitStream(seed, "card-block-split-19", [
+      "the card is 6222-0212-3456-7890-",
+      "128 on file",
     ]);
 
     const mask = await seed.createGuardrail(
@@ -205,17 +215,33 @@ describe("bank_card recognises grouped numbers and values touching CJK text", ()
     return waitForSlsLog(sls!, LOGSTORE, (l) => l.get("request_id") === requestId, `row ${requestId}`);
   };
 
-  test.for([
-    ["spaces", "My credit card number is 4111 1111 1111 1111, please check my bill.", `My credit card number is ${MASKED}, please check my bill.`],
-    ["hyphens", "My credit card number is 4111-1111-1111-1111, please check my bill.", `My credit card number is ${MASKED}, please check my bill.`],
-    ["no separator", "My credit card number is 4111111111111111, please check my bill.", `My credit card number is ${MASKED}, please check my bill.`],
-    ["four-six-five", "amex 3782 822463 10005 on file", `amex ${MASKED} on file`],
-    ["four-six-four", "diners 3056-930902-5904 on file", `diners ${MASKED} on file`],
-    ["a longer run keeps what follows the card", "num 4111 1111 1111 1111 123 end", `num ${MASKED} 123 end`],
+  const SENTENCE = (card: string) => `My credit card number is ${card}, please check my bill.`;
+
+  const MASKED_SAMPLES = [
+    ["spaces", SENTENCE("4111 1111 1111 1111"), SENTENCE(MASKED)],
+    ["hyphens", SENTENCE("4111-1111-1111-1111"), SENTENCE(MASKED)],
+    ["no separator", SENTENCE("4111111111111111"), SENTENCE(MASKED)],
+    ["a 19-digit card in 4-4-4-4-3", "card 6222 0212 3456 7890 128 end", `card ${MASKED} end`],
+    ["a leading year stays", "ref 2026 4111 1111 1111 1111", `ref 2026 ${MASKED}`],
+    ["a 16-digit card and three digits mask whole", "num 4111 1111 1111 1111 123 end", `num ${MASKED} end`],
+    ["four trailing digits stay", "num 4111 1111 1111 1111 1234 end", `num ${MASKED} 1234 end`],
     ["touching Chinese", "卡號4111111111111111。", `卡號${MASKED}。`],
     ["grouped, touching Chinese", "卡號4111 1111 1111 1111。", `卡號${MASKED}。`],
-    ["a reference number that happens to pass Luhn is masked too", "ref 2026110700123451", `ref ${MASKED}`],
-  ] as const)("mask on input: %s", async ([, sent, seen], ctx) => {
+    ["four-six-five", "amex 3782 822463 10005 on file", `amex ${MASKED} on file`],
+    ["four-six-four", "diners 3056-930902-5904 on file", `diners ${MASKED} on file`],
+    ["an unbroken reference number passing Luhn", "ref 2026110700123451", `ref ${MASKED}`],
+  ] as const;
+
+  const UNTOUCHED_SAMPLES = [
+    "2026110700123450",
+    "2026 1107 0012 3450",
+    "2026 1107 0012 3451",
+    "1234 5678 9012 3452",
+    // Known limit: a leading number with a card's prefix hides the card behind it.
+    "ref 4026 4111 1111 1111 1111",
+  ] as const;
+
+  test.for(MASKED_SAMPLES)("mask on input: %s", async ([, sent, seen], ctx) => {
     if (!etcdReachable) return ctx.skip();
     const res = await chat("card-mask", sent);
     await res.text();
@@ -225,10 +251,7 @@ describe("bank_card recognises grouped numbers and values touching CJK text", ()
     expect(JSON.parse(row.get("redacted_entity_counts") ?? "{}")).toEqual({ bank_card: 1 });
   });
 
-  test.for([
-    "2026110700123450",
-    "2026 1107 0012 3450",
-  ] as const)("a number failing Luhn is left alone: %s", async (number, ctx) => {
+  test.for(UNTOUCHED_SAMPLES)("left alone by mask: %s", async (number, ctx) => {
     if (!etcdReachable) return ctx.skip();
     const sent = `order ${number} shipped`;
     const res = await chat("card-mask", sent);
@@ -239,12 +262,7 @@ describe("bank_card recognises grouped numbers and values touching CJK text", ()
     expect(row.get("redacted_entity_counts")).toBeUndefined();
   });
 
-  test.for([
-    ["spaces", "My credit card number is 4111 1111 1111 1111, please check my bill."],
-    ["hyphens", "My credit card number is 4111-1111-1111-1111, please check my bill."],
-    ["no separator", "My credit card number is 4111111111111111, please check my bill."],
-    ["touching Chinese", "卡號4111111111111111。"],
-  ] as const)("block on input: %s", async ([, sent], ctx) => {
+  test.for(MASKED_SAMPLES)("block on input: %s", async ([, sent], ctx) => {
     if (!etcdReachable) return ctx.skip();
     const before = upstreamCalls();
     const res = await chat("card-block", sent);
@@ -256,6 +274,15 @@ describe("bank_card recognises grouped numbers and values touching CJK text", ()
     expect(row.get("guardrail_blocked")).toBe("true");
     const hits = JSON.parse(row.get("guardrail_enforced_hits") ?? "[]") as Array<{ guardrail_name?: string }>;
     expect(hits.map((h) => h.guardrail_name)).toContain("card-block");
+  });
+
+  test.for(UNTOUCHED_SAMPLES)("left alone by block: %s", async (number, ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    const before = upstreamCalls();
+    const res = await chat("card-block", `order ${number} shipped`);
+    await res.text();
+    expect(res.status).toBe(200);
+    expect(upstreamCalls()).toBe(before + 1);
   });
 
   test("mask on output, non-streaming", async (ctx) => {
@@ -271,29 +298,41 @@ describe("bank_card recognises grouped numbers and values touching CJK text", ()
     const res = await chat("card-block-output", "what is on file?");
     const body = await res.text();
     expect(res.status).toBe(422);
-    expect(body).not.toContain("1111");
+    expect(body).not.toContain("0212");
     expect((await rowOf(res)).get("guardrail_blocked")).toBe("true");
   });
 
-  test("mask on a stream that splits the card across chunks", async (ctx) => {
-    if (!etcdReachable) return ctx.skip();
-    const res = await chat("card-mask-split", "what is on file?", true);
-    const wire = await res.text();
-    expect(res.status).toBe(200);
-    const text = wire
+  const streamedText = (wire: string) =>
+    wire
       .split("\n")
       .filter((l) => l.startsWith("data: {"))
-      .map((l) => (JSON.parse(l.slice(6)) as { choices: Array<{ delta?: { content?: string } }> }).choices[0]?.delta?.content ?? "")
+      .map(
+        (l) =>
+          (JSON.parse(l.slice(6)) as { choices: Array<{ delta?: { content?: string } }> }).choices[0]
+            ?.delta?.content ?? "",
+      )
       .join("");
-    expect(text).toBe(`the card is ${MASKED} on file`);
-    expect(wire).not.toContain("1111");
+
+  test.for([
+    ["4-4-4-4", "card-mask-split", "1111"],
+    ["4-4-4-4-3", "card-mask-split-19", "0212"],
+  ] as const)("mask on a stream that splits the card across chunks: %s", async ([, model, digits], ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    const res = await chat(model, "what is on file?", true);
+    const wire = await res.text();
+    expect(res.status).toBe(200);
+    expect(streamedText(wire)).toBe(`the card is ${MASKED} on file`);
+    expect(wire).not.toContain(digits);
   });
 
-  test("block on a stream that splits the card across chunks", async (ctx) => {
+  test.for([
+    ["4-4-4-4", "card-block-split", "1111"],
+    ["4-4-4-4-3", "card-block-split-19", "0212"],
+  ] as const)("block on a stream that splits the card across chunks: %s", async ([, model, digits], ctx) => {
     if (!etcdReachable) return ctx.skip();
-    const res = await chat("card-block-split", "what is on file?", true);
+    const res = await chat(model, "what is on file?", true);
     const wire = await res.text();
-    expect(wire).not.toContain("1111");
+    expect(wire).not.toContain(digits);
     const row = await rowOf(res);
     expect(row.get("guardrail_blocked")).toBe("true");
     expect(row.get("error_class")).toBe("content_filter");

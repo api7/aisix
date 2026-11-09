@@ -221,12 +221,16 @@ pub const BUILTIN_DETECTORS: &[(&str, &str, Option<MatchValidator>)] = &[
         r"(?-u:\b)\d{17}[0-9Xx](?-u:\b)",
         Some(china_id_checksum),
     ),
-    // 13–19 digit PAN (bank/credit card), unbroken or printed in the 4-4-4-4,
-    // 4-6-5 or 4-6-4 groups separated by spaces or hyphens, Luhn-verified.
+    // 13–19 digit PAN (bank/credit card), Luhn-verified: an unbroken run of any
+    // prefix, or the 4-4-4-4(-3), 4-6-5 and 4-6-4 groups separated by spaces or
+    // hyphens. A grouped number must start like a card (2[2-7]xx or 3, 4, 5, 6,
+    // 8, 9), because the match cannot be retried from a later group: a leading
+    // 4-digit number such as a year would otherwise swallow the card after it
+    // and fail Luhn. A leading number with a card's prefix still does.
     (
         "bank_card",
-        r"(?-u:\b)(?:\d{13,19}|\d{4}(?:[ -]\d{4}){3}|\d{4}[ -]\d{6}[ -]\d{4,5})(?-u:\b)",
-        Some(luhn_checksum),
+        r"(?-u:\b)(?:\d{13,19}|(?:2[2-7]\d{2}|[3-689]\d{3})(?:[ -]\d{4}){3}(?:[ -]\d{3})?|(?:2[2-7]\d{2}|[3-689]\d{3})[ -]\d{6}[ -]\d{4,5})(?-u:\b)",
+        Some(bank_card_checksum),
     ),
     ("us_ssn", r"(?-u:\b)\d{3}-\d{2}-\d{4}(?-u:\b)", None),
     (
@@ -281,6 +285,23 @@ fn china_id_checksum(s: &str) -> bool {
     }
     let expected = CHECK[(sum % 11) as usize];
     bytes[17].to_ascii_uppercase() == expected
+}
+
+/// Whether a `bank_card` match is a card. A grouped 19-digit match may be a
+/// 16-digit card followed by three more digits, so its first 16 digits count
+/// on their own. An unbroken run has no such boundary to read.
+fn bank_card_checksum(s: &str) -> bool {
+    if luhn_checksum(s) {
+        return true;
+    }
+    let digits = s.bytes().filter(u8::is_ascii_digit).count();
+    if digits != 19 || !s.contains([' ', '-']) {
+        return false;
+    }
+    s.char_indices()
+        .filter(|(_, c)| c.is_ascii_digit())
+        .nth(15)
+        .is_some_and(|(end, _)| luhn_checksum(&s[..=end]))
 }
 
 /// Luhn check for payment-card numbers, reading through the separators a
@@ -633,13 +654,60 @@ mod tests {
         assert!(g.redact_input_text("2026110700123451").is_some());
     }
 
+    fn masked_card(text: &str) -> String {
+        guardrail(vec![builtin("bank_card", PiiAction::Mask)])
+            .redact_input_text(text)
+            .map_or_else(|| text.to_string(), |r| r.text)
+    }
+
+    /// Grouped digits only count as a card under a card's prefix, whichever
+    /// checksum they would pass.
     #[test]
-    fn bank_card_in_a_longer_grouped_run_masks_the_first_sixteen_digits() {
-        let g = guardrail(vec![builtin("bank_card", PiiAction::Mask)]);
-        let r = g
-            .redact_input_text("card 4111 1111 1111 1111 123 end")
-            .unwrap();
-        assert_eq!(r.text, "card [BANK_CARD_REDACTED] 123 end");
+    fn a_grouped_number_needs_a_card_prefix() {
+        for unmasked in [
+            "2026 1107 0012 3450",
+            "2026 1107 0012 3451",
+            "1234 5678 9012 3452",
+            // A leading number with a card's prefix hides the card behind it.
+            "ref 4026 4111 1111 1111 1111",
+        ] {
+            assert_eq!(masked_card(unmasked), unmasked);
+        }
+        assert_eq!(masked_card("2026110700123451"), "[BANK_CARD_REDACTED]");
+    }
+
+    #[test]
+    fn a_card_after_a_leading_year_keeps_the_year() {
+        assert_eq!(
+            masked_card("ref 2026 4111 1111 1111 1111"),
+            "ref 2026 [BANK_CARD_REDACTED]"
+        );
+    }
+
+    #[test]
+    fn a_grouped_nineteen_digit_number_masks_whole() {
+        // Passes Luhn across all 19 digits; its first 16 do not.
+        assert_eq!(
+            masked_card("card 6222 0212 3456 7890 128 end"),
+            "card [BANK_CARD_REDACTED] end"
+        );
+        // A 16-digit card followed by three digits passes on its first 16.
+        assert_eq!(
+            masked_card("card 4111 1111 1111 1111 123 end"),
+            "card [BANK_CARD_REDACTED] end"
+        );
+        // Four trailing digits are not part of the grouping.
+        assert_eq!(
+            masked_card("card 4111 1111 1111 1111 1234 end"),
+            "card [BANK_CARD_REDACTED] 1234 end"
+        );
+        // Neither reading passes.
+        assert_eq!(
+            masked_card("card 6222 0212 3456 7890 129 end"),
+            "card 6222 0212 3456 7890 129 end"
+        );
+        // An unbroken run is checked whole: the first 16 passing is not enough.
+        assert_eq!(masked_card("4111111111111111123"), "4111111111111111123");
     }
 
     /// A value written straight after, or before, Chinese text is still that
