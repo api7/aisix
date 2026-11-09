@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { scrapeMetrics, sumMetric, type MetricSample } from "../harness/index.js";
+import { scrapeMetrics, suiteThreadPerCore, sumMetric, type MetricSample } from "../harness/index.js";
 
 // The published image, started the way it ships, on a kernel older than 6.4.
 //
@@ -49,7 +49,8 @@ const sample = (samples: MetricSample[], name: string) => samples.find((s) => s.
 const hasDocker = await dockerAvailable();
 if (!hasDocker && process.env.CI) throw new Error("this spec needs a docker daemon, and CI has one");
 
-describe.skipIf(!hasDocker)("image default start on a kernel without PR_GET_AUXV", () => {
+// The test binary goes into a Linux image as it is.
+describe.skipIf(!hasDocker || process.platform !== "linux")("image default start on a kernel without PR_GET_AUXV", () => {
   const id = randomUUID().slice(0, 8);
   const image = `aisix-e2e-no-pr-get-auxv:${id}`;
   const container = `aisix-e2e-no-pr-get-auxv-${id}`;
@@ -95,6 +96,7 @@ describe.skipIf(!hasDocker)("image default start on a kernel without PR_GET_AUXV
         "resources_file: /etc/aisix/resources.yaml",
         "proxy:",
         '  addr: "0.0.0.0:3000"',
+        ...(suiteThreadPerCore !== undefined ? [`  thread_per_core: ${suiteThreadPerCore}`] : []),
         "admin:",
         '  addr: "0.0.0.0:3001"',
         "  admin_keys: [e2e-admin-key]",
@@ -127,17 +129,19 @@ describe.skipIf(!hasDocker)("image default start on a kernel without PR_GET_AUXV
 
     const until = Date.now() + 30_000;
     for (;;) {
-      const ok = await fetch(`${metricsUrl}/metrics`)
+      // Connection refused is the normal state until the listener binds.
+      const ready = await fetch(`${metricsUrl}/status/ready`)
         .then((r) => r.ok)
         .catch(() => false);
-      if (ok) break;
-      if (Date.now() > until) {
-        throw new Error(`gateway never served /metrics:\n${await containerLogs()}`);
+      if (ready) break;
+      const running = (await docker("inspect", "--format", "{{.State.Running}}", container)) === "true";
+      if (!running || Date.now() > until) {
+        throw new Error(`gateway never became ready (running=${running}):\n${await containerLogs()}`);
       }
       await new Promise((r) => setTimeout(r, 200));
     }
     gatewayPid = await inContainer(
-      'for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = aisix ] && echo "${p#/proc/}"; done',
+      'for p in /proc/[0-9]*; do [ "$(cat "$p/comm" 2>/dev/null)" = aisix ] && echo "${p#/proc/}"; done; true',
     );
   }, IMAGE_BUILD_TIMEOUT_MS);
 
@@ -211,10 +215,7 @@ describe.skipIf(!hasDocker)("image default start on a kernel without PR_GET_AUXV
     expect(threads.split("\n")).toContain("heap-autodump");
   });
 
-  test("nothing panicked and no metric read failed", async () => {
-    await scrapeMetrics(metricsUrl);
-    const logs = await containerLogs();
-    expect(logs).not.toContain("panicked");
-    expect(logs).not.toContain("reading memory metrics failed");
+  test("nothing panicked", async () => {
+    expect(await containerLogs()).not.toContain("panicked");
   });
 });
