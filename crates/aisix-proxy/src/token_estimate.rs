@@ -419,6 +419,20 @@ fn count_responses_prompt(bpe: &CoreBPE, body: &Value) -> u32 {
                             n = n.saturating_add(count_content_value(bpe, content));
                         }
                     }
+                    // The tools a client tool search loaded are counted with
+                    // the request's tools below; the model reads the item
+                    // itself as the result naming them.
+                    None if aisix_gateway::tool_calls::client_tool_search_item_call_id(
+                        item,
+                        "tool_search_output",
+                    )
+                    .is_some() =>
+                    {
+                        n = n.saturating_add(enc(
+                            bpe,
+                            &aisix_gateway::tool_calls::client_tool_search_output_text(item),
+                        ));
+                    }
                     None => {
                         // Non-message item (function_call, function_call_output,
                         // reasoning, ...).
@@ -439,9 +453,10 @@ fn count_responses_prompt(bpe: &CoreBPE, body: &Value) -> u32 {
 }
 
 /// Every tool definition a Responses request declares, top-level and in
-/// `additional_tools` items alike, with each `namespace` tool's sub-tools
-/// standing in for the namespace: each sub-tool reaches the model as a tool
-/// of its own.
+/// `additional_tools` items alike, plus the tools a client tool search
+/// loaded, with each `namespace` tool's sub-tools standing in for the
+/// namespace: each sub-tool reaches the model as a tool of its own, and a
+/// client `tool_search` as the function it is offered as.
 fn responses_tool_definitions(body: &Value) -> Value {
     let declared =
         aisix_gateway::tool_calls::responses_declared_tools(body.get("tools"), body.get("input"));
@@ -456,7 +471,13 @@ fn responses_tool_definitions(body: &Value) -> Value {
                     .unwrap_or_default(),
                 _ => vec![t.as_ref()],
             })
-            .cloned()
+            .map(|t| {
+                if aisix_gateway::tool_calls::is_client_tool_search(t) {
+                    aisix_gateway::tool_calls::client_tool_search_function(t)
+                } else {
+                    t.clone()
+                }
+            })
             .collect(),
     )
 }
@@ -1336,6 +1357,40 @@ mod tests {
         assert_eq!(top_level, flat);
         assert_eq!(lite, flat);
         assert_eq!(redeclared, flat);
+    }
+
+    /// A client `tool_search` counts as the function it is offered as, and
+    /// the tools a search loaded count as tools.
+    #[test]
+    fn responses_prompt_counts_the_client_search_and_the_tools_it_loaded() {
+        let count =
+            |body: Value| Estimator::new("gpt-4o", PromptInput::Responses(body)).count_prompt();
+        let user = json!({"role": "user", "content": "hi"});
+        let search = json!({"type": "tool_search", "execution": "client",
+            "description": "Search the deferred tools.",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}});
+        let member = json!({"type": "function", "name": "read", "description": "Read a page of the docs.",
+            "parameters": {"type": "object", "properties": {"page": {"type": "string"}}}});
+        let output = |tools: Value| {
+            json!({"type": "tool_search_output", "call_id": "ts_1",
+            "execution": "client", "status": "completed", "tools": tools})
+        };
+        let bare = count(json!({"input": [user.clone()]}));
+        let declared = count(json!({"input": [user.clone()], "tools": [search.clone()]}));
+        let as_function = count(
+            json!({"input": [user.clone()], "tools": [{"type": "function",
+            "name": "tool_search", "description": search["description"],
+            "parameters": search["parameters"]}]}),
+        );
+        assert!(declared > bare);
+        assert_eq!(declared, as_function);
+        let loaded_none =
+            count(json!({"input": [user.clone(), output(json!([]))], "tools": [search.clone()]}));
+        let loaded = count(json!({"input": [user, output(json!([
+            {"type": "namespace", "name": "mcp__docs", "tools": [member]},
+        ]))], "tools": [search]}));
+        // Loading one tool adds at least its definition's description.
+        assert!(loaded >= loaded_none + 5, "{loaded} vs {loaded_none}");
     }
 
     #[test]

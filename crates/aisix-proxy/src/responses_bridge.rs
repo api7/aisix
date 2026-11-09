@@ -23,6 +23,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use aisix_gateway::tool_calls::{
+    client_tool_search_arguments, client_tool_search_function, client_tool_search_item_call_id,
+    client_tool_search_output_text, is_client_tool_search, CLIENT_TOOL_SEARCH_NAME,
+};
 use aisix_gateway::{
     ChatChunk, ChatChunkStream, ChatFormat, ChatMessage, ChatResponse, FinishReason, Role,
     UsageStats,
@@ -162,6 +166,37 @@ fn append_input_item(messages: &mut Vec<ChatMessage>, item: &Value) {
         // Tool declarations, merged into the request's `tools` by
         // [`declared_tools`]: not a turn of the conversation.
         Some("additional_tools") => {}
+        // A search the client ran for the model, replayed as the call to the
+        // `tool_search` function the model was offered and its result. The
+        // tools the search loaded join the request's tools
+        // ([`declared_tools`]); the result tells the model which.
+        Some("tool_search_call") => {
+            if let Some(call_id) = client_tool_search_item_call_id(item, "tool_search_call") {
+                push_tool_call(
+                    messages,
+                    json!({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": CLIENT_TOOL_SEARCH_NAME,
+                            "arguments": client_tool_search_arguments(item),
+                        },
+                    }),
+                );
+            }
+        }
+        Some("tool_search_output") => {
+            if let Some(call_id) = client_tool_search_item_call_id(item, "tool_search_output") {
+                messages.push(ChatMessage {
+                    role: Role::Tool,
+                    content: Some(client_tool_search_output_text(item)),
+                    content_blocks: None,
+                    name: None,
+                    tool_call_id: Some(call_id.to_string()),
+                    extra: Map::new(),
+                });
+            }
+        }
         // A prior custom-tool call replayed for the agent loop. The request
         // side gave the model a function tool taking one string
         // (`custom_tool_parameters`), so the replayed call has to go back in
@@ -709,6 +744,11 @@ fn responses_tools_to_chat(tools: &[std::borrow::Cow<'_, Value>]) -> Option<Valu
                     })
                     .collect(),
                 Some("custom") => custom_chat_tool(t, None).into_iter().collect(),
+                Some("tool_search") if is_client_tool_search(t) => {
+                    function_chat_tool(&client_tool_search_function(t), None)
+                        .into_iter()
+                        .collect()
+                }
                 _ => Vec::new(),
             }
         })
@@ -747,7 +787,7 @@ fn function_chat_tool(t: &Value, rename: Option<(String, Option<String>)>) -> Op
 /// the tool and re-names replayed calls with it, the reply side maps a call
 /// back through [`ResponsesReplyContext`].
 fn namespace_chat_tool_name(namespace: &str, tool: &str) -> String {
-    format!("{namespace}__{tool}")
+    aisix_gateway::tool_calls::responses_namespace_tool_name(namespace, tool)
 }
 
 /// Names of the top-level `function` and `custom` tools a request declared:
@@ -902,6 +942,9 @@ pub struct ResponsesReplyContext {
     custom_tools: std::collections::BTreeSet<String>,
     /// Chat function name → the namespace sub-tool it was offered for.
     namespace_tools: std::collections::BTreeMap<String, NamespaceMember>,
+    /// The request declared a client-executed `tool_search`: a call to
+    /// [`CLIENT_TOOL_SEARCH_NAME`] goes back as a `tool_search_call` item.
+    client_tool_search: bool,
     echo: Map<String, Value>,
 }
 
@@ -942,6 +985,7 @@ impl ResponsesReplyContext {
         Self {
             custom_tools,
             namespace_tools: namespace_tool_map(&tools),
+            client_tool_search: tools.iter().any(|t| is_client_tool_search(t)),
             echo: response_echo_fields(body),
         }
     }
@@ -951,6 +995,10 @@ impl ResponsesReplyContext {
     pub fn echo_previous_response_id(&mut self, id: &str) {
         self.echo
             .insert("previous_response_id".into(), Value::String(id.to_string()));
+    }
+
+    fn is_tool_search_call(&self, chat_name: &str) -> bool {
+        self.client_tool_search && chat_name == CLIENT_TOOL_SEARCH_NAME
     }
 
     fn tool_call<'a>(&'a self, chat_name: &'a str) -> ReplyToolCall<'a> {
@@ -1394,6 +1442,14 @@ fn build_output_items(
                 .and_then(|f| f.get("arguments"))
                 .and_then(|a| a.as_str())
                 .unwrap_or("");
+            if reply.is_tool_search_call(name) {
+                output.push(tool_search_call_item(
+                    &format!("tsc_{}", Uuid::new_v4().simple()),
+                    call_id,
+                    Some(arguments),
+                ));
+                continue;
+            }
             let call = reply.tool_call(name);
             output.push(if call.custom {
                 custom_tool_call_item(
@@ -1442,6 +1498,31 @@ fn function_call_item(
         item["namespace"] = json!(namespace);
     }
     item
+}
+
+/// A `tool_search_call` output item for a search the client runs itself.
+/// `arguments` is the function-call argument string the model produced, or
+/// `None` while the call is still streaming. Arguments that do not parse
+/// as a JSON object leave the item `incomplete` with empty arguments.
+fn tool_search_call_item(id: &str, call_id: &str, arguments: Option<&str>) -> Value {
+    let (arguments, status) = match arguments {
+        None => (json!({}), "in_progress"),
+        Some(raw) => {
+            let raw = if raw.trim().is_empty() { "{}" } else { raw };
+            match serde_json::from_str::<Value>(raw) {
+                Ok(v @ Value::Object(_)) => (v, "completed"),
+                _ => (json!({}), "incomplete"),
+            }
+        }
+    };
+    json!({
+        "type": "tool_search_call",
+        "id": id,
+        "call_id": call_id,
+        "execution": "client",
+        "arguments": arguments,
+        "status": status,
+    })
 }
 
 /// A `custom_tool_call` output item, carrying `namespace` the same way
@@ -1573,6 +1654,10 @@ struct ToolCallState {
     /// The call names one of the request's `custom` tools, so it streams as
     /// a `custom_tool_call` item rather than a `function_call` one.
     custom: bool,
+    /// The call is to the client's `tool_search`, so it streams as a
+    /// `tool_search_call` item: announced, then done, with no argument
+    /// events in between. Fixed when the item is announced, like `custom`.
+    tool_search: bool,
     /// `(namespace, sub-tool name)` when the call names a flattened
     /// namespace sub-tool, function or custom. Fixed when the item is
     /// announced, like `custom`.
@@ -1586,13 +1671,21 @@ impl ToolCallState {
     /// `fc_…` for a function call, `ctc_…` for a custom tool call — the two
     /// item-id prefixes the Responses API uses for the two item types.
     fn item_id(&self) -> String {
-        let prefix = if self.custom { "ctc" } else { "fc" };
+        let prefix = if self.tool_search {
+            "tsc"
+        } else if self.custom {
+            "ctc"
+        } else {
+            "fc"
+        };
         format!("{prefix}_{}", self.item_uuid)
     }
 
     /// The completed output item for this call.
     fn done_item(&self) -> Value {
-        if self.custom {
+        if self.tool_search {
+            tool_search_call_item(&self.item_id(), &self.call_id, Some(&self.arguments))
+        } else if self.custom {
             self.item(&unwrap_custom_tool_input(&self.arguments), "completed")
         } else {
             self.item(&self.arguments, "completed")
@@ -1604,6 +1697,9 @@ impl ToolCallState {
     /// under the sub-tool name and its namespace when it names a namespace
     /// sub-tool.
     fn item(&self, payload: &str, status: &str) -> Value {
+        if self.tool_search {
+            return tool_search_call_item(&self.item_id(), &self.call_id, None);
+        }
         let (name, namespace) = match &self.namespace {
             Some((namespace, name)) => (name.as_str(), Some(namespace.as_str())),
             None => (self.name.as_str(), None),
@@ -2078,6 +2174,7 @@ impl ResponsesSseEncoder {
                             call_id: String::new(),
                             name: String::new(),
                             custom: false,
+                            tool_search: false,
                             namespace: None,
                             output_index,
                             arguments: String::new(),
@@ -2085,6 +2182,7 @@ impl ResponsesSseEncoder {
                         },
                     );
                 }
+                let tool_search = self.reply.is_tool_search_call(name);
                 let call = self.reply.tool_call(name);
                 let custom = call.custom;
                 let namespace = call
@@ -2104,6 +2202,7 @@ impl ResponsesSseEncoder {
                     // would leave `.done` disagreeing with the `.added`
                     // the client already read.
                     if !state.item_added {
+                        state.tool_search = tool_search;
                         state.custom = custom;
                         state.namespace = namespace;
                     }
@@ -2130,7 +2229,7 @@ impl ResponsesSseEncoder {
                     // Streaming the wrapper through would hand the client
                     // pieces of `{"content":"…"}` under an event type whose
                     // payload is supposed to be the input itself.
-                    if state.item_added && !state.custom {
+                    if state.item_added && !state.custom && !state.tool_search {
                         let (item_id, output_index) = (state.item_id(), state.output_index);
                         events.push(self.event(
                             "response.function_call_arguments.delta",
@@ -2255,17 +2354,21 @@ impl ResponsesSseEncoder {
             .map(|(k, _)| *k)
             .collect();
         for k in pending {
-            let (item_id, arguments, output_index, custom, done_item) = {
+            let (item_id, arguments, output_index, custom, tool_search, done_item) = {
                 let s = self.tool_calls.get(&k).expect("present");
                 (
                     s.item_id(),
                     s.arguments.clone(),
                     s.output_index,
                     s.custom,
+                    s.tool_search,
                     s.done_item(),
                 )
             };
-            if custom {
+            if tool_search {
+                // A tool search streams no argument events: the item is
+                // announced, then done carrying its parsed arguments.
+            } else if custom {
                 // The buffered fragments become exactly one delta carrying
                 // the unwrapped input, then the done event — a custom tool
                 // never emits `response.function_call_arguments.*`.
@@ -5891,5 +5994,179 @@ mod tests {
         let call = &chat.messages[0].extra["tool_calls"][0]["function"];
         assert_eq!(call["name"], "functions__exec");
         assert_eq!(call["arguments"], wrap_custom_tool_input("ls"));
+    }
+
+    /// A Codex-shaped request with a client tool search: the declaration
+    /// (in `additional_tools`, as lite mode sends it), and a search the
+    /// client already ran that loaded two deferred MCP tools.
+    fn tool_search_request() -> Value {
+        json!({
+            "model": "m",
+            "input": [
+                {"type": "additional_tools", "role": "developer", "tools": [
+                    {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+                    {"type": "tool_search", "execution": "client", "description": "Find tools.",
+                     "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}},
+                ]},
+                {"role": "user", "content": "read the docs"},
+                {"type": "tool_search_call", "call_id": "ts_1", "execution": "client",
+                 "status": "completed", "arguments": {"query": "docs", "limit": 8}},
+                {"type": "tool_search_output", "call_id": "ts_1", "execution": "client",
+                 "status": "completed", "tools": [
+                    {"type": "namespace", "name": "mcp__docs", "description": "Docs server.", "tools": [
+                        {"type": "function", "name": "read", "description": "Read a page.",
+                         "defer_loading": true, "parameters": {"type": "object"}},
+                        {"type": "function", "name": "search", "defer_loading": true,
+                         "parameters": {"type": "object"}},
+                    ]},
+                ]},
+            ],
+        })
+    }
+
+    #[test]
+    fn a_client_tool_search_and_its_history_reach_the_chat_model() {
+        let chat = responses_request_to_chat("m", &tool_search_request());
+        let tools = &chat.extra["tools"];
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "shell",
+                "tool_search",
+                "mcp__docs__read",
+                "mcp__docs__search"
+            ]
+        );
+        assert_eq!(tools[1]["function"]["description"], "Find tools.");
+        assert!(!tools.to_string().contains("defer_loading"));
+
+        let call = &chat.messages[1];
+        assert!(matches!(call.role, Role::Assistant));
+        let tc = &call.extra["tool_calls"][0];
+        assert_eq!(tc["id"], "ts_1");
+        assert_eq!(tc["function"]["name"], "tool_search");
+        let args: Value =
+            serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args, json!({"query": "docs", "limit": 8}));
+        let result = &chat.messages[2];
+        assert!(matches!(result.role, Role::Tool));
+        assert_eq!(result.tool_call_id.as_deref(), Some("ts_1"));
+        let text = result.content.as_deref().unwrap();
+        assert!(text.contains("mcp__docs__read") && text.contains("mcp__docs__search"));
+    }
+
+    #[test]
+    fn a_hosted_tool_search_is_still_not_offered_to_a_chat_model() {
+        let chat = responses_request_to_chat(
+            "m",
+            &json!({"input": "hi", "tools": [{"type": "tool_search"}]}),
+        );
+        assert!(chat.extra.get("tools").is_none());
+    }
+
+    #[test]
+    fn non_streaming_calls_to_the_search_and_a_loaded_tool_come_back_as_codex_items() {
+        let reply = ResponsesReplyContext::from_request(&tool_search_request());
+        let resp = chat_response_with(
+            None,
+            Some(json!([
+                {"id": "c1", "type": "function",
+                 "function": {"name": "tool_search", "arguments": "{\"query\":\"wiki\"}"}},
+                {"id": "c2", "type": "function",
+                 "function": {"name": "mcp__docs__read", "arguments": "{}"}},
+                {"id": "c3", "type": "function",
+                 "function": {"name": "tool_search", "arguments": "not json"}},
+            ])),
+            FinishReason::ToolCalls,
+        );
+        let out = chat_response_to_responses_json(&resp, "m", 0, &reply);
+        let search = &out["output"][0];
+        assert_eq!(search["type"], "tool_search_call");
+        assert_eq!(search["execution"], "client");
+        assert_eq!(search["call_id"], "c1");
+        assert_eq!(search["arguments"], json!({"query": "wiki"}));
+        assert_eq!(search["status"], "completed");
+        assert!(search["id"].as_str().unwrap().starts_with("tsc_"));
+        let loaded = &out["output"][1];
+        assert_eq!(loaded["type"], "function_call");
+        assert_eq!(loaded["namespace"], "mcp__docs");
+        assert_eq!(loaded["name"], "read");
+        let broken = &out["output"][2];
+        assert_eq!(broken["arguments"], json!({}));
+        assert_eq!(broken["status"], "incomplete");
+    }
+
+    /// Without a client `tool_search` declared, a function the model calls
+    /// `tool_search` is an ordinary function call.
+    #[test]
+    fn a_tool_search_call_needs_a_declared_client_search() {
+        let reply = ResponsesReplyContext::from_request(&json!({"tools": [
+            {"type": "function", "name": "tool_search"},
+        ]}));
+        let resp = chat_response_with(
+            None,
+            Some(json!([{"id": "c1", "type": "function",
+                "function": {"name": "tool_search", "arguments": "{}"}}])),
+            FinishReason::ToolCalls,
+        );
+        let out = chat_response_to_responses_json(&resp, "m", 0, &reply);
+        assert_eq!(out["output"][0]["type"], "function_call");
+    }
+
+    #[test]
+    fn streaming_search_call_is_announced_then_done_with_no_argument_events() {
+        let reply = ResponsesReplyContext::from_request(&tool_search_request());
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, reply);
+        let tool_chunk = |tc: Value, finish: Option<FinishReason>| ChatChunk {
+            choice_index: 0,
+            logprobs: None,
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![tc]),
+                ..Default::default()
+            },
+            finish_reason: finish,
+            usage: Some(UsageStats::new(4, 6)),
+            service_tier: None,
+            accounting_usage: None,
+        };
+        let mut all = enc.next_events(&tool_chunk(
+            json!({"index": 0, "id": "call_s", "type": "function",
+                "function": {"name": "tool_search", "arguments": "{\"query\""}}),
+            None,
+        ));
+        all.extend(enc.next_events(&tool_chunk(
+            json!({"index": 0, "function": {"arguments": ":\"docs\"}"}}),
+            Some(FinishReason::ToolCalls),
+        )));
+        assert_eq!(
+            types_of(&all),
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        let added = &all[2].data["item"];
+        assert_eq!(added["type"], "tool_search_call");
+        assert_eq!(added["status"], "in_progress");
+        assert_eq!(added["arguments"], json!({}));
+        let done = &all[3].data["item"];
+        assert_eq!(done["type"], "tool_search_call");
+        assert_eq!(done["execution"], "client");
+        assert_eq!(done["call_id"], "call_s");
+        assert_eq!(done["arguments"], json!({"query": "docs"}));
+        assert_eq!(done["status"], "completed");
+        assert_eq!(done["id"], added["id"]);
+        assert_eq!(all[4].data["response"]["output"][0], *done);
     }
 }

@@ -813,6 +813,41 @@ fn responses_input(body: &Map<String, Value>) -> Option<Converted> {
                             "parts": openai_content_parts(item.get("content"))?,
                         }));
                     }
+                    // A search the client ran for the model: a call to its
+                    // `tool_search` tool, answered with the tools it loaded.
+                    Some("tool_search_call")
+                        if aisix_gateway::tool_calls::client_tool_search_item_call_id(
+                            item,
+                            "tool_search_call",
+                        )
+                        .is_some() =>
+                    {
+                        let mut part = json!({
+                            "type": "tool_call",
+                            "name": aisix_gateway::tool_calls::CLIENT_TOOL_SEARCH_NAME,
+                            "arguments": arguments(item.get("arguments")),
+                        });
+                        if let Some(id) = item.get("call_id").and_then(Value::as_str) {
+                            part["id"] = Value::String(id.to_string());
+                        }
+                        out.push(json!({"role": "assistant", "parts": [part]}));
+                    }
+                    Some("tool_search_output")
+                        if aisix_gateway::tool_calls::client_tool_search_item_call_id(
+                            item,
+                            "tool_search_output",
+                        )
+                        .is_some() =>
+                    {
+                        let mut part = json!({
+                            "type": "tool_call_response",
+                            "response": item.get("tools").cloned().unwrap_or(Value::Null),
+                        });
+                        if let Some(id) = item.get("call_id").and_then(Value::as_str) {
+                            part["id"] = Value::String(id.to_string());
+                        }
+                        out.push(json!({"role": "tool", "parts": [part]}));
+                    }
                     // A reference names an earlier item without saying
                     // whose it was: no role can be claimed for it.
                     Some("item_reference") => return None,
@@ -835,6 +870,19 @@ fn responses_input(body: &Map<String, Value>) -> Option<Converted> {
         .map(|s| vec![text_part(s)]);
     let declared =
         aisix_gateway::tool_calls::responses_declared_tools(body.get("tools"), body.get("input"));
+    let declared: Vec<std::borrow::Cow<'_, Value>> = declared
+        .into_iter()
+        .map(|t| {
+            if aisix_gateway::tool_calls::is_client_tool_search(&t) {
+                // Named as the function the model is offered it as.
+                let mut search = aisix_gateway::tool_calls::client_tool_search_function(&t);
+                search["type"] = json!("tool_search");
+                std::borrow::Cow::Owned(search)
+            } else {
+                t
+            }
+        })
+        .collect();
     let tools = openai_tool_definitions(declared.iter().map(AsRef::as_ref));
     Some((messages, system, Some(tools)))
 }
@@ -1021,6 +1069,38 @@ mod tests {
             c.tool_definitions.as_deref(),
             Some(r#"[{"description":"new","name":"w","type":"function"}]"#)
         );
+    }
+
+    /// A client tool search in the history is a tool call and its
+    /// response, and the tool definitions are what the model was offered:
+    /// the search, then the tools it loaded.
+    #[test]
+    fn responses_client_tool_search_is_a_tool_call_and_loads_tool_definitions() {
+        let body = json!({
+            "tools": [{"type": "tool_search", "execution": "client", "description": "find"}],
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"type": "tool_search_call", "call_id": "ts_1", "execution": "client",
+                 "arguments": {"query": "docs"}},
+                {"type": "tool_search_output", "call_id": "ts_1", "execution": "client",
+                 "status": "completed", "tools": [{"type": "namespace", "name": "mcp__docs",
+                    "tools": [{"type": "function", "name": "read", "defer_loading": true}]}]},
+            ]
+        });
+        let c = structured_content(PromptWire::OpenAiResponses, &body.to_string(), "", None, "");
+        let input: Value = serde_json::from_str(c.input_messages.as_deref().unwrap()).unwrap();
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(
+            input[1]["parts"][0],
+            json!({"type": "tool_call", "id": "ts_1", "name": "tool_search", "arguments": {"query": "docs"}})
+        );
+        assert_eq!(input[2]["role"], "tool");
+        assert_eq!(input[2]["parts"][0]["type"], "tool_call_response");
+        assert_eq!(input[2]["parts"][0]["id"], "ts_1");
+        let tools: Value = serde_json::from_str(c.tool_definitions.as_deref().unwrap()).unwrap();
+        assert_eq!(tools[0]["name"], "tool_search");
+        assert_eq!(tools[0]["type"], "tool_search");
+        assert_eq!(tools[1]["name"], "mcp__docs");
     }
 
     #[test]

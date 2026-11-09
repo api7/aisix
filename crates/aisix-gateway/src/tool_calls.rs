@@ -20,25 +20,38 @@ use crate::{
 };
 
 /// The tool declarations of a Responses request: its top-level `tools`,
-/// then the `tools` of every `additional_tools` input item, in input order.
-/// A client may declare its tools either way (the Codex CLI's lite mode
-/// sends no top-level list at all), so every reader that translates or
-/// counts a request's tools reads them through here.
+/// then the `tools` of every `additional_tools` input item, in input order,
+/// then the tools a client-executed tool search loaded (see below). A client
+/// may declare its tools either way (the Codex CLI's lite mode sends no
+/// top-level list at all), so every reader that translates or counts a
+/// request's tools reads them through here.
 ///
 /// A tool declared again replaces its earlier declaration and keeps the
 /// earlier one's position: the Codex CLI leaves each `additional_tools` item
 /// in the history and, when a tool's schema changes, appends another item
 /// re-declaring it. A namespace declared again is merged member by member,
-/// its header (description) taken from the later declaration. A tool without
-/// a name is kept as is.
+/// its header (description) taken from the later declaration. A client
+/// `tool_search` is declared once, like a tool named `tool_search`. Any
+/// other tool without a name is kept as is.
+///
+/// When the request declares a client `tool_search`, a tool (or namespace
+/// member) marked `defer_loading: true` is left out: it becomes callable
+/// only once a `tool_search_output` item in the input loads it. The tools
+/// those items load follow every direct declaration, `defer_loading`
+/// removed — loaded top-level tools first, then the loaded namespace
+/// members regrouped by namespace. A loaded tool whose callable name a
+/// direct declaration already takes is left out, and a tool loaded more
+/// than once keeps its first definition.
 pub fn responses_declared_tools<'a>(
     tools: Option<&'a Value>,
     input: Option<&'a Value>,
 ) -> Vec<Cow<'a, Value>> {
-    let additional = input
+    let items = input
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let additional = items
+        .iter()
         .filter(|item| is_responses_additional_tools_item(item))
         .filter_map(|item| item.get("tools").and_then(Value::as_array))
         .flatten();
@@ -52,7 +65,11 @@ pub fn responses_declared_tools<'a>(
     let mut position: std::collections::HashMap<(bool, &'a str), usize> = Default::default();
     for tool in declared {
         let is_namespace = tool.get("type").and_then(Value::as_str) == Some("namespace");
-        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .or_else(|| is_client_tool_search(tool).then_some(CLIENT_TOOL_SEARCH_NAME));
+        let Some(name) = name else {
             out.push(Cow::Borrowed(tool));
             continue;
         };
@@ -72,7 +89,222 @@ pub fn responses_declared_tools<'a>(
             }
         }
     }
+    if out.iter().any(|t| is_client_tool_search(t)) {
+        out = out.into_iter().filter_map(without_deferred).collect();
+    }
+    if items
+        .iter()
+        .any(|item| searched_tools(item).next().is_some())
+    {
+        let loaded = loaded_tools(items, &out);
+        out.extend(loaded.into_iter().map(Cow::Owned));
+    }
     out
+}
+
+/// The function name a client-executed `tool_search` is offered to a chat
+/// model under, and the name its calls come back by.
+pub const CLIENT_TOOL_SEARCH_NAME: &str = "tool_search";
+
+/// A `tool_search` tool the client runs itself (`execution: "client"`), as
+/// opposed to the hosted one.
+pub fn is_client_tool_search(tool: &Value) -> bool {
+    tool.get("type").and_then(Value::as_str) == Some("tool_search")
+        && tool.get("execution").and_then(Value::as_str) == Some("client")
+}
+
+/// A client `tool_search` declaration as a flat Responses `function` tool
+/// named [`CLIENT_TOOL_SEARCH_NAME`], with a default description and
+/// parameters for whichever the declaration leaves out.
+pub fn client_tool_search_function(tool: &Value) -> Value {
+    let description = tool
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|d| !d.is_empty())
+        .unwrap_or(
+            "Search the deferred tools by keyword. Matching tools are loaded and can be called from the next turn on.",
+        );
+    let parameters = tool.get("parameters").cloned().unwrap_or_else(|| {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What to search the deferred tools for."},
+                "limit": {"type": "integer", "description": "The most tools to return."},
+            },
+            "required": ["query"],
+            "additionalProperties": false,
+        })
+    });
+    json!({
+        "type": "function",
+        "name": CLIENT_TOOL_SEARCH_NAME,
+        "description": description,
+        "parameters": parameters,
+    })
+}
+
+/// The `call_id` of a client-executed `tool_search_call` or
+/// `tool_search_output` input item (`kind`), when the item is one and
+/// carries a non-empty id. An item without one cannot be paired with its
+/// other half and is not replayed.
+pub fn client_tool_search_item_call_id<'a>(item: &'a Value, kind: &str) -> Option<&'a str> {
+    (item.get("type").and_then(Value::as_str) == Some(kind)
+        && item.get("execution").and_then(Value::as_str) == Some("client"))
+    .then(|| item.get("call_id").and_then(Value::as_str))
+    .flatten()
+    .filter(|id| !id.is_empty())
+}
+
+/// A `tool_search_call` item's `arguments` as a function-call argument
+/// string: a string as sent, anything else serialised (absent as `{}`).
+pub fn client_tool_search_arguments(item: &Value) -> String {
+    match item.get("arguments") {
+        Some(Value::String(s)) => s.clone(),
+        None | Some(Value::Null) => "{}".to_string(),
+        Some(v) => v.to_string(),
+    }
+}
+
+/// The tool result a chat model reads for a `tool_search_output` item:
+/// which tools the search loaded, by the names they are now callable under.
+pub fn client_tool_search_output_text(item: &Value) -> String {
+    let names: Vec<String> = searched_tools(item)
+        .flat_map(|tool| loaded_entries(tool).into_iter().map(|(name, _, _)| name))
+        .collect();
+    if names.is_empty() {
+        "No tools matched the search.".to_string()
+    } else {
+        format!(
+            "These tools are now loaded and can be called: {}",
+            names.join(", ")
+        )
+    }
+}
+
+/// The name a chat model calls a namespace member by: chat tools are one
+/// flat list, so the namespace is folded into the name.
+pub fn responses_namespace_tool_name(namespace: &str, tool: &str) -> String {
+    format!("{namespace}__{tool}")
+}
+
+fn is_deferred(tool: &Value) -> bool {
+    tool.get("defer_loading").and_then(Value::as_bool) == Some(true)
+}
+
+/// `tool` without its deferred parts: `None` for a deferred tool or a
+/// namespace whose every member is deferred.
+fn without_deferred(tool: Cow<'_, Value>) -> Option<Cow<'_, Value>> {
+    if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+        return (!is_deferred(&tool)).then_some(tool);
+    }
+    let members = namespace_members(&tool);
+    if !members.iter().any(is_deferred) {
+        return Some(tool);
+    }
+    let eager: Vec<Value> = members
+        .iter()
+        .filter(|m| !is_deferred(m))
+        .cloned()
+        .collect();
+    if eager.is_empty() {
+        return None;
+    }
+    let mut kept = tool.into_owned();
+    kept["tools"] = Value::Array(eager);
+    Some(Cow::Owned(kept))
+}
+
+/// The tools of every client `tool_search_output` item that has a `call_id`.
+fn searched_tools(item: &Value) -> impl Iterator<Item = &Value> {
+    client_tool_search_item_call_id(item, "tool_search_output")
+        .and_then(|_| item.get("tools"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
+/// One loaded tool as `(callable name, namespace and its tool, spec)`: a
+/// namespace stands for each of its members.
+type LoadedEntry<'a> = (String, Option<(&'a str, &'a Value)>, &'a Value);
+
+fn loaded_entries(tool: &Value) -> Vec<LoadedEntry<'_>> {
+    if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+        let name = member_name(tool).unwrap_or_default();
+        return vec![(name.to_string(), None, tool)];
+    }
+    let namespace = member_name(tool).unwrap_or_default();
+    namespace_members(tool)
+        .iter()
+        .map(|m| {
+            (
+                responses_namespace_tool_name(namespace, member_name(m).unwrap_or_default()),
+                Some((namespace, tool)),
+                m,
+            )
+        })
+        .collect()
+}
+
+/// Callable names the direct declarations already take.
+fn callable_names(declared: &[Cow<'_, Value>]) -> std::collections::HashSet<String> {
+    declared
+        .iter()
+        .flat_map(|t| match t.get("type").and_then(Value::as_str) {
+            Some("namespace") => {
+                let namespace = member_name(t).unwrap_or_default();
+                namespace_members(t)
+                    .iter()
+                    .filter_map(member_name)
+                    .map(|m| responses_namespace_tool_name(namespace, m))
+                    .collect::<Vec<_>>()
+            }
+            _ if is_client_tool_search(t) => vec![CLIENT_TOOL_SEARCH_NAME.to_string()],
+            _ => member_name(t).map(str::to_string).into_iter().collect(),
+        })
+        .collect()
+}
+
+fn without_deferral(spec: &Value) -> Value {
+    let mut spec = spec.clone();
+    if let Some(obj) = spec.as_object_mut() {
+        obj.remove("defer_loading");
+    }
+    spec
+}
+
+/// The tools the input's `tool_search_output` items loaded, as tool
+/// declarations to follow the direct ones (see [`responses_declared_tools`]).
+fn loaded_tools(items: &[Value], declared: &[Cow<'_, Value>]) -> Vec<Value> {
+    let mut taken = callable_names(declared);
+    let mut top_level: Vec<Value> = Vec::new();
+    // Namespace name → (its first loaded declaration, members), in the order
+    // the namespaces were first loaded.
+    let mut namespaces: Vec<(&str, &Value, Vec<Value>)> = Vec::new();
+    for (callable, namespace, spec) in items
+        .iter()
+        .flat_map(searched_tools)
+        .flat_map(loaded_entries)
+    {
+        if !taken.insert(callable) {
+            continue;
+        }
+        let spec = without_deferral(spec);
+        match namespace {
+            None => top_level.push(spec),
+            Some((name, header)) => match namespaces.iter_mut().find(|(n, _, _)| *n == name) {
+                Some((_, _, members)) => members.push(spec),
+                None => namespaces.push((name, header, vec![spec])),
+            },
+        }
+    }
+    top_level
+        .into_iter()
+        .chain(namespaces.into_iter().map(|(_, header, members)| {
+            let mut namespace = header.clone();
+            namespace["tools"] = Value::Array(members);
+            namespace
+        }))
+        .collect()
 }
 
 fn namespace_members(namespace: &Value) -> &[Value] {
@@ -524,6 +756,104 @@ mod tests {
                 json!({"type": "web_search"}),
             ]
         );
+    }
+
+    fn search_output(call_id: &str, tools: Value) -> Value {
+        json!({"type": "tool_search_output", "call_id": call_id, "execution": "client",
+            "status": "completed", "tools": tools})
+    }
+
+    /// With a client `tool_search` declared, deferred tools wait for a
+    /// search to load them; what the searches load follows the direct
+    /// declarations, loses to a direct declaration of the same callable
+    /// name, keeps its first definition, and drops `defer_loading`.
+    #[test]
+    fn tools_a_client_search_loaded_follow_the_direct_declarations() {
+        let search = json!({"type": "tool_search", "execution": "client", "description": "find"});
+        let body = json!({
+            "tools": [
+                {"type": "function", "name": "shell"},
+                {"type": "function", "name": "lazy", "defer_loading": true},
+                {"type": "namespace", "name": "mcp__half", "tools": [
+                    {"type": "function", "name": "eager"},
+                    {"type": "function", "name": "deferred", "defer_loading": true},
+                ]},
+                {"type": "namespace", "name": "mcp__all", "tools": [
+                    {"type": "function", "name": "x", "defer_loading": true},
+                ]},
+            ],
+            "input": [
+                {"type": "additional_tools", "tools": [search.clone()]},
+                {"role": "user", "content": "hi"},
+                {"type": "additional_tools", "tools": [search.clone()]},
+                search_output("ts_1", json!([
+                    {"type": "namespace", "name": "mcp__docs", "description": "Docs.", "tools": [
+                        {"type": "function", "name": "read", "description": "first", "defer_loading": true},
+                        {"type": "function", "name": "write", "defer_loading": true},
+                    ]},
+                    {"type": "function", "name": "shell", "description": "loaded shell", "defer_loading": true},
+                    {"type": "namespace", "name": "mcp__half", "tools": [
+                        {"type": "function", "name": "eager", "description": "loaded eager", "defer_loading": true},
+                    ]},
+                ])),
+                search_output("ts_2", json!([
+                    {"type": "namespace", "name": "mcp__docs", "description": "Docs again.", "tools": [
+                        {"type": "function", "name": "read", "description": "second", "defer_loading": true},
+                    ]},
+                    {"type": "function", "name": "lazy", "defer_loading": true},
+                    {"type": "function", "name": "tool_search"},
+                ])),
+                // Not paired with a call: loads nothing.
+                {"type": "tool_search_output", "execution": "client", "tools": [
+                    {"type": "function", "name": "orphan"},
+                ]},
+            ],
+        });
+        assert_eq!(
+            declared(&body),
+            vec![
+                json!({"type": "function", "name": "shell"}),
+                json!({"type": "namespace", "name": "mcp__half", "tools": [
+                    {"type": "function", "name": "eager"},
+                ]}),
+                search,
+                json!({"type": "function", "name": "lazy"}),
+                json!({"type": "namespace", "name": "mcp__docs", "description": "Docs.", "tools": [
+                    {"type": "function", "name": "read", "description": "first"},
+                    {"type": "function", "name": "write"},
+                ]}),
+            ]
+        );
+    }
+
+    /// Without a client `tool_search`, nothing is deferred: a tool marked
+    /// `defer_loading` is declared like any other.
+    #[test]
+    fn defer_loading_without_a_client_search_is_declared_as_is() {
+        let tool = json!({"type": "function", "name": "lazy", "defer_loading": true});
+        let hosted = json!({"type": "tool_search"});
+        let body = json!({"tools": [tool.clone(), hosted.clone()], "input": "hi"});
+        assert_eq!(declared(&body), vec![tool, hosted]);
+    }
+
+    #[test]
+    fn a_search_output_names_the_tools_it_loaded_by_their_callable_names() {
+        let text = client_tool_search_output_text(&search_output(
+            "c",
+            json!([
+                {"type": "namespace", "name": "mcp__docs", "tools": [
+                    {"type": "function", "name": "read"}, {"type": "function", "name": "write"},
+                ]},
+                {"type": "function", "name": "shell"},
+            ]),
+        ));
+        assert!(
+            text.contains("mcp__docs__read, mcp__docs__write, shell"),
+            "{text}"
+        );
+        let none = client_tool_search_output_text(&search_output("c", json!([])));
+        assert!(!none.contains("mcp__"), "{none}");
+        assert_ne!(none, text);
     }
 
     #[test]
