@@ -485,6 +485,28 @@ impl OutputCollector {
                     },
                 );
             }
+            // A freeform tool's call: its `input` is the text the tool gets.
+            Some("custom_tool_call") => {
+                self.put(
+                    key(0),
+                    Part::ToolCall {
+                        id: item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        name: item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        arguments: item
+                            .get("input")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    },
+                );
+            }
             // A search the client runs for the model: a call to its
             // `tool_search` tool, arguments an object.
             Some("tool_search_call") if is_client_execution(item) => {
@@ -520,8 +542,10 @@ impl OutputCollector {
         match event.get("type").and_then(Value::as_str) {
             Some("response.output_item.added") => {
                 if let Some(item) = event.get("item") {
-                    if item.get("type").and_then(Value::as_str) == Some("function_call")
-                        || is_client_tool_search_call(item)
+                    if matches!(
+                        item.get("type").and_then(Value::as_str),
+                        Some("function_call" | "custom_tool_call")
+                    ) || is_client_tool_search_call(item)
                     {
                         self.observe_responses_item(output_index, item);
                     }
@@ -560,7 +584,9 @@ impl OutputCollector {
                     delta,
                 );
             }
-            Some("response.function_call_arguments.delta") => {
+            Some(
+                "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta",
+            ) => {
                 if self.slots.contains_key(&key(0)) {
                     self.append(key(0), unreachable_part, delta);
                 }
@@ -834,6 +860,32 @@ mod tests {
                 {"type":"tool_call","id":"tu_1","name":"lookup","arguments":{"q":1}},
             ])
         );
+    }
+
+    /// A freeform tool's call is a tool call whose arguments are its input
+    /// text, streamed (its input in deltas) or not.
+    #[test]
+    fn responses_custom_tool_call_is_a_tool_call() {
+        let done = json!({"type":"custom_tool_call","id":"ctc_1","call_id":"call_c","name":"exec",
+            "namespace":"functions","input":"ls -la","status":"completed"});
+        let expected = json!([
+            {"type":"tool_call","id":"call_c","name":"exec","arguments":"ls -la"},
+        ]);
+        let out = OutputCollector::from_body(
+            OutputWire::OpenAiResponses,
+            4096,
+            &json!({"output":[done]}),
+        );
+        assert_eq!(parts(&out), expected);
+        // A stream cut before its done event keeps what the deltas carried.
+        let mut c = OutputCollector::new(OutputWire::OpenAiResponses, 4096);
+        c.feed_sse(&sse(&[
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call",
+                "id":"ctc_1","call_id":"call_c","name":"exec","namespace":"functions","input":"","status":"in_progress"}}),
+            json!({"type":"response.custom_tool_call_input.delta","output_index":0,"item_id":"ctc_1","delta":"ls "}),
+            json!({"type":"response.custom_tool_call_input.delta","output_index":0,"item_id":"ctc_1","delta":"-la"}),
+        ]));
+        assert_eq!(parts(&c.finish()), expected);
     }
 
     /// A search the client executes is a tool call the model made, streamed
