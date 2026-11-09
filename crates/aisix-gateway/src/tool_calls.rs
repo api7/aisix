@@ -92,8 +92,13 @@ pub fn responses_declared_tools<'a>(
     if out.iter().any(|t| is_client_tool_search(t)) {
         out = out.into_iter().filter_map(without_deferred).collect();
     }
-    let loaded = loaded_tools(items, &out);
-    out.extend(loaded.into_iter().map(Cow::Owned));
+    if items
+        .iter()
+        .any(|item| searched_tools(item).next().is_some())
+    {
+        let loaded = loaded_tools(items, &out);
+        out.extend(loaded.into_iter().map(Cow::Owned));
+    }
     out
 }
 
@@ -193,14 +198,14 @@ fn without_deferred(tool: Cow<'_, Value>) -> Option<Cow<'_, Value>> {
         return (!is_deferred(&tool)).then_some(tool);
     }
     let members = namespace_members(&tool);
+    if !members.iter().any(is_deferred) {
+        return Some(tool);
+    }
     let eager: Vec<Value> = members
         .iter()
         .filter(|m| !is_deferred(m))
         .cloned()
         .collect();
-    if eager.len() == members.len() {
-        return Some(tool);
-    }
     if eager.is_empty() {
         return None;
     }
@@ -253,6 +258,7 @@ fn callable_names(declared: &[Cow<'_, Value>]) -> std::collections::HashSet<Stri
                     .map(|m| responses_namespace_tool_name(namespace, m))
                     .collect::<Vec<_>>()
             }
+            _ if is_client_tool_search(t) => vec![CLIENT_TOOL_SEARCH_NAME.to_string()],
             _ => member_name(t).map(str::to_string).into_iter().collect(),
         })
         .collect()
@@ -795,6 +801,7 @@ mod tests {
                         {"type": "function", "name": "read", "description": "second", "defer_loading": true},
                     ]},
                     {"type": "function", "name": "lazy", "defer_loading": true},
+                    {"type": "function", "name": "tool_search"},
                 ])),
                 // Not paired with a call: loads nothing.
                 {"type": "tool_search_output", "execution": "client", "tools": [

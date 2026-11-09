@@ -485,6 +485,24 @@ impl OutputCollector {
                     },
                 );
             }
+            // A search the client runs for the model: a call to its
+            // `tool_search` tool, arguments an object.
+            Some("tool_search_call") if is_client_execution(item) => {
+                self.put(
+                    key(0),
+                    Part::ToolCall {
+                        id: item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        name: aisix_gateway::tool_calls::CLIENT_TOOL_SEARCH_NAME.to_string(),
+                        arguments: item
+                            .get("arguments")
+                            .map(Value::to_string)
+                            .unwrap_or_default(),
+                    },
+                );
+            }
             _ => {}
         }
     }
@@ -502,7 +520,9 @@ impl OutputCollector {
         match event.get("type").and_then(Value::as_str) {
             Some("response.output_item.added") => {
                 if let Some(item) = event.get("item") {
-                    if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    if item.get("type").and_then(Value::as_str) == Some("function_call")
+                        || is_client_tool_search_call(item)
+                    {
                         self.observe_responses_item(output_index, item);
                     }
                 }
@@ -550,10 +570,20 @@ impl OutputCollector {
     }
 }
 
+fn is_client_execution(item: &Value) -> bool {
+    item.get("execution").and_then(Value::as_str) == Some("client")
+}
+
+fn is_client_tool_search_call(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("tool_search_call")
+        && is_client_execution(item)
+}
+
 /// The finish reason a Responses result reports, in OpenAI chat's
 /// vocabulary (the one the usage event's `finish_reason` speaks for chat):
 /// a `completed` response is `tool_calls` when its output asks for a tool
-/// (a `function_call` or `custom_tool_call` item) and `stop` otherwise; an
+/// (a `function_call` or `custom_tool_call` item, or a `tool_search_call`
+/// the client executes) and `stop` otherwise; an
 /// `incomplete` one is `content_filter` when that is its reason and
 /// `length` otherwise. Any other status (`failed`, `cancelled`, …) names
 /// none.
@@ -564,7 +594,7 @@ pub fn responses_finish_reason(response: &Value) -> Option<&'static str> {
                 matches!(
                     item.get("type").and_then(Value::as_str),
                     Some("function_call") | Some("custom_tool_call")
-                )
+                ) || is_client_tool_search_call(item)
             });
             Some(if calls_tool { "tool_calls" } else { "stop" })
         }
@@ -701,6 +731,14 @@ mod tests {
                 Some("tool_calls"),
             ),
             (
+                json!({"status":"completed","output":[{"type":"tool_search_call","execution":"client"}]}),
+                Some("tool_calls"),
+            ),
+            (
+                json!({"status":"completed","output":[{"type":"tool_search_call","execution":"server"}]}),
+                Some("stop"),
+            ),
+            (
                 json!({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}),
                 Some("length"),
             ),
@@ -796,6 +834,27 @@ mod tests {
                 {"type":"tool_call","id":"tu_1","name":"lookup","arguments":{"q":1}},
             ])
         );
+    }
+
+    /// A search the client executes is a tool call the model made, streamed
+    /// or not.
+    #[test]
+    fn responses_client_tool_search_call_is_a_tool_call() {
+        let item = json!({"type":"tool_search_call","id":"tsc_1","call_id":"call_s",
+            "execution":"client","status":"completed","arguments":{"query":"docs"}});
+        let expected = json!([
+            {"type":"tool_call","id":"call_s","name":"tool_search","arguments":{"query":"docs"}},
+        ]);
+        let body = json!({"output":[item]});
+        let out = OutputCollector::from_body(OutputWire::OpenAiResponses, 4096, &body);
+        assert_eq!(parts(&out), expected);
+        let mut c = OutputCollector::new(OutputWire::OpenAiResponses, 4096);
+        c.feed_sse(&sse(&[
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"tool_search_call",
+                "id":"tsc_1","call_id":"call_s","execution":"client","status":"in_progress","arguments":{}}}),
+            json!({"type":"response.output_item.done","output_index":0,"item":item}),
+        ]));
+        assert_eq!(parts(&c.finish()), expected);
     }
 
     #[test]

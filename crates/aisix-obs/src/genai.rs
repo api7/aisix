@@ -815,7 +815,13 @@ fn responses_input(body: &Map<String, Value>) -> Option<Converted> {
                     }
                     // A search the client ran for the model: a call to its
                     // `tool_search` tool, answered with the tools it loaded.
-                    Some("tool_search_call") if is_client_execution(item) => {
+                    Some("tool_search_call")
+                        if aisix_gateway::tool_calls::client_tool_search_item_call_id(
+                            item,
+                            "tool_search_call",
+                        )
+                        .is_some() =>
+                    {
                         let mut part = json!({
                             "type": "tool_call",
                             "name": aisix_gateway::tool_calls::CLIENT_TOOL_SEARCH_NAME,
@@ -826,7 +832,13 @@ fn responses_input(body: &Map<String, Value>) -> Option<Converted> {
                         }
                         out.push(json!({"role": "assistant", "parts": [part]}));
                     }
-                    Some("tool_search_output") if is_client_execution(item) => {
+                    Some("tool_search_output")
+                        if aisix_gateway::tool_calls::client_tool_search_item_call_id(
+                            item,
+                            "tool_search_output",
+                        )
+                        .is_some() =>
+                    {
                         let mut part = json!({
                             "type": "tool_call_response",
                             "response": item.get("tools").cloned().unwrap_or(Value::Null),
@@ -873,10 +885,6 @@ fn responses_input(body: &Map<String, Value>) -> Option<Converted> {
         .collect();
     let tools = openai_tool_definitions(declared.iter().map(AsRef::as_ref));
     Some((messages, system, Some(tools)))
-}
-
-fn is_client_execution(item: &Value) -> bool {
-    item.get("execution").and_then(Value::as_str) == Some("client")
 }
 
 fn completions_input(body: &Map<String, Value>) -> Option<Converted> {
