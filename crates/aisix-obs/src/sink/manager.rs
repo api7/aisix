@@ -39,7 +39,7 @@ struct Running {
     fingerprint: u64,
     handle: SinkHandle,
     cancel: watch::Sender<bool>,
-    /// Detached worker; awaited only on graceful [`ExporterPipelines::shutdown`].
+    /// Detached worker; awaited only by [`ExporterPipelines::shutdown`].
     worker: JoinHandle<()>,
 }
 
@@ -184,8 +184,9 @@ impl ExporterPipelines {
             .collect()
     }
 
-    /// Stop every pipeline and await its worker (graceful shutdown). Each
-    /// pipeline performs a final drain before exiting.
+    /// Stop every pipeline and await its worker, each performing a final
+    /// drain first. The gateway does not call this on exit: what is still
+    /// queued at SIGTERM is dropped.
     pub async fn shutdown(&self) {
         let pipelines: Vec<Running> = self.running.lock().drain().map(|(_, p)| p).collect();
         for pipeline in &pipelines {

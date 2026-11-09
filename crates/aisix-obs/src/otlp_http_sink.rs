@@ -468,7 +468,8 @@ impl OtlpHttpFanOut {
         self.inner.exporters.queue_depths()
     }
 
-    /// Drain every exporter pipeline at graceful shutdown.
+    /// Stop and drain every exporter pipeline. The gateway does not call this
+    /// on exit: what is still queued at SIGTERM is dropped.
     pub async fn shutdown(&self) {
         self.inner.exporters.shutdown().await;
     }
