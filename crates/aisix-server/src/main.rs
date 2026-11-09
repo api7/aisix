@@ -32,8 +32,10 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // from a gateway that is already misbehaving, and the automatic dump near
 // the memory limit has something to write. One allocation in every 2 MiB
 // (2^21 bytes) on average is sampled with its stack. jemalloc reads this
-// symbol at startup and then `_RJEM_MALLOC_CONF`, which overrides it — an
-// operator turns sampling off with `_RJEM_MALLOC_CONF=prof_active:false`.
+// symbol at startup and then `_RJEM_MALLOC_CONF`, which overrides it, but
+// only when the process is not secure-exec: the file capability the official
+// image sets on the binary makes jemalloc ignore the variable for the image's
+// default non-root user.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[export_name = "_rjem_malloc_conf"]
 pub static MALLOC_CONF: Option<&'static u8> =
