@@ -179,7 +179,7 @@ describe("bank_card recognises grouped numbers and values touching CJK text", ()
     await seed.createApiKey({ key_hash: hash(BLOCK_CALLER), allowed_models: ["*"] });
     await waitConfigPropagation(async () => {
       const res = await fetch(`${app!.proxyUrl}/v1/models`, {
-        headers: { authorization: `Bearer ${MASK_CALLER}` },
+        headers: { authorization: `Bearer ${BLOCK_CALLER}` },
       });
       await res.arrayBuffer();
       return res.status === 200;
