@@ -15,9 +15,15 @@
 //! Sink-agnostic — the caller supplies a `build` closure mapping an exporter
 //! to an [`ObservabilitySink`], so the manager is shared by every
 //! pipeline-backed sink family (`otlp`, `http_batch`, …).
+//!
+//! The first sighting happens on the request path, which under
+//! `proxy.thread_per_core` is one worker's single-thread runtime, so a
+//! pipeline must not inherit its runtime from the caller: it would stay on
+//! that worker for life and take batching, encoding and delivery with it.
+//! [`ExporterPipelines::set_runtime`] names where pipelines run instead.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 use tokio::sync::watch;
@@ -42,6 +48,9 @@ pub struct ExporterPipelines {
     running: Mutex<HashMap<String, Running>>,
     cfg: PipelineConfig,
     metrics: Option<Metrics>,
+    /// Where pipelines run. Unset, they run on the runtime of the caller
+    /// that starts them.
+    runtime: OnceLock<tokio::runtime::Handle>,
 }
 
 impl ExporterPipelines {
@@ -52,6 +61,7 @@ impl ExporterPipelines {
             running: Mutex::new(HashMap::new()),
             cfg,
             metrics: None,
+            runtime: OnceLock::new(),
         }
     }
 
@@ -60,6 +70,12 @@ impl ExporterPipelines {
     pub fn with_metrics(mut self, metrics: Metrics) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    /// Run every pipeline started from now on on `runtime`. Called once at
+    /// boot, before any pipeline starts; a later call is ignored.
+    pub fn set_runtime(&self, runtime: tokio::runtime::Handle) {
+        let _ = self.runtime.set(runtime);
     }
 
     /// Number of running pipelines.
@@ -116,7 +132,10 @@ impl ExporterPipelines {
         let (handle, pipeline) =
             SinkPipeline::with_metrics(sink, self.cfg.clone(), self.metrics.clone());
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let worker = tokio::spawn(pipeline.run(cancel_rx));
+        let worker = match self.runtime.get() {
+            Some(runtime) => runtime.spawn(pipeline.run(cancel_rx)),
+            None => tokio::spawn(pipeline.run(cancel_rx)),
+        };
         running.insert(
             key.to_string(),
             Running {
@@ -285,6 +304,86 @@ mod tests {
             "config change rebuilds the pipeline"
         );
         assert_eq!(mgr.len(), 1, "still exactly one pipeline for exporter a");
+    }
+
+    /// A sink that records the name of the thread each batch is delivered on.
+    struct ThreadRecordingSink {
+        delivered_on: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObservabilitySink for ThreadRecordingSink {
+        fn name(&self) -> &str {
+            "thread-recording"
+        }
+        fn capabilities(&self) -> SinkCapabilities {
+            SinkCapabilities {
+                idempotency: IdempotencyScheme::None,
+                ordering: OrderingScope::None,
+                batch_unit: BatchUnit::Records,
+                max_batch_bytes: None,
+                supports_partial_batch: false,
+                supports_streaming_ingest: false,
+            }
+        }
+        async fn append_batch(
+            &self,
+            batch: &EventBatch,
+            _marker: &IdempotencyMarker,
+        ) -> SinkResult {
+            let thread = std::thread::current();
+            self.delivered_on
+                .lock()
+                .push(thread.name().unwrap_or("unnamed").to_string());
+            Ok(SinkAck {
+                accepted: batch.len(),
+                ..SinkAck::default()
+            })
+        }
+        async fn healthcheck(&self) -> SinkHealth {
+            SinkHealth::healthy()
+        }
+    }
+
+    /// The first sighting comes from a request worker's single-thread
+    /// runtime; delivery has to happen on the runtime the manager was given,
+    /// including for the pipeline a config change rebuilds from that worker.
+    #[tokio::test]
+    async fn pipelines_run_on_the_given_runtime_not_the_callers() {
+        let control = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("control-rt")
+            .enable_all()
+            .build()
+            .unwrap();
+        let mgr = manager();
+        mgr.set_runtime(control.handle().clone());
+
+        let delivered_on = Arc::new(Mutex::new(Vec::new()));
+        let build = || {
+            Arc::new(ThreadRecordingSink {
+                delivered_on: Arc::clone(&delivered_on),
+            }) as Arc<dyn ObservabilitySink>
+        };
+        mgr.get_or_create("a", 1, build).try_enqueue(rec());
+        mgr.get_or_create("a", 2, build).try_enqueue(rec());
+        // `shutdown` awaits only the rebuilt pipeline; the stale one drains
+        // on its own.
+        mgr.shutdown().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while delivered_on.lock().len() < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("both pipelines deliver");
+
+        let delivered_on = delivered_on.lock().clone();
+        assert!(
+            delivered_on.iter().all(|thread| thread == "control-rt"),
+            "delivered on {delivered_on:?}"
+        );
+        control.shutdown_background();
     }
 
     #[tokio::test]

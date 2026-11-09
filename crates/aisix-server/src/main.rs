@@ -1272,6 +1272,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     proxy_state
         .otlp_fan_out
         .set_service_name(&cfg.observability.service_name);
+    // This is the control runtime under `proxy.thread_per_core`, and the one
+    // runtime that serves everything otherwise.
+    proxy_state
+        .otlp_fan_out
+        .set_pipeline_runtime(tokio::runtime::Handle::current());
     // AISIX-Cloud#1045: operator UA→client_type rules. Compile errors are
     // boot-fatal — a dropped rule would silently misattribute traffic.
     let client_classifier =
@@ -2831,7 +2836,7 @@ async fn serve_listeners(
     // serving on fewer ports than it reported.
     let mut listeners = Vec::with_capacity(resolved.len());
     for (addr, tls) in resolved {
-        let listener = std::net::TcpListener::bind(addr)
+        let listener = bind_listener(addr)
             .map_err(|e| anyhow::anyhow!("{label} listener bind {addr} failed: {e}"))?;
         match tls {
             None => tracing::info!(%addr, label, "aisix listening (http)"),
@@ -3524,6 +3529,38 @@ struct WorkerListener {
     tls: Option<tokio_rustls::TlsAcceptor>,
 }
 
+/// Pending connections each listening socket may queue; the kernel caps it at
+/// `net.core.somaxconn`. A burst of new connections that outruns accept
+/// overflows a short queue, and the client then waits out a SYN retransmit.
+const LISTEN_BACKLOG: i32 = 4096;
+
+/// A stream socket for `addr`, with the options `TcpListener::bind` sets.
+fn listener_socket(addr: std::net::SocketAddr) -> std::io::Result<socket2::Socket> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    Ok(socket)
+}
+
+fn bind_and_listen(
+    socket: socket2::Socket,
+    addr: std::net::SocketAddr,
+) -> std::io::Result<std::net::TcpListener> {
+    socket.bind(&addr.into())?;
+    socket.listen(LISTEN_BACKLOG)?;
+    Ok(socket.into())
+}
+
+/// `TcpListener::bind`, with [`LISTEN_BACKLOG`] in place of its short backlog.
+fn bind_listener(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    bind_and_listen(listener_socket(addr)?, addr)
+}
+
 /// A listener that shares `addr` with the other workers' listeners.
 ///
 /// `SO_REUSEPORT` has to be set before the bind, and every socket on the
@@ -3539,21 +3576,9 @@ fn bind_reuseport_listener(addr: std::net::SocketAddr) -> std::io::Result<std::n
 
     #[cfg(unix)]
     {
-        let domain = if addr.is_ipv4() {
-            socket2::Domain::IPV4
-        } else {
-            socket2::Domain::IPV6
-        };
-        let socket =
-            socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-        socket.set_reuse_address(true)?;
+        let socket = listener_socket(addr)?;
         socket.set_reuse_port(true)?;
-        socket.bind(&addr.into())?;
-        // Matches the backlog `std::net::TcpListener::bind` requests, so
-        // the two modes queue the same number of pending connections per
-        // socket.
-        socket.listen(128)?;
-        Ok(socket.into())
+        bind_and_listen(socket, addr)
     }
 }
 
@@ -4576,6 +4601,74 @@ managed:
             seen, PREFACE,
             "hyper must still see the connection from byte zero"
         );
+    }
+
+    /// The accept queue the kernel actually gave a listening socket: for a
+    /// socket in LISTEN, `tcpi_sacked` is `sk_max_ack_backlog`, the value
+    /// `ss -ltn` prints as Send-Q.
+    #[cfg(target_os = "linux")]
+    fn accept_queue_limit(listener: &std::net::TcpListener) -> u32 {
+        use std::os::fd::AsRawFd;
+        let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                listener.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_INFO,
+                std::ptr::addr_of_mut!(info).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        info.tcpi_sacked
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn both_listener_paths_request_the_same_backlog() {
+        let somaxconn: u32 = std::fs::read_to_string("/proc/sys/net/core/somaxconn")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let expected = somaxconn.min(4096);
+        let any_port = "127.0.0.1:0".parse().unwrap();
+
+        let plain = bind_listener(any_port).unwrap();
+        assert_eq!(accept_queue_limit(&plain), expected);
+
+        let shared = bind_reuseport_listener(any_port).unwrap();
+        let shared_addr = shared.local_addr().unwrap();
+        let sibling = bind_reuseport_listener(shared_addr).unwrap();
+        assert_eq!(accept_queue_limit(&shared), expected);
+        assert_eq!(accept_queue_limit(&sibling), expected);
+    }
+
+    /// What `TcpListener::bind` gave the single-listener path, which a
+    /// restart depends on: an address in use still fails, and one with only
+    /// a TIME_WAIT connection left on it does not.
+    #[cfg(unix)]
+    #[test]
+    fn plain_listener_rebinds_over_time_wait_but_not_over_a_listener() {
+        use std::io::Read;
+
+        let first = bind_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = first.local_addr().unwrap();
+        assert_eq!(
+            bind_listener(addr).unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        let (accepted, _) = first.accept().unwrap();
+        // The gateway's side closes first, so the TIME_WAIT is on `addr`.
+        drop(accepted);
+        client.read_to_end(&mut Vec::new()).unwrap();
+        drop(client);
+        drop(first);
+
+        bind_listener(addr).expect("TIME_WAIT must not block a restart");
     }
 
     /// The HTTP/1.1 side of the same contract.
