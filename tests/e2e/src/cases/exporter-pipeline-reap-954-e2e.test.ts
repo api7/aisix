@@ -131,8 +131,6 @@ describe("a deleted or disabled exporter's pipeline is stopped (#954)", () => {
           `the stop line for ${name}`,
         );
         // The worker itself exits, on whichever stop signal it sees first.
-        // Under thread-per-core it runs on the worker runtime of the request
-        // that started it, not on the one that reacted to the change.
         await waitForLogLine(
           app,
           (l) =>

@@ -4609,8 +4609,11 @@ managed:
     #[cfg(target_os = "linux")]
     fn accept_queue_limit(listener: &std::net::TcpListener) -> u32 {
         use std::os::fd::AsRawFd;
+        // SAFETY: `tcp_info` is a plain C struct, valid when zeroed.
         let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+        // SAFETY: the fd is open for the borrow, and `info` and `len` describe
+        // a writable buffer of `len` bytes.
         let rc = unsafe {
             libc::getsockopt(
                 listener.as_raw_fd(),
