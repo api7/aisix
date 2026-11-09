@@ -169,6 +169,15 @@ impl OtlpHttpFanOut {
         let _ = self.inner.service_name.set(name.to_string());
     }
 
+    /// Run exporter pipelines on `runtime` rather than on whichever request
+    /// first sights an exporter — the gateway's control runtime, so that
+    /// under `proxy.thread_per_core` batching, encoding and delivery stay
+    /// off the workers. Called once at boot, before any exporter pipeline
+    /// starts; a later call is ignored.
+    pub fn set_pipeline_runtime(&self, runtime: tokio::runtime::Handle) {
+        self.inner.exporters.set_runtime(runtime);
+    }
+
     /// Whether a pipeline may start for exporter `name`: the published
     /// snapshot still has it enabled (always, before the reaper runs).
     fn admits(&self, name: &str) -> bool {
@@ -410,10 +419,9 @@ impl OtlpHttpFanOut {
     /// Driven by the publish rather than by traffic or a timer: a deleted
     /// exporter is by definition one no request will touch again. It keys
     /// on the exporter table's generation, so a write to any other
-    /// collection costs one comparison. Stopping only signals the worker,
-    /// wherever it runs — under `proxy.thread_per_core` a pipeline lives on
-    /// the worker runtime whose request first saw the exporter, not on the
-    /// runtime running this loop.
+    /// collection costs one comparison. Stopping only signals the pipeline,
+    /// which drains and exits on the runtime given to
+    /// [`Self::set_pipeline_runtime`].
     pub async fn reap_on_config_change(
         self,
         snapshot: SnapshotHandle<AisixSnapshot>,
@@ -460,7 +468,8 @@ impl OtlpHttpFanOut {
         self.inner.exporters.queue_depths()
     }
 
-    /// Drain every exporter pipeline at graceful shutdown.
+    /// Stop and drain every exporter pipeline. The gateway does not call this
+    /// on exit: what is still queued at SIGTERM is dropped.
     pub async fn shutdown(&self) {
         self.inner.exporters.shutdown().await;
     }

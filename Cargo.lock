@@ -527,6 +527,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ipnet",
+ "libc",
  "rcgen",
  "reqwest 0.12.28",
  "rustls",
