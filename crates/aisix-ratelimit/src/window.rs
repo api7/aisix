@@ -99,9 +99,10 @@ impl FixedWindowCounter {
     ///
     /// A count that has landed exactly ON the limit is consumed, not
     /// still admissible. Token limiting is post-paid — the usage is
-    /// committed after the response — so crossing the cap by one
-    /// in-flight response is inherent; admitting at equality on top of
-    /// that overshot by a further whole response (#950). The Redis
+    /// committed after the response — so every request admitted before the
+    /// window filled still completes and counts: the overshoot is bounded by
+    /// the tokens of all in-flight responses, not one. Admitting at equality
+    /// on top of that overshot by a further whole response (#950). The Redis
     /// backend's acquire script draws the same line, so swapping
     /// backends cannot change the observable limit.
     pub fn is_exceeded(&mut self, now_secs: u64, limit: u64) -> Option<u64> {
