@@ -508,6 +508,7 @@ const UPSTREAM_ERROR_CLASSES: &[&str] = &[
     "upstream_in_band",
     "transport",
     "stream_aborted",
+    "tool_error",
 ];
 
 /// What ended a request whose record names `class` ([`error_class`], or the

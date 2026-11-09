@@ -60,6 +60,7 @@ impl McpBridge for StaticEcho {
             content: serde_json::json!([{ "type": "text", "text": text }]),
             structured_content: None,
             is_error: false,
+            upstream_status: None,
         })
     }
 }

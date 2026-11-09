@@ -31,6 +31,12 @@ export interface McpUpstream {
   close(): Promise<void>;
 }
 
+/** How a faulted upstream answers a `tools/call`, instead of serving the tool. */
+export type McpToolFault =
+  | { kind: "http"; status: number; body: string }
+  | { kind: "jsonrpc"; code: number; message: string }
+  | { kind: "hang" };
+
 export interface McpUpstreamOptions {
   /**
    * Also expose a `lookup` tool whose result carries `structuredContent`
@@ -66,6 +72,12 @@ export interface McpUpstreamOptions {
    * was refused.
    */
   rejectAuthorization?: (authorization: string | undefined) => boolean;
+  /**
+   * Answer a `tools/call` of these tool names with the given fault. Only the
+   * call is faulted: the handshake before it succeeds, as on a server whose
+   * tool backend failed.
+   */
+  toolFaults?: Record<string, McpToolFault>;
 }
 
 /**
@@ -138,6 +150,24 @@ async function handle(
       return;
     }
     const body: unknown = JSON.parse(raw);
+    const call = body as { id?: unknown; method?: string; params?: { name?: string } };
+    const fault =
+      call.method === "tools/call" ? options.toolFaults?.[call.params?.name ?? ""] : undefined;
+    if (fault?.kind === "hang") return;
+    if (fault?.kind === "http") {
+      res.writeHead(fault.status, { "content-type": "text/plain" }).end(fault.body);
+      return;
+    }
+    if (fault?.kind === "jsonrpc") {
+      res.writeHead(200, { "content-type": "application/json" }).end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: call.id,
+          error: { code: fault.code, message: fault.message },
+        }),
+      );
+      return;
+    }
 
     const server = new Server(
       { name: `${label}-upstream`, version: "0.1.0" },
