@@ -13,8 +13,8 @@ import {
 } from "../harness/index.js";
 
 // E2E: a gateway with no configured log level writes WARN and above, plus its
-// access log, which only `observability.access_log` turns off. A lower level
-// or `RUST_LOG` doesn't touch the access log, and `info` still brings back the
+// access log, which only `observability.access_log` turns off. A stricter
+// `RUST_LOG` doesn't touch the access log, and `info` still brings back the
 // lines the default hides.
 
 const ACCESS_LINE = "proxy request completed";
@@ -129,7 +129,7 @@ describe("the gateway's default log level", () => {
     expect(app.output()).not.toContain(ACCESS_LINE);
   });
 
-  test("a stricter level and RUST_LOG leave the access log on", async (ctx) => {
+  test("RUST_LOG at a stricter level leaves the access log on", async (ctx) => {
     if (!etcdReachable) {
       ctx.skip();
       return;

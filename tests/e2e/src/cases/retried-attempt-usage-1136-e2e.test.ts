@@ -236,9 +236,8 @@ describe("a retried 504 attempt stays in the usage export (AISIX-Cloud#1136)", (
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     sls = await startMockSls();
-    // At `warn`, where the failed-attempt line is still written but the
-    // INFO-level request span is not: the line has to carry the request id
-    // on its own.
+    // The line has to carry the request id as its own field, not only
+    // through the request span written ahead of the message.
     app = await spawnApp({
       logLevel: "warn",
       extraEnv: {
@@ -331,7 +330,7 @@ describe("a retried 504 attempt stays in the usage export (AISIX-Cloud#1136)", (
     // The plain log names the failed attempt under the same request id.
     await waitForLogLine(
       app,
-      (l) => l.includes("routing target attempt failed") && l.includes(`request_id=${requestId}`),
+      (l) => l.split("routing target attempt failed")[1]?.includes(`request_id=${requestId}`) ?? false,
       `${c.label}: the failed-attempt log line of ${requestId}`,
     );
   });

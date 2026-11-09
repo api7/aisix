@@ -106,21 +106,21 @@ const ACCESS_LOG_DIRECTIVE: &str = "aisix_obs::access_log=info";
 /// configured level, with [`QUIET_TARGETS`] and, when the access log is on,
 /// [`ACCESS_LOG_DIRECTIVE`] applied on top.
 fn build_filter(cfg: &ObservabilityConfig) -> Result<EnvFilter, ObsError> {
-    let mut filter = EnvFilter::try_from_default_env()
+    let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&cfg.log_level))
         .map_err(|source| ObsError::Filter {
             directive: cfg.log_level.clone(),
             source,
         })?;
+    Ok(apply_fixed_directives(filter, cfg))
+}
+
+fn apply_fixed_directives(mut filter: EnvFilter, cfg: &ObservabilityConfig) -> EnvFilter {
     let access_log = cfg.access_log.then_some(ACCESS_LOG_DIRECTIVE);
     for directive in QUIET_TARGETS.iter().copied().chain(access_log) {
-        filter = filter.add_directive(
-            directive
-                .parse()
-                .expect("build_filter applies valid filter directives"),
-        );
+        filter = filter.add_directive(directive.parse().expect("the fixed directives are valid"));
     }
-    Ok(filter)
+    filter
 }
 
 /// Install a process-wide tracing subscriber.
@@ -255,21 +255,18 @@ mod tests {
         );
     }
 
-    /// The access log follows its own switch, not the log level, and leaves
-    /// every other `info` line to the level. `RUST_LOG` is left out because
-    /// a test cannot set it without racing the others in this process; the
-    /// `default-log-level` e2e drives it on the real binary.
+    /// The access log follows its own switch, whatever filter it is applied
+    /// on top of, and leaves every other `info` line to that filter.
     #[test]
     fn the_access_log_is_filtered_by_its_switch_not_the_level() {
-        let logged_at = |access_log: bool| {
+        let logged_at = |base: &str, access_log: bool| {
             let writer = VecWriter::default();
             let cfg = ObservabilityConfig {
-                log_level: "warn".into(),
                 access_log,
                 ..Default::default()
             };
             let subscriber = tracing_subscriber::registry()
-                .with(build_filter(&cfg).expect("filter builds"))
+                .with(apply_fixed_directives(EnvFilter::new(base), &cfg))
                 .with(fmt::layer().with_ansi(false).with_writer(writer.clone()));
             tracing::subscriber::with_default(subscriber, || {
                 tracing::info!(target: "aisix_obs::access_log", "the access-log line");
@@ -280,13 +277,16 @@ mod tests {
             logged
         };
 
-        let on = logged_at(true);
+        let on = logged_at("warn", true);
         assert!(on.contains("the access-log line"), "{on}");
         assert!(!on.contains("an info line"), "{on}");
         assert!(on.contains("a warn line"), "{on}");
-        let off = logged_at(false);
+        let off = logged_at("warn", false);
         assert!(!off.contains("the access-log line"), "{off}");
         assert!(off.contains("a warn line"), "{off}");
+        // A filter that names the access log's target doesn't outrank the switch.
+        let named_off = logged_at("info,aisix_obs::access_log=off", true);
+        assert!(named_off.contains("the access-log line"), "{named_off}");
     }
 
     #[test]

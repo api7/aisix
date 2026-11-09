@@ -1747,7 +1747,7 @@ fn pin_context_origin(
 /// At WARN, because a group running on fewer targets than the operator
 /// configured is a degraded state they want to see without having raised
 /// verbosity first — an incident is diagnosed from the log level the
-/// gateway was already running at, and `info` is the default. Throttled per
+/// gateway was already running at, and `warn` is the default. Throttled per
 /// (target, reason) by
 /// [`crate::ModelRuntimeStatusTracker::should_log_exclusion`] so a cooling
 /// target in a busy group produces one line a minute rather than one per
