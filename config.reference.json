@@ -59,7 +59,7 @@
           ]
         }
       },
-      "log_level": "info",
+      "log_level": "warn",
       "metrics": {
         "buckets": {
           "a2a_ttfb": null,

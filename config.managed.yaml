@@ -179,11 +179,12 @@ observability:
   # Also the `service.name` resource attribute on every trace an `otlp_http`
   # observability exporter sends.
   service_name: "aisix"
-  log_level: "info"
-  # One access-log line ("proxy request completed") per request, written at
-  # `info`, so the effective log filter (`RUST_LOG` when set, else `log_level`)
-  # must allow `info` for it to appear. false turns the access log off whatever
-  # the filter; every other log line is unaffected.
+  # WARN and above. Raise it to "info" to see lifecycle and per-call lines
+  # while diagnosing. `RUST_LOG`, when set, replaces this value.
+  log_level: "warn"
+  # One access-log line ("proxy request completed") per request, whatever the
+  # log level or `RUST_LOG`. false turns the access log off; every other log
+  # line is unaffected.
   access_log: true
   metrics:
     # Complete label lists per metric. Omitted metrics retain their defaults.

@@ -187,7 +187,7 @@ impl BedrockGuardrail {
     ) -> Self {
         let row_name = row_name.into();
         if let Some(url) = endpoint_url.as_ref() {
-            // Visible at INFO so an operator inspecting DP logs sees
+            // At INFO so an operator diagnosing at that level sees
             // "Bedrock isn't talking to AWS" without having to grep
             // env. Prints once per BedrockGuardrail materialised from
             // the snapshot, which is rare (snapshot rebuild only).

@@ -321,8 +321,8 @@ pub fn request_failed_message(status: u16) -> String {
 
 impl AccessLog<'_> {
     /// Emit a single `tracing::info!` event carrying every field, unless
-    /// `observability.access_log` is off. When on, the line is filtered by
-    /// the log level like any other `info` event.
+    /// `observability.access_log` is off. When on, the line is written
+    /// whatever the log level (see `build_filter`).
     pub fn emit(&self) {
         self.emit_with(None);
     }

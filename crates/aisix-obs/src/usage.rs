@@ -32,6 +32,7 @@
 use crate::metrics::UsageEventLabels;
 use aisix_core::{AppliedGuardrail, GuardrailEnforcedHit, GuardrailMonitorHit, GuardrailScore};
 use serde::Serialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The fixed subsystem that made an embedding call while serving a caller's
 /// request.
@@ -1127,10 +1128,10 @@ fn is_zero_f64(n: &f64) -> bool {
 /// Cheap clonable handle the proxy hands to request handlers. Backed
 /// by an mpsc::Sender; `try_emit` is non-blocking and silently drops
 /// the event if the worker's queue is full (avoids back-pressuring
-/// the request hot path on a wedged CP). Drops are counted via
-/// tracing::warn! and (when a `Metrics` handle is attached) the
-/// `aisix_usage_event_drops_total{reason}` prometheus counter so
-/// observers can see a wedge.
+/// the request hot path on a wedged CP). Drops are counted exactly by
+/// the `aisix_usage_event_drops_total{reason}` prometheus counter (when
+/// a `Metrics` handle is attached) and logged by a rate-limited
+/// tracing::warn!, so observers can see a wedge.
 ///
 /// In a deployment without CP-side telemetry (legacy / dev), the
 /// handle's `tx` is `None` and `try_emit` is a no-op.
@@ -1157,6 +1158,69 @@ fn is_zero_f64(n: &f64) -> bool {
 pub struct UsageSink {
     tx: Option<tokio::sync::mpsc::Sender<UsageEvent>>,
     metrics: Option<crate::metrics::Metrics>,
+    drop_log: std::sync::Arc<DropLog>,
+}
+
+/// At most one `usage event dropped` line per reason per this window. A
+/// sink that has fallen behind drops on every request, so one line per drop
+/// would make the overload itself flood the log.
+const DROP_LOG_WINDOW_MS: u64 = 10_000;
+
+/// The drop WARN's per-reason rate limits. Atomics only: the drop path runs
+/// on every request exactly when the gateway is overloaded.
+#[derive(Debug)]
+struct DropLog {
+    started: std::time::Instant,
+    sink_full: DropLogGate,
+    sink_closed: DropLogGate,
+}
+
+impl Default for DropLog {
+    fn default() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            sink_full: DropLogGate::default(),
+            sink_closed: DropLogGate::default(),
+        }
+    }
+}
+
+impl DropLog {
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+}
+
+#[derive(Debug, Default)]
+struct DropLogGate {
+    /// When the next line may be written; 0 lets the first drop through.
+    next_line_at_ms: AtomicU64,
+    /// Drops no line has reported yet.
+    unlogged: AtomicU64,
+}
+
+impl DropLogGate {
+    /// Count one drop. `Some(n)` means write a line now, reporting the `n`
+    /// drops since the previous one. A racing drop that loses the exchange
+    /// stays in `unlogged` for whichever line comes next, so no drop goes
+    /// uncounted; drops after the last line wait for the next drop to be
+    /// reported, and only the metric is current between lines.
+    fn note(&self, now_ms: u64) -> Option<u64> {
+        self.unlogged.fetch_add(1, Ordering::Relaxed);
+        let next = self.next_line_at_ms.load(Ordering::Relaxed);
+        if now_ms < next {
+            return None;
+        }
+        self.next_line_at_ms
+            .compare_exchange(
+                next,
+                now_ms + DROP_LOG_WINDOW_MS,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .ok()?;
+        Some(self.unlogged.swap(0, Ordering::Relaxed))
+    }
 }
 
 /// Log one line per provider call that came back with a response id
@@ -1220,6 +1284,7 @@ impl UsageSink {
         Self {
             tx: Some(tx),
             metrics: None,
+            drop_log: std::sync::Arc::default(),
         }
     }
 
@@ -1230,6 +1295,7 @@ impl UsageSink {
         Self {
             tx: None,
             metrics: None,
+            drop_log: std::sync::Arc::default(),
         }
     }
 
@@ -1245,8 +1311,8 @@ impl UsageSink {
 
     /// Non-blocking emit. Returns immediately:
     /// - `Ok(())` on enqueue success;
-    /// - `Ok(())` and a tracing::warn! on `try_send` failure (queue
-    ///   full / receiver dropped). We deliberately don't propagate the
+    /// - `Ok(())` and a rate-limited tracing::warn! on `try_send` failure
+    ///   (queue full / receiver dropped). We deliberately don't propagate the
     ///   error to the caller — request handlers must NOT fail because
     ///   telemetry can't keep up.
     /// - `Ok(())` no-op on a `disabled()` sink.
@@ -1333,14 +1399,20 @@ impl UsageSink {
             // `Full` = worker is overloaded; `Closed` = worker shut
             // down cleanly. Either way the event is gone — record the
             // distinction so the operator knows *why* the wedge.
-            let reason = match err {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => "sink_full",
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => "sink_closed",
+            let (reason, drop_log) = match err {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    ("sink_full", &self.drop_log.sink_full)
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    ("sink_closed", &self.drop_log.sink_closed)
+                }
             };
             if let Some(m) = &self.metrics {
                 m.record_usage_event_drop(reason, labels);
             }
-            tracing::warn!(reason = reason, "usage event dropped");
+            if let Some(dropped) = drop_log.note(self.drop_log.now_ms()) {
+                tracing::warn!(reason = reason, dropped, "usage event dropped");
+            }
         }
     }
 }
@@ -1713,6 +1785,95 @@ mod tests {
             drop_value, 1,
             "drops_total{{reason=sink_full}} must be exactly 1:\n{rendered}",
         );
+    }
+
+    /// However many events a full queue refuses, the log gets one line per
+    /// window while the metric still counts every one of them.
+    #[test]
+    fn a_burst_of_drops_writes_one_line_and_counts_every_drop() {
+        const DROPS: u64 = 5_000;
+        let metrics = crate::metrics::Metrics::new(false);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let sink = UsageSink::new(tx).with_metrics(metrics.clone());
+        let event = || UsageEvent {
+            status_code: 200,
+            inbound_protocol: "openai".into(),
+            ..Default::default()
+        };
+
+        let out = capture_logs(|| {
+            sink.try_emit("chat", event(), UsageEventLabels::default()); // fills the queue
+            for _ in 0..DROPS {
+                sink.try_emit("chat", event(), UsageEventLabels::default());
+            }
+        });
+
+        let lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("usage event dropped"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{out}");
+        assert!(lines[0].contains("reason=\"sink_full\""), "{out}");
+        assert!(
+            lines[0].contains("dropped=1"),
+            "the first drop reports at once: {out}"
+        );
+        assert_eq!(
+            parse_counter_value(
+                &metrics.render(),
+                "aisix_usage_event_drops_total",
+                &[("reason", "sink_full")],
+            ),
+            DROPS,
+        );
+    }
+
+    /// Each reason has its own window: a queue that stays full must not hide
+    /// the worker shutting down.
+    #[test]
+    fn each_drop_reason_writes_its_own_line() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let sink = UsageSink::new(tx);
+        let event = || UsageEvent {
+            status_code: 200,
+            inbound_protocol: "openai".into(),
+            ..Default::default()
+        };
+
+        let out = capture_logs(|| {
+            for _ in 0..4 {
+                sink.try_emit("chat", event(), UsageEventLabels::default());
+            }
+            drop(rx);
+            for _ in 0..3 {
+                sink.try_emit("chat", event(), UsageEventLabels::default());
+            }
+        });
+
+        let lines: Vec<&str> = out
+            .lines()
+            .filter(|l| l.contains("usage event dropped"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        assert!(lines[0].contains("reason=\"sink_full\""), "{out}");
+        assert!(lines[1].contains("reason=\"sink_closed\""), "{out}");
+    }
+
+    /// A later window's line reports everything dropped since the previous
+    /// line, so the lines add up to the total.
+    #[test]
+    fn a_later_window_reports_the_drops_since_the_previous_line() {
+        let gate = DropLogGate::default();
+        assert_eq!(gate.note(0), Some(1));
+        for at in [1, 5_000, DROP_LOG_WINDOW_MS - 1] {
+            assert_eq!(gate.note(at), None);
+        }
+        assert_eq!(gate.note(DROP_LOG_WINDOW_MS), Some(4));
+        assert_eq!(gate.note(DROP_LOG_WINDOW_MS + 1), None);
+        assert_eq!(gate.note(DROP_LOG_WINDOW_MS * 2 - 1), None);
+        // An idle gap does not owe a line per window it spanned.
+        assert_eq!(gate.note(DROP_LOG_WINDOW_MS * 7), Some(3));
+        assert_eq!(gate.note(DROP_LOG_WINDOW_MS * 7 + 1), None);
     }
 
     /// Issue #408 audit MEDIUM-1: the `sink_closed` reason path must

@@ -142,9 +142,17 @@ chrono-tz = "0.10"
 uuid = { version = "1.11", features = ["v4", "v5", "serde"] }
 hostname = "0.4"
 # `setpriority`/`gettid` for the background-priority threads in
-# `aisix_core::sched`. rustix rather than raw `libc` because that crate
-# forbids unsafe code and these are its only two syscalls.
-rustix = { version = "1", features = ["param", "process", "thread"] }
+# `aisix_core::sched`, and the page size, clock tick rate and fd limit behind
+# the `process_*` metrics in `aisix_obs::memory`. rustix rather than raw `libc`
+# because those crates need no unsafe code for these calls.
+#
+# `use-libc-auxv` is load-bearing. Without it rustix reads the auxiliary
+# vector through `PR_GET_AUXV` (Linux 6.4+) or else `/proc/self/auxv`, and its
+# page-size and clock-tick getters panic when both fail. The image's file
+# capability makes the process non-dumpable, which leaves that file owned by
+# root, so on an older kernel both do fail for the image's non-root user. libc
+# already holds the vector from the process's start and reads no file.
+rustix = { version = "1", features = ["param", "process", "thread", "use-libc-auxv"] }
 
 # Observability
 tracing = "0.1"

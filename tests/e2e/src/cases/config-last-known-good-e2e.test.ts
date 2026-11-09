@@ -11,6 +11,7 @@ import {
   startEtcdRelay,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -205,6 +206,14 @@ describe("config last-known-good: rejected updates keep serving across resync an
         messages: [{ role: "user", content: "post-restart" }],
       });
       expect(after.status, JSON.stringify(after.body)).toBe(200);
+
+      // Serving a stale row is a degraded state, so the default log level
+      // reports it.
+      await waitForLogLine(
+        app,
+        (l) => /\bWARN\b/.test(l) && l.includes("serving last-known-good values for rejected keys"),
+        "the last-known-good warning",
+      );
 
       // The rejection + staleness survive, and the stale-since instant is
       // CONTINUOUS across the restart (persisted in the snapshot cache),

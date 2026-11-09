@@ -185,12 +185,12 @@ describe("an enabled cooldown records the exclusion it causes", () => {
     stable = await startOpenAiUpstream({ nonStreamBody: okBody("survivor-served") });
 
     // Pinned to the gateway's own production default
-    // (`observability.log_level: info`) rather than the harness default
-    // of `warn`, because the claim under test is that these lines are
-    // visible without an operator having raised verbosity in advance —
-    // nobody turns on debug before the incident. Passing it explicitly
-    // also keeps an ambient `RUST_LOG` from deciding the outcome.
-    app = await spawnApp({ admin: false, logLevel: "info" });
+    // (`observability.log_level: warn`), because the claim under test is
+    // that these lines are visible without an operator having raised
+    // verbosity in advance — nobody turns on debug before the incident.
+    // Passing it explicitly also keeps an ambient `RUST_LOG` from deciding
+    // the outcome.
+    app = await spawnApp({ admin: false, logLevel: "warn" });
     admin = new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl);
     seed = new SeedClient(etcd, app.etcdPrefix);
 

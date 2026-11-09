@@ -117,7 +117,8 @@ export interface AppOverrides {
   /**
    * Log level for the spawned binary. Defaults to `warn` — quiet enough
    * that the suite's output stays readable. Tests that assert on a line
-   * the gateway emits at `info` (the access log) raise it here.
+   * the gateway emits at `info` raise it here. The access log is written
+   * at any level while `accessLog` is on.
    *
    * Applied to BOTH `observability.log_level` and `RUST_LOG`: the DP's
    * `init_tracing` tries `EnvFilter::try_from_default_env()` first, so
@@ -126,6 +127,12 @@ export interface AppOverrides {
    * debugging with `RUST_LOG=error` can't turn a test's subject off.
    */
   logLevel?: string;
+  /**
+   * Leave the log level to the binary: no `observability.log_level`, no
+   * `RUST_LOG`. For a spec about the gateway's own default; `logLevel` is
+   * ignored when this is set.
+   */
+  binaryDefaultLogLevel?: boolean;
   /**
    * `observability.access_log`. Defaults to `true`, the binary's own
    * default; only a spec whose subject is the switch turns it off.
@@ -456,7 +463,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
       : { addr: `127.0.0.1:${adminPort}`, enabled: false },
     observability: {
       service_name: "aisix-e2e",
-      log_level: overrides.logLevel ?? "warn",
+      ...(overrides.binaryDefaultLogLevel ? {} : { log_level: overrides.logLevel ?? "warn" }),
       access_log: overrides.accessLog ?? true,
       metrics: {
         prometheus: {
@@ -507,7 +514,11 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   for (const [k, v] of Object.entries(process.env)) {
     if (v !== undefined && !k.startsWith("AISIX_")) childEnv[k] = v;
   }
-  childEnv.RUST_LOG = overrides.logLevel ?? process.env.RUST_LOG ?? "warn";
+  if (overrides.binaryDefaultLogLevel) {
+    delete childEnv.RUST_LOG;
+  } else {
+    childEnv.RUST_LOG = overrides.logLevel ?? process.env.RUST_LOG ?? "warn";
+  }
   childEnv.HTTP_PROXY = "";
   childEnv.HTTPS_PROXY = "";
   childEnv.ALL_PROXY = "";

@@ -1609,7 +1609,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             stats.partial_rows.extend(lkg_stats.partial_rows);
             stats.partially_compatible = loader::aggregate_partial_compat(&stats.partial_rows);
             if lkg_stats.accepted > 0 {
-                tracing::info!(
+                tracing::warn!(
                     count = lkg_stats.accepted,
                     "serving last-known-good values for rejected keys",
                 );

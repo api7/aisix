@@ -336,7 +336,9 @@ jobs:
 
   build-bin:
     name: build aisix (instrumented)
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest: an e2e packages this binary with the
+    # repository's Dockerfile, and its glibc must not be newer than the image's.
+    runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: "-C instrument-coverage"
       LLVM_PROFILE_FILE: "coverage/aisix-%p-%m.profraw"

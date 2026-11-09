@@ -97,23 +97,30 @@ pub enum ObsError {
 /// a warning line and fail the e2e log scan (#998).
 const QUIET_TARGETS: &[&str] = &["lofty=error"];
 
+/// The access log's own target, which [`build_filter`] keeps at `info` while
+/// `observability.access_log` is on: that switch decides whether the lines are
+/// written, and the log level decides about everything else.
+const ACCESS_LOG_DIRECTIVE: &str = "aisix_obs::access_log=info";
+
 /// The subscriber's level filter: `RUST_LOG` when set, else the
-/// configured level, with [`QUIET_TARGETS`] applied on top.
+/// configured level, with [`QUIET_TARGETS`] and, when the access log is on,
+/// [`ACCESS_LOG_DIRECTIVE`] applied on top.
 fn build_filter(cfg: &ObservabilityConfig) -> Result<EnvFilter, ObsError> {
-    let mut filter = EnvFilter::try_from_default_env()
+    let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&cfg.log_level))
         .map_err(|source| ObsError::Filter {
             directive: cfg.log_level.clone(),
             source,
         })?;
-    for directive in QUIET_TARGETS {
-        filter = filter.add_directive(
-            directive
-                .parse()
-                .expect("QUIET_TARGETS holds valid filter directives"),
-        );
+    Ok(apply_fixed_directives(filter, cfg))
+}
+
+fn apply_fixed_directives(mut filter: EnvFilter, cfg: &ObservabilityConfig) -> EnvFilter {
+    let access_log = cfg.access_log.then_some(ACCESS_LOG_DIRECTIVE);
+    for directive in QUIET_TARGETS.iter().copied().chain(access_log) {
+        filter = filter.add_directive(directive.parse().expect("the fixed directives are valid"));
     }
-    Ok(filter)
+    filter
 }
 
 /// Install a process-wide tracing subscriber.
@@ -246,6 +253,40 @@ mod tests {
             logged.contains("transcription failed"),
             "the gateway's own WARNs must be unaffected, got: {logged}"
         );
+    }
+
+    /// The access log follows its own switch, whatever filter it is applied
+    /// on top of, and leaves every other `info` line to that filter.
+    #[test]
+    fn the_access_log_is_filtered_by_its_switch_not_the_level() {
+        let logged_at = |base: &str, access_log: bool| {
+            let writer = VecWriter::default();
+            let cfg = ObservabilityConfig {
+                access_log,
+                ..Default::default()
+            };
+            let subscriber = tracing_subscriber::registry()
+                .with(apply_fixed_directives(EnvFilter::new(base), &cfg))
+                .with(fmt::layer().with_ansi(false).with_writer(writer.clone()));
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "aisix_obs::access_log", "the access-log line");
+                tracing::info!(target: "aisix_obs::usage", "an info line");
+                tracing::warn!(target: "aisix_obs::usage", "a warn line");
+            });
+            let logged = String::from_utf8_lossy(&writer.buf.lock().unwrap()).into_owned();
+            logged
+        };
+
+        let on = logged_at("warn", true);
+        assert!(on.contains("the access-log line"), "{on}");
+        assert!(!on.contains("an info line"), "{on}");
+        assert!(on.contains("a warn line"), "{on}");
+        let off = logged_at("warn", false);
+        assert!(!off.contains("the access-log line"), "{off}");
+        assert!(off.contains("a warn line"), "{off}");
+        // A filter that names the access log's target doesn't outrank the switch.
+        let named_off = logged_at("info,aisix_obs::access_log=off", true);
+        assert!(named_off.contains("the access-log line"), "{named_off}");
     }
 
     #[test]
