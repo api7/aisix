@@ -222,8 +222,9 @@ impl OpenApiBridge {
                     crate::oauth::get_or_fetch(&self.oauth_config()),
                 )
                 .await
-                .map_err(|_| {
-                    McpError::Connect("tool call timed out".to_string()).into_credential_failure()
+                .map_err(|_| McpError::Upstream {
+                    failure: ToolCallFailure::CredentialUnavailable,
+                    detail: "fetching the upstream MCP credential timed out".to_string(),
                 })?
                 .map_err(McpError::into_credential_failure)?;
                 request.bearer_auth(token)

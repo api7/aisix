@@ -20,12 +20,14 @@ import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 const KEY = "sk-a2a-rpc-error";
 const CREDENTIAL_REF = "mock";
 const LOGSTORE = "a2a-rpc-error";
+const FULL_LOGSTORE = "a2a-rpc-error-full";
 const SENTINEL = "sentinel-agent-said-this-5c1d";
 
 describe("a JSON-RPC error from an agent inside a 200", () => {
   let etcdReachable = false;
   let app: SpawnedApp | undefined;
   let agent: A2aUpstream | undefined;
+  let holdingAgent: A2aUpstream | undefined;
   let sls: MockSls | undefined;
   let otlp: MockOtlp | undefined;
 
@@ -34,6 +36,10 @@ describe("a JSON-RPC error from an agent inside a 200", () => {
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
     agent = await startA2aUpstream({ rpcError: { code: -32004, message: SENTINEL } });
+    holdingAgent = await startA2aUpstream({
+      rpcError: { code: -32004, message: SENTINEL },
+      holdStreamAfterRpcError: true,
+    });
     sls = await startMockSls();
     otlp = await startMockOtlp();
     app = await spawnApp({
@@ -54,6 +60,16 @@ describe("a JSON-RPC error from an agent inside a 200", () => {
       content_mode: "metadata_only",
     });
     await seed.createObservabilityExporter({
+      name: "a2a-rpc-error-sls-full",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: "a2a-rpc-error",
+      logstore: FULL_LOGSTORE,
+      credential_ref: CREDENTIAL_REF,
+      content_mode: "full",
+    });
+    await seed.createObservabilityExporter({
       name: "a2a-rpc-error-otlp",
       enabled: true,
       kind: "otlp_http",
@@ -62,6 +78,13 @@ describe("a JSON-RPC error from an agent inside a 200", () => {
     await seed.update("a2a_agents", randomUUID(), {
       name: "refuser",
       url: agent.url,
+      protocol_version: "0.3",
+      auth_type: "none",
+      enabled: true,
+    });
+    await seed.update("a2a_agents", randomUUID(), {
+      name: "holder",
+      url: holdingAgent.url,
       protocol_version: "0.3",
       auth_type: "none",
       enabled: true,
@@ -83,6 +106,7 @@ describe("a JSON-RPC error from an agent inside a 200", () => {
   afterAll(async () => {
     await app?.exit();
     await agent?.close();
+    await holdingAgent?.close();
     await sls?.close();
     await otlp?.close();
   });
@@ -124,6 +148,16 @@ describe("a JSON-RPC error from an agent inside a 200", () => {
     expect(row.get("error_message")).toBe("upstream agent returned JSON-RPC error -32004");
     expect(JSON.stringify(Object.fromEntries(row))).not.toContain(SENTINEL);
 
+    // A full-content export carries what the agent actually answered.
+    const fullRow = await waitForSlsLog(
+      sls!,
+      FULL_LOGSTORE,
+      (l) => l.get("request_id") === requestId,
+      `full row ${requestId}`,
+    );
+    expect(fullRow.get("error_message")).toBe("upstream agent returned JSON-RPC error -32004");
+    expect(fullRow.get("response")).toContain(SENTINEL);
+
     const traceId = row.get("trace_id");
     await expect
       .poll(() => otlp!.spans.filter((s) => s.traceId === traceId && s.kind === 3).length, {
@@ -136,5 +170,43 @@ describe("a JSON-RPC error from an agent inside a 200", () => {
     expect(carrier.statusCode).toBe(2);
     expect(carrier.attributes["error.type"]).toBe("upstream_in_band");
     expect(spans.find((s) => s.kind === 2)?.statusCode ?? 0).toBe(0);
+  });
+
+  test("a caller that stops reading at the error has not abandoned the stream", async (ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    const res = await fetch(`${app!.proxyUrl}/a2a/holder`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${KEY}`,
+        "content-type": "application/json",
+        accept: "text/event-stream, application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "message/stream",
+        params: { message: { role: "user", parts: [] } },
+      }),
+    });
+    expect(res.status).toBe(200);
+    const reader = res.body!.getReader();
+    let seen = "";
+    while (!seen.includes(SENTINEL)) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      seen += new TextDecoder().decode(value);
+    }
+    expect(seen).toContain(SENTINEL);
+    await reader.cancel();
+
+    const requestId = res.headers.get("x-aisix-request-id");
+    const row = await waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (l) => l.get("request_id") === requestId,
+      `row ${requestId}`,
+    );
+    expect(row.get("status_code")).toBe("200");
+    expect(row.get("error_class")).toBe("upstream_in_band");
   });
 });

@@ -458,6 +458,10 @@ async fn dispatch(
     match result {
         Ok(response_value) => {
             call.facts.observe_result(&response_value);
+            let in_band = A2aFailure::in_band(&response_value);
+            if in_band.is_some() {
+                crate::usage_attr::note_client_error_body(&snapshot, || response_value.to_string());
+            }
             if meters_content(call.operation) {
                 call.text
                     .response
@@ -475,7 +479,7 @@ async fn dispatch(
                 trace.as_ref(),
                 /* dispatched */ true,
                 /* refusal */ None,
-                A2aFailure::in_band(&response_value).as_ref(),
+                in_band.as_ref(),
             );
             axum::Json(response_value).into_response()
         }
@@ -672,6 +676,13 @@ async fn dispatch_stream(
                     }
                     if let Some(failure) = A2aFailure::in_band(&value) {
                         guard.failure.get_or_insert(failure);
+                        // A caller stops reading at the error, as at a terminal
+                        // event, and that is not abandoning the stream.
+                        guard.call.stream.reached_end = true;
+                        crate::usage_attr::note_client_error_body(
+                            &guard.state.snapshot.load(),
+                            || value.to_string(),
+                        );
                     }
                     if value.get("result").is_some() {
                         guard.call.stream.event_count += 1;

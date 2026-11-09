@@ -603,11 +603,9 @@ impl RmcpBridge {
                 if !claims(API_KEY_HEADER) {
                     // A key with non-header-safe bytes is a clean config error,
                     // not a panic — and the key itself never enters the message.
-                    let mut value = HeaderValue::from_str(key).map_err(|_| {
-                        McpError::Connect(
-                            "upstream API key is not a valid HTTP header value".to_string(),
-                        )
-                        .into_credential_failure()
+                    let mut value = HeaderValue::from_str(key).map_err(|_| McpError::Upstream {
+                        failure: ToolCallFailure::CredentialUnavailable,
+                        detail: "upstream API key is not a valid HTTP header value".to_string(),
                     })?;
                     // Marks the value opaque to `Debug` formatting of the
                     // header map, mirroring this module's redaction posture.
@@ -751,7 +749,10 @@ impl RmcpBridge {
 /// Fetching the upstream's credential ran out of the deadline: the identity
 /// provider is what failed, not the MCP server.
 fn credential_timed_out() -> McpError {
-    McpError::Connect("upstream MCP connect timed out".to_string()).into_credential_failure()
+    McpError::Upstream {
+        failure: ToolCallFailure::CredentialUnavailable,
+        detail: "fetching the upstream MCP credential timed out".to_string(),
+    }
 }
 
 fn connect_timed_out() -> McpError {
