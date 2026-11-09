@@ -139,7 +139,7 @@ impl McpError {
 
     /// Mark a connect-time failure as the credential fetch's rather than the
     /// upstream's: the MCP server was not contacted.
-    pub(crate) fn from_credential_fetch(self) -> Self {
+    pub(crate) fn into_credential_failure(self) -> Self {
         match self {
             McpError::Connect(_) => McpError::Upstream {
                 failure: ToolCallFailure::CredentialUnavailable,

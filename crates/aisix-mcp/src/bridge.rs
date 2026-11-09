@@ -607,7 +607,7 @@ impl RmcpBridge {
                         McpError::Connect(
                             "upstream API key is not a valid HTTP header value".to_string(),
                         )
-                        .from_credential_fetch()
+                        .into_credential_failure()
                     })?;
                     // Marks the value opaque to `Debug` formatting of the
                     // header map, mirroring this module's redaction posture.
@@ -625,7 +625,7 @@ impl RmcpBridge {
                         tokio::time::timeout_at(deadline, crate::oauth::get_or_fetch(cfg))
                             .await
                             .map_err(|_| credential_timed_out())?
-                            .map_err(McpError::from_credential_fetch)?,
+                            .map_err(McpError::into_credential_failure)?,
                     );
                 }
             }
@@ -751,7 +751,7 @@ impl RmcpBridge {
 /// Fetching the upstream's credential ran out of the deadline: the identity
 /// provider is what failed, not the MCP server.
 fn credential_timed_out() -> McpError {
-    McpError::Connect("upstream MCP connect timed out".to_string()).from_credential_fetch()
+    McpError::Connect("upstream MCP connect timed out".to_string()).into_credential_failure()
 }
 
 fn connect_timed_out() -> McpError {

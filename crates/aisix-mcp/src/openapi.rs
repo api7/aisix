@@ -223,9 +223,9 @@ impl OpenApiBridge {
                 )
                 .await
                 .map_err(|_| {
-                    McpError::Connect("tool call timed out".to_string()).from_credential_fetch()
+                    McpError::Connect("tool call timed out".to_string()).into_credential_failure()
                 })?
-                .map_err(McpError::from_credential_fetch)?;
+                .map_err(McpError::into_credential_failure)?;
                 request.bearer_auth(token)
             }
             McpAuthType::OauthDelegate if claims("authorization") => request,
