@@ -59,7 +59,8 @@ pub enum ToolCallFailure {
     Timeout,
     /// The upstream could not be reached, or dropped the connection.
     Transport,
-    /// The upstream answered a success status carrying this JSON-RPC error code.
+    /// The upstream answered with this JSON-RPC error code. The MCP client drops
+    /// the HTTP status of such an answer, so a non-2xx one reads the same way.
     JsonRpc(i32),
 }
 

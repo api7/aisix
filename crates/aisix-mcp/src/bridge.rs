@@ -623,7 +623,7 @@ impl RmcpBridge {
                     auth_header = Some(
                         tokio::time::timeout_at(deadline, crate::oauth::get_or_fetch(cfg))
                             .await
-                            .map_err(|_| connect_timed_out())??,
+                            .map_err(|_| credential_timed_out())??,
                     );
                 }
             }
@@ -644,7 +644,7 @@ impl RmcpBridge {
                 auth_header = Some(
                     tokio::time::timeout_at(deadline, auth.token())
                         .await
-                        .map_err(|_| connect_timed_out())??,
+                        .map_err(|_| credential_timed_out())??,
                 );
             }
         }
@@ -744,6 +744,12 @@ impl RmcpBridge {
             timeout: upstream.timeout,
         })
     }
+}
+
+/// Fetching the upstream's credential ran out of the deadline. The identity
+/// provider is what failed, so this names no upstream failure.
+fn credential_timed_out() -> McpError {
+    McpError::Connect("upstream MCP connect timed out".to_string())
 }
 
 fn connect_timed_out() -> McpError {
@@ -1464,6 +1470,28 @@ mod tests {
         let truncated = sanitize_error_message(&long);
         assert!(truncated.chars().count() <= 257, "bounded output");
         assert!(truncated.ends_with('…'));
+    }
+
+    /// A token endpoint that never answers is the identity provider's failure,
+    /// not the MCP server's, which was never contacted.
+    #[tokio::test]
+    async fn a_hung_token_endpoint_names_no_upstream_failure() {
+        let token_endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = token_endpoint.local_addr().unwrap();
+        let mut upstream =
+            McpUpstream::new("http://127.0.0.1:9/mcp").with_timeout(Duration::from_millis(200));
+        upstream.auth = McpAuth::OAuth2(OAuthClientConfig {
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string(),
+            token_url: format!("http://{addr}/token"),
+            scopes: Vec::new(),
+        });
+        let err = RmcpBridge::connect(&upstream)
+            .await
+            .err()
+            .expect("the token endpoint hangs");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert_eq!(err.tool_call_failure(), None);
     }
 
     /// rmcp's text ends at reqwest's "error sending request"; the failed session

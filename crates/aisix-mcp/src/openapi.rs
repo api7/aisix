@@ -222,7 +222,7 @@ impl OpenApiBridge {
                     crate::oauth::get_or_fetch(&self.oauth_config()),
                 )
                 .await
-                .map_err(|_| tool_call_timed_out())??;
+                .map_err(|_| McpError::Request("tool call timed out".to_string()))??;
                 request.bearer_auth(token)
             }
             McpAuthType::OauthDelegate if claims("authorization") => request,
