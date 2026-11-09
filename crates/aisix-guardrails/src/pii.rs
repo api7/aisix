@@ -199,44 +199,51 @@ fn mask_token(name: &str) -> String {
 
 /// One built-in detector: `(id, pattern, validator)`.
 ///
-/// Patterns lean conservative — `\b` boundaries and checksum validators —
+/// Patterns lean conservative — word boundaries and checksum validators —
 /// because a mask false-positive corrupts user content (worse than a
-/// keyword-blocklist false positive, which merely rejects). IDs are wire
-/// contract: cp-api's validator and the dashboard's detector list carry
-/// the same set.
+/// keyword-blocklist false positive, which merely rejects). The boundaries
+/// are ASCII (`(?-u:\b)`): a Unicode `\b` counts a CJK character as a word
+/// character, so a value written straight after Chinese text would not match.
+/// IDs are wire contract: cp-api's validator and the dashboard's detector list
+/// carry the same set.
 pub const BUILTIN_DETECTORS: &[(&str, &str, Option<MatchValidator>)] = &[
     (
         "email",
-        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+        r"(?-u:\b)[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?-u:\b)",
         None,
     ),
     // Chinese mainland mobile: 1[3-9] + 9 digits, standalone digit run.
-    ("china_mobile", r"\b1[3-9]\d{9}\b", None),
+    ("china_mobile", r"(?-u:\b)1[3-9]\d{9}(?-u:\b)", None),
     // 18-char Chinese national ID (17 digits + check char), verified with
     // the ISO 7064 MOD 11-2 checksum.
     (
         "china_id_card",
-        r"\b\d{17}[0-9Xx]\b",
+        r"(?-u:\b)\d{17}[0-9Xx](?-u:\b)",
         Some(china_id_checksum),
     ),
-    // 13–19 digit PAN (bank/credit card), Luhn-verified.
-    ("bank_card", r"\b\d{13,19}\b", Some(luhn_checksum)),
-    ("us_ssn", r"\b\d{3}-\d{2}-\d{4}\b", None),
+    // 13–19 digit PAN (bank/credit card), unbroken or printed in the 4-4-4-4,
+    // 4-6-5 or 4-6-4 groups separated by spaces or hyphens, Luhn-verified.
+    (
+        "bank_card",
+        r"(?-u:\b)(?:\d{13,19}|\d{4}(?:[ -]\d{4}){3}|\d{4}[ -]\d{6}[ -]\d{4,5})(?-u:\b)",
+        Some(luhn_checksum),
+    ),
+    ("us_ssn", r"(?-u:\b)\d{3}-\d{2}-\d{4}(?-u:\b)", None),
     (
         "ip_address",
-        r"\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b",
+        r"(?-u:\b)(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?-u:\b)",
         None,
     ),
     // Well-known credential signatures: OpenAI, AWS access key id, GitHub
     // (classic + fine-grained), Slack, Google API key.
     (
         "api_key",
-        r"\b(?:sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35})\b",
+        r"(?-u:\b)(?:sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35})(?-u:\b)",
         None,
     ),
     (
         "jwt",
-        r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+        r"(?-u:\b)eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?-u:\b)",
         None,
     ),
     (
@@ -276,11 +283,12 @@ fn china_id_checksum(s: &str) -> bool {
     bytes[17].to_ascii_uppercase() == expected
 }
 
-/// Luhn check for payment-card numbers.
+/// Luhn check for payment-card numbers, reading through the separators a
+/// grouped number is printed with.
 fn luhn_checksum(s: &str) -> bool {
     let mut sum = 0u32;
     let mut double = false;
-    for b in s.bytes().rev() {
+    for b in s.bytes().rev().filter(|b| !matches!(b, b' ' | b'-')) {
         if !b.is_ascii_digit() {
             return false;
         }
@@ -586,6 +594,116 @@ mod tests {
         let r = g.redact_input_text("card 4111111111111111 ok").unwrap();
         assert_eq!(r.text, "card [BANK_CARD_REDACTED] ok");
         assert!(g.redact_input_text("card 4111111111111112 ok").is_none());
+    }
+
+    #[test]
+    fn bank_card_matches_the_printed_groupings() {
+        let g = guardrail(vec![builtin("bank_card", PiiAction::Mask)]);
+        for card in [
+            "4111 1111 1111 1111",
+            "4111-1111-1111-1111",
+            "4111111111111111",
+            "3782 822463 10005",
+            "3782-822463-10005",
+            "3056 930902 5904",
+        ] {
+            let r = g
+                .redact_input_text(&format!("card {card}, thanks"))
+                .unwrap_or_else(|| panic!("{card} not detected"));
+            assert_eq!(r.text, "card [BANK_CARD_REDACTED], thanks", "{card}");
+        }
+        for not_a_card in [
+            "2026110700123450",
+            "2026 1107 0012 3450",
+            "4111 1111 1111 1112",
+            "3782 822463 10006",
+            // A partial number and other groupings stay out of the shape.
+            "4111 1111 1111",
+            "411 1111 1111 1111",
+            // Other separators are not card groupings.
+            "4111.1111.1111.1111",
+            "4111\n1111\n1111\n1111",
+        ] {
+            assert!(
+                g.redact_input_text(not_a_card).is_none(),
+                "{not_a_card} must not be masked"
+            );
+        }
+        // Luhn cannot tell a reference number from a card: this one passes.
+        assert!(g.redact_input_text("2026110700123451").is_some());
+    }
+
+    #[test]
+    fn bank_card_in_a_longer_grouped_run_masks_the_first_sixteen_digits() {
+        let g = guardrail(vec![builtin("bank_card", PiiAction::Mask)]);
+        let r = g
+            .redact_input_text("card 4111 1111 1111 1111 123 end")
+            .unwrap();
+        assert_eq!(r.text, "card [BANK_CARD_REDACTED] 123 end");
+    }
+
+    /// A value written straight after, or before, Chinese text is still that
+    /// value; an ASCII word character next to it still means a longer token.
+    #[test]
+    fn builtin_detectors_match_values_touching_cjk_text() {
+        let cases = [
+            ("email", "邮箱alice@example.com。", "邮箱[EMAIL_REDACTED]。"),
+            (
+                "china_mobile",
+                "手机号13812345678请回电",
+                "手机号[CHINA_MOBILE_REDACTED]请回电",
+            ),
+            (
+                "china_id_card",
+                "身份证11010519491231002X已登记",
+                "身份证[CHINA_ID_CARD_REDACTED]已登记",
+            ),
+            (
+                "bank_card",
+                "卡號4111111111111111。",
+                "卡號[BANK_CARD_REDACTED]。",
+            ),
+            (
+                "bank_card",
+                "卡號4111 1111 1111 1111。",
+                "卡號[BANK_CARD_REDACTED]。",
+            ),
+            ("us_ssn", "号码123-45-6789的", "号码[US_SSN_REDACTED]的"),
+            (
+                "ip_address",
+                "地址192.168.1.100的",
+                "地址[IP_ADDRESS_REDACTED]的",
+            ),
+            (
+                "api_key",
+                "密钥sk-abcdefghijklmnopqrstuv的",
+                "密钥[API_KEY_REDACTED]的",
+            ),
+            (
+                "jwt",
+                "令牌eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dGVzdHNpZ25hdHVyZQ的",
+                "令牌[JWT_REDACTED]的",
+            ),
+        ];
+        for (id, text, masked) in cases {
+            let g = guardrail(vec![builtin(id, PiiAction::Mask)]);
+            let r = g
+                .redact_input_text(text)
+                .unwrap_or_else(|| panic!("{id} missed {text}"));
+            assert_eq!(r.text, masked, "{id}");
+        }
+        for (id, text) in [
+            ("china_mobile", "x13812345678"),
+            ("china_mobile", "138123456789"),
+            ("china_mobile", "13812345678_1"),
+            ("bank_card", "x4111111111111111"),
+            ("bank_card", "4111111111111111x"),
+            ("us_ssn", "1123-45-6789"),
+            ("email", "alice@example.com_x"),
+        ] {
+            let g = guardrail(vec![builtin(id, PiiAction::Mask)]);
+            assert!(g.redact_input_text(text).is_none(), "{id} matched {text}");
+        }
     }
 
     #[test]
