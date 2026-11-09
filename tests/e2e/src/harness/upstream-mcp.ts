@@ -33,7 +33,7 @@ export interface McpUpstream {
 
 /** How a faulted upstream answers a `tools/call`, instead of serving the tool. */
 export type McpToolFault =
-  | { kind: "http"; status: number; body: string }
+  | { kind: "http"; status: number; body: string; contentType?: string }
   | { kind: "jsonrpc"; code: number; message: string }
   | { kind: "hang" };
 
@@ -155,7 +155,9 @@ async function handle(
       call.method === "tools/call" ? options.toolFaults?.[call.params?.name ?? ""] : undefined;
     if (fault?.kind === "hang") return;
     if (fault?.kind === "http") {
-      res.writeHead(fault.status, { "content-type": "text/plain" }).end(fault.body);
+      res
+        .writeHead(fault.status, { "content-type": fault.contentType ?? "text/plain" })
+        .end(fault.body);
       return;
     }
     if (fault?.kind === "jsonrpc") {

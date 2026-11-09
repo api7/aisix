@@ -607,6 +607,7 @@ impl RmcpBridge {
                         McpError::Connect(
                             "upstream API key is not a valid HTTP header value".to_string(),
                         )
+                        .from_credential_fetch()
                     })?;
                     // Marks the value opaque to `Debug` formatting of the
                     // header map, mirroring this module's redaction posture.
@@ -623,7 +624,8 @@ impl RmcpBridge {
                     auth_header = Some(
                         tokio::time::timeout_at(deadline, crate::oauth::get_or_fetch(cfg))
                             .await
-                            .map_err(|_| credential_timed_out())??,
+                            .map_err(|_| credential_timed_out())?
+                            .map_err(McpError::from_credential_fetch)?,
                     );
                 }
             }
@@ -746,10 +748,10 @@ impl RmcpBridge {
     }
 }
 
-/// Fetching the upstream's credential ran out of the deadline. The identity
-/// provider is what failed, so this names no upstream failure.
+/// Fetching the upstream's credential ran out of the deadline: the identity
+/// provider is what failed, not the MCP server.
 fn credential_timed_out() -> McpError {
-    McpError::Connect("upstream MCP connect timed out".to_string())
+    McpError::Connect("upstream MCP connect timed out".to_string()).from_credential_fetch()
 }
 
 fn connect_timed_out() -> McpError {
@@ -854,6 +856,7 @@ fn service_failure(error: &rmcp::ServiceError) -> Option<ToolCallFailure> {
         rmcp::ServiceError::TransportSend(transport) => transport_failure(transport),
         rmcp::ServiceError::TransportClosed => Some(ToolCallFailure::Transport),
         rmcp::ServiceError::Timeout { .. } => Some(ToolCallFailure::Timeout),
+        rmcp::ServiceError::UnexpectedResponse => Some(ToolCallFailure::Undecodable),
         _ => None,
     }
 }
@@ -863,13 +866,15 @@ fn init_failure(error: &ClientInitializeError) -> Option<ToolCallFailure> {
         ClientInitializeError::TransportError { error, .. } => transport_failure(error),
         ClientInitializeError::JsonRpcError(data) => Some(ToolCallFailure::JsonRpc(data.code.0)),
         ClientInitializeError::ConnectionClosed(_) => Some(ToolCallFailure::Transport),
+        ClientInitializeError::ExpectedInitResponse(_)
+        | ClientInitializeError::ExpectedInitResult(_)
+        | ClientInitializeError::ConflictInitResponseId(_, _) => Some(ToolCallFailure::Undecodable),
         _ => None,
     }
 }
 
-/// What a failed send says about the upstream. A shape that names neither a
-/// status nor a connection problem (an answer rmcp could not read) has no
-/// cause to report.
+/// What a failed send says about the upstream. The shapes left over are the
+/// gateway's own transport plumbing, which say nothing about it.
 fn transport_failure(error: &rmcp::transport::DynamicTransportError) -> Option<ToolCallFailure> {
     let error = error
         .error
@@ -879,7 +884,10 @@ fn transport_failure(error: &rmcp::transport::DynamicTransportError) -> Option<T
         StreamableHttpError::InsufficientScope(_) => Some(ToolCallFailure::UpstreamStatus(403)),
         StreamableHttpError::SessionExpired => Some(ToolCallFailure::UpstreamStatus(404)),
         StreamableHttpError::UnexpectedServerResponse(message) => {
-            http_status_of(message).map(ToolCallFailure::UpstreamStatus)
+            Some(http_status_of(message).map_or(
+                ToolCallFailure::Undecodable,
+                ToolCallFailure::UpstreamStatus,
+            ))
         }
         StreamableHttpError::Client(client) if client.is_timeout() => {
             Some(ToolCallFailure::Timeout)
@@ -887,6 +895,11 @@ fn transport_failure(error: &rmcp::transport::DynamicTransportError) -> Option<T
         StreamableHttpError::Client(_)
         | StreamableHttpError::Io(_)
         | StreamableHttpError::Sse(SseError::Body(_)) => Some(ToolCallFailure::Transport),
+        StreamableHttpError::Sse(_)
+        | StreamableHttpError::UnexpectedEndOfStream
+        | StreamableHttpError::UnexpectedContentType(_)
+        | StreamableHttpError::Deserialize(_)
+        | StreamableHttpError::MissingSessionIdInResponse => Some(ToolCallFailure::Undecodable),
         _ => None,
     }
 }
@@ -1475,7 +1488,7 @@ mod tests {
     /// A token endpoint that never answers is the identity provider's failure,
     /// not the MCP server's, which was never contacted.
     #[tokio::test]
-    async fn a_hung_token_endpoint_names_no_upstream_failure() {
+    async fn a_hung_token_endpoint_is_a_credential_failure() {
         let token_endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = token_endpoint.local_addr().unwrap();
         let mut upstream =
@@ -1491,7 +1504,10 @@ mod tests {
             .err()
             .expect("the token endpoint hangs");
         assert!(err.to_string().contains("timed out"), "{err}");
-        assert_eq!(err.tool_call_failure(), None);
+        assert_eq!(
+            err.tool_call_failure(),
+            Some(ToolCallFailure::CredentialUnavailable)
+        );
     }
 
     /// rmcp's text ends at reqwest's "error sending request"; the failed session

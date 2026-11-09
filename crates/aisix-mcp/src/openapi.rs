@@ -222,7 +222,10 @@ impl OpenApiBridge {
                     crate::oauth::get_or_fetch(&self.oauth_config()),
                 )
                 .await
-                .map_err(|_| McpError::Request("tool call timed out".to_string()))??;
+                .map_err(|_| {
+                    McpError::Connect("tool call timed out".to_string()).from_credential_fetch()
+                })?
+                .map_err(McpError::from_credential_fetch)?;
                 request.bearer_auth(token)
             }
             McpAuthType::OauthDelegate if claims("authorization") => request,
@@ -463,7 +466,10 @@ impl McpBridge for OpenApiBridge {
         let tool = tools
             .iter()
             .find(|t| t.name == name)
-            .ok_or_else(|| McpError::Request(format!("unknown tool '{name}'")))?;
+            .ok_or_else(|| McpError::Upstream {
+                failure: ToolCallFailure::ToolNotFound,
+                detail: format!("upstream MCP request failed: unknown tool '{name}'"),
+            })?;
         self.execute(tool, &arguments, tokio::time::Instant::now() + self.timeout)
             .await
     }

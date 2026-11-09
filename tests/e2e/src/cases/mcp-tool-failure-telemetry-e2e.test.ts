@@ -72,6 +72,7 @@ describe.each(["full", "metadata_only"] as const)(
         mediaResult: { content: [{ type: "text", text: TOOL_TEXT }] },
         toolFaults: {
           http500: { kind: "http", status: 500, body: TOOL_TEXT },
+          html: { kind: "http", status: 200, body: `<html>${TOOL_TEXT}</html>`, contentType: "text/html" },
           rpcerror: { kind: "jsonrpc", code: -32000, message: TOOL_TEXT },
           hangs: { kind: "hang" },
         },
@@ -123,6 +124,15 @@ describe.each(["full", "metadata_only"] as const)(
         display_name: "gone",
         url: `http://127.0.0.1:${closedPort}/mcp`,
         enabled: true,
+      });
+      await seed.update("mcp_servers", randomUUID(), {
+        display_name: "signedout",
+        url: faulty.url,
+        enabled: true,
+        auth_type: "oauth2",
+        client_id: "tool-failure",
+        secret: "tool-failure-secret",
+        token_url: `http://127.0.0.1:${closedPort}/token`,
       });
       await seed.update("mcp_servers", randomUUID(), {
         name: "erp",
@@ -285,6 +295,27 @@ describe.each(["full", "metadata_only"] as const)(
         "upstream MCP server connection failed",
       ],
       [
+        "an answer the MCP client cannot read",
+        "faulty__html",
+        "faulty",
+        "upstream_decode",
+        "upstream MCP server returned an undecodable response",
+      ],
+      [
+        "a credential that cannot be fetched",
+        "signedout__echo",
+        "signedout",
+        "credential_error",
+        "MCP upstream credential unavailable",
+      ],
+      [
+        "an openapi tool that does not exist",
+        "erp__nosuchtool",
+        "erp",
+        "tool_not_found",
+        "MCP tool not found",
+      ],
+      [
         "JSON-RPC error inside a 200",
         "faulty__rpcerror",
         "faulty",
@@ -331,12 +362,16 @@ describe.each(["full", "metadata_only"] as const)(
       expect(slsLogsFor(sls!, LOGSTORE).filter((l) => l.get("request_id") === answer.requestId)).toEqual([]);
     });
 
-    test("an ACL refusal is the gateway's own error and carries no failure mark", async (ctx) => {
+    test("an ACL refusal keeps its answer and is named on the row", async (ctx) => {
       if (!etcdReachable) return ctx.skip();
       const answer = await callTool("faulty__reverse", { text: "hi" }, RESTRICTED);
       expect(answer.status).toBe(200);
       expect(answer.body.error?.code).toBe(-32602);
-      await expectTelemetry(answer, null);
+      expect(answer.body.error?.message).toBe("tool 'faulty__reverse' is not available");
+      await expectTelemetry(answer, {
+        errorClass: "permission_denied",
+        errorMessage: "MCP tool access denied",
+      });
     });
 
     test("the access log and the request counters name the failure as the upstream's", async (ctx) => {

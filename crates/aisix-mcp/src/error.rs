@@ -62,6 +62,14 @@ pub enum ToolCallFailure {
     /// The upstream answered with this JSON-RPC error code. The MCP client drops
     /// the HTTP status of such an answer, so a non-2xx one reads the same way.
     JsonRpc(i32),
+    /// The upstream answered with something the MCP client could not read.
+    Undecodable,
+    /// The credential for the upstream could not be obtained.
+    CredentialUnavailable,
+    /// The caller's MCP access rules do not permit the tool.
+    PermissionDenied,
+    /// The server does not have the tool.
+    ToolNotFound,
 }
 
 impl ToolCallFailure {
@@ -72,6 +80,10 @@ impl ToolCallFailure {
             Self::Timeout => "timeout",
             Self::Transport => "transport",
             Self::JsonRpc(_) => "upstream_in_band",
+            Self::Undecodable => "upstream_decode",
+            Self::CredentialUnavailable => "credential_error",
+            Self::PermissionDenied => "permission_denied",
+            Self::ToolNotFound => "tool_not_found",
         }
     }
 
@@ -86,6 +98,10 @@ impl ToolCallFailure {
             Self::JsonRpc(code) => {
                 format!("upstream MCP server returned JSON-RPC error {code}")
             }
+            Self::Undecodable => "upstream MCP server returned an undecodable response".to_string(),
+            Self::CredentialUnavailable => "MCP upstream credential unavailable".to_string(),
+            Self::PermissionDenied => "MCP tool access denied".to_string(),
+            Self::ToolNotFound => "MCP tool not found".to_string(),
         }
     }
 }
@@ -114,7 +130,22 @@ impl McpError {
         match self {
             McpError::Upstream { failure, .. } => Some(*failure),
             McpError::Unauthorized(_) => Some(ToolCallFailure::UpstreamStatus(401)),
+            McpError::TokenExchange(_) | McpError::UserOAuth(_) => {
+                Some(ToolCallFailure::CredentialUnavailable)
+            }
             _ => None,
+        }
+    }
+
+    /// Mark a connect-time failure as the credential fetch's rather than the
+    /// upstream's: the MCP server was not contacted.
+    pub(crate) fn from_credential_fetch(self) -> Self {
+        match self {
+            McpError::Connect(_) => McpError::Upstream {
+                failure: ToolCallFailure::CredentialUnavailable,
+                detail: self.to_string(),
+            },
+            other => other,
         }
     }
 

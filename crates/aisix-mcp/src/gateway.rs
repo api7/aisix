@@ -498,9 +498,9 @@ pub struct McpGateway {
     /// The same, for an `oauth2_authorization_code` server: the HTTP status
     /// is where an MCP client looks for the sign-in challenge.
     user_oauth_failure: Arc<OnceLock<UserOAuthError>>,
-    /// Why the `tools/call` this gateway served failed upstream, shared with
-    /// every clone like `tools_list`. Only the request's telemetry reads it;
-    /// the caller's answer is whatever the handler returned.
+    /// Why the `tools/call` this gateway served failed, shared with every clone
+    /// like `tools_list`. Only the request's telemetry reads it; the caller's
+    /// answer is whatever the handler returned.
     tool_call_failure: Arc<OnceLock<ToolCallFailure>>,
     /// When set, this gateway serves exactly one upstream under its **original**
     /// tool names: `tools/list` strips the `<server>__` namespace prefix and
@@ -603,7 +603,7 @@ impl McpGateway {
         self.user_oauth_failure.clone()
     }
 
-    /// Handle on why this gateway's `tools/call` failed upstream, cloned out
+    /// Handle on why this gateway's `tools/call` failed, cloned out
     /// the same way as [`McpGateway::token_exchange_failure`].
     pub fn tool_call_failure(&self) -> Arc<OnceLock<ToolCallFailure>> {
         self.tool_call_failure.clone()
@@ -950,6 +950,9 @@ impl ServerHandler for McpGateway {
         // form so grants mean the same thing on every endpoint; the message
         // echoes the caller's own spelling.
         if !self.tool_acl.permits(&namespaced) {
+            let _ = self
+                .tool_call_failure
+                .set(ToolCallFailure::PermissionDenied);
             return Err(ErrorData::invalid_params(
                 format!("tool '{request_name}' is not available"),
                 None,
