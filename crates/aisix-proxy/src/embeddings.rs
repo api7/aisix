@@ -882,9 +882,6 @@ pub(crate) fn embedding_usage_stats(body: &serde_json::Value) -> Option<aisix_ga
 ///     none of these concepts apply to the embeddings endpoint;
 ///     cp-api reads these UsageEvent fields with `omitempty`-equivalent
 ///     defaults so leaving them zero is the same as omitting.
-///   - `cost_usd = 0.0` — cp-api computes cost server-side from
-///     pricing catalog + token counts on ingestion (same convention
-///     as every chat.rs emit site).
 ///
 /// Issue #226. /v1/embeddings is the first non-chat handler to gain
 /// emission; follow-ups for completions / responses / rerank /
@@ -936,7 +933,6 @@ fn emit_usage_event(
     //     no completion side and no cache token concepts
     //   - provider_request_id / provider_model_version / finish_reason
     //     — not exposed by the OpenAI embeddings response shape
-    //   - cost_usd — cp-api computes server-side from pricing catalog
     //   - guardrail_blocked — a blocked input short-circuits before this
     //     emit (success-only path), so it is never set here
     //   - cache_status / cache_hit_saved_* — no caching on embeddings
@@ -2178,7 +2174,6 @@ mod tests {
             assert_eq!(ev.attempt_kind, if i == 0 { "initial" } else { "retry" });
             assert_eq!(ev.status_code, events[0].status_code);
             assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
-            assert_eq!(ev.cost_usd, 0.0);
         }
     }
 

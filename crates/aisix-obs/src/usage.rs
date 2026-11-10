@@ -107,9 +107,8 @@ pub struct GatewayEmbeddingCall {
 /// Its scalar fields are Copy / String / `Option<String>` so the event is
 /// cheap to construct on the request hot path. The request-scoped
 /// `gateway_embedding_calls` audit trail is deliberately separate from its
-/// parent accounting fields. `costed in USD` per the DP's pricing snapshot at
-/// request time — provider prices can change post-hoc, but we record what was
-/// current when the request ran.
+/// parent accounting fields. The event carries no cost: the control plane
+/// prices the tokens it records.
 ///
 /// `model_id` and `api_key_id` are optional: a guardrail-rejected
 /// request may have neither (rejection runs before model resolution).
@@ -259,7 +258,7 @@ pub struct UsageEvent {
     /// or semantic guardrails.
     ///
     /// These are deliberately separate from this event's top-level token
-    /// and cost fields. Those describe the model the caller addressed; adding
+    /// fields. Those describe the model the caller addressed; adding
     /// a different embedding model's tokens there would mis-price the parent
     /// request and replace its model-level accounting. Each entry describes
     /// one gateway bridge invocation (`count` is therefore always one), not
@@ -511,12 +510,6 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub finish_reason: String,
 
-    /// Cost the DP computed for this request in US dollars. Zero when
-    /// the request never reached cost calculation (e.g. blocked by a
-    /// guardrail before dispatch). cp-api recomputes this server-side
-    /// from its pricing catalog; the DP-supplied value is dropped.
-    pub cost_usd: f64,
-
     /// True when a guardrail rejected the request (input or output).
     ///
     /// cp-api indexes this and the dashboard's Logs "Guardrail blocks"
@@ -655,11 +648,11 @@ pub struct UsageEvent {
     /// the input tokens the request *would* have spent on the upstream
     /// if the cache hadn't served it. Zero on miss / disabled / error.
     ///
-    /// cp-api derives `cost_saved_usd` server-side by multiplying these
-    /// counters by the model's pricing (same pattern as `cost_usd` on
-    /// non-cache rows — the DP doesn't own the pricing catalog).
-    /// Surfacing tokens (not USD) here keeps pricing changes a cp-api-
-    /// only deploy and lets the dashboard show "tokens saved" too.
+    /// The control plane prices these counters into the saved cost, as
+    /// it prices every row's tokens — the DP doesn't own the pricing
+    /// catalog. Surfacing tokens here keeps pricing changes a
+    /// control-plane-only deploy and lets the dashboard show "tokens
+    /// saved" too.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cache_hit_saved_input_tokens: u32,
 
@@ -2105,7 +2098,6 @@ mod tests {
             completion_tokens: 34,
             upstream_latency_ms: 56,
             status_code: 200,
-            cost_usd: 0.0012,
             guardrail_blocked: false,
             ..Default::default()
         };
@@ -2120,6 +2112,9 @@ mod tests {
         assert!(json.contains(r#""prompt_tokens":12"#));
         assert!(json.contains(r#""completion_tokens":34"#));
         assert!(json.contains(r#""guardrail_blocked":false"#));
+        // The control plane prices the tokens; and an organization's amounts
+        // are in its own currency, so no field may name one.
+        assert!(!json.contains("cost") && !json.contains("usd"), "{json}");
     }
 
     #[test]

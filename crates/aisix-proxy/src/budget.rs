@@ -40,8 +40,8 @@ type Entry = Arc<ResourceEntry<Budget>>;
 
 /// Customer-facing detail for a budget denial, lifted into the 429 `error`
 /// block so a programmatic client can see which budget tripped (`scope` /
-/// `scope_ref`) and by how much (`limit_usd` / `spent_usd`), not just the
-/// human `message`.
+/// `scope_ref`) and by how much (`limit` / `spent`, in the organization's
+/// currency), not just the human `message`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BudgetReason {
     pub message: String,
@@ -49,7 +49,7 @@ pub struct BudgetReason {
     pub scope_ref: Option<String>,
     pub limit_usd: Option<String>,
     pub spent_usd: Option<String>,
-    /// Feeds `aisix_budget_remaining_usd`; not part of the response body.
+    /// Feeds `aisix_budget_remaining`; not part of the response body.
     pub remaining_usd: Option<String>,
     pub period: Option<String>,
     pub period_resets_at: Option<String>,

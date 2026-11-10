@@ -866,7 +866,6 @@ mod tests {
             completion_tokens: 20,
             upstream_latency_ms: 30,
             status_code: 200,
-            cost_usd: 0.001,
             guardrail_blocked: false,
             ..Default::default()
         }

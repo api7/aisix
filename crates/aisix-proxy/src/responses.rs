@@ -3974,7 +3974,6 @@ fn apply_passthrough_headers(
 ///   - provider_model_version — not yet plumbed for non-chat handlers
 ///     (follow-up). `finish_reason` is derived from the client-facing
 ///     result at the emission chokepoint (`usage_attr::emit_usage`).
-///   - cost_usd — cp-api computes server-side from pricing catalog
 ///   - cache_status / cache_hit_* / ttft_ms — no caching/streaming
 ///     surface on Responses API non-streaming
 ///   - served_by_model / routing_* — Responses doesn't run routing

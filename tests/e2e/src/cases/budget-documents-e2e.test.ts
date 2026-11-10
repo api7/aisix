@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   ProxyClient,
+  scrapeMetrics,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -18,7 +19,9 @@ import {
 // What a caller sees is the long-standing budget refusal: 429, `error.type`
 // `billing_error`, `error.code` `budget_exceeded`, and the budget's `scope`,
 // `scope_ref` and amounts beside them in the error object (OpenAI error envelope:
-// https://platform.openai.com/docs/guides/error-codes).
+// https://platform.openai.com/docs/guides/error-codes). An organization is
+// priced in its own currency (USD or CNY), so neither the amounts in the body
+// nor the budget gauges name one.
 
 const hash = (plaintext: string) => createHash("sha256").update(plaintext).digest("hex");
 const rfc3339 = (ms: number) => new Date(ms).toISOString().replace(".000Z", "Z");
@@ -210,9 +213,22 @@ describe("budgets pushed as documents decide requests locally", () => {
     const error = refusal(await chat(KEYS.apiKey));
     expect(error.scope).toBe("api_key");
     expect(error.scope_ref).toBe(IDS.apiKey);
-    expect(error.limit_usd).toBe("10.00");
-    expect(error.spent_usd).toBe("10.25");
+    expect(error.limit).toBe("10.00");
+    expect(error.spent).toBe("10.25");
+    expect(Object.keys(error).filter((k) => k.includes("usd"))).toEqual([]);
     expect(upA!.receivedRequests.length).toBe(before);
+  });
+
+  test("the refused key's budget gauges carry the amounts under currency-free names", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    refusal(await chat(KEYS.apiKey));
+    const samples = await scrapeMetrics(app.metricsUrl);
+    const gauge = (name: string) =>
+      samples.find((s) => s.name === name && s.labels.api_key_id === IDS.apiKey)?.value;
+    expect(gauge("aisix_budget_limit")).toBe(10);
+    expect(gauge("aisix_budget_spent")).toBe(10.25);
+    expect(gauge("aisix_budget_remaining")).toBe(-0.25);
+    expect(samples.filter((s) => s.name.startsWith("aisix_budget_") && s.name.includes("usd"))).toEqual([]);
   });
 
   test("member and team budgets refuse the keys they name", async (ctx) => {

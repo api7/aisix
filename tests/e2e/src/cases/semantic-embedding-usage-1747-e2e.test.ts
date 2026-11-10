@@ -280,11 +280,12 @@ function expectSucceededCall(
 
 function expectUnchangedParentUsage(row: Map<string, string>): void {
   // The chat upstream's own usage remains the parent usage. The embedding
-  // model must not inflate its token totals or the cost field in Phase 1.
+  // model must not inflate its token totals. The row carries no cost: the
+  // control plane prices the tokens.
   expect(row.get("prompt_tokens")).toBe("11");
   expect(row.get("completion_tokens")).toBe("7");
   expect(row.get("total_tokens")).toBe("18");
-  expect(Number(row.get("cost_usd"))).toBe(0);
+  expect(row.has("cost_usd")).toBe(false);
 }
 
 describe("gateway-initiated embedding usage on the real parent event (#1747)", () => {
@@ -765,12 +766,12 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     expect(row.has("gateway_embedding_calls_dropped")).toBe(false);
 
     // These are the streamed target's terminal usage values, not the
-    // semantic embedding's values. Chat streaming intentionally leaves the
-    // DP-provided cost at zero: the control plane prices it on ingestion.
+    // semantic embedding's values. The row carries no cost: the control
+    // plane prices it on ingestion.
     expect(row.get("prompt_tokens")).toBe(String(STREAM_USAGE.prompt_tokens));
     expect(row.get("completion_tokens")).toBe(String(STREAM_USAGE.completion_tokens));
     expect(row.get("total_tokens")).toBe(String(STREAM_USAGE.total_tokens));
-    expect(Number(row.get("cost_usd"))).toBe(0);
+    expect(row.has("cost_usd")).toBe(false);
     expect(streamRouteTargetModelID).not.toBe("");
     expect(row.get("model_id")).toBe(streamRouteTargetModelID);
     expect(row.get("attempt_model")).toBe(STREAM_ROUTE_TARGET);
@@ -840,7 +841,7 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
     expect(row.get("prompt_tokens") ?? "0").toBe("0");
     expect(row.get("completion_tokens") ?? "0").toBe("0");
     expect(row.get("total_tokens") ?? "0").toBe("0");
-    expect(Number(row.get("cost_usd") ?? "0")).toBe(0);
+    expect(row.has("cost_usd")).toBe(false);
     expect(row.get("requested_model")).toBe(FAILED_USAGE_ROUTER_MODEL);
     expect(failedUsageRouterModelID).not.toBe("");
     expect(row.get("requested_model_id")).toBe(failedUsageRouterModelID);
@@ -978,7 +979,7 @@ describe("gateway-initiated embedding usage on the real parent event (#1747)", (
       expect(row.get("prompt_tokens") ?? "0").toBe("0");
       expect(row.get("completion_tokens") ?? "0").toBe("0");
       expect(row.get("total_tokens") ?? "0").toBe("0");
-      expect(Number(row.get("cost_usd") ?? "0")).toBe(0);
+      expect(row.has("cost_usd")).toBe(false);
       expect(row.get("requested_model")).toBe(CANCELLED_ROUTER_MODEL);
       expect(row.get("model_id") ?? "").toBe("");
       expect(row.get("attempt_model") ?? "").toBe("");

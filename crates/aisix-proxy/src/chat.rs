@@ -323,7 +323,6 @@ pub async fn chat_completions(
                         redacted_entity_counts: redaction_counts.clone(),
                         guardrail_monitor_hits: monitor_hits.clone(),
                     },
-                    success.cost_usd,
                     /* guardrail_blocked */ false,
                     &client,
                     success.captured_content.take(),
@@ -616,7 +615,6 @@ pub async fn chat_completions(
                             redacted_entity_counts: redaction_counts.clone(),
                             guardrail_monitor_hits: monitor_hits.clone(),
                         },
-                        /* cost_usd */ 0.0,
                         guardrail_blocked,
                         &client,
                         None,
@@ -669,7 +667,6 @@ pub async fn chat_completions(
                             bypass_reason: crate::usage_attr::bypass_reason(&audit),
                             ..UsageExtras::default()
                         },
-                        /* cost_usd */ 0.0,
                         guardrail_blocked,
                         &client,
                         None,
@@ -740,9 +737,6 @@ struct Success {
     /// finish_reason / stop_reason as the upstream returned it. Empty
     /// for streaming (no terminal event yet) and cache hits.
     finish_reason: String,
-    /// Cost computed via the per-key Budget's pricing table, in USD.
-    /// 0.0 when no budget is configured for the key.
-    cost_usd: f64,
     /// Set when at least one guardrail returned `Bypass` (remote-API
     /// guardrail upstream unreachable + `fail_open=true`). The first
     /// bypass reason wins. Goes onto `usage_events.guardrail_bypassed_reason`
@@ -783,9 +777,8 @@ struct Success {
     /// On a cache HIT, the prompt + completion tokens of the cached
     /// response — the work the upstream would have repeated had the
     /// cache not served the request. Both 0 on miss / disabled. cp-api
-    /// multiplies these by its pricing catalog to derive
-    /// `cost_saved_usd` on ingestion (matches the existing `cost_usd`
-    /// pattern: DP records tokens, cp-api owns pricing). See #88.
+    /// prices these into the saved cost on ingestion: the DP records
+    /// tokens, cp-api owns pricing. See #88.
     cache_hit_saved_input_tokens: u32,
     cache_hit_saved_output_tokens: u32,
     /// Display name of the routing target that actually served this
@@ -2303,9 +2296,6 @@ async fn dispatch(
                     comp.failure.as_ref(),
                 );
                 // Telemetry: emit with the actual upstream-reported counts.
-                // cost_usd stays 0.0; cp-api recomputes server-side from
-                // its model_pricing catalog (same pattern as the non-
-                // streaming path's cost_usd handling).
                 emit_usage_event(
                     &state_for_telem,
                     &snap,
@@ -2384,7 +2374,6 @@ async fn dispatch(
                             merged
                         },
                     },
-                    /* cost_usd */ 0.0,
                     comp.guardrail_blocked,
                     &client_for_telem,
                     // Prompt captured up front, response assembled across the
@@ -2491,7 +2480,6 @@ async fn dispatch(
             usage_estimated: false,
             completion_tokens: None,
             total_tokens: None,
-            cost_usd: 0.0,
             cached_prompt_tokens: 0,
             cache_write_tokens: None,
             modality: Default::default(),
@@ -2976,9 +2964,6 @@ async fn dispatch(
                     provider_key_id,
                     upstream_model,
                     finish_reason,
-                    // Cache hits don't burn cost on our side (we already
-                    // paid the upstream price the first time around).
-                    cost_usd: 0.0,
                     bypass_reason: bypass_reason.clone(),
                     cache_status: CacheStatus::Hit,
                     cache_hit_layer: Some(hit_layer),
@@ -2987,7 +2972,7 @@ async fn dispatch(
                     // upstream's prompt + completion tokens. Surfacing
                     // them as a dedicated counter (rather than relying
                     // on the existing prompt_tokens column + cache_status
-                    // filter) lets cp-api compute `cost_saved_usd`
+                    // filter) lets cp-api price the saved cost
                     // without joining on the status enum.
                     cache_hit_saved_input_tokens: prompt.try_into().unwrap_or(u32::MAX),
                     cache_hit_saved_output_tokens: completion.try_into().unwrap_or(u32::MAX),
@@ -3385,10 +3370,6 @@ async fn dispatch(
     }
     reservation.commit_tokens(total).await;
 
-    // cp-api recomputes cost server-side from its pricing catalog when
-    // ingesting telemetry; the DP just records 0.0 on the wire.
-    let cost_usd = 0.0;
-
     let (output_verdict, hits) = resolved_chain
         .check_output_non_segment_observed(&upstream)
         .await;
@@ -3646,7 +3627,6 @@ async fn dispatch(
         provider_key_id,
         upstream_model,
         finish_reason,
-        cost_usd,
         bypass_reason,
         cache_status,
         cache_hit_layer: None,
@@ -4266,7 +4246,6 @@ async fn dispatch_ensemble(
                         },
                         ..UsageExtras::default()
                     },
-                    /* cost_usd */ 0.0,
                     comp.guardrail_blocked,
                     &client_for_telem,
                     /* content */ None,
@@ -4300,7 +4279,6 @@ async fn dispatch_ensemble(
             completion_tokens: None,
             total_tokens: None,
             usage_estimated: false,
-            cost_usd: 0.0,
             cached_prompt_tokens: 0,
             cache_write_tokens: None,
             modality: Default::default(),
@@ -4476,7 +4454,6 @@ async fn dispatch_ensemble(
                 guardrail_monitor_hits: hits.to_vec(),
                 ..UsageExtras::default()
             },
-            /* cost_usd */ 0.0,
             blocked,
             client,
             /* content */ None,
@@ -4626,7 +4603,6 @@ async fn dispatch_ensemble(
         provider_key_id: crate::request_metrics::UNKNOWN.to_string(),
         upstream_model: crate::request_metrics::UNKNOWN.to_string(),
         finish_reason: String::new(),
-        cost_usd: 0.0,
         bypass_reason,
         cache_status: CacheStatus::Disabled,
         cache_hit_layer: None,
@@ -4764,7 +4740,6 @@ fn emit_usage_event(
     prompt_tokens: u32,
     completion_tokens: u32,
     extras: UsageExtras,
-    cost_usd: f64,
     guardrail_blocked: bool,
     client: &ClientContext,
     content: Option<CapturedContent>,
@@ -4816,7 +4791,6 @@ fn emit_usage_event(
         provider_model_version: extras.provider_model_version,
         service_tier: extras.service_tier,
         finish_reason: extras.finish_reason,
-        cost_usd,
         guardrail_blocked,
         guardrail_bypassed_reason: extras.bypass_reason,
         applied_guardrails: extras.applied_guardrails,
@@ -5023,8 +4997,8 @@ struct UsageExtras {
     /// `None` otherwise. Goes onto `usage_events.cache_similarity`.
     cache_similarity: Option<f32>,
     /// On a cache HIT, the cached response's prompt + completion
-    /// tokens. Zero otherwise. cp-api derives `cost_saved_usd` on
-    /// ingest from these + its pricing catalog (see #88).
+    /// tokens. Zero otherwise. cp-api prices the saved cost on ingest
+    /// from these + its pricing catalog (see #88).
     cache_hit_saved_input_tokens: u32,
     cache_hit_saved_output_tokens: u32,
     /// Attempt-scoped time to the upstream's first generated chunk.
@@ -5117,7 +5091,6 @@ fn emit_failed_attempts(
                 bypass_reason: crate::usage_attr::bypass_reason(audit),
                 ..UsageExtras::default()
             },
-            /* cost_usd */ 0.0,
             /* guardrail_blocked */ false,
             client,
             None,
@@ -5568,7 +5541,6 @@ impl EnsembleSubcall {
             self.usage.prompt_tokens,
             self.usage.completion_tokens,
             extras,
-            /* cost_usd */ 0.0,
             blocked,
             &ctx.client,
             /* content */ None,

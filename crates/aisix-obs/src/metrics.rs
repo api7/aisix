@@ -221,9 +221,11 @@ pub const M_ROUTING_SUCCESSFUL_FALLBACKS_TOTAL: &str = "aisix_routing_successful
 pub const M_ROUTING_FAILED_FALLBACKS_TOTAL: &str = "aisix_routing_failed_fallbacks_total";
 pub const M_RATELIMIT_REMAINING_REQUESTS: &str = "aisix_ratelimit_remaining_requests";
 pub const M_RATELIMIT_REMAINING_TOKENS: &str = "aisix_ratelimit_remaining_tokens";
-pub const M_BUDGET_LIMIT_USD: &str = "aisix_budget_limit_usd";
-pub const M_BUDGET_SPENT_USD: &str = "aisix_budget_spent_usd";
-pub const M_BUDGET_REMAINING_USD: &str = "aisix_budget_remaining_usd";
+/// Budget amounts, in the organization's currency (USD or CNY) — which is
+/// why no budget family names one.
+pub const M_BUDGET_LIMIT_USD: &str = "aisix_budget_limit";
+pub const M_BUDGET_SPENT_USD: &str = "aisix_budget_spent";
+pub const M_BUDGET_REMAINING_USD: &str = "aisix_budget_remaining";
 pub const M_BUDGET_RESET_SECONDS: &str = "aisix_budget_reset_seconds";
 pub const M_BUDGET_DETAILS_PRESENT: &str = "aisix_budget_details_present";
 pub const M_REDIS_FAILURES_TOTAL: &str = "aisix_redis_failures_total";
@@ -1422,7 +1424,7 @@ impl Metrics {
     /// Retirement writes a value, because the exporter has no API to drop
     /// a series. The value is deliberately NOT zero for anything that
     /// carries a quantity: `aisix_ratelimit_remaining_requests 0` reads as
-    /// "quota exhausted" and `aisix_budget_remaining_usd 0` as "spent it
+    /// "quota exhausted" and `aisix_budget_remaining 0` as "spent it
     /// all", so zeroing would replace a stale claim with a false one.
     /// `NaN` is the honest marker — it renders in the text format and
     /// every comparison against it is false, so an alert on a retired
@@ -5419,7 +5421,7 @@ mod tests {
         // cleared value is 0 — that is what makes the alert stop matching.
         assert_eq!(value(M_BUDGET_DETAILS_PRESENT), "0");
         // The quantities go to NaN, NOT 0: `spent 0 / limit 0` is a claim
-        // about a budget, and a `remaining_usd 0` would read as "exhausted".
+        // about a budget, and a `remaining 0` would read as "exhausted".
         for metric in [
             M_BUDGET_LIMIT_USD,
             M_BUDGET_SPENT_USD,
@@ -5612,7 +5614,7 @@ mod tests {
     }
 
     /// Budget gauges with the caller name labels selected, plus the value
-    /// each rendered `aisix_budget_spent_usd` series carries, by team name.
+    /// each rendered `aisix_budget_spent` series carries, by team name.
     fn named_budget_metrics() -> Metrics {
         let selected: Vec<String> = [
             "api_key_id",
