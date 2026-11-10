@@ -345,9 +345,9 @@ impl BudgetGate {
                 .unwrap_or_else(|| format!("{} budget exceeded", scope.replace('_', " "))),
             scope_ref: doc.scope_ref.clone().or_else(|| budget.scope_ref.clone()),
             scope: Some(scope),
-            limit: amount(&doc.limit_usd),
-            spent: amount(&doc.spent_usd),
-            remaining: amount(&doc.remaining_usd),
+            limit: amount(&doc.limit),
+            spent: amount(&doc.spent),
+            remaining: amount(&doc.remaining),
             period: Some(budget.period.as_str().to_string()),
             period_resets_at: Some(resets_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
             retry_after_seconds: Some((resets_at - self.now).num_seconds().max(0) as u64),
@@ -679,7 +679,7 @@ mod tests {
         );
         doc["exhausted"]["reason"] = serde_json::json!({
             "message": "api key budget 'x' exceeded", "scope": "api_key", "scope_ref": "k-1",
-            "limit_usd": "10", "spent_usd": "10.5", "remaining_usd": "-0.5", "period": "month",
+            "limit": "10", "spent": "10.5", "remaining": "-0.5", "period": "month",
             "period_resets_at": "1999-01-01T00:00:00Z", "retry_after_seconds": 5
         });
         let snap = snapshot_with(&[("b-1", doc)]);
@@ -693,6 +693,33 @@ mod tests {
         assert_eq!(r.period_resets_at.as_deref(), Some("2026-11-01T00:00:00Z"));
         assert_eq!(r.retry_after_seconds, Some(3600));
         assert_eq!(r.gauges().remaining, Some(-0.5));
+    }
+
+    /// A control plane writing the pre-1965 spelling beside the current one
+    /// (for older gateways), or only the old one (an older control plane),
+    /// still refuses: the old keys are unknown here and never read.
+    #[test]
+    fn the_old_amount_keys_are_not_read() {
+        let old =
+            serde_json::json!({"limit_usd": "9", "spent_usd": "9.5", "remaining_usd": "-0.5"});
+        let mut both = old.clone();
+        both.as_object_mut().unwrap().extend(
+            serde_json::json!({"limit": "10", "spent": "10.5", "remaining": "-0.5"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        for (reason, limit, spent) in [(both, Some("10.00"), Some("10.50")), (old, None, None)] {
+            let mut doc = exhausted("api_key", serde_json::json!({"scope_ref": "k-1"}), None);
+            doc["exhausted"]["reason"] = reason;
+            let snap = snapshot_with(&[("b-1", doc)]);
+            let k = key(&snap, "k-1", serde_json::json!({}));
+            let Verdict::Exceeded(r) = gate_at(&snap, Utc::now(), false).key_verdict(&k) else {
+                panic!("an exhausted budget refuses whatever its amounts")
+            };
+            assert_eq!(r.limit.as_deref(), limit);
+            assert_eq!(r.spent.as_deref(), spent);
+        }
     }
 
     #[test]

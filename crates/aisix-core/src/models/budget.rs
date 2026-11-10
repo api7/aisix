@@ -168,13 +168,13 @@ pub struct BudgetReason {
     pub scope_ref: Option<String>,
     /// The budget's limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limit_usd: Option<String>,
+    pub limit: Option<String>,
     /// Spend in the period when the budget was exhausted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spent_usd: Option<String>,
+    pub spent: Option<String>,
     /// Limit minus spend; zero or negative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remaining_usd: Option<String>,
+    pub remaining: Option<String>,
     /// Accounting period.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub period: Option<String>,
@@ -277,9 +277,30 @@ mod tests {
             json!({"scope": "team_member", "scope_ref": "t", "period": "month",
                    "exhausted_members": {"u": {"period_start": "2026-10-01T00:00:00Z", "reason": {}}}}),
             json!({"scope": "provider_key", "scope_ref": "pk", "period": "day",
-                   "exhausted": {"reason": {"message": "m", "limit_usd": "0.00"}}}),
+                   "exhausted": {"reason": {"message": "m", "limit": "0.00"}}}),
         ] {
             assert!(validate_budget(&doc).is_ok(), "strict rejected {doc}");
+        }
+    }
+
+    /// Every release's control plane from the support floor up may have left
+    /// the old amount keys in a reason, beside the current ones or alone:
+    /// either row loads, and the old keys are never read.
+    #[test]
+    fn a_reason_with_the_old_amount_keys_loads() {
+        let old = json!({"limit_usd": "9", "spent_usd": "9.5", "remaining_usd": "-0.5"});
+        let both = json!({"limit_usd": "9", "spent_usd": "9.5", "remaining_usd": "-0.5",
+                          "limit": "10", "spent": "10.5", "remaining": "-0.5"});
+        for (reason, limit) in [(both, Some("10")), (old, None)] {
+            let doc = json!({"scope": "api_key", "scope_ref": "k", "period": "month",
+                             "exhausted": {"reason": reason}});
+            assert!(
+                validate_budget_lenient(&doc).is_ok(),
+                "lenient rejected {doc}"
+            );
+            let budget: super::Budget = serde_json::from_value(doc).unwrap();
+            let reason = budget.exhausted.unwrap().reason;
+            assert_eq!(reason.limit.as_deref(), limit);
         }
     }
 

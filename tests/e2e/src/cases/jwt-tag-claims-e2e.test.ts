@@ -201,9 +201,9 @@ describe("tags from JWT claims on bearer tokens", () => {
       code: "budget_exceeded",
       message,
       scope: "tag",
-      limit_usd: "10.00",
-      spent_usd: "10.25",
-      remaining_usd: "-0.25",
+      limit: "10.00",
+      spent: "10.25",
+      remaining: "-0.25",
       period: "month",
     });
     for (const [value, message] of [

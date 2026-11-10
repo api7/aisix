@@ -10549,8 +10549,8 @@ data: [DONE]\n\n";
                 "message": "monthly cap exceeded",
                 "scope": "api_key",
                 "scope_ref": "key-id-1",
-                "limit_usd": "10.00",
-                "spent_usd": "10.50",
+                "limit": "10.00",
+                "spent": "10.50",
                 "period": "month"
             }}
         }))
