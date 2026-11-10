@@ -37,11 +37,11 @@ pub struct Pricing {
     #[schemars(length(min = 1, max = 255))]
     pub key: String,
 
-    /// Prompt token price in USD per 1,000 tokens.
+    /// Prompt token price per 1,000 tokens, in the organization's currency.
     #[schemars(range(min = 0.0))]
     pub input_per_1k: f64,
 
-    /// Completion token price in USD per 1,000 tokens.
+    /// Completion token price per 1,000 tokens, in the organization's currency.
     #[schemars(range(min = 0.0))]
     pub output_per_1k: f64,
 

@@ -69,13 +69,13 @@ impl Adapter {
     }
 }
 
-/// Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.
+/// Per-token price. Both values are per 1,000 tokens, in the organization's currency.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct ModelCost {
-    /// Prompt token cost in USD per 1,000 tokens.
+    /// Prompt token price per 1,000 tokens, in the organization's currency.
     #[schemars(range(min = 0.0))]
     pub input_per_1k: f64,
-    /// Completion token cost in USD per 1,000 tokens.
+    /// Completion token price per 1,000 tokens, in the organization's currency.
     #[schemars(range(min = 0.0))]
     pub output_per_1k: f64,
 }
