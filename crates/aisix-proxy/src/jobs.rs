@@ -2044,17 +2044,6 @@ fn maybe_attribute_batch(
     let request_headers = client.request_headers.clone();
     let model_id = target.model_entry.id.clone();
     let display_name = target.display_name().to_string();
-    // Resolved before the spawn, off the live snapshot, through the same
-    // index `least_cost` ranks with: `pricing_key` first, inline `cost`
-    // second. The completed batch is priced at what the model costs when
-    // its output is collected.
-    let snap = state.snapshot.load();
-    let cost = state
-        .pricing
-        .for_snapshot(&snap)
-        .resolve(&target.model_entry.value)
-        .cloned();
-    drop(snap);
     let pk_id = target.pk_entry.id.to_string();
     let secret = target.secret.clone();
     let adapter = target.adapter;
@@ -2071,7 +2060,6 @@ fn maybe_attribute_batch(
             &request_headers,
             &model_id,
             &display_name,
-            cost.as_ref(),
             &pk_id,
             &secret,
             adapter,
@@ -2105,7 +2093,6 @@ async fn attribute_batch_usage(
     request_headers: &std::collections::BTreeMap<String, String>,
     model_id: &str,
     display_name: &str,
-    cost: Option<&aisix_core::models::model::ModelCost>,
     pk_id: &str,
     secret: &str,
     adapter: Adapter,
@@ -2241,9 +2228,6 @@ async fn attribute_batch_usage(
                 .agreed()
                 .map(|t| crate::chat::sanitize_tag(t.to_owned()))
                 .filter(|t| !t.is_empty()),
-            cost_usd: cost
-                .map(|c| c.calculate(agg.prompt, agg.completion))
-                .unwrap_or(0.0),
             inbound_protocol: "batch".to_string(),
             // Set here rather than by the emit chokepoint: this path
             // deliberately bypasses it (no live request, so no trace

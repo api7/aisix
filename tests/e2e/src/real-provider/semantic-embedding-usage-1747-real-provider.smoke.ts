@@ -283,7 +283,7 @@ describe("semantic embedding usage with a real OpenAI provider (#1747)", () => {
       expect(Number(row.get("total_tokens"))).toBeGreaterThanOrEqual(
         Number(row.get("prompt_tokens")),
       );
-      expect(Number(row.get("cost_usd"))).toBe(0);
+      expect(row.has("cost_usd")).toBe(false);
       expect(row.get("model_id")).toBe(targetModelID);
       expect(row.get("attempt_model")).toBe(TARGET_MODEL);
       expect(row.get("model_id")).not.toBe(embeddingModelID);
@@ -315,7 +315,7 @@ describe("semantic embedding usage with a real OpenAI provider (#1747)", () => {
         expect(call.total_tokens).toBeGreaterThanOrEqual(call.prompt_tokens);
         expect(call.latency_ms).toBeGreaterThan(0);
       }
-      expect(Number(row.get("cost_usd"))).toBe(0);
+      expect(row.has("cost_usd")).toBe(false);
       expect(row.get("model_id")).toBe(guardrailModelID);
       expect(row.get("attempt_model")).toBeUndefined();
       expect(row.get("model_id")).not.toBe(embeddingModelID);
@@ -343,7 +343,7 @@ describe("semantic embedding usage with a real OpenAI provider (#1747)", () => {
       expect(call.prompt_tokens).toBeGreaterThan(0);
       expect(call.total_tokens).toBeGreaterThanOrEqual(call.prompt_tokens);
       expect(call.latency_ms).toBeGreaterThan(0);
-      expect(Number(missRow.get("cost_usd"))).toBe(0);
+      expect(missRow.has("cost_usd")).toBe(false);
       expect(missRow.get("model_id")).toBe(cacheModelID);
       expect(missRow.get("attempt_model")).toBeUndefined();
       expect(missRow.get("model_id")).not.toBe(embeddingModelID);

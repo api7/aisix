@@ -1530,10 +1530,6 @@ async fn run_session(
     // which takes its own for the model-label collapse.
     let snap = state.snapshot.load();
     let pk = crate::usage_attr::ResolvedPk::resolve(&snap, &pk_id);
-    // Priced off the same fresh snapshot, through the index every other
-    // reader of a model's price uses: `pricing_key` first, inline `cost`
-    // second.
-    let pricing = state.pricing.for_snapshot(&snap);
     crate::request_metrics::record(
         &state,
         "/v1/realtime",
@@ -1584,10 +1580,6 @@ async fn run_session(
                 .min(u32::MAX as u128) as u32,
         ),
         upstream_response_headers,
-        cost_usd: pricing
-            .resolve(&model_entry.value)
-            .map(|c| c.calculate(usage.input_tokens, usage.output_tokens))
-            .unwrap_or(0.0),
         inbound_protocol: "realtime".to_string(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),

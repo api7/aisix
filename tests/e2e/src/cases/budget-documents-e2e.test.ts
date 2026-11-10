@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   ProxyClient,
+  scrapeMetrics,
   SeedClient,
   spawnApp,
   startOpenAiUpstream,
@@ -18,7 +19,9 @@ import {
 // What a caller sees is the long-standing budget refusal: 429, `error.type`
 // `billing_error`, `error.code` `budget_exceeded`, and the budget's `scope`,
 // `scope_ref` and amounts beside them in the error object (OpenAI error envelope:
-// https://platform.openai.com/docs/guides/error-codes).
+// https://platform.openai.com/docs/guides/error-codes). An organization is
+// priced in its own currency (USD or CNY), so neither the amounts in the body
+// nor the budget gauges name one.
 
 const hash = (plaintext: string) => createHash("sha256").update(plaintext).digest("hex");
 const rfc3339 = (ms: number) => new Date(ms).toISOString().replace(".000Z", "Z");
@@ -28,15 +31,27 @@ const DAY_START = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDa
 const MONTH_START = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
 const YESTERDAY = DAY_START - 86_400_000;
 
+// The amounts under their pre-1965 names, which a control plane keeps
+// writing for older gateways, beside the current ones — and an older control
+// plane's reason, which carries only those.
+const OLD_AMOUNTS = { limit_usd: "9.00", spent_usd: "9.25", remaining_usd: "-0.25" };
 const reason = (scope: string, scopeRef: string) => ({
   type: "billing_error",
   code: "budget_exceeded",
   message: `${scope.replace("_", " ")} budget exceeded`,
   scope,
   scope_ref: scopeRef,
-  limit_usd: "10.00",
-  spent_usd: "10.25",
-  remaining_usd: "-0.25",
+  limit: "10.00",
+  spent: "10.25",
+  remaining: "-0.25",
+  ...OLD_AMOUNTS,
+  period: "month",
+});
+const oldReason = (scope: string, scopeRef: string) => ({
+  message: `${scope.replace("_", " ")} budget exceeded`,
+  scope,
+  scope_ref: scopeRef,
+  ...OLD_AMOUNTS,
   period: "month",
 });
 
@@ -51,6 +66,7 @@ const KEYS = {
   tagMember: "sk-bd-e2e-tag-member",
   lifted: "sk-bd-e2e-lifted",
   plain: "sk-bd-e2e-plain",
+  oldSpelling: "sk-bd-e2e-old-spelling",
   sentinel: "sk-bd-e2e-sentinel",
 };
 
@@ -64,6 +80,7 @@ const IDS = {
   tagTeam: randomUUID(),
   tagUser: randomUUID(),
   lifted: randomUUID(),
+  oldSpelling: randomUUID(),
 };
 
 describe("budgets pushed as documents decide requests locally", () => {
@@ -167,6 +184,10 @@ describe("budgets pushed as documents decide requests locally", () => {
       scope: "tag", tag: { key: "dept", value: "member-value" }, period: "month",
       exhausted: { period_start: rfc3339(MONTH_START), reason: { ...reason("tag", "dept=member-value"), message: "tag member-value out" } },
     });
+    await budget({
+      scope: "api_key", scope_ref: IDS.oldSpelling, period: "month",
+      exhausted: { reason: oldReason("api_key", IDS.oldSpelling) },
+    });
     // Exhausted yesterday on a daily budget: the block has lifted.
     await budget({
       scope: "api_key", scope_ref: IDS.lifted, period: "day",
@@ -190,6 +211,7 @@ describe("budgets pushed as documents decide requests locally", () => {
     await key(randomUUID(), KEYS.tagOwn, { team_id: IDS.tagTeam, user_id: IDS.tagUser, tags: { dept: "own" } });
     await key(randomUUID(), KEYS.tagMember, { user_id: IDS.tagUser });
     await key(IDS.lifted, KEYS.lifted);
+    await key(IDS.oldSpelling, KEYS.oldSpelling);
     await key(randomUUID(), KEYS.plain);
     await key(randomUUID(), KEYS.sentinel);
 
@@ -210,9 +232,36 @@ describe("budgets pushed as documents decide requests locally", () => {
     const error = refusal(await chat(KEYS.apiKey));
     expect(error.scope).toBe("api_key");
     expect(error.scope_ref).toBe(IDS.apiKey);
-    expect(error.limit_usd).toBe("10.00");
-    expect(error.spent_usd).toBe("10.25");
+    expect(error.limit).toBe("10.00");
+    expect(error.spent).toBe("10.25");
+    expect(Object.keys(error).filter((k) => k.includes("usd"))).toEqual([]);
     expect(upA!.receivedRequests.length).toBe(before);
+  });
+
+  test("the refused key's budget gauges carry the amounts under currency-free names", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    refusal(await chat(KEYS.apiKey));
+    const samples = await scrapeMetrics(app.metricsUrl);
+    const gauge = (name: string) =>
+      samples.find((s) => s.name === name && s.labels.api_key_id === IDS.apiKey)?.value;
+    expect(gauge("aisix_budget_limit")).toBe(10);
+    expect(gauge("aisix_budget_spent")).toBe(10.25);
+    expect(gauge("aisix_budget_remaining")).toBe(-0.25);
+    expect(samples.filter((s) => s.name.startsWith("aisix_budget_") && s.name.includes("usd"))).toEqual([]);
+  });
+
+  test("a reason carrying only the old amount names still refuses, without amounts", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const before = upA!.receivedRequests.length;
+    const error = refusal(await chat(KEYS.oldSpelling));
+    expect(error.scope).toBe("api_key");
+    expect(error.scope_ref).toBe(IDS.oldSpelling);
+    for (const k of ["limit", "spent", "limit_usd", "spent_usd"]) expect(error).not.toHaveProperty(k);
+    expect(upA!.receivedRequests.length).toBe(before);
+    const samples = await scrapeMetrics(app.metricsUrl);
+    const mine = samples.filter((s) => s.labels.api_key_id === IDS.oldSpelling);
+    expect(mine.find((s) => s.name === "aisix_budget_details_present")?.value).toBe(1);
+    expect(mine.filter((s) => ["aisix_budget_limit", "aisix_budget_spent", "aisix_budget_remaining"].includes(s.name))).toEqual([]);
   });
 
   test("member and team budgets refuse the keys they name", async (ctx) => {

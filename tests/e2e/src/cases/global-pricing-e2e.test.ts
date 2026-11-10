@@ -25,7 +25,7 @@ import {
 // the cases below pin is the resolution order and its consequences —
 // environment over global over inline, a price edit taking effect with no
 // model document rewritten, the catalog carrying nothing but prices, and
-// the same chain pricing the usage events.
+// usage events carrying no cost at all.
 
 const CALLER_PLAINTEXT = "sk-global-pricing-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
@@ -417,13 +417,11 @@ async function startRealtimeUpstream(input: number, output: number) {
   };
 }
 
-describe("global pricing e2e: usage events price through the same chain", () => {
-  // The realtime session is one of the two paths that compute `cost_usd`
-  // on the data plane rather than leaving it to the control plane, so it
-  // is where a divergence between "what least_cost ranks by" and "what
-  // the usage event bills" would show up. Nine input and four output
-  // tokens against 1.0/2.0 per 1K is 0.017 USD, read off the usage event
-  // the session exports.
+describe("global pricing e2e: a priced model's usage events carry no cost", () => {
+  // Prices rank `least_cost` targets and nothing else on the gateway: the
+  // control plane prices the tokens a usage event records, in the
+  // organization's own currency. So even a realtime session on a model
+  // the gateway holds a price for exports its usage row without a cost.
   const INPUT_TOKENS = 9;
   const OUTPUT_TOKENS = 4;
   const CALLER = "sk-global-pricing-realtime-caller";
@@ -470,23 +468,13 @@ describe("global pricing e2e: usage events price through the same chain", () => 
       secret: "sk-mock",
       api_base: `http://127.0.0.1:${upstream.port}/v1`,
     });
-    // Priced by the catalog. The inline `cost` is deliberately absent, so
-    // a non-zero cost on the event proves the reference resolved.
+    // Priced by the catalog: the gateway holds a price for it.
     await seed.createModel({
       display_name: "rt-catalog",
       provider: "openai",
       model_name: "gpt-realtime-mock",
       provider_key_id: pk.id,
       pricing_key: "vendor/rt",
-    });
-    // Same session shape, priced inline instead — the fallback half.
-    await seed.createModel({
-      display_name: "rt-inline",
-      provider: "openai",
-      model_name: "gpt-realtime-mock",
-      provider_key_id: pk.id,
-      pricing_key: "vendor/not-written",
-      cost: { input_per_1k: 1.0, output_per_1k: 2.0 },
     });
     await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"] });
   });
@@ -518,18 +506,20 @@ describe("global pricing e2e: usage events price through the same chain", () => 
     });
   }
 
-  /** The `cost_usd` of the usage event `model`'s session exported. */
-  async function costFor(model: string): Promise<number> {
+  /** The fields of the usage row `model`'s session exported that name a cost. */
+  async function costFieldsFor(model: string): Promise<string[]> {
     const row = await waitForSlsLog(
       sls!,
       LOGSTORE,
       (log) => log.get("requested_model") === model,
       `the usage row of the ${model} session`,
     );
-    return Number(row.get("cost_usd"));
+    // The row is the session's: the upstream's token counts reached it.
+    expect(row.get("prompt_tokens")).toBe(String(INPUT_TOKENS));
+    return [...row.keys()].filter((k) => k.includes("cost"));
   }
 
-  test("a realtime session bills at the pricing document's rate", async (ctx) => {
+  test("a realtime session on a catalog-priced model exports no cost", async (ctx) => {
     if (!etcdReachable || !app || !seed) {
       ctx.skip();
       return;
@@ -541,20 +531,11 @@ describe("global pricing e2e: usage events price through the same chain", () => 
       if (res.status !== 200) return false;
       const ids =
         ((await res.json()) as { data?: Array<{ id?: string }> }).data?.map((m) => m.id) ?? [];
-      return ids.includes("rt-catalog") && ids.includes("rt-inline");
+      return ids.includes("rt-catalog");
     });
 
     await runSession("rt-catalog");
     // The usage event is emitted as the session tears down.
-    expect(await costFor("rt-catalog")).toBeCloseTo(0.017, 9);
-  });
-
-  test("without a pricing document the session bills at the model's inline cost", async (ctx) => {
-    if (!etcdReachable || !app || !seed) {
-      ctx.skip();
-      return;
-    }
-    await runSession("rt-inline");
-    expect(await costFor("rt-inline")).toBeCloseTo(0.017, 9);
+    expect(await costFieldsFor("rt-catalog")).toEqual([]);
   });
 });

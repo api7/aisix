@@ -1472,7 +1472,6 @@ mod tests {
             assert_eq!(ev.attempt_kind, if i == 0 { "initial" } else { "retry" });
             assert_eq!(ev.status_code, events[0].status_code);
             assert_eq!((ev.prompt_tokens, ev.completion_tokens), (0, 0));
-            assert_eq!(ev.cost_usd, 0.0);
         }
     }
 

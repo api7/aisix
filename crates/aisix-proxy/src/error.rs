@@ -104,10 +104,12 @@ pub struct BudgetErrorFields {
     pub scope: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope_ref: Option<String>,
+    /// Amounts in the organization's currency, which is why neither
+    /// field names one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit_usd: Option<String>,
+    pub limit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub spent_usd: Option<String>,
+    pub spent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub period: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -151,8 +153,8 @@ impl ErrorEnvelope {
         self.error.budget = Some(BudgetErrorFields {
             scope: r.scope.clone(),
             scope_ref: r.scope_ref.clone(),
-            limit_usd: r.limit_usd.clone(),
-            spent_usd: r.spent_usd.clone(),
+            limit: r.limit.clone(),
+            spent: r.spent.clone(),
             period: r.period.clone(),
             period_resets_at: r.period_resets_at.clone(),
             retry_after_seconds: r.retry_after_seconds,
@@ -857,7 +859,7 @@ impl ProxyError {
     /// OWN limiter is what refused it.
     ///
     /// `None` for every other 429: a budget rejection caps spend in
-    /// dollars, not requests or tokens, and an upstream 429 reports the
+    /// money, not requests or tokens, and an upstream 429 reports the
     /// provider's quota, which the gateway does not know. Both would
     /// have to invent the numbers. That makes the presence of the
     /// `x-ratelimit-*` trio on a 429 the caller's signal that AISIX
@@ -1629,15 +1631,15 @@ mod tests {
     #[test]
     fn openai_envelope_budget_exceeded_carries_structured_fields() {
         // prd-09b §5.8: the budget_exceeded 429 lifts the budget's structured
-        // reason into the error block. Pin scope / scope_ref / limit_usd /
-        // spent_usd / period so a regression that drops them (the old
+        // reason into the error block. Pin scope / scope_ref / limit /
+        // spent / period so a regression that drops them (the old
         // String-only variant) fails here.
         let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
             message: "team budget 'frontend' exceeded ($1.00/month). Resets soon.".into(),
             scope: Some("team".into()),
             scope_ref: Some("team-uuid-1".into()),
-            limit_usd: Some("1.00".into()),
-            spent_usd: Some("2.00".into()),
+            limit: Some("1.00".into()),
+            spent: Some("2.00".into()),
             period: Some("month".into()),
             period_resets_at: Some("2026-06-01T00:00:00Z".into()),
             retry_after_seconds: Some(259_200),
@@ -1653,8 +1655,12 @@ mod tests {
         assert_eq!(e["code"], "budget_exceeded");
         assert_eq!(e["scope"], "team");
         assert_eq!(e["scope_ref"], "team-uuid-1");
-        assert_eq!(e["limit_usd"], "1.00");
-        assert_eq!(e["spent_usd"], "2.00");
+        assert_eq!(e["limit"], "1.00");
+        assert_eq!(e["spent"], "2.00");
+        // An organization's amounts are in its own currency (USD or CNY),
+        // so no key may name one.
+        let keys: Vec<&String> = e.as_object().unwrap().keys().collect();
+        assert!(keys.iter().all(|k| !k.contains("usd")), "{keys:?}");
         assert_eq!(e["period"], "month");
         assert_eq!(e["period_resets_at"], "2026-06-01T00:00:00Z");
         assert_eq!(e["retry_after_seconds"], 259_200);
@@ -1667,7 +1673,7 @@ mod tests {
         // omits them so every other error keeps the bare OpenAI shape.
         let other = serde_json::to_value(ProxyError::ModelNotFound("m".into()).envelope()).unwrap();
         assert!(other["error"].get("scope").is_none());
-        assert!(other["error"].get("limit_usd").is_none());
+        assert!(other["error"].get("limit").is_none());
     }
 
     #[tokio::test]
@@ -1675,13 +1681,13 @@ mod tests {
         // The structured budget fields are an OpenAI-envelope extension
         // only. The Anthropic /v1/messages error block is the strict
         // {type, message} shape — a fully-populated reason must NOT leak
-        // scope / limit_usd etc. into it.
+        // scope / limit etc. into it.
         let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
             message: "team budget 'frontend' exceeded ($1.00/month). Resets soon.".into(),
             scope: Some("team".into()),
             scope_ref: Some("team-uuid-1".into()),
-            limit_usd: Some("1.00".into()),
-            spent_usd: Some("2.00".into()),
+            limit: Some("1.00".into()),
+            spent: Some("2.00".into()),
             period: Some("month".into()),
             period_resets_at: Some("2026-06-01T00:00:00Z".into()),
             retry_after_seconds: Some(259_200),
@@ -1693,8 +1699,8 @@ mod tests {
                 .await;
         assert!(json["error"].get("scope").is_none());
         assert!(json["error"].get("scope_ref").is_none());
-        assert!(json["error"].get("limit_usd").is_none());
-        assert!(json["error"].get("spent_usd").is_none());
+        assert!(json["error"].get("limit").is_none());
+        assert!(json["error"].get("spent").is_none());
     }
 
     #[tokio::test]
@@ -1850,7 +1856,7 @@ mod tests {
         assert!(h.get("x-ratelimit-scope").is_none());
     }
 
-    /// A budget rejection caps spend in dollars. It shares the 429
+    /// A budget rejection caps spend in money. It shares the 429
     /// status but has no request/token dimension, so the trio must stay
     /// absent rather than carry a number in the wrong unit.
     #[tokio::test]
@@ -1859,8 +1865,8 @@ mod tests {
             message: "budget exceeded".into(),
             scope: None,
             scope_ref: None,
-            limit_usd: Some("1.00".into()),
-            spent_usd: Some("2.00".into()),
+            limit: Some("1.00".into()),
+            spent: Some("2.00".into()),
             period: None,
             period_resets_at: None,
             retry_after_seconds: Some(600),

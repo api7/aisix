@@ -357,16 +357,16 @@
     },
     "ModelCost": {
       "additionalProperties": false,
-      "description": "Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.",
+      "description": "Per-token price. Both values are per 1,000 tokens, in the organization's currency.",
       "properties": {
         "input_per_1k": {
-          "description": "Prompt token cost in USD per 1,000 tokens.",
+          "description": "Prompt token price per 1,000 tokens, in the organization's currency.",
           "format": "double",
           "minimum": 0.0,
           "type": "number"
         },
         "output_per_1k": {
-          "description": "Completion token cost in USD per 1,000 tokens.",
+          "description": "Completion token price per 1,000 tokens, in the organization's currency.",
           "format": "double",
           "minimum": 0.0,
           "type": "number"

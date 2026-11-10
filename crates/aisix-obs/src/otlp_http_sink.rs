@@ -1953,7 +1953,6 @@ mod tests {
             provider_request_id: "chatcmpl-abc".into(),
             provider_model_version: "gpt-4o-2024-08-06".into(),
             finish_reason: "stop".into(),
-            cost_usd: 0.001,
             operation: "image_generation".into(),
             ..Default::default()
         }

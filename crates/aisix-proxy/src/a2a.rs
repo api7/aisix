@@ -1052,8 +1052,7 @@ fn a2a_error_envelope(id: Option<serde_json::Value>, message: &str) -> serde_jso
 /// The event records who called which agent with which operation, which task
 /// it touched, the outcome, and latency. Token counts are the gateway's own
 /// reading of the words that passed through — an agent reports none of its
-/// own — and are flagged `usage_estimated`; `cost_usd` stays zero, since what
-/// an agent charges is not something the gateway can know.
+/// own — and are flagged `usage_estimated`.
 ///
 /// This is the chokepoint every A2A path emits through, so the metric
 /// families ride here too: a path that accounts for a call cannot skip
@@ -1977,8 +1976,6 @@ mod tests {
             event.usage_estimated,
             "the gateway counted these, not the agent — the flag says so"
         );
-        // What an agent charges is not something the gateway can know.
-        assert_eq!(event.cost_usd, 0.0);
     }
 
     /// An agent that answers with words rather than a bare task record.

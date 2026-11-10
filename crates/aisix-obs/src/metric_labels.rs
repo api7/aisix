@@ -371,19 +371,19 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
         required = &["api_key_id", "model"]
     ),
     metric!(
-        M_BUDGET_LIMIT_USD,
+        M_BUDGET_LIMIT,
         BUDGET,
         extra = CALLER_NAMES,
         required = BUDGET
     ),
     metric!(
-        M_BUDGET_SPENT_USD,
+        M_BUDGET_SPENT,
         BUDGET,
         extra = CALLER_NAMES,
         required = BUDGET
     ),
     metric!(
-        M_BUDGET_REMAINING_USD,
+        M_BUDGET_REMAINING,
         BUDGET,
         extra = CALLER_NAMES,
         required = BUDGET
@@ -533,7 +533,10 @@ pub struct LabelSelection {
 impl LabelSelection {
     pub fn compile(config: &BTreeMap<String, Vec<String>>) -> Result<Self, String> {
         for (name, labels) in config {
-            if aisix_core::config::RETIRED_METRIC_FAMILIES.contains(&name.as_str()) {
+            if aisix_core::config::RETIRED_METRIC_FAMILIES
+                .iter()
+                .any(|(retired, _)| retired == name)
+            {
                 continue;
             }
             let definition = METRIC_DEFINITIONS
@@ -966,6 +969,9 @@ mod tests {
         let metrics = Metrics::new_with_labels("env", &HistogramBuckets::default(), &retired)
             .expect("a retired family must not fail boot");
         assert!(!metrics.render().contains("aisix_llm_spend_micro_usd_total"));
+        let renamed = selection("aisix_budget_spent_usd", &["api_key_id"]);
+        Metrics::new_with_labels("env", &HistogramBuckets::default(), &renamed)
+            .expect("a renamed family's old name must not fail boot");
         assert!(
             LabelSelection::compile(&selection("aisix_no_such_family", &["endpoint"]))
                 .unwrap_err()
@@ -1044,6 +1050,23 @@ mod tests {
                     "{} defaults to {name}",
                     metric.name
                 );
+            }
+        }
+    }
+
+    /// An organization's amounts are in its own currency (USD or CNY), so
+    /// no family or label names a currency.
+    #[test]
+    fn no_metric_family_or_label_names_a_currency() {
+        for metric in METRIC_DEFINITIONS {
+            assert!(!metric.name.contains("usd"), "{}", metric.name);
+            for label in metric
+                .default_labels
+                .iter()
+                .chain(metric.extra_labels)
+                .chain(metric.always_labels)
+            {
+                assert!(!label.contains("usd"), "{} offers {label}", metric.name);
             }
         }
     }

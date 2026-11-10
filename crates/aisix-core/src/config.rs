@@ -1366,20 +1366,11 @@ impl ObservabilityConfig {
     /// needs no entry here — it is an unknown key, reported by
     /// [`Config::ignored_keys`].
     pub fn retired_settings(&self) -> Vec<&'static str> {
-        let mut out = Vec::new();
-        if self
-            .metrics
-            .labels
-            .keys()
-            .any(|name| RETIRED_METRIC_FAMILIES.contains(&name.as_str()))
-        {
-            out.push(
-                "observability.metrics.labels names aisix_llm_spend_micro_usd_total, which \
-                 this gateway no longer emits; the entry is ignored. Delete it. Spend is the \
-                 cost the control plane records for each request.",
-            );
-        }
-        out
+        RETIRED_METRIC_FAMILIES
+            .iter()
+            .filter(|(name, _)| self.metrics.labels.contains_key(*name))
+            .map(|(_, warning)| *warning)
+            .collect()
     }
 
     fn default_service_name() -> String {
@@ -1398,7 +1389,31 @@ impl ObservabilityConfig {
 /// ignored, and warned about at boot
 /// ([`ObservabilityConfig::retired_settings`]), so a config written for an
 /// older gateway still loads. Any other unknown family name fails boot.
-pub const RETIRED_METRIC_FAMILIES: &[&str] = &["aisix_llm_spend_micro_usd_total"];
+/// Each entry is the family's name and the warning that names what, if
+/// anything, replaced it.
+pub const RETIRED_METRIC_FAMILIES: &[(&str, &str)] = &[
+    (
+        "aisix_llm_spend_micro_usd_total",
+        "observability.metrics.labels names aisix_llm_spend_micro_usd_total, which this \
+         gateway no longer emits; the entry is ignored. Delete it. Spend is the cost the \
+         control plane records for each request.",
+    ),
+    (
+        "aisix_budget_limit_usd",
+        "observability.metrics.labels names aisix_budget_limit_usd, which is now \
+         aisix_budget_limit; the entry is ignored. Rename it to aisix_budget_limit.",
+    ),
+    (
+        "aisix_budget_spent_usd",
+        "observability.metrics.labels names aisix_budget_spent_usd, which is now \
+         aisix_budget_spent; the entry is ignored. Rename it to aisix_budget_spent.",
+    ),
+    (
+        "aisix_budget_remaining_usd",
+        "observability.metrics.labels names aisix_budget_remaining_usd, which is now \
+         aisix_budget_remaining; the entry is ignored. Rename it to aisix_budget_remaining.",
+    ),
+];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
@@ -3933,13 +3948,17 @@ observability:
   metrics:
     labels:
       aisix_llm_spend_micro_usd_total: [endpoint, model]
+      aisix_budget_spent_usd: [api_key_id]
 "#,
         );
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
         let warnings = cfg.observability.retired_settings();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(warnings[0].contains("aisix_llm_spend_micro_usd_total"));
         assert!(warnings[0].contains("control plane"));
+        // A renamed family's warning names its replacement.
+        assert!(warnings[1].contains("aisix_budget_spent_usd"));
+        assert!(warnings[1].contains("Rename it to aisix_budget_spent."));
     }
 
     #[test]

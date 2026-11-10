@@ -3,7 +3,7 @@
   "description": "A per-1,000-token price shared by every model that names it.\n\nA model refers to one of these with `pricing_key`. The gateway looks the price up in the environment's own pricing documents first and in the global catalog second; a model with no `pricing_key`, or one whose key matches no document, falls back to its inline `cost`.",
   "properties": {
     "input_per_1k": {
-      "description": "Prompt token price in USD per 1,000 tokens.",
+      "description": "Prompt token price per 1,000 tokens, in the organization's currency.",
       "format": "double",
       "minimum": 0.0,
       "type": "number"
@@ -15,7 +15,7 @@
       "type": "string"
     },
     "output_per_1k": {
-      "description": "Completion token price in USD per 1,000 tokens.",
+      "description": "Completion token price per 1,000 tokens, in the organization's currency.",
       "format": "double",
       "minimum": 0.0,
       "type": "number"

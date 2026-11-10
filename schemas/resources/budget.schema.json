@@ -110,7 +110,7 @@
           "description": "Error code. The response always reports `budget_exceeded`.",
           "type": "string"
         },
-        "limit_usd": {
+        "limit": {
           "description": "The budget's limit.",
           "type": "string"
         },
@@ -125,7 +125,7 @@
         "period_resets_at": {
           "description": "Ignored: the gateway computes when the period resets."
         },
-        "remaining_usd": {
+        "remaining": {
           "description": "Limit minus spend; zero or negative.",
           "type": "string"
         },
@@ -140,7 +140,7 @@
           "description": "Id of the capped resource, or the tag for scope `tag`.",
           "type": "string"
         },
-        "spent_usd": {
+        "spent": {
           "description": "Spend in the period when the budget was exhausted.",
           "type": "string"
         },

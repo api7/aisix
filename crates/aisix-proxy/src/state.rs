@@ -278,9 +278,8 @@ pub struct ProxyStateInner {
     pub guardrail_index: Arc<LiveGuardrailIndex>,
     /// Prices by `pricing_key`, derived from the two pricing tables and
     /// rebuilt only when one of them changes. Every reader of a model's
-    /// price goes through it — `least_cost` ranking and the `cost_usd` on
-    /// the usage events — so ranking and billing cannot disagree about
-    /// what a model costs.
+    /// price goes through it — `least_cost` ranking today — so no reader
+    /// can disagree with another about what a model costs.
     pub pricing: Arc<LivePricingIndex>,
     /// Registered MCP servers by name → resource id, rebuilt only when the
     /// `mcp_servers` table changes. Both MCP gates that a key can address by

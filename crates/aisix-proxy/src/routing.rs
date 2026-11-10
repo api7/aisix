@@ -3196,16 +3196,14 @@ mod tests {
     }
 
     /// Every reader of a model's price must go through
-    /// [`PricingIndex::resolve`], so ranking and billing cannot disagree
-    /// about what a model costs.
+    /// [`PricingIndex::resolve`], so no two readers can disagree about
+    /// what a model costs.
     ///
-    /// A census rather than a list of the three known sites, for the
-    /// reason `guardrail_coverage.rs` gives: the readers here come in a
-    /// family (`least_cost` ordering, the realtime session's `cost_usd`,
-    /// the batch attribution's), a fourth is added by writing one more
-    /// `.cost`, and a hand-written list agrees with itself forever. The
-    /// symptom of missing one is silent — a model priced by reference
-    /// bills zero on the site that still reads the field.
+    /// A census rather than a list of the known sites, for the reason
+    /// `guardrail_coverage.rs` gives: a new reader is added by writing one
+    /// more `.cost`, and a hand-written list agrees with itself forever.
+    /// The symptom of missing one is silent — a model priced by reference
+    /// reads as free on the site that still reads the field.
     #[test]
     fn no_one_reads_a_models_price_off_the_field() {
         use std::path::Path;
@@ -3237,8 +3235,8 @@ mod tests {
                     }
                     let src = std::fs::read_to_string(&path).expect("source is utf-8");
                     for (i, line) in src.lines().enumerate() {
-                        // `.cost` as a field access, not `cost_usd` /
-                        // `cost_saved_usd` / a local named `*_cost`, and
+                        // `.cost` as a field access, not a longer
+                        // identifier or a local named `*_cost`, and
                         // not a comment.
                         let trimmed = line.trim_start();
                         if trimmed.starts_with("//") || trimmed.starts_with("///") {

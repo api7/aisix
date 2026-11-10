@@ -1106,9 +1106,8 @@ impl<P: ConfigProvider> Supervisor<P> {
         // again — so a control plane that starts refusing the shared
         // catalog leaves the gateway pricing on the last catalog it was
         // allowed to read instead of dropping every price at once. Losing
-        // them is not neutral: `least_cost` stops ranking and realtime /
-        // batch usage events lose `cost_usd`, and the WARN above is the
-        // only sign either happened.
+        // them is not neutral: `least_cost` stops ranking, and the WARN
+        // above is the only sign it happened.
         for source in refused {
             for entry in self.entries_last_read_from(&source.prefix) {
                 // Only where nothing else answered for the key. On a
@@ -3349,9 +3348,8 @@ mod tests {
     async fn a_refused_catalog_keeps_the_prices_it_last_read() {
         // A denial is not a deletion. Once the catalog HAS been read, a
         // later refusal must leave those prices in place: dropping them
-        // silently stops `least_cost` ranking and empties `cost_usd` on
-        // realtime and batch usage events, with only the WARN to show for
-        // it. A successful read replaces them; only a successful read does.
+        // silently stops `least_cost` ranking, with only the WARN to show
+        // for it. A successful read replaces them; only a successful read does.
         const OTHER_PRICE: &[u8] =
             br#"{"key":"openai/gpt-4o","input_per_1k":0.001,"output_per_1k":0.002}"#;
         let sup = scoped_supervisor(

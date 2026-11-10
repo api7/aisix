@@ -40,17 +40,17 @@ type Entry = Arc<ResourceEntry<Budget>>;
 
 /// Customer-facing detail for a budget denial, lifted into the 429 `error`
 /// block so a programmatic client can see which budget tripped (`scope` /
-/// `scope_ref`) and by how much (`limit_usd` / `spent_usd`), not just the
-/// human `message`.
+/// `scope_ref`) and by how much (`limit` / `spent`, in the organization's
+/// currency), not just the human `message`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BudgetReason {
     pub message: String,
     pub scope: Option<String>,
     pub scope_ref: Option<String>,
-    pub limit_usd: Option<String>,
-    pub spent_usd: Option<String>,
-    /// Feeds `aisix_budget_remaining_usd`; not part of the response body.
-    pub remaining_usd: Option<String>,
+    pub limit: Option<String>,
+    pub spent: Option<String>,
+    /// Feeds `aisix_budget_remaining`; not part of the response body.
+    pub remaining: Option<String>,
     pub period: Option<String>,
     pub period_resets_at: Option<String>,
     pub retry_after_seconds: Option<u64>,
@@ -68,9 +68,9 @@ impl BudgetReason {
     fn gauges(&self) -> aisix_obs::BudgetGauges {
         let amount = |v: &Option<String>| v.as_deref().and_then(|s| s.parse::<f64>().ok());
         aisix_obs::BudgetGauges {
-            limit_usd: amount(&self.limit_usd),
-            spent_usd: amount(&self.spent_usd),
-            remaining_usd: amount(&self.remaining_usd),
+            limit: amount(&self.limit),
+            spent: amount(&self.spent),
+            remaining: amount(&self.remaining),
             reset_seconds: self.retry_after_seconds,
         }
     }
@@ -326,8 +326,8 @@ impl BudgetGate {
 
     fn reason(&self, budget: &Budget, doc: &aisix_core::models::BudgetReason) -> BudgetReason {
         let resets_at = next_period_start(period_start(self.now, budget.period), budget.period);
-        // Amounts are restated in the dollar-string form the response has
-        // always carried.
+        // Amounts are restated in the two-decimal string form the response
+        // has always carried.
         let amount = |v: &Option<String>| {
             v.as_deref()
                 .and_then(|s| s.trim().parse::<f64>().ok())
@@ -345,9 +345,9 @@ impl BudgetGate {
                 .unwrap_or_else(|| format!("{} budget exceeded", scope.replace('_', " "))),
             scope_ref: doc.scope_ref.clone().or_else(|| budget.scope_ref.clone()),
             scope: Some(scope),
-            limit_usd: amount(&doc.limit_usd),
-            spent_usd: amount(&doc.spent_usd),
-            remaining_usd: amount(&doc.remaining_usd),
+            limit: amount(&doc.limit),
+            spent: amount(&doc.spent),
+            remaining: amount(&doc.remaining),
             period: Some(budget.period.as_str().to_string()),
             period_resets_at: Some(resets_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
             retry_after_seconds: Some((resets_at - self.now).num_seconds().max(0) as u64),
@@ -679,7 +679,7 @@ mod tests {
         );
         doc["exhausted"]["reason"] = serde_json::json!({
             "message": "api key budget 'x' exceeded", "scope": "api_key", "scope_ref": "k-1",
-            "limit_usd": "10", "spent_usd": "10.5", "remaining_usd": "-0.5", "period": "month",
+            "limit": "10", "spent": "10.5", "remaining": "-0.5", "period": "month",
             "period_resets_at": "1999-01-01T00:00:00Z", "retry_after_seconds": 5
         });
         let snap = snapshot_with(&[("b-1", doc)]);
@@ -688,11 +688,38 @@ mod tests {
         let Verdict::Exceeded(r) = gate_at(&snap, now, false).key_verdict(&k) else {
             panic!()
         };
-        assert_eq!(r.limit_usd.as_deref(), Some("10.00"));
-        assert_eq!(r.spent_usd.as_deref(), Some("10.50"));
+        assert_eq!(r.limit.as_deref(), Some("10.00"));
+        assert_eq!(r.spent.as_deref(), Some("10.50"));
         assert_eq!(r.period_resets_at.as_deref(), Some("2026-11-01T00:00:00Z"));
         assert_eq!(r.retry_after_seconds, Some(3600));
-        assert_eq!(r.gauges().remaining_usd, Some(-0.5));
+        assert_eq!(r.gauges().remaining, Some(-0.5));
+    }
+
+    /// A control plane writing the pre-1965 spelling beside the current one
+    /// (for older gateways), or only the old one (an older control plane),
+    /// still refuses: the old keys are unknown here and never read.
+    #[test]
+    fn the_old_amount_keys_are_not_read() {
+        let old =
+            serde_json::json!({"limit_usd": "9", "spent_usd": "9.5", "remaining_usd": "-0.5"});
+        let mut both = old.clone();
+        both.as_object_mut().unwrap().extend(
+            serde_json::json!({"limit": "10", "spent": "10.5", "remaining": "-0.5"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        for (reason, limit, spent) in [(both, Some("10.00"), Some("10.50")), (old, None, None)] {
+            let mut doc = exhausted("api_key", serde_json::json!({"scope_ref": "k-1"}), None);
+            doc["exhausted"]["reason"] = reason;
+            let snap = snapshot_with(&[("b-1", doc)]);
+            let k = key(&snap, "k-1", serde_json::json!({}));
+            let Verdict::Exceeded(r) = gate_at(&snap, Utc::now(), false).key_verdict(&k) else {
+                panic!("an exhausted budget refuses whatever its amounts")
+            };
+            assert_eq!(r.limit.as_deref(), limit);
+            assert_eq!(r.spent.as_deref(), spent);
+        }
     }
 
     #[test]

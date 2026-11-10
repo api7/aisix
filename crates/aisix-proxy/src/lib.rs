@@ -5697,7 +5697,7 @@ data: [DONE]\n\n";
     /// Regression for #88. On a cache hit the DP must surface the
     /// cached response's prompt + completion tokens on a dedicated
     /// `cache_hit_saved_*` pair so cp-api can multiply by its pricing
-    /// catalog server-side and report `cost_saved_usd` on `/usage`.
+    /// catalog server-side and report the saved cost on `/usage`.
     /// Miss rows must keep the saved counters at zero.
     #[tokio::test]
     async fn cache_hit_emits_saved_token_counters_on_telemetry_event() {
@@ -8906,7 +8906,6 @@ data: [DONE]\n\n";
         );
         assert_eq!(event.prompt_tokens, 0);
         assert_eq!(event.completion_tokens, 0);
-        assert_eq!(event.cost_usd, 0.0);
         // Attributable, or the control plane has nowhere to file the row.
         assert_eq!(event.api_key_id, "key-id-1", "{event:?}");
     }
@@ -9341,7 +9340,6 @@ data: [DONE]\n\n";
         );
         assert_eq!(event.prompt_tokens, 0, "nothing was delivered");
         assert_eq!(event.completion_tokens, 0);
-        assert_eq!(event.cost_usd, 0.0);
         assert_eq!(event.api_key_id, "key-id-1", "{event:?}");
     }
 
@@ -10551,8 +10549,8 @@ data: [DONE]\n\n";
                 "message": "monthly cap exceeded",
                 "scope": "api_key",
                 "scope_ref": "key-id-1",
-                "limit_usd": "10.00",
-                "spent_usd": "10.50",
+                "limit": "10.00",
+                "spent": "10.50",
                 "period": "month"
             }}
         }))
