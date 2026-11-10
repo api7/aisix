@@ -1976,7 +1976,6 @@ mod tests {
             event.usage_estimated,
             "the gateway counted these, not the agent — the flag says so"
         );
-        // What an agent charges is not something the gateway can know.
     }
 
     /// An agent that answers with words rather than a bare task record.

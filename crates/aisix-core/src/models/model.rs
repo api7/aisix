@@ -80,15 +80,6 @@ pub struct ModelCost {
     pub output_per_1k: f64,
 }
 
-impl ModelCost {
-    /// Calculate USD cost for the given token counts.
-    pub fn calculate(&self, input_tokens: u64, output_tokens: u64) -> f64 {
-        let input_cost = self.input_per_1k * (input_tokens as f64) / 1000.0;
-        let output_cost = self.output_per_1k * (output_tokens as f64) / 1000.0;
-        input_cost + output_cost
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 pub struct BackgroundModelCheck {
     /// Whether background health checks are enabled for this model.

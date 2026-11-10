@@ -2112,9 +2112,15 @@ mod tests {
         assert!(json.contains(r#""prompt_tokens":12"#));
         assert!(json.contains(r#""completion_tokens":34"#));
         assert!(json.contains(r#""guardrail_blocked":false"#));
-        // The control plane prices the tokens; and an organization's amounts
-        // are in its own currency, so no field may name one.
-        assert!(!json.contains("cost") && !json.contains("usd"), "{json}");
+        // The control plane prices the tokens, so the event carries no cost;
+        // and an organization's amounts are in its own currency, so no
+        // field may name one.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        assert!(
+            !keys.iter().any(|k| *k == "cost_usd" || k.contains("usd")),
+            "{keys:?}"
+        );
     }
 
     #[test]

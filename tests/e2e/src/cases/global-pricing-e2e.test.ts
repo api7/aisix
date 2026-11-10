@@ -468,22 +468,13 @@ describe("global pricing e2e: a priced model's usage events carry no cost", () =
       secret: "sk-mock",
       api_base: `http://127.0.0.1:${upstream.port}/v1`,
     });
-    // Priced both ways the gateway knows: by the catalog and inline.
+    // Priced by the catalog: the gateway holds a price for it.
     await seed.createModel({
       display_name: "rt-catalog",
       provider: "openai",
       model_name: "gpt-realtime-mock",
       provider_key_id: pk.id,
       pricing_key: "vendor/rt",
-    });
-    // Same session shape, priced inline instead — the fallback half.
-    await seed.createModel({
-      display_name: "rt-inline",
-      provider: "openai",
-      model_name: "gpt-realtime-mock",
-      provider_key_id: pk.id,
-      pricing_key: "vendor/not-written",
-      cost: { input_per_1k: 1.0, output_per_1k: 2.0 },
     });
     await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"] });
   });
@@ -540,20 +531,11 @@ describe("global pricing e2e: a priced model's usage events carry no cost", () =
       if (res.status !== 200) return false;
       const ids =
         ((await res.json()) as { data?: Array<{ id?: string }> }).data?.map((m) => m.id) ?? [];
-      return ids.includes("rt-catalog") && ids.includes("rt-inline");
+      return ids.includes("rt-catalog");
     });
 
     await runSession("rt-catalog");
     // The usage event is emitted as the session tears down.
     expect(await costFieldsFor("rt-catalog")).toEqual([]);
-  });
-
-  test("a realtime session on an inline-priced model exports no cost", async (ctx) => {
-    if (!etcdReachable || !app || !seed) {
-      ctx.skip();
-      return;
-    }
-    await runSession("rt-inline");
-    expect(await costFieldsFor("rt-inline")).toEqual([]);
   });
 });

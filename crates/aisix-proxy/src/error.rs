@@ -859,7 +859,7 @@ impl ProxyError {
     /// OWN limiter is what refused it.
     ///
     /// `None` for every other 429: a budget rejection caps spend in
-    /// dollars, not requests or tokens, and an upstream 429 reports the
+    /// money, not requests or tokens, and an upstream 429 reports the
     /// provider's quota, which the gateway does not know. Both would
     /// have to invent the numbers. That makes the presence of the
     /// `x-ratelimit-*` trio on a 429 the caller's signal that AISIX

@@ -326,8 +326,8 @@ impl BudgetGate {
 
     fn reason(&self, budget: &Budget, doc: &aisix_core::models::BudgetReason) -> BudgetReason {
         let resets_at = next_period_start(period_start(self.now, budget.period), budget.period);
-        // Amounts are restated in the dollar-string form the response has
-        // always carried.
+        // Amounts are restated in the two-decimal string form the response
+        // has always carried.
         let amount = |v: &Option<String>| {
             v.as_deref()
                 .and_then(|s| s.trim().parse::<f64>().ok())
