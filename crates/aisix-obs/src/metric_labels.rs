@@ -371,19 +371,19 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
         required = &["api_key_id", "model"]
     ),
     metric!(
-        M_BUDGET_LIMIT_USD,
+        M_BUDGET_LIMIT,
         BUDGET,
         extra = CALLER_NAMES,
         required = BUDGET
     ),
     metric!(
-        M_BUDGET_SPENT_USD,
+        M_BUDGET_SPENT,
         BUDGET,
         extra = CALLER_NAMES,
         required = BUDGET
     ),
     metric!(
-        M_BUDGET_REMAINING_USD,
+        M_BUDGET_REMAINING,
         BUDGET,
         extra = CALLER_NAMES,
         required = BUDGET

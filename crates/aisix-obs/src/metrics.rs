@@ -223,9 +223,9 @@ pub const M_RATELIMIT_REMAINING_REQUESTS: &str = "aisix_ratelimit_remaining_requ
 pub const M_RATELIMIT_REMAINING_TOKENS: &str = "aisix_ratelimit_remaining_tokens";
 /// Budget amounts, in the organization's currency (USD or CNY) — which is
 /// why no budget family names one.
-pub const M_BUDGET_LIMIT_USD: &str = "aisix_budget_limit";
-pub const M_BUDGET_SPENT_USD: &str = "aisix_budget_spent";
-pub const M_BUDGET_REMAINING_USD: &str = "aisix_budget_remaining";
+pub const M_BUDGET_LIMIT: &str = "aisix_budget_limit";
+pub const M_BUDGET_SPENT: &str = "aisix_budget_spent";
+pub const M_BUDGET_REMAINING: &str = "aisix_budget_remaining";
 pub const M_BUDGET_RESET_SECONDS: &str = "aisix_budget_reset_seconds";
 pub const M_BUDGET_DETAILS_PRESENT: &str = "aisix_budget_details_present";
 pub const M_REDIS_FAILURES_TOTAL: &str = "aisix_redis_failures_total";
@@ -2776,14 +2776,14 @@ impl Metrics {
 
     pub fn set_budget_gauges(&self, labels: BudgetLabels<'_>, budget: BudgetGauges) {
         self.cached_budget_gauge(M_BUDGET_DETAILS_PRESENT, labels, 1.0);
-        if let Some(value) = budget.limit_usd {
-            self.cached_budget_gauge(M_BUDGET_LIMIT_USD, labels, value);
+        if let Some(value) = budget.limit {
+            self.cached_budget_gauge(M_BUDGET_LIMIT, labels, value);
         }
-        if let Some(value) = budget.spent_usd {
-            self.cached_budget_gauge(M_BUDGET_SPENT_USD, labels, value);
+        if let Some(value) = budget.spent {
+            self.cached_budget_gauge(M_BUDGET_SPENT, labels, value);
         }
-        if let Some(value) = budget.remaining_usd {
-            self.cached_budget_gauge(M_BUDGET_REMAINING_USD, labels, value);
+        if let Some(value) = budget.remaining {
+            self.cached_budget_gauge(M_BUDGET_REMAINING, labels, value);
         }
         if let Some(value) = budget.reset_seconds {
             self.cached_budget_gauge(M_BUDGET_RESET_SECONDS, labels, value as f64);
@@ -3747,9 +3747,9 @@ impl Default for BudgetLabels<'_> {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BudgetGauges {
-    pub limit_usd: Option<f64>,
-    pub spent_usd: Option<f64>,
-    pub remaining_usd: Option<f64>,
+    pub limit: Option<f64>,
+    pub spent: Option<f64>,
+    pub remaining: Option<f64>,
     pub reset_seconds: Option<u64>,
 }
 
@@ -4912,16 +4912,16 @@ mod tests {
         metrics.set_budget_gauges(
             key_a,
             BudgetGauges {
-                limit_usd: Some(100.0),
-                spent_usd: Some(40.0),
-                remaining_usd: Some(60.0),
+                limit: Some(100.0),
+                spent: Some(40.0),
+                remaining: Some(60.0),
                 reset_seconds: Some(3600),
             },
         );
         metrics.set_budget_gauges(
             key_b,
             BudgetGauges {
-                spent_usd: Some(7.0),
+                spent: Some(7.0),
                 ..BudgetGauges::default()
             },
         );
@@ -4935,9 +4935,9 @@ mod tests {
         };
         for (metric, value) in [
             (M_BUDGET_DETAILS_PRESENT, "1"),
-            (M_BUDGET_LIMIT_USD, "100"),
-            (M_BUDGET_SPENT_USD, "40"),
-            (M_BUDGET_REMAINING_USD, "60"),
+            (M_BUDGET_LIMIT, "100"),
+            (M_BUDGET_SPENT, "40"),
+            (M_BUDGET_REMAINING, "60"),
             (M_BUDGET_RESET_SECONDS, "3600"),
         ] {
             let line = series(metric, "team-a")
@@ -4954,9 +4954,9 @@ mod tests {
             );
         }
         // Key B must have its OWN spent series, not overwrite A's.
-        assert!(series(M_BUDGET_SPENT_USD, "team-b").is_some_and(|l| l.ends_with(" 7")));
+        assert!(series(M_BUDGET_SPENT, "team-b").is_some_and(|l| l.ends_with(" 7")));
         // Unset dimensions register nothing for B.
-        assert!(series(M_BUDGET_LIMIT_USD, "team-b").is_none());
+        assert!(series(M_BUDGET_LIMIT, "team-b").is_none());
 
         metrics.clear_budget_gauges(key_a);
         let rendered = metrics.render();
@@ -5280,9 +5280,9 @@ mod tests {
             "{rendered}"
         );
         for metric in [
-            M_BUDGET_LIMIT_USD,
-            M_BUDGET_SPENT_USD,
-            M_BUDGET_REMAINING_USD,
+            M_BUDGET_LIMIT,
+            M_BUDGET_SPENT,
+            M_BUDGET_REMAINING,
             M_BUDGET_RESET_SECONDS,
         ] {
             assert!(
@@ -5325,9 +5325,9 @@ mod tests {
             "{rendered}"
         );
         for metric in [
-            M_BUDGET_LIMIT_USD,
-            M_BUDGET_SPENT_USD,
-            M_BUDGET_REMAINING_USD,
+            M_BUDGET_LIMIT,
+            M_BUDGET_SPENT,
+            M_BUDGET_REMAINING,
             M_BUDGET_RESET_SECONDS,
         ] {
             assert!(
@@ -5356,7 +5356,7 @@ mod tests {
         m.set_budget_gauges(
             labels,
             BudgetGauges {
-                spent_usd: Some(40.0),
+                spent: Some(40.0),
                 ..BudgetGauges::default()
             },
         );
@@ -5365,7 +5365,7 @@ mod tests {
 
         let rendered = m.render();
         assert!(
-            series_lines(&rendered, M_BUDGET_SPENT_USD)
+            series_lines(&rendered, M_BUDGET_SPENT)
                 .pop()
                 .expect("renders")
                 .ends_with(" NaN"),
@@ -5373,7 +5373,7 @@ mod tests {
         );
         // Still nothing for the amounts that were never written.
         assert!(
-            series_lines(&rendered, M_BUDGET_LIMIT_USD).is_empty(),
+            series_lines(&rendered, M_BUDGET_LIMIT).is_empty(),
             "{rendered}"
         );
     }
@@ -5396,9 +5396,9 @@ mod tests {
         m.set_budget_gauges(
             labels,
             BudgetGauges {
-                limit_usd: Some(100.0),
-                spent_usd: Some(95.0),
-                remaining_usd: Some(5.0),
+                limit: Some(100.0),
+                spent: Some(95.0),
+                remaining: Some(5.0),
                 reset_seconds: Some(60),
             },
         );
@@ -5423,9 +5423,9 @@ mod tests {
         // The quantities go to NaN, NOT 0: `spent 0 / limit 0` is a claim
         // about a budget, and a `remaining 0` would read as "exhausted".
         for metric in [
-            M_BUDGET_LIMIT_USD,
-            M_BUDGET_SPENT_USD,
-            M_BUDGET_REMAINING_USD,
+            M_BUDGET_LIMIT,
+            M_BUDGET_SPENT,
+            M_BUDGET_REMAINING,
             M_BUDGET_RESET_SECONDS,
         ] {
             assert_eq!(value(metric), "NaN", "{metric} must retire to NaN");
@@ -5488,7 +5488,7 @@ mod tests {
     fn rebinding_retires_the_old_label_set_and_leaves_the_new_one() {
         let m = Metrics::new(false);
         let spend = |v| BudgetGauges {
-            spent_usd: Some(v),
+            spent: Some(v),
             ..BudgetGauges::default()
         };
         let before = BudgetLabels {
@@ -5516,7 +5516,7 @@ mod tests {
 
         let rendered = m.render();
         let line = |team: &str| -> String {
-            series_lines(&rendered, M_BUDGET_SPENT_USD)
+            series_lines(&rendered, M_BUDGET_SPENT)
                 .into_iter()
                 .find(|l| l.contains(&format!("team_id=\"{team}\"")))
                 .unwrap_or_else(|| panic!("team {team} must render\n{rendered}"))
@@ -5542,14 +5542,14 @@ mod tests {
                 user_name: "alice",
             },
             BudgetGauges {
-                spent_usd: Some(12.0),
+                spent: Some(12.0),
                 ..BudgetGauges::default()
             },
         );
         assert_eq!(m.retire_stale_gauges(|_| true), 0);
         let rendered = m.render();
         assert!(
-            series_lines(&rendered, M_BUDGET_SPENT_USD)
+            series_lines(&rendered, M_BUDGET_SPENT)
                 .pop()
                 .expect("renders")
                 .ends_with(" 12"),
@@ -5573,7 +5573,7 @@ mod tests {
         m.set_budget_gauges(
             labels,
             BudgetGauges {
-                spent_usd: Some(40.0),
+                spent: Some(40.0),
                 ..BudgetGauges::default()
             },
         );
@@ -5587,7 +5587,7 @@ mod tests {
     fn the_label_set_a_rebind_creates_is_tracked_too() {
         let m = Metrics::new(false);
         let spend = |v| BudgetGauges {
-            spent_usd: Some(v),
+            spent: Some(v),
             ..BudgetGauges::default()
         };
         let before = BudgetLabels {
@@ -5626,7 +5626,7 @@ mod tests {
         ]
         .map(str::to_owned)
         .to_vec();
-        let config = [M_BUDGET_SPENT_USD, M_BUDGET_DETAILS_PRESENT]
+        let config = [M_BUDGET_SPENT, M_BUDGET_DETAILS_PRESENT]
             .map(|m| (m.to_owned(), selected.clone()))
             .into_iter()
             .collect();
@@ -5635,7 +5635,7 @@ mod tests {
 
     fn spent_by_team(m: &Metrics) -> Vec<(String, String)> {
         let rendered = m.render();
-        let mut out: Vec<(String, String)> = series_lines(&rendered, M_BUDGET_SPENT_USD)
+        let mut out: Vec<(String, String)> = series_lines(&rendered, M_BUDGET_SPENT)
             .into_iter()
             .map(|l| {
                 let team = l
@@ -5664,7 +5664,7 @@ mod tests {
 
     fn spend(v: f64) -> BudgetGauges {
         BudgetGauges {
-            spent_usd: Some(v),
+            spent: Some(v),
             ..BudgetGauges::default()
         }
     }
@@ -5890,7 +5890,7 @@ mod tests {
             },
         ];
         let spend = |v| BudgetGauges {
-            spent_usd: Some(v),
+            spent: Some(v),
             ..BudgetGauges::default()
         };
         m.set_budget_gauges(base, spend(1.0));
@@ -5898,7 +5898,7 @@ mod tests {
             m.set_budget_gauges(*v, spend(2.0 + i as f64));
         }
         let rendered = m.render();
-        let series = series_lines(&rendered, M_BUDGET_SPENT_USD);
+        let series = series_lines(&rendered, M_BUDGET_SPENT);
         assert_eq!(series.len(), 1 + variants.len(), "{rendered}");
         // Gauges overwrite rather than sum: a dropped key label makes the
         // LAST variant's value land on the base series instead.

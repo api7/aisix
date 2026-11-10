@@ -47,10 +47,10 @@ pub struct BudgetReason {
     pub message: String,
     pub scope: Option<String>,
     pub scope_ref: Option<String>,
-    pub limit_usd: Option<String>,
-    pub spent_usd: Option<String>,
+    pub limit: Option<String>,
+    pub spent: Option<String>,
     /// Feeds `aisix_budget_remaining`; not part of the response body.
-    pub remaining_usd: Option<String>,
+    pub remaining: Option<String>,
     pub period: Option<String>,
     pub period_resets_at: Option<String>,
     pub retry_after_seconds: Option<u64>,
@@ -68,9 +68,9 @@ impl BudgetReason {
     fn gauges(&self) -> aisix_obs::BudgetGauges {
         let amount = |v: &Option<String>| v.as_deref().and_then(|s| s.parse::<f64>().ok());
         aisix_obs::BudgetGauges {
-            limit_usd: amount(&self.limit_usd),
-            spent_usd: amount(&self.spent_usd),
-            remaining_usd: amount(&self.remaining_usd),
+            limit: amount(&self.limit),
+            spent: amount(&self.spent),
+            remaining: amount(&self.remaining),
             reset_seconds: self.retry_after_seconds,
         }
     }
@@ -345,9 +345,9 @@ impl BudgetGate {
                 .unwrap_or_else(|| format!("{} budget exceeded", scope.replace('_', " "))),
             scope_ref: doc.scope_ref.clone().or_else(|| budget.scope_ref.clone()),
             scope: Some(scope),
-            limit_usd: amount(&doc.limit_usd),
-            spent_usd: amount(&doc.spent_usd),
-            remaining_usd: amount(&doc.remaining_usd),
+            limit: amount(&doc.limit_usd),
+            spent: amount(&doc.spent_usd),
+            remaining: amount(&doc.remaining_usd),
             period: Some(budget.period.as_str().to_string()),
             period_resets_at: Some(resets_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
             retry_after_seconds: Some((resets_at - self.now).num_seconds().max(0) as u64),
@@ -688,11 +688,11 @@ mod tests {
         let Verdict::Exceeded(r) = gate_at(&snap, now, false).key_verdict(&k) else {
             panic!()
         };
-        assert_eq!(r.limit_usd.as_deref(), Some("10.00"));
-        assert_eq!(r.spent_usd.as_deref(), Some("10.50"));
+        assert_eq!(r.limit.as_deref(), Some("10.00"));
+        assert_eq!(r.spent.as_deref(), Some("10.50"));
         assert_eq!(r.period_resets_at.as_deref(), Some("2026-11-01T00:00:00Z"));
         assert_eq!(r.retry_after_seconds, Some(3600));
-        assert_eq!(r.gauges().remaining_usd, Some(-0.5));
+        assert_eq!(r.gauges().remaining, Some(-0.5));
     }
 
     #[test]
