@@ -189,6 +189,10 @@ This repo reads its config from etcd, but users never write etcd directly — th
 - Exactly four divergence axes are registered as intentional and allowed: reference style (names here vs UUIDs in the CP), tenancy scoping (flat here vs org/environment there), credential custody (`key_hash` in documents here vs server-generated plaintext-once there), and CP-derived fields (`cost`, `telemetry_tags`). Anything else that diverges from cp-admin.yaml is drift. The control plane's contract check (`contract-check.yml`, advisory: nightly and on spec changes there) reports any divergence not registered in its `openapi/cross-plane-allowlist.yaml`.
 - Why the CP spec and not this repo's schemas: the CP is spec-first behind a closed validator (its spec already is the authoritative field shape on that side), the spec renders into the customer-facing API reference, and this repo's schemas are generated from the implementation — a schema that follows the implementation cannot lead it.
 
+## A Money Amount Never Names a Currency
+
+**An organization is priced in its own currency (USD or CNY), so no name for an amount carries one** — not a response or error field, a usage-event field, a metric family or label, a config key, a projected-document field, or a Rust identifier. Write `limit`, `spent`, `cost`, never `limit_usd`. The `_usd` spellings still in the tree (the reason keys a control plane keeps writing for gateways at the support floor, and the retired metric names `RETIRED_METRIC_FAMILIES` warns about) are legacy kept only because removing them costs more than it buys — never a pattern to copy. The usage-event, budget-429 and metric-catalog tests assert no `usd` in their keys.
+
 ## A Reference, Not a Copy
 
 **A document references another resource by id and never carries a copy of another resource's mutable data.** The gateway resolves the reference on the read path, through an index keyed on the referenced table's `generation` — never on the snapshot version. Data with its own lifecycle is its own resource kind, under the environment prefix or the global one, never a field inlined into its consumers, even while it has a single reader.
