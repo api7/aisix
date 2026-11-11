@@ -944,10 +944,10 @@ impl RateStore for RedisStore {
         let mut conn = match self.conn.acquire().await {
             Ok(c) => c,
             Err(e) => {
-                // The count stays: an outage errs toward over-counting a
-                // refused request, never toward a slot nobody gives back
-                // (the concurrency member still ages out by its ttl).
+                // The count stays — an outage errs toward over-counting a
+                // refused request — but the slot is still given back.
                 self.note_failure("refund", &e);
+                self.spawn_shared_release(key, member);
                 return;
             }
         };
@@ -956,6 +956,7 @@ impl RateStore for RedisStore {
             Err(e) => {
                 self.note_failure("refund", &e);
                 self.conn.note_error().await;
+                self.spawn_shared_release(key, member);
             }
         }
     }
