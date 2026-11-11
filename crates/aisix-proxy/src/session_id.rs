@@ -45,7 +45,7 @@ pub(crate) fn resolve(headers: &HeaderMap, metadata: Option<&Value>) -> Option<S
         .and_then(usable)
         .or_else(|| vendor_header(headers))
         .or_else(|| {
-            is_codex_caller(header("user-agent")?)
+            is_codex_request(headers)
                 .then(|| {
                     CODEX_SESSION_HEADERS
                         .iter()

@@ -285,7 +285,6 @@ pub(crate) async fn resolve(
     let default_target = semantic.default_ref(snapshot);
 
     let affinity = session_affinity_key(router_entry, semantic, routing, session);
-    let create_pins = session.create_pins && !is_side_request(routing.headers, prompt);
     if let Some((key, ttl)) = &affinity {
         if let Some(hit) = state.session_pins.lookup(key, *ttl).await {
             match pinned_route(snapshot, semantic, &hit.pin) {
@@ -364,7 +363,9 @@ pub(crate) async fn resolve(
                 false,
             )?;
             match (&affinity, &dispatch.route) {
-                (Some((key, ttl)), Some(route)) if create_pins => {
+                (Some((key, ttl)), Some(route))
+                    if session.create_pins && !is_side_request(routing.headers, prompt) =>
+                {
                     let target_id = snapshot
                         .models
                         .get_by_name(&semantic.routes[i].target_ref(snapshot))
@@ -1877,7 +1878,13 @@ mod tests {
     fn side_requests_are_recognized_by_header_or_phrase() {
         let mut headers = HeaderMap::new();
         assert!(!is_side_request(Some(&headers), "fix the login bug"));
-        for phrase in SIDE_REQUEST_PHRASES {
+        for phrase in [
+            "Write the title in the predominant language of the session",
+            "You are coming up with a succinct title for a coding session",
+            "Describe your most recent action in 3-5 words using present tense",
+            "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]",
+            "Generate a concise, single-line task title",
+        ] {
             assert!(
                 is_side_request(None, &format!("<session>\nhi\n</session>\n\n{phrase} —")),
                 "{phrase}"
