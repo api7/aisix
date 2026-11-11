@@ -714,6 +714,41 @@ fn push_dims(args: &mut Vec<String>, dims: &[Dim]) {
     }
 }
 
+impl RedisStore {
+    /// Remove `member` from the shared concurrency set, detached. A member
+    /// that was never added makes this a no-op ZREM.
+    fn spawn_shared_release(&self, key: &str, member: &str) {
+        let conc_key = format!("{}:conc", self.bucket_prefix(key));
+        let conn = self.conn.clone();
+        let member = member.to_string();
+        let metrics = self.metrics.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                // ZREM's first arg is the key, so Redis Cluster routes it.
+                let mut c = match conn.acquire().await {
+                    Ok(c) => c,
+                    Err(_) => {
+                        record_failure(&metrics, "release");
+                        return;
+                    }
+                };
+                let res: Result<(), redis::RedisError> = redis::cmd("ZREM")
+                    .arg(&conc_key)
+                    .arg(&member)
+                    .query_async(&mut c)
+                    .await;
+                if res.is_err() {
+                    // The detached tasks are the only Redis failures with
+                    // no log at all — nothing awaits them, so the counter
+                    // is their only trace.
+                    record_failure(&metrics, "release");
+                    conn.note_error().await;
+                }
+            });
+        }
+    }
+}
+
 #[async_trait]
 impl RateStore for RedisStore {
     async fn acquire(
@@ -891,7 +926,11 @@ impl RateStore for RedisStore {
         self.lease_members
             .remove(&(key.to_string(), member.to_string()));
         if !stamp.shared {
-            return self.local.refund(key, limits, member, stamp).await;
+            self.local.refund(key, limits, member, stamp).await;
+            // An acquire whose reply was lost may still have added the
+            // member on Redis; give it back as `release` would.
+            self.spawn_shared_release(key, member);
+            return;
         }
         let prefix = self.bucket_prefix(key);
         let mut args = vec![prefix, member.to_string(), stamp.at_secs.to_string()];
@@ -927,34 +966,7 @@ impl RateStore for RedisStore {
         // Drop the local slot first (a cheap no-op when the bucket was
         // never acquired locally); covers the degraded-acquire case.
         self.local.release(key, member);
-        let conc_key = format!("{}:conc", self.bucket_prefix(key));
-        let conn = self.conn.clone();
-        let member = member.to_string();
-        let metrics = self.metrics.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                // ZREM's first arg is the key, so Redis Cluster routes it.
-                let mut c = match conn.acquire().await {
-                    Ok(c) => c,
-                    Err(_) => {
-                        record_failure(&metrics, "release");
-                        return;
-                    }
-                };
-                let res: Result<(), redis::RedisError> = redis::cmd("ZREM")
-                    .arg(&conc_key)
-                    .arg(&member)
-                    .query_async(&mut c)
-                    .await;
-                if res.is_err() {
-                    // The detached tasks are the only Redis failures with
-                    // no log at all — nothing awaits them, so the counter
-                    // is their only trace.
-                    record_failure(&metrics, "release");
-                    conn.note_error().await;
-                }
-            });
-        }
+        self.spawn_shared_release(key, member);
     }
 
     fn add_tokens(&self, key: &str, tokens: u64, window_type: RateLimitWindowType) {

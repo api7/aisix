@@ -26,7 +26,7 @@
 //! counts once per downstream request; a Model Group's per-target layers
 //! count through [`TargetGate`] (per upstream attempt, except the
 //! caller-facing policies a group satisfies, which count once per
-//! request). A request this gateway's own limiter refuses consumes
+//! request — see [`is_caller_facing`]). A request this gateway's own limiter refuses consumes
 //! nothing: a refused pass refunds what it counted, and a routed request
 //! whose every target was refused refunds the request gate too. Counts of
 //! an attempt that went upstream are never given back.
@@ -478,13 +478,9 @@ async fn reserve_policy_layers(
         let Some(layer) = match_policy_layer(policy, &entry.id, input, phase) else {
             continue;
         };
-        let caller_facing = caller_scoped.as_deref_mut().filter(|cs| {
-            policy.is_conditional()
-                && aisix_core::models::eval_condition_nodes(
-                    policy.conditions.as_deref().unwrap_or_default(),
-                    &cs.parent_input,
-                )
-        });
+        let caller_facing = caller_scoped
+            .as_deref_mut()
+            .filter(|cs| is_caller_facing(policy, &cs.parent_input));
         if let Some(cs) = &caller_facing {
             if cs.held.contains(&entry.id) {
                 continue;
@@ -501,6 +497,25 @@ async fn reserve_policy_layers(
         }
     }
     Ok(())
+}
+
+/// Whether a policy that matched a routing target pass is about the
+/// caller-addressed group rather than the member: it still matches with the
+/// group's identity in place of the member's (`parent_input`, which carries
+/// no member-only dimension), and its bucket does not split on a member
+/// property — a `group_by` on `model` or `provider` keeps one counter per
+/// member, which only a per-attempt count can keep honest.
+fn is_caller_facing(policy: &RateLimitPolicy, parent_input: &ConditionInput<'_>) -> bool {
+    policy.is_conditional()
+        && !policy
+            .group_by
+            .iter()
+            .flatten()
+            .any(|d| matches!(d, GroupByDimension::Model | GroupByDimension::Provider))
+        && aisix_core::models::eval_condition_nodes(
+            policy.conditions.as_deref().unwrap_or_default(),
+            parent_input,
+        )
 }
 
 /// Convert a store-level rejection into the surfaced [`ProxyError`],
@@ -718,6 +733,23 @@ async fn reserve_target_layers(
     }
 }
 
+/// The target pass's input with the group standing in for the member: its
+/// id and alias as `model` / `model_name`, and no `provider` (a group has
+/// none, so a provider leaf keeps a policy member-scoped).
+fn parent_condition_input<'a>(
+    target_input: &ConditionInput<'a>,
+    parent: RoutingParent<'a>,
+) -> ConditionInput<'a> {
+    ConditionInput {
+        model: Some(parent.entry_id),
+        model_name: Some(parent.name),
+        provider: None,
+        routing_parent_model: None,
+        routing_parent_model_name: None,
+        ..*target_input
+    }
+}
+
 /// The per-target rate-limit gate of one downstream request, shared by
 /// every loop that walks a Model Group's targets (chat, messages,
 /// count_tokens, responses, and [`crate::routing::dispatch_with_failover`]
@@ -734,8 +766,9 @@ async fn reserve_target_layers(
 ///   the target's own `model` / `model_name` satisfy — count once per
 ///   attempt, failed attempts and same-target retries included;
 /// - conditional policies the caller-addressed group satisfies (its id or
-///   alias standing in for the model, AISIX-Cloud#1267) count at most once
-///   per downstream request: reserved on the first attempt they match,
+///   alias standing in for the model, AISIX-Cloud#1267; no `provider` leaf
+///   and no `group_by` on `model` / `provider`, which are member
+///   properties) count at most once per downstream request: reserved on the first attempt they match,
 ///   held in the request's reservation from then on (so its tokens are
 ///   committed once, with the winning attempt's usage), skipped on later
 ///   attempts;
@@ -792,13 +825,7 @@ impl<'a> TargetGate<'a> {
         let mrl = ModelRateLimit::from_model(target_name, target_entry_id, target);
         let input = condition_input(auth, Some(&mrl), Some(parent));
         let mut caller_scoped = CallerScoped {
-            parent_input: ConditionInput {
-                model: Some(parent.entry_id),
-                model_name: Some(parent.name),
-                routing_parent_model: None,
-                routing_parent_model_name: None,
-                ..input
-            },
+            parent_input: parent_condition_input(&input, parent),
             held: &self.caller_held,
             taken: Vec::new(),
         };
@@ -1346,6 +1373,57 @@ mod tests {
         let layer = match_policy_layer(&policy, "pol-10", &input, PolicyPhase::ModelTarget)
             .expect("matches via parent");
         assert_eq!(layer.bucket_key, "policy:v2:pol-10:model=model-1");
+    }
+
+    #[test]
+    fn caller_facing_only_for_group_policies_that_do_not_split_per_member() {
+        let auth = make_auth(Some("team-1"), None);
+        let target = make_model_rl("gpt-4.1-prod", "model-1", Some("openai"));
+        let parent = RoutingParent {
+            name: "chat-group",
+            entry_id: "group-1",
+        };
+        let input = condition_input(&auth, Some(&target), Some(parent));
+        let parent_input = parent_condition_input(&input, parent);
+        let facing = |policy: serde_json::Value| {
+            let policy = make_conditional_policy(policy);
+            assert!(
+                match_policy_layer(&policy, "pol", &input, PolicyPhase::ModelTarget).is_some(),
+                "the target pass must match {:?}",
+                policy.name
+            );
+            is_caller_facing(&policy, &parent_input)
+        };
+        let group_leaf =
+            serde_json::json!({ "dimension": "model", "operator": "in", "value": ["group-1"] });
+        assert!(facing(serde_json::json!({
+            "name": "group-pinned", "conditions": [group_leaf], "limits": { "rpm": 1 },
+        })));
+        assert!(facing(serde_json::json!({
+            "name": "group-alias",
+            "conditions": [{ "dimension": "model_name", "operator": "==", "value": "chat-group" }],
+            "limits": { "rpm": 1 },
+        })));
+        assert!(!facing(serde_json::json!({
+            "name": "member-pinned",
+            "conditions": [{ "dimension": "model", "operator": "in", "value": ["model-1"] }],
+            "limits": { "rpm": 1 },
+        })));
+        // One counter per member: counted per attempt in that member's bucket.
+        assert!(!facing(serde_json::json!({
+            "name": "group-per-model", "conditions": [group_leaf],
+            "group_by": ["model"], "limits": { "rpm": 1 },
+        })));
+        assert!(!facing(serde_json::json!({
+            "name": "group-per-provider", "conditions": [group_leaf],
+            "group_by": ["provider"], "limits": { "rpm": 1 },
+        })));
+        // The provider is the member's: a group has none.
+        assert!(!facing(serde_json::json!({
+            "name": "group-openai",
+            "conditions": [group_leaf, { "dimension": "provider", "operator": "==", "value": "openai" }],
+            "limits": { "rpm": 1 },
+        })));
     }
 
     #[test]
