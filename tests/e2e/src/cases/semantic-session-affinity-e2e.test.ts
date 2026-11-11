@@ -496,6 +496,17 @@ describe("semantic session affinity on one gateway", () => {
       const other = { "x-aisix-session-id": session() };
       await expectClassified(await post("/v1/responses", { model: "sa-router", input }, other), "sa-legal", "legal");
     });
+
+    test("messages: a Codex turn holding only injected blocks has nothing to classify", async (ctx) => {
+      if (!ready()) return ctx.skip();
+      const text = `<environment_context>\n  <note>${LEGAL}</note>\n</environment_context>`;
+      const r = await messages("sa-router", text, { "user-agent": CODEX_UA, "x-aisix-session-id": session() });
+      expect(r.status, r.text).toBe(200);
+      expect(r.text).toContain("served-by-sa-default");
+      expect(r.route).toBeNull();
+      expect(field(await accessLine(app!, r), "semantic_fallback")).toBe("empty_prompt");
+      await expectClassified(await messages("sa-router", text, { "x-aisix-session-id": session() }), "sa-legal", "legal");
+    });
   });
 
   test("a request without a session id is classified every time", async (ctx) => {
