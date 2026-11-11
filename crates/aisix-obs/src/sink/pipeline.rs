@@ -323,6 +323,10 @@ impl SinkPipeline {
         // `cancel` is borrowed by the select below for as long as each
         // iteration lasts, including the arm bodies.
         let mut shutdown = cancel.clone();
+        // A dropped sender never signals again and `changed` would return
+        // at once on every turn; the worker then runs until its channel
+        // closes.
+        let mut cancel_open = true;
 
         tracing::info!(
             sink = %self.sink.name(),
@@ -364,7 +368,7 @@ impl SinkPipeline {
                     self.take(&mut buffer);
                     self.flush(&mut buffer, None, &mut shutdown).await;
                 }
-                _ = cancel.changed() => {}
+                changed = cancel.changed(), if cancel_open => cancel_open = changed.is_ok(),
             }
         }
     }
@@ -909,6 +913,25 @@ mod tests {
             "the worker exited on the drop, not on a flush tick"
         );
         assert_eq!(*sink.ids.lock(), ["req-0", "req-1"]);
+    }
+
+    /// A spinning worker never lets the paused clock advance, so this test
+    /// would hang rather than reach the tick.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_cancel_sender_leaves_the_worker_serving_its_queue() {
+        let sink = FakeSink::new(Mode::Ok);
+        let mut c = cfg();
+        c.flush_interval = Duration::from_secs(1);
+        let (handle, worker) = SinkPipeline::new(sink.clone(), c);
+        let (cancel_tx, cancel) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        tokio::spawn(worker.run(cancel));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        drop(cancel_tx);
+
+        assert!(handle.try_enqueue(rec(0)));
+        tokio::time::sleep_until(started + Duration::from_secs(1) + TICK).await;
+        assert_eq!(*sink.ids.lock(), ["req-0"]);
     }
 
     #[tokio::test]
