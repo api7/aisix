@@ -345,6 +345,10 @@ impl SinkPipeline {
             if self.rx.len() >= self.cfg.max_batch {
                 self.take(&mut buffer);
                 self.flush(&mut buffer, None, &mut shutdown).await;
+                // `try_recv` spends no scheduler budget, and a sink that
+                // fails without waiting never yields either; `recv` used
+                // to make this loop give way to the runtime's other tasks.
+                tokio::task::consume_budget().await;
                 continue;
             }
             if self.rx.is_closed() {
