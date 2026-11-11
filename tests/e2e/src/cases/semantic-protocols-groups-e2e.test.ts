@@ -36,7 +36,12 @@ import { pickFreePort } from "../harness/ports.js";
 // first input is the classified text.
 
 const CALLER_PLAINTEXT = "sk-semantic-protocols-e2e";
-const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
+const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+const CALLER_KEY_HASH = sha256(CALLER_PLAINTEXT);
+// Callers with their own counters, for the rate-limit cases.
+const TEAM_CALLER = "sk-semantic-protocols-e2e-team";
+const CAPPED_CALLER = "sk-semantic-protocols-e2e-capped";
+const ALL_REFUSED_CALLER = "sk-semantic-protocols-e2e-all-refused";
 
 const LEGAL_ASK = "please review this contract";
 const OTHER_ASK = "what time is the meeting tomorrow";
@@ -196,7 +201,7 @@ describe("semantic routing on every protocol, with model-group targets", () => {
     const chatTarget = async (
       name: string,
       content: string,
-      opts: { failing?: boolean; allowed_cidrs?: string[] } = {},
+      opts: { failing?: boolean; allowed_cidrs?: string[]; rate_limit?: object } = {},
     ) => {
       const mock = await startChatMock(content, opts.failing);
       chatMocks[name] = mock;
@@ -213,6 +218,7 @@ describe("semantic routing on every protocol, with model-group targets", () => {
         model_name: "deepseek-chat",
         provider_key_id: pk.id,
         ...(opts.allowed_cidrs ? { allowed_cidrs: opts.allowed_cidrs } : {}),
+        ...(opts.rate_limit ? { rate_limit: opts.rate_limit } : {}),
       });
     };
     await chatTarget("sp-legal", "served-by-legal");
@@ -256,10 +262,23 @@ describe("semantic routing on every protocol, with model-group targets", () => {
         routing: { strategy: "failover", targets: members.map((model) => ({ model })) },
         ...extra,
       });
-    await group("sp-legal-group", ["sp-member-down", "sp-member-up"]);
+    const legalGroup = await group("sp-legal-group", ["sp-member-down", "sp-member-up"]);
+    await chatTarget("sp-full-a", "served-by-full-a", { rate_limit: { rpm: 1 } });
+    await chatTarget("sp-full-b", "served-by-full-b", { rate_limit: { rpm: 1 } });
+    await chatTarget("sp-free", "served-by-free");
     await group("sp-locked-group", ["sp-locked-member"]);
     await group("sp-limited-group", ["sp-limited-member"], { rate_limit: { rpm: 2 } });
     await group("ct-legal-group", ["ct-member-down", "ct-member-up"]);
+    await group("sp-capped-group", ["sp-member-up"], { rate_limit: { rpm: 1 } });
+    await group("sp-full-group", ["sp-full-a", "sp-full-b"]);
+    await seed.createRateLimitPolicy({
+      name: "sp-group-pinned",
+      conditions: [
+        { dimension: "team", operator: "in", value: ["sp-team"] },
+        { dimension: "model", operator: "in", value: [legalGroup.id] },
+      ],
+      limits: { rpm: 2 },
+    });
 
     const router = (name: string, legalTarget: string, defaultTarget: string) =>
       seed!.createModel({
@@ -284,6 +303,8 @@ describe("semantic routing on every protocol, with model-group targets", () => {
     await router("sp-limited-router", "sp-limited-group", "sp-default");
     await router("ct-router", "ct-legal", "ct-default");
     await router("ct-group-router", "ct-legal-group", "ct-default");
+    await router("sp-capped-router", "sp-capped-group", "sp-default");
+    await router("sp-full-router", "sp-full-group", "sp-default");
     // An embedding model that does not exist: every decision fails, and
     // the failure target serves.
     await seed.createModel({
@@ -300,6 +321,9 @@ describe("semantic routing on every protocol, with model-group targets", () => {
     });
 
     // Seeded last: authenticating it proves every resource above landed.
+    await seed.createApiKey({ key_hash: sha256(TEAM_CALLER), allowed_models: ["*"], team_id: "sp-team" });
+    await seed.createApiKey({ key_hash: sha256(CAPPED_CALLER), allowed_models: ["*"], rate_limit: { rpm: 1 } });
+    await seed.createApiKey({ key_hash: sha256(ALL_REFUSED_CALLER), allowed_models: ["*"], rate_limit: { rpm: 1 } });
     await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
     const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
@@ -314,14 +338,14 @@ describe("semantic routing on every protocol, with model-group targets", () => {
 
   const ready = () => etcdReachable && !!app && !!embed;
 
-  async function post(path: string, body: object, anthropic = false): Promise<Result> {
+  async function post(path: string, body: object, anthropic = false, key = CALLER_PLAINTEXT): Promise<Result> {
     const res = await fetch(`${app!.proxyUrl}${path}`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         ...(anthropic
-          ? { "x-api-key": CALLER_PLAINTEXT, "anthropic-version": "2023-06-01" }
-          : { authorization: `Bearer ${CALLER_PLAINTEXT}` }),
+          ? { "x-api-key": key, "anthropic-version": "2023-06-01" }
+          : { authorization: `Bearer ${key}` }),
       },
       body: JSON.stringify(body),
     });
@@ -581,6 +605,50 @@ describe("semantic routing on every protocol, with model-group targets", () => {
       const third = await responses("sp-limited-router", LEGAL_ASK);
       expect(third.status, third.text).toBe(429);
       expect(chatMocks["sp-limited-member"]!.hits).toBe(2);
+    });
+
+    test("a policy pinned to the group counts once per request, failovers included", async (ctx) => {
+      if (!ready()) return ctx.skip();
+      await awaitWindowHeadroom(10);
+      const ask = { model: "sp-group-router", messages: [{ role: "user", content: LEGAL_ASK }] };
+      const down = chatMocks["sp-member-down"]!.hits;
+      // Each request fails over from the down member: two attempts per request.
+      for (let i = 0; i < 2; i++) {
+        const r = await post("/v1/chat/completions", ask, false, TEAM_CALLER);
+        expect(r.status, `request ${i + 1}: ${r.text}`).toBe(200);
+      }
+      expect(chatMocks["sp-member-down"]!.hits - down).toBe(2);
+      const third = await post("/v1/chat/completions", ask, false, TEAM_CALLER);
+      expect(third.status, third.text).toBe(429);
+    });
+
+    test("a request the group's own limit refuses leaves the router's gate unconsumed", async (ctx) => {
+      if (!ready()) return ctx.skip();
+      await awaitWindowHeadroom(10);
+      const ask = (model: string, text: string) => ({ model, messages: [{ role: "user", content: text }] });
+      // Fill the group's rpm 1 with another key.
+      expect((await chat("sp-capped-router", [{ role: "user", content: LEGAL_ASK }])).status).toBe(200);
+      const refused = await post("/v1/chat/completions", ask("sp-capped-router", LEGAL_ASK), false, CAPPED_CALLER);
+      expect(refused.status, refused.text).toBe(429);
+      // The key's only slot (rpm 1) is still free.
+      const ok = await post("/v1/chat/completions", ask("sp-router", OTHER_ASK), false, CAPPED_CALLER);
+      expect(ok.status, ok.text).toBe(200);
+      const over = await post("/v1/chat/completions", ask("sp-router", OTHER_ASK), false, CAPPED_CALLER);
+      expect(over.status).toBe(429);
+    });
+
+    test("a request whose every group member refuses leaves the router's gate unconsumed", async (ctx) => {
+      if (!ready()) return ctx.skip();
+      await awaitWindowHeadroom(10);
+      const ask = (model: string, text: string) => ({ model, messages: [{ role: "user", content: text }] });
+      expect((await chat("sp-full-a", [{ role: "user", content: OTHER_ASK }])).status).toBe(200);
+      expect((await chat("sp-full-b", [{ role: "user", content: OTHER_ASK }])).status).toBe(200);
+      const refused = await post("/v1/chat/completions", ask("sp-full-router", LEGAL_ASK), false, ALL_REFUSED_CALLER);
+      expect(refused.status, refused.text).toBe(429);
+      const ok = await post("/v1/chat/completions", ask("sp-free", OTHER_ASK), false, ALL_REFUSED_CALLER);
+      expect(ok.status, ok.text).toBe(200);
+      const over = await post("/v1/chat/completions", ask("sp-free", OTHER_ASK), false, ALL_REFUSED_CALLER);
+      expect(over.status).toBe(429);
     });
 
     test("a group with no member this caller may reach is unavailable: default serves", async (ctx) => {
