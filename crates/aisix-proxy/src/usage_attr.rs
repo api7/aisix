@@ -1309,11 +1309,11 @@ pub(crate) fn emit_usage(
             })
         });
     state.otlp_fan_out.fan_out(
-        &event,
+        event,
         content,
         emission.as_ref(),
         facts.as_ref(),
-        exporters.iter().map(|e| &e.value),
+        exporters.iter(),
     );
 }
 

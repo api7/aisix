@@ -22,6 +22,7 @@
 //! that worker for life and take batching, encoding and delivery with it.
 //! [`ExporterPipelines::set_runtime`] names where pipelines run instead.
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
@@ -37,6 +38,11 @@ struct Running {
     /// Hash of the exporter's delivery-relevant config. A change rebuilds the
     /// pipeline (old stops, new starts).
     fingerprint: u64,
+    /// The config the fingerprint was last checked against. Held, not just
+    /// remembered by address, so the address cannot be reused by a different
+    /// config while it is stored: a request that hands the same config back
+    /// skips the hash.
+    source: Option<Arc<dyn Any + Send + Sync>>,
     handle: SinkHandle,
     cancel: watch::Sender<bool>,
     /// Detached worker; awaited only by [`ExporterPipelines::shutdown`].
@@ -99,7 +105,7 @@ impl ExporterPipelines {
         fingerprint: u64,
         build: impl FnOnce() -> Arc<dyn ObservabilitySink>,
     ) -> SinkHandle {
-        self.get_or_create_if(key, fingerprint, || true, build)
+        self.resolve(key, None, || fingerprint, || true, build)
             .expect("admitted unconditionally")
     }
 
@@ -107,19 +113,49 @@ impl ExporterPipelines {
     /// `admit` holds. `admit` runs under the same lock as [`Self::retain`],
     /// so a caller that judges liveness from state published before a
     /// `retain` cannot start a pipeline that `retain` has already stopped.
-    pub fn get_or_create_if(
+    ///
+    /// `source` is the exporter config `fingerprint` hashes. Handing back
+    /// the same `Arc` the running pipeline was last checked against returns
+    /// its handle without computing the fingerprint.
+    pub fn get_or_create_if<S: Send + Sync + 'static>(
         &self,
         key: &str,
-        fingerprint: u64,
+        source: &Arc<S>,
+        fingerprint: impl FnOnce() -> u64,
+        admit: impl FnOnce() -> bool,
+        build: impl FnOnce() -> Arc<dyn ObservabilitySink>,
+    ) -> Option<SinkHandle> {
+        let source: Arc<dyn Any + Send + Sync> = Arc::clone(source) as _;
+        self.resolve(key, Some(source), fingerprint, admit, build)
+    }
+
+    fn resolve(
+        &self,
+        key: &str,
+        source: Option<Arc<dyn Any + Send + Sync>>,
+        fingerprint: impl FnOnce() -> u64,
         admit: impl FnOnce() -> bool,
         build: impl FnOnce() -> Arc<dyn ObservabilitySink>,
     ) -> Option<SinkHandle> {
         let mut running = self.running.lock();
-        if let Some(existing) = running.get(key) {
-            if existing.fingerprint == fingerprint {
-                return Some(existing.handle.clone());
+        let fingerprint = match running.get_mut(key) {
+            Some(existing) => {
+                let same_source = match (&existing.source, &source) {
+                    (Some(a), Some(b)) => std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b)),
+                    _ => false,
+                };
+                if same_source {
+                    return Some(existing.handle.clone());
+                }
+                let fingerprint = fingerprint();
+                if existing.fingerprint == fingerprint {
+                    existing.source = source;
+                    return Some(existing.handle.clone());
+                }
+                fingerprint
             }
-        }
+            None => fingerprint(),
+        };
         if !admit() {
             return None;
         }
@@ -140,6 +176,7 @@ impl ExporterPipelines {
             key.to_string(),
             Running {
                 fingerprint,
+                source,
                 handle: handle.clone(),
                 cancel: cancel_tx,
                 worker,
@@ -269,6 +306,51 @@ mod tests {
             builds.fetch_add(1, Ordering::Relaxed);
             Arc::new(CountingSink { delivered }) as Arc<dyn ObservabilitySink>
         }
+    }
+
+    #[tokio::test]
+    async fn the_same_source_skips_the_fingerprint_and_a_new_one_is_checked() {
+        let mgr = manager();
+        let builds = Arc::new(AtomicU32::new(0));
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let hashed = AtomicU32::new(0);
+        let resolve = |source: &Arc<String>, fingerprint: u64| {
+            mgr.get_or_create_if(
+                "a",
+                source,
+                || {
+                    hashed.fetch_add(1, Ordering::Relaxed);
+                    fingerprint
+                },
+                || true,
+                counting(&builds, &delivered),
+            )
+            .unwrap()
+        };
+        let first = Arc::new("v1".to_string());
+        resolve(&first, 1);
+        resolve(&first, 1);
+        assert_eq!(
+            hashed.load(Ordering::Relaxed),
+            1,
+            "the same config is not hashed again"
+        );
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+
+        // A new Arc holding the same config keeps the pipeline…
+        let reloaded = Arc::new("v1".to_string());
+        resolve(&reloaded, 1);
+        resolve(&reloaded, 1);
+        assert_eq!(hashed.load(Ordering::Relaxed), 2);
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+
+        // …and one with a changed config rebuilds it.
+        let edited = Arc::new("v2".to_string());
+        resolve(&edited, 2);
+        assert_eq!(builds.load(Ordering::Relaxed), 2);
+        resolve(&edited, 2);
+        assert_eq!(hashed.load(Ordering::Relaxed), 3);
+        mgr.shutdown().await;
     }
 
     #[tokio::test]

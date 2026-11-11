@@ -240,8 +240,9 @@ pub struct SinkRecord {
     /// Canonical schema version. See [`SCHEMA_VERSION`].
     pub schema_version: &'static str,
     /// The per-request metadata (flattened into the record on the wire).
+    /// Shared by every record one event fans out to.
     #[serde(flatten)]
-    pub usage: UsageEvent,
+    pub usage: Arc<UsageEvent>,
     /// Opt-in captured content; omitted entirely under `metadata_only`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<SinkContent>,
@@ -273,10 +274,10 @@ pub struct SinkRecord {
 
 impl SinkRecord {
     /// Build a metadata-only record (no content captured).
-    pub fn metadata_only(usage: UsageEvent) -> Self {
+    pub fn metadata_only(usage: impl Into<Arc<UsageEvent>>) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
-            usage,
+            usage: usage.into(),
             content: None,
             trace: None,
             facts: None,
