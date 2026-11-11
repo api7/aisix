@@ -963,6 +963,14 @@
           },
           "minItems": 1,
           "type": "array"
+        },
+        "session_affinity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SemanticSessionAffinity"
+            }
+          ],
+          "description": "Session affinity, for either decision mode. When omitted, every request is classified."
         }
       },
       "required": [
@@ -1131,6 +1139,26 @@
       "required": [
         "name"
       ],
+      "type": "object"
+    },
+    "SemanticSessionAffinity": {
+      "additionalProperties": false,
+      "description": "Keep a session on the model its first matched request was routed to.\n\nA request's session id is read from, in order: the `x-aisix-session-id` header; any `x-<vendor>-session-id` header (such as `x-claude-code-session-id`) whose value is at least 8 letters, digits, `-` or `_`; for Codex clients, the `session-id`, `session_id`, `thread-id` or `conversation_id` header; the `x-session-id` header; the session in the body's `metadata.user_id`; the body's `metadata.session_id`; and the `session.id` entry of the `baggage` header. A request without one is routed normally.\n\nWhen a request with a session id matches a route and is sent to that route's target, the session is pinned to that route. Later requests of the session with the same API key go to the pinned route without being classified, for as long as that route's target is still a route target of this router. A request that falls back to `default` or to a failure target pins nothing. Token-counting requests use a pin but never create one.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Whether sessions are pinned. While off, existing pins are ignored.",
+          "type": "boolean"
+        },
+        "ttl_seconds": {
+          "default": 3600,
+          "description": "How long a pin lasts after the last request that used it, in seconds.",
+          "format": "uint64",
+          "maximum": 604800.0,
+          "minimum": 60.0,
+          "type": "integer"
+        }
+      },
       "type": "object"
     },
     "WhenAllUnavailablePolicy": {

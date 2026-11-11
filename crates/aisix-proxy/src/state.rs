@@ -287,9 +287,11 @@ pub struct ProxyStateInner {
     /// the two resolve a rename at the same instant.
     pub mcp_servers: Arc<LiveMcpServerIndex>,
     /// Per-user tokens of `oauth2_authorization_code` MCP servers.
-    /// [`ProxyState::with_mcp_oauth_store`] picks where they are kept; until
+    /// [`ProxyState::with_shared_store`] picks where they are kept; until
     /// then, this process alone.
     pub(crate) mcp_oauth: Arc<aisix_mcp::UserOAuthManager>,
+    /// Semantic-router session pins, kept in the same store as `mcp_oauth`.
+    pub(crate) session_pins: Arc<crate::session_affinity::SessionPins>,
     /// The `budgets` documents indexed for the per-request budget gate,
     /// rebuilt only when that table changes.
     pub(crate) budgets: Arc<crate::budget::LiveBudgetIndex>,
@@ -407,6 +409,8 @@ impl ProxyState {
     pub fn new(snapshot: SnapshotHandle<AisixSnapshot>, hub: Arc<Hub>, cfg: &ProxyConfig) -> Self {
         let metrics = Arc::new(Metrics::new(false));
         let semantic_cache = Arc::new(crate::semantic::SemanticVectorCache::default());
+        let shared_store: Arc<dyn aisix_mcp::SharedStore> =
+            Arc::new(aisix_mcp::MemoryStore::default());
         let guardrail_index = LiveGuardrailIndex::new_with_sink(
             snapshot.clone(),
             None,
@@ -442,9 +446,8 @@ impl ProxyState {
             guardrail_index,
             pricing: Arc::new(LivePricingIndex::new()),
             mcp_servers: Arc::new(LiveMcpServerIndex::new()),
-            mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::new(
-                aisix_mcp::MemoryStore::default(),
-            ))),
+            mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::clone(&shared_store))),
+            session_pins: Arc::new(crate::session_affinity::SessionPins::new(shared_store)),
             budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
@@ -478,6 +481,8 @@ impl ProxyState {
     ) -> Self {
         let metrics = Arc::new(Metrics::new(false));
         let semantic_cache = Arc::new(crate::semantic::SemanticVectorCache::default());
+        let shared_store: Arc<dyn aisix_mcp::SharedStore> =
+            Arc::new(aisix_mcp::MemoryStore::default());
         let guardrail_index = LiveGuardrailIndex::new_with_sink(
             snapshot.clone(),
             None,
@@ -498,9 +503,8 @@ impl ProxyState {
             guardrail_index,
             pricing: Arc::new(LivePricingIndex::new()),
             mcp_servers: Arc::new(LiveMcpServerIndex::new()),
-            mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::new(
-                aisix_mcp::MemoryStore::default(),
-            ))),
+            mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::clone(&shared_store))),
+            session_pins: Arc::new(crate::session_affinity::SessionPins::new(shared_store)),
             budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
@@ -536,6 +540,8 @@ impl ProxyState {
         cfg: &ProxyConfig,
     ) -> Self {
         let semantic_cache = Arc::new(crate::semantic::SemanticVectorCache::default());
+        let shared_store: Arc<dyn aisix_mcp::SharedStore> =
+            Arc::new(aisix_mcp::MemoryStore::default());
         let guardrail_index = LiveGuardrailIndex::new_with_sink(
             snapshot.clone(),
             None,
@@ -568,9 +574,8 @@ impl ProxyState {
             guardrail_index,
             pricing: Arc::new(LivePricingIndex::new()),
             mcp_servers: Arc::new(LiveMcpServerIndex::new()),
-            mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::new(
-                aisix_mcp::MemoryStore::default(),
-            ))),
+            mcp_oauth: Arc::new(aisix_mcp::UserOAuthManager::new(Arc::clone(&shared_store))),
+            session_pins: Arc::new(crate::session_affinity::SessionPins::new(shared_store)),
             budgets: Arc::new(crate::budget::LiveBudgetIndex::default()),
             health: Arc::new(HealthTracker::with_flags(bookkeeping_flags)),
             livez: Arc::new(LivezState::new()),
@@ -645,10 +650,12 @@ impl ProxyState {
     /// Attach a CP-side usage telemetry sink. Default is `disabled()`;
     /// the server bootstrap calls this in managed mode after spawning
     /// the sender worker.
-    /// Keep per-user MCP tokens in `store` rather than in this process.
-    pub fn with_mcp_oauth_store(mut self, store: Arc<dyn aisix_mcp::SharedStore>) -> Self {
-        Arc::make_mut(&mut self.inner).mcp_oauth =
-            Arc::new(aisix_mcp::UserOAuthManager::new(store));
+    /// Keep per-user MCP tokens and semantic session pins in `store` rather
+    /// than in this process.
+    pub fn with_shared_store(mut self, store: Arc<dyn aisix_mcp::SharedStore>) -> Self {
+        let inner = Arc::make_mut(&mut self.inner);
+        inner.mcp_oauth = Arc::new(aisix_mcp::UserOAuthManager::new(Arc::clone(&store)));
+        inner.session_pins = Arc::new(crate::session_affinity::SessionPins::new(store));
         self
     }
 

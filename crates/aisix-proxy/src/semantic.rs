@@ -35,6 +35,7 @@ use aisix_obs::{
 
 use crate::error::ProxyError;
 use crate::routing::{AttemptModel, RoutingRequest};
+use crate::session_affinity::Pin;
 use crate::state::ProxyState;
 
 // Scoring primitives are shared with the `kind: "semantic"` guardrail,
@@ -267,6 +268,7 @@ pub(crate) async fn resolve(
     prompt: &str,
     request_id: &str,
     routing: RoutingRequest<'_>,
+    session: SessionRequest<'_>,
 ) -> Result<SemanticDispatch, ProxyError> {
     let semantic = router_entry
         .value
@@ -280,6 +282,30 @@ pub(crate) async fn resolve(
     // working across a rename of any of them, and an id that resolves to
     // nothing behaves as the dangling alias it stands in for.
     let default_target = semantic.default_ref(snapshot);
+
+    let affinity = session_affinity_key(router_entry, semantic, routing, session);
+    if let Some((key, ttl)) = &affinity {
+        if let Some(hit) = state.session_pins.lookup(key, *ttl).await {
+            match pinned_route(snapshot, semantic, &hit.pin) {
+                Some(i) => {
+                    let dispatch = serve_route(
+                        state,
+                        snapshot,
+                        router,
+                        routing,
+                        semantic,
+                        i,
+                        &default_target,
+                        None,
+                        true,
+                    )?;
+                    state.session_pins.touch(key, hit, *ttl).await;
+                    return Ok(dispatch);
+                }
+                None => state.session_pins.discard(key, &hit).await,
+            }
+        }
+    }
 
     // No user text to classify (e.g. a system-only or tool-only request):
     // route to `default` without a decision call rather than deciding on
@@ -324,26 +350,56 @@ pub(crate) async fn resolve(
 
     let dispatch = match pick.winner {
         Some(i) => {
-            let eligible = select_eligible(
+            let dispatch = serve_route(
                 state,
                 snapshot,
                 router,
                 routing,
-                &semantic.routes[i].target_ref(snapshot),
-                Some(&default_target),
-            )?;
-            // `x-aisix-route` reports the route that actually served the
-            // request: a winner displaced by its target's gates is a
-            // fall-through to `default`, not a served route.
-            let name = (!eligible.fell_back).then(|| semantic.routes[i].name.clone());
-            note_decision(
-                name.clone(),
+                semantic,
+                i,
+                &default_target,
                 pick.score,
-                eligible
-                    .fell_back
-                    .then_some(SemanticFallback::TargetUnavailable),
-            );
-            eligible.into_dispatch(name)
+                false,
+            )?;
+            match (&affinity, &dispatch.route) {
+                (Some((key, ttl)), Some(route)) if session.create_pins => {
+                    let target_id = snapshot
+                        .models
+                        .get_by_name(&semantic.routes[i].target_ref(snapshot))
+                        .map(|e| e.id.clone())
+                        .expect("a served route's target resolves");
+                    let own = Pin {
+                        target_id,
+                        route: route.clone(),
+                    };
+                    let pin = state
+                        .session_pins
+                        .create(key, own.clone(), *ttl, |p| {
+                            pinned_route(snapshot, semantic, p).is_some()
+                        })
+                        .await;
+                    if pin.target_id == own.target_id {
+                        dispatch
+                    } else {
+                        // Another request of the session pinned it first:
+                        // go where that one went.
+                        let winner = pinned_route(snapshot, semantic, &pin)
+                            .expect("create returns a usable winner");
+                        serve_route(
+                            state,
+                            snapshot,
+                            router,
+                            routing,
+                            semantic,
+                            winner,
+                            &default_target,
+                            None,
+                            true,
+                        )?
+                    }
+                }
+                _ => dispatch,
+            }
         }
         None => {
             note_decision(None, pick.score, pick.miss);
@@ -359,6 +415,85 @@ pub(crate) async fn resolve(
         "semantic routing decision",
     );
     Ok(dispatch)
+}
+
+/// What session affinity reads off a request besides its headers.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SessionRequest<'a> {
+    /// The body's `metadata` object, where a client may name its session.
+    pub metadata: Option<&'a serde_json::Value>,
+    /// Whether a matched route pins the session. Off for requests that only
+    /// measure (`count_tokens`): they follow a pin but never set one.
+    pub create_pins: bool,
+}
+
+/// The pin key and TTL for this request, when its router keeps session
+/// affinity and the request names a session.
+fn session_affinity_key(
+    router_entry: &ResourceEntry<Model>,
+    semantic: &Semantic,
+    routing: RoutingRequest<'_>,
+    session: SessionRequest<'_>,
+) -> Option<(String, std::time::Duration)> {
+    let affinity = semantic.session_affinity.as_ref().filter(|a| a.enabled)?;
+    let session_id = crate::session_id::resolve(routing.headers?, session.metadata)?;
+    Some((
+        crate::session_affinity::pin_key(&router_entry.id, routing.api_key_id, &session_id),
+        affinity.ttl(),
+    ))
+}
+
+/// The route `pin` still holds: one whose target is the pinned model,
+/// the pinned route's own name first. `None` once no route targets it.
+fn pinned_route(snapshot: &AisixSnapshot, semantic: &Semantic, pin: &Pin) -> Option<usize> {
+    let targets_pin = |route: &SemanticRoute| {
+        snapshot
+            .models
+            .get_by_name(&route.target_ref(snapshot))
+            .is_some_and(|e| e.id == pin.target_id)
+    };
+    semantic
+        .routes
+        .iter()
+        .position(|r| r.name == pin.route && targets_pin(r))
+        .or_else(|| semantic.routes.iter().position(targets_pin))
+}
+
+/// Dispatch as route `i` having won: its target when that is eligible,
+/// else `default` as `target_unavailable`.
+#[allow(clippy::too_many_arguments)]
+fn serve_route(
+    state: &ProxyState,
+    snapshot: &AisixSnapshot,
+    router: &Model,
+    routing: RoutingRequest<'_>,
+    semantic: &Semantic,
+    i: usize,
+    default_target: &str,
+    score: Option<f64>,
+    pinned: bool,
+) -> Result<SemanticDispatch, ProxyError> {
+    let eligible = select_eligible(
+        state,
+        snapshot,
+        router,
+        routing,
+        &semantic.routes[i].target_ref(snapshot),
+        Some(default_target),
+    )?;
+    // `x-aisix-route` reports the route that actually served the request:
+    // a winner displaced by its target's gates is a fall-through to
+    // `default`, not a served route.
+    let name = (!eligible.fell_back).then(|| semantic.routes[i].name.clone());
+    crate::attribution::note_semantic_decision(SemanticAccessLog {
+        route: name.clone(),
+        score,
+        fallback: eligible
+            .fell_back
+            .then_some(SemanticFallback::TargetUnavailable),
+        pinned,
+    });
+    Ok(eligible.into_dispatch(name))
 }
 
 const REMINDER_OPEN: &str = "<system-reminder>";
@@ -500,6 +635,7 @@ fn note_decision(route: Option<String>, score: Option<f64>, fallback: Option<Sem
         route,
         score,
         fallback,
+        pinned: false,
     });
 }
 

@@ -118,7 +118,8 @@ pub use schema::{
 };
 pub use semantic::{
     Aggregation, ClassifierType, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure,
-    Semantic, SemanticClassifier, SemanticMatch, SemanticRoute, TYPESAFE_PROVIDER,
+    Semantic, SemanticClassifier, SemanticMatch, SemanticRoute, SemanticSessionAffinity,
+    TYPESAFE_PROVIDER,
 };
 pub use snapshot::{AisixSnapshot, KeyOwnerNames};
 pub use tags::{effective_tags, is_valid_tag_key, tag_value_from_claim, Tags, TAG_KEY_PATTERN};

@@ -1643,6 +1643,10 @@ async fn dispatch(
             context_origin: None,
             budget: Some(&budget_gate),
         },
+        crate::semantic::SessionRequest {
+            metadata: req.extra.get("metadata"),
+            create_pins: true,
+        },
     )
     .await
     .map_err(&with_model)?;

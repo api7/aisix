@@ -89,6 +89,8 @@ mod responses_bridge;
 mod rewrite;
 mod routing;
 mod semantic;
+mod session_affinity;
+mod session_id;
 mod span_facts;
 pub mod sse_keepalive;
 mod state;

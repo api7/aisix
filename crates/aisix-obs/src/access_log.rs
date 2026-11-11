@@ -292,6 +292,9 @@ pub struct SemanticAccessLog {
     /// `semantic_fallback`: set only when no matched route served the
     /// request.
     pub fallback: Option<SemanticFallback>,
+    /// `semantic_pinned`: the request went where its session is pinned
+    /// instead of being classified. Rendered only when `true`.
+    pub pinned: bool,
 }
 
 /// The `/mcp` half of an access-log line: which JSON-RPC method the single
@@ -367,6 +370,7 @@ impl AccessLog<'_> {
             semantic_route = semantic.and_then(|s| s.route.as_deref()),
             semantic_score = semantic.and_then(|s| s.score),
             semantic_fallback = semantic.and_then(|s| s.fallback.map(SemanticFallback::as_str)),
+            semantic_pinned = semantic.and_then(|s| s.pinned.then_some(true)),
             "proxy request completed",
         );
     }
@@ -1004,6 +1008,7 @@ mod tests {
                 route: Some("code".into()),
                 score: Some(0.81),
                 fallback: None,
+                pinned: false,
             });
             matched.emit();
             let mut fell_back = line.to_record();
@@ -1011,13 +1016,22 @@ mod tests {
                 route: None,
                 score: Some(0.2),
                 fallback: Some(SemanticFallback::LowConfidence),
+                pinned: false,
             });
             fell_back.emit();
+            let mut pinned = line.to_record();
+            pinned.semantic = Some(SemanticAccessLog {
+                route: Some("code".into()),
+                score: None,
+                fallback: None,
+                pinned: true,
+            });
+            pinned.emit();
             line.to_record().emit();
         });
         let out = writer.contents();
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 3, "{out}");
+        assert_eq!(lines.len(), 4, "{out}");
         assert!(lines[0].contains("semantic_route=\"code\""), "{out}");
         assert!(lines[0].contains("semantic_score=0.81"), "{out}");
         assert!(!lines[0].contains("semantic_fallback"), "{out}");
@@ -1027,6 +1041,11 @@ mod tests {
             lines[1].contains("semantic_fallback=\"low_confidence\""),
             "{out}"
         );
-        assert!(!lines[2].contains("semantic_"), "{out}");
+        assert!(!lines[0].contains("semantic_pinned"), "{out}");
+        assert!(!lines[1].contains("semantic_pinned"), "{out}");
+        assert!(lines[2].contains("semantic_route=\"code\""), "{out}");
+        assert!(lines[2].contains("semantic_pinned=true"), "{out}");
+        assert!(!lines[2].contains("semantic_score"), "{out}");
+        assert!(!lines[3].contains("semantic_"), "{out}");
     }
 }

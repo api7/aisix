@@ -521,6 +521,10 @@ async fn dispatch(
             context_origin: None,
             budget: Some(&budget_gate),
         },
+        crate::semantic::SessionRequest {
+            metadata: body.get("metadata"),
+            create_pins: false,
+        },
     )
     .await?;
     let _group_reservation = plan.reserve_group(state, snapshot, auth).await?;

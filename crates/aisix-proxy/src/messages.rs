@@ -741,6 +741,10 @@ async fn dispatch(
             context_origin: None,
             budget: Some(&budget_gate),
         },
+        crate::semantic::SessionRequest {
+            metadata: body.get("metadata"),
+            create_pins: true,
+        },
     )
     .await?;
     if let (Some(r), Some(group)) = (

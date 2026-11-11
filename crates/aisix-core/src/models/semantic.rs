@@ -248,6 +248,46 @@ impl SemanticClassifier {
     }
 }
 
+fn default_session_affinity_ttl_seconds() -> u64 {
+    3600
+}
+
+/// Keep a session on the model its first matched request was routed to.
+///
+/// A request's session id is read from, in order: the `x-aisix-session-id`
+/// header; any `x-<vendor>-session-id` header (such as
+/// `x-claude-code-session-id`) whose value is at least 8 letters, digits,
+/// `-` or `_`; for Codex clients, the `session-id`, `session_id`,
+/// `thread-id` or `conversation_id` header; the `x-session-id` header;
+/// the session in the body's `metadata.user_id`; the body's
+/// `metadata.session_id`; and the `session.id` entry of the `baggage`
+/// header. A request without one is routed normally.
+///
+/// When a request with a session id matches a route and is sent to that
+/// route's target, the session is pinned to that route. Later requests of
+/// the session with the same API key go to the pinned route without being
+/// classified, for as long as that route's target is still a route target
+/// of this router. A request that falls back to `default` or to a failure
+/// target pins nothing. Token-counting requests use a pin but never create
+/// one.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
+pub struct SemanticSessionAffinity {
+    /// Whether sessions are pinned. While off, existing pins are ignored.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How long a pin lasts after the last request that used it, in
+    /// seconds.
+    #[serde(default = "default_session_affinity_ttl_seconds")]
+    #[schemars(range(min = 60, max = 604800))]
+    pub ttl_seconds: u64,
+}
+
+impl SemanticSessionAffinity {
+    pub fn ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.ttl_seconds)
+    }
+}
+
 /// Semantic-routing config: pick a target by request meaning.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct Semantic {
@@ -305,6 +345,10 @@ pub struct Semantic {
     /// routing to `default`.
     #[serde(default, skip_serializing_if = "is_default_failure")]
     pub on_embedding_failure: OnEmbeddingFailure,
+    /// Session affinity, for either decision mode. When omitted, every
+    /// request is classified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_affinity: Option<SemanticSessionAffinity>,
 }
 
 fn is_default_failure(p: &OnEmbeddingFailure) -> bool {
