@@ -112,6 +112,8 @@ pub struct SessionPins {
     store: Arc<dyn SharedStore>,
     local: moka::future::Cache<String, Local>,
     skip_store_until: Mutex<Option<Instant>>,
+    /// Keys a store refresh is in flight for: one at a time per key.
+    refreshing: dashmap::DashSet<String>,
 }
 
 impl SessionPins {
@@ -123,6 +125,7 @@ impl SessionPins {
                 .expire_after(LocalExpiry)
                 .build(),
             skip_store_until: Mutex::new(None),
+            refreshing: dashmap::DashSet::new(),
         }
     }
 
@@ -170,9 +173,15 @@ impl SessionPins {
         if record.expires_at - unix_now() >= (ttl.as_secs() / 2) as i64 || self.store_skipped() {
             return;
         }
+        if !self.refreshing.insert(key.to_owned()) {
+            return;
+        }
         let this = Arc::clone(self);
         let key = key.to_owned();
-        tokio::spawn(async move { this.refresh(key, hit.pin, record, ttl).await });
+        tokio::spawn(async move {
+            this.refresh(key.clone(), hit.pin, record, ttl).await;
+            this.refreshing.remove(&key);
+        });
     }
 
     async fn refresh(&self, key: String, pin: Pin, record: StoreRecord, ttl: Duration) {
@@ -620,6 +629,31 @@ mod tests {
         }
         let other = SessionPins::new(probe.clone());
         assert_eq!(other.lookup("k", TTL).await.unwrap().pin, pin("x"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_refresh_at_a_time_per_key() {
+        let (probe, pins) = setup();
+        probe
+            .inner
+            .put(
+                NAMESPACE,
+                "j",
+                encode(&pin("y")),
+                Duration::from_secs(200),
+                &NO_LABELS,
+                PutCondition::CreateOnly,
+            )
+            .await
+            .unwrap();
+        let hit = pins.lookup("j", TTL).await.unwrap();
+        for _ in 0..5 {
+            pins.touch("j", hit.clone(), TTL).await;
+        }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(probe.puts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]

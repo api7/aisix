@@ -3539,7 +3539,7 @@ async fn dispatch(
     // three branches (non-streaming, streaming, cache hit) with the
     // same policy so a refactor can't silently flip one of them.
     let served_by_target = served_by_target_for_routing(
-        virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic(),
+        crate::dispatch_plan::is_routing_request(&virtual_entry.value),
         chosen_target_display_name,
     );
 
