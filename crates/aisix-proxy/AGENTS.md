@@ -418,6 +418,12 @@ Two shapes, both already implemented — copy the nearest one:
   pre-dispatch `quota::enforce*` already reserved) and the per-layer counting
   contract (AISIX-Cloud#1954).
 
+Those four loops read every group-level knob — `retry_on_429`,
+`fallback_on_statuses`, the group retries and timeouts, the per-target
+`RoutingParent` — off `dispatch_plan::DispatchPlan`, never off the addressed
+entry: under a semantic router whose target is a model group, the group
+supplies them, and an entry read silently drops them.
+
 Whichever shape, the group's own gate stays enforced pre-dispatch — the two tiers
 are additive, not either/or — and a caller-visible rejection must keep the
 direct-model envelope (`ModelIpRestricted` names no model and no CIDR), so a group

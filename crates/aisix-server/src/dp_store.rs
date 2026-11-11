@@ -31,7 +31,7 @@ impl DpManagerStore {
     pub fn new(origin: &str, mtls: &MtlsBundle) -> Self {
         let client = crate::heartbeat::build_client(mtls)
             .inspect_err(|error| {
-                tracing::error!(error = %format_args!("{error:#}"), "per-user MCP token storage is unavailable: \
+                tracing::error!(error = %format_args!("{error:#}"), "shared storage (per-user MCP tokens, session pins) is unavailable: \
                     could not build the dp-manager client");
             })
             .ok();

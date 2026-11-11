@@ -398,13 +398,23 @@ pub fn effective_timeouts(
     group: Option<&Model>,
     defaults: TimeoutDefaults,
 ) -> TimeoutBudget {
+    effective_timeouts_nested(target, group.as_slice(), defaults)
+}
+
+/// [`effective_timeouts`] across several parent levels, nearest first — a
+/// semantic router's group target is read before the router itself.
+pub fn effective_timeouts_nested(
+    target: &Model,
+    parents: &[&Model],
+    defaults: TimeoutDefaults,
+) -> TimeoutBudget {
     let request_level = target
         .request_timeout_level()
-        .or_else(|| group.and_then(|g| g.request_timeout_level()));
+        .or_else(|| parents.iter().find_map(|p| p.request_timeout_level()));
     let request = request_level.unwrap_or(defaults.request);
     let resource_stream = target
         .stream_read_timeout()
-        .or_else(|| group.and_then(|g| g.stream_read_timeout()));
+        .or_else(|| parents.iter().find_map(|p| p.stream_read_timeout()));
     let (stream, stream_configured) = if let Some(d) = resource_stream {
         (Some(d), true)
     } else if let Some(r) = request_level {
@@ -629,6 +639,7 @@ where
         crate::quota::TargetGate::new(routing.is_some().then_some(crate::quota::RoutingParent {
             name: &entry.value.display_name,
             entry_id: &entry.id,
+            group: None,
         }));
     'targets: for (i, target) in attempt_models.into_iter().enumerate() {
         let pk_id = crate::dispatch::resolve_provider_key(snapshot, &target.model)

@@ -42,16 +42,13 @@ impl PolicyIndex {
 
     /// A superset of matching policies. Full conditions, schedules and the
     /// request/target reservation phase still decide whether each one applies.
-    /// Model selectors include both dispatched target and caller-addressed parent.
+    /// Model selectors include the dispatched target, the caller-addressed parent
+    /// and a semantic router's group target.
     pub(crate) fn candidates(&self, input: &ConditionInput<'_>) -> impl Iterator<Item = &Entry> {
         let mut positions = self.fallback.clone();
         for (dimension, by_value) in &self.by_value {
-            let parent = match dimension {
-                PolicyDimension::Model => input.routing_parent_model,
-                PolicyDimension::ModelName => input.routing_parent_model_name,
-                _ => None,
-            };
-            for value in [input.get(dimension), parent].into_iter().flatten() {
+            let [parent, group] = input.routing_parents(dimension);
+            for value in [input.get(dimension), parent, group].into_iter().flatten() {
                 if let Some(matches) = by_value.get(value) {
                     positions.extend_from_slice(matches);
                 }

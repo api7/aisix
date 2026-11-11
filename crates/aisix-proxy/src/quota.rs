@@ -97,6 +97,17 @@ pub(crate) struct RoutingParent<'a> {
     pub name: &'a str,
     /// The parent's resource entry id.
     pub entry_id: &'a str,
+    /// The model group a semantic router's chosen target is, when it is
+    /// one: its members' policies match the group as well as the router.
+    pub group: Option<RoutingGroup<'a>>,
+}
+
+/// The model group between a semantic router and the member it dispatched
+/// to, in the same two spellings as [`RoutingParent`].
+#[derive(Clone, Copy)]
+pub(crate) struct RoutingGroup<'a> {
+    pub name: &'a str,
+    pub entry_id: &'a str,
 }
 
 /// The request's condition-dimension values at this gate point. Model
@@ -119,6 +130,8 @@ fn condition_input<'a>(
         provider: model_rl.and_then(|m| m.provider.as_deref()),
         routing_parent_model: routing_parent.map(|p| p.entry_id),
         routing_parent_model_name: routing_parent.map(|p| p.name),
+        routing_group_model: routing_parent.and_then(|p| p.group).map(|g| g.entry_id),
+        routing_group_model_name: routing_parent.and_then(|p| p.group).map(|g| g.name),
         tags: Some(&auth.tags),
     }
 }
@@ -135,8 +148,14 @@ fn condition_input<'a>(
 ///   no model property reserve once at the request gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PolicyPhase {
-    Request { defer_model_properties: bool },
+    Request {
+        defer_model_properties: bool,
+    },
     ModelTarget,
+    /// A model group a semantic router chose: only the classic `model`
+    /// scope naming the group, which its own request gate would have
+    /// reserved had the caller addressed it.
+    GroupTarget,
 }
 
 /// One policy layer this request must reserve at the current phase.
@@ -163,7 +182,9 @@ fn match_policy_layer(
         // Load-time validation rejects formless rows; nothing to enforce.
         return None;
     };
-    if matches!(phase, PolicyPhase::ModelTarget) && scope != PolicyScope::Model {
+    if matches!(phase, PolicyPhase::ModelTarget | PolicyPhase::GroupTarget)
+        && scope != PolicyScope::Model
+    {
         // Request-level scopes were reserved at the request gate; only
         // the model scope follows the target.
         return None;
@@ -210,6 +231,7 @@ fn match_conditional_layer(
             defer_model_properties,
         } => !(follows_model && defer_model_properties),
         PolicyPhase::ModelTarget => follows_model,
+        PolicyPhase::GroupTarget => false,
     };
     if !due_here {
         return None;
@@ -698,6 +720,56 @@ pub(crate) async fn reserve_model_only(
     reserve_target_layers(state, snapshot, &mrl, &input, None).await
 }
 
+/// Reserve what binds a model group a semantic router chose as its target,
+/// as the group's own request gate reserves it when a caller addresses the
+/// group directly: its inline `rate_limit` and the classic `model`-scope
+/// policies naming it. Everything else is reserved elsewhere — the
+/// request-level layers at the router's gate, and per attempt the member
+/// layers through [`TargetGate`], whose condition input carries the group
+/// beside the router ([`RoutingParent::group`]).
+///
+/// Like a request gate, all or nothing: a refusal refunds what this call
+/// counted.
+pub(crate) async fn reserve_semantic_group(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    group_entry_id: &str,
+    group: &aisix_core::Model,
+) -> Result<MultiReservation, ProxyError> {
+    let mut reservations = Vec::new();
+    let mrl = ModelRateLimit::from_model(&group.display_name, group_entry_id, group);
+    let reserved = async {
+        if let Some(ref limits) = mrl.limits {
+            let key = format!("model:{}", mrl.bucket_name);
+            let r = state
+                .limiter
+                .pre_commit(&key, limits)
+                .await
+                .map_err(|e| reject(state, e, "model", None))?;
+            reservations.push(r);
+        }
+        let input = condition_input(auth, Some(&mrl), None);
+        reserve_policy_layers(
+            state,
+            snapshot,
+            &input,
+            PolicyPhase::GroupTarget,
+            &mut reservations,
+            None,
+        )
+        .await
+    }
+    .await;
+    match reserved {
+        Ok(()) => Ok(MultiReservation::new(reservations)),
+        Err(e) => {
+            MultiReservation::new(reservations).refund().await;
+            Err(e)
+        }
+    }
+}
+
 /// The target pass shared by [`reserve_model_only`] and [`TargetGate`].
 /// On a refusal every layer counted in this pass — `caller_scoped.taken`
 /// included — is refunded.
@@ -1019,6 +1091,8 @@ mod tests {
                     provider: value,
                     routing_parent_model: parent,
                     routing_parent_model_name: parent,
+                    routing_group_model: None,
+                    routing_group_model_name: None,
                     tags: None,
                 };
                 for phase in [REQUEST, REQUEST_DEFERRING, PolicyPhase::ModelTarget] {
@@ -1339,6 +1413,7 @@ mod tests {
         let parent = RoutingParent {
             name: "chat-group",
             entry_id: "group-1",
+            group: None,
         };
         let input = condition_input(&auth, Some(&target), Some(parent));
         let layer = match_policy_layer(&policy, "pol-9", &input, PolicyPhase::ModelTarget)
@@ -1367,6 +1442,7 @@ mod tests {
         let parent = RoutingParent {
             name: "chat-group",
             entry_id: "group-1",
+            group: None,
         };
         let input = condition_input(&auth, Some(&target), Some(parent));
         let layer = match_policy_layer(&policy, "pol-10", &input, PolicyPhase::ModelTarget)
@@ -1381,6 +1457,7 @@ mod tests {
         let parent = RoutingParent {
             name: "chat-group",
             entry_id: "group-1",
+            group: None,
         };
         let input = condition_input(&auth, Some(&target), Some(parent));
         let facing = |policy: serde_json::Value| {
@@ -1452,6 +1529,33 @@ mod tests {
             "conditions": [group_leaf, { "dimension": "model", "operator": "~=", "value": "model-2" }],
             "limits": { "rpm": 1 },
         })));
+    }
+
+    #[test]
+    fn under_a_semantic_router_the_router_and_its_group_are_both_caller_facing() {
+        let auth = make_auth(None, None);
+        let target = make_model_rl("gpt-4.1-prod", "model-1", Some("openai"));
+        let parent = RoutingParent {
+            name: "router",
+            entry_id: "router-1",
+            group: Some(RoutingGroup {
+                name: "chat-group",
+                entry_id: "group-1",
+            }),
+        };
+        let input = condition_input(&auth, Some(&target), Some(parent));
+        let facing = |ids: &[&str]| {
+            let policy = make_conditional_policy(serde_json::json!({
+                "name": "p",
+                "conditions": [{ "dimension": "model", "operator": "in", "value": ids }],
+                "limits": { "rpm": 1 },
+            }));
+            assert!(match_policy_layer(&policy, "pol", &input, PolicyPhase::ModelTarget).is_some());
+            is_caller_facing(&policy, &input)
+        };
+        assert!(facing(&["group-1"]));
+        assert!(facing(&["router-1"]));
+        assert!(!facing(&["model-1"]));
     }
 
     #[test]

@@ -42,7 +42,7 @@ use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::render::{render_chunk, render_response};
-use crate::routing::{is_retryable, resolve_attempt_models, AttemptModel, RoutingRequest};
+use crate::routing::{is_retryable, RoutingRequest};
 use crate::state::ProxyState;
 
 /// Header set on every non-streaming response indicating whether the
@@ -398,22 +398,10 @@ pub async fn chat_completions(
                 // Only present for a semantic router that resolved to a route;
                 // absent on a fall-through to `default` and on non-semantic
                 // requests. Same RFC 7230 header-value guard as above.
-                if let Some(route) = success.served_by_route.as_deref() {
-                    match axum::http::HeaderValue::try_from(route) {
-                        Ok(v) => {
-                            success.response.headers_mut().insert("x-aisix-route", v);
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                route_name = %route,
-                                error = %err,
-                                "semantic route name is not a valid HTTP header value; \
-                                 omitting x-aisix-route — rename the route to use only \
-                                 visible ASCII (no CR/LF, no non-ASCII characters)"
-                            );
-                        }
-                    }
-                }
+                crate::dispatch_plan::insert_route_header(
+                    success.response.headers_mut(),
+                    success.served_by_route.as_deref(),
+                );
             }
             success.response
         }
@@ -1129,11 +1117,6 @@ async fn resolve_cache_hit(
     }
 }
 
-/// Text of the latest user turn, used as the semantic-routing query.
-/// Walks `messages` in reverse and returns the first `role: "user"`
-/// message's text. `ChatMessage::content` already carries the
-/// concatenated text of multimodal content blocks, so this also covers
-/// vision/array-shaped messages (non-text blocks are skipped upstream).
 /// Generated output text for the token-estimation fallback
 /// (AISIX-Cloud#1074) — the non-streaming analog of the stream loop's
 /// `est_output_text` accumulation: message content + reasoning +
@@ -1315,14 +1298,6 @@ pub(crate) fn effective_subcall_usage(
     )
     .min(u64::from(u32::MAX)) as u32;
     EffectiveSubcallUsage { usage, estimated }
-}
-
-fn last_user_message_text(req: &ChatFormat) -> Option<String> {
-    req.messages
-        .iter()
-        .rev()
-        .find(|m| m.role == aisix_gateway::Role::User)
-        .and_then(|m| m.text().map(std::borrow::Cow::into_owned))
 }
 
 /// Compute the value of [`Success::served_by_target`] for a request.
@@ -1652,41 +1627,31 @@ async fn dispatch(
     // the "which target + which route" decision. `semantic_route` carries
     // the matched route name (None on a fall-through to `default` or a
     // non-semantic request) for the `x-aisix-route` response header.
-    let (attempt_models, semantic_route): (Vec<AttemptModel>, Option<String>) =
-        if virtual_entry.value.is_semantic() {
-            let prompt = last_user_message_text(req).unwrap_or_default();
-            crate::semantic::resolve(
-                state,
-                snapshot,
-                &virtual_entry,
-                &prompt,
-                &client.source_ip,
-                request_id,
-            )
-            .await
-            .map_err(&with_model)?
-        } else {
-            let budget_gate = crate::budget::gate(state, snapshot);
-            let attempts = resolve_attempt_models(
-                &state.routing,
-                &state.runtime_status,
-                &state.pricing,
-                snapshot,
-                &req.model,
-                &virtual_entry.id,
-                &virtual_entry.value,
-                RoutingRequest {
-                    tags: &client.routing_tags,
-                    headers: Some(&client.headers),
-                    api_key_id: auth.entry.id.as_str(),
-                    source_ip: &client.source_ip,
-                    context_origin: None,
-                    budget: Some(&budget_gate),
-                },
-            )
-            .map_err(&with_model)?;
-            (attempts, None)
-        };
+    let budget_gate = crate::budget::gate(state, snapshot);
+    let plan = crate::dispatch_plan::plan(
+        state,
+        snapshot,
+        &req.model,
+        &virtual_entry,
+        request_id,
+        || crate::semantic::chat_prompt(req),
+        RoutingRequest {
+            tags: &client.routing_tags,
+            headers: Some(&client.headers),
+            api_key_id: auth.entry.id.as_str(),
+            source_ip: &client.source_ip,
+            context_origin: None,
+            budget: Some(&budget_gate),
+        },
+        crate::semantic::SessionRequest {
+            metadata: req.extra.get("metadata"),
+            create_pins: true,
+        },
+    )
+    .await
+    .map_err(&with_model)?;
+    let attempt_models = &plan.attempts;
+    let semantic_route = plan.semantic_route.clone();
 
     // For non-routing requests, surface a misconfigured bridge as a
     // proper 503 rather than burying it inside a generic Bridge error.
@@ -1718,6 +1683,9 @@ async fn dispatch(
         &virtual_entry.value,
     );
     let mut reservation = crate::quota::enforce_rate_limit(state, snapshot, auth, Some(&model_rl))
+        .await
+        .map_err(&with_model)?;
+    plan.reserve_group(state, snapshot, auth, &mut reservation)
         .await
         .map_err(&with_model)?;
 
@@ -1764,20 +1732,9 @@ async fn dispatch(
     // the remaining chunks, so a mid-stream stall terminates the response
     // (no fallback once the 200 is committed).
     if req.is_streaming() {
-        let retry_on_429 = virtual_entry
-            .value
-            .routing
-            .as_ref()
-            .map(|r| r.retry_on_429_or_default())
-            .unwrap_or(false);
-        let fallback_statuses: &[u16] = virtual_entry
-            .value
-            .routing
-            .as_ref()
-            .map(|r| r.fallback_on_statuses_or_default())
-            .unwrap_or(&[]);
-        let is_routing_request =
-            virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic();
+        let retry_on_429 = plan.retry_on_429(&virtual_entry.value);
+        let fallback_statuses: &[u16] = plan.fallback_statuses(&virtual_entry.value);
+        let is_routing_request = crate::dispatch_plan::is_routing_request(&virtual_entry.value);
         let mut stream_routing = RoutingTelemetry::for_request(&virtual_entry.value.display_name)
             .with_trace(client.trace.clone());
         let mut last_err: Option<BridgeError> = None;
@@ -1810,12 +1767,7 @@ async fn dispatch(
         // and post-stream token accounting cover the member's limits too
         // (AISIX-Cloud#1087).
         let mut won_member_reservation: Option<aisix_ratelimit::MultiReservation> = None;
-        let mut target_gate = crate::quota::TargetGate::new(is_routing_request.then_some(
-            crate::quota::RoutingParent {
-                name: &virtual_entry.value.display_name,
-                entry_id: &virtual_entry.id,
-            },
-        ));
+        let mut target_gate = crate::quota::TargetGate::new(plan.quota_parent(&virtual_entry));
 
         'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
             let model = &attempt.model;
@@ -1855,11 +1807,7 @@ async fn dispatch(
             // connect deadline (above) AND the per-chunk read timeout +
             // first-chunk peek below, so the budget is applied
             // consistently.
-            let timeouts = crate::routing::effective_timeouts(
-                model,
-                Some(&virtual_entry.value),
-                state.default_timeouts,
-            );
+            let timeouts = plan.timeouts(model, &virtual_entry.value, state.default_timeouts);
             let stream_budget = timeouts.stream;
             if let Some(d) = stream_budget {
                 ctx = ctx.with_deadline(d);
@@ -1880,7 +1828,7 @@ async fn dispatch(
             // existed on the group.
             let budget = crate::routing::effective_retries(
                 model,
-                crate::routing::group_retries_of(&virtual_entry.value),
+                plan.group_retries(&virtual_entry.value),
                 state.default_retries,
                 target_idx + 1 < attempt_models.len(),
             );
@@ -3022,20 +2970,9 @@ async fn dispatch(
     // requests (AISIX-Cloud#410). Stays `None` until an attempt wins.
     let mut chosen_target_display_name: Option<String> = None;
     let mut upstream: Option<aisix_gateway::ChatResponse> = None;
-    let retry_on_429 = virtual_entry
-        .value
-        .routing
-        .as_ref()
-        .map(|routing| routing.retry_on_429_or_default())
-        .unwrap_or(false);
-    let fallback_statuses: &[u16] = virtual_entry
-        .value
-        .routing
-        .as_ref()
-        .map(|routing| routing.fallback_on_statuses_or_default())
-        .unwrap_or(&[]);
-    let is_routing_request =
-        virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic();
+    let retry_on_429 = plan.retry_on_429(&virtual_entry.value);
+    let fallback_statuses: &[u16] = plan.fallback_statuses(&virtual_entry.value);
+    let is_routing_request = crate::dispatch_plan::is_routing_request(&virtual_entry.value);
     let mut routing = RoutingTelemetry::for_request(&virtual_entry.value.display_name)
         .with_trace(client.trace.clone());
     // The winning target's own model-layer reservation (routing dispatch
@@ -3043,11 +2980,7 @@ async fn dispatch(
     // member's TPM/TPD bills with the request-level layers
     // (AISIX-Cloud#1087).
     let mut won_member_reservation: Option<aisix_ratelimit::MultiReservation> = None;
-    let mut target_gate =
-        crate::quota::TargetGate::new(is_routing_request.then_some(crate::quota::RoutingParent {
-            name: &virtual_entry.value.display_name,
-            entry_id: &virtual_entry.id,
-        }));
+    let mut target_gate = crate::quota::TargetGate::new(plan.quota_parent(&virtual_entry));
 
     'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
         let model = &attempt.model;
@@ -3091,19 +3024,16 @@ async fn dispatch(
             Arc::new(pk_entry.value.clone()),
             Some(client),
         );
-        if let Some(d) = crate::routing::effective_timeouts(
-            model,
-            Some(&virtual_entry.value),
-            state.default_timeouts,
-        )
-        .request
+        if let Some(d) = plan
+            .timeouts(model, &virtual_entry.value, state.default_timeouts)
+            .request
         {
             ctx = ctx.with_deadline(d);
         }
         // Per-target retry budget — see the streaming loop above.
         let budget = crate::routing::effective_retries(
             model,
-            crate::routing::group_retries_of(&virtual_entry.value),
+            plan.group_retries(&virtual_entry.value),
             state.default_retries,
             target_idx + 1 < attempt_models.len(),
         );
@@ -3609,7 +3539,7 @@ async fn dispatch(
     // three branches (non-streaming, streaming, cache hit) with the
     // same policy so a refactor can't silently flip one of them.
     let served_by_target = served_by_target_for_routing(
-        virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic(),
+        crate::dispatch_plan::is_routing_request(&virtual_entry.value),
         chosen_target_display_name,
     );
 
@@ -3803,6 +3733,7 @@ async fn dispatch_ensemble(
         routing_parent: crate::quota::RoutingParent {
             name: &virtual_entry.value.display_name,
             entry_id: &virtual_entry.id,
+            group: None,
         },
     };
 
@@ -4028,6 +3959,7 @@ async fn dispatch_ensemble(
             Some(crate::quota::RoutingParent {
                 name: &virtual_entry.value.display_name,
                 entry_id: &virtual_entry.id,
+                group: None,
             }),
         )
         .await

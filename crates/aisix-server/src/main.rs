@@ -1262,10 +1262,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // so a real DP scrape surfaces UsageEvent throughput without
     // needing cp-api or an OTLP receiver in the loop.
     proxy_state = proxy_state.with_usage_sink(usage_sink.with_metrics((*metrics).clone()));
-    // With no dp-manager, per-user MCP tokens stay in this process and do not
-    // survive a restart.
+    // With no dp-manager, per-user MCP tokens and semantic session pins stay in
+    // this process and do not survive a restart.
     if let Some(h) = heartbeat_cfg.as_ref() {
-        proxy_state = proxy_state.with_mcp_oauth_store(Arc::new(dp_store::DpManagerStore::new(
+        proxy_state = proxy_state.with_shared_store(Arc::new(dp_store::DpManagerStore::new(
             dpmgr_origin(&h.url),
             &h.mtls,
         )));

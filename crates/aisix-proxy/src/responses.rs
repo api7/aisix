@@ -709,15 +709,17 @@ async fn dispatch(
     // targets whose Provider Key serves `/v1/responses` natively take the
     // verbatim passthrough; every other target is bridged through ChatFormat
     // (#825), so a group can mix and fail over across both kinds.
+    // A semantic router picks its target here, shared with
+    // /v1/chat/completions; a model-group target then selects its members
+    // with the same context affinity a caller addressing it gets.
     let budget_gate = crate::budget::gate(state, snapshot);
-    let attempt_models = crate::routing::resolve_attempt_models(
-        &state.routing,
-        &state.runtime_status,
-        &state.pricing,
+    let plan = crate::dispatch_plan::plan(
+        state,
         snapshot,
         &model_name,
-        &model_entry.id,
-        &model_entry.value,
+        &model_entry,
+        request_id,
+        || crate::semantic::responses_prompt(body),
         crate::routing::RoutingRequest {
             tags: &client.routing_tags,
             headers: Some(&client.headers),
@@ -726,28 +728,27 @@ async fn dispatch(
             context_origin: affinity.origin(),
             budget: Some(&budget_gate),
         },
-    )?;
-    let retry_on_429 = model_entry
-        .value
-        .routing
-        .as_ref()
-        .map(|r| r.retry_on_429_or_default())
-        .unwrap_or(false);
-    let fallback_statuses: &[u16] = model_entry
-        .value
-        .routing
-        .as_ref()
-        .map(|r| r.fallback_on_statuses_or_default())
-        .unwrap_or(&[]);
-    // NOTE: deliberately narrower than chat's `routing.is_some() ||
-    // is_semantic()`. The quota gate defers model-property policies on any
-    // routing/ensemble/semantic PARENT (`ModelRateLimit::routing_parent`),
-    // expecting the per-target pass to reserve them — which only runs when
-    // this flag is true. Safe today because semantic/ensemble parents
-    // cannot successfully dispatch on this endpoint (no provider →
-    // pre-dispatch 4xx); if this endpoint ever grows semantic support,
-    // widen this flag or the deferred policies are silently skipped.
-    let is_routing_request = model_entry.value.routing.is_some();
+        crate::semantic::SessionRequest {
+            metadata: body.get("metadata"),
+            create_pins: true,
+        },
+    )
+    .await?;
+    plan.reserve_group(
+        state,
+        snapshot,
+        auth,
+        reservation.get_or_insert_with(Default::default),
+    )
+    .await?;
+    let attempt_models = &plan.attempts;
+    let retry_on_429 = plan.retry_on_429(&model_entry.value);
+    let fallback_statuses: &[u16] = plan.fallback_statuses(&model_entry.value);
+    // Also arms the per-target quota pass the request gate deferred a
+    // routing/semantic parent's model-property policies to, and the
+    // context-affinity tagging: a semantic router can serve successive
+    // turns from different targets, exactly like a group.
+    let is_routing_request = crate::dispatch_plan::is_routing_request(&model_entry.value);
     let mut routing = RoutingTelemetry::for_request(&model_entry.value.display_name)
         .with_trace(client.trace.clone());
     // Walk the targets, failing over on a retryable failure. Streaming and
@@ -756,11 +757,7 @@ async fn dispatch(
     // has arrived under `stream_timeout` (#554) — so the 200 is committed to
     // exactly one target and a slow first chunk fails over.
     let mut last_err: Option<ProxyError> = None;
-    let mut target_gate =
-        crate::quota::TargetGate::new(is_routing_request.then_some(crate::quota::RoutingParent {
-            name: &model_entry.value.display_name,
-            entry_id: &model_entry.id,
-        }));
+    let mut target_gate = crate::quota::TargetGate::new(plan.quota_parent(&model_entry));
     'targets: for (target_idx, target) in attempt_models.iter().enumerate() {
         // Resolved ProviderKey UUID for this target — feeds the per-PK
         // telemetry attribution tags on the emitted UsageEvent
@@ -772,17 +769,13 @@ async fn dispatch(
         // model gets a budget too.
         let budget = crate::routing::effective_retries(
             &target.model,
-            crate::routing::group_retries_of(&model_entry.value),
+            plan.group_retries(&model_entry.value),
             state.default_retries,
             target_idx + 1 < attempt_models.len(),
         );
         // Deadlines resolved target → group → deployment default, next to
         // the retry budget so the two knobs stay in lockstep.
-        let timeouts = crate::routing::effective_timeouts(
-            &target.model,
-            Some(&model_entry.value),
-            state.default_timeouts,
-        );
+        let timeouts = plan.timeouts(&target.model, &model_entry.value, state.default_timeouts);
         // A group target that cannot read some tagged ciphertext gets the
         // request without it, rather than a certain 400. Built once per
         // target: every same-target retry sends the same body.
@@ -971,6 +964,12 @@ async fn dispatch(
                                 .unwrap_or(0);
                             r.commit_tokens(total).await;
                         }
+                    }
+                    if state.expose_debug_headers {
+                        crate::dispatch_plan::insert_route_header(
+                            success.response.headers_mut(),
+                            plan.semantic_route.as_deref(),
+                        );
                     }
                     return Ok(success);
                 }

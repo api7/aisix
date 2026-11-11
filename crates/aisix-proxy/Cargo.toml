@@ -76,6 +76,9 @@ percent-encoding.workspace = true
 rand = { workspace = true }
 chrono.workspace = true
 sha2.workspace = true
+hex.workspace = true
+# Bounded in-process cache in front of the shared store for session pins.
+moka.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true

@@ -406,15 +406,15 @@
               ]
             }
           ],
-          "description": "`{ \"target\": \"<direct alias>\" }` (or `{ \"target_id\": \"<id>\" }`) — route to a specific safe model.",
+          "description": "`{ \"target\": \"<alias>\" }` (or `{ \"target_id\": \"<id>\" }`) — route to a specific safe direct model or model group.",
           "properties": {
             "target": {
-              "description": "Direct-model alias to route to when embedding fails. Read only when `target_id` is absent.",
+              "description": "Alias of the direct model or model group to route to when embedding fails. Read only when `target_id` is absent.",
               "minLength": 1,
               "type": "string"
             },
             "target_id": {
-              "description": "Resource id of the direct model to route to when embedding fails. Present, it is authoritative and `target` is ignored, so renaming that model keeps this fallback pointing at it with no edit to this document.",
+              "description": "Resource id of the direct model or model group to route to when embedding fails. Present, it is authoritative and `target` is ignored, so renaming that model keeps this fallback pointing at it with no edit to this document.",
               "minLength": 1,
               "type": [
                 "string",
@@ -425,7 +425,7 @@
           "type": "object"
         }
       ],
-      "description": "What the router does when the embedding call errors or times out. Use `\"default\"` to route to the router's default model, `\"fail\"` to reject the request with `503`, or `{ \"target\": \"<direct alias>\" }` to route to a specific fallback model."
+      "description": "What the router does when the embedding call errors or times out. Use `\"default\"` to route to the router's default model, `\"fail\"` to reject the request with `503`, or `{ \"target\": \"<alias>\" }` to route to a specific fallback direct model or model group."
     },
     "PanelMember": {
       "allOf": [
@@ -894,12 +894,12 @@
           "description": "Route selection by a hosted decision model instead of embeddings. When set, `embedding_model`, `embedding_model_id`, `embedding_timeout_ms`, `on_embedding_failure` and `match` are not accepted, every route needs a `description` and takes no `examples` or `threshold`. When omitted, routes are matched by embedding similarity."
         },
         "default": {
-          "description": "Direct model alias used when no route clears its threshold. Read only when `default_id` is absent.",
+          "description": "Alias of the direct model or model group used when no route clears its threshold. Read only when `default_id` is absent.",
           "minLength": 1,
           "type": "string"
         },
         "default_id": {
-          "description": "Resource id of the direct model used when no route clears its threshold. Present, it is authoritative and `default` is ignored, so renaming that model keeps this router pointing at it with no edit to this document.",
+          "description": "Resource id of the direct model or model group used when no route clears its threshold. Present, it is authoritative and `default` is ignored, so renaming that model keeps this router pointing at it with no edit to this document.",
           "minLength": 1,
           "type": [
             "string",
@@ -948,6 +948,14 @@
           },
           "minItems": 1,
           "type": "array"
+        },
+        "session_affinity": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SemanticSessionAffinity"
+            }
+          ],
+          "description": "Session affinity, for either decision mode. When omitted, every request is classified."
         }
       },
       "required": [
@@ -956,7 +964,7 @@
       "type": "object"
     },
     "SemanticClassifier": {
-      "description": "Route selection by a hosted decision model. For each request the latest user message is sent to the model together with every route's `name` and `description`, and the model picks one route. A request goes to the picked route's target, or to the router's `default` when the model's confidence in its pick is below `min_confidence`. To catch requests that fit none of the routes, configure a route for them.",
+      "description": "Route selection by a hosted decision model. For each request the newest user text (reminder blocks removed) is sent to the model together with every route's `name` and `description`, and the model picks one route. A request goes to the picked route's target, or to the router's `default` when the model's confidence in its pick is below `min_confidence`. To catch requests that fit none of the routes, configure a route for them.",
       "properties": {
         "min_confidence": {
           "default": 0.5,
@@ -1090,12 +1098,12 @@
           "type": "string"
         },
         "target": {
-          "description": "Direct model alias that receives traffic matching this route. Read only when `target_id` is absent.",
+          "description": "Alias of the direct model or model group that receives traffic matching this route. A model group dispatches the traffic the way it does when addressed directly. Read only when `target_id` is absent.",
           "minLength": 1,
           "type": "string"
         },
         "target_id": {
-          "description": "Resource id of the direct model that receives traffic matching this route. Present, it is authoritative and `target` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this route pointing at it with no edit to this document. An id resolving to no model is a route target that does not exist, exactly as a `target` naming no model is.",
+          "description": "Resource id of the direct model or model group that receives traffic matching this route. Present, it is authoritative and `target` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this route pointing at it with no edit to this document. An id resolving to no model is a route target that does not exist, exactly as a `target` naming no model is.",
           "minLength": 1,
           "type": [
             "string",
@@ -1113,6 +1121,25 @@
       "required": [
         "name"
       ],
+      "type": "object"
+    },
+    "SemanticSessionAffinity": {
+      "description": "Keep a session on the model its first matched request was routed to.\n\nA request's session id is read from, in order: the `x-aisix-session-id` header; any `x-<vendor>-session-id` header (such as `x-claude-code-session-id`) whose value is at least 8 letters, digits, `-` or `_`; for Codex clients, the `session-id`, `session_id`, `thread-id` or `conversation_id` header; the `x-session-id` header; the session in the body's `metadata.user_id`; the body's `metadata.session_id`; and the `session.id` entry of the `baggage` header. A request without one is routed normally.\n\nWhen a request with a session id matches a route and is sent to that route's target, the session is pinned to that route. Later requests of the session with the same API key go to the pinned route without being classified, for as long as that route's target is still a route target of this router. A request that falls back to `default` or to a failure target pins nothing. Token-counting requests use a pin but never create one.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Whether sessions are pinned. While off, existing pins are ignored.",
+          "type": "boolean"
+        },
+        "ttl_seconds": {
+          "default": 3600,
+          "description": "How long a pin lasts after the last request that used it, in seconds.",
+          "format": "uint64",
+          "maximum": 604800.0,
+          "minimum": 60.0,
+          "type": "integer"
+        }
+      },
       "type": "object"
     },
     "WhenAllUnavailablePolicy": {
