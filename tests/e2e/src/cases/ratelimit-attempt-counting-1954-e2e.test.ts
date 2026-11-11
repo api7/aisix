@@ -23,6 +23,9 @@ import {
 //   2. A MEMBER's own limit counts every upstream attempt, same-target
 //      retries included — on count_tokens and embeddings, whose loops used
 //      to reserve once per target.
+//      A group-pinned policy whose match also depends on the member — a
+//      negated provider condition, or a `model ~=` the member half of the
+//      {member, group} pair decides — counts every attempt instead.
 //   3. A request this gateway's own limiter refuses consumes nothing: a
 //      request gate layer that refuses gives back what earlier layers
 //      counted, and a routed request whose every member is over its own
@@ -90,10 +93,14 @@ describe.each(["memory", "redis"] as const)(
       memberEmb: `sk-1954-memb-${sfx}`,
       gateCapped: `sk-1954-gate-${sfx}`,
       allRefused: `sk-1954-allref-${sfx}`,
+      groupNotProvider: `sk-1954-gnp-${sfx}`,
+      groupNotModel: `sk-1954-gnm-${sfx}`,
       burner: `sk-1954-burner-${sfx}`,
     };
     let groupChatPolicyId = "";
     let groupEmbPolicyId = "";
+    let groupNotProviderPolicyId = "";
+    let groupNotModelPolicyId = "";
     let ctUpstream: OpenAiUpstream | undefined;
     let membEmbUpstream: OpenAiUpstream | undefined;
     let downChat: OpenAiUpstream | undefined;
@@ -188,6 +195,33 @@ describe.each(["memory", "redis"] as const)(
         })
       ).id;
 
+      groupNotProviderPolicyId = (
+        await seed.createRateLimitPolicy({
+          name: name("group-not-anthropic-cap"),
+          conditions: [
+            { dimension: "team", operator: "in", value: [name("team-gnp")] },
+            { dimension: "model", operator: "in", value: [gChat] },
+            {
+              logic: "and",
+              negate: true,
+              children: [{ dimension: "provider", operator: "==", value: "anthropic" }],
+            },
+          ],
+          limits: { rpm: 3 },
+        })
+      ).id;
+      groupNotModelPolicyId = (
+        await seed.createRateLimitPolicy({
+          name: name("group-not-model-cap"),
+          conditions: [
+            { dimension: "team", operator: "in", value: [name("team-gnm")] },
+            { dimension: "model", operator: "in", value: [gChat] },
+            { dimension: "model", operator: "~=", value: name("elsewhere") },
+          ],
+          limits: { rpm: 3 },
+        })
+      ).id;
+
       // 2. a member with rpm 2 that fails once and is retried.
       await model(name("ct"), ctUpstream, {
         provider: "anthropic",
@@ -214,6 +248,8 @@ describe.each(["memory", "redis"] as const)(
         seed.createApiKey({ key_hash: sha256(plaintext), allowed_models: ["*"], ...extra });
       await key(keys.groupChat, { team_id: name("team-gchat") });
       await key(keys.groupEmb, { team_id: name("team-gemb") });
+      await key(keys.groupNotProvider, { team_id: name("team-gnp") });
+      await key(keys.groupNotModel, { team_id: name("team-gnm") });
       await key(keys.memberCt);
       await key(keys.memberEmb);
       await key(keys.gateCapped, { rate_limit: { rpm: 2 } });
@@ -286,6 +322,27 @@ describe.each(["memory", "redis"] as const)(
         const fourth = await call(key(), model());
         expect(fourth.status).toBe(429);
         expect(fourth.body?.error?.policy?.id).toBe(policyId());
+      },
+    );
+
+    test.for([
+      ["NOT (provider == anthropic)", () => keys.groupNotProvider, () => groupNotProviderPolicyId],
+      ["model ~= another model", () => keys.groupNotModel, () => groupNotModelPolicyId],
+    ] as const)(
+      "chat: a group policy that also tests the member (%s) counts every attempt",
+      { timeout: 60_000 },
+      async ([, key, policyId], ctx) => {
+        if (!ready || !app) {
+          ctx.skip();
+          return;
+        }
+        await awaitWindowHeadroom(20);
+        // Three attempts (the down member twice, then the healthy one), each
+        // matching the policy, fill its rpm 3 in one request.
+        expect((await chat(key(), name("g-chat"))).status).toBe(200);
+        const second = await chat(key(), name("g-chat"));
+        expect(second.status).toBe(429);
+        expect(second.body?.error?.policy?.id).toBe(policyId());
       },
     );
 
