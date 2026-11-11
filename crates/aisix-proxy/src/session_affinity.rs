@@ -18,6 +18,7 @@ use std::time::Duration;
 use aisix_mcp::{PutCondition, SharedStore, StoreError, StoredValue};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
+use tracing::Instrument;
 
 pub(crate) const NAMESPACE: &str = "session_affinity";
 const VALUE_VERSION: u64 = 1;
@@ -139,7 +140,7 @@ impl SessionPins {
                 };
             }
         }
-        let read = self.store_call(self.store.get(NAMESPACE, key)).await?;
+        let read = self.store_call(self.store.get(NAMESPACE, key)).await.ok()?;
         match read.as_ref().and_then(decode) {
             Some((pin, record)) => {
                 self.remember(key, pin.clone(), Some(record), ttl).await;
@@ -178,10 +179,13 @@ impl SessionPins {
         }
         let this = Arc::clone(self);
         let key = key.to_owned();
-        tokio::spawn(async move {
-            this.refresh(key.clone(), hit.pin, record, ttl).await;
-            this.refreshing.remove(&key);
-        });
+        tokio::spawn(
+            async move {
+                this.refresh(key.clone(), hit.pin, record, ttl).await;
+                this.refreshing.remove(&key);
+            }
+            .instrument(tracing::Span::current()),
+        );
     }
 
     async fn refresh(&self, key: String, pin: Pin, record: StoreRecord, ttl: Duration) {
@@ -193,31 +197,31 @@ impl SessionPins {
             &NO_LABELS,
             PutCondition::IfVersion(record.version),
         );
-        match tokio::time::timeout(STORE_CALL_TIMEOUT, put).await {
-            Ok(Ok(version)) => {
+        match self.store_call(put).await {
+            Ok(version) => {
                 let record = StoreRecord {
                     version,
                     expires_at: unix_now() + ttl.as_secs() as i64,
                 };
                 self.remember(&key, pin, Some(record), ttl).await;
             }
-            Ok(Err(StoreError::PreconditionFailed)) => {
+            Err(StoreError::PreconditionFailed) => {
                 match self.store_call(self.store.get(NAMESPACE, &key)).await {
                     // Someone else wrote it since: take theirs.
-                    Some(Some(read)) => {
+                    Ok(Some(read)) => {
                         if let Some((pin, record)) = decode(&read) {
                             self.remember(&key, pin, Some(record), ttl).await;
                         }
                     }
                     // The store's copy ran out while this gateway kept using
                     // the pin: write it back.
-                    Some(None) => {
+                    Ok(None) => {
                         self.create(&key, pin, ttl, |_| true).await;
                     }
-                    None => {}
+                    Err(_) => {}
                 }
             }
-            Ok(Err(_)) | Err(_) => self.note_store_failure(),
+            Err(_) => {}
         }
     }
 
@@ -226,7 +230,8 @@ impl SessionPins {
     pub(crate) async fn discard(&self, key: &str, hit: &Hit) {
         self.local.invalidate(key).await;
         if let Some(record) = hit.store {
-            self.store_call(self.store.delete(NAMESPACE, key, Some(record.version)))
+            let _ = self
+                .store_call(self.store.delete(NAMESPACE, key, Some(record.version)))
                 .await;
         }
     }
@@ -250,7 +255,7 @@ impl SessionPins {
             PutCondition::CreateOnly,
         );
         match self.store_call(put).await {
-            Some(version) => {
+            Ok(version) => {
                 let record = StoreRecord {
                     version,
                     expires_at: unix_now() + ttl.as_secs() as i64,
@@ -258,15 +263,18 @@ impl SessionPins {
                 self.remember(key, pin.clone(), Some(record), ttl).await;
                 pin
             }
-            None if self.store_skipped() => {
+            // Skipped, down, over quota or too large: this key is pinned
+            // here alone.
+            Err(error) if error != StoreError::PreconditionFailed => {
                 self.remember(key, pin.clone(), None, ttl).await;
                 pin
             }
-            None => {
+            Err(_) => {
                 // The create lost: someone holds the key.
                 let winner = self
                     .store_call(self.store.get(NAMESPACE, key))
                     .await
+                    .ok()
                     .flatten()
                     .as_ref()
                     .and_then(decode)
@@ -298,28 +306,29 @@ impl SessionPins {
             .await;
     }
 
-    /// Run one store call within [`STORE_CALL_TIMEOUT`]. `None` when the
-    /// store is being skipped, failed, or — for a write — its precondition
-    /// did not hold; only the last leaves the store in use.
+    /// Run one store call within [`STORE_CALL_TIMEOUT`]. While the store is
+    /// being skipped the call is not made and answers `Unavailable`. Only an
+    /// outage — `Unavailable` or a timeout — starts the skip: a refusal
+    /// (`OverQuota`, `TooLarge`, `PreconditionFailed`) is a healthy store's
+    /// answer about this one key.
     async fn store_call<T>(
         &self,
         call: impl std::future::Future<Output = Result<T, StoreError>>,
-    ) -> Option<T> {
+    ) -> Result<T, StoreError> {
         if self.store_skipped() {
-            return None;
+            return Err(StoreError::Unavailable);
         }
         match tokio::time::timeout(STORE_CALL_TIMEOUT, call).await {
-            Ok(Ok(value)) => Some(value),
-            Ok(Err(StoreError::PreconditionFailed)) => None,
-            Ok(Err(error)) => {
-                tracing::debug!(%error, "session affinity store call failed; pinning locally");
+            Ok(Err(StoreError::Unavailable)) => {
+                tracing::debug!("session affinity store unavailable; pinning locally");
                 self.note_store_failure();
-                None
+                Err(StoreError::Unavailable)
             }
+            Ok(result) => result,
             Err(_) => {
                 tracing::debug!("session affinity store call timed out; pinning locally");
                 self.note_store_failure();
-                None
+                Err(StoreError::Unavailable)
             }
         }
     }
@@ -390,6 +399,7 @@ mod tests {
         gets: AtomicUsize,
         puts: AtomicUsize,
         down: AtomicBool,
+        over_quota: AtomicBool,
     }
 
     #[async_trait]
@@ -413,6 +423,9 @@ mod tests {
             self.puts.fetch_add(1, Ordering::SeqCst);
             if self.down.load(Ordering::SeqCst) {
                 return Err(StoreError::Unavailable);
+            }
+            if self.over_quota.load(Ordering::SeqCst) {
+                return Err(StoreError::OverQuota);
             }
             self.inner.put(ns, key, value, ttl, labels, condition).await
         }
@@ -539,6 +552,23 @@ mod tests {
         tokio::time::advance(STORE_BACKOFF + Duration::from_secs(1)).await;
         assert!(pins.lookup("other3", TTL).await.is_none());
         assert_eq!(probe.gets.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_store_refusal_pins_that_key_locally_and_keeps_the_store_in_use() {
+        let (probe, pins) = setup();
+        let other = Arc::new(SessionPins::new(probe.clone()));
+        other.create("theirs", pin("y"), TTL, |_| true).await;
+        probe.over_quota.store(true, Ordering::SeqCst);
+        assert_eq!(pins.create("k", pin("x"), TTL, |_| true).await, pin("x"));
+        assert_eq!(pins.lookup("k", TTL).await.unwrap().pin, pin("x"));
+        let gets = probe.gets.load(Ordering::SeqCst);
+        assert_eq!(
+            pins.lookup("theirs", TTL).await.unwrap().pin,
+            pin("y"),
+            "another session still reads the store"
+        );
+        assert_eq!(probe.gets.load(Ordering::SeqCst), gets + 1);
     }
 
     #[tokio::test(start_paused = true)]
