@@ -193,13 +193,19 @@ impl SessionPins {
                 self.remember(&key, pin, Some(record), ttl).await;
             }
             Ok(Err(StoreError::PreconditionFailed)) => {
-                // Someone else wrote it since: take theirs.
-                if let Some(Some((pin, record))) = self
-                    .store_call(self.store.get(NAMESPACE, &key))
-                    .await
-                    .map(|read| read.as_ref().and_then(decode))
-                {
-                    self.remember(&key, pin, Some(record), ttl).await;
+                match self.store_call(self.store.get(NAMESPACE, &key)).await {
+                    // Someone else wrote it since: take theirs.
+                    Some(Some(read)) => {
+                        if let Some((pin, record)) = decode(&read) {
+                            self.remember(&key, pin, Some(record), ttl).await;
+                        }
+                    }
+                    // The store's copy ran out while this gateway kept using
+                    // the pin: write it back.
+                    Some(None) => {
+                        self.create(&key, pin, ttl, |_| true).await;
+                    }
+                    None => {}
                 }
             }
             Ok(Err(_)) | Err(_) => self.note_store_failure(),
@@ -591,6 +597,29 @@ mod tests {
         assert_eq!(probe.puts.load(Ordering::SeqCst), 2, "one refresh");
         let stored = probe.inner.get(NAMESPACE, "j").await.unwrap().unwrap();
         assert!(stored.expires_at.unwrap() - unix_now() > 500);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_store_copy_that_ran_out_under_a_live_local_pin_is_written_back() {
+        let (probe, pins) = setup();
+        let short = Duration::from_secs(1);
+        pins.create("k", pin("x"), TTL, |_| true).await;
+        // The store's copy is gone while the local pin is still in use.
+        probe.inner.delete(NAMESPACE, "k", None).await.unwrap();
+        let hit = pins.lookup("k", TTL).await.unwrap();
+        let stale = Hit {
+            store: hit.store.map(|r| StoreRecord {
+                expires_at: unix_now() - short.as_secs() as i64,
+                ..r
+            }),
+            ..hit
+        };
+        pins.touch("k", stale, TTL).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        let other = SessionPins::new(probe.clone());
+        assert_eq!(other.lookup("k", TTL).await.unwrap().pin, pin("x"));
     }
 
     #[tokio::test(start_paused = true)]
