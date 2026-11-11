@@ -5,7 +5,7 @@
 //! rather than by health/weight ([`Routing`](super::Routing)) or by
 //! fanning out to a panel ([`EnsembleConfig`](super::EnsembleConfig)).
 //!
-//! Per request the proxy embeds the latest user message via the
+//! Per request the proxy embeds the newest user text (see below) via the
 //! `embedding_model`, scores it against each route's example embeddings
 //! (cosine, aggregated per route), and dispatches to the highest route
 //! whose score clears its threshold — or to `default` when none does.
@@ -16,13 +16,18 @@
 //! state, the batch contains only the prompt, followed by local arithmetic.
 //!
 //! A router that carries a `classifier` block decides differently: the
-//! latest user message is sent once to a hosted decision model, which
+//! newest user text is sent once to a hosted decision model, which
 //! picks one of the configured routes by its `description`. The embedding
 //! fields, `match`, and the per-route `examples` / `threshold` do not
 //! apply in that mode and are rejected there.
 //!
-//! Routes reference direct Models by `display_name`, the same way routing
-//! targets and ensemble panel members do. Mutual exclusivity with the
+//! The newest user text is the text of the most recent user turn that has
+//! any, with every `<system-reminder>…</system-reminder>` block removed;
+//! turns carrying only tool results, images or reminders are skipped. The
+//! system prompt is never classified.
+//!
+//! Routes reference direct Models or model groups by `display_name`, the
+//! same way routing targets and ensemble panel members do. Mutual exclusivity with the
 //! direct-upstream fields, `routing`, and `ensemble` is enforced by the
 //! runtime schema (`super::schema`), not by this type.
 
@@ -64,13 +69,14 @@ pub struct SemanticRoute {
     /// header only when `proxy.expose_debug_headers` is enabled.
     #[schemars(length(min = 1))]
     pub name: String,
-    /// Direct model alias that receives traffic matching this route.
-    /// Read only when `target_id` is absent.
+    /// Alias of the direct model or model group that receives traffic
+    /// matching this route. A model group dispatches the traffic the way it
+    /// does when addressed directly. Read only when `target_id` is absent.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     #[schemars(length(min = 1))]
     pub target: String,
-    /// Resource id of the direct model that receives traffic matching this
-    /// route. Present, it is authoritative and `target` is ignored: the id
+    /// Resource id of the direct model or model group that receives traffic
+    /// matching this route. Present, it is authoritative and `target` is ignored: the id
     /// is resolved against the models in the current configuration, so
     /// renaming that model keeps this route pointing at it with no edit to
     /// this document. An id resolving to no model is a route target that
@@ -142,23 +148,23 @@ pub enum EmbeddingFailureMode {
 
 /// What the router does when the embedding call errors or times out. Use
 /// `"default"` to route to the router's default model, `"fail"` to reject the
-/// request with `503`, or `{ "target": "<direct alias>" }` to route to a
-/// specific fallback model.
+/// request with `503`, or `{ "target": "<alias>" }` to route to a specific
+/// fallback direct model or model group.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum OnEmbeddingFailure {
     /// `"default"` or `"fail"`.
     Mode(EmbeddingFailureMode),
-    /// `{ "target": "<direct alias>" }` (or `{ "target_id": "<id>" }`) —
-    /// route to a specific safe model.
+    /// `{ "target": "<alias>" }` (or `{ "target_id": "<id>" }`) — route to a
+    /// specific safe direct model or model group.
     Target {
-        /// Direct-model alias to route to when embedding fails. Read only
-        /// when `target_id` is absent.
+        /// Alias of the direct model or model group to route to when
+        /// embedding fails. Read only when `target_id` is absent.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         #[schemars(length(min = 1))]
         target: String,
-        /// Resource id of the direct model to route to when embedding
-        /// fails. Present, it is authoritative and `target` is ignored, so
+        /// Resource id of the direct model or model group to route to when
+        /// embedding fails. Present, it is authoritative and `target` is ignored, so
         /// renaming that model keeps this fallback pointing at it with no
         /// edit to this document.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -201,7 +207,7 @@ fn default_classifier_timeout_ms() -> u64 {
 }
 
 /// Route selection by a hosted decision model. For each request the
-/// latest user message is sent to the model together with every route's
+/// newest user text (reminder blocks removed) is sent to the model together with every route's
 /// `name` and `description`, and the model picks one route. A request goes
 /// to the picked route's target, or to the router's `default` when the
 /// model's confidence in its pick is below `min_confidence`. To catch
@@ -275,13 +281,13 @@ pub struct Semantic {
     /// Routes evaluated for each request. At least one is required.
     #[schemars(length(min = 1))]
     pub routes: Vec<SemanticRoute>,
-    /// Direct model alias used when no route clears its threshold. Read
-    /// only when `default_id` is absent.
+    /// Alias of the direct model or model group used when no route clears
+    /// its threshold. Read only when `default_id` is absent.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     #[schemars(length(min = 1))]
     pub default: String,
-    /// Resource id of the direct model used when no route clears its
-    /// threshold. Present, it is authoritative and `default` is ignored,
+    /// Resource id of the direct model or model group used when no route
+    /// clears its threshold. Present, it is authoritative and `default` is ignored,
     /// so renaming that model keeps this router pointing at it with no
     /// edit to this document.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -346,7 +352,7 @@ impl Semantic {
             .map(std::time::Duration::from_millis)
     }
 
-    /// Every direct-model alias this router can dispatch to, as CONFIGURED:
+    /// Every model alias this router can dispatch to, as CONFIGURED:
     /// each route's `target` plus `default`. Name form only — a reference
     /// written as `target_id` / `default_id` is not reported here, so this
     /// is usable only where the id form cannot appear (the resources file,

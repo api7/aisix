@@ -40,6 +40,7 @@ mod count_tokens;
 mod decisions;
 mod decisions_convert;
 mod dispatch;
+mod dispatch_plan;
 mod ebml;
 mod effort_mapping;
 mod embeddings;

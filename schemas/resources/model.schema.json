@@ -416,15 +416,15 @@
               ]
             }
           ],
-          "description": "`{ \"target\": \"<direct alias>\" }` (or `{ \"target_id\": \"<id>\" }`) — route to a specific safe model.",
+          "description": "`{ \"target\": \"<alias>\" }` (or `{ \"target_id\": \"<id>\" }`) — route to a specific safe direct model or model group.",
           "properties": {
             "target": {
-              "description": "Direct-model alias to route to when embedding fails. Read only when `target_id` is absent.",
+              "description": "Alias of the direct model or model group to route to when embedding fails. Read only when `target_id` is absent.",
               "minLength": 1,
               "type": "string"
             },
             "target_id": {
-              "description": "Resource id of the direct model to route to when embedding fails. Present, it is authoritative and `target` is ignored, so renaming that model keeps this fallback pointing at it with no edit to this document.",
+              "description": "Resource id of the direct model or model group to route to when embedding fails. Present, it is authoritative and `target` is ignored, so renaming that model keeps this fallback pointing at it with no edit to this document.",
               "minLength": 1,
               "type": [
                 "string",
@@ -435,7 +435,7 @@
           "type": "object"
         }
       ],
-      "description": "What the router does when the embedding call errors or times out. Use `\"default\"` to route to the router's default model, `\"fail\"` to reject the request with `503`, or `{ \"target\": \"<direct alias>\" }` to route to a specific fallback model."
+      "description": "What the router does when the embedding call errors or times out. Use `\"default\"` to route to the router's default model, `\"fail\"` to reject the request with `503`, or `{ \"target\": \"<alias>\" }` to route to a specific fallback direct model or model group."
     },
     "PanelMember": {
       "additionalProperties": false,
@@ -909,12 +909,12 @@
           "description": "Route selection by a hosted decision model instead of embeddings. When set, `embedding_model`, `embedding_model_id`, `embedding_timeout_ms`, `on_embedding_failure` and `match` are not accepted, every route needs a `description` and takes no `examples` or `threshold`. When omitted, routes are matched by embedding similarity."
         },
         "default": {
-          "description": "Direct model alias used when no route clears its threshold. Read only when `default_id` is absent.",
+          "description": "Alias of the direct model or model group used when no route clears its threshold. Read only when `default_id` is absent.",
           "minLength": 1,
           "type": "string"
         },
         "default_id": {
-          "description": "Resource id of the direct model used when no route clears its threshold. Present, it is authoritative and `default` is ignored, so renaming that model keeps this router pointing at it with no edit to this document.",
+          "description": "Resource id of the direct model or model group used when no route clears its threshold. Present, it is authoritative and `default` is ignored, so renaming that model keeps this router pointing at it with no edit to this document.",
           "minLength": 1,
           "type": [
             "string",
@@ -972,7 +972,7 @@
     },
     "SemanticClassifier": {
       "additionalProperties": false,
-      "description": "Route selection by a hosted decision model. For each request the latest user message is sent to the model together with every route's `name` and `description`, and the model picks one route. A request goes to the picked route's target, or to the router's `default` when the model's confidence in its pick is below `min_confidence`. To catch requests that fit none of the routes, configure a route for them.",
+      "description": "Route selection by a hosted decision model. For each request the newest user text (reminder blocks removed) is sent to the model together with every route's `name` and `description`, and the model picks one route. A request goes to the picked route's target, or to the router's `default` when the model's confidence in its pick is below `min_confidence`. To catch requests that fit none of the routes, configure a route for them.",
       "properties": {
         "min_confidence": {
           "default": 0.5,
@@ -1108,12 +1108,12 @@
           "type": "string"
         },
         "target": {
-          "description": "Direct model alias that receives traffic matching this route. Read only when `target_id` is absent.",
+          "description": "Alias of the direct model or model group that receives traffic matching this route. A model group dispatches the traffic the way it does when addressed directly. Read only when `target_id` is absent.",
           "minLength": 1,
           "type": "string"
         },
         "target_id": {
-          "description": "Resource id of the direct model that receives traffic matching this route. Present, it is authoritative and `target` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this route pointing at it with no edit to this document. An id resolving to no model is a route target that does not exist, exactly as a `target` naming no model is.",
+          "description": "Resource id of the direct model or model group that receives traffic matching this route. Present, it is authoritative and `target` is ignored: the id is resolved against the models in the current configuration, so renaming that model keeps this route pointing at it with no edit to this document. An id resolving to no model is a route target that does not exist, exactly as a `target` naming no model is.",
           "minLength": 1,
           "type": [
             "string",

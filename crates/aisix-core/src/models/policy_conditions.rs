@@ -580,6 +580,13 @@ pub struct ConditionInput<'a> {
     /// Display name of that parent, the `model_name` twin of
     /// [`Self::routing_parent_model`].
     pub routing_parent_model_name: Option<&'a str>,
+    /// Entry id of the model group between the two when a semantic
+    /// router's chosen target is a group: the request's model identity is
+    /// then {target, group, router}, and a `model` leaf sees all three.
+    pub routing_group_model: Option<&'a str>,
+    /// Display name of that group, the `model_name` twin of
+    /// [`Self::routing_group_model`].
+    pub routing_group_model_name: Option<&'a str>,
     /// The request's effective cost-attribution tags, read by the
     /// `tag:<key>` dimensions. `None` — like an empty set — means the
     /// request carries no tag dimension at all.
@@ -605,14 +612,17 @@ impl<'a> ConditionInput<'a> {
 
     /// The caller-addressed parent's value for a model-property
     /// dimension, when the primary value describes a dispatch target
-    /// that parent selected. Identity/provider dimensions have no
-    /// parent variant (the parent shares the caller identity and
-    /// carries no provider).
-    fn routing_parent(&self, dimension: &PolicyDimension) -> Option<&'a str> {
+    /// that parent selected, then the group between them. Identity/provider
+    /// dimensions have no parent variant (the parent shares the caller
+    /// identity and carries no provider).
+    pub fn routing_parents(&self, dimension: &PolicyDimension) -> [Option<&'a str>; 2] {
         match dimension {
-            PolicyDimension::Model => self.routing_parent_model,
-            PolicyDimension::ModelName => self.routing_parent_model_name,
-            _ => None,
+            PolicyDimension::Model => [self.routing_parent_model, self.routing_group_model],
+            PolicyDimension::ModelName => [
+                self.routing_parent_model_name,
+                self.routing_group_model_name,
+            ],
+            _ => [None, None],
         }
     }
 
@@ -655,7 +665,8 @@ fn eval_leaf(leaf: &PolicyCondition, input: &ConditionInput<'_>) -> bool {
         return false;
     };
     // Model dimensions carry a {dispatched target, requested parent}
-    // pair on a routing dispatch — the request's model-identity SET.
+    // pair on a routing dispatch (plus the group between them under a
+    // semantic router) — the request's model-identity SET.
     // Positive operators (==/in/regex) ask "does ANY identity satisfy"
     // (∃); the negative operator `~=` asks "do ALL identities differ"
     // (∀) — the two identities are distinct strings, so an ∃ reading
@@ -664,11 +675,12 @@ fn eval_leaf(leaf: &PolicyCondition, input: &ConditionInput<'_>) -> bool {
     // operator vocabulary (and the dashboard's normalization) is
     // built on; `negate` then flips the combined result, so a negated
     // leaf excluding the parent excludes every request addressed to it.
-    let parent = input.routing_parent(&leaf.dimension);
+    let parents = input.routing_parents(&leaf.dimension);
+    let mut parents = parents.iter().flatten();
     let raw = if leaf.operator == ConditionOperator::Ne {
-        eval_operator(leaf, var) && parent.is_none_or(|p| eval_operator(leaf, p))
+        eval_operator(leaf, var) && parents.all(|p| eval_operator(leaf, p))
     } else {
-        eval_operator(leaf, var) || parent.is_some_and(|p| eval_operator(leaf, p))
+        eval_operator(leaf, var) || parents.any(|p| eval_operator(leaf, p))
     };
     raw != leaf.negate
 }
@@ -800,6 +812,8 @@ mod tests {
             provider: Some("openai"),
             routing_parent_model: None,
             routing_parent_model_name: None,
+            routing_group_model: None,
+            routing_group_model_name: None,
             tags: None,
         }
     }
@@ -947,6 +961,34 @@ mod tests {
         assert!(!eval_condition_nodes(&nodes, &routed_input()));
         // The same member reached directly stays matched.
         assert!(eval_condition_nodes(&nodes, &input()));
+    }
+
+    #[test]
+    fn a_semantic_router_s_group_target_is_a_third_identity() {
+        // Router → group → member: a policy pinning the group matches the
+        // member exactly as it does when the group is addressed directly,
+        // and one pinning the router still does too.
+        let via_group = ConditionInput {
+            routing_parent_model: Some("router-1"),
+            routing_parent_model_name: Some("smart-router"),
+            routing_group_model: Some("group-1"),
+            routing_group_model_name: Some("chat-group"),
+            ..input()
+        };
+        let eq = |v: &str| vec![leaf(PolicyDimension::Model, ConditionOperator::Eq, one(v))];
+        let ne = |v: &str| vec![leaf(PolicyDimension::Model, ConditionOperator::Ne, one(v))];
+        for id in ["model-1", "group-1", "router-1"] {
+            assert!(eval_condition_nodes(&eq(id), &via_group), "{id}");
+            assert!(!eval_condition_nodes(&ne(id), &via_group), "{id}");
+        }
+        assert!(!eval_condition_nodes(&eq("other"), &via_group));
+        assert!(eval_condition_nodes(&ne("other"), &via_group));
+        let name = vec![leaf(
+            PolicyDimension::ModelName,
+            ConditionOperator::Eq,
+            one("chat-group"),
+        )];
+        assert!(eval_condition_nodes(&name, &via_group));
     }
 
     #[test]

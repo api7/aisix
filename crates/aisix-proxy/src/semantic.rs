@@ -34,7 +34,7 @@ use aisix_obs::{
 };
 
 use crate::error::ProxyError;
-use crate::routing::AttemptModel;
+use crate::routing::{AttemptModel, RoutingRequest};
 use crate::state::ProxyState;
 
 // Scoring primitives are shared with the `kind: "semantic"` guardrail,
@@ -156,7 +156,7 @@ impl std::fmt::Display for DecisionFailure {
     }
 }
 
-/// Direct-model alias to dispatch to when the router cannot decide — the
+/// Model alias (a direct model or a model group) to dispatch to when the router cannot decide — the
 /// embedding call failed (`on_embedding_failure`), or the classifier call
 /// did (`classifier.on_failure`). `None` means the policy is `fail` — the
 /// caller returns `503`.
@@ -238,11 +238,26 @@ struct Pick {
     miss: Option<SemanticFallback>,
 }
 
-/// Resolve a semantic router to a single direct-model attempt + the name
-/// of the route that matched (`None` when the request fell through to
-/// `default`). The returned `Vec<AttemptModel>` always has exactly one
-/// element; the chat dispatch loop drives it like any routing target.
+/// What a semantic router decided to dispatch to.
+pub(crate) struct SemanticDispatch {
+    /// The attempts the dispatch loop drives: the one direct target, or
+    /// the members a model-group target selected for this request.
+    pub attempts: Vec<AttemptModel>,
+    /// Name of the route that served the request; `None` when it fell
+    /// through to `default` or to the failure target.
+    pub route: Option<String>,
+    /// The chosen target, when it is a model group: its routing knobs
+    /// govern the attempts, exactly as when a caller addresses it directly.
+    pub group: Option<Arc<ResourceEntry<Model>>>,
+}
+
+/// Resolve a semantic router to its dispatch: the attempts of the chosen
+/// target (one direct model, or a model group's members) + the name of the
+/// route that matched (`None` when the request fell through to `default`).
+/// Every endpoint that honours a semantic router decides through here.
 ///
+/// `prompt` is the request's classification text ([`classification_text`]).
+/// `routing` carries what a model-group target needs to select its members.
 /// How it decided is published for the request's access-log line
 /// ([`crate::attribution::note_semantic_decision`]).
 pub(crate) async fn resolve(
@@ -250,9 +265,9 @@ pub(crate) async fn resolve(
     snapshot: &AisixSnapshot,
     router_entry: &ResourceEntry<Model>,
     prompt: &str,
-    source_ip: &str,
     request_id: &str,
-) -> Result<(Vec<AttemptModel>, Option<String>), ProxyError> {
+    routing: RoutingRequest<'_>,
+) -> Result<SemanticDispatch, ProxyError> {
     let semantic = router_entry
         .value
         .semantic
@@ -271,9 +286,8 @@ pub(crate) async fn resolve(
     // an empty string, which could spuriously match a route.
     if prompt.trim().is_empty() {
         note_decision(None, None, Some(SemanticFallback::EmptyPrompt));
-        let (attempt, _) =
-            select_eligible(state, snapshot, router, source_ip, &default_target, None)?;
-        return Ok((vec![attempt], None));
+        let eligible = select_eligible(state, snapshot, router, routing, &default_target, None)?;
+        return Ok(eligible.into_dispatch(None));
     }
 
     let pick = match &semantic.classifier {
@@ -304,45 +318,181 @@ pub(crate) async fn resolve(
         Ok(pick) => pick,
         Err(failure) => {
             note_decision(None, None, Some(SemanticFallback::DecisionFailed));
-            return fallback(state, snapshot, router, source_ip, semantic, failure);
+            return fallback(state, snapshot, router, routing, semantic, failure);
         }
     };
 
-    let (attempt, route_name): (AttemptModel, Option<String>) = match pick.winner {
+    let dispatch = match pick.winner {
         Some(i) => {
-            let (attempt, fell_back) = select_eligible(
+            let eligible = select_eligible(
                 state,
                 snapshot,
                 router,
-                source_ip,
+                routing,
                 &semantic.routes[i].target_ref(snapshot),
                 Some(&default_target),
             )?;
             // `x-aisix-route` reports the route that actually served the
             // request: a winner displaced by its target's gates is a
             // fall-through to `default`, not a served route.
-            let name = (!fell_back).then(|| semantic.routes[i].name.clone());
+            let name = (!eligible.fell_back).then(|| semantic.routes[i].name.clone());
             note_decision(
                 name.clone(),
                 pick.score,
-                fell_back.then_some(SemanticFallback::TargetUnavailable),
+                eligible
+                    .fell_back
+                    .then_some(SemanticFallback::TargetUnavailable),
             );
-            (attempt, name)
+            eligible.into_dispatch(name)
         }
         None => {
             note_decision(None, pick.score, pick.miss);
-            let (attempt, _) =
-                select_eligible(state, snapshot, router, source_ip, &default_target, None)?;
-            (attempt, None)
+            select_eligible(state, snapshot, router, routing, &default_target, None)?
+                .into_dispatch(None)
         }
     };
     tracing::debug!(
         router = %router_entry.value.display_name,
-        resolved_route = ?route_name,
-        target = %attempt.model.display_name,
+        resolved_route = ?dispatch.route,
+        group = ?dispatch.group.as_ref().map(|g| g.value.display_name.as_str()),
+        first_target = ?dispatch.attempts.first().map(|a| a.model.display_name.as_str()),
         "semantic routing decision",
     );
-    Ok((vec![attempt], route_name))
+    Ok(dispatch)
+}
+
+const REMINDER_OPEN: &str = "<system-reminder>";
+const REMINDER_CLOSE: &str = "</system-reminder>";
+
+/// The text a semantic router classifies: the newest user turn that has
+/// human text. A turn's human text is its text parts, with every complete
+/// `<system-reminder>…</system-reminder>` block removed — agent harnesses
+/// inject those as ordinary text beside the live ask, and a turn holding
+/// only tool results, images or reminders has none, so the walk moves on to
+/// the turn before it. Empty when no turn has any.
+///
+/// `user_turns` yields each user turn's text parts, newest turn first. The
+/// per-protocol readers ([`chat_prompt`], [`anthropic_prompt`],
+/// [`responses_prompt`]) decide what a user turn and a text part are.
+pub(crate) fn classification_text<'a, T, P>(user_turns: T) -> String
+where
+    T: IntoIterator<Item = P>,
+    P: IntoIterator<Item = &'a str>,
+{
+    for parts in user_turns {
+        let joined = parts.into_iter().collect::<Vec<_>>().join(" ");
+        let text = strip_reminders(&joined);
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    String::new()
+}
+
+/// `text` without its complete reminder blocks, the pieces around them
+/// trimmed and joined by a space. The delimiters match case-insensitively;
+/// an opening tag with no closing tag after it is not a block and stays.
+/// A literal scan rather than a regex: this runs on caller-controlled
+/// input before routing, and the cursor only moves forward.
+fn strip_reminders(text: &str) -> String {
+    // ASCII lowering keeps every byte offset, so positions found in it
+    // index `text` directly.
+    let lowered = text.to_ascii_lowercase();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut keep_from = 0;
+    while let Some(open) = lowered[keep_from..].find(REMINDER_OPEN) {
+        let start = keep_from + open;
+        let body = start + REMINDER_OPEN.len();
+        let Some(close) = lowered[body..].find(REMINDER_CLOSE) else {
+            break;
+        };
+        kept.push(text[keep_from..start].trim());
+        keep_from = body + close + REMINDER_CLOSE.len();
+    }
+    kept.push(text[keep_from..].trim());
+    kept.retain(|piece| !piece.is_empty());
+    kept.join(" ")
+}
+
+/// [`classification_text`] of a Chat Completions request: its `user`
+/// messages, their string content or the `text` parts of an array content.
+pub(crate) fn chat_prompt(req: &aisix_gateway::ChatFormat) -> String {
+    classification_text(
+        req.messages
+            .iter()
+            .rev()
+            .filter(|m| m.role == aisix_gateway::Role::User)
+            .map(|m| -> Vec<&str> {
+                match (&m.content, &m.content_blocks) {
+                    (Some(text), _) => vec![text.as_str()],
+                    (None, Some(blocks)) => text_parts(blocks, "text").collect(),
+                    (None, None) => Vec::new(),
+                }
+            }),
+    )
+}
+
+/// [`classification_text`] of an Anthropic Messages body: its `user`
+/// messages, their string content or their `text` blocks (a `tool_result`
+/// block is not text). The top-level `system` is never classified.
+pub(crate) fn anthropic_prompt(body: &serde_json::Value) -> String {
+    let messages = body
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    classification_text(
+        messages
+            .iter()
+            .rev()
+            .filter(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+            .map(|m| content_text_parts(m.get("content"), "text")),
+    )
+}
+
+/// [`classification_text`] of a Responses body: a string `input` is the one
+/// user turn; in an array `input`, the `message` items with role `user` are,
+/// read through their `input_text` parts. Every other item type — a
+/// `function_call_output` included — is not a user turn, and `instructions`
+/// is never classified.
+pub(crate) fn responses_prompt(body: &serde_json::Value) -> String {
+    match body.get("input") {
+        Some(serde_json::Value::String(text)) => classification_text([[text.as_str()]]),
+        Some(serde_json::Value::Array(items)) => classification_text(
+            items
+                .iter()
+                .rev()
+                .filter(|item| {
+                    item.get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(|t| t == "message")
+                        && item.get("role").and_then(serde_json::Value::as_str) == Some("user")
+                })
+                .map(|item| content_text_parts(item.get("content"), "input_text")),
+        ),
+        _ => String::new(),
+    }
+}
+
+fn content_text_parts<'a>(
+    content: Option<&'a serde_json::Value>,
+    part_type: &'static str,
+) -> Vec<&'a str> {
+    match content {
+        Some(serde_json::Value::String(text)) => vec![text.as_str()],
+        Some(serde_json::Value::Array(parts)) => text_parts(parts, part_type).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn text_parts<'a>(
+    parts: &'a [serde_json::Value],
+    part_type: &'static str,
+) -> impl Iterator<Item = &'a str> + 'a {
+    parts
+        .iter()
+        .filter(move |p| p.get("type").and_then(serde_json::Value::as_str) == Some(part_type))
+        .filter_map(|p| p.get("text").and_then(serde_json::Value::as_str))
 }
 
 fn note_decision(route: Option<String>, score: Option<f64>, fallback: Option<SemanticFallback>) {
@@ -493,15 +643,14 @@ fn fallback(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
     router: &Model,
-    source_ip: &str,
+    routing: RoutingRequest<'_>,
     semantic: &Semantic,
     failure: DecisionFailure,
-) -> Result<(Vec<AttemptModel>, Option<String>), ProxyError> {
+) -> Result<SemanticDispatch, ProxyError> {
     match failure_target(snapshot, semantic) {
-        Some(alias) => {
-            let (attempt, _) = select_eligible(state, snapshot, router, source_ip, &alias, None)?;
-            Ok((vec![attempt], None))
-        }
+        Some(alias) => Ok(
+            select_eligible(state, snapshot, router, routing, &alias, None)?.into_dispatch(None),
+        ),
         None => Err(ProxyError::SemanticDecisionFailed {
             router: router.display_name.clone(),
             reason: failure,
@@ -687,66 +836,100 @@ async fn classify_inner(
     Ok((picked, answer.confidence))
 }
 
-/// Resolve a direct-model alias to the single `AttemptModel` the dispatch
-/// loop will drive.
-fn attempt_for_target(snapshot: &AisixSnapshot, alias: &str) -> Result<AttemptModel, ProxyError> {
+/// A route, default or failure target, resolved: a model group is
+/// dispatched through its own members, anything else as the one attempt.
+enum Candidate {
+    Direct(Arc<ResourceEntry<Model>>),
+    Group(Arc<ResourceEntry<Model>>),
+}
+
+impl Candidate {
+    fn model(&self) -> &Model {
+        match self {
+            Self::Direct(entry) | Self::Group(entry) => &entry.value,
+        }
+    }
+}
+
+fn candidate_for_target(snapshot: &AisixSnapshot, alias: &str) -> Result<Candidate, ProxyError> {
     let entry = snapshot.models.get_by_name(alias).ok_or_else(|| {
         ProxyError::InvalidRequest(format!(
             "semantic router target {alias:?} does not resolve to a known model",
         ))
     })?;
-    Ok(AttemptModel {
-        id: entry.id.clone(),
-        model: entry.value.clone(),
-        priority: 0,
-        weight: 1,
+    Ok(if entry.value.is_routing() {
+        Candidate::Group(entry)
+    } else {
+        Candidate::Direct(entry)
     })
+}
+
+/// The target [`select_eligible`] picked.
+struct Eligible {
+    attempts: Vec<AttemptModel>,
+    group: Option<Arc<ResourceEntry<Model>>>,
+    /// Whether the fallback displaced the primary.
+    fell_back: bool,
+}
+
+impl Eligible {
+    fn into_dispatch(self, route: Option<String>) -> SemanticDispatch {
+        SemanticDispatch {
+            attempts: self.attempts,
+            route,
+            group: self.group,
+        }
+    }
 }
 
 /// Pick the dispatchable target among `{primary, fallback}` — the
 /// semantic single-winner analogue of the group filter
 /// (`routing::targets_allowed_for_ip` + `filter_attempt_models`):
 ///
-/// - the member's client-IP allowlist is a HARD gate: an excluded
+/// - the target's client-IP allowlist is a HARD gate: an excluded
 ///   candidate is dropped, and with every candidate excluded the caller
 ///   gets the same 403 as the entry gate, naming only the alias they
 ///   addressed (`routing.rs` does the same for all-excluded groups, so
 ///   a router never becomes a probe for which members exist);
-/// - the member's provider-key budget is a HARD gate too: with every
+/// - a direct target's provider-key budget is a HARD gate too: with every
 ///   candidate excluded by it, the caller gets the budget's own answer;
-/// - member health (request-path cooldown / background-unhealthy) is a
-///   SOFT preference: prefer an available candidate, but with none
-///   available dispatch the primary anyway — the router has no
-///   `when_all_unavailable` knob, and the semantically-right target
-///   beats failing the request on an advisory signal.
-///
-/// Returns the attempt plus whether the fallback displaced the primary
-/// (so the caller can clear the served-route attribution).
+/// - a direct target's health (request-path cooldown / background-unhealthy)
+///   is a SOFT preference: prefer an available candidate, but with none
+///   available dispatch the first direct candidate anyway — the router has
+///   no `when_all_unavailable` knob, and the semantically-right target
+///   beats failing the request on an advisory signal;
+/// - a model-group target is available when it selects at least one member
+///   for this request, through the same selection a caller addressing the
+///   group gets (its strategy, member allowlists and budgets, health and
+///   `when_all_unavailable`). A group that selects none is passed over, and
+///   when nothing else can serve, its refusal is the answer. It is resolved
+///   only once it is reached, so a group that does not serve keeps its
+///   balancing state untouched.
 fn select_eligible(
     state: &ProxyState,
     snapshot: &AisixSnapshot,
     router: &Model,
-    source_ip: &str,
+    routing: RoutingRequest<'_>,
     primary: &str,
     fallback_alias: Option<&str>,
-) -> Result<(AttemptModel, bool), ProxyError> {
-    let mut candidates: Vec<(AttemptModel, bool)> = Vec::with_capacity(2);
-    candidates.push((attempt_for_target(snapshot, primary)?, false));
+) -> Result<Eligible, ProxyError> {
+    let mut candidates: Vec<(Candidate, bool)> = Vec::with_capacity(2);
+    candidates.push((candidate_for_target(snapshot, primary)?, false));
     if let Some(alias) = fallback_alias {
         // A dangling `default` only matters when it must actually serve;
         // as a mere fallback candidate it is skipped, not fatal.
         if alias != primary {
-            if let Ok(attempt) = attempt_for_target(snapshot, alias) {
-                candidates.push((attempt, true));
+            if let Ok(candidate) = candidate_for_target(snapshot, alias) {
+                candidates.push((candidate, true));
             }
         }
     }
-    candidates.retain(|(attempt, fell_back)| {
-        let allowed = attempt.model.ip_allowed(source_ip);
+    candidates.retain(|(candidate, fell_back)| {
+        let allowed = candidate.model().ip_allowed(routing.source_ip);
         if !allowed {
             tracing::debug!(
                 router = %router.display_name,
-                target = %attempt.model.display_name,
+                target = %candidate.model().display_name,
                 fallback = fell_back,
                 "semantic target excluded by its allowed_cidrs",
             );
@@ -757,16 +940,27 @@ fn select_eligible(
         return Err(ProxyError::ModelIpRestricted(router.display_name.clone()));
     }
     // A candidate on a provider key whose budget is exhausted is excluded
-    // as hard as one outside its allowlist.
-    let gate = crate::budget::gate(state, snapshot);
+    // as hard as one outside its allowlist. A group carries no provider
+    // key: its members are judged when it selects them.
+    let owned_gate;
+    let gate = match routing.budget {
+        Some(gate) => gate,
+        None => {
+            owned_gate = crate::budget::gate(state, snapshot);
+            &owned_gate
+        }
+    };
     let mut refusal: Option<ProxyError> = None;
-    candidates.retain(
-        |(attempt, fell_back)| match gate.check_model(&attempt.model) {
+    candidates.retain(|(candidate, fell_back)| {
+        let Candidate::Direct(entry) = candidate else {
+            return true;
+        };
+        match gate.check_model(&entry.value) {
             Ok(()) => true,
             Err(err) => {
                 tracing::debug!(
                     router = %router.display_name,
-                    target = %attempt.model.display_name,
+                    target = %entry.value.display_name,
                     fallback = fell_back,
                     error = %err,
                     "semantic target excluded by its provider key's budget",
@@ -776,37 +970,104 @@ fn select_eligible(
                 }
                 false
             }
-        },
-    );
+        }
+    });
     if let (true, Some(err)) = (candidates.is_empty(), refusal) {
         return Err(err);
     }
-    let picked = candidates
-        .iter()
-        .position(|(attempt, _)| {
-            let stale_after = attempt
-                .model
-                .background_model_check
-                .as_ref()
-                .map(|cfg| std::time::Duration::from_secs(cfg.stale_after_seconds));
-            matches!(
-                state
-                    .runtime_status
-                    .status_with_stale(&attempt.id, stale_after)
-                    .status,
-                crate::RuntimeStatus::Healthy | crate::RuntimeStatus::NotApplicable
-            )
-        })
-        .unwrap_or(0);
-    let (attempt, fell_back) = candidates.swap_remove(picked);
+
+    let mut group_refusal: Option<ProxyError> = None;
+    let mut picked: Option<(usize, Vec<AttemptModel>)> = None;
+    for (i, (candidate, _)) in candidates.iter().enumerate() {
+        match candidate {
+            Candidate::Direct(entry) => {
+                let stale_after = entry
+                    .value
+                    .background_model_check
+                    .as_ref()
+                    .map(|cfg| std::time::Duration::from_secs(cfg.stale_after_seconds));
+                if matches!(
+                    state
+                        .runtime_status
+                        .status_with_stale(&entry.id, stale_after)
+                        .status,
+                    crate::RuntimeStatus::Healthy | crate::RuntimeStatus::NotApplicable
+                ) {
+                    picked = Some((i, vec![direct_attempt(entry)]));
+                    break;
+                }
+            }
+            Candidate::Group(group) => match crate::routing::resolve_attempt_models(
+                &state.routing,
+                &state.runtime_status,
+                &state.pricing,
+                snapshot,
+                &group.value.display_name,
+                &group.id,
+                &group.value,
+                routing,
+            ) {
+                Ok(members) => {
+                    picked = Some((i, members));
+                    break;
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        router = %router.display_name,
+                        group = %group.value.display_name,
+                        error = %err,
+                        "semantic group target selects no member",
+                    );
+                    group_refusal.get_or_insert(err);
+                }
+            },
+        }
+    }
+    let picked = picked.or_else(|| {
+        candidates
+            .iter()
+            .enumerate()
+            .find_map(|(i, (c, _))| match c {
+                Candidate::Direct(entry) => Some((i, vec![direct_attempt(entry)])),
+                Candidate::Group(_) => None,
+            })
+    });
+    let Some((i, attempts)) = picked else {
+        // Every candidate is a group that selected nothing. Its refusal is
+        // the answer, under the router's name where it names the group.
+        let err = group_refusal.expect("a passed-over group recorded why");
+        return Err(match err {
+            ProxyError::ModelIpRestricted(_) => {
+                ProxyError::ModelIpRestricted(router.display_name.clone())
+            }
+            other => other,
+        });
+    };
+    let (candidate, fell_back) = candidates.swap_remove(i);
     if fell_back {
         tracing::debug!(
             router = %router.display_name,
-            served = %attempt.model.display_name,
+            served = %candidate.model().display_name,
             "semantic route target unavailable; serving default",
         );
     }
-    Ok((attempt, fell_back))
+    Ok(Eligible {
+        attempts,
+        group: match candidate {
+            Candidate::Group(group) => Some(group),
+            Candidate::Direct(_) => None,
+        },
+        fell_back,
+    })
+}
+
+fn direct_attempt(entry: &ResourceEntry<Model>) -> AttemptModel {
+    AttemptModel {
+        id: entry.id.clone(),
+        model: entry.value.clone(),
+        priority: 0,
+        weight: 1,
+    }
 }
 
 /// Why [`embed_texts`] produced no vectors.
@@ -1290,6 +1551,74 @@ mod tests {
         let resolved = failure_target(&snap, &dangling).unwrap();
         assert_eq!(resolved, "m-gone");
         assert!(snap.models.get_by_name(&resolved).is_none());
+    }
+
+    #[test]
+    fn reminder_blocks_are_removed_and_the_text_around_them_kept() {
+        assert_eq!(
+            strip_reminders("<system-reminder>ctx</system-reminder>\nfix the bug"),
+            "fix the bug"
+        );
+        assert_eq!(
+            strip_reminders("before <SYSTEM-REMINDER>a</System-Reminder> mid <system-reminder>b</system-reminder> after"),
+            "before mid after"
+        );
+        assert_eq!(
+            strip_reminders("<system-reminder>only</system-reminder>"),
+            ""
+        );
+        // An opening tag nothing closes is not a block.
+        assert_eq!(
+            strip_reminders("<system-reminder>a</system-reminder> x <system-reminder> y"),
+            "x <system-reminder> y"
+        );
+    }
+
+    #[test]
+    fn classification_walks_back_past_turns_without_human_text() {
+        let turns: Vec<Vec<&str>> = vec![
+            vec![],
+            vec!["<system-reminder>r</system-reminder>"],
+            vec![
+                "<system-reminder>r</system-reminder>",
+                "review the",
+                "contract",
+            ],
+            vec!["older ask"],
+        ];
+        assert_eq!(classification_text(turns), "review the contract");
+        assert_eq!(classification_text(Vec::<Vec<&str>>::new()), "");
+    }
+
+    #[test]
+    fn each_protocol_reads_its_user_turns() {
+        let messages = serde_json::json!({
+            "system": "system text is never classified",
+            "messages": [
+                {"role": "user", "content": "the real ask"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "x", "input": {}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t", "content": "tool output"},
+                    {"type": "text", "text": "<system-reminder>r</system-reminder>"}
+                ]}
+            ]
+        });
+        assert_eq!(anthropic_prompt(&messages), "the real ask");
+
+        let responses = serde_json::json!({
+            "instructions": "never classified",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "first ask"}]},
+                {"role": "user", "content": "second ask"},
+                {"type": "function_call", "call_id": "c", "name": "x", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c", "output": "tool output"}
+            ]
+        });
+        assert_eq!(responses_prompt(&responses), "second ask");
+        assert_eq!(
+            responses_prompt(&serde_json::json!({"input": "plain string"})),
+            "plain string"
+        );
     }
 
     #[test]
