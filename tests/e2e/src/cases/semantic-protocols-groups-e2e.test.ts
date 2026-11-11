@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  awaitWindowHeadroom,
   EtcdClient,
   ProxyClient,
   SeedClient,
@@ -218,6 +219,7 @@ describe("semantic routing on every protocol, with model-group targets", () => {
     await chatTarget("sp-default", "served-by-default");
     await chatTarget("sp-member-down", "never-served", { failing: true });
     await chatTarget("sp-member-up", "served-by-group-member");
+    await chatTarget("sp-limited-member", "served-by-limited-member");
     // A member this caller (127.0.0.1) may not reach.
     await chatTarget("sp-locked-member", "never-served-locked", {
       allowed_cidrs: ["10.0.0.0/8"],
@@ -248,13 +250,15 @@ describe("semantic routing on every protocol, with model-group targets", () => {
     await anthropicTarget("ct-member-down", "fail");
     await anthropicTarget("ct-member-up", 33);
 
-    const group = (name: string, members: string[]) =>
+    const group = (name: string, members: string[], extra: object = {}) =>
       seed!.createModel({
         display_name: name,
         routing: { strategy: "failover", targets: members.map((model) => ({ model })) },
+        ...extra,
       });
     await group("sp-legal-group", ["sp-member-down", "sp-member-up"]);
     await group("sp-locked-group", ["sp-locked-member"]);
+    await group("sp-limited-group", ["sp-limited-member"], { rate_limit: { rpm: 2 } });
     await group("ct-legal-group", ["ct-member-down", "ct-member-up"]);
 
     const router = (name: string, legalTarget: string, defaultTarget: string) =>
@@ -277,6 +281,7 @@ describe("semantic routing on every protocol, with model-group targets", () => {
     await router("sp-router", "sp-legal", "sp-default");
     await router("sp-group-router", "sp-legal-group", "sp-default");
     await router("sp-locked-router", "sp-locked-group", "sp-default");
+    await router("sp-limited-router", "sp-limited-group", "sp-default");
     await router("ct-router", "ct-legal", "ct-default");
     await router("ct-group-router", "ct-legal-group", "ct-default");
 
@@ -537,6 +542,20 @@ describe("semantic routing on every protocol, with model-group targets", () => {
       expect(r.json).toEqual({ input_tokens: 33 });
       expect(r.route).toBe("legal");
       expect(anthropicMocks["ct-member-down"]!.receivedRequests.length).toBe(down + 1);
+    });
+
+    test("the group's own rate limit binds traffic the router sends it", async (ctx) => {
+      if (!ready()) return ctx.skip();
+      await awaitWindowHeadroom(5);
+      const ask = [{ role: "user", content: LEGAL_ASK }];
+      const first = await chat("sp-limited-router", ask);
+      expect(first.status, first.text).toBe(200);
+      expect(first.text).toContain("served-by-limited-member");
+      const second = await messages("sp-limited-router", ask);
+      expect(second.status, second.text).toBe(200);
+      const third = await responses("sp-limited-router", LEGAL_ASK);
+      expect(third.status, third.text).toBe(429);
+      expect(chatMocks["sp-limited-member"]!.hits).toBe(2);
     });
 
     test("a group with no member this caller may reach is unavailable: default serves", async (ctx) => {
