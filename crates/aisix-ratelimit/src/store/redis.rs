@@ -52,8 +52,8 @@ use dashmap::DashMap;
 use redis::Script;
 
 use super::{
-    local::LocalStore, sliding_step_secs, token_dims, Dim, RateStore, StreamLeaseRefresh, DAY_SECS,
-    MINUTE_SECS,
+    local::LocalStore, sliding_step_secs, token_dims, AcquireStamp, Dim, RateStore,
+    StreamLeaseRefresh, DAY_SECS, MINUTE_SECS,
 };
 use crate::error::{LimitDetail, RateLimitError};
 use crate::limiter::RateLimitStatus;
@@ -258,9 +258,46 @@ if conc_max >= 0 then
   redis.call('ZADD', conc_key, conc_now, member)
   redis.call('EXPIRE', conc_key, conc_key_ttl)
 end
-return {0, 0, 0, 0, 0}
+-- The second element is the clock the increments were counted under, so a
+-- refund can find the exact window / sub-bucket they landed in.
+return {0, now, 0, 0, 0}
 "#
 );
+
+/// Undo one acquire: decrement every request dimension in the window /
+/// sub-bucket the acquire counted under (`at`), unless it has rolled since,
+/// then release the member's concurrency slot. ARGV: prefix, member, at,
+/// then the request dims as in [`ACQUIRE_LUA`].
+const REFUND_LUA: &str = r#"
+local prefix = ARGV[1]
+local member = ARGV[2]
+local at = tonumber(ARGV[3])
+local now = tonumber(redis.call('TIME')[1])
+local idx = 4
+local nreq = tonumber(ARGV[idx]); idx = idx + 1
+for i = 1, nreq do
+  local name, window, step = ARGV[idx], tonumber(ARGV[idx+1]), tonumber(ARGV[idx+3])
+  idx = idx + 4
+  if step > 0 then
+    local start = at - (at % step)
+    local cur = now - (now % step)
+    local key = prefix .. ':sw:' .. name
+    if start >= cur - window and tonumber(redis.call('HGET', key, start) or '0') > 0 then
+      redis.call('HINCRBY', key, start, -1)
+    end
+  else
+    local ws = at - (at % window)
+    if ws == now - (now % window) then
+      local key = prefix .. ':' .. name .. ':' .. ws
+      if tonumber(redis.call('GET', key) or '0') > 0 then
+        redis.call('DECR', key)
+      end
+    end
+  end
+end
+redis.call('ZREM', prefix .. ':conc', member)
+return 1
+"#;
 
 /// Refresh one live streaming member's concurrency lease. The member must
 /// already exist: refresh racing stream teardown must not resurrect a member
@@ -677,6 +714,41 @@ fn push_dims(args: &mut Vec<String>, dims: &[Dim]) {
     }
 }
 
+impl RedisStore {
+    /// Remove `member` from the shared concurrency set, detached. A member
+    /// that was never added makes this a no-op ZREM.
+    fn spawn_shared_release(&self, key: &str, member: &str) {
+        let conc_key = format!("{}:conc", self.bucket_prefix(key));
+        let conn = self.conn.clone();
+        let member = member.to_string();
+        let metrics = self.metrics.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                // ZREM's first arg is the key, so Redis Cluster routes it.
+                let mut c = match conn.acquire().await {
+                    Ok(c) => c,
+                    Err(_) => {
+                        record_failure(&metrics, "release");
+                        return;
+                    }
+                };
+                let res: Result<(), redis::RedisError> = redis::cmd("ZREM")
+                    .arg(&conc_key)
+                    .arg(&member)
+                    .query_async(&mut c)
+                    .await;
+                if res.is_err() {
+                    // The detached tasks are the only Redis failures with
+                    // no log at all — nothing awaits them, so the counter
+                    // is their only trace.
+                    record_failure(&metrics, "release");
+                    conn.note_error().await;
+                }
+            });
+        }
+    }
+}
+
 #[async_trait]
 impl RateStore for RedisStore {
     async fn acquire(
@@ -684,7 +756,7 @@ impl RateStore for RedisStore {
         key: &str,
         limits: &RateLimit,
         member: &str,
-    ) -> Result<(), RateLimitError> {
+    ) -> Result<AcquireStamp, RateLimitError> {
         let prefix = self.bucket_prefix(key);
         let mut args = vec![
             prefix,
@@ -750,7 +822,10 @@ impl RateStore for RedisStore {
                                 LeaseOwnership::ConfirmedRedis,
                             );
                         }
-                        Ok(())
+                        Ok(AcquireStamp {
+                            at_secs: retry,
+                            shared: true,
+                        })
                     }
                     CODE_CONCURRENCY => {
                         let limit = reply.get(3).copied().unwrap_or(0).max(0) as u64;
@@ -767,7 +842,10 @@ impl RateStore for RedisStore {
                         scope: aisix_core::RateLimitScope::Requests,
                         detail: refused(&super::request_dims(limits)),
                     }),
-                    _ => Ok(()),
+                    _ => Ok(AcquireStamp {
+                        at_secs: retry,
+                        shared: true,
+                    }),
                 }
             }
             Err(e) => {
@@ -844,40 +922,52 @@ impl RateStore for RedisStore {
         }
     }
 
+    async fn refund(&self, key: &str, limits: &RateLimit, member: &str, stamp: AcquireStamp) {
+        self.lease_members
+            .remove(&(key.to_string(), member.to_string()));
+        if !stamp.shared {
+            self.local.refund(key, limits, member, stamp).await;
+            // An acquire whose reply was lost may still have added the
+            // member on Redis; give it back as `release` would.
+            self.spawn_shared_release(key, member);
+            return;
+        }
+        let prefix = self.bucket_prefix(key);
+        let mut args = vec![prefix, member.to_string(), stamp.at_secs.to_string()];
+        push_dims(&mut args, &super::request_dims(limits));
+        let script = Script::new(REFUND_LUA);
+        let mut invocation = script.prepare_invoke();
+        invocation.key(&args[0]);
+        for a in &args {
+            invocation.arg(a);
+        }
+        let mut conn = match self.conn.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                // The count stays — an outage errs toward over-counting a
+                // refused request — but the slot is still given back.
+                self.note_failure("refund", &e);
+                self.spawn_shared_release(key, member);
+                return;
+            }
+        };
+        match invocation.invoke_async::<i64>(&mut conn).await {
+            Ok(_) => self.mark_ok(),
+            Err(e) => {
+                self.note_failure("refund", &e);
+                self.conn.note_error().await;
+                self.spawn_shared_release(key, member);
+            }
+        }
+    }
+
     fn release(&self, key: &str, member: &str) {
         self.lease_members
             .remove(&(key.to_string(), member.to_string()));
         // Drop the local slot first (a cheap no-op when the bucket was
         // never acquired locally); covers the degraded-acquire case.
         self.local.release(key, member);
-        let conc_key = format!("{}:conc", self.bucket_prefix(key));
-        let conn = self.conn.clone();
-        let member = member.to_string();
-        let metrics = self.metrics.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                // ZREM's first arg is the key, so Redis Cluster routes it.
-                let mut c = match conn.acquire().await {
-                    Ok(c) => c,
-                    Err(_) => {
-                        record_failure(&metrics, "release");
-                        return;
-                    }
-                };
-                let res: Result<(), redis::RedisError> = redis::cmd("ZREM")
-                    .arg(&conc_key)
-                    .arg(&member)
-                    .query_async(&mut c)
-                    .await;
-                if res.is_err() {
-                    // The detached tasks are the only Redis failures with
-                    // no log at all — nothing awaits them, so the counter
-                    // is their only trace.
-                    record_failure(&metrics, "release");
-                    conn.note_error().await;
-                }
-            });
-        }
+        self.spawn_shared_release(key, member);
     }
 
     fn add_tokens(&self, key: &str, tokens: u64, window_type: RateLimitWindowType) {

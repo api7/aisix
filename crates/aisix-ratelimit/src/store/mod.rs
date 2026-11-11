@@ -15,6 +15,10 @@
 //!   check-only + request check-and-increment, all-or-nothing per bucket.
 //! - **commit** (request path success, async): post-deduct token add +
 //!   concurrency release.
+//! - **refund** (request path refusal, async): give back exactly the
+//!   request-window increments one acquire made, plus its concurrency
+//!   slot — for a reservation the gateway's own limiter refused further
+//!   down the same request, which therefore consumed nothing.
 //! - **release** / **add_tokens** (after-the-fact, sync): concurrency
 //!   release on drop, and the streaming post-stream token add. These are
 //!   sync because they run from `Drop` and from the synchronous SSE
@@ -126,6 +130,29 @@ pub(crate) fn token_dims(limits: &RateLimit) -> Vec<Dim> {
     )
 }
 
+/// Where and when one successful [`RateStore::acquire`] counted, so a
+/// [`RateStore::refund`] can decrement exactly the windows (fixed) or
+/// sub-buckets (sliding) that acquire incremented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcquireStamp {
+    /// The clock reading (unix seconds) the acquire counted under — the
+    /// store's own clock, which for Redis is the server's `TIME`.
+    pub at_secs: u64,
+    /// Whether the shared backend counted it. `false` for the local store
+    /// and for a Redis store's fail-open fallback, whose count lives in
+    /// the per-process store.
+    pub shared: bool,
+}
+
+impl AcquireStamp {
+    pub fn local(at_secs: u64) -> Self {
+        Self {
+            at_secs,
+            shared: false,
+        }
+    }
+}
+
 /// Backend that holds the rate-limit counters for a bucket.
 ///
 /// `member` is a process-unique reservation id (`<instance>:<seq>`) used
@@ -144,7 +171,14 @@ pub trait RateStore: Send + Sync + 'static {
         key: &str,
         limits: &RateLimit,
         member: &str,
-    ) -> Result<(), RateLimitError>;
+    ) -> Result<AcquireStamp, RateLimitError>;
+
+    /// Undo one successful acquire: decrement by one every request window
+    /// `limits` counts, in the window / sub-bucket `stamp` names, and
+    /// release `member`'s concurrency slot. A window that has rolled since
+    /// is left alone — its count was already wiped, and decrementing the
+    /// fresh one would take back a sibling request's increment.
+    async fn refund(&self, key: &str, limits: &RateLimit, member: &str, stamp: AcquireStamp);
 
     /// Post-deduct: add `tokens` to the tpm/tpd windows AND release the
     /// concurrency slot held by `member`. Like the local backend this

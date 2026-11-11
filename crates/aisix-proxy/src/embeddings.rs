@@ -582,7 +582,7 @@ async fn dispatch(
     let client_facing_model = body.model.clone();
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+    let mut reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
     // Preserve the caller's original `input` shape per #162 /
     // `docs/api-proxy.md` §4.4 "both pass through". The bridge will
@@ -617,6 +617,7 @@ async fn dispatch(
         state,
         snapshot,
         auth,
+        &mut reservation,
         client_ctx,
         &client_facing_model,
         &model_entry,

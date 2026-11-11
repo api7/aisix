@@ -1879,3 +1879,91 @@ async fn cluster_sliding_window_routes_to_one_slot() {
     assert_eq!(err.detail().dimension, "rpm");
     assert!(b.peek(&key, &limits).await.unwrap().tpm_used >= 10);
 }
+
+// --- refund --------------------------------------------------------------
+
+/// A refund on the shared backend gives the slot back to every replica:
+/// the fixed window it counted in, and the concurrency member.
+#[tokio::test]
+async fn refund_returns_the_shared_fixed_window_and_slot() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let mut raw = raw_conn(&url).await;
+    // Both acquires must share one minute window.
+    server_now_with_headroom(&mut raw, 60, 5).await;
+    let a = Limiter::with_store(Arc::new(store(&url).await));
+    let b = Limiter::with_store(Arc::new(store(&url).await));
+    let key = unique_key("refund-fixed");
+    let limits = RateLimit {
+        rpm: Some(1),
+        concurrency: Some(1),
+        ..rl()
+    };
+    let r = a.pre_commit(&key, &limits).await.expect("first allowed");
+    assert!(b.pre_commit(&key, &limits).await.is_err());
+    r.refund().await;
+    let kept = b
+        .pre_commit(&key, &limits)
+        .await
+        .expect("refunded slot reopens");
+    assert!(a.pre_commit(&key, &limits).await.is_err());
+    drop(kept);
+}
+
+#[tokio::test]
+async fn refund_after_the_shared_window_rolled_is_a_no_op() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let a = Limiter::with_store(Arc::new(store(&url).await));
+    let key = unique_key("refund-rolled");
+    let limits = RateLimit {
+        rps: Some(1),
+        ..rl()
+    };
+    wait_for_second_boundary().await;
+    let old = a.pre_commit(&key, &limits).await.expect("first allowed");
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let _fresh = a.pre_commit(&key, &limits).await.expect("next second");
+    old.refund().await;
+    assert!(
+        a.pre_commit(&key, &limits).await.is_err(),
+        "a refund for the previous second must not free the current one"
+    );
+}
+
+/// Sliding: the refund comes out of the sub-bucket the acquire counted in.
+#[tokio::test]
+async fn refund_decrements_the_shared_sliding_sub_bucket() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_URL not set");
+        return;
+    };
+    let mut raw = raw_conn(&url).await;
+    let now = server_now_with_headroom(&mut raw, 10, 3).await;
+    let a = Limiter::with_store(Arc::new(store(&url).await));
+    let key = unique_key("refund-sw");
+    let limits = sliding(RateLimit {
+        rpm: Some(2),
+        ..rl()
+    });
+    let first = a.pre_commit(&key, &limits).await.expect("first");
+    let _second = a.pre_commit(&key, &limits).await.expect("second");
+    assert!(a.pre_commit(&key, &limits).await.is_err());
+    first.refund().await;
+    let counted: Option<u64> = redis::cmd("HGET")
+        .arg(format!("{DEFAULT_PREFIX}:{{{key}}}:sw:rpm"))
+        .arg(now - now % 10)
+        .query_async(&mut raw)
+        .await
+        .expect("HGET");
+    assert_eq!(counted, Some(1));
+    let _third = a
+        .pre_commit(&key, &limits)
+        .await
+        .expect("refunded unit reopens");
+    assert!(a.pre_commit(&key, &limits).await.is_err());
+}

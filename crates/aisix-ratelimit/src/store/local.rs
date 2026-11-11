@@ -14,8 +14,8 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 
 use super::{
-    request_dims, sliding_step_secs, token_dims, Dim, RateStore, DAY_SECS, DIM_RPD, DIM_RPH,
-    DIM_RPM, DIM_RPS, DIM_TPD, DIM_TPM, HOUR_SECS, MINUTE_SECS, SECOND_SECS,
+    request_dims, sliding_step_secs, token_dims, AcquireStamp, Dim, RateStore, DAY_SECS, DIM_RPD,
+    DIM_RPH, DIM_RPM, DIM_RPS, DIM_TPD, DIM_TPM, HOUR_SECS, MINUTE_SECS, SECOND_SECS,
 };
 use crate::clock::{Clock, SystemClock};
 use crate::error::{LimitDetail, RateLimitError};
@@ -109,6 +109,15 @@ impl KeyState {
         }
     }
 
+    /// Undo the increment an acquire at `at` made, in the window (fixed)
+    /// or sub-bucket (sliding) it landed in; a no-op once that has rolled.
+    fn refund(&mut self, d: &Dim, at: u64) {
+        match d.step_secs {
+            None => self.fixed(d.name).decrement(at, 1),
+            Some(_) => self.sliding(d.name).refund(at, 1),
+        }
+    }
+
     fn current(&mut self, d: &Dim, now: u64) -> u64 {
         match d.step_secs {
             None => self.fixed(d.name).current(now),
@@ -177,7 +186,7 @@ impl<C: Clock> RateStore for LocalStore<C> {
         key: &str,
         limits: &RateLimit,
         _member: &str,
-    ) -> Result<(), RateLimitError> {
+    ) -> Result<AcquireStamp, RateLimitError> {
         let now = self.clock.unix_secs();
         let state = self.state_for(key);
         let mut s = state.lock();
@@ -227,7 +236,18 @@ impl<C: Clock> RateStore for LocalStore<C> {
         }
 
         s.in_flight += 1;
-        Ok(())
+        Ok(AcquireStamp::local(now))
+    }
+
+    async fn refund(&self, key: &str, limits: &RateLimit, _member: &str, stamp: AcquireStamp) {
+        let Some(state) = self.states.get(key) else {
+            return;
+        };
+        let mut s = state.lock();
+        for d in request_dims(limits) {
+            s.refund(&d, stamp.at_secs);
+        }
+        s.in_flight = s.in_flight.saturating_sub(1);
     }
 
     async fn commit(

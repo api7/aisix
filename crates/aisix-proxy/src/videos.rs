@@ -1913,7 +1913,7 @@ async fn dispatch_create(
     // (AISIX-Cloud#1118 decision 3; the #1116 shape).
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+    let mut reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
     // A Model Group walks its targets (AISIX-Cloud#1111). The video id then
     // names the target that accepted the task, so the GET routes poll the
@@ -1929,6 +1929,7 @@ async fn dispatch_create(
         state,
         snapshot,
         auth,
+        &mut reservation,
         client,
         &body.model,
         &model_entry,

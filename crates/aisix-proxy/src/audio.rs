@@ -1377,7 +1377,7 @@ async fn multipart_dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+    let mut reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
     // Static labels for telemetry — this dispatch serves
     // both audio sub-routes, and logging translations under the
@@ -1401,6 +1401,7 @@ async fn multipart_dispatch(
         state,
         snapshot,
         auth,
+        &mut reservation,
         client_ctx,
         &model_name,
         &model_entry,
@@ -2218,7 +2219,7 @@ async fn speech_dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+    let mut reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
     // A Model Group walks its targets (AISIX-Cloud#1111). Each attempt builds
     // its own wire body — the `model` field and the PK's `request.*` overrides
@@ -2230,6 +2231,7 @@ async fn speech_dispatch(
         state,
         snapshot,
         auth,
+        &mut reservation,
         client_ctx,
         &model_name,
         &model_entry,
