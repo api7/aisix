@@ -85,9 +85,9 @@ pub use oidc_provider::{
 };
 pub use passthrough_route::{PassthroughAuthMode, PassthroughCredentialMode, PassthroughRoute};
 pub use policy_conditions::{
-    eval_condition_nodes, validate_condition_nodes, ConditionGroup, ConditionInput, ConditionLogic,
-    ConditionNode, ConditionOperator, ConditionValue, GroupByDimension, PolicyAction,
-    PolicyCondition, PolicyDimension,
+    eval_condition_nodes, eval_condition_nodes_for_any_member, validate_condition_nodes,
+    ConditionGroup, ConditionInput, ConditionLogic, ConditionNode, ConditionOperator,
+    ConditionValue, GroupByDimension, PolicyAction, PolicyCondition, PolicyDimension,
 };
 pub use pricing::{LivePricingIndex, Pricing, PricingIndex};
 pub use provider_key::{
