@@ -180,14 +180,13 @@ impl SinkStats {
 #[derive(Clone)]
 pub struct SinkHandle {
     name: Arc<str>,
-    // Declared before `_closer` so the last handle's sender is gone by the
-    // time its `_closer` wakes the worker to find the channel closed.
+    // Declared before `wake` so the last handle's sender is gone by the
+    // time dropping its `wake` tells the worker to find the channel closed.
     tx: mpsc::Sender<Arc<SinkRecord>>,
-    _closer: Arc<WakeOnClose>,
     /// Wakes the worker once a full batch is queued. Below that the worker
     /// is left asleep until its flush tick: it never waits in `recv`, so a
     /// send on the request path does not wake it record by record.
-    wake: Arc<Notify>,
+    wake: Arc<WakeOnClose>,
     max_batch: usize,
     stats: Arc<SinkStats>,
     /// Prometheus view of the drop counters below. `SinkStats` is the
@@ -212,7 +211,7 @@ impl SinkHandle {
         match self.tx.try_send(record) {
             Ok(()) => {
                 if self.queued() >= self.max_batch as u64 {
-                    self.wake.notify_one();
+                    self.wake.0.notify_one();
                 }
                 true
             }
@@ -247,8 +246,9 @@ impl SinkHandle {
     }
 }
 
-/// Wakes the worker when the last [`SinkHandle`] is dropped, so it drains
-/// and exits then rather than at its next flush tick.
+/// The worker's wake signal, which also fires when the last [`SinkHandle`]
+/// is dropped, so the worker drains and exits then rather than at its next
+/// flush tick.
 struct WakeOnClose(Arc<Notify>);
 
 impl Drop for WakeOnClose {
@@ -294,8 +294,7 @@ impl SinkPipeline {
         let handle = SinkHandle {
             name: Arc::from(sink.name()),
             tx,
-            _closer: Arc::new(WakeOnClose(Arc::clone(&wake))),
-            wake: Arc::clone(&wake),
+            wake: Arc::new(WakeOnClose(Arc::clone(&wake))),
             max_batch: cfg.max_batch,
             stats: Arc::clone(&stats),
             metrics: metrics.clone(),
@@ -354,20 +353,14 @@ impl SinkPipeline {
                 return;
             }
             tokio::select! {
-                // A full batch is queued, or the last handle is gone; the
-                // top of the loop tells which.
+                // A full batch is queued, the last handle is gone, or a
+                // shutdown: the top of the loop tells which.
                 _ = self.wake.notified() => {}
                 _ = ticker.tick() => {
                     self.take(&mut buffer);
                     self.flush(&mut buffer, None, &mut shutdown).await;
                 }
-                _ = cancel.changed() => {
-                    if *cancel.borrow() {
-                        self.drain(&mut buffer, &mut shutdown).await;
-                        tracing::info!(sink = %self.sink.name(), "sink pipeline shutting down");
-                        return;
-                    }
-                }
+                _ = cancel.changed() => {}
             }
         }
     }

@@ -1252,13 +1252,14 @@ pub(crate) fn emit_usage(
     // emitters and the cancel guard itself both run.
     crate::attribution::note_usage_emitted(terminal, event.attempt_index);
     let provider_key_id = labels.provider_key_id;
+    let exporters = live_exporters(state, snap);
+    if exporters.is_empty() {
+        state.usage_sink.try_emit(surface.handler, event, labels);
+        return;
+    }
     state
         .usage_sink
         .try_emit(surface.handler, event.clone(), labels);
-    let exporters = live_exporters(state, snap);
-    if exporters.is_empty() {
-        return;
-    }
     // A streamed response's parts were read off the frames the caller got;
     // they belong to the event that ends the request.
     let streamed;

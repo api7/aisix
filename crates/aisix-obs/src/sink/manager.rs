@@ -141,7 +141,7 @@ impl ExporterPipelines {
         let fingerprint = match running.get_mut(key) {
             Some(existing) => {
                 let same_source = match (&existing.source, &source) {
-                    (Some(a), Some(b)) => std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b)),
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
                     _ => false,
                 };
                 if same_source {
