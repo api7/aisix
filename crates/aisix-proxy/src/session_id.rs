@@ -93,6 +93,14 @@ fn vendor_header(headers: &HeaderMap) -> Option<String> {
         .map(|(_, value)| value.to_owned())
 }
 
+/// Whether the request comes from Codex, by its `User-Agent`.
+pub(crate) fn is_codex_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(is_codex_caller)
+}
+
 fn is_codex_caller(user_agent: &str) -> bool {
     let bytes = user_agent.as_bytes();
     bytes.len() > 5

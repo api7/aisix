@@ -424,6 +424,80 @@ describe("semantic session affinity on one gateway", () => {
     expect(field(await accessLine(app!, pinned), "semantic_pinned")).toBe("true");
   });
 
+  describe("a client's side request follows a pin but never sets one", () => {
+    const CLAUDE_TITLE = (ask: string) =>
+      `<session>\n${ask}\n</session>\n\nWrite the title in the predominant language of the session — a stray word or code token in another language doesn't change it, and neither does the English of these instructions.`;
+    const CODEX_UA = "codex_cli_rs/0.167.0 (Linux; x86_64)";
+
+    for (const [protocol, send] of [
+      ["messages", messages],
+      ["chat", chat],
+    ] as const) {
+      test(`${protocol}: a title request is classified and pins nothing`, async (ctx) => {
+        if (!ready()) return ctx.skip();
+        const h = { "x-claude-code-session-id": randomUUID() };
+        await expectClassified(await send("sa-router", CLAUDE_TITLE(LEGAL), h), "sa-legal", "legal");
+        await expectClassified(await send("sa-router", CODE, h), "sa-code", "code");
+        await expectPinned(await send("sa-router", LEGAL, h), "sa-code", "code");
+      });
+    }
+
+    test("a title request in a pinned session goes to the pin", async (ctx) => {
+      if (!ready()) return ctx.skip();
+      const h = { "x-claude-code-session-id": randomUUID() };
+      await expectClassified(await messages("sa-router", LEGAL, h), "sa-legal", "legal");
+      await expectPinned(await messages("sa-router", CLAUDE_TITLE(CODE), h), "sa-legal", "legal");
+    });
+
+    test("x-claude-code-request-class: auxiliary pins nothing", async (ctx) => {
+      if (!ready()) return ctx.skip();
+      const session = { "x-claude-code-session-id": randomUUID() };
+      const aux = { ...session, "x-claude-code-request-class": "auxiliary" };
+      await expectClassified(await messages("sa-router", LEGAL, aux), "sa-legal", "legal");
+      await expectClassified(await messages("sa-router", CODE, session), "sa-code", "code");
+      await expectPinned(await messages("sa-router", LEGAL, aux), "sa-code", "code");
+    });
+
+    test("responses: a Codex title request pins nothing", async (ctx) => {
+      if (!ready()) return ctx.skip();
+      const h = { "user-agent": CODEX_UA, "session-id": randomUUID() };
+      const title = `Generate a concise, single-line task title of at most 36 characters and under five words where possible.\n\n${LEGAL}`;
+      await expectClassified(await responses("sa-router", title, h), "sa-legal", "legal");
+      await expectClassified(await responses("sa-router", CODE, h), "sa-code", "code");
+      await expectPinned(await responses("sa-router", LEGAL, h), "sa-code", "code");
+    });
+
+    test("responses: what Codex injects into a user turn is not classified", async (ctx) => {
+      if (!ready()) return ctx.skip();
+      const input = [
+        {
+          type: "message",
+          role: "user",
+          content: [
+            { type: "input_text", text: `# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\n${LEGAL}\n</INSTRUCTIONS>` },
+            { type: "input_text", text: "<environment_context>\n  <cwd>/repo</cwd>\n  <note>contract</note>\n</environment_context>" },
+          ],
+        },
+        {
+          type: "message",
+          role: "user",
+          content: [{ type: "input_image", image_url: "data:image/png;base64,iVBORw0KGgo=" }],
+        },
+      ];
+      const codex = { "user-agent": CODEX_UA, "session-id": randomUUID() };
+      const r = await post("/v1/responses", { model: "sa-router", input }, codex);
+      expect(r.status, r.text).toBe(200);
+      expect(r.text).toContain("served-by-sa-default");
+      expect(r.route).toBeNull();
+      expect(field(await accessLine(app!, r), "semantic_fallback")).toBe("empty_prompt");
+      await expectClassified(await responses("sa-router", CODE, codex), "sa-code", "code");
+
+      // From any other client the same turn is text, and is classified.
+      const other = { "x-aisix-session-id": session() };
+      await expectClassified(await post("/v1/responses", { model: "sa-router", input }, other), "sa-legal", "legal");
+    });
+  });
+
   test("a request without a session id is classified every time", async (ctx) => {
     if (!ready()) return ctx.skip();
     await expectClassified(await chat("sa-router", LEGAL), "sa-legal", "legal");
@@ -569,6 +643,19 @@ describe("semantic session affinity across managed gateways", () => {
     const keys = [...cp!.store.keys()].filter((k) => k.startsWith("session_affinity/"));
     expect(keys.length).toBeGreaterThan(0);
     expect(keys.every((k) => /^session_affinity\/[0-9a-f]{64}$/.test(k)), keys.join()).toBe(true);
+  });
+
+  test("a side request writes no pin to the store", async (ctx) => {
+    if (!ready()) return ctx.skip();
+    const [a, b] = apps as [SpawnedApp, SpawnedApp];
+    const h = { "x-aisix-session-id": session(), "x-claude-code-request-class": "auxiliary" };
+    const stored = () => [...cp!.store.keys()].filter((k) => k.startsWith("session_affinity/")).length;
+    const before = stored();
+    expect(servedBy(await chat(a, LEGAL, h))).toBe("sa-legal");
+    expect(stored()).toBe(before);
+    const r = await chat(b, CODE, h);
+    expect(servedBy(r), r.text).toBe("sa-code");
+    expect(field(await accessLine(b, r), "semantic_pinned")).toBeUndefined();
   });
 
   test("a gateway that lost the race to pin goes where the first pin went", async (ctx) => {

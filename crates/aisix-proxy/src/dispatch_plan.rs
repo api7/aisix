@@ -30,8 +30,8 @@ pub(crate) struct DispatchPlan {
 /// Resolve the attempts for `entry`, the model the caller addressed as
 /// `model_name`. `prompt` and `session` are read only for a semantic router:
 /// the request's classification text, built by the endpoint's protocol
-/// reader (`semantic::chat_prompt` and its siblings), and what its session
-/// affinity reads off the body.
+/// reader (`semantic::chat_prompt` and its siblings) with the blocks its
+/// client injects removed, and what its session affinity reads off the body.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn plan(
     state: &ProxyState,
@@ -39,7 +39,7 @@ pub(crate) async fn plan(
     model_name: &str,
     entry: &ResourceEntry<Model>,
     request_id: &str,
-    prompt: impl FnOnce() -> String,
+    prompt: impl FnOnce(crate::semantic::InjectedBlocks) -> String,
     routing: RoutingRequest<'_>,
     session: crate::semantic::SessionRequest<'_>,
 ) -> Result<DispatchPlan, ProxyError> {
@@ -48,7 +48,7 @@ pub(crate) async fn plan(
             state,
             snapshot,
             entry,
-            &prompt(),
+            &prompt(crate::semantic::InjectedBlocks::of(routing.headers)),
             request_id,
             routing,
             session,
