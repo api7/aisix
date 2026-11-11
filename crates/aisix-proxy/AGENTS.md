@@ -412,9 +412,11 @@ Two shapes, both already implemented — copy the nearest one:
   `routing::dispatch_with_failover` serves the single-shot family (completions,
   embeddings, rerank, images, audio, video submits) — and in both the
   streaming and non-streaming branches; skip the target and continue rather than
-  failing the whole request. See `quota::reserve_routing_target`, which also shows
-  the non-double-charge rule: it returns `None` for non-routing dispatch, whose
-  model layers the pre-dispatch `quota::enforce*` already reserved.
+  failing the whole request. See `quota::TargetGate`, the one per-attempt
+  rate-limit gate every target-walking loop calls — it also carries the
+  non-double-charge rule (`None` for non-routing dispatch, whose model layers the
+  pre-dispatch `quota::enforce*` already reserved) and the per-layer counting
+  contract (AISIX-Cloud#1954).
 
 Whichever shape, the group's own gate stays enforced pre-dispatch — the two tiers
 are additive, not either/or — and a caller-visible rejection must keep the

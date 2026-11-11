@@ -780,6 +780,11 @@ async fn dispatch(
     // record (#655).
     let n = attempt_models.len();
     let mut last_err: Option<ProxyError> = None;
+    let mut target_gate =
+        crate::quota::TargetGate::new(is_routing_request.then_some(crate::quota::RoutingParent {
+            name: &model_entry.value.display_name,
+            entry_id: &model_entry.id,
+        }));
     'targets: for (i, target) in attempt_models.iter().enumerate() {
         let pk_id = crate::dispatch::resolve_provider_key(snapshot, &target.model)
             .map(|e| e.id.clone())
@@ -828,19 +833,17 @@ async fn dispatch(
             // 429 attempt and move on to the remaining targets in strategy
             // order (same-target retries can't help — the window won't
             // reset mid-loop).
-            let mut member_reservation = match crate::quota::reserve_routing_target(
-                state,
-                snapshot,
-                auth,
-                is_routing_request.then_some(crate::quota::RoutingParent {
-                    name: &model_entry.value.display_name,
-                    entry_id: &model_entry.id,
-                }),
-                &target.model.display_name,
-                &target.id,
-                &target.model,
-            )
-            .await
+            let mut member_reservation = match target_gate
+                .reserve(
+                    state,
+                    snapshot,
+                    auth,
+                    reservation.get_or_insert_with(Default::default),
+                    &target.model.display_name,
+                    &target.id,
+                    &target.model,
+                )
+                .await
             {
                 Ok(r) => r,
                 Err(e) => {
@@ -993,6 +996,9 @@ async fn dispatch(
                 }
             }
         }
+    }
+    if let Some(r) = reservation.as_mut() {
+        target_gate.refund_unserved(r).await;
     }
     Err(MessagesDispatchError {
         err: last_err.unwrap_or(ProxyError::ProviderUnavailable),

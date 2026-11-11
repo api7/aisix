@@ -389,7 +389,7 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+    let mut reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
     *routing_out = crate::attempt::RoutingTelemetry::for_request(&model_entry.value.display_name)
         .with_trace(client_ctx.trace.clone());
@@ -398,6 +398,7 @@ async fn dispatch(
         state,
         snapshot,
         auth,
+        &mut reservation,
         client_ctx,
         &model_name,
         &model_entry,

@@ -29,7 +29,7 @@ use aisix_core::{RateLimit, RateLimitWindowType};
 use crate::clock::Clock;
 use crate::error::RateLimitError;
 use crate::store::local::LocalStore;
-use crate::store::{RateStore, StreamLeaseRefresh};
+use crate::store::{AcquireStamp, RateStore, StreamLeaseRefresh};
 
 /// Current window state for a single key, returned by [`Limiter::peek`].
 /// Used by the proxy handlers to inject the `x-ratelimit-*` response
@@ -114,7 +114,7 @@ impl Limiter {
         limits: &RateLimit,
     ) -> Result<Reservation, RateLimitError> {
         let member = self.next_member();
-        self.store.acquire(key, limits, &member).await?;
+        let stamp = self.store.acquire(key, limits, &member).await?;
         let has_concurrency_slot = limits.concurrency.is_some();
         // Keep this state from acquire onward. A slow upstream-header phase
         // can discover a missing Redis member before the response is known
@@ -131,6 +131,8 @@ impl Limiter {
             store: Arc::clone(&self.store),
             key: key.to_string(),
             window_type: limits.window_type,
+            limits: limits.clone(),
+            stamp,
             member,
             has_concurrency_slot,
             refresh_task,
@@ -238,6 +240,10 @@ pub struct Reservation {
     store: Arc<dyn RateStore>,
     key: String,
     window_type: RateLimitWindowType,
+    /// The limits the acquire counted, so a refund knows which request
+    /// windows it incremented.
+    limits: RateLimit,
+    stamp: AcquireStamp,
     member: String,
     has_concurrency_slot: bool,
     /// Starts at successful acquire, rather than at the later SSE handoff:
@@ -275,6 +281,19 @@ impl Reservation {
             .await;
         self.committed = true;
     }
+
+    /// Give back everything this reservation counted: its request-window
+    /// increments (in the window they landed in, a no-op once that has
+    /// rolled) and its concurrency slot. Pre-commit charges no tokens, so
+    /// there are none to return. For a request the gateway itself refused
+    /// before any upstream saw it; a dispatched request is never refunded.
+    pub async fn refund(mut self) {
+        self.stop_refresh();
+        self.store
+            .refund(&self.key, &self.limits, &self.member, self.stamp)
+            .await;
+        self.committed = true;
+    }
 }
 
 impl Drop for Reservation {
@@ -290,6 +309,7 @@ impl Drop for Reservation {
 /// Wraps multiple [`Reservation`]s across rate-limit layers (api_key,
 /// model, team, member). Commits all with the same token count; dropping
 /// releases all concurrency slots.
+#[derive(Default)]
 pub struct MultiReservation {
     reservations: Vec<Reservation>,
 }
@@ -297,6 +317,18 @@ pub struct MultiReservation {
 impl MultiReservation {
     pub fn new(reservations: Vec<Reservation>) -> Self {
         Self { reservations }
+    }
+
+    /// Add one more layer.
+    pub fn push(&mut self, reservation: Reservation) {
+        self.reservations.push(reservation);
+    }
+
+    /// [`Reservation::refund`] every layer.
+    pub async fn refund(self) {
+        for r in self.reservations {
+            r.refund().await;
+        }
     }
 
     /// Commit the actual token cost to every layer.
@@ -486,8 +518,12 @@ mod tests {
             key: &str,
             limits: &RateLimit,
             member: &str,
-        ) -> Result<(), RateLimitError> {
+        ) -> Result<AcquireStamp, RateLimitError> {
             self.inner.acquire(key, limits, member).await
+        }
+
+        async fn refund(&self, key: &str, limits: &RateLimit, member: &str, stamp: AcquireStamp) {
+            self.inner.refund(key, limits, member, stamp).await;
         }
 
         async fn commit(
@@ -1492,5 +1528,73 @@ mod tests {
         let slid = sliding(fixed.clone());
         limiter.pre_commit("k", &slid).await.unwrap();
         assert!(limiter.pre_commit("k", &slid).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn refund_gives_back_every_request_window_and_the_concurrency_slot() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let l = RateLimit {
+            rph: Some(1),
+            concurrency: Some(1),
+            ..limits(Some(1), None, None)
+        };
+        let r = limiter.pre_commit("k", &l).await.unwrap();
+        assert!(limiter.pre_commit("k", &l).await.is_err());
+        r.refund().await;
+        let status = limiter.peek("k", &l).await.unwrap();
+        assert_eq!((status.rpm_used, status.in_flight), (0, 0));
+        // Every window (rpm AND rph) and the slot are free again.
+        limiter.pre_commit("k", &l).await.unwrap().refund().await;
+        let kept = limiter.pre_commit("k", &l).await.unwrap();
+        assert!(limiter.pre_commit("k", &l).await.is_err());
+        drop(kept);
+    }
+
+    /// A refund lands in the window its acquire counted under; after that
+    /// window has rolled it must not eat a newer request's count.
+    #[tokio::test]
+    async fn refund_after_the_fixed_window_rolled_leaves_the_new_window_alone() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let l = limits(Some(1), None, None);
+        let old = limiter.pre_commit("k", &l).await.unwrap();
+        clock.advance(60);
+        let _fresh = limiter.pre_commit("k", &l).await.unwrap();
+        old.refund().await;
+        assert!(limiter.pre_commit("k", &l).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sliding_refund_decrements_the_sub_bucket_it_was_counted_in() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let l = sliding(limits(Some(2), None, None));
+        let first = limiter.pre_commit("k", &l).await.unwrap();
+        clock.advance(10);
+        let _second = limiter.pre_commit("k", &l).await.unwrap();
+        assert!(limiter.pre_commit("k", &l).await.is_err());
+        // The refund comes from the OLDER sub-bucket, so the one counted
+        // now keeps its unit and only one slot reopens.
+        first.refund().await;
+        let _third = limiter.pre_commit("k", &l).await.unwrap();
+        assert!(limiter.pre_commit("k", &l).await.is_err());
+        // Once the first sub-bucket has left the window the newer one still
+        // holds both of its units: the refund did not take one from there.
+        clock.advance(60);
+        assert!(limiter.pre_commit("k", &l).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sliding_refund_after_its_sub_bucket_was_reused_is_a_no_op() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::local_with_clock(clock.clone());
+        let l = sliding(limits(Some(1), None, None));
+        let old = limiter.pre_commit("k", &l).await.unwrap();
+        // 70s later the 60s/10s ring has wrapped onto the same slot.
+        clock.advance(70);
+        let _fresh = limiter.pre_commit("k", &l).await.unwrap();
+        old.refund().await;
+        assert!(limiter.pre_commit("k", &l).await.is_err());
     }
 }

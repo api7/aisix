@@ -21,10 +21,21 @@
 //! All layers use AND logic — every layer must pass or the request gets
 //! 429. The returned [`MultiReservation`] commits token usage to all
 //! layers and releases all concurrency permits on drop.
+//!
+//! Counting: the request gate ([`enforce`] / [`enforce_rate_limit`])
+//! counts once per downstream request; a Model Group's per-target layers
+//! count through [`TargetGate`] (per upstream attempt, except the
+//! caller-facing policies a group satisfies, which count once per
+//! request). A request this gateway's own limiter refuses consumes
+//! nothing: a refused pass refunds what it counted, and a routed request
+//! whose every target was refused refunds the request gate too. Counts of
+//! an attempt that went upstream are never given back.
 
 use aisix_core::models::{
     ConditionInput, GroupByDimension, PolicyScope, PolicyWindow, RateLimitPolicy,
 };
+use std::collections::HashSet;
+
 use aisix_core::RateLimit;
 use aisix_ratelimit::MultiReservation;
 
@@ -320,6 +331,10 @@ fn classic_rate_limit(policy: &RateLimitPolicy) -> Option<RateLimit> {
 /// Reserve across all applicable rate-limit layers (api_key, model,
 /// mcp_server, policies). `mcp_server` is the MCP server an in-flight
 /// `tools/call` targets; `None` for every non-MCP endpoint.
+///
+/// All or nothing: when any layer refuses, every layer this call already
+/// counted is refunded ([`MultiReservation::refund`]), so a request the
+/// gate turns away has consumed no quota at any layer.
 async fn reserve_layers(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
@@ -330,7 +345,32 @@ async fn reserve_layers(
     // Starts empty so the common no-limits request never allocates;
     // the first reservation (if any) grows it on demand.
     let mut reservations = Vec::new();
+    match reserve_request_layers(
+        state,
+        snapshot,
+        auth,
+        model_rl,
+        mcp_server,
+        &mut reservations,
+    )
+    .await
+    {
+        Ok(()) => Ok(MultiReservation::new(reservations)),
+        Err(e) => {
+            MultiReservation::new(reservations).refund().await;
+            Err(e)
+        }
+    }
+}
 
+async fn reserve_request_layers(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    model_rl: Option<&ModelRateLimit>,
+    mcp_server: Option<&str>,
+    reservations: &mut Vec<aisix_ratelimit::Reservation>,
+) -> Result<(), ProxyError> {
     // Layer 1: API key inline rate limit.
     let key_limits = auth.key().rate_limit.clone().unwrap_or_default();
     if !key_limits.is_unrestricted() {
@@ -385,9 +425,21 @@ async fn reserve_layers(
     let phase = PolicyPhase::Request {
         defer_model_properties: model_rl.is_some_and(|m| m.routing_parent),
     };
-    reserve_policy_layers(state, snapshot, &input, phase, &mut reservations).await?;
+    reserve_policy_layers(state, snapshot, &input, phase, reservations, None).await
+}
 
-    Ok(MultiReservation::new(reservations))
+/// The caller-facing half of a routing target pass: conditional policies
+/// the caller-addressed parent satisfies — with the parent's identity
+/// standing in for the target's `model` / `model_name`, every other
+/// dimension (team, member, provider, tags) as the target pass sees it.
+/// Such a policy is about the entry the caller addressed, so it counts at
+/// most once per downstream request however many attempts run.
+struct CallerScoped<'a> {
+    parent_input: ConditionInput<'a>,
+    /// Policy entry ids an earlier pass of this request already reserved.
+    held: &'a HashSet<String>,
+    /// What this pass reserved, keyed by policy entry id.
+    taken: Vec<(String, aisix_ratelimit::Reservation)>,
 }
 
 /// Select policy candidates for the given phase and reserve every
@@ -404,6 +456,7 @@ async fn reserve_policy_layers(
     input: &ConditionInput<'_>,
     phase: PolicyPhase,
     reservations: &mut Vec<aisix_ratelimit::Reservation>,
+    mut caller_scoped: Option<&mut CallerScoped<'_>>,
 ) -> Result<(), ProxyError> {
     // O(1) empty check before anything else: deployments with no
     // rate-limit policies (the default) skip the wall-clock read and
@@ -425,12 +478,27 @@ async fn reserve_policy_layers(
         let Some(layer) = match_policy_layer(policy, &entry.id, input, phase) else {
             continue;
         };
+        let caller_facing = caller_scoped.as_deref_mut().filter(|cs| {
+            policy.is_conditional()
+                && aisix_core::models::eval_condition_nodes(
+                    policy.conditions.as_deref().unwrap_or_default(),
+                    &cs.parent_input,
+                )
+        });
+        if let Some(cs) = &caller_facing {
+            if cs.held.contains(&entry.id) {
+                continue;
+            }
+        }
         let r = state
             .limiter
             .pre_commit(&layer.bucket_key, &layer.limits)
             .await
             .map_err(|e| reject(state, e, "policy", Some((&entry.id, &policy.name))))?;
-        reservations.push(r);
+        match caller_facing {
+            Some(cs) => cs.taken.push((entry.id.clone(), r)),
+            None => reservations.push(r),
+        }
     }
     Ok(())
 }
@@ -578,8 +646,8 @@ pub(crate) async fn enforce_rate_limit(
 /// deliberately omits those request-level layers so they are not double-counted
 /// per member. Returns an empty [`MultiReservation`] (zero overhead, no
 /// `pre_commit` calls) when the model carries no limits, so unlimited members
-/// pay nothing. On a partial failure the already-acquired layers release on the
-/// dropped `Vec`, same as [`reserve_layers`].
+/// pay nothing. All or nothing like [`reserve_layers`]: a refusal refunds the
+/// layers this call already counted.
 ///
 /// `auth` supplies the identity dimensions a conditional row's tree may
 /// combine with its model condition (e.g. `team ∈ {T} AND model_name ~~
@@ -594,75 +662,178 @@ pub(crate) async fn reserve_model_only(
     model: &aisix_core::Model,
     routing_parent: Option<RoutingParent<'_>>,
 ) -> Result<MultiReservation, ProxyError> {
-    let mut reservations = Vec::new();
-
-    // Inline model rate limit.
     let mrl = ModelRateLimit::from_model(model_name, model_entry_id, model);
-    if let Some(ref limits) = mrl.limits {
-        let key = format!("model:{}", mrl.bucket_name);
-        let r = state
-            .limiter
-            .pre_commit(&key, limits)
-            .await
-            .map_err(|e| reject(state, e, "model", None))?;
-        reservations.push(r);
-    }
-
-    // Policies that follow the model to this target. The condition
-    // input carries the {target, caller-addressed parent} pair so a
-    // policy pinning the parent's id or alias matches here too
-    // (AISIX-Cloud#1267).
     let input = condition_input(auth, Some(&mrl), routing_parent);
-    reserve_policy_layers(
-        state,
-        snapshot,
-        &input,
-        PolicyPhase::ModelTarget,
-        &mut reservations,
-    )
-    .await?;
-
-    Ok(MultiReservation::new(reservations))
+    reserve_target_layers(state, snapshot, &mrl, &input, None).await
 }
 
-/// Reserve the model-scoped layers for one routing-dispatch target (Model
-/// Group / semantic-router member), mirroring the ensemble per-sub-call
-/// reservation (#620). Returns `Ok(None)` for a direct (non-routing)
-/// dispatch: there the target IS the requested entry, whose model layers
-/// were already reserved pre-dispatch by [`enforce`]/[`enforce_rate_limit`],
-/// so reserving again would double-count the request (AISIX-Cloud#1087).
-///
-/// An `Err` means this target is over one of its own limits right now —
-/// the dispatch loops treat that as a failed 429 attempt and continue with
-/// the remaining targets (matching LiteLLM, which filters rate-limited
-/// deployments out of the candidate set).
-pub(crate) async fn reserve_routing_target(
+/// The target pass shared by [`reserve_model_only`] and [`TargetGate`].
+/// On a refusal every layer counted in this pass — `caller_scoped.taken`
+/// included — is refunded.
+async fn reserve_target_layers(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
-    auth: &AuthenticatedKey,
-    routing_parent: Option<RoutingParent<'_>>,
-    target_name: &str,
-    target_entry_id: &str,
-    target: &aisix_core::Model,
-) -> Result<Option<MultiReservation>, ProxyError> {
-    let Some(parent) = routing_parent else {
-        return Ok(None);
-    };
-    reserve_model_only(
-        state,
-        snapshot,
-        auth,
-        target_name,
-        target_entry_id,
-        target,
-        Some(parent),
-    )
-    .await
-    .map(Some)
+    mrl: &ModelRateLimit,
+    input: &ConditionInput<'_>,
+    mut caller_scoped: Option<&mut CallerScoped<'_>>,
+) -> Result<MultiReservation, ProxyError> {
+    let mut reservations = Vec::new();
+    let reserved = async {
+        // Inline model rate limit.
+        if let Some(ref limits) = mrl.limits {
+            let key = format!("model:{}", mrl.bucket_name);
+            let r = state
+                .limiter
+                .pre_commit(&key, limits)
+                .await
+                .map_err(|e| reject(state, e, "model", None))?;
+            reservations.push(r);
+        }
+        // Policies that follow the model to this target. The condition
+        // input carries the {target, caller-addressed parent} pair so a
+        // policy pinning the parent's id or alias matches here too
+        // (AISIX-Cloud#1267).
+        reserve_policy_layers(
+            state,
+            snapshot,
+            input,
+            PolicyPhase::ModelTarget,
+            &mut reservations,
+            caller_scoped.as_deref_mut(),
+        )
+        .await
+    }
+    .await;
+    match reserved {
+        Ok(()) => Ok(MultiReservation::new(reservations)),
+        Err(e) => {
+            MultiReservation::new(reservations).refund().await;
+            if let Some(cs) = caller_scoped {
+                for (_, r) in cs.taken.drain(..) {
+                    r.refund().await;
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The per-target rate-limit gate of one downstream request, shared by
+/// every loop that walks a Model Group's targets (chat, messages,
+/// count_tokens, responses, and [`crate::routing::dispatch_with_failover`]
+/// for the single-shot family) so they count identically. Call
+/// [`Self::reserve`] once per upstream ATTEMPT — every same-target retry
+/// included — and [`Self::refund_unserved`] on the request's failure path.
+///
+/// Per-layer counting for a request routed through a group (the request
+/// gate, [`enforce`] / [`enforce_rate_limit`], is unchanged: once per
+/// downstream request):
+///
+/// - member layers — the target's inline model `rate_limit`, classic
+///   `model`-scope policies on the target, and conditional policies only
+///   the target's own `model` / `model_name` satisfy — count once per
+///   attempt, failed attempts and same-target retries included;
+/// - conditional policies the caller-addressed group satisfies (its id or
+///   alias standing in for the model, AISIX-Cloud#1267) count at most once
+///   per downstream request: reserved on the first attempt they match,
+///   held in the request's reservation from then on (so its tokens are
+///   committed once, with the winning attempt's usage), skipped on later
+///   attempts;
+/// - a pass refused by any layer refunds what it counted and the target is
+///   skipped; when no attempt passed its target gate and at least one was
+///   refused, the request was turned away by the gateway alone, and
+///   [`Self::refund_unserved`] refunds the request gate's layers too. An
+///   attempt that passed is never refunded, whatever the upstream answered.
+///
+/// A direct (non-routing) dispatch has no target layers here: the target
+/// IS the requested entry, whose model layers the request gate already
+/// reserved, so reserving again would double-count it (AISIX-Cloud#1087).
+pub(crate) struct TargetGate<'a> {
+    parent: Option<RoutingParent<'a>>,
+    caller_held: HashSet<String>,
+    admitted: bool,
+    refused: bool,
+}
+
+impl<'a> TargetGate<'a> {
+    /// `routing_parent` is the caller-addressed group; `None` for a direct
+    /// dispatch.
+    pub(crate) fn new(routing_parent: Option<RoutingParent<'a>>) -> Self {
+        Self {
+            parent: routing_parent,
+            caller_held: HashSet::new(),
+            admitted: false,
+            refused: false,
+        }
+    }
+
+    /// Reserve one attempt's target layers. `Ok(None)` for a direct
+    /// dispatch. The returned reservation is the attempt's member layers;
+    /// the caller-facing policies go straight into `request`. An `Err`
+    /// means the target is over one of its own limits right now — the
+    /// loops record a 429 attempt (`dispatched: false`) and move to the
+    /// next target, which is how a rate-limited deployment leaves the
+    /// candidate set.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn reserve(
+        &mut self,
+        state: &ProxyState,
+        snapshot: &aisix_core::AisixSnapshot,
+        auth: &AuthenticatedKey,
+        request: &mut MultiReservation,
+        target_name: &str,
+        target_entry_id: &str,
+        target: &aisix_core::Model,
+    ) -> Result<Option<MultiReservation>, ProxyError> {
+        let Some(parent) = self.parent else {
+            self.admitted = true;
+            return Ok(None);
+        };
+        let mrl = ModelRateLimit::from_model(target_name, target_entry_id, target);
+        let input = condition_input(auth, Some(&mrl), Some(parent));
+        let mut caller_scoped = CallerScoped {
+            parent_input: ConditionInput {
+                model: Some(parent.entry_id),
+                model_name: Some(parent.name),
+                routing_parent_model: None,
+                routing_parent_model_name: None,
+                ..input
+            },
+            held: &self.caller_held,
+            taken: Vec::new(),
+        };
+        let reserved =
+            reserve_target_layers(state, snapshot, &mrl, &input, Some(&mut caller_scoped)).await;
+        let taken = caller_scoped.taken;
+        match reserved {
+            Ok(member) => {
+                for (policy_id, r) in taken {
+                    self.caller_held.insert(policy_id);
+                    request.push(r);
+                }
+                self.admitted = true;
+                Ok(Some(member))
+            }
+            Err(e) => {
+                self.refused = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// On the request's failure path: refund `request` (the request gate's
+    /// layers and the caller-facing policies held in it) when every
+    /// attempt was refused by its target's own limits, i.e. nothing went
+    /// upstream and the gateway's limiter alone turned the request away.
+    pub(crate) async fn refund_unserved(&self, request: &mut MultiReservation) {
+        if self.refused && !self.admitted {
+            std::mem::take(request).refund().await;
+        }
+    }
 }
 
 /// Seconds until the offending window reopens, for a
-/// [`reserve_routing_target`] rejection. `chat.rs` funnels its rejection
+/// [`TargetGate::reserve`] rejection. `chat.rs` funnels its rejection
 /// through a `BridgeError`, which would otherwise drop the hint the
 /// `/v1/messages` and `/v1/responses` loops keep by carrying the
 /// `ProxyError::RateLimit` itself — so every endpoint's all-targets-exhausted

@@ -545,8 +545,11 @@ pub(crate) fn refused_model_label(addressed: &str, target: &aisix_core::Model) -
 /// caller addressed: a direct model is its own only target, a Model Group
 /// walks its `routing.targets` exactly as `/v1/chat/completions` does
 /// (strategy order, health/cooldown filter, per-target client-IP allowlist,
-/// per-target model rate-limit layers), with same-target retries before
-/// failing over.
+/// per-target model rate-limit layers, reserved per attempt through
+/// [`crate::quota::TargetGate`]), with same-target retries before failing
+/// over. `request_reservation` is the request gate's reservation: the
+/// caller-facing policies a group satisfies are held in it, and it is
+/// refunded when every target was refused by its own limits.
 ///
 /// `call` performs ONE attempt against the target it is handed, with that
 /// target's resolved deadlines. It must build all the per-target state it
@@ -580,6 +583,7 @@ pub(crate) async fn dispatch_with_failover<T, P, U, F, Fut>(
     state: &crate::ProxyState,
     snapshot: &AisixSnapshot,
     auth: &crate::auth::AuthenticatedKey,
+    request_reservation: &mut aisix_ratelimit::MultiReservation,
     client: &crate::client_ip::ClientContext,
     requested_name: &str,
     entry: &aisix_core::ResourceEntry<Model>,
@@ -621,7 +625,12 @@ where
         .unwrap_or(&[]);
     let n = attempt_models.len();
     let mut last_err: Option<ProxyError> = None;
-    for (i, target) in attempt_models.into_iter().enumerate() {
+    let mut target_gate =
+        crate::quota::TargetGate::new(routing.is_some().then_some(crate::quota::RoutingParent {
+            name: &entry.value.display_name,
+            entry_id: &entry.id,
+        }));
+    'targets: for (i, target) in attempt_models.into_iter().enumerate() {
         let pk_id = crate::dispatch::resolve_provider_key(snapshot, &target.model)
             .map(|e| e.id.clone())
             .unwrap_or_default();
@@ -638,46 +647,6 @@ where
                 target_model: &target_model,
                 model_id: &target.id,
             })
-        };
-        let member_reservation = match crate::quota::reserve_routing_target(
-            state,
-            snapshot,
-            auth,
-            routing.is_some().then_some(crate::quota::RoutingParent {
-                name: &entry.value.display_name,
-                entry_id: &entry.id,
-            }),
-            &target.model.display_name,
-            &target.id,
-            &target.model,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                // A target over its own limits is an attempt that never
-                // reached an upstream — recorded, as chat records it, so the
-                // failover it forced is visible.
-                let (index, kind) = begin(telemetry);
-                telemetry.record(
-                    state,
-                    AttemptRecord {
-                        index,
-                        kind,
-                        target_model: target_model.clone(),
-                        target_model_id: target.id.clone(),
-                        provider_key_id: pk_id.clone(),
-                        status: 429,
-                        success: false,
-                        error_class: "rate_limit_exceeded".to_string(),
-                        error_message: e.to_string(),
-                        latency_ms: 0,
-                        dispatched: false,
-                    },
-                );
-                last_err = Some(e);
-                continue;
-            }
         };
         let budget = effective_retries(
             &target.model,
@@ -696,6 +665,43 @@ where
                 tokio::time::sleep(retry_backoff(attempt_idx as u32, hint)).await;
             }
             let (index, kind) = begin(telemetry);
+            let member_reservation = match target_gate
+                .reserve(
+                    state,
+                    snapshot,
+                    auth,
+                    request_reservation,
+                    &target.model.display_name,
+                    &target.id,
+                    &target.model,
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    // A target over its own limits is an attempt that never
+                    // reached an upstream — recorded, as chat records it, so
+                    // the failover it forced is visible.
+                    telemetry.record(
+                        state,
+                        AttemptRecord {
+                            index,
+                            kind,
+                            target_model: target_model.clone(),
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: 429,
+                            success: false,
+                            error_class: "rate_limit_exceeded".to_string(),
+                            error_message: e.to_string(),
+                            latency_ms: 0,
+                            dispatched: false,
+                        },
+                    );
+                    last_err = Some(e);
+                    continue 'targets;
+                }
+            };
             let attempt_started = std::time::Instant::now();
             let in_flight = state.runtime_status.count_in_flight(&target.id);
             match call(target.clone(), timeouts).await {
@@ -787,6 +793,7 @@ where
             }
         }
     }
+    target_gate.refund_unserved(request_reservation).await;
     Err(last_err.unwrap_or(ProxyError::ProviderUnavailable))
 }
 
