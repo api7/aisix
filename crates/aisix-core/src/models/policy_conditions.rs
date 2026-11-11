@@ -675,14 +675,109 @@ fn eval_leaf(leaf: &PolicyCondition, input: &ConditionInput<'_>) -> bool {
     // operator vocabulary (and the dashboard's normalization) is
     // built on; `negate` then flips the combined result, so a negated
     // leaf excluding the parent excludes every request addressed to it.
-    let parents = input.routing_parents(&leaf.dimension);
-    let mut parents = parents.iter().flatten();
-    let raw = if leaf.operator == ConditionOperator::Ne {
-        eval_operator(leaf, var) && parents.all(|p| eval_operator(leaf, p))
-    } else {
-        eval_operator(leaf, var) || parents.any(|p| eval_operator(leaf, p))
-    };
+    let raw = eval_model_pair(
+        leaf,
+        Some(eval_operator(leaf, var)),
+        input.routing_parents(&leaf.dimension),
+    )
+    .expect("a known primary value settles the pair");
     raw != leaf.negate
+}
+
+/// The un-negated result of a leaf over the primary value and the routing
+/// parents (a semantic router, and the model group it picked):
+/// ∃ for the positive operators, ∀ for `~=` (see [`eval_leaf`]). `primary`
+/// is the primary value's result, `None` when it is unknown; a missing
+/// parent leaves the primary alone. Shared by both evaluators so they read
+/// the pair identically.
+fn eval_model_pair(
+    leaf: &PolicyCondition,
+    primary: Option<bool>,
+    parents: [Option<&str>; 2],
+) -> Option<bool> {
+    let parents = parents
+        .into_iter()
+        .flatten()
+        .map(|p| Some(eval_operator(leaf, p)));
+    if leaf.operator == ConditionOperator::Ne {
+        match primary {
+            Some(false) => Some(false),
+            _ => kleene_and(std::iter::once(primary).chain(parents)),
+        }
+    } else {
+        match primary {
+            Some(true) => Some(true),
+            _ => kleene_or(std::iter::once(primary).chain(parents)),
+        }
+    }
+}
+
+/// Evaluate a condition list for a routing target pass with the dispatched
+/// member left open: the member-only values — `provider` and the member
+/// half of the `model` / `model_name` pair — are unknown, while the
+/// caller-addressed parent ([`ConditionInput::routing_parent_model`] and its
+/// name twin) and the caller's own dimensions are known. Three-valued
+/// (Kleene) logic: `NOT unknown` is unknown, AND is false on any false
+/// child, OR true on any true child, otherwise unknown. `Some(true)` means
+/// the list matches whichever member the parent dispatches to; `None` means
+/// the answer could not be settled without the member (it may still turn
+/// out the same for every member the group actually has).
+///
+/// Each known leaf evaluates exactly as [`eval_condition_nodes`] would, so
+/// whenever this returns `Some(b)`, every member gives `b` there too.
+pub fn eval_condition_nodes_for_any_member(
+    nodes: &[ConditionNode],
+    input: &ConditionInput<'_>,
+) -> Option<bool> {
+    kleene_and(nodes.iter().map(|n| eval_node_for_any_member(n, input)))
+}
+
+fn kleene_and(values: impl Iterator<Item = Option<bool>>) -> Option<bool> {
+    let mut acc = Some(true);
+    for v in values {
+        match v {
+            Some(false) => return Some(false),
+            None => acc = None,
+            Some(true) => {}
+        }
+    }
+    acc
+}
+
+fn kleene_or(values: impl Iterator<Item = Option<bool>>) -> Option<bool> {
+    kleene_and(values.map(|v| v.map(|b| !b))).map(|b| !b)
+}
+
+fn eval_node_for_any_member(node: &ConditionNode, input: &ConditionInput<'_>) -> Option<bool> {
+    match node {
+        ConditionNode::Leaf(leaf) => eval_leaf_for_any_member(leaf, input),
+        ConditionNode::Group(group) => {
+            let children = group
+                .children
+                .iter()
+                .map(|c| eval_node_for_any_member(c, input));
+            let raw = match group.logic {
+                ConditionLogic::And => kleene_and(children),
+                ConditionLogic::Or => kleene_or(children),
+            };
+            raw.map(|r| r != group.negate)
+        }
+    }
+}
+
+fn eval_leaf_for_any_member(leaf: &PolicyCondition, input: &ConditionInput<'_>) -> Option<bool> {
+    let raw = match leaf.dimension {
+        PolicyDimension::Provider => None,
+        PolicyDimension::Model | PolicyDimension::ModelName => {
+            eval_model_pair(leaf, None, input.routing_parents(&leaf.dimension))
+        }
+        // The caller's own dimensions: the same for every member.
+        PolicyDimension::Team
+        | PolicyDimension::Member
+        | PolicyDimension::ApiKey
+        | PolicyDimension::Tag(_) => return Some(eval_leaf(leaf, input)),
+    };
+    raw.map(|r| r != leaf.negate)
 }
 
 fn eval_operator(leaf: &PolicyCondition, var: &str) -> bool {
@@ -1295,5 +1390,130 @@ mod tests {
         dims.sort_by(|a, b| a.canonical_rank().cmp(&b.canonical_rank()));
         let names: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
         assert_eq!(names, ["team", "model", "tag:bg", "tag:subsidiary"]);
+    }
+
+    fn group_of(
+        logic: ConditionLogic,
+        negate: bool,
+        children: Vec<ConditionNode>,
+    ) -> ConditionNode {
+        ConditionNode::Group(ConditionGroup {
+            logic,
+            negate,
+            children,
+        })
+    }
+
+    /// The members a `routed_input()` parent could dispatch to, for
+    /// checking a settled `eval_condition_nodes_for_any_member` against the
+    /// real evaluator.
+    fn members<'a>() -> Vec<ConditionInput<'a>> {
+        [
+            ("model-1", "gpt-4.1-prod", Some("openai")),
+            ("model-2", "claude-prod", Some("anthropic")),
+            ("model-4", "gpt-4o", Some("Anthropic")),
+            ("model-3", "other", None),
+        ]
+        .into_iter()
+        .map(|(model, model_name, provider)| ConditionInput {
+            model: Some(model),
+            model_name: Some(model_name),
+            provider,
+            ..routed_input()
+        })
+        .collect()
+    }
+
+    #[test]
+    fn for_any_member_settles_only_what_the_group_decides() {
+        use ConditionLogic::{And, Or};
+        use ConditionOperator::{Eq, In, Ne, Regex, RegexCi};
+        use PolicyDimension::{Model, ModelName, Provider, Team};
+        let group = || leaf(Model, In, many(&["group-1"]));
+        let provider_leaves = || {
+            vec![
+                leaf(Provider, Eq, one("anthropic")),
+                leaf(Provider, Ne, one("anthropic")),
+                leaf(Provider, In, many(&["anthropic"])),
+                leaf(Provider, Regex, one("^anth")),
+                leaf(Provider, RegexCi, one("^ANTH")),
+            ]
+        };
+        let mut cases: Vec<(Vec<ConditionNode>, Option<bool>)> = Vec::new();
+        for p in provider_leaves() {
+            let ConditionNode::Leaf(pl) = &p else {
+                unreachable!()
+            };
+            let negated = ConditionNode::Leaf(PolicyCondition {
+                negate: true,
+                ..pl.clone()
+            });
+            cases.extend([
+                (vec![group(), p.clone()], None),
+                (vec![group(), negated.clone()], None),
+                (vec![group(), group_of(And, true, vec![p.clone()])], None),
+                (vec![group(), group_of(Or, true, vec![p.clone()])], None),
+                (
+                    vec![group_of(Or, false, vec![group(), p.clone()])],
+                    Some(true),
+                ),
+                (
+                    vec![group_of(Or, false, vec![group(), negated.clone()])],
+                    Some(true),
+                ),
+                // Nested: (group OR NOT p) AND NOT (team-2 AND p).
+                (
+                    vec![
+                        group_of(Or, false, vec![group(), negated.clone()]),
+                        group_of(And, true, vec![leaf(Team, Eq, one("team-2")), p.clone()]),
+                    ],
+                    Some(true),
+                ),
+                // Nested: NOT (group AND NOT p) — false only for some members.
+                (
+                    vec![group_of(And, true, vec![group(), negated.clone()])],
+                    None,
+                ),
+                // A known false sibling settles the AND whatever p is.
+                (
+                    vec![leaf(Team, Eq, one("team-2")), negated.clone()],
+                    Some(false),
+                ),
+            ]);
+        }
+        cases.extend([
+            (vec![group()], Some(true)),
+            (vec![leaf(ModelName, Eq, one("chat-group"))], Some(true)),
+            (vec![leaf(ModelName, RegexCi, one("^CHAT"))], Some(true)),
+            // `!(model in [group])` excludes every request addressed to it.
+            (vec![neg_leaf(Model, In, many(&["group-1"]))], Some(false)),
+            // Member-pinned: only the member could satisfy it.
+            (vec![leaf(Model, Eq, one("model-1"))], None),
+            // `~=` is ∀ over the pair: the group differing is not enough...
+            (vec![leaf(Model, Ne, one("model-2"))], None),
+            (vec![neg_leaf(Model, Eq, one("model-2"))], None),
+            // ...but the group matching settles it false.
+            (vec![leaf(Model, Ne, one("group-1"))], Some(false)),
+            (vec![], Some(true)),
+        ]);
+        for (nodes, want) in cases {
+            assert_eq!(
+                eval_condition_nodes_for_any_member(&nodes, &routed_input()),
+                want,
+                "{nodes:?}"
+            );
+            if let Some(b) = want {
+                for m in members() {
+                    assert_eq!(eval_condition_nodes(&nodes, &m), b, "{nodes:?} on {m:?}");
+                }
+            } else {
+                let got: Vec<bool> = members()
+                    .iter()
+                    .map(|m| eval_condition_nodes(&nodes, m))
+                    .collect();
+                // An unsettled answer must really depend on the member.
+                assert!(got.contains(&true) && got.contains(&false), "{nodes:?}");
+            }
+        }
     }
 }

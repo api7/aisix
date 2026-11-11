@@ -450,14 +450,11 @@ async fn reserve_request_layers(
     reserve_policy_layers(state, snapshot, &input, phase, reservations, None).await
 }
 
-/// The caller-facing half of a routing target pass: conditional policies
-/// the caller-addressed parent satisfies — with the parent's identity
-/// standing in for the target's `model` / `model_name`, every other
-/// dimension (team, member, provider, tags) as the target pass sees it.
-/// Such a policy is about the entry the caller addressed, so it counts at
-/// most once per downstream request however many attempts run.
+/// The caller-facing half of a routing target pass: the conditional
+/// policies [`is_caller_facing`] classifies as about the entry the caller
+/// addressed, which count at most once per downstream request however many
+/// attempts run.
 struct CallerScoped<'a> {
-    parent_input: ConditionInput<'a>,
     /// Policy entry ids an earlier pass of this request already reserved.
     held: &'a HashSet<String>,
     /// What this pass reserved, keyed by policy entry id.
@@ -500,14 +497,17 @@ async fn reserve_policy_layers(
         let Some(layer) = match_policy_layer(policy, &entry.id, input, phase) else {
             continue;
         };
+        // Held means an earlier pass classified it caller-facing, and that
+        // classification does not change across the request's attempts.
+        if caller_scoped
+            .as_deref()
+            .is_some_and(|cs| cs.held.contains(&entry.id))
+        {
+            continue;
+        }
         let caller_facing = caller_scoped
             .as_deref_mut()
-            .filter(|cs| is_caller_facing(policy, &cs.parent_input));
-        if let Some(cs) = &caller_facing {
-            if cs.held.contains(&entry.id) {
-                continue;
-            }
-        }
+            .filter(|_| is_caller_facing(policy, input));
         let r = state
             .limiter
             .pre_commit(&layer.bucket_key, &layer.limits)
@@ -521,23 +521,39 @@ async fn reserve_policy_layers(
     Ok(())
 }
 
-/// Whether a policy that matched a routing target pass is about the
-/// caller-addressed group rather than the member: it still matches with the
-/// group's identity in place of the member's (`parent_input`, which carries
-/// no member-only dimension), and its bucket does not split on a member
-/// property — a `group_by` on `model` or `provider` keeps one counter per
-/// member, which only a per-attempt count can keep honest.
-fn is_caller_facing(policy: &RateLimitPolicy, parent_input: &ConditionInput<'_>) -> bool {
+/// Whether a conditional policy that matched a routing target pass is about
+/// the caller-addressed group rather than the member, and so counts once per
+/// downstream request instead of once per attempt. It is when both hold:
+///
+/// - its conditions are true for the group's identity whatever the member
+///   holds — evaluated with every member-only value (`provider`, the
+///   member's `model` / `model_name`) unknown under three-valued logic,
+///   where `NOT unknown` is unknown, and only a definite true counts
+///   ([`aisix_core::models::eval_condition_nodes_for_any_member`]). So
+///   `model == G AND NOT provider == X` counts per attempt: whether it
+///   matches depends on the member's provider;
+/// - its bucket does not split on a member property — a `group_by` on
+///   `model` or `provider` keeps one counter per member, which only a
+///   per-attempt count can keep honest.
+///
+/// Keys on both identities: the caller-addressed entry is known, the
+/// dispatched target is not. Only a [`TargetGate`] with a parent asks —
+/// a routing group or semantic router on the chat, messages, count_tokens
+/// and responses loops and [`crate::routing::dispatch_with_failover`].
+/// Direct dispatch (wildcard aliases included) has no target pass, and
+/// ensemble panel and judge calls reserve through [`reserve_model_only`],
+/// which has no caller-facing half, so every policy there counts per call.
+fn is_caller_facing(policy: &RateLimitPolicy, input: &ConditionInput<'_>) -> bool {
     policy.is_conditional()
         && !policy
             .group_by
             .iter()
             .flatten()
             .any(|d| matches!(d, GroupByDimension::Model | GroupByDimension::Provider))
-        && aisix_core::models::eval_condition_nodes(
+        && aisix_core::models::eval_condition_nodes_for_any_member(
             policy.conditions.as_deref().unwrap_or_default(),
-            parent_input,
-        )
+            input,
+        ) == Some(true)
 }
 
 /// Convert a store-level rejection into the surfaced [`ProxyError`],
@@ -805,23 +821,6 @@ async fn reserve_target_layers(
     }
 }
 
-/// The target pass's input with the group standing in for the member: its
-/// id and alias as `model` / `model_name`, and no `provider` (a group has
-/// none, so a provider leaf keeps a policy member-scoped).
-fn parent_condition_input<'a>(
-    target_input: &ConditionInput<'a>,
-    parent: RoutingParent<'a>,
-) -> ConditionInput<'a> {
-    ConditionInput {
-        model: Some(parent.entry_id),
-        model_name: Some(parent.name),
-        provider: None,
-        routing_parent_model: None,
-        routing_parent_model_name: None,
-        ..*target_input
-    }
-}
-
 /// The per-target rate-limit gate of one downstream request, shared by
 /// every loop that walks a Model Group's targets (chat, messages,
 /// count_tokens, responses, and [`crate::routing::dispatch_with_failover`]
@@ -834,13 +833,14 @@ fn parent_condition_input<'a>(
 /// downstream request):
 ///
 /// - member layers — the target's inline model `rate_limit`, classic
-///   `model`-scope policies on the target, and conditional policies only
-///   the target's own `model` / `model_name` satisfy — count once per
-///   attempt, failed attempts and same-target retries included;
-/// - conditional policies the caller-addressed group satisfies (its id or
-///   alias standing in for the model, AISIX-Cloud#1267; no `provider` leaf
-///   and no `group_by` on `model` / `provider`, which are member
-///   properties) count at most once per downstream request: reserved on the first attempt they match,
+///   `model`-scope policies on the target, and conditional policies whose
+///   match depends on the member (its `model` / `model_name` or
+///   `provider`, see [`is_caller_facing`]) — count once per attempt,
+///   failed attempts and same-target retries included;
+/// - conditional policies the caller-addressed group satisfies whatever
+///   the member holds (its id or alias standing in for the model,
+///   AISIX-Cloud#1267; see [`is_caller_facing`]) count at most once per
+///   downstream request: reserved on the first attempt they match,
 ///   held in the request's reservation from then on (so its tokens are
 ///   committed once, with the winning attempt's usage), skipped on later
 ///   attempts;
@@ -897,7 +897,6 @@ impl<'a> TargetGate<'a> {
         let mrl = ModelRateLimit::from_model(target_name, target_entry_id, target);
         let input = condition_input(auth, Some(&mrl), Some(parent));
         let mut caller_scoped = CallerScoped {
-            parent_input: parent_condition_input(&input, parent),
             held: &self.caller_held,
             taken: Vec::new(),
         };
@@ -1461,7 +1460,6 @@ mod tests {
             group: None,
         };
         let input = condition_input(&auth, Some(&target), Some(parent));
-        let parent_input = parent_condition_input(&input, parent);
         let facing = |policy: serde_json::Value| {
             let policy = make_conditional_policy(policy);
             assert!(
@@ -1469,7 +1467,7 @@ mod tests {
                 "the target pass must match {:?}",
                 policy.name
             );
-            is_caller_facing(&policy, &parent_input)
+            is_caller_facing(&policy, &input)
         };
         let group_leaf =
             serde_json::json!({ "dimension": "model", "operator": "in", "value": ["group-1"] });
@@ -1501,6 +1499,36 @@ mod tests {
             "conditions": [group_leaf, { "dimension": "provider", "operator": "==", "value": "openai" }],
             "limits": { "rpm": 1 },
         })));
+        // The group alone settles an OR whatever the provider.
+        assert!(facing(serde_json::json!({
+            "name": "group-or-openai",
+            "conditions": [{ "logic": "or", "children": [
+                group_leaf, { "dimension": "provider", "operator": "==", "value": "openai" }
+            ]}],
+            "limits": { "rpm": 1 },
+        })));
+        // A negated provider condition depends on the member's provider
+        // however it is negated.
+        for not_anthropic in [
+            serde_json::json!({ "dimension": "provider", "operator": "==", "negate": true, "value": "anthropic" }),
+            serde_json::json!({ "logic": "and", "negate": true, "children": [
+                { "dimension": "provider", "operator": "==", "value": "anthropic" }
+            ]}),
+            serde_json::json!({ "dimension": "provider", "operator": "~=", "value": "anthropic" }),
+        ] {
+            assert!(!facing(serde_json::json!({
+                "name": "group-not-anthropic",
+                "conditions": [group_leaf, not_anthropic],
+                "limits": { "rpm": 1 },
+            })));
+        }
+        // So does a condition only the member half of the model pair can
+        // settle: the group differs from `model-2`, a sibling member may not.
+        assert!(!facing(serde_json::json!({
+            "name": "group-not-model-2",
+            "conditions": [group_leaf, { "dimension": "model", "operator": "~=", "value": "model-2" }],
+            "limits": { "rpm": 1 },
+        })));
     }
 
     #[test]
@@ -1516,7 +1544,6 @@ mod tests {
             }),
         };
         let input = condition_input(&auth, Some(&target), Some(parent));
-        let parent_input = parent_condition_input(&input, parent);
         let facing = |ids: &[&str]| {
             let policy = make_conditional_policy(serde_json::json!({
                 "name": "p",
@@ -1524,7 +1551,7 @@ mod tests {
                 "limits": { "rpm": 1 },
             }));
             assert!(match_policy_layer(&policy, "pol", &input, PolicyPhase::ModelTarget).is_some());
-            is_caller_facing(&policy, &parent_input)
+            is_caller_facing(&policy, &input)
         };
         assert!(facing(&["group-1"]));
         assert!(facing(&["router-1"]));
