@@ -284,6 +284,20 @@ describe("semantic routing on every protocol, with model-group targets", () => {
     await router("sp-limited-router", "sp-limited-group", "sp-default");
     await router("ct-router", "ct-legal", "ct-default");
     await router("ct-group-router", "ct-legal-group", "ct-default");
+    // An embedding model that does not exist: every decision fails, and
+    // the failure target serves.
+    await seed.createModel({
+      display_name: "sp-failing-router",
+      semantic: {
+        embedding_model: "sp-no-such-embed",
+        routes: [
+          { name: "legal", target: "sp-legal", examples: ["analyze this contract"], threshold: 0.5 },
+        ],
+        default: "sp-default",
+        match: { threshold: 0.5 },
+        on_embedding_failure: { target: "sp-legal-group" },
+      },
+    });
 
     // Seeded last: authenticating it proves every resource above landed.
     await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
@@ -542,6 +556,17 @@ describe("semantic routing on every protocol, with model-group targets", () => {
       expect(r.json).toEqual({ input_tokens: 33 });
       expect(r.route).toBe("legal");
       expect(anthropicMocks["ct-member-down"]!.receivedRequests.length).toBe(down + 1);
+    });
+
+    test("a failure target that is a group fails over inside the group", async (ctx) => {
+      if (!ready()) return ctx.skip();
+      const down = chatMocks["sp-member-down"]!.hits;
+      const r = await chat("sp-failing-router", [{ role: "user", content: LEGAL_ASK }]);
+      expect(r.status, r.text).toBe(200);
+      expect(r.text).toContain("served-by-group-member");
+      expect(r.route).toBeNull();
+      expect(chatMocks["sp-member-down"]!.hits).toBe(down + 1);
+      expect(field(await accessLine(r), "semantic_fallback")).toBe("decision_failed");
     });
 
     test("the group's own rate limit binds traffic the router sends it", async (ctx) => {
