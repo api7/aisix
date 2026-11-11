@@ -45,7 +45,7 @@ pub(crate) fn resolve(headers: &HeaderMap, metadata: Option<&Value>) -> Option<S
         .and_then(usable)
         .or_else(|| vendor_header(headers))
         .or_else(|| {
-            is_codex_caller(header("user-agent")?)
+            is_codex_request(headers)
                 .then(|| {
                     CODEX_SESSION_HEADERS
                         .iter()
@@ -91,6 +91,14 @@ fn vendor_header(headers: &HeaderMap) -> Option<String> {
         .filter(|(_, value)| is_id_token(value))
         .min_by_key(|(name, _)| *name)
         .map(|(_, value)| value.to_owned())
+}
+
+/// Whether the request comes from Codex, by its `User-Agent`.
+pub(crate) fn is_codex_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(is_codex_caller)
 }
 
 fn is_codex_caller(user_agent: &str) -> bool {

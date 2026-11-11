@@ -514,7 +514,7 @@ async fn dispatch(
         &model_name,
         &model_entry,
         request_id,
-        || crate::semantic::anthropic_prompt(body),
+        |blocks| crate::semantic::anthropic_prompt(body, blocks),
         crate::routing::RoutingRequest {
             tags: &client.routing_tags,
             headers: Some(&client.headers),

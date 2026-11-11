@@ -1634,7 +1634,7 @@ async fn dispatch(
         &req.model,
         &virtual_entry,
         request_id,
-        || crate::semantic::chat_prompt(req),
+        |blocks| crate::semantic::chat_prompt(req, blocks),
         RoutingRequest {
             tags: &client.routing_tags,
             headers: Some(&client.headers),

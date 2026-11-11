@@ -19,6 +19,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use axum::http::HeaderMap;
 use dashmap::DashMap;
 
 use aisix_core::models::{
@@ -362,7 +363,9 @@ pub(crate) async fn resolve(
                 false,
             )?;
             match (&affinity, &dispatch.route) {
-                (Some((key, ttl)), Some(route)) if session.create_pins => {
+                (Some((key, ttl)), Some(route))
+                    if session.create_pins && !is_side_request(routing.headers, prompt) =>
+                {
                     let target_id = snapshot
                         .models
                         .get_by_name(&semantic.routes[i].target_ref(snapshot))
@@ -425,6 +428,27 @@ pub(crate) struct SessionRequest<'a> {
     /// Whether a matched route pins the session. Off for requests that only
     /// measure (`count_tokens`): they follow a pin but never set one.
     pub create_pins: bool,
+}
+
+/// Phrases of the prompts agent clients send beside a session's main loop
+/// (titles, status lines, next-input suggestions), matched case-sensitively
+/// anywhere in the classification text.
+const SIDE_REQUEST_PHRASES: [&str; 5] = [
+    "Write the title in the predominant language of the session",
+    "You are coming up with a succinct title for a coding session",
+    "Describe your most recent action in 3-5 words using present tense",
+    "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]",
+    "Generate a concise, single-line task title",
+];
+
+/// Whether this is a client's side request rather than a turn of the
+/// conversation: it follows a session's pin but never sets one, since its
+/// text says nothing about where the conversation belongs.
+fn is_side_request(headers: Option<&HeaderMap>, prompt: &str) -> bool {
+    headers
+        .and_then(|h| h.get("x-claude-code-request-class"))
+        .is_some_and(|v| v.as_bytes() == b"auxiliary")
+        || SIDE_REQUEST_PHRASES.iter().any(|p| prompt.contains(p))
 }
 
 /// The pin key and TTL for this request, when its router keeps session
@@ -496,27 +520,57 @@ fn serve_route(
     Ok(eligible.into_dispatch(name))
 }
 
-const REMINDER_OPEN: &str = "<system-reminder>";
-const REMINDER_CLOSE: &str = "</system-reminder>";
+/// Text blocks a client injects into a user turn beside the human ask, as
+/// `(opening, closing)` delimiters, lowercase: they match case-insensitively.
+#[derive(Clone, Copy)]
+pub(crate) struct InjectedBlocks(&'static [(&'static str, &'static str)]);
+
+const REMINDER: (&str, &str) = ("<system-reminder>", "</system-reminder>");
+
+/// What Codex puts in user turns of its own: the AGENTS.md instructions,
+/// environment context and plugin hints.
+const CODEX_BLOCKS: [(&str, &str); 6] = [
+    REMINDER,
+    ("<environment_context>", "</environment_context>"),
+    ("<recommended_plugins>", "</recommended_plugins>"),
+    ("<user_instructions>", "</user_instructions>"),
+    (
+        "<environments_instructions>",
+        "</environments_instructions>",
+    ),
+    ("# agents.md instructions for ", "</instructions>"),
+];
+
+impl InjectedBlocks {
+    /// The blocks the calling client injects: Codex's own besides the
+    /// `<system-reminder>` every caller's turns are cleared of.
+    pub(crate) fn of(headers: Option<&HeaderMap>) -> Self {
+        if headers.is_some_and(crate::session_id::is_codex_request) {
+            Self(&CODEX_BLOCKS)
+        } else {
+            Self(std::slice::from_ref(&REMINDER))
+        }
+    }
+}
 
 /// The text a semantic router classifies: the newest user turn that has
 /// human text. A turn's human text is its text parts, with every complete
-/// `<system-reminder>…</system-reminder>` block removed — agent harnesses
-/// inject those as ordinary text beside the live ask, and a turn holding
-/// only tool results, images or reminders has none, so the walk moves on to
-/// the turn before it. Empty when no turn has any.
+/// injected block removed — agent harnesses inject those as ordinary text
+/// beside the live ask, and a turn holding only tool results, images or
+/// injected blocks has none, so the walk moves on to the turn before it.
+/// Empty when no turn has any.
 ///
 /// `user_turns` yields each user turn's text parts, newest turn first. The
 /// per-protocol readers ([`chat_prompt`], [`anthropic_prompt`],
 /// [`responses_prompt`]) decide what a user turn and a text part are.
-pub(crate) fn classification_text<'a, T, P>(user_turns: T) -> String
+pub(crate) fn classification_text<'a, T, P>(user_turns: T, blocks: InjectedBlocks) -> String
 where
     T: IntoIterator<Item = P>,
     P: IntoIterator<Item = &'a str>,
 {
     for parts in user_turns {
         let joined = parts.into_iter().collect::<Vec<_>>().join(" ");
-        let text = strip_reminders(&joined);
+        let text = strip_blocks(&joined, blocks);
         if !text.is_empty() {
             return text;
         }
@@ -524,25 +578,48 @@ where
     String::new()
 }
 
-/// `text` without its complete reminder blocks, the pieces around them
+/// `text` without its complete injected blocks, the pieces around them
 /// trimmed and joined by a space. The delimiters match case-insensitively;
-/// an opening tag with no closing tag after it is not a block and stays.
-/// A literal scan rather than a regex: this runs on caller-controlled
-/// input before routing, and the cursor only moves forward.
-fn strip_reminders(text: &str) -> String {
+/// an opening delimiter with no closing one after it is not a block and
+/// stays. A literal scan rather than a regex: this runs on caller-controlled
+/// input before routing, and every cursor only moves forward.
+fn strip_blocks(text: &str, InjectedBlocks(blocks): InjectedBlocks) -> String {
     // ASCII lowering keeps every byte offset, so positions found in it
     // index `text` directly.
     let lowered = text.to_ascii_lowercase();
+    // Each kind's next opening at or after the cursor; `None` once the
+    // kind can no longer form a block.
+    let mut next_open: Vec<Option<usize>> =
+        blocks.iter().map(|(open, _)| lowered.find(open)).collect();
     let mut kept: Vec<&str> = Vec::new();
     let mut keep_from = 0;
-    while let Some(open) = lowered[keep_from..].find(REMINDER_OPEN) {
-        let start = keep_from + open;
-        let body = start + REMINDER_OPEN.len();
-        let Some(close) = lowered[body..].find(REMINDER_CLOSE) else {
+    let mut cursor = 0;
+    loop {
+        for (slot, (open, _)) in next_open.iter_mut().zip(blocks) {
+            if slot.is_some_and(|at| at < cursor) {
+                *slot = lowered[cursor..].find(open).map(|at| cursor + at);
+            }
+        }
+        let Some((kind, start)) = next_open
+            .iter()
+            .enumerate()
+            .filter_map(|(kind, at)| Some((kind, (*at)?)))
+            .min_by_key(|&(_, at)| at)
+        else {
             break;
         };
-        kept.push(text[keep_from..start].trim());
-        keep_from = body + close + REMINDER_CLOSE.len();
+        let (open, close) = blocks[kind];
+        let body = start + open.len();
+        match lowered[body..].find(close) {
+            Some(end) => {
+                kept.push(text[keep_from..start].trim());
+                keep_from = body + end + close.len();
+                cursor = keep_from;
+            }
+            // No closing delimiter anywhere after this opening, so no
+            // later opening of the kind can close either.
+            None => next_open[kind] = None,
+        }
     }
     kept.push(text[keep_from..].trim());
     kept.retain(|piece| !piece.is_empty());
@@ -551,7 +628,7 @@ fn strip_reminders(text: &str) -> String {
 
 /// [`classification_text`] of a Chat Completions request: its `user`
 /// messages, their string content or the `text` parts of an array content.
-pub(crate) fn chat_prompt(req: &aisix_gateway::ChatFormat) -> String {
+pub(crate) fn chat_prompt(req: &aisix_gateway::ChatFormat, blocks: InjectedBlocks) -> String {
     classification_text(
         req.messages
             .iter()
@@ -564,13 +641,14 @@ pub(crate) fn chat_prompt(req: &aisix_gateway::ChatFormat) -> String {
                     (None, None) => Vec::new(),
                 }
             }),
+        blocks,
     )
 }
 
 /// [`classification_text`] of an Anthropic Messages body: its `user`
 /// messages, their string content or their `text` blocks (a `tool_result`
 /// block is not text). The top-level `system` is never classified.
-pub(crate) fn anthropic_prompt(body: &serde_json::Value) -> String {
+pub(crate) fn anthropic_prompt(body: &serde_json::Value, blocks: InjectedBlocks) -> String {
     let messages = body
         .get("messages")
         .and_then(serde_json::Value::as_array)
@@ -582,6 +660,7 @@ pub(crate) fn anthropic_prompt(body: &serde_json::Value) -> String {
             .rev()
             .filter(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("user"))
             .map(|m| content_text_parts(m.get("content"), "text")),
+        blocks,
     )
 }
 
@@ -590,9 +669,9 @@ pub(crate) fn anthropic_prompt(body: &serde_json::Value) -> String {
 /// read through their `input_text` parts. Every other item type — a
 /// `function_call_output` included — is not a user turn, and `instructions`
 /// is never classified.
-pub(crate) fn responses_prompt(body: &serde_json::Value) -> String {
+pub(crate) fn responses_prompt(body: &serde_json::Value, blocks: InjectedBlocks) -> String {
     match body.get("input") {
-        Some(serde_json::Value::String(text)) => classification_text([[text.as_str()]]),
+        Some(serde_json::Value::String(text)) => classification_text([[text.as_str()]], blocks),
         Some(serde_json::Value::Array(items)) => classification_text(
             items
                 .iter()
@@ -604,6 +683,7 @@ pub(crate) fn responses_prompt(body: &serde_json::Value) -> String {
                         && item.get("role").and_then(serde_json::Value::as_str) == Some("user")
                 })
                 .map(|item| content_text_parts(item.get("content"), "input_text")),
+            blocks,
         ),
         _ => String::new(),
     }
@@ -1689,6 +1769,13 @@ mod tests {
         assert!(snap.models.get_by_name(&resolved).is_none());
     }
 
+    const GENERIC: InjectedBlocks = InjectedBlocks(&[REMINDER]);
+    const CODEX: InjectedBlocks = InjectedBlocks(&CODEX_BLOCKS);
+
+    fn strip_reminders(text: &str) -> String {
+        strip_blocks(text, GENERIC)
+    }
+
     #[test]
     fn reminder_blocks_are_removed_and_the_text_around_them_kept() {
         assert_eq!(
@@ -1711,6 +1798,44 @@ mod tests {
     }
 
     #[test]
+    fn codex_blocks_are_removed_for_codex_callers_only() {
+        let cases = [
+            "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>",
+            "<recommended_plugins>p</recommended_plugins>",
+            "<user_instructions>u</user_instructions>",
+            "<environments_instructions>e</environments_instructions>",
+            "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\nbe terse\n</INSTRUCTIONS>",
+            // The AGENTS.md opening matches whatever its case.
+            "# agents.md Instructions For /repo <instructions>x</instructions>",
+        ];
+        for block in cases {
+            let text = format!("before {block} after");
+            assert_eq!(strip_blocks(&text, CODEX), "before after", "{block}");
+            assert_eq!(strip_reminders(&text), text, "{block}");
+        }
+        // Unclosed blocks are text, and do not stop a later block from
+        // being removed.
+        assert_eq!(
+            strip_blocks(
+                "<environment_context> a <user_instructions>u</user_instructions> b",
+                CODEX
+            ),
+            "<environment_context> a b"
+        );
+        assert_eq!(
+            strip_blocks("# AGENTS.md instructions for /repo no end", CODEX),
+            "# AGENTS.md instructions for /repo no end"
+        );
+        assert_eq!(
+            strip_blocks(
+                "<system-reminder>r</system-reminder> ask <environment_context>e</environment_context>",
+                CODEX
+            ),
+            "ask"
+        );
+    }
+
+    #[test]
     fn classification_walks_back_past_turns_without_human_text() {
         let turns: Vec<Vec<&str>> = vec![
             vec![],
@@ -1722,8 +1847,58 @@ mod tests {
             ],
             vec!["older ask"],
         ];
-        assert_eq!(classification_text(turns), "review the contract");
-        assert_eq!(classification_text(Vec::<Vec<&str>>::new()), "");
+        assert_eq!(classification_text(turns, GENERIC), "review the contract");
+        assert_eq!(classification_text(Vec::<Vec<&str>>::new(), GENERIC), "");
+
+        // A Codex turn holding only what Codex injected is skipped.
+        let codex_turns: Vec<Vec<&str>> = vec![
+            vec!["<environment_context>e</environment_context>"],
+            vec!["the ask"],
+        ];
+        assert_eq!(classification_text(codex_turns.clone(), CODEX), "the ask");
+        assert_eq!(
+            classification_text(codex_turns, GENERIC),
+            "<environment_context>e</environment_context>"
+        );
+    }
+
+    #[test]
+    fn injected_blocks_follow_the_caller() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(InjectedBlocks::of(Some(&headers)).0.len(), 1);
+        assert_eq!(InjectedBlocks::of(None).0.len(), 1);
+        headers.insert(
+            "user-agent",
+            "codex_cli_rs/0.167.0 (Linux)".parse().unwrap(),
+        );
+        assert_eq!(InjectedBlocks::of(Some(&headers)).0, &CODEX_BLOCKS);
+    }
+
+    #[test]
+    fn side_requests_are_recognized_by_header_or_phrase() {
+        let mut headers = HeaderMap::new();
+        assert!(!is_side_request(Some(&headers), "fix the login bug"));
+        for phrase in [
+            "Write the title in the predominant language of the session",
+            "You are coming up with a succinct title for a coding session",
+            "Describe your most recent action in 3-5 words using present tense",
+            "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]",
+            "Generate a concise, single-line task title",
+        ] {
+            assert!(
+                is_side_request(None, &format!("<session>\nhi\n</session>\n\n{phrase} —")),
+                "{phrase}"
+            );
+        }
+        // Case-sensitive.
+        assert!(!is_side_request(
+            None,
+            "generate a concise, single-line task title"
+        ));
+        headers.insert("x-claude-code-request-class", "main".parse().unwrap());
+        assert!(!is_side_request(Some(&headers), "fix the login bug"));
+        headers.insert("x-claude-code-request-class", "auxiliary".parse().unwrap());
+        assert!(is_side_request(Some(&headers), "fix the login bug"));
     }
 
     #[test]
@@ -1739,7 +1914,7 @@ mod tests {
                 ]}
             ]
         });
-        assert_eq!(anthropic_prompt(&messages), "the real ask");
+        assert_eq!(anthropic_prompt(&messages, GENERIC), "the real ask");
 
         let responses = serde_json::json!({
             "instructions": "never classified",
@@ -1750,9 +1925,9 @@ mod tests {
                 {"type": "function_call_output", "call_id": "c", "output": "tool output"}
             ]
         });
-        assert_eq!(responses_prompt(&responses), "second ask");
+        assert_eq!(responses_prompt(&responses, GENERIC), "second ask");
         assert_eq!(
-            responses_prompt(&serde_json::json!({"input": "plain string"})),
+            responses_prompt(&serde_json::json!({"input": "plain string"}), GENERIC),
             "plain string"
         );
     }
