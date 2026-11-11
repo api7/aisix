@@ -25,7 +25,8 @@ bytes.workspace = true
 regex.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
-serde.workspace = true
+# `rc`: a `SinkRecord` serializes the `Arc`-shared usage event it carries.
+serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 reqwest.workspace = true
 uuid.workspace = true

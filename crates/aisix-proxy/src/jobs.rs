@@ -2256,13 +2256,9 @@ async fn attribute_batch_usage(
             upstream: crate::span_facts::upstream_facts(&snap, &event, pk_id),
             ..Default::default()
         });
-        state.otlp_fan_out.fan_out(
-            &event,
-            None,
-            None,
-            Some(&facts),
-            exporters.iter().map(|e| &e.value),
-        );
+        state
+            .otlp_fan_out
+            .fan_out(event, None, None, Some(&facts), exporters.iter());
         tracing::info!(
             batch_id = %raw_batch_id,
             provider_model = %provider_model,

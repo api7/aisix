@@ -54,6 +54,7 @@ use aisix_core::models::{
     ObservabilityExporter, OtlpHttpConfig, SlsContentMode,
 };
 use aisix_core::snapshot::SnapshotHandle;
+use aisix_core::ResourceEntry;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -217,29 +218,22 @@ impl OtlpHttpFanOut {
     /// the usage-event wire.
     pub fn fan_out<'a, I>(
         &self,
-        event: &UsageEvent,
+        mut event: UsageEvent,
         content: Option<&CapturedContent>,
         trace: Option<&crate::trace::TraceEmission>,
         facts: Option<&Arc<crate::genai::SpanFacts>>,
         exporters: I,
     ) where
-        I: IntoIterator<Item = &'a ObservabilityExporter>,
+        I: IntoIterator<Item = &'a Arc<ResourceEntry<ObservabilityExporter>>>,
     {
-        let settled;
-        let event = match event.settled_cache_creation_ttl() {
-            ttl if ttl == event.cache_creation_ttl => event,
-            ttl => {
-                settled = UsageEvent {
-                    cache_creation_ttl: ttl,
-                    ..event.clone()
-                };
-                &settled
-            }
-        };
+        event.cache_creation_ttl = event.settled_cache_creation_ttl();
+        // One copy of the event, shared by every record built from it.
+        let event = Arc::new(event);
         // The shared metadata-only record, built once on first sighting and
         // reused by every exporter that does not capture content.
         let mut metadata_record: Option<Arc<SinkRecord>> = None;
-        for exp in exporters {
+        for entry in exporters {
+            let exp = &entry.value;
             if !exp.enabled {
                 continue;
             }
@@ -249,8 +243,11 @@ impl OtlpHttpFanOut {
             // builds the matching sink. All kinds share one `ExporterPipelines`
             // manager and the pooled client. A new `ExporterKind` variant
             // makes this `match` non-exhaustive — a compile-time prompt to wire
-            // its sink here.
-            let client = self.inner.client.clone();
+            // its sink here. The fingerprint and the sink are only computed
+            // when the entry is not the one the running pipeline last saw.
+            let client = &self.inner.client;
+            let admit = || self.admits(&exp.name);
+            let pipelines = &self.inner.exporters;
             let handle = match &exp.kind {
                 ExporterKind::OtlpHttp(cfg) => {
                     // Per-request sampling (#519 B.2), decided here — before
@@ -262,101 +259,89 @@ impl OtlpHttpFanOut {
                     if !otlp_should_sample(cfg.sample_rate, &event.request_id) {
                         continue;
                     }
-                    let fingerprint = fingerprint_otlp(cfg);
-                    let name = exp.name.clone();
-                    let endpoint = cfg.endpoint.clone();
-                    let headers = cfg.headers.clone();
-                    let service_name = self
-                        .inner
-                        .service_name
-                        .get()
-                        .cloned()
-                        .unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_string());
-                    self.inner.exporters.get_or_create_if(
+                    pipelines.get_or_create_if(
                         &exp.name,
-                        fingerprint,
-                        || self.admits(&exp.name),
-                        move || {
+                        entry,
+                        || fingerprint_otlp(cfg),
+                        admit,
+                        || {
+                            let service_name = self
+                                .inner
+                                .service_name
+                                .get()
+                                .cloned()
+                                .unwrap_or_else(|| DEFAULT_SERVICE_NAME.to_string());
                             Arc::new(
-                                OtlpSink::new(name, endpoint, headers, client)
-                                    .with_service_name(service_name),
+                                OtlpSink::new(
+                                    exp.name.clone(),
+                                    cfg.endpoint.clone(),
+                                    cfg.headers.clone(),
+                                    client.clone(),
+                                )
+                                .with_service_name(service_name),
                             ) as Arc<dyn ObservabilitySink>
                         },
                     )
                 }
-                ExporterKind::AliyunSls(cfg) => {
-                    let fingerprint = fingerprint_sls(cfg);
-                    let name = exp.name.clone();
-                    let cfg = cfg.clone();
-                    self.inner.exporters.get_or_create_if(
-                        &exp.name,
-                        fingerprint,
-                        || self.admits(&exp.name),
-                        move || {
-                            // Resolve the AccessKey from the DP's local env at
-                            // build time (the key never rode the kine path).
-                            // Missing creds → empty key → SLS 401 surfaces as a
-                            // delivery-health auth error, not a silent drop.
-                            let (ak_id, ak_secret) =
-                                resolve_sls_credential(&cfg.credential_ref).unwrap_or_default();
-                            Arc::new(AliyunSlsSink::new(
-                                name,
-                                &cfg.endpoint,
-                                &cfg.project,
-                                &cfg.logstore,
-                                ak_id,
-                                ak_secret,
-                                client,
-                            )) as Arc<dyn ObservabilitySink>
-                        },
-                    )
-                }
-                ExporterKind::ObjectStore(cfg) => {
-                    let fingerprint = fingerprint_object_store(cfg);
-                    let name = exp.name.clone();
-                    let cfg = cfg.clone();
-                    self.inner.exporters.get_or_create_if(
-                        &exp.name,
-                        fingerprint,
-                        || self.admits(&exp.name),
-                        move || {
-                            // Resolve cloud creds from the DP's local env and
-                            // build the backend at build time. Missing creds or
-                            // an un-buildable backend yield a sink that reports
-                            // the reason via delivery health (never a silent
-                            // drop) — mirroring the SLS path.
-                            build_object_store_sink(name, &cfg)
-                        },
-                    )
-                }
-                ExporterKind::Datadog(cfg) => {
-                    let fingerprint = fingerprint_datadog(cfg);
-                    let name = exp.name.clone();
-                    let cfg = cfg.clone();
-                    self.inner.exporters.get_or_create_if(
-                        &exp.name,
-                        fingerprint,
-                        || self.admits(&exp.name),
-                        move || {
-                            // Resolve the Datadog API key from the DP's local
-                            // env at build time (the key never rode the kine
-                            // path). Missing key → empty → Datadog 403 surfaces
-                            // as a delivery-health auth error, not a silent drop
-                            // — mirroring the SLS path.
-                            let api_key =
-                                resolve_datadog_credential(&cfg.credential_ref).unwrap_or_default();
-                            Arc::new(DatadogSink::new(
-                                name,
-                                &cfg.site,
-                                api_key,
-                                &cfg.ddsource,
-                                &cfg.tags,
-                                &cfg.service,
-                                client,
-                            )) as Arc<dyn ObservabilitySink>
-                        },
-                    )
-                }
+                ExporterKind::AliyunSls(cfg) => pipelines.get_or_create_if(
+                    &exp.name,
+                    entry,
+                    || fingerprint_sls(cfg),
+                    admit,
+                    || {
+                        // Resolve the AccessKey from the DP's local env at
+                        // build time (the key never rode the kine path).
+                        // Missing creds → empty key → SLS 401 surfaces as a
+                        // delivery-health auth error, not a silent drop.
+                        let (ak_id, ak_secret) =
+                            resolve_sls_credential(&cfg.credential_ref).unwrap_or_default();
+                        Arc::new(AliyunSlsSink::new(
+                            exp.name.clone(),
+                            &cfg.endpoint,
+                            &cfg.project,
+                            &cfg.logstore,
+                            ak_id,
+                            ak_secret,
+                            client.clone(),
+                        )) as Arc<dyn ObservabilitySink>
+                    },
+                ),
+                ExporterKind::ObjectStore(cfg) => pipelines.get_or_create_if(
+                    &exp.name,
+                    entry,
+                    || fingerprint_object_store(cfg),
+                    admit,
+                    // Resolve cloud creds from the DP's local env and build
+                    // the backend at build time. Missing creds or an
+                    // un-buildable backend yield a sink that reports the
+                    // reason via delivery health (never a silent drop) —
+                    // mirroring the SLS path.
+                    || build_object_store_sink(exp.name.clone(), cfg),
+                ),
+                ExporterKind::Datadog(cfg) => pipelines.get_or_create_if(
+                    &exp.name,
+                    entry,
+                    || fingerprint_datadog(cfg),
+                    admit,
+                    || {
+                        // Resolve the Datadog API key from the DP's local env
+                        // at build time (the key never rode the kine path).
+                        // Missing key → empty → Datadog 403 surfaces as a
+                        // delivery-health auth error, not a silent drop —
+                        // mirroring the SLS path.
+                        let api_key =
+                            resolve_datadog_credential(&cfg.credential_ref).unwrap_or_default();
+                        Arc::new(DatadogSink::new(
+                            exp.name.clone(),
+                            &cfg.site,
+                            api_key,
+                            &cfg.ddsource,
+                            &cfg.tags,
+                            &cfg.service,
+                            client.clone(),
+                        )) as Arc<dyn ObservabilitySink>
+                    },
+                ),
             };
 
             // The exporter left the published snapshot after this request
@@ -370,7 +355,7 @@ impl OtlpHttpFanOut {
             // that selects any gets a record of its own.
             let selects_headers =
                 !exp.request_headers.is_empty() || !exp.upstream_response_headers.is_empty();
-            let record = content_record(&exp.kind, event, content, trace, facts)
+            let record = content_record(&exp.kind, &event, content, trace, facts)
                 .map(|record| {
                     if selects_headers {
                         Arc::new(Arc::unwrap_or_clone(record).with_exporter_headers(
@@ -384,7 +369,7 @@ impl OtlpHttpFanOut {
                 .unwrap_or_else(|| {
                     if selects_headers {
                         return Arc::new(
-                            SinkRecord::metadata_only(event.clone())
+                            SinkRecord::metadata_only(Arc::clone(&event))
                                 .with_trace(trace.cloned())
                                 .with_facts(facts.cloned())
                                 .with_exporter_headers(
@@ -395,7 +380,7 @@ impl OtlpHttpFanOut {
                     }
                     Arc::clone(metadata_record.get_or_insert_with(|| {
                         Arc::new(
-                            SinkRecord::metadata_only(event.clone())
+                            SinkRecord::metadata_only(Arc::clone(&event))
                                 .with_trace(trace.cloned())
                                 .with_facts(facts.cloned()),
                         )
@@ -587,7 +572,7 @@ fn fingerprint_sls(cfg: &AliyunSlsConfig) -> u64 {
 /// the handler already applied at capture time.
 fn content_record(
     kind: &ExporterKind,
-    event: &UsageEvent,
+    event: &Arc<UsageEvent>,
     content: Option<&CapturedContent>,
     trace: Option<&crate::trace::TraceEmission>,
     facts: Option<&Arc<crate::genai::SpanFacts>>,
@@ -611,7 +596,7 @@ fn content_record(
     sc.response_truncated = sc.response_truncated || captured.response_truncated;
     sc.output = captured.output.clone();
     Some(Arc::new(
-        SinkRecord::metadata_only(event.clone())
+        SinkRecord::metadata_only(Arc::clone(event))
             .with_content(sc)
             .with_trace(trace.cloned())
             .with_facts(facts.cloned()),
@@ -1940,6 +1925,20 @@ fn _ensure_arc_clone(_: Arc<()>) {}
 mod tests {
     use super::*;
 
+    fn entry(exp: ObservabilityExporter) -> Arc<ResourceEntry<ObservabilityExporter>> {
+        Arc::new(ResourceEntry::new(format!("id-{}", exp.name), exp, 1))
+    }
+
+    fn content_record_of(
+        kind: &ExporterKind,
+        event: &UsageEvent,
+        content: Option<&CapturedContent>,
+        trace: Option<&crate::trace::TraceEmission>,
+        facts: Option<&Arc<crate::genai::SpanFacts>>,
+    ) -> Option<Arc<SinkRecord>> {
+        content_record(kind, &Arc::new(event.clone()), content, trace, facts)
+    }
+
     fn sample_event() -> UsageEvent {
         UsageEvent {
             request_id: "req-test-123".into(),
@@ -2290,7 +2289,7 @@ mod tests {
         let prompt =
             json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}).to_string();
         let record = |cap: u32| {
-            content_record(
+            content_record_of(
                 &otlp_kind(SlsContentMode::Full, cap),
                 &event,
                 Some(&CapturedContent {
@@ -2318,7 +2317,7 @@ mod tests {
         assert!(attr(&span, "aisix.content.prompt").is_none());
 
         // Only the answer cut: the prompt is still reported structured.
-        let long_answer = content_record(
+        let long_answer = content_record_of(
             &otlp_kind(SlsContentMode::Full, 2 * prompt.len() as u32),
             &event,
             Some(&CapturedContent::new(
@@ -2371,7 +2370,7 @@ mod tests {
             ))
         };
         let span = |captured: CapturedContent| {
-            let record = content_record(
+            let record = content_record_of(
                 &otlp_kind(SlsContentMode::Full, 4096),
                 &event,
                 Some(&captured),
@@ -2552,7 +2551,7 @@ mod tests {
         // otlp on its default (metadata_only) never carries content, even
         // when content was captured.
         let otlp = otlp_kind(SlsContentMode::MetadataOnly, 1024);
-        assert!(content_record(&otlp, &event, Some(&captured), None, None).is_none());
+        assert!(content_record_of(&otlp, &event, Some(&captured), None, None).is_none());
 
         // object_store never carries content either — content_record gates on
         // the AliyunSls variant, so any other kind gets metadata-only even when
@@ -2568,19 +2567,19 @@ mod tests {
         }))
         .unwrap()
         .kind;
-        assert!(content_record(&objstore, &event, Some(&captured), None, None).is_none());
+        assert!(content_record_of(&objstore, &event, Some(&captured), None, None).is_none());
 
         // sls metadata_only → no content.
         let meta = sls_kind(SlsContentMode::MetadataOnly, 1024);
-        assert!(content_record(&meta, &event, Some(&captured), None, None).is_none());
+        assert!(content_record_of(&meta, &event, Some(&captured), None, None).is_none());
 
         // sls full but nothing captured → falls back to metadata.
         let full = sls_kind(SlsContentMode::Full, 1024);
-        assert!(content_record(&full, &event, None, None, None).is_none());
+        assert!(content_record_of(&full, &event, None, None, None).is_none());
 
         // sls full + captured content → a content-bearing record that still
         // carries the metadata.
-        let rec = content_record(&full, &event, Some(&captured), None, None)
+        let rec = content_record_of(&full, &event, Some(&captured), None, None)
             .expect("full-capture sls with content yields a content record");
         let c = rec.content.as_ref().expect("content attached");
         assert_eq!(c.prompt, "the prompt");
@@ -2597,7 +2596,7 @@ mod tests {
             response_truncated: false,
             output: None,
         };
-        let rec = content_record(
+        let rec = content_record_of(
             &sls_kind(SlsContentMode::Full, 16),
             &event,
             Some(&big),
@@ -2619,7 +2618,7 @@ mod tests {
             response_truncated: false,
             output: None,
         };
-        let rec = content_record(&full, &event, Some(&pre), None, None).unwrap();
+        let rec = content_record_of(&full, &event, Some(&pre), None, None).unwrap();
         assert!(
             rec.content.as_ref().unwrap().truncated,
             "source truncation must propagate"
@@ -2629,16 +2628,16 @@ mod tests {
         // full + captured content → a content-bearing record (same shared
         // `SlsContentMode` plumbing).
         let dd_meta = datadog_kind(SlsContentMode::MetadataOnly, 1024);
-        assert!(content_record(&dd_meta, &event, Some(&captured), None, None).is_none());
+        assert!(content_record_of(&dd_meta, &event, Some(&captured), None, None).is_none());
         let dd_full = datadog_kind(SlsContentMode::Full, 1024);
-        assert!(content_record(&dd_full, &event, None, None, None).is_none());
-        let rec = content_record(&dd_full, &event, Some(&captured), None, None)
+        assert!(content_record_of(&dd_full, &event, None, None, None).is_none());
+        let rec = content_record_of(&dd_full, &event, Some(&captured), None, None)
             .expect("full-capture datadog with content yields a content record");
         let c = rec.content.as_ref().expect("content attached");
         assert_eq!(c.prompt, "the prompt");
         assert_eq!(c.response, "the response");
         // Per-exporter cap truncates a datadog record too.
-        let rec = content_record(
+        let rec = content_record_of(
             &datadog_kind(SlsContentMode::Full, 16),
             &event,
             Some(&big),
@@ -2652,14 +2651,14 @@ mod tests {
         // otlp_http behaves identically (#519 B.2): full + captured content →
         // a content-bearing record; full with nothing captured → metadata.
         let otlp_full = otlp_kind(SlsContentMode::Full, 1024);
-        assert!(content_record(&otlp_full, &event, None, None, None).is_none());
-        let rec = content_record(&otlp_full, &event, Some(&captured), None, None)
+        assert!(content_record_of(&otlp_full, &event, None, None, None).is_none());
+        let rec = content_record_of(&otlp_full, &event, Some(&captured), None, None)
             .expect("full-capture otlp with content yields a content record");
         let c = rec.content.as_ref().expect("content attached");
         assert_eq!(c.prompt, "the prompt");
         assert_eq!(c.response, "the response");
         // Per-exporter cap truncates an otlp record too.
-        let rec = content_record(
+        let rec = content_record_of(
             &otlp_kind(SlsContentMode::Full, 16),
             &event,
             Some(&big),
@@ -2699,7 +2698,7 @@ mod tests {
             response_truncated: false,
             output: None,
         };
-        let rec = content_record(
+        let rec = content_record_of(
             &otlp_kind(SlsContentMode::Full, 1024),
             &event,
             Some(&captured),
@@ -2737,7 +2736,7 @@ mod tests {
             response_truncated: false,
             output: None,
         };
-        let rec = content_record(
+        let rec = content_record_of(
             &otlp_kind(SlsContentMode::Full, 16),
             &event,
             Some(&big),
@@ -3787,7 +3786,7 @@ mod tests {
         // can't easily count spawned tasks, but if the call returned
         // and the test process didn't hang, we're good.
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, None, None, std::iter::empty());
+        f.fan_out(sample_event(), None, None, None, std::iter::empty());
     }
 
     #[test]
@@ -3801,7 +3800,13 @@ mod tests {
         let mut exp = sample_exporter();
         exp.enabled = false;
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, None, None, std::iter::once(&exp));
+        f.fan_out(
+            sample_event(),
+            None,
+            None,
+            None,
+            std::iter::once(&entry(exp)),
+        );
     }
 
     #[tokio::test]
@@ -3834,7 +3839,13 @@ mod tests {
         let control = mk("control", &ctrl_srv.uri(), None);
 
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, None, None, [&zero, &control]);
+        f.fan_out(
+            sample_event(),
+            None,
+            None,
+            None,
+            [&entry(zero), &entry(control)],
+        );
 
         // The control's span lands after the 1s flush…
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -3879,7 +3890,13 @@ mod tests {
         .unwrap();
 
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), None, None, None, std::iter::once(&exp));
+        f.fan_out(
+            sample_event(),
+            None,
+            None,
+            None,
+            std::iter::once(&entry(exp)),
+        );
 
         // Poll for the batched POST (flush_interval is 1s).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -3937,13 +3954,7 @@ mod tests {
         ]));
         let f = OtlpHttpFanOut::new();
         let live = handle.load().observability_exporters.entries();
-        f.fan_out(
-            &sample_event(),
-            None,
-            None,
-            None,
-            live.iter().map(|e| &e.value),
-        );
+        f.fan_out(sample_event(), None, None, None, live.iter());
         let mut names: Vec<_> = f.exporter_stats().into_keys().collect();
         names.sort();
         assert_eq!(names, ["gone", "keep", "off"]);
@@ -3965,13 +3976,7 @@ mod tests {
 
         // A request that loaded the snapshot before the publish emits after
         // the reap: the removed exporters' pipelines stay stopped.
-        f.fan_out(
-            &sample_event(),
-            None,
-            None,
-            None,
-            live.iter().map(|e| &e.value),
-        );
+        f.fan_out(sample_event(), None, None, None, live.iter());
         assert_eq!(
             f.exporter_stats().into_keys().collect::<Vec<_>>(),
             ["keep"],
