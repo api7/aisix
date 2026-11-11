@@ -497,7 +497,9 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let _reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+    // Never token-committed — count_tokens burns no generation tokens; the
+    // drop at return releases the concurrency slots.
+    let mut reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
     // Resolve the attempt list (routing-aware). count_tokens is
     // Anthropic-only, so we attempt the group's Anthropic targets in
@@ -527,7 +529,8 @@ async fn dispatch(
         },
     )
     .await?;
-    let _group_reservation = plan.reserve_group(state, snapshot, auth).await?;
+    plan.reserve_group(state, snapshot, auth, &mut reservation)
+        .await?;
     let attempt_models = &plan.attempts;
     let retry_on_429 = plan.retry_on_429(&model_entry.value);
     let fallback_statuses: &[u16] = plan.fallback_statuses(&model_entry.value);
@@ -539,7 +542,8 @@ async fn dispatch(
         .with_trace(client.trace.clone());
     let mut last_err: Option<ProxyError> = None;
     let mut any_anthropic = false;
-    for (target_idx, target) in attempt_models.iter().enumerate() {
+    let mut target_gate = crate::quota::TargetGate::new(plan.quota_parent(&model_entry));
+    'targets: for (target_idx, target) in attempt_models.iter().enumerate() {
         // count_tokens has no upstream equivalent outside the Anthropic
         // protocol; skip foreign targets in a mixed group rather than
         // dispatching to an upstream that would 404.
@@ -561,47 +565,6 @@ async fn dispatch(
             display_name: &target.model.display_name,
             target_model: &target_model,
             model_id: &target.id,
-        };
-        // Reserve THIS target's own model rate-limit layers before
-        // dispatching to it (AISIX-Cloud#1087); over-limit → skip it and
-        // try the remaining targets. Like the handler-level `_reservation` it is
-        // never token-committed — count_tokens burns no generation tokens;
-        // the drop at scope end releases the concurrency slot.
-        let _member_reservation = match crate::quota::reserve_routing_target(
-            state,
-            snapshot,
-            auth,
-            plan.quota_parent(&model_entry),
-            &target.model.display_name,
-            &target.id,
-            &target.model,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                // An attempt that never reached an upstream, recorded so
-                // the failover it forced is visible.
-                let (index, kind) = routing.begin_attempt(attempt_target);
-                routing.record(
-                    state,
-                    crate::attempt::AttemptRecord {
-                        index,
-                        kind,
-                        target_model: target_model.clone(),
-                        target_model_id: target.id.clone(),
-                        provider_key_id: pk_id.clone(),
-                        status: 429,
-                        success: false,
-                        error_class: "rate_limit_exceeded".to_string(),
-                        error_message: e.to_string(),
-                        latency_ms: 0,
-                        dispatched: false,
-                    },
-                );
-                last_err = Some(e);
-                continue;
-            }
         };
         // Same-target retries before failing over, like the other
         // group-capable endpoints. This loop had fail-over only: a
@@ -631,6 +594,45 @@ async fn dispatch(
                 tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32, hint)).await;
             }
             let (index, kind) = routing.begin_attempt(attempt_target);
+            // Reserve THIS target's own model rate-limit layers for every
+            // attempt, retries included (AISIX-Cloud#1087, #1954);
+            // over-limit → skip it and try the remaining targets.
+            let _member_reservation = match target_gate
+                .reserve(
+                    state,
+                    snapshot,
+                    auth,
+                    &mut reservation,
+                    &target.model.display_name,
+                    &target.id,
+                    &target.model,
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    // An attempt that never reached an upstream, recorded so
+                    // the failover it forced is visible.
+                    routing.record(
+                        state,
+                        crate::attempt::AttemptRecord {
+                            index,
+                            kind,
+                            target_model: target_model.clone(),
+                            target_model_id: target.id.clone(),
+                            provider_key_id: pk_id.clone(),
+                            status: 429,
+                            success: false,
+                            error_class: "rate_limit_exceeded".to_string(),
+                            error_message: e.to_string(),
+                            latency_ms: 0,
+                            dispatched: false,
+                        },
+                    );
+                    last_err = Some(e);
+                    continue 'targets;
+                }
+            };
             let attempt_started = Instant::now();
             match count_tokens_to_target(
                 state,
@@ -736,6 +738,7 @@ async fn dispatch(
     // No Anthropic target to serve count_tokens. Reject at the boundary
     // with a 400 (parallel to /v1/rerank's provider gate) rather than
     // dispatching to an upstream that would 404.
+    target_gate.refund_unserved(&mut reservation).await;
     if !any_anthropic {
         return Err(ProxyError::InvalidRequest(format!(
             "model `{model_name}` is not backed by an Anthropic-protocol upstream; \

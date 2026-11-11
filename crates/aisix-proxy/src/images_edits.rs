@@ -499,7 +499,7 @@ async fn dispatch(
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
+    let mut reservation = crate::quota::enforce(state, snapshot, auth, Some(&model_rl)).await?;
 
     // A Model Group walks its targets (AISIX-Cloud#1111); every per-target
     // input — provider gate, key, URL, upstream id, deadline — comes from
@@ -510,6 +510,7 @@ async fn dispatch(
         state,
         snapshot,
         auth,
+        &mut reservation,
         client_ctx,
         &model_name,
         &model_entry,

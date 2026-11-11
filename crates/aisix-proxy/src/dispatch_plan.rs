@@ -146,21 +146,33 @@ impl DispatchPlan {
         })
     }
 
-    /// The group target's own rate-limit layers, reserved once for the
-    /// request ([`crate::quota::reserve_semantic_group`]); `None` without
-    /// a group target.
+    /// Reserve the group target's own rate-limit layers once for the
+    /// request ([`crate::quota::reserve_semantic_group`]) into `request`,
+    /// the request gate's reservation they extend, so they are committed and
+    /// refunded with it. A refusal turns the request away at its gate:
+    /// `request` is refunded too. Nothing to do without a group target.
     pub async fn reserve_group(
         &self,
         state: &ProxyState,
         snapshot: &AisixSnapshot,
         auth: &AuthenticatedKey,
-    ) -> Result<Option<aisix_ratelimit::MultiReservation>, ProxyError> {
+        request: &mut aisix_ratelimit::MultiReservation,
+    ) -> Result<(), ProxyError> {
         let Some(group) = &self.group else {
-            return Ok(None);
+            return Ok(());
         };
-        crate::quota::reserve_semantic_group(state, snapshot, auth, &group.id, &group.value)
+        match crate::quota::reserve_semantic_group(state, snapshot, auth, &group.id, &group.value)
             .await
-            .map(Some)
+        {
+            Ok(reserved) => {
+                request.merge(reserved);
+                Ok(())
+            }
+            Err(e) => {
+                std::mem::take(request).refund().await;
+                Err(e)
+            }
+        }
     }
 }
 

@@ -1685,13 +1685,9 @@ async fn dispatch(
     let mut reservation = crate::quota::enforce_rate_limit(state, snapshot, auth, Some(&model_rl))
         .await
         .map_err(&with_model)?;
-    if let Some(group) = plan
-        .reserve_group(state, snapshot, auth)
+    plan.reserve_group(state, snapshot, auth, &mut reservation)
         .await
-        .map_err(&with_model)?
-    {
-        reservation.merge(group);
-    }
+        .map_err(&with_model)?;
 
     let now = created_ts();
 
@@ -1771,6 +1767,7 @@ async fn dispatch(
         // and post-stream token accounting cover the member's limits too
         // (AISIX-Cloud#1087).
         let mut won_member_reservation: Option<aisix_ratelimit::MultiReservation> = None;
+        let mut target_gate = crate::quota::TargetGate::new(plan.quota_parent(&virtual_entry));
 
         'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
             let model = &attempt.model;
@@ -1852,16 +1849,17 @@ async fn dispatch(
                 // 429 attempt and move on to the remaining targets in strategy
                 // order (same-target retries can't help — the window won't
                 // reset mid-loop).
-                let member_reservation = match crate::quota::reserve_routing_target(
-                    state,
-                    snapshot,
-                    auth,
-                    plan.quota_parent(&virtual_entry),
-                    &model.display_name,
-                    &attempt.id,
-                    model,
-                )
-                .await
+                let member_reservation = match target_gate
+                    .reserve(
+                        state,
+                        snapshot,
+                        auth,
+                        &mut reservation,
+                        &model.display_name,
+                        &attempt.id,
+                        model,
+                    )
+                    .await
                 {
                     Ok(r) => {
                         last_reserve_reject = None;
@@ -2059,6 +2057,7 @@ async fn dispatch(
         }
 
         let Some(won) = won else {
+            target_gate.refund_unserved(&mut reservation).await;
             // When the loop's LAST failure was a per-target quota
             // rejection, surface the un-flattened ProxyError: same 429 +
             // Retry-After as the BridgeError twin, plus the structured
@@ -2981,6 +2980,7 @@ async fn dispatch(
     // member's TPM/TPD bills with the request-level layers
     // (AISIX-Cloud#1087).
     let mut won_member_reservation: Option<aisix_ratelimit::MultiReservation> = None;
+    let mut target_gate = crate::quota::TargetGate::new(plan.quota_parent(&virtual_entry));
 
     'targets: for (target_idx, attempt) in attempt_models.iter().enumerate() {
         let model = &attempt.model;
@@ -3060,16 +3060,17 @@ async fn dispatch(
             // 429 attempt and move on to the remaining targets in strategy
             // order (same-target retries can't help — the window won't
             // reset mid-loop).
-            let member_reservation = match crate::quota::reserve_routing_target(
-                state,
-                snapshot,
-                auth,
-                plan.quota_parent(&virtual_entry),
-                &model.display_name,
-                &attempt.id,
-                model,
-            )
-            .await
+            let member_reservation = match target_gate
+                .reserve(
+                    state,
+                    snapshot,
+                    auth,
+                    &mut reservation,
+                    &model.display_name,
+                    &attempt.id,
+                    model,
+                )
+                .await
             {
                 Ok(r) => {
                     last_reserve_reject = None;
@@ -3244,6 +3245,7 @@ async fn dispatch(
     }
 
     let Some(mut upstream) = upstream else {
+        target_gate.refund_unserved(&mut reservation).await;
         // Prefer the un-flattened quota rejection when it was the last
         // failure — keeps `error.policy` attribution (AISIX-Cloud#892).
         if let Some(e) = last_reserve_reject {

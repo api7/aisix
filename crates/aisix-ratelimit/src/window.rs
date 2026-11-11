@@ -230,6 +230,19 @@ impl SlidingWindowCounter {
         *slot = slot.saturating_sub(delta);
     }
 
+    /// Undo `delta` recorded at `at_secs`, from the sub-bucket it landed
+    /// in, saturating at zero. No-op once that sub-bucket's slot has been
+    /// reused for a newer one: the unit already left the sum, and the slot
+    /// now holds other requests' counts.
+    pub fn refund(&mut self, at_secs: u64, delta: u64) {
+        let start = self.current_start(at_secs);
+        let len = self.slots.len();
+        let slot = &mut self.slots[((start / self.step_secs) as usize) % len];
+        if slot.0 == start {
+            slot.1 = slot.1.saturating_sub(delta);
+        }
+    }
+
     /// Rolling usage at `now`.
     pub fn current(&self, now_secs: u64) -> u64 {
         self.starts_in_window(now_secs)
