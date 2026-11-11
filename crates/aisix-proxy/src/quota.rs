@@ -475,14 +475,17 @@ async fn reserve_policy_layers(
         let Some(layer) = match_policy_layer(policy, &entry.id, input, phase) else {
             continue;
         };
+        // Held means an earlier pass classified it caller-facing, and that
+        // classification does not change across the request's attempts.
+        if caller_scoped
+            .as_deref()
+            .is_some_and(|cs| cs.held.contains(&entry.id))
+        {
+            continue;
+        }
         let caller_facing = caller_scoped
             .as_deref_mut()
             .filter(|_| is_caller_facing(policy, input));
-        if let Some(cs) = &caller_facing {
-            if cs.held.contains(&entry.id) {
-                continue;
-            }
-        }
         let r = state
             .limiter
             .pre_commit(&layer.bucket_key, &layer.limits)
@@ -510,6 +513,14 @@ async fn reserve_policy_layers(
 /// - its bucket does not split on a member property — a `group_by` on
 ///   `model` or `provider` keeps one counter per member, which only a
 ///   per-attempt count can keep honest.
+///
+/// Keys on both identities: the caller-addressed entry is known, the
+/// dispatched target is not. Only a [`TargetGate`] with a parent asks —
+/// a routing group or semantic router on the chat, messages, count_tokens
+/// and responses loops and [`crate::routing::dispatch_with_failover`].
+/// Direct dispatch (wildcard aliases included) has no target pass, and
+/// ensemble panel and judge calls reserve through [`reserve_model_only`],
+/// which has no caller-facing half, so every policy there counts per call.
 fn is_caller_facing(policy: &RateLimitPolicy, input: &ConditionInput<'_>) -> bool {
     policy.is_conditional()
         && !policy
@@ -750,9 +761,10 @@ async fn reserve_target_layers(
 /// downstream request):
 ///
 /// - member layers — the target's inline model `rate_limit`, classic
-///   `model`-scope policies on the target, and conditional policies only
-///   the target's own `model` / `model_name` satisfy — count once per
-///   attempt, failed attempts and same-target retries included;
+///   `model`-scope policies on the target, and conditional policies whose
+///   match depends on the member (its `model` / `model_name` or
+///   `provider`, see [`is_caller_facing`]) — count once per attempt,
+///   failed attempts and same-target retries included;
 /// - conditional policies the caller-addressed group satisfies whatever
 ///   the member holds (its id or alias standing in for the model,
 ///   AISIX-Cloud#1267; see [`is_caller_facing`]) count at most once per

@@ -664,13 +664,37 @@ fn eval_leaf(leaf: &PolicyCondition, input: &ConditionInput<'_>) -> bool {
     // operator vocabulary (and the dashboard's normalization) is
     // built on; `negate` then flips the combined result, so a negated
     // leaf excluding the parent excludes every request addressed to it.
-    let parent = input.routing_parent(&leaf.dimension);
-    let raw = if leaf.operator == ConditionOperator::Ne {
-        eval_operator(leaf, var) && parent.is_none_or(|p| eval_operator(leaf, p))
-    } else {
-        eval_operator(leaf, var) || parent.is_some_and(|p| eval_operator(leaf, p))
-    };
+    let raw = eval_model_pair(
+        leaf,
+        Some(eval_operator(leaf, var)),
+        input.routing_parent(&leaf.dimension),
+    )
+    .expect("a known primary value settles the pair");
     raw != leaf.negate
+}
+
+/// The un-negated result of a leaf over the {primary, routing parent} pair:
+/// ∃ for the positive operators, ∀ for `~=` (see [`eval_leaf`]). `primary`
+/// is the primary value's result, `None` when it is unknown; a missing
+/// parent leaves the primary alone. Shared by both evaluators so they read
+/// the pair identically.
+fn eval_model_pair(
+    leaf: &PolicyCondition,
+    primary: Option<bool>,
+    parent: Option<&str>,
+) -> Option<bool> {
+    let parent = || parent.map(|p| eval_operator(leaf, p));
+    if leaf.operator == ConditionOperator::Ne {
+        match primary {
+            Some(false) => Some(false),
+            _ => kleene_and([primary, parent().or(Some(true))].into_iter()),
+        }
+    } else {
+        match primary {
+            Some(true) => Some(true),
+            _ => kleene_or([primary, parent().or(Some(false))].into_iter()),
+        }
+    }
 }
 
 /// Evaluate a condition list for a routing target pass with the dispatched
@@ -681,7 +705,8 @@ fn eval_leaf(leaf: &PolicyCondition, input: &ConditionInput<'_>) -> bool {
 /// (Kleene) logic: `NOT unknown` is unknown, AND is false on any false
 /// child, OR true on any true child, otherwise unknown. `Some(true)` means
 /// the list matches whichever member the parent dispatches to; `None` means
-/// the answer depends on the member.
+/// the answer could not be settled without the member (it may still turn
+/// out the same for every member the group actually has).
 ///
 /// Each known leaf evaluates exactly as [`eval_condition_nodes`] would, so
 /// whenever this returns `Some(b)`, every member gives `b` there too.
@@ -729,19 +754,13 @@ fn eval_leaf_for_any_member(leaf: &PolicyCondition, input: &ConditionInput<'_>) 
     let raw = match leaf.dimension {
         PolicyDimension::Provider => None,
         PolicyDimension::Model | PolicyDimension::ModelName => {
-            // The pair {member (unknown), parent}: `eval_leaf`'s ∃ for the
-            // positive operators is settled by a satisfying parent, its ∀
-            // for `~=` by a failing one.
-            let parent = input
-                .routing_parent(&leaf.dimension)
-                .map(|p| eval_operator(leaf, p));
-            match (leaf.operator == ConditionOperator::Ne, parent) {
-                (false, Some(true)) => Some(true),
-                (true, Some(false)) => Some(false),
-                _ => None,
-            }
+            eval_model_pair(leaf, None, input.routing_parent(&leaf.dimension))
         }
-        _ => return Some(eval_leaf(leaf, input)),
+        // The caller's own dimensions: the same for every member.
+        PolicyDimension::Team
+        | PolicyDimension::Member
+        | PolicyDimension::ApiKey
+        | PolicyDimension::Tag(_) => return Some(eval_leaf(leaf, input)),
     };
     raw.map(|r| r != leaf.negate)
 }
@@ -1347,7 +1366,7 @@ mod tests {
         [
             ("model-1", "gpt-4.1-prod", Some("openai")),
             ("model-2", "claude-prod", Some("anthropic")),
-            ("group-1", "chat-group", Some("Anthropic")),
+            ("model-4", "gpt-4o", Some("Anthropic")),
             ("model-3", "other", None),
         ]
         .into_iter()
