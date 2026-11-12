@@ -224,6 +224,11 @@ pub async fn responses(
         body.as_object()
             .map(aisix_obs::GenAiRequestParams::from_openai_responses),
     );
+    if let Some(trace) = &client.trace {
+        if aisix_gateway::tool_calls::responses_declares_additional_tools(&body) {
+            trace.note_declares_additional_tools();
+        }
+    }
     let api_key_id = auth.entry.id.clone();
 
     let model_name = body
@@ -758,6 +763,8 @@ async fn dispatch(
     // exactly one target and a slow first chunk fails over.
     let mut last_err: Option<ProxyError> = None;
     let mut target_gate = crate::quota::TargetGate::new(plan.quota_parent(&model_entry));
+    let declares_additional_tools =
+        aisix_gateway::tool_calls::responses_declares_additional_tools(body);
     'targets: for (target_idx, target) in attempt_models.iter().enumerate() {
         // Resolved ProviderKey UUID for this target — feeds the per-PK
         // telemetry attribution tags on the emitted UsageEvent
@@ -861,10 +868,10 @@ async fn dispatch(
             };
             let attempt_body = stripped_body.as_ref().unwrap_or(body);
             let mark = affinity.response_mark(is_routing_request.then_some(target.id.as_str()));
-            let result = if crate::dispatch::serves_natively(
+            let result = if crate::dispatch::responses_served_natively(
                 snapshot,
                 &target.model,
-                aisix_core::ApiSurface::Responses,
+                declares_additional_tools,
             ) {
                 responses_to_target(
                     state,
@@ -1207,7 +1214,7 @@ fn responses_value_text(v: &Value) -> String {
 
 /// Dispatch one concrete target's Responses-API passthrough. The caller
 /// has already confirmed the target serves `/v1/responses` natively
-/// ([`crate::dispatch::serves_natively`]) — which its vendor id implies
+/// ([`crate::dispatch::responses_served_natively`]) — which its vendor id implies
 /// only for OpenAI itself, and which any vendor can declare — so the
 /// URL is resolved per surface rather than from `api_base` alone.
 #[allow(clippy::too_many_arguments)]

@@ -1292,7 +1292,12 @@ pub(crate) fn emit_usage(
         .iter()
         .any(|e| e.value.enabled && matches!(e.value.kind, aisix_core::ExporterKind::OtlpHttp(_)))
         .then(|| {
-            let mut upstream = crate::span_facts::upstream_facts(snap, &event, provider_key_id);
+            let mut upstream = crate::span_facts::upstream_facts(
+                snap,
+                &event,
+                provider_key_id,
+                trace.is_some_and(|t| t.declares_additional_tools()),
+            );
             // An event that never reached its upstream (a cache hit, a
             // refusal) names the model it addressed but no server it called.
             if !dispatched {

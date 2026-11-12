@@ -292,6 +292,44 @@ pub(crate) fn serves_natively_with(
     }
 }
 
+/// Whether one `/v1/responses` attempt on `model` takes its key's native
+/// Responses surface, given whether the request declares tools in
+/// `additional_tools` input items (Codex's lite mode).
+///
+/// Such a request is bridged on every key whose `provider` is not
+/// `openai`, `azure` or `byo` (or unset), even when the key declares
+/// `apis.responses`: only OpenAI's own API reads that item type, and
+/// other native Responses upstreams silently ignore it, so the model
+/// would see no tools at all — the bridge reads them. Decided per
+/// attempt, from the key of the target actually dispatched.
+pub(crate) fn responses_served_natively(
+    snapshot: &AisixSnapshot,
+    model: &Model,
+    declares_additional_tools: bool,
+) -> bool {
+    let pk = resolve_provider_key(snapshot, model).ok();
+    responses_served_natively_with(
+        model,
+        pk.as_ref().map(|e| &e.value),
+        declares_additional_tools,
+    )
+}
+
+/// [`responses_served_natively`] over an already-resolved key, with no
+/// attribution side effect.
+pub(crate) fn responses_served_natively_with(
+    model: &Model,
+    pk: Option<&ProviderKey>,
+    declares_additional_tools: bool,
+) -> bool {
+    let reads_additional_tools = matches!(
+        pk.map(|p| p.provider.as_str()).unwrap_or_default(),
+        "" | "openai" | "azure" | "byo"
+    );
+    serves_natively_with(model, pk, ApiSurface::Responses)
+        && (reads_additional_tools || !declares_additional_tools)
+}
+
 /// Required upstream model id (`model_name`) for a non-routing Model.
 pub(crate) fn require_upstream_model(model: &Model) -> Result<&str, ProxyError> {
     model.model_name.as_deref().ok_or_else(|| {
@@ -958,6 +996,37 @@ mod tests {
         let m = model_on("byo", "pk-2");
         assert!(serves_natively(&snap, &m, ApiSurface::Messages));
         assert!(!serves_natively(&snap, &m, ApiSurface::Responses));
+    }
+
+    /// A request declaring tools in `additional_tools` input items keeps a
+    /// declared native Responses surface only on `openai`, `azure`, `byo`
+    /// and unset providers; every other vendor is bridged. Without such
+    /// items every key keeps its native surface.
+    #[test]
+    fn additional_tools_bridge_every_provider_but_openai_azure_and_byo() {
+        for (provider, native_with_tools) in [
+            ("openai", true),
+            ("azure", true),
+            ("byo", true),
+            ("", true),
+            ("deepseek", false),
+            ("openrouter", false),
+            ("my-vllm", false),
+        ] {
+            let snap = snapshot_with_pk_json(
+                "pk-1",
+                &format!(
+                    r#"{{"display_name":"k","secret":"k","api_base":"https://up/v1","provider":"{provider}","adapter":"openai","apis":{{"responses":{{}}}}}}"#
+                ),
+            );
+            let m = model_on(provider, "pk-1");
+            assert!(responses_served_natively(&snap, &m, false), "{provider:?}");
+            assert_eq!(
+                responses_served_natively(&snap, &m, true),
+                native_with_tools,
+                "{provider:?}"
+            );
+        }
     }
 
     /// AISIX-Cloud#1388: an OpenAI-compatible endpoint reached through the

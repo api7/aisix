@@ -353,6 +353,14 @@ pub fn is_responses_additional_tools_item(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("additional_tools")
 }
 
+/// Whether a Responses request body declares tools in `additional_tools`
+/// input items.
+pub fn responses_declares_additional_tools(body: &Value) -> bool {
+    body.get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(is_responses_additional_tools_item))
+}
+
 /// Separates a tool-call id from the thought signature appended to it.
 pub const THOUGHT_SIGNATURE_SEPARATOR: &str = "__thought__";
 
