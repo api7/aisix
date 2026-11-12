@@ -294,6 +294,10 @@ impl SinkPipeline {
         // `cancel` is borrowed by the select below for as long as each
         // iteration lasts, including the arm bodies.
         let mut shutdown = cancel.clone();
+        // A dropped sender never signals again and `changed` would return
+        // at once on every turn; the worker then runs until its channel
+        // closes.
+        let mut cancel_open = true;
 
         tracing::info!(
             sink = %self.sink.name(),
@@ -321,8 +325,10 @@ impl SinkPipeline {
                 _ = ticker.tick() => {
                     self.flush(&mut buffer, None, &mut shutdown).await;
                 }
-                _ = cancel.changed() => {
-                    if *cancel.borrow() {
+                changed = cancel.changed(), if cancel_open => {
+                    if changed.is_err() {
+                        cancel_open = false;
+                    } else if *cancel.borrow() {
                         self.drain(&mut buffer, &mut shutdown).await;
                         tracing::info!(sink = %self.sink.name(), "sink pipeline shutting down");
                         return;
@@ -627,6 +633,8 @@ mod tests {
         mode: Mode,
         batch_sizes: Mutex<Vec<usize>>,
         attempts: Mutex<Vec<tokio::time::Instant>>,
+        /// Request ids of delivered records, in delivery order.
+        ids: Mutex<Vec<String>>,
     }
 
     impl FakeSink {
@@ -635,6 +643,7 @@ mod tests {
                 mode,
                 batch_sizes: Mutex::new(Vec::new()),
                 attempts: Mutex::new(Vec::new()),
+                ids: Mutex::new(Vec::new()),
             })
         }
         fn delivered(&self) -> usize {
@@ -679,6 +688,9 @@ mod tests {
             match &self.mode {
                 Mode::Ok => {
                     self.batch_sizes.lock().push(batch.len());
+                    self.ids
+                        .lock()
+                        .extend(batch.records.iter().map(|r| r.usage.request_id.clone()));
                     Ok(SinkAck {
                         accepted: batch.len(),
                         ..SinkAck::default()
@@ -791,6 +803,94 @@ mod tests {
 
         // Two count-flushes of 2, then a final drain flush of 1.
         assert_eq!(*sink.batch_sizes.lock(), vec![2, 2, 1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_batches_flush_at_once_and_the_rest_on_the_tick_in_order() {
+        let sink = FakeSink::new(Mode::Ok);
+        let mut c = cfg();
+        c.max_batch = 10;
+        c.flush_interval = Duration::from_secs(1);
+        let (handle, worker) = SinkPipeline::new(sink.clone(), c);
+        let (_keep_alive, cancel) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        tokio::spawn(worker.run(cancel));
+        // Past the interval's immediate first tick.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        for i in 0..9 {
+            assert!(handle.try_enqueue(rec(i)));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            sink.batch_sizes.lock().is_empty(),
+            "one short of a batch waits"
+        );
+
+        assert!(handle.try_enqueue(rec(9)));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(*sink.batch_sizes.lock(), vec![10], "the batch is full");
+
+        for i in 10..35 {
+            assert!(handle.try_enqueue(rec(i)));
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(*sink.batch_sizes.lock(), vec![10, 10, 10]);
+
+        tokio::time::sleep_until(started + Duration::from_secs(1) + TICK).await;
+        assert_eq!(*sink.batch_sizes.lock(), vec![10, 10, 10, 5]);
+        let attempts = sink.attempts.lock().clone();
+        assert!(attempts[2] - started < Duration::from_secs(1));
+        assert!(
+            attempts[3] - started >= Duration::from_secs(1),
+            "the rest went on the tick"
+        );
+        let expected: Vec<String> = (0..35).map(|i| format!("req-{i}")).collect();
+        assert_eq!(*sink.ids.lock(), expected, "nothing lost or reordered");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_last_handle_drains_without_waiting_for_the_tick() {
+        let sink = FakeSink::new(Mode::Ok);
+        let (handle, worker) = SinkPipeline::new(sink.clone(), cfg());
+        let (_keep_alive, cancel) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        let jh = tokio::spawn(worker.run(cancel));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        let second = handle.clone();
+        assert!(handle.try_enqueue(rec(0)));
+        assert!(second.try_enqueue(rec(1)));
+        drop(handle);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(!jh.is_finished(), "a handle is still live");
+
+        drop(second);
+        jh.await.unwrap();
+        assert!(
+            tokio::time::Instant::now() - started < Duration::from_secs(1),
+            "the worker exited on the drop, not on a flush tick"
+        );
+        assert_eq!(*sink.ids.lock(), ["req-0", "req-1"]);
+    }
+
+    /// A spinning worker never lets the paused clock advance, so this test
+    /// would hang rather than reach the tick.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_cancel_sender_leaves_the_worker_serving_its_queue() {
+        let sink = FakeSink::new(Mode::Ok);
+        let mut c = cfg();
+        c.flush_interval = Duration::from_secs(1);
+        let (handle, worker) = SinkPipeline::new(sink.clone(), c);
+        let (cancel_tx, cancel) = watch::channel(false);
+        let started = tokio::time::Instant::now();
+        tokio::spawn(worker.run(cancel));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        drop(cancel_tx);
+
+        assert!(handle.try_enqueue(rec(0)));
+        tokio::time::sleep_until(started + Duration::from_secs(1) + TICK).await;
+        assert_eq!(*sink.ids.lock(), ["req-0"]);
     }
 
     #[tokio::test]
