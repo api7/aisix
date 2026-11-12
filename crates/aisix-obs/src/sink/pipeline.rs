@@ -284,7 +284,9 @@ impl SinkPipeline {
     }
 
     /// Drain → batch → deliver until the channel closes or `cancel` flips
-    /// true. Performs one final flush when cancelled. Delivery failures are
+    /// true; a `cancel` sender dropped without flipping it leaves the worker
+    /// running until the channel closes. Performs one final flush when
+    /// cancelled. Delivery failures are
     /// counted and logged, never propagated.
     pub async fn run(mut self, mut cancel: watch::Receiver<bool>) {
         let mut ticker = tokio::time::interval(self.cfg.flush_interval);

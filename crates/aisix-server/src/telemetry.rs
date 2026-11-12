@@ -251,6 +251,9 @@ async fn run(
         "telemetry sender started (mTLS)",
     );
 
+    // A dropped sender never signals again and `changed` would return at
+    // once on every turn; the worker then runs until its channel closes.
+    let mut cancel_open = true;
     loop {
         tokio::select! {
             // New event from the proxy. Buffer it; flush if we hit
@@ -280,7 +283,7 @@ async fn run(
                     flush(&client, &cfg, &metrics, &mut state, &mut buffer, Retry::Allowed, cancel).await;
                 }
             }
-            _ = cancel.changed() => {}
+            changed = cancel.changed(), if cancel_open => cancel_open = changed.is_ok(),
         }
         // A POST that reached the control plane cleared the waiting mark;
         // whatever is still queued behind it waits from now.
@@ -1532,6 +1535,30 @@ mod tests {
         finish_sender(sender.as_mut()).await;
         assert_recorded_events(&batches, &ordered_events(250));
         assert!(tx.is_closed());
+    }
+
+    /// A spinning worker keeps the runtime busy, so the paused clock never
+    /// advances and the test hangs rather than reaching its assertions.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_cancel_sender_leaves_the_worker_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TelemetryConfig::new(
+            "http://127.0.0.1:9/dp/telemetry".into(),
+            write_test_bundle(dir.path()),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let worker = tokio::spawn(async move {
+            run(cfg, Metrics::new(false), rx, &mut cancel_rx).await;
+        });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        drop(cancel_tx);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!worker.is_finished());
+
+        drop(tx);
+        worker.await.unwrap();
     }
 
     /// The shutdown drain is the one flush that can meet a FULL queue —

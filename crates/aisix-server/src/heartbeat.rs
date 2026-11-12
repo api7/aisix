@@ -287,6 +287,9 @@ async fn run(cfg: HeartbeatConfig, cancel: &mut watch::Receiver<bool>) {
         "heartbeat started (mTLS)",
     );
 
+    // A dropped sender never signals again and `changed` would return at
+    // once on every turn; the beat then keeps its schedule.
+    let mut cancel_open = true;
     loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -296,8 +299,10 @@ async fn run(cfg: HeartbeatConfig, cancel: &mut watch::Receiver<bool>) {
                     Err(e) => tracing::warn!(error = %format_args!("{e:#}"), "heartbeat failed"),
                 }
             }
-            _ = cancel.changed() => {
-                if *cancel.borrow() {
+            changed = cancel.changed(), if cancel_open => {
+                if changed.is_err() {
+                    cancel_open = false;
+                } else if *cancel.borrow() {
                     tracing::info!("heartbeat shutting down");
                     return;
                 }
@@ -1136,6 +1141,42 @@ managed:
             .await
             .expect("heartbeat did not stop after cancel")
             .unwrap();
+    }
+
+    /// A spinning worker keeps the runtime busy, so the paused clock never
+    /// advances and the test hangs rather than reaching its assertion.
+    #[tokio::test]
+    async fn a_dropped_cancel_sender_leaves_the_heartbeat_running() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let (tx, rx) = watch::channel(false);
+        let handle = spawn(
+            cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls),
+            rx,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty()
+        {
+            assert!(Instant::now() < deadline, "the first beat never arrived");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        tokio::time::pause();
+        drop(tx);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!handle.is_finished());
+        handle.abort();
     }
 
     #[test]
