@@ -1540,10 +1540,11 @@ mod tests {
     /// A spinning worker keeps the runtime busy, so the paused clock never
     /// advances and the test hangs rather than reaching its assertions.
     #[tokio::test(start_paused = true)]
-    async fn a_dropped_cancel_sender_leaves_the_worker_running() {
+    async fn a_dropped_cancel_sender_leaves_the_worker_delivering() {
+        let (server, batches) = recording_server(200).await;
         let dir = tempfile::tempdir().unwrap();
         let cfg = TelemetryConfig::new(
-            "http://127.0.0.1:9/dp/telemetry".into(),
+            format!("{}/dp/telemetry", server.uri()),
             write_test_bundle(dir.path()),
         );
         let (tx, rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
@@ -1557,8 +1558,15 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(!worker.is_finished());
 
+        // Real HTTP from here: a paused clock would jump to the request
+        // timeout while the POST is in flight.
+        tokio::time::resume();
+        for event in ordered_events(2) {
+            tx.try_send(event).unwrap();
+        }
         drop(tx);
         worker.await.unwrap();
+        assert_recorded_events(&batches, &ordered_events(2));
     }
 
     /// The shutdown drain is the one flush that can meet a FULL queue —

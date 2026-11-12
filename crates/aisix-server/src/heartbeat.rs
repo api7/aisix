@@ -1176,6 +1176,16 @@ managed:
         drop(tx);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!handle.is_finished());
+
+        tokio::time::resume();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while server.received_requests().await.unwrap_or_default().len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "no beat after the sender was dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         handle.abort();
     }
 
