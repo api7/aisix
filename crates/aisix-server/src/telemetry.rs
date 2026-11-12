@@ -1543,10 +1543,11 @@ mod tests {
     async fn a_dropped_cancel_sender_leaves_the_worker_delivering() {
         let (server, batches) = recording_server(200).await;
         let dir = tempfile::tempdir().unwrap();
-        let cfg = TelemetryConfig::new(
+        let mut cfg = TelemetryConfig::new(
             format!("{}/dp/telemetry", server.uri()),
             write_test_bundle(dir.path()),
         );
+        cfg.interval = Duration::from_millis(200);
         let (tx, rx) = tokio::sync::mpsc::channel(QUEUE_CAPACITY);
         let (cancel_tx, mut cancel_rx) = watch::channel(false);
         let worker = tokio::spawn(async move {
@@ -1564,9 +1565,21 @@ mod tests {
         for event in ordered_events(2) {
             tx.try_send(event).unwrap();
         }
+        // Delivered by the interval flush while the channel is still open,
+        // not by the drain on close.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while batches.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no flush after the sender was dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_recorded_events(&batches, &ordered_events(2));
+        assert!(!worker.is_finished());
+
         drop(tx);
         worker.await.unwrap();
-        assert_recorded_events(&batches, &ordered_events(2));
     }
 
     /// The shutdown drain is the one flush that can meet a FULL queue —
