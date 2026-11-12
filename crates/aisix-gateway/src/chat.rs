@@ -726,9 +726,8 @@ impl CacheCreationTtl {
     };
 
     /// Read an OpenAI-shape `cache_write_tokens_details` object (under
-    /// `prompt_tokens_details` or `input_tokens_details`). Taken only when
-    /// both lifetimes are reported as integers: one alone could not say how
-    /// the rest of the write was kept.
+    /// `prompt_tokens_details` or `input_tokens_details`). Each lifetime is
+    /// taken when reported as an integer, independently of the other.
     pub fn from_openai_cache_write_details(split: Option<&serde_json::Value>) -> Self {
         let count = |key: &str| {
             split
@@ -736,13 +735,10 @@ impl CacheCreationTtl {
                 .and_then(serde_json::Value::as_u64)
                 .map(|n| n.min(u64::from(u32::MAX)) as u32)
         };
-        match (count("ttl_30m_tokens"), count("ttl_12h_tokens")) {
-            (Some(thirty_m), Some(twelve_h)) => Self {
-                cache_write_30m_tokens: Some(thirty_m),
-                cache_write_12h_tokens: Some(twelve_h),
-                ..Self::NONE
-            },
-            _ => Self::NONE,
+        Self {
+            cache_write_30m_tokens: count("ttl_30m_tokens"),
+            cache_write_12h_tokens: count("ttl_12h_tokens"),
+            ..Self::NONE
         }
     }
 
@@ -799,37 +795,43 @@ impl CacheCreationTtl {
         *self == Self::NONE
     }
 
-    /// Each pair as a record of its write — `creation_total`
-    /// (`cache_creation_tokens`) for the 5m/1h pair, `write_total`
-    /// (`cache_write_tokens`) for the 30m/12h pair: kept, with an unreported
-    /// part as `0`, only when its parts add up to a non-zero total. A split
-    /// that misses the total — a partial upstream report, a lifetime this
-    /// gateway does not read, frames or members merged unevenly — would
-    /// misstate what was written at which lifetime, so it is no split at
-    /// all, as is any split of a write that did not happen.
+    /// Each pair as a record of its write.
+    ///
+    /// The 5m/1h pair against `creation_total` (`cache_creation_tokens`):
+    /// kept, with an unreported part as `0`, only when its parts add up to a
+    /// non-zero total. A split that misses the total — a partial upstream
+    /// report, a lifetime this gateway does not read, frames or members
+    /// merged unevenly — would misstate what was written at which lifetime,
+    /// so it is no split at all, as is any split of a write that did not
+    /// happen.
+    ///
+    /// The 30m/12h pair against `write_total` (`cache_write_tokens`): each
+    /// part kept as reported, an unreported one left absent, so a write the
+    /// parts do not cover is still accounted for by the total. Dropped only
+    /// when the parts exceed a non-zero total, or there is no write.
     pub fn accounting_for(self, creation_total: u32, write_total: u32) -> Self {
-        fn pair(a: Option<u32>, b: Option<u32>, total: u32) -> (Option<u32>, Option<u32>) {
-            let (x, y) = (a.unwrap_or(0), b.unwrap_or(0));
-            if (a.is_none() && b.is_none()) || total == 0 || x.saturating_add(y) != total {
-                return (None, None);
-            }
+        let (five_m, one_h) = (self.cache_creation_5m_tokens, self.cache_creation_1h_tokens);
+        let (x, y) = (five_m.unwrap_or(0), one_h.unwrap_or(0));
+        let creation = if (five_m.is_none() && one_h.is_none())
+            || creation_total == 0
+            || x.saturating_add(y) != creation_total
+        {
+            (None, None)
+        } else {
             (Some(x), Some(y))
-        }
-        let (five_m, one_h) = pair(
-            self.cache_creation_5m_tokens,
-            self.cache_creation_1h_tokens,
-            creation_total,
-        );
-        let (thirty_m, twelve_h) = pair(
-            self.cache_write_30m_tokens,
-            self.cache_write_12h_tokens,
-            write_total,
-        );
+        };
+        let (thirty_m, twelve_h) = (self.cache_write_30m_tokens, self.cache_write_12h_tokens);
+        let parts = u64::from(thirty_m.unwrap_or(0)) + u64::from(twelve_h.unwrap_or(0));
+        let write = if write_total == 0 || parts > u64::from(write_total) {
+            (None, None)
+        } else {
+            (thirty_m, twelve_h)
+        };
         Self {
-            cache_creation_5m_tokens: five_m,
-            cache_creation_1h_tokens: one_h,
-            cache_write_30m_tokens: thirty_m,
-            cache_write_12h_tokens: twelve_h,
+            cache_creation_5m_tokens: creation.0,
+            cache_creation_1h_tokens: creation.1,
+            cache_write_30m_tokens: write.0,
+            cache_write_12h_tokens: write.1,
         }
     }
 
@@ -2335,7 +2337,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_write_ttl_needs_both_lifetimes_and_their_total() {
+    fn cache_write_ttl_keeps_each_reported_lifetime_within_the_total() {
         let read =
             |v: serde_json::Value| CacheCreationTtl::from_openai_cache_write_details(Some(&v));
         let both = read(serde_json::json!({"ttl_30m_tokens": 0, "ttl_12h_tokens": 7000}));
@@ -2347,12 +2349,20 @@ mod tests {
                 ..CacheCreationTtl::NONE
             }
         );
-        assert!(read(serde_json::json!({"ttl_12h_tokens": 7000})).is_empty());
-        assert!(read(serde_json::json!({"ttl_30m_tokens": "x", "ttl_12h_tokens": 1})).is_empty());
+        let twelve_h_only = read(serde_json::json!({"ttl_12h_tokens": 5000}));
+        assert_eq!(twelve_h_only.cache_write_30m_tokens, None);
+        assert_eq!(twelve_h_only.cache_write_12h_tokens, Some(5000));
+        let bad_30m = read(serde_json::json!({"ttl_30m_tokens": "x", "ttl_12h_tokens": 1}));
+        assert_eq!(bad_30m.cache_write_30m_tokens, None);
+        assert_eq!(bad_30m.cache_write_12h_tokens, Some(1));
         assert!(CacheCreationTtl::from_openai_cache_write_details(None).is_empty());
 
         assert_eq!(both.accounting_for(0, 7000), both);
-        assert!(both.accounting_for(0, 7001).is_empty());
+        // Parts short of the total stand as reported; the rest is the total's.
+        assert_eq!(both.accounting_for(0, 9000), both);
+        assert_eq!(twelve_h_only.accounting_for(0, 7000), twelve_h_only);
+        // Parts above the total, or no write at all, are no split.
+        assert!(both.accounting_for(0, 6999).is_empty());
         assert!(both.accounting_for(0, 0).is_empty());
         // The two pairs settle independently.
         let mixed = CacheCreationTtl {

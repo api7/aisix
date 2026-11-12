@@ -11,7 +11,8 @@ import {
 // split by cache retention whenever the upstream reports the split, so a
 // 12-hour write can be priced at its own rate. `cache_write_tokens` stays the
 // total; `cache_write_30m_tokens` / `cache_write_12h_tokens` are its parts,
-// present only together and only when they add up to it.
+// each present exactly when the upstream reported it, and both absent when
+// they add up to more than the total.
 //
 // The caller's prompt-cache settings (`prompt_cache_options`, a content
 // block's `prompt_cache_breakpoint`) reach the upstream as sent.
@@ -25,19 +26,21 @@ const WRITE = 7000;
 const WRITE_30M = 2000;
 const WRITE_12H = 5000;
 
-// The model name tells the upstream which split to report.
-type Split = "split" | "mismatch" | "single" | "none";
-const SPLITS: Record<Split, Record<string, number> | undefined> = {
-  split: { ttl_30m_tokens: WRITE_30M, ttl_12h_tokens: WRITE_12H },
-  mismatch: { ttl_30m_tokens: 1000, ttl_12h_tokens: 1000 },
-  single: { ttl_12h_tokens: WRITE },
-  none: undefined,
+// The model name tells the upstream which split to report, and the event
+// carries `expect` (undefined = the field is absent).
+type Split = "split" | "short" | "over" | "single" | "none";
+const SPLITS: Record<Split, { reported?: Record<string, number>; expect: [number?, number?] }> = {
+  split: { reported: { ttl_30m_tokens: WRITE_30M, ttl_12h_tokens: WRITE_12H }, expect: [WRITE_30M, WRITE_12H] },
+  short: { reported: { ttl_30m_tokens: 1000, ttl_12h_tokens: 1000 }, expect: [1000, 1000] },
+  over: { reported: { ttl_30m_tokens: 4000, ttl_12h_tokens: 4000 }, expect: [undefined, undefined] },
+  single: { reported: { ttl_12h_tokens: WRITE_12H }, expect: [undefined, WRITE_12H] },
+  none: { expect: [undefined, undefined] },
 };
 
 type Surface = "responses" | "chat/completions" | "completions";
 const cases: Array<{ surface: Surface; stream: boolean; split: Split; model: string }> = [];
 for (const [surface, streams, splits] of [
-  ["responses", [false, true], ["split", "mismatch", "single", "none"]],
+  ["responses", [false, true], ["split", "short", "over", "single", "none"]],
   ["chat/completions", [false, true], ["split", "none"]],
   ["completions", [false], ["split"]],
 ] as const) {
@@ -79,7 +82,7 @@ describe("OpenAI cache-write retention split on the usage event", () => {
       const details = {
         cached_tokens: 300,
         cache_write_tokens: WRITE,
-        ...(SPLITS[split] ? { cache_write_tokens_details: SPLITS[split] } : {}),
+        ...(SPLITS[split].reported ? { cache_write_tokens_details: SPLITS[split].reported } : {}),
       };
       const responses = req.url === "/v1/responses";
       const usage = responses
@@ -143,7 +146,7 @@ describe("OpenAI cache-write retention split on the usage event", () => {
     });
   });
 
-  test("the split rides the event only when both lifetimes add up to the write", async (ctx) => {
+  test("each reported lifetime rides the event unless the parts exceed the write", async (ctx) => {
     if (!reachable) return ctx.skip();
     const breakpoint = { mode: "explicit", ttl: "12h" };
     const cacheOptions = { ttl: "12h" };
@@ -184,13 +187,9 @@ describe("OpenAI cache-write retention split on the usage event", () => {
       expect(event["aisix.cache_write_tokens"], c.model).toBe(WRITE);
       expect(event["aisix.cached_prompt_tokens"], c.model).toBe(300);
       expect(event["gen_ai.usage.input_tokens"], c.model).toBe(8000);
-      if (c.split === "split") {
-        expect(event["aisix.cache_write_30m_tokens"], c.model).toBe(WRITE_30M);
-        expect(event["aisix.cache_write_12h_tokens"], c.model).toBe(WRITE_12H);
-      } else {
-        expect(event["aisix.cache_write_30m_tokens"], c.model).toBeUndefined();
-        expect(event["aisix.cache_write_12h_tokens"], c.model).toBeUndefined();
-      }
+      const [thirtyM, twelveH] = SPLITS[c.split].expect;
+      expect(event["aisix.cache_write_30m_tokens"], c.model).toBe(thirtyM);
+      expect(event["aisix.cache_write_12h_tokens"], c.model).toBe(twelveH);
       expect(event["aisix.cache_creation_5m_tokens"], c.model).toBeUndefined();
       expect(event["aisix.cache_creation_1h_tokens"], c.model).toBeUndefined();
     }

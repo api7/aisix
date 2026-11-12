@@ -309,11 +309,12 @@ pub struct UsageEvent {
     /// account for the whole write. `cache_creation_tokens` stays the total
     /// either way.
     ///
-    /// `cache_write_30m_tokens`, `cache_write_12h_tokens`: the same split of
-    /// `cache_write_tokens` by OpenAI's 30-minute and 12-hour cache
-    /// retention (`cache_write_tokens_details`), under the same rule: present
-    /// only together, only when the upstream reported both and they add up
-    /// to a non-zero `cache_write_tokens`.
+    /// `cache_write_30m_tokens`, `cache_write_12h_tokens`: the part of
+    /// `cache_write_tokens` written with OpenAI's 30-minute and 12-hour cache
+    /// retention (`cache_write_tokens_details`), each present exactly when
+    /// the upstream reported it. Any part of the write they leave uncovered
+    /// is still in `cache_write_tokens`. Both are absent when they add up to
+    /// more than `cache_write_tokens`, or there is no write.
     #[serde(flatten)]
     pub cache_creation_ttl: aisix_gateway::CacheCreationTtl,
 
