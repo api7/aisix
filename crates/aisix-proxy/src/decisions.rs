@@ -852,6 +852,7 @@ fn emit_usage_event(
         completion_tokens: usage.output,
         cached_prompt_tokens: usage.cached,
         cache_write_tokens: usage.cache_write,
+        cache_creation_ttl: usage.cache_write_ttl,
         modality_tokens: usage.modality,
         reasoning_tokens: usage.reasoning,
         total_tokens: usage.upstream_total,

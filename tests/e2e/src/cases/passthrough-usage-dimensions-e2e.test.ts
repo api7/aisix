@@ -232,7 +232,11 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
           prompt_tokens: 900,
           completion_tokens: 25,
           total_tokens: 925,
-          prompt_tokens_details: { cached_tokens: 768, cache_write_tokens: 113 },
+          prompt_tokens_details: {
+            cached_tokens: 768,
+            cache_write_tokens: 113,
+            cache_write_tokens_details: { ttl_30m_tokens: 13, ttl_12h_tokens: 100 },
+          },
           completion_tokens_details: { reasoning_tokens: 17 },
         },
       },
@@ -515,6 +519,8 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
     expect(chat["gen_ai.usage.output_tokens"]).toBe(25);
     expect(chat["aisix.cached_prompt_tokens"]).toBe(768);
     expect(chat["aisix.cache_write_tokens"]).toBe(113);
+    expect(chat["aisix.cache_write_30m_tokens"]).toBe(13);
+    expect(chat["aisix.cache_write_12h_tokens"]).toBe(100);
     expect(chat["aisix.reasoning_tokens"]).toBe(17);
     expect(chat["aisix.requested_model"]).toBe("gpt-4o-mini");
   });

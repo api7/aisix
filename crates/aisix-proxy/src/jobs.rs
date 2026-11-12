@@ -2253,7 +2253,7 @@ async fn attribute_batch_usage(
         // live request and therefore no trace bundle; the exporter falls
         // back to the legacy flat span (AISIX-Cloud#1279).
         let facts = std::sync::Arc::new(aisix_obs::SpanFacts {
-            upstream: crate::span_facts::upstream_facts(&snap, &event, pk_id),
+            upstream: crate::span_facts::upstream_facts(&snap, &event, pk_id, false),
             ..Default::default()
         });
         state.otlp_fan_out.fan_out(

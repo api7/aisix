@@ -20,6 +20,9 @@ pub(crate) fn upstream_facts(
     snap: &AisixSnapshot,
     event: &UsageEvent,
     provider_key_id: &str,
+    // The request declares tools in `additional_tools` input items, which
+    // bridges a Responses attempt on most keys.
+    declares_additional_tools: bool,
 ) -> Option<UpstreamFacts> {
     match event.operation.as_str() {
         "mcp" => {
@@ -64,7 +67,9 @@ pub(crate) fn upstream_facts(
             ..UpstreamFacts::default()
         };
         return Some(
-            match pk.and_then(|p| upstream_base(model, p, &event.operation)) {
+            match pk
+                .and_then(|p| upstream_base(model, p, &event.operation, declares_additional_tools))
+            {
                 Some(base) => facts.with_base_url(&base),
                 None => facts,
             },
@@ -120,7 +125,12 @@ fn request_model(model: &Model, event: &UsageEvent) -> Option<String> {
 /// dispatch paths use. `None` where the upstream URL is not a function of
 /// the key alone (Bedrock's and Vertex's regional endpoints) or the key
 /// cannot be resolved.
-fn upstream_base(model: &Model, pk: &ProviderKey, operation: &str) -> Option<String> {
+fn upstream_base(
+    model: &Model,
+    pk: &ProviderKey,
+    operation: &str,
+    declares_additional_tools: bool,
+) -> Option<String> {
     use aisix_core::Adapter;
     if matches!(
         pk.adapter,
@@ -133,12 +143,18 @@ fn upstream_base(model: &Model, pk: &ProviderKey, operation: &str) -> Option<Str
             .filter(|b| !b.is_empty())
             .map(str::to_string);
     }
-    let surface = match operation {
-        "messages" | "count_tokens" => Some(ApiSurface::Messages),
-        "responses" => Some(ApiSurface::Responses),
+    let native = match operation {
+        "messages" | "count_tokens" => Some(ApiSurface::Messages)
+            .filter(|s| crate::dispatch::serves_natively_with(model, Some(pk), *s)),
+        "responses" => Some(ApiSurface::Responses).filter(|_| {
+            crate::dispatch::responses_served_natively_with(
+                model,
+                Some(pk),
+                declares_additional_tools,
+            )
+        }),
         _ => None,
     };
-    let native = surface.filter(|s| crate::dispatch::serves_natively_with(model, Some(pk), *s));
     crate::dispatch::configured_base_url(pk, native)
 }
 
@@ -193,4 +209,32 @@ pub(crate) fn chat_params(req: &aisix_gateway::ChatFormat) -> aisix_obs::GenAiRe
         body.insert("stream".into(), Value::from(v));
     }
     aisix_obs::GenAiRequestParams::from_openai_chat(&body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Responses attempt rerouted to the bridge because the request
+    /// declares `additional_tools` reports the address the bridge dialled,
+    /// not the key's declared native Responses base.
+    #[test]
+    fn a_bridged_lite_attempt_reports_the_bridge_address() {
+        let pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"k","api_key":"k","api_base":"https://chat.example/v1","provider":"deepseek","adapter":"openai","apis":{"responses":{"base":"https://native.example/v1"}}}"#,
+        )
+        .unwrap();
+        let model: Model = serde_json::from_str(
+            r#"{"display_name":"m","provider":"deepseek","model_name":"x","provider_key_id":"pk"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            upstream_base(&model, &pk, "responses", false).as_deref(),
+            Some("https://native.example/v1")
+        );
+        assert_eq!(
+            upstream_base(&model, &pk, "responses", true).as_deref(),
+            Some("https://chat.example/v1")
+        );
+    }
 }

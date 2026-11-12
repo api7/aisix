@@ -105,6 +105,8 @@ struct CompletionUsage {
     /// inferred.
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    /// `cache_write_tokens` split by cache retention, when reported.
+    cache_write_ttl: aisix_gateway::CacheCreationTtl,
     modality: aisix_gateway::ModalityTokens,
     /// `completion_tokens_details.reasoning_tokens` and `total_tokens`,
     /// recorded exactly as `/v1/chat/completions` records them; 0 when the
@@ -246,6 +248,7 @@ pub async fn completions(
                     completion_tokens: 0,
                     cached_prompt_tokens: 0,
                     cache_write_tokens: None,
+                    cache_write_ttl: aisix_gateway::CacheCreationTtl::NONE,
                     modality: aisix_gateway::ModalityTokens::NONE,
                     reasoning_tokens: 0,
                     upstream_total_tokens: 0,
@@ -620,6 +623,7 @@ async fn dispatch(
                     completion_tokens: 0,
                     cached_prompt_tokens: 0,
                     cache_write_tokens: None,
+                    cache_write_ttl: aisix_gateway::CacheCreationTtl::NONE,
                     modality: Default::default(),
                     reasoning_tokens: 0,
                     upstream_total_tokens: 0,
@@ -852,6 +856,9 @@ fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
         completion_tokens,
         cached_prompt_tokens,
         cache_write_tokens,
+        cache_write_ttl: aisix_gateway::CacheCreationTtl::from_openai_cache_write_details(
+            usage.pointer("/prompt_tokens_details/cache_write_tokens_details"),
+        ),
         modality: aisix_gateway::ModalityTokens::from_openai_details(
             usage.get("prompt_tokens_details"),
             usage.get("completion_tokens_details"),
@@ -870,6 +877,7 @@ pub(crate) fn completion_usage_stats(body: &Value) -> Option<UsageStats> {
     Some(UsageStats {
         cached_prompt_tokens: u.cached_prompt_tokens,
         cache_write_tokens: u.cache_write_tokens,
+        cache_creation_ttl: u.cache_write_ttl,
         modality: u.modality,
         reasoning_tokens: u.reasoning_tokens,
         upstream_total_tokens: u.upstream_total_tokens,
@@ -972,6 +980,7 @@ fn emit_usage_event(
         completion_tokens: usage.completion_tokens,
         cached_prompt_tokens: usage.cached_prompt_tokens,
         cache_write_tokens: usage.cache_write_tokens,
+        cache_creation_ttl: usage.cache_write_ttl,
         modality_tokens: usage.modality,
         reasoning_tokens: usage.reasoning_tokens,
         total_tokens: usage.upstream_total_tokens,

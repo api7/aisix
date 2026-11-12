@@ -5854,7 +5854,7 @@ impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
                 // recorded.
                 c.upstream_total_tokens = None;
                 c.cache_creation_tokens = 0;
-                c.cache_creation_ttl = aisix_gateway::CacheCreationTtl::NONE;
+                c.cache_creation_ttl = c.cache_creation_ttl.without_cache_creation();
                 c.cache_read_tokens = 0;
                 c.total_tokens = c.prompt_tokens as u64;
             }

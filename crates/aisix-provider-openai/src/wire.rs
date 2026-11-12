@@ -303,6 +303,11 @@ pub struct OpenAiPromptDetails {
     pub cached_tokens: Option<u32>,
     #[serde(default)]
     pub cache_write_tokens: Option<u32>,
+    /// `cache_write_tokens` by cache retention (`ttl_30m_tokens` /
+    /// `ttl_12h_tokens`). Kept as raw JSON so an unexpected shape costs only
+    /// the split, never the usage it rides on.
+    #[serde(default)]
+    pub cache_write_tokens_details: Option<serde_json::Value>,
     /// Audio / image input tokens, as reported (audio-input models).
     #[serde(default)]
     pub audio_tokens: Option<u32>,
@@ -468,7 +473,9 @@ pub fn into_usage(u: OpenAiUsage) -> UsageStats {
         // creation/read counters; leave at 0 (cp-api falls back to
         // prompt rate for unset cache counters).
         cache_creation_tokens: 0,
-        cache_creation_ttl: aisix_gateway::CacheCreationTtl::NONE,
+        cache_creation_ttl: aisix_gateway::CacheCreationTtl::from_openai_cache_write_details(
+            prompt.and_then(|d| d.cache_write_tokens_details.as_ref()),
+        ),
         cache_read_tokens: 0,
         // Preserve DeepSeek's native counters verbatim for passthrough
         // (#542) so a client reading the native field names still works,

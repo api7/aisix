@@ -250,6 +250,10 @@ pub struct RequestTraceBundle {
     /// The caller's GenAI request parameters, set once by the handler that
     /// parsed the body (the inference families only).
     request: OnceLock<Arc<crate::genai::GenAiRequestParams>>,
+    /// Set when a Responses request declares tools in `additional_tools`
+    /// input items, which decides per key whether its attempts were
+    /// bridged — and so which upstream address their spans report.
+    declares_additional_tools: AtomicBool,
 }
 
 impl RequestTraceBundle {
@@ -274,6 +278,7 @@ impl RequestTraceBundle {
             synthesized_children: AtomicBool::new(false),
             http: None,
             request: OnceLock::new(),
+            declares_additional_tools: AtomicBool::new(false),
         }
     }
 
@@ -287,6 +292,18 @@ impl RequestTraceBundle {
     /// they describe the request as the caller sent it.
     pub fn set_genai_request(&self, params: crate::genai::GenAiRequestParams) {
         let _ = self.request.set(Arc::new(params));
+    }
+
+    /// Record that this Responses request declares tools in
+    /// `additional_tools` input items.
+    pub fn note_declares_additional_tools(&self) {
+        self.declares_additional_tools
+            .store(true, Ordering::Relaxed);
+    }
+
+    /// Whether [`Self::note_declares_additional_tools`] was called.
+    pub fn declares_additional_tools(&self) -> bool {
+        self.declares_additional_tools.load(Ordering::Relaxed)
     }
 
     /// The export-only facts of one usage event of this request: the

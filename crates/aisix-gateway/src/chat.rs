@@ -677,9 +677,10 @@ pub struct UsageStats {
     /// upgrade, a rollback) unreadable. A cache hit reports none.
     #[serde(skip)]
     pub modality: ModalityTokens,
-    /// The split of `cache_creation_tokens` by cache lifetime, when the
-    /// upstream reported one. Not serialized, for the same reason as
-    /// `modality`.
+    /// The split of `cache_creation_tokens` and of `cache_write_tokens` by
+    /// cache lifetime, as far as the upstream reported one: zeroing one of
+    /// those totals clears only its own pair. Not serialized, for the same
+    /// reason as `modality`.
     #[serde(skip)]
     pub cache_creation_ttl: CacheCreationTtl,
     /// The OpenAI-shape `*_tokens_details` counters an upstream reported,
@@ -689,19 +690,31 @@ pub struct UsageStats {
     pub openai_details: OpenAiUsageDetails,
 }
 
-/// Prompt-cache writes by cache lifetime, as the upstream reported them:
-/// Anthropic `usage.cache_creation.ephemeral_5m_input_tokens` /
-/// `ephemeral_1h_input_tokens`, Bedrock Converse `usage.cacheDetails[]` by
-/// `ttl`. Each is a part of `cache_creation_tokens`, and `None` when the
-/// upstream reported no split — distinct from a reported `0`. A one-hour
-/// write is priced above a five-minute one, so only the split tells them
-/// apart. Serialized under the usage event's own field names.
+/// Prompt-cache writes by cache lifetime, as the upstream reported them,
+/// in two independent pairs:
+///
+/// - `cache_creation_5m_tokens` / `cache_creation_1h_tokens`: Anthropic
+///   `usage.cache_creation.ephemeral_5m_input_tokens` /
+///   `ephemeral_1h_input_tokens`, Bedrock Converse `usage.cacheDetails[]` by
+///   `ttl`. Parts of `cache_creation_tokens`.
+/// - `cache_write_30m_tokens` / `cache_write_12h_tokens`: OpenAI
+///   `*_tokens_details.cache_write_tokens_details.ttl_30m_tokens` /
+///   `ttl_12h_tokens`. Parts of `cache_write_tokens`.
+///
+/// Each is `None` when the upstream reported no split — distinct from a
+/// reported `0`. A longer-lived write is priced above a shorter one, so only
+/// the split tells them apart. Serialized under the usage event's own field
+/// names.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheCreationTtl {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_5m_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_1h_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_30m_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_12h_tokens: Option<u32>,
 }
 
 impl CacheCreationTtl {
@@ -709,7 +722,26 @@ impl CacheCreationTtl {
     pub const NONE: Self = Self {
         cache_creation_5m_tokens: None,
         cache_creation_1h_tokens: None,
+        cache_write_30m_tokens: None,
+        cache_write_12h_tokens: None,
     };
+
+    /// Read an OpenAI-shape `cache_write_tokens_details` object (under
+    /// `prompt_tokens_details` or `input_tokens_details`). Each lifetime is
+    /// taken when reported as an integer, independently of the other.
+    pub fn from_openai_cache_write_details(split: Option<&serde_json::Value>) -> Self {
+        let count = |key: &str| {
+            split
+                .and_then(|s| s.get(key))
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n.min(u64::from(u32::MAX)) as u32)
+        };
+        Self {
+            cache_write_30m_tokens: count("ttl_30m_tokens"),
+            cache_write_12h_tokens: count("ttl_12h_tokens"),
+            ..Self::NONE
+        }
+    }
 
     /// Read an Anthropic-shape `usage.cache_creation` object; anything but
     /// an object reports no split.
@@ -728,6 +760,7 @@ impl CacheCreationTtl {
         Self {
             cache_creation_5m_tokens: count("ephemeral_5m_input_tokens"),
             cache_creation_1h_tokens: count("ephemeral_1h_input_tokens"),
+            ..Self::NONE
         }
     }
 
@@ -755,6 +788,7 @@ impl CacheCreationTtl {
         Self {
             cache_creation_5m_tokens: Some(five_m),
             cache_creation_1h_tokens: Some(one_h),
+            ..Self::NONE
         }
     }
 
@@ -762,21 +796,53 @@ impl CacheCreationTtl {
         *self == Self::NONE
     }
 
-    /// The split as a record of a `total`-token write: kept, with an
-    /// unreported part as `0`, only when its parts add up to a non-zero
-    /// total. A split that misses the total — a partial upstream report, a
-    /// lifetime this gateway does not read, frames or members merged
-    /// unevenly — would misstate what was written at which lifetime, so it
-    /// is no split at all, as is any split of a write that did not happen.
-    pub fn accounting_for(self, total: u32) -> Self {
-        let five_m = self.cache_creation_5m_tokens.unwrap_or(0);
-        let one_h = self.cache_creation_1h_tokens.unwrap_or(0);
-        if self.is_empty() || total == 0 || five_m.saturating_add(one_h) != total {
-            return Self::NONE;
-        }
+    /// Each pair as a record of its write.
+    ///
+    /// The 5m/1h pair against `creation_total` (`cache_creation_tokens`):
+    /// kept, with an unreported part as `0`, only when its parts add up to a
+    /// non-zero total. A split that misses the total — a partial upstream
+    /// report, a lifetime this gateway does not read, frames or members
+    /// merged unevenly — would misstate what was written at which lifetime,
+    /// so it is no split at all, as is any split of a write that did not
+    /// happen.
+    ///
+    /// The 30m/12h pair against `write_total` (`cache_write_tokens`): each
+    /// part kept as reported, an unreported one left absent, so a write the
+    /// parts do not cover is still accounted for by the total. Dropped only
+    /// when the parts exceed a non-zero total, or there is no write.
+    pub fn accounting_for(self, creation_total: u32, write_total: u32) -> Self {
+        let (five_m, one_h) = (self.cache_creation_5m_tokens, self.cache_creation_1h_tokens);
+        let (x, y) = (five_m.unwrap_or(0), one_h.unwrap_or(0));
+        let creation = if (five_m.is_none() && one_h.is_none())
+            || creation_total == 0
+            || x.saturating_add(y) != creation_total
+        {
+            (None, None)
+        } else {
+            (Some(x), Some(y))
+        };
+        let (thirty_m, twelve_h) = (self.cache_write_30m_tokens, self.cache_write_12h_tokens);
+        let parts = u64::from(thirty_m.unwrap_or(0)) + u64::from(twelve_h.unwrap_or(0));
+        let write = if write_total == 0 || parts > u64::from(write_total) {
+            (None, None)
+        } else {
+            (thirty_m, twelve_h)
+        };
         Self {
-            cache_creation_5m_tokens: Some(five_m),
-            cache_creation_1h_tokens: Some(one_h),
+            cache_creation_5m_tokens: creation.0,
+            cache_creation_1h_tokens: creation.1,
+            cache_write_30m_tokens: write.0,
+            cache_write_12h_tokens: write.1,
+        }
+    }
+
+    /// The same split without the 5m/1h pair, for a record that stops
+    /// counting `cache_creation_tokens`.
+    pub fn without_cache_creation(self) -> Self {
+        Self {
+            cache_creation_5m_tokens: None,
+            cache_creation_1h_tokens: None,
+            ..self
         }
     }
 
@@ -797,6 +863,8 @@ impl CacheCreationTtl {
                 self.cache_creation_1h_tokens,
                 other.cache_creation_1h_tokens,
             ),
+            cache_write_30m_tokens: add(self.cache_write_30m_tokens, other.cache_write_30m_tokens),
+            cache_write_12h_tokens: add(self.cache_write_12h_tokens, other.cache_write_12h_tokens),
         }
     }
 
@@ -810,6 +878,12 @@ impl CacheCreationTtl {
             cache_creation_1h_tokens: self
                 .cache_creation_1h_tokens
                 .max(other.cache_creation_1h_tokens),
+            cache_write_30m_tokens: self
+                .cache_write_30m_tokens
+                .max(other.cache_write_30m_tokens),
+            cache_write_12h_tokens: self
+                .cache_write_12h_tokens
+                .max(other.cache_write_12h_tokens),
         }
     }
 }
@@ -2219,6 +2293,7 @@ mod tests {
             CacheCreationTtl {
                 cache_creation_5m_tokens: Some(20),
                 cache_creation_1h_tokens: Some(300),
+                ..CacheCreationTtl::NONE
             }
         );
         assert!(CacheCreationTtl::from_anthropic(None).is_empty());
@@ -2229,6 +2304,7 @@ mod tests {
             CacheCreationTtl {
                 cache_creation_5m_tokens: Some(20),
                 cache_creation_1h_tokens: Some(300),
+                ..CacheCreationTtl::NONE
             }
         );
         // A breakdown that does not account for the whole write, or carries
@@ -2242,20 +2318,61 @@ mod tests {
         let one_hour = CacheCreationTtl {
             cache_creation_5m_tokens: None,
             cache_creation_1h_tokens: Some(300),
+            ..CacheCreationTtl::NONE
         };
         assert_eq!(
-            one_hour.accounting_for(300),
+            one_hour.accounting_for(300, 0),
             CacheCreationTtl {
                 cache_creation_5m_tokens: Some(0),
                 cache_creation_1h_tokens: Some(300),
+                ..CacheCreationTtl::NONE
             }
         );
-        assert!(one_hour.accounting_for(320).is_empty());
+        assert!(one_hour.accounting_for(320, 0).is_empty());
         let zeros = CacheCreationTtl {
             cache_creation_5m_tokens: Some(0),
             cache_creation_1h_tokens: Some(0),
+            ..CacheCreationTtl::NONE
         };
-        assert!(zeros.accounting_for(0).is_empty());
+        assert!(zeros.accounting_for(0, 0).is_empty());
+    }
+
+    #[test]
+    fn cache_write_ttl_keeps_each_reported_lifetime_within_the_total() {
+        let read =
+            |v: serde_json::Value| CacheCreationTtl::from_openai_cache_write_details(Some(&v));
+        let both = read(serde_json::json!({"ttl_30m_tokens": 0, "ttl_12h_tokens": 7000}));
+        assert_eq!(
+            both,
+            CacheCreationTtl {
+                cache_write_30m_tokens: Some(0),
+                cache_write_12h_tokens: Some(7000),
+                ..CacheCreationTtl::NONE
+            }
+        );
+        let twelve_h_only = read(serde_json::json!({"ttl_12h_tokens": 5000}));
+        assert_eq!(twelve_h_only.cache_write_30m_tokens, None);
+        assert_eq!(twelve_h_only.cache_write_12h_tokens, Some(5000));
+        let bad_30m = read(serde_json::json!({"ttl_30m_tokens": "x", "ttl_12h_tokens": 1}));
+        assert_eq!(bad_30m.cache_write_30m_tokens, None);
+        assert_eq!(bad_30m.cache_write_12h_tokens, Some(1));
+        assert!(CacheCreationTtl::from_openai_cache_write_details(None).is_empty());
+
+        assert_eq!(both.accounting_for(0, 7000), both);
+        // Parts short of the total stand as reported; the rest is the total's.
+        assert_eq!(both.accounting_for(0, 9000), both);
+        assert_eq!(twelve_h_only.accounting_for(0, 7000), twelve_h_only);
+        // Parts above the total, or no write at all, are no split.
+        assert!(both.accounting_for(0, 6999).is_empty());
+        assert!(both.accounting_for(0, 0).is_empty());
+        // The two pairs settle independently.
+        let mixed = CacheCreationTtl {
+            cache_creation_5m_tokens: Some(1),
+            cache_creation_1h_tokens: Some(2),
+            ..both
+        };
+        assert_eq!(mixed.accounting_for(4, 7000), both);
+        assert_eq!(mixed.without_cache_creation(), both);
     }
 
     #[test]
@@ -2280,6 +2397,7 @@ mod tests {
             cache_creation_ttl: CacheCreationTtl {
                 cache_creation_5m_tokens: Some(0),
                 cache_creation_1h_tokens: Some(1),
+                ..CacheCreationTtl::NONE
             },
             openai_details: OpenAiUsageDetails {
                 accepted_prediction_tokens: Some(2),
