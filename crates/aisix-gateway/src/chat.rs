@@ -677,9 +677,10 @@ pub struct UsageStats {
     /// upgrade, a rollback) unreadable. A cache hit reports none.
     #[serde(skip)]
     pub modality: ModalityTokens,
-    /// The split of `cache_creation_tokens` by cache lifetime, when the
-    /// upstream reported one. Not serialized, for the same reason as
-    /// `modality`.
+    /// The split of `cache_creation_tokens` and of `cache_write_tokens` by
+    /// cache lifetime, as far as the upstream reported one: zeroing one of
+    /// those totals clears only its own pair. Not serialized, for the same
+    /// reason as `modality`.
     #[serde(skip)]
     pub cache_creation_ttl: CacheCreationTtl,
     /// The OpenAI-shape `*_tokens_details` counters an upstream reported,
