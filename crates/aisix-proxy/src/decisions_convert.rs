@@ -787,6 +787,8 @@ pub(crate) struct DecisionUsage {
     pub cached: u32,
     /// Raw cache-write count, when the upstream reported one.
     pub cache_write: Option<u32>,
+    /// `cache_write` split by cache retention, when reported.
+    pub cache_write_ttl: aisix_gateway::CacheCreationTtl,
     /// Reasoning tokens, a subset of `output` (Decisions format only).
     pub reasoning: u32,
     /// The upstream's own total; 0 when it reported none.
@@ -820,6 +822,9 @@ pub(crate) fn decisions_usage(body: &Value) -> Option<DecisionUsage> {
         output: count(body, "/usage/output_tokens").unwrap_or(0),
         cached: count(body, "/usage/input_tokens_details/cached_tokens").unwrap_or(0),
         cache_write: count(body, "/usage/input_tokens_details/cache_write_tokens"),
+        cache_write_ttl: aisix_gateway::CacheCreationTtl::from_openai_cache_write_details(
+            body.pointer("/usage/input_tokens_details/cache_write_tokens_details"),
+        ),
         reasoning: count(body, "/usage/output_tokens_details/reasoning_tokens").unwrap_or(0),
         upstream_total: count(body, "/usage/total_tokens").unwrap_or(0),
         modality: aisix_gateway::ModalityTokens::from_openai_details(

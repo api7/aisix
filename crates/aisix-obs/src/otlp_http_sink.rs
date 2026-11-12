@@ -1523,6 +1523,14 @@ fn push_usage(attributes: &mut Vec<Value>, event: &UsageEvent, operation: Option
             "aisix.cache_creation_1h_tokens",
             event.cache_creation_ttl.cache_creation_1h_tokens,
         ),
+        (
+            "aisix.cache_write_30m_tokens",
+            event.cache_creation_ttl.cache_write_30m_tokens,
+        ),
+        (
+            "aisix.cache_write_12h_tokens",
+            event.cache_creation_ttl.cache_write_12h_tokens,
+        ),
     ] {
         if let Some(v) = value {
             attributes.push(attr_int(key, i64::from(v)));
@@ -2223,6 +2231,7 @@ mod tests {
             cache_creation_ttl: aisix_gateway::CacheCreationTtl {
                 cache_creation_5m_tokens: Some(0),
                 cache_creation_1h_tokens: Some(40),
+                ..aisix_gateway::CacheCreationTtl::NONE
             },
             completion_tokens: 5,
             ..sample_event()
@@ -2252,10 +2261,23 @@ mod tests {
             prompt_tokens: 120,
             cached_prompt_tokens: 100,
             cache_write_tokens: Some(20),
+            cache_creation_ttl: aisix_gateway::CacheCreationTtl {
+                cache_write_30m_tokens: Some(0),
+                cache_write_12h_tokens: Some(20),
+                ..aisix_gateway::CacheCreationTtl::NONE
+            },
             completion_tokens: 30,
             reasoning_tokens: 12,
             ..sample_event()
         });
+        assert_eq!(
+            attr(&openai, "aisix.cache_write_30m_tokens").unwrap()["intValue"],
+            "0"
+        );
+        assert_eq!(
+            attr(&openai, "aisix.cache_write_12h_tokens").unwrap()["intValue"],
+            "20"
+        );
         assert_eq!(
             attr(&openai, "gen_ai.usage.input_tokens").unwrap()["intValue"],
             "120"
@@ -2278,6 +2300,8 @@ mod tests {
         assert!(attr(&plain, "gen_ai.usage.cache_creation.input_tokens").is_none());
         assert!(attr(&plain, "aisix.cache_creation_5m_tokens").is_none());
         assert!(attr(&plain, "aisix.cache_creation_1h_tokens").is_none());
+        assert!(attr(&plain, "aisix.cache_write_30m_tokens").is_none());
+        assert!(attr(&plain, "aisix.cache_write_12h_tokens").is_none());
     }
 
     /// A complete chat capture becomes the conventions' structured content;

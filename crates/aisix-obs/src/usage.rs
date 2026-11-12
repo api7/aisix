@@ -235,7 +235,10 @@ pub struct UsageEvent {
     /// the absent-or-zero case identically.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cached_prompt_tokens: u32,
-    /// Raw OpenAI cache-write count; it is not additive to prompt tokens.
+    /// OpenAI-shape prompt-cache writes (`*_tokens_details.cache_write_tokens`):
+    /// tokens written to the cache that are counted inside `prompt_tokens` and
+    /// not inside `cached_prompt_tokens`. Omitted when the upstream reported
+    /// none; a reported `0` is kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u32>,
 
@@ -305,6 +308,12 @@ pub struct UsageEvent {
     /// absent when the upstream reported no split, or one that does not
     /// account for the whole write. `cache_creation_tokens` stays the total
     /// either way.
+    ///
+    /// `cache_write_30m_tokens`, `cache_write_12h_tokens`: the same split of
+    /// `cache_write_tokens` by OpenAI's 30-minute and 12-hour cache
+    /// retention (`cache_write_tokens_details`), under the same rule: present
+    /// only together, only when the upstream reported both and they add up
+    /// to a non-zero `cache_write_tokens`.
     #[serde(flatten)]
     pub cache_creation_ttl: aisix_gateway::CacheCreationTtl,
 
@@ -1084,8 +1093,10 @@ impl UsageEvent {
     /// `CacheCreationTtl::accounting_for`. The two outlets, `UsageSink::try_emit`
     /// and `OtlpHttpFanOut::fan_out`, both apply it.
     pub fn settled_cache_creation_ttl(&self) -> aisix_gateway::CacheCreationTtl {
-        self.cache_creation_ttl
-            .accounting_for(self.cache_creation_tokens)
+        self.cache_creation_ttl.accounting_for(
+            self.cache_creation_tokens,
+            self.cache_write_tokens.unwrap_or(0),
+        )
     }
 
     /// OTel GenAI `gen_ai.usage.cache_read.input_tokens`: the subset-shape
@@ -1648,6 +1659,7 @@ mod tests {
             cache_creation_ttl: aisix_gateway::CacheCreationTtl {
                 cache_creation_5m_tokens: five_m,
                 cache_creation_1h_tokens: one_h,
+                ..aisix_gateway::CacheCreationTtl::NONE
             },
             ..sample_event("req")
         };
@@ -2451,6 +2463,7 @@ mod tests {
             cache_creation_ttl: aisix_gateway::CacheCreationTtl {
                 cache_creation_5m_tokens: Some(0),
                 cache_creation_1h_tokens: Some(300),
+                ..aisix_gateway::CacheCreationTtl::NONE
             },
             ..Default::default()
         };

@@ -3010,7 +3010,9 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
             usage.get("input_tokens_details"),
             usage.get("output_tokens_details"),
         ),
-        cache_creation_ttl: aisix_gateway::CacheCreationTtl::NONE,
+        cache_creation_ttl: aisix_gateway::CacheCreationTtl::from_openai_cache_write_details(
+            usage.pointer("/input_tokens_details/cache_write_tokens_details"),
+        ),
         // OpenAI verbatim path: no Anthropic-style cache counters.
         cache_creation_tokens: 0,
         cache_read_tokens: 0,

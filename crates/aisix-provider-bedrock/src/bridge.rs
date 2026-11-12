@@ -6246,6 +6246,7 @@ mod tests {
             aisix_gateway::CacheCreationTtl {
                 cache_creation_5m_tokens: Some(50),
                 cache_creation_1h_tokens: Some(150),
+                ..aisix_gateway::CacheCreationTtl::NONE
             }
         );
         assert_eq!(
@@ -6325,6 +6326,7 @@ mod tests {
             aisix_gateway::CacheCreationTtl {
                 cache_creation_5m_tokens: Some(0),
                 cache_creation_1h_tokens: Some(200),
+                ..aisix_gateway::CacheCreationTtl::NONE
             }
         );
         assert_eq!(chat.usage.prompt_tokens, 40);

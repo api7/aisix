@@ -542,6 +542,7 @@ mod tests {
             cache_creation_ttl: aisix_gateway::CacheCreationTtl {
                 cache_creation_5m_tokens: Some(10),
                 cache_creation_1h_tokens: Some(30),
+                ..aisix_gateway::CacheCreationTtl::NONE
             },
             ..UsageEvent::default()
         });
