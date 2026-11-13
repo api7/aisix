@@ -719,11 +719,12 @@ async fn dispatch_stream(
                             .response
                             .observe(&value, crate::token_estimate::push_capped);
                     }
+                    // A caller stops reading at an in-band error, as at a
+                    // terminal event, and that is not abandoning the stream.
+                    let mut ends_stream = is_stream_end(&value);
                     if let Some(failure) = A2aFailure::in_band(&value) {
                         guard.failure.get_or_insert(failure);
-                        // A caller stops reading at the error, as at a terminal
-                        // event, and that is not abandoning the stream.
-                        guard.call.stream.reached_end = true;
+                        ends_stream = true;
                         crate::usage_attr::note_client_error_body(
                             &guard.state.snapshot.load(),
                             || value.to_string(),
@@ -750,12 +751,12 @@ async fn dispatch_stream(
                     // for an agent that leaves the connection open after
                     // finishing, never happens. Marking the end at the loop
                     // exit instead reported every such completed task as
-                    // abandoned.
-                    if is_stream_end(&value) {
-                        guard.call.stream.reached_end = true;
-                    }
-                    if guard.call.stream.reached_end {
+                    // abandoned. The words are counted ahead first, so a
+                    // caller gone during that count is still recorded as
+                    // abandoned: the event never reached it.
+                    if ends_stream {
                         guard.count_ahead().await;
+                        guard.call.stream.reached_end = true;
                     }
                     yield Ok::<_, std::convert::Infallible>(
                         axum::response::sse::Event::default().data(value.to_string()),

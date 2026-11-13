@@ -2841,6 +2841,16 @@ pub fn build_responses_bridge_stream(
         if encoder.is_finished() && !buffering {
             guard.comp().reached_end = true;
         }
+        // A fail-closed overflow in the loop already decided this response's
+        // outcome; record the refusal before the count, for the same reason.
+        let overflow_recorded = match output_guardrail.as_ref() {
+            Some(chain) if overflowed && !released => {
+                guard.comp().record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
+                aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain.as_ref());
+                true
+            }
+            _ => false,
+        };
         // Token-estimation fallback (AISIX-Cloud#1074), run HERE rather than
         // from the Drop guard below: the terminal `response.completed` this
         // relay is about to synthesize carries the client-visible usage, and
@@ -2933,8 +2943,10 @@ pub fn build_responses_bridge_stream(
                 max_buffer_bytes,
                 "streaming /v1/responses (cross-provider) output exceeded buffer cap; failing closed",
             );
-            guard.comp().record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
-            aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain.as_ref());
+            if !overflow_recorded {
+                guard.comp().record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
+                aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain.as_ref());
+            }
             yield Ok(guardrail_failure_frames(
                 &mut encoder,
                 sent_downstream,

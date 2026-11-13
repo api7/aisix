@@ -4154,7 +4154,8 @@ impl<F: FnOnce(AnthropicStreamUsage)> AnthropicStreamGuard<F> {
         };
         if let (Some(est), Some((_, usage))) = (&self.estimator, &self.slot) {
             let (prompt, completion, output) = estimate_inputs(usage, delivered);
-            self.counted.count(est, prompt, completion, output).await;
+            // The output buffer only grows: its length identifies it.
+            self.counted.count(est, prompt, completion, output, 0).await;
         }
     }
 
@@ -4181,7 +4182,7 @@ impl<F: FnOnce(AnthropicStreamUsage)> AnthropicStreamGuard<F> {
             // the estimate has nothing to add.
             if let Some(est) = self.estimator.take() {
                 let (prompt, completion, output) = estimate_inputs(&usage, delivered);
-                let filled = self.counted.fill(&est, prompt, completion, output);
+                let filled = self.counted.fill(&est, prompt, completion, output, 0);
                 if filled.estimated {
                     usage.prompt_tokens = filled.prompt_tokens;
                     usage.completion_tokens = filled.completion_tokens.max(usage.completion_tokens);

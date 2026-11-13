@@ -5853,8 +5853,9 @@ impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
                 c.completion_tokens
             };
             let output = (delivered > 0).then_some(c.est_output_text.as_str());
+            // The output buffer only grows: its length identifies it.
             self.counted
-                .count(est, c.prompt_tokens, completion, output)
+                .count(est, c.prompt_tokens, completion, output, 0)
                 .await;
         }
     }
@@ -5898,7 +5899,7 @@ impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
         let filled = self.estimator.take().map(|est| {
             let output = (delivered > 0).then_some(c.est_output_text.as_str());
             self.counted
-                .fill(&est, c.prompt_tokens, c.completion_tokens, output)
+                .fill(&est, c.prompt_tokens, c.completion_tokens, output, 0)
         });
         if let Some(filled) = filled.filter(|filled| filled.estimated) {
             c.prompt_tokens = filled.prompt_tokens;

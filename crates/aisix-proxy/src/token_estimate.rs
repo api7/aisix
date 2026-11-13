@@ -239,10 +239,15 @@ pub async fn fill_missing_pooled(
 /// that frame drops the stream there, and the guard's Drop — which must
 /// emit in place and cannot wait — then takes this count instead of
 /// tokenizing on the request worker. It answers only for the inputs it
-/// was counted from (output text only grows, so its length identifies
-/// it); for anything else the guard counts inline as before.
+/// was counted from; for anything else the guard counts inline as before.
+///
+/// The output is identified by its length and a revision: a buffer that
+/// only grows is identified by its length alone (revision 0), and one that
+/// can be replaced by other text bumps the revision on each replacement.
 #[derive(Default)]
-pub struct CountedAhead(Option<(u32, u32, Option<usize>, Filled)>);
+pub struct CountedAhead(Option<(CountKey, Filled)>);
+
+type CountKey = (u32, u32, Option<(usize, u32)>);
 
 impl CountedAhead {
     pub async fn count(
@@ -251,14 +256,15 @@ impl CountedAhead {
         upstream_prompt: u32,
         upstream_completion: u32,
         output_text: Option<&str>,
+        output_revision: u32,
     ) {
         let key = (
             upstream_prompt,
             upstream_completion,
-            output_text.map(str::len),
+            output_text.map(|t| (t.len(), output_revision)),
         );
         if !needs_counting(upstream_prompt, upstream_completion, output_text.is_some())
-            || self.0.is_some_and(|(p, c, len, _)| (p, c, len) == key)
+            || self.0.is_some_and(|(counted, _)| counted == key)
         {
             return;
         }
@@ -269,7 +275,7 @@ impl CountedAhead {
             output_text.map(str::to_owned),
         )
         .await;
-        self.0 = Some((key.0, key.1, key.2, filled));
+        self.0 = Some((key, filled));
     }
 
     /// [`fill_missing`], taken from the count ahead when it was counted
@@ -280,14 +286,15 @@ impl CountedAhead {
         upstream_prompt: u32,
         upstream_completion: u32,
         output_text: Option<&str>,
+        output_revision: u32,
     ) -> Filled {
         let key = (
             upstream_prompt,
             upstream_completion,
-            output_text.map(str::len),
+            output_text.map(|t| (t.len(), output_revision)),
         );
         match self.0 {
-            Some((p, c, len, filled)) if (p, c, len) == key => filled,
+            Some((counted, filled)) if counted == key => filled,
             _ => fill_missing(est, upstream_prompt, upstream_completion, output_text),
         }
     }
@@ -1113,9 +1120,9 @@ mod tests {
             ChatFormat::new("relay-model", vec![msg(Role::User, "hi")]),
         );
         let mut ahead = CountedAhead::default();
-        ahead.count(&est, 0, 0, Some("Hello world")).await;
+        ahead.count(&est, 0, 0, Some("Hello world"), 0).await;
 
-        let same = ahead.fill(&est, 0, 0, Some("Hello world"));
+        let same = ahead.fill(&est, 0, 0, Some("Hello world"), 0);
         let inline = fill_missing(&est, 0, 0, Some("Hello world"));
         assert_eq!(
             (same.prompt_tokens, same.completion_tokens, same.estimated),
@@ -1127,14 +1134,20 @@ mod tests {
         );
 
         // More output arrived after the count ahead: it must not stand in.
-        let grown = ahead.fill(&est, 0, 0, Some("Hello world, and then some more"));
+        let grown = ahead.fill(&est, 0, 0, Some("Hello world, and then some more"), 0);
         let fresh = fill_missing(&est, 0, 0, Some("Hello world, and then some more"));
         assert_eq!(grown.completion_tokens, fresh.completion_tokens);
         assert_ne!(grown.completion_tokens, same.completion_tokens);
 
         // A counter the upstream reported after the count ahead stands.
-        let reported = ahead.fill(&est, 0, 7, Some("Hello world"));
+        let reported = ahead.fill(&est, 0, 7, Some("Hello world"), 0);
         assert_eq!(reported.completion_tokens, 7);
+
+        // Output replaced by other text of the same length.
+        let replaced = ahead.fill(&est, 0, 0, Some("1 2 3 4 5 6"), 1);
+        let fresh = fill_missing(&est, 0, 0, Some("1 2 3 4 5 6"));
+        assert_eq!(replaced.completion_tokens, fresh.completion_tokens);
+        assert_ne!(replaced.completion_tokens, same.completion_tokens);
     }
 
     #[test]

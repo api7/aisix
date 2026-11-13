@@ -3373,6 +3373,9 @@ struct SseTextCapture {
     /// response is present, because an upstream can send a mismatching
     /// authoritative aggregate after clean deltas.
     saw_non_terminal_visible: bool,
+    /// Bumped each time a terminal snapshot replaces the text [`Self::text`]
+    /// returns, which can leave its length unchanged.
+    revision: u32,
 }
 
 impl SseTextCapture {
@@ -3383,6 +3386,7 @@ impl SseTextCapture {
             terminal: None,
             terminal_response: None,
             saw_non_terminal_visible: false,
+            revision: 0,
         }
     }
 
@@ -3406,6 +3410,7 @@ impl SseTextCapture {
                     self.terminal_response = (full.len() <= self.cap).then(|| resp.clone());
                     if !full.is_empty() {
                         self.terminal = Some(full);
+                        self.revision += 1;
                     }
                 }
             }
@@ -3493,8 +3498,9 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
             let completion = usage.map_or(0, |u| u.completion_tokens);
             if prompt == 0 || completion == 0 {
                 let text = capture.as_ref().map_or("", SseTextCapture::text);
+                let revision = capture.as_ref().map_or(0, |c| c.revision);
                 self.counted
-                    .count(est, prompt, completion, Some(text))
+                    .count(est, prompt, completion, Some(text), revision)
                     .await;
             }
         }
@@ -3508,6 +3514,7 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
         };
         let hits = std::mem::take(&mut self.hits);
         let mut usage = usage.unwrap_or_default();
+        let revision = capture.as_ref().map_or(0, |c| c.revision);
         let out_text = capture.map(SseTextCapture::into_text).unwrap_or_default();
         if let Some(est) = self.estimator.take() {
             if usage.prompt_tokens == 0 || usage.completion_tokens == 0 {
@@ -3516,6 +3523,7 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
                     usage.prompt_tokens,
                     usage.completion_tokens,
                     Some(&out_text),
+                    revision,
                 );
                 if filled.estimated {
                     usage.prompt_tokens = filled.prompt_tokens;
