@@ -1837,7 +1837,8 @@ async fn anthropic_passthrough_dispatch(
             &upstream_model,
             || crate::util::outbound_value(&body_bytes),
             || anthropic_estimation_output_text(&json_body),
-        );
+        )
+        .await;
 
         // #448 (#22): run output guardrails on the passthrough response.
         // The body is forwarded verbatim, so extract its text (content
@@ -2092,7 +2093,7 @@ impl Upstream {
 /// (AISIX-Cloud#1074): fill token counters the upstream never reported
 /// and mark the metrics estimated. `output_text` is built lazily — only
 /// when estimation actually runs.
-fn fill_missing_anthropic_metrics(
+async fn fill_missing_anthropic_metrics(
     metrics: &mut AnthropicUsageMetrics,
     upstream_model: &str,
     prompt: impl FnOnce() -> Value,
@@ -2105,12 +2106,13 @@ fn fill_missing_anthropic_metrics(
         upstream_model,
         crate::token_estimate::PromptInput::Anthropic(prompt()),
     );
-    let filled = crate::token_estimate::fill_missing(
-        &est,
+    let filled = crate::token_estimate::fill_missing_pooled(
+        est,
         metrics.prompt_tokens,
         metrics.completion_tokens,
-        Some(&output_text()),
-    );
+        Some(output_text()),
+    )
+    .await;
     if filled.estimated {
         metrics.prompt_tokens = filled.prompt_tokens;
         metrics.completion_tokens = filled.completion_tokens;
@@ -2764,7 +2766,8 @@ async fn cross_provider_dispatch(
         &upstream_model,
         || body.clone(),
         || crate::chat::estimation_output_text(&resp),
-    );
+    )
+    .await;
     if metrics.usage_estimated {
         resp.usage.prompt_tokens = metrics.prompt_tokens;
         resp.usage.completion_tokens = metrics.completion_tokens;
@@ -3188,16 +3191,22 @@ fn build_anthropic_sse_stream(
         // it must be the same number the usage record gets. The guard keeps
         // its own copy of this fill for the stream a consumer abandoned
         // before EOF, where no closing pair is emitted at all.
-        if let Some(est) = guard.estimator.take() {
+        //
+        // The count runs on the estimation pool. The guard keeps its
+        // estimator until the count is back, so a consumer that leaves
+        // while it runs still gets its record filled by the guard.
+        if let Some(est) = guard.estimator.clone() {
             let filled = {
                 let comp = guard.comp();
-                crate::token_estimate::fill_missing(
-                    &est,
+                crate::token_estimate::fill_missing_pooled(
+                    est,
                     comp.prompt_tokens,
                     comp.completion_tokens,
-                    Some(comp.est_output_text.as_str()),
+                    Some(comp.est_output_text.clone()),
                 )
-            };
+            }
+            .await;
+            guard.estimator = None;
             if filled.estimated {
                 let comp = guard.comp();
                 comp.prompt_tokens = filled.prompt_tokens;
@@ -3366,14 +3375,14 @@ impl crate::attempt::RecordsStreamRefusal for AnthropicStreamCompletion {
     }
 }
 
-struct CompleteAnthropicStreamOnDrop<F: FnOnce(AnthropicStreamCompletion)> {
+struct CompleteAnthropicStreamOnDrop<F: FnOnce(AnthropicStreamCompletion) + Send + 'static> {
     slot: Option<(F, AnthropicStreamCompletion)>,
     /// Token-estimation fallback (AISIX-Cloud#1074); fills counters the
     /// upstream never reported before `on_complete` runs.
     estimator: Option<crate::token_estimate::Estimator>,
 }
 
-impl<F: FnOnce(AnthropicStreamCompletion)> CompleteAnthropicStreamOnDrop<F> {
+impl<F: FnOnce(AnthropicStreamCompletion) + Send + 'static> CompleteAnthropicStreamOnDrop<F> {
     fn comp(&mut self) -> &mut AnthropicStreamCompletion {
         &mut self
             .slot
@@ -3383,7 +3392,9 @@ impl<F: FnOnce(AnthropicStreamCompletion)> CompleteAnthropicStreamOnDrop<F> {
     }
 }
 
-impl<F: FnOnce(AnthropicStreamCompletion)> Drop for CompleteAnthropicStreamOnDrop<F> {
+impl<F: FnOnce(AnthropicStreamCompletion) + Send + 'static> Drop
+    for CompleteAnthropicStreamOnDrop<F>
+{
     fn drop(&mut self) {
         if let Some((f, mut c)) = self.slot.take() {
             // Token-estimation fallback (AISIX-Cloud#1074): fill the
@@ -3391,20 +3402,27 @@ impl<F: FnOnce(AnthropicStreamCompletion)> Drop for CompleteAnthropicStreamOnDro
             // delivered-count gate (unlike chat.rs / the passthrough
             // guard), so the estimate covers whatever the bridge produced
             // before the stream ended.
-            if let Some(est) = self.estimator.take() {
-                let filled = crate::token_estimate::fill_missing(
-                    &est,
-                    c.prompt_tokens,
-                    c.completion_tokens,
-                    Some(c.est_output_text.as_str()),
-                );
-                if filled.estimated {
-                    c.prompt_tokens = filled.prompt_tokens;
-                    c.completion_tokens = filled.completion_tokens;
-                    c.usage_estimated = true;
-                }
-            }
-            f(c);
+            let Some(est) = self.estimator.take() else {
+                f(c);
+                return;
+            };
+            let output = std::mem::take(&mut c.est_output_text);
+            let (prompt, completion) = (c.prompt_tokens, c.completion_tokens);
+            crate::token_estimate::fill_missing_then(
+                est,
+                prompt,
+                completion,
+                Some(output),
+                None,
+                move |filled, _| {
+                    if filled.estimated {
+                        c.prompt_tokens = filled.prompt_tokens;
+                        c.completion_tokens = filled.completion_tokens;
+                        c.usage_estimated = true;
+                    }
+                    f(c);
+                },
+            );
         }
     }
 }
@@ -4108,7 +4126,7 @@ fn drain_anthropic_sse_frames(
 /// point). Applies the #419 cost-leak gate: if no byte-chunk reached
 /// the client, the completion-side counters are zeroed (the prompt was
 /// processed upstream regardless, so `prompt_tokens` is kept).
-struct AnthropicStreamGuard<F: FnOnce(AnthropicStreamUsage)> {
+struct AnthropicStreamGuard<F: FnOnce(AnthropicStreamUsage) + Send + 'static> {
     slot: Option<(F, AnthropicStreamUsage)>,
     delivered: Arc<AtomicU32>,
     /// Token-estimation fallback (AISIX-Cloud#1074): fills counters the
@@ -4117,7 +4135,7 @@ struct AnthropicStreamGuard<F: FnOnce(AnthropicStreamUsage)> {
     estimator: Option<crate::token_estimate::Estimator>,
 }
 
-impl<F: FnOnce(AnthropicStreamUsage)> AnthropicStreamGuard<F> {
+impl<F: FnOnce(AnthropicStreamUsage) + Send + 'static> AnthropicStreamGuard<F> {
     fn usage(&mut self) -> &mut AnthropicStreamUsage {
         &mut self
             .slot
@@ -4125,49 +4143,87 @@ impl<F: FnOnce(AnthropicStreamUsage)> AnthropicStreamGuard<F> {
             .expect("AnthropicStreamGuard accessed after take")
             .1
     }
-}
 
-impl<F: FnOnce(AnthropicStreamUsage)> Drop for AnthropicStreamGuard<F> {
-    fn drop(&mut self) {
-        if let Some((f, mut usage)) = self.slot.take() {
-            let delivered = self.delivered.load(Ordering::Relaxed);
-            usage.chunks_delivered = delivered;
-            if delivered == 0 {
-                // No bytes crossed the wire (client aborted before the
-                // first chunk). Don't bill the completion side; keep
-                // prompt_tokens per the "prompts always billed"
-                // industry contract (#419 parity).
-                usage.completion_tokens = 0;
-                usage.cache_creation_tokens = 0;
-                usage.cache_creation_ttl = aisix_gateway::CacheCreationTtl::NONE;
-                usage.cache_read_tokens = 0;
-            }
-            // Token-estimation fallback (AISIX-Cloud#1074), after the #419
-            // gate. A floor-only completion count (message_start placeholder,
-            // no message_delta) is treated as missing so an aborted stream
-            // estimates from the delivered text; max() keeps the floor when
-            // the estimate has nothing to add.
-            if let Some(est) = self.estimator.take() {
-                let upstream_completion = if usage.output_tokens_from_delta {
+    /// The stream's normal end, which can wait for the estimation pool
+    /// (see `chat::CompleteOnDrop::finish`).
+    async fn finish(&mut self) {
+        let delivered = self.delivered.load(Ordering::Relaxed);
+        let needs_estimate = match (&self.estimator, &self.slot) {
+            (Some(_), Some((_, usage))) => crate::token_estimate::needs_counting(
+                usage.prompt_tokens,
+                if delivered > 0 && usage.output_tokens_from_delta {
                     usage.completion_tokens
                 } else {
                     0
-                };
-                let output = (delivered > 0).then_some(usage.est_output_text.as_str());
-                let filled = crate::token_estimate::fill_missing(
-                    &est,
-                    usage.prompt_tokens,
-                    upstream_completion,
-                    output,
-                );
+                },
+                delivered > 0,
+            ),
+            _ => false,
+        };
+        let slot = if needs_estimate {
+            Some(crate::estimate_pool::reserve().await)
+        } else {
+            None
+        };
+        if let Some(done) = self.complete(slot) {
+            let _ = done.await;
+        }
+    }
+
+    fn complete(
+        &mut self,
+        pool_slot: Option<crate::estimate_pool::Slot>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let (f, mut usage) = self.slot.take()?;
+        let delivered = self.delivered.load(Ordering::Relaxed);
+        usage.chunks_delivered = delivered;
+        if delivered == 0 {
+            // No bytes crossed the wire (client aborted before the
+            // first chunk). Don't bill the completion side; keep
+            // prompt_tokens per the "prompts always billed"
+            // industry contract (#419 parity).
+            usage.completion_tokens = 0;
+            usage.cache_creation_tokens = 0;
+            usage.cache_creation_ttl = aisix_gateway::CacheCreationTtl::NONE;
+            usage.cache_read_tokens = 0;
+        }
+        // Token-estimation fallback (AISIX-Cloud#1074), after the #419
+        // gate. A floor-only completion count (message_start placeholder,
+        // no message_delta) is treated as missing so an aborted stream
+        // estimates from the delivered text; max() keeps the floor when
+        // the estimate has nothing to add.
+        let Some(est) = self.estimator.take() else {
+            f(usage);
+            return None;
+        };
+        let upstream_completion = if usage.output_tokens_from_delta {
+            usage.completion_tokens
+        } else {
+            0
+        };
+        let output = (delivered > 0).then(|| std::mem::take(&mut usage.est_output_text));
+        let prompt = usage.prompt_tokens;
+        crate::token_estimate::fill_missing_then(
+            est,
+            prompt,
+            upstream_completion,
+            output,
+            pool_slot,
+            move |filled, _| {
                 if filled.estimated {
                     usage.prompt_tokens = filled.prompt_tokens;
                     usage.completion_tokens = filled.completion_tokens.max(usage.completion_tokens);
                     usage.usage_estimated = true;
                 }
-            }
-            f(usage);
-        }
+                f(usage);
+            },
+        )
+    }
+}
+
+impl<F: FnOnce(AnthropicStreamUsage) + Send + 'static> Drop for AnthropicStreamGuard<F> {
+    fn drop(&mut self) {
+        self.complete(None);
     }
 }
 
@@ -4725,7 +4781,9 @@ where
                 }
             }
         }
-        // guard drops here → on_complete fires (delivery-gated).
+        // on_complete fires (delivery-gated); an early return or a
+        // disconnect leaves it to the guard's Drop.
+        guard.finish().await;
     };
     AnthropicDeliveryCounter {
         // Re-attach the request span: the body is polled after the
@@ -6725,8 +6783,8 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
     /// extraction — zero counters fill from the estimator and flag the
     /// metrics; upstream-reported counters stay untouched. The output
     /// extractor covers text + thinking + tool_use name/input.
-    #[test]
-    fn fill_missing_anthropic_metrics_fills_zeros_only() {
+    #[tokio::test]
+    async fn fill_missing_anthropic_metrics_fills_zeros_only() {
         use super::{
             anthropic_estimation_output_text, fill_missing_anthropic_metrics, AnthropicUsageMetrics,
         };
@@ -6755,7 +6813,8 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
             "relay-claude",
             || body.clone(),
             || anthropic_estimation_output_text(&resp),
-        );
+        )
+        .await;
         assert_eq!(m.prompt_tokens, 8);
         assert!(m.completion_tokens > 0);
         assert!(m.usage_estimated);
@@ -6771,7 +6830,8 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
             "relay-claude",
             || body.clone(),
             || panic!("output extractor must not run when usage is complete"),
-        );
+        )
+        .await;
         assert_eq!((m.prompt_tokens, m.completion_tokens), (11, 7));
         assert!(!m.usage_estimated);
     }

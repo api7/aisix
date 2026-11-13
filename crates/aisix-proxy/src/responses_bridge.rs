@@ -2539,14 +2539,14 @@ impl crate::attempt::RecordsStreamRefusal for ResponsesStreamCompletion {
     }
 }
 
-struct CompleteOnDrop<F: FnOnce(ResponsesStreamCompletion)> {
+struct CompleteOnDrop<F: FnOnce(ResponsesStreamCompletion) + Send + 'static> {
     slot: Option<(F, ResponsesStreamCompletion)>,
     /// Token-estimation fallback (AISIX-Cloud#1074); fills counters the
     /// upstream never reported before `on_complete` runs.
     estimator: Option<crate::token_estimate::Estimator>,
 }
 
-impl<F: FnOnce(ResponsesStreamCompletion)> CompleteOnDrop<F> {
+impl<F: FnOnce(ResponsesStreamCompletion) + Send + 'static> CompleteOnDrop<F> {
     fn comp(&mut self) -> &mut ResponsesStreamCompletion {
         &mut self
             .slot
@@ -2556,26 +2556,33 @@ impl<F: FnOnce(ResponsesStreamCompletion)> CompleteOnDrop<F> {
     }
 }
 
-impl<F: FnOnce(ResponsesStreamCompletion)> Drop for CompleteOnDrop<F> {
+impl<F: FnOnce(ResponsesStreamCompletion) + Send + 'static> Drop for CompleteOnDrop<F> {
     fn drop(&mut self) {
         if let Some((f, mut comp)) = self.slot.take() {
             // Token-estimation fallback (AISIX-Cloud#1074): fill the
             // counters the upstream never reported from the request +
             // the accumulated output text.
-            if let Some(est) = self.estimator.take() {
-                let filled = crate::token_estimate::fill_missing(
-                    &est,
-                    comp.prompt_tokens,
-                    comp.completion_tokens,
-                    Some(comp.est_output_text.as_str()),
-                );
-                if filled.estimated {
-                    comp.prompt_tokens = filled.prompt_tokens;
-                    comp.completion_tokens = filled.completion_tokens;
-                    comp.usage_estimated = true;
-                }
-            }
-            f(comp);
+            let Some(est) = self.estimator.take() else {
+                f(comp);
+                return;
+            };
+            let output = std::mem::take(&mut comp.est_output_text);
+            let (prompt, completion) = (comp.prompt_tokens, comp.completion_tokens);
+            crate::token_estimate::fill_missing_then(
+                est,
+                prompt,
+                completion,
+                Some(output),
+                None,
+                move |filled, _| {
+                    if filled.estimated {
+                        comp.prompt_tokens = filled.prompt_tokens;
+                        comp.completion_tokens = filled.completion_tokens;
+                        comp.usage_estimated = true;
+                    }
+                    f(comp);
+                },
+            );
         }
     }
 }
@@ -2843,16 +2850,22 @@ pub fn build_responses_bridge_stream(
         // to reconcile that with the dashboard. The guard keeps its own copy
         // of this fill for the stream a consumer abandoned before EOF, where
         // no terminal event is emitted at all.
-        if let Some(est) = guard.estimator.take() {
+        //
+        // The count runs on the estimation pool. The guard keeps its
+        // estimator until the count is back, so a consumer that leaves
+        // while it runs still gets its record filled by the guard.
+        if let Some(est) = guard.estimator.clone() {
             let filled = {
                 let comp = guard.comp();
-                crate::token_estimate::fill_missing(
-                    &est,
+                crate::token_estimate::fill_missing_pooled(
+                    est,
                     comp.prompt_tokens,
                     comp.completion_tokens,
-                    Some(comp.est_output_text.as_str()),
+                    Some(comp.est_output_text.clone()),
                 )
-            };
+            }
+            .await;
+            guard.estimator = None;
             if filled.estimated {
                 let comp = guard.comp();
                 comp.prompt_tokens = filled.prompt_tokens;

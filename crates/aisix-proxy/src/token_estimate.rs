@@ -115,9 +115,13 @@ pub enum PromptInput {
 }
 
 /// Prompt shape + the model name that selects the tokenizer encoding.
+/// Cloning shares the captured request: a stream's terminal fill hands a
+/// clone to the estimation pool while its guard keeps the original, so a
+/// disconnect during the count still leaves the guard able to estimate.
+#[derive(Clone)]
 pub struct Estimator {
     model: String,
-    input: PromptInput,
+    input: std::sync::Arc<PromptInput>,
 }
 
 /// Outcome of [`fill_missing`]: the (possibly filled) token counts and
@@ -132,14 +136,14 @@ impl Estimator {
     pub fn new(model: impl Into<String>, input: PromptInput) -> Self {
         Self {
             model: model.into(),
-            input,
+            input: std::sync::Arc::new(input),
         }
     }
 
     /// Count the prompt side of the captured request.
     pub fn count_prompt(&self) -> u32 {
         let bpe = bpe_for(&self.model);
-        match &self.input {
+        match &*self.input {
             PromptInput::Chat(req) => count_chat_prompt(bpe, req),
             PromptInput::Anthropic(body) => count_anthropic_prompt(bpe, body),
             PromptInput::Responses(body) => count_responses_prompt(bpe, body),
@@ -195,6 +199,73 @@ pub fn fill_missing(
         }
     }
     filled
+}
+
+/// Whether [`fill_missing`] has anything to tokenize for these counters.
+pub fn needs_counting(upstream_prompt: u32, upstream_completion: u32, has_output: bool) -> bool {
+    upstream_prompt == 0 || (upstream_completion == 0 && has_output)
+}
+
+/// [`fill_missing`] on the estimation pool, so the tokenizer never runs on
+/// a request worker. The caller waits; the worker's other connections do
+/// not. Counters that need no counting return without leaving the worker.
+pub async fn fill_missing_pooled(
+    est: Estimator,
+    upstream_prompt: u32,
+    upstream_completion: u32,
+    output_text: Option<String>,
+) -> Filled {
+    if !needs_counting(upstream_prompt, upstream_completion, output_text.is_some()) {
+        return Filled {
+            prompt_tokens: upstream_prompt,
+            completion_tokens: upstream_completion,
+            estimated: false,
+        };
+    }
+    crate::estimate_pool::run(move || {
+        fill_missing(
+            &est,
+            upstream_prompt,
+            upstream_completion,
+            output_text.as_deref(),
+        )
+    })
+    .await
+}
+
+/// [`fill_missing`] for a guard that ends a request and emits its usage
+/// record: `then` gets the counts, and the output text back, exactly once.
+/// Where the count runs is [`crate::estimate_pool::run_then`]'s rule.
+pub fn fill_missing_then(
+    est: Estimator,
+    upstream_prompt: u32,
+    upstream_completion: u32,
+    output_text: Option<String>,
+    slot: Option<crate::estimate_pool::Slot>,
+    then: impl FnOnce(Filled, Option<String>) + Send + 'static,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !needs_counting(upstream_prompt, upstream_completion, output_text.is_some()) {
+        let unchanged = Filled {
+            prompt_tokens: upstream_prompt,
+            completion_tokens: upstream_completion,
+            estimated: false,
+        };
+        then(unchanged, output_text);
+        return None;
+    }
+    crate::estimate_pool::run_then(
+        slot,
+        move || {
+            let filled = fill_missing(
+                &est,
+                upstream_prompt,
+                upstream_completion,
+                output_text.as_deref(),
+            );
+            (filled, output_text)
+        },
+        move |(filled, output_text)| then(filled, output_text),
+    )
 }
 
 fn bpe_for(model: &str) -> &'static CoreBPE {

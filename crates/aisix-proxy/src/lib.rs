@@ -47,6 +47,7 @@ mod embeddings;
 mod ensemble;
 mod error;
 mod error_translate;
+mod estimate_pool;
 #[cfg(test)]
 mod guardrail_blocked_telemetry;
 #[cfg(test)]

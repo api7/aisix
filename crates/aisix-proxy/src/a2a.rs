@@ -423,7 +423,8 @@ async fn dispatch(
                 /* dispatched */ false,
                 Some(&err),
                 None,
-            );
+            )
+            .await;
             let response = err.into_response();
             return response;
         }
@@ -480,7 +481,8 @@ async fn dispatch(
                 /* dispatched */ true,
                 /* refusal */ None,
                 in_band.as_ref(),
-            );
+            )
+            .await;
             axum::Json(response_value).into_response()
         }
         Err(err) => {
@@ -502,7 +504,8 @@ async fn dispatch(
                 /* dispatched */ true,
                 /* refusal */ None,
                 Some(&A2aFailure::of(&err)),
-            );
+            )
+            .await;
             a2a_error_response(rpc_id, status, &err.to_string())
         }
     }
@@ -521,7 +524,7 @@ async fn dispatch(
 /// the caller's slot the moment the response headers went out, letting a key
 /// capped at N run many more than N concurrent streams — #450, on a second
 /// endpoint.
-struct StreamUsageOnDrop {
+struct StreamUsage {
     state: ProxyState,
     auth: AuthenticatedKey,
     request_id: String,
@@ -544,6 +547,26 @@ struct StreamUsageOnDrop {
     _concurrency: aisix_ratelimit::StreamConcurrencyGuard,
 }
 
+/// Holds the [`StreamUsage`] until the stream ends; its Drop emits it.
+struct StreamUsageOnDrop(Option<StreamUsage>);
+
+impl std::ops::Deref for StreamUsageOnDrop {
+    type Target = StreamUsage;
+    fn deref(&self) -> &StreamUsage {
+        self.0
+            .as_ref()
+            .expect("StreamUsageOnDrop accessed after drop")
+    }
+}
+
+impl std::ops::DerefMut for StreamUsageOnDrop {
+    fn deref_mut(&mut self) -> &mut StreamUsage {
+        self.0
+            .as_mut()
+            .expect("StreamUsageOnDrop accessed after drop")
+    }
+}
+
 impl Drop for StreamUsageOnDrop {
     fn drop(&mut self) {
         // A panic is already unwinding; emitting here would at best double-report
@@ -551,31 +574,50 @@ impl Drop for StreamUsageOnDrop {
         if std::thread::panicking() {
             return;
         }
+        let Some(mut usage) = self.0.take() else {
+            return;
+        };
         // A stream the caller abandoned mid-task is recorded as 499, the same
         // outcome the LLM streaming paths record for the same event. Only a
         // still-successful call is downgraded: a stream that already faulted
         // has a truer status than the hang-up that followed it.
-        let status = if self.call.stream.reached_end || self.status != StatusCode::OK.as_u16() {
-            self.status
+        let status = if usage.call.stream.reached_end || usage.status != StatusCode::OK.as_u16() {
+            usage.status
         } else {
             crate::CLIENT_CLOSED_REQUEST
         };
-        // A stream can outlive several config generations, so the
-        // end-of-stream emit reads a FRESH snapshot rather than the one the
-        // request started on (#941).
-        emit_a2a_usage(
-            &self.state,
-            &self.state.snapshot.load(),
-            &self.auth,
-            &self.request_id,
-            &self.agent,
-            &self.call,
-            status,
-            self.started.elapsed(),
-            self.trace.as_ref(),
-            /* dispatched */ true,
-            /* refusal */ None,
-            self.failure.as_ref(),
+        let elapsed = usage.started.elapsed();
+        // The words are counted on the estimation pool; the request text
+        // goes there and comes back for content capture.
+        let request = std::mem::take(&mut usage.call.text.request);
+        let response_text = usage.call.text.response.joined();
+        crate::estimate_pool::run_then(
+            None,
+            move || {
+                let counted = count_a2a_words(&request, response_text);
+                (request, counted)
+            },
+            move |(request, counted)| {
+                usage.call.text.request = request;
+                // A stream can outlive several config generations, so the
+                // end-of-stream emit reads a FRESH snapshot rather than the
+                // one the request started on (#941).
+                emit_a2a_usage_counted(
+                    &usage.state,
+                    &usage.state.snapshot.load(),
+                    &usage.auth,
+                    &usage.request_id,
+                    &usage.agent,
+                    &usage.call,
+                    status,
+                    elapsed,
+                    usage.trace.as_ref(),
+                    /* dispatched */ true,
+                    /* refusal */ None,
+                    usage.failure.as_ref(),
+                    counted,
+                );
+            },
         );
     }
 }
@@ -629,12 +671,13 @@ async fn dispatch_stream(
                 /* dispatched */ true,
                 /* refusal */ None,
                 Some(&A2aFailure::of(&err)),
-            );
+            )
+            .await;
             return a2a_error_response(rpc_id, status, &err.to_string());
         }
     };
 
-    let mut guard = StreamUsageOnDrop {
+    let mut guard = StreamUsageOnDrop(Some(StreamUsage {
         state: state.clone(),
         auth,
         request_id: request_id.to_string(),
@@ -645,7 +688,7 @@ async fn dispatch_stream(
         failure: None,
         trace,
         _concurrency: reservation.into_stream_hold(),
-    };
+    }));
     let agent_label = agent.to_string();
 
     // Re-attach the request span: the body is polled after the request-id
@@ -1021,7 +1064,8 @@ async fn guardrail_block_response(
         // This IS the guardrail refusal.
         Some(&refusal),
         None,
-    );
+    )
+    .await;
     Some(response)
 }
 
@@ -1058,7 +1102,65 @@ fn a2a_error_envelope(id: Option<serde_json::Value>, message: &str) -> serde_jso
 /// families ride here too: a path that accounts for a call cannot skip
 /// metering it.
 #[allow(clippy::too_many_arguments)]
-fn emit_a2a_usage(
+async fn emit_a2a_usage(
+    state: &ProxyState,
+    snap: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    request_id: &str,
+    agent: &str,
+    call: &A2aCall,
+    status_code: u16,
+    latency: Duration,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    dispatched: bool,
+    refusal: Option<&crate::error::ProxyError>,
+    failure: Option<&A2aFailure>,
+) {
+    let counted = count_a2a_call(call).await;
+    emit_a2a_usage_counted(
+        state,
+        snap,
+        auth,
+        request_id,
+        agent,
+        call,
+        status_code,
+        latency,
+        trace,
+        dispatched,
+        refusal,
+        failure,
+        counted,
+    );
+}
+
+/// The gateway's count of the words on one A2A call, with the agent's
+/// joined text it was taken from (content capture reads it too).
+struct A2aCounted {
+    response_text: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+}
+
+/// Count `call`'s words on the estimation pool, off the request worker.
+async fn count_a2a_call(call: &A2aCall) -> A2aCounted {
+    let request = call.text.request.clone();
+    let response_text = call.text.response.joined();
+    crate::estimate_pool::run(move || count_a2a_words(&request, response_text)).await
+}
+
+fn count_a2a_words(request: &str, response_text: String) -> A2aCounted {
+    // No model resolves on this endpoint, so the estimator falls back to its
+    // default encoding — the same thing it does for any non-OpenAI model.
+    A2aCounted {
+        prompt_tokens: crate::token_estimate::count_text("", request),
+        completion_tokens: crate::token_estimate::count_text("", &response_text),
+        response_text,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_a2a_usage_counted(
     state: &ProxyState,
     // The request's snapshot, loaded once by the caller (#941).
     snap: &aisix_core::AisixSnapshot,
@@ -1080,13 +1182,14 @@ fn emit_a2a_usage(
     refusal: Option<&crate::error::ProxyError>,
     // The upstream agent's failure, for a call that reached it.
     failure: Option<&A2aFailure>,
+    counted: A2aCounted,
 ) {
     let guardrail_blocked = refusal.is_some_and(crate::error::ProxyError::is_guardrail_block);
-    // No model resolves on this endpoint, so the estimator falls back to its
-    // default encoding — the same thing it does for any non-OpenAI model.
-    let response_text = call.text.response.joined();
-    let prompt_tokens = crate::token_estimate::count_text("", &call.text.request);
-    let completion_tokens = crate::token_estimate::count_text("", &response_text);
+    let A2aCounted {
+        response_text,
+        prompt_tokens,
+        completion_tokens,
+    } = counted;
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: aisix_obs::UsageEvent::occurred_at_now(),

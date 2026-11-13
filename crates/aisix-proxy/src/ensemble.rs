@@ -260,7 +260,8 @@ impl ModelCaller for ProxyModelCaller<'_> {
             model.upstream_model().unwrap_or(target),
             &response.usage,
             &crate::chat::estimation_output_text(&response),
-        );
+        )
+        .await;
         reservation
             .commit_tokens(u64::from(effective.usage.total_tokens))
             .await;

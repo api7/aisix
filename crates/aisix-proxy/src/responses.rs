@@ -1760,12 +1760,13 @@ async fn responses_to_target(
                         &body_bytes,
                     )),
                 );
-                let filled = crate::token_estimate::fill_missing(
-                    &est,
+                let filled = crate::token_estimate::fill_missing_pooled(
+                    est,
                     usage.prompt_tokens,
                     usage.completion_tokens,
-                    Some(&responses_sse_output_text(&buf)),
-                );
+                    Some(responses_sse_output_text(&buf)),
+                )
+                .await;
                 if filled.estimated {
                     usage.prompt_tokens = filled.prompt_tokens;
                     usage.completion_tokens = filled.completion_tokens;
@@ -2055,28 +2056,13 @@ async fn responses_to_target(
             eos_scan,
             requested_model.to_string(),
             mark,
-            move |mut usage, out_text, output_hits| {
+            // Token-estimation fallback (AISIX-Cloud#1074): the stream's
+            // guard fills the missing counters BEFORE the TPM accounting and
+            // the emit below.
+            Some(estimator_c),
+            move |usage, out_text, output_hits| {
                 // Streams that reach here are committed 200s — the
                 // `!status.is_success()` guard above returned early on errors.
-                //
-                // Token-estimation fallback (AISIX-Cloud#1074): a stream that
-                // ends without a terminal usage event (client abort, relay
-                // that omits usage) fills the missing counters from the
-                // request + the assembled output text, BEFORE the TPM
-                // accounting and the emit below.
-                if usage.prompt_tokens == 0 || usage.completion_tokens == 0 {
-                    let filled = crate::token_estimate::fill_missing(
-                        &estimator_c,
-                        usage.prompt_tokens,
-                        usage.completion_tokens,
-                        Some(&out_text),
-                    );
-                    if filled.estimated {
-                        usage.prompt_tokens = filled.prompt_tokens;
-                        usage.completion_tokens = filled.completion_tokens;
-                        usage.usage_estimated = true;
-                    }
-                }
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
                 // reservation's async `commit_tokens`, which this closure can't await).
@@ -2230,12 +2216,13 @@ async fn responses_to_target(
                         &body_bytes,
                     )),
                 );
-                let filled = crate::token_estimate::fill_missing(
-                    &est,
+                let filled = crate::token_estimate::fill_missing_pooled(
+                    est,
                     u.prompt_tokens,
                     u.completion_tokens,
-                    Some(&responses_output_text(&json_body)),
-                );
+                    Some(responses_output_text(&json_body)),
+                )
+                .await;
                 if filled.estimated {
                     u.prompt_tokens = filled.prompt_tokens;
                     u.completion_tokens = filled.completion_tokens;
@@ -2821,12 +2808,13 @@ async fn responses_cross_provider_to_target(
                 model.upstream_model().unwrap_or("unknown"),
                 crate::token_estimate::PromptInput::Responses(body.clone()),
             );
-            let filled = crate::token_estimate::fill_missing(
-                &est,
+            let filled = crate::token_estimate::fill_missing_pooled(
+                est,
                 u.prompt_tokens,
                 u.completion_tokens,
-                Some(&crate::chat::estimation_output_text(&resp)),
-            );
+                Some(crate::chat::estimation_output_text(&resp)),
+            )
+            .await;
             if filled.estimated {
                 u.prompt_tokens = filled.prompt_tokens;
                 u.completion_tokens = filled.completion_tokens;
@@ -3466,11 +3454,18 @@ impl SseTextCapture {
 /// end-of-stream scan's monitor observations (AISIX-Cloud#1010) — the Drop
 /// (disconnect) path passes none: the response never completed, so there is
 /// nothing final to observe, matching the chat surface's disconnect behavior.
-struct ResponsesUsageGuard<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> {
+struct ResponsesUsageGuard<
+    F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>) + Send + 'static,
+> {
     slot: Option<(F, Option<ResponseUsage>, Option<SseTextCapture>)>,
+    /// Token-estimation fallback (AISIX-Cloud#1074): a stream that ends
+    /// without a terminal usage event (client abort, relay that omits
+    /// usage) fills the missing counters from the request + the assembled
+    /// output text before `on_complete` runs.
+    estimator: Option<crate::token_estimate::Estimator>,
 }
 
-impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
+impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>) + Send + 'static>
     ResponsesUsageGuard<F>
 {
     fn parts(&mut self) -> (&mut Option<ResponseUsage>, Option<&mut SseTextCapture>) {
@@ -3480,19 +3475,68 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
             .expect("ResponsesUsageGuard accessed after take");
         (&mut slot.1, slot.2.as_mut())
     }
+
+    fn needs_estimate(&self) -> bool {
+        match (&self.estimator, &self.slot) {
+            (Some(_), Some((_, usage, _))) => usage
+                .as_ref()
+                .is_none_or(|u| u.prompt_tokens == 0 || u.completion_tokens == 0),
+            _ => false,
+        }
+    }
+
+    /// The stream's normal end, which can wait for the estimation pool
+    /// (see `chat::CompleteOnDrop::finish`).
+    async fn finish(&mut self, hits: Vec<aisix_core::GuardrailMonitorHit>) {
+        let slot = if self.needs_estimate() {
+            Some(crate::estimate_pool::reserve().await)
+        } else {
+            None
+        };
+        if let Some(done) = self.complete(hits, slot) {
+            let _ = done.await;
+        }
+    }
+
+    fn complete(
+        &mut self,
+        hits: Vec<aisix_core::GuardrailMonitorHit>,
+        pool_slot: Option<crate::estimate_pool::Slot>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let (f, usage, capture) = self.slot.take()?;
+        let mut usage = usage.unwrap_or_default();
+        let out_text = capture.map(SseTextCapture::into_text).unwrap_or_default();
+        let estimator = self.estimator.take();
+        let Some(est) =
+            estimator.filter(|_| usage.prompt_tokens == 0 || usage.completion_tokens == 0)
+        else {
+            f(usage, out_text, hits);
+            return None;
+        };
+        let (prompt, completion) = (usage.prompt_tokens, usage.completion_tokens);
+        crate::token_estimate::fill_missing_then(
+            est,
+            prompt,
+            completion,
+            Some(out_text),
+            pool_slot,
+            move |filled, out_text| {
+                if filled.estimated {
+                    usage.prompt_tokens = filled.prompt_tokens;
+                    usage.completion_tokens = filled.completion_tokens;
+                    usage.usage_estimated = true;
+                }
+                f(usage, out_text.unwrap_or_default(), hits);
+            },
+        )
+    }
 }
 
-impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> Drop
+impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>) + Send + 'static> Drop
     for ResponsesUsageGuard<F>
 {
     fn drop(&mut self) {
-        if let Some((f, usage, capture)) = self.slot.take() {
-            f(
-                usage.unwrap_or_default(),
-                capture.map(SseTextCapture::into_text).unwrap_or_default(),
-                Vec::new(),
-            );
-        }
+        self.complete(Vec::new(), None);
     }
 }
 
@@ -3524,6 +3568,9 @@ fn build_responses_passthrough_stream<S, F>(
     // Context tags applied to the forwarded frames only; the usage and
     // capture parsers read each frame as the upstream sent it.
     mark: crate::responses_affinity::ResponseMark,
+    // Token-estimation fallback context (AISIX-Cloud#1074); see
+    // `ResponsesUsageGuard::estimator`.
+    estimator: Option<crate::token_estimate::Estimator>,
     on_complete: F,
 ) -> impl futures::Stream<Item = reqwest::Result<bytes::Bytes>>
 where
@@ -3561,6 +3608,7 @@ where
                 }),
                 capture_cap.map(SseTextCapture::new),
             )),
+            estimator,
         };
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
@@ -3727,13 +3775,7 @@ where
             }
             None => Vec::new(),
         };
-        if let Some((f, usage, capture)) = guard.slot.take() {
-            f(
-                usage.unwrap_or_default(),
-                capture.map(SseTextCapture::into_text).unwrap_or_default(),
-                hits,
-            );
-        }
+        guard.finish(hits).await;
     })
 }
 

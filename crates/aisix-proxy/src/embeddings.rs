@@ -705,19 +705,30 @@ async fn dispatch(
             // reports nothing at all does the local estimator count the
             // request `input`. Telemetry only — the response body is
             // forwarded untouched.
-            let (prompt_tokens, usage_estimated) =
-                if let Some(reported) = reported_prompt_tokens(&embed_resp.usage) {
-                    (reported, false)
-                } else {
-                    let upstream_model = model.upstream_model().unwrap_or("unknown");
-                    let estimated = match &req.token_input {
-                        Some(tokens) => token_id_count(tokens),
-                        None => req.input.iter().fold(0u32, |acc, s| {
-                            acc.saturating_add(crate::token_estimate::count_text(upstream_model, s))
-                        }),
-                    };
-                    (estimated, estimated > 0)
+            let (prompt_tokens, usage_estimated) = if let Some(reported) =
+                reported_prompt_tokens(&embed_resp.usage)
+            {
+                (reported, false)
+            } else {
+                let estimated = match &req.token_input {
+                    Some(tokens) => token_id_count(tokens),
+                    None => {
+                        // Counted on the estimation pool, off the request worker.
+                        let upstream_model = model.upstream_model().unwrap_or("unknown").to_owned();
+                        let input = req.input.clone();
+                        crate::estimate_pool::run(move || {
+                            input.iter().fold(0u32, |acc, s| {
+                                acc.saturating_add(crate::token_estimate::count_text(
+                                    &upstream_model,
+                                    s,
+                                ))
+                            })
+                        })
+                        .await
+                    }
                 };
+                (estimated, estimated > 0)
+            };
             // Commit the reservation — release the concurrency permit
             // and finalise RPM. Embeddings do report prompt_tokens via
             // EmbeddingResponse.usage; thread it through so TPM works
