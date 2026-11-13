@@ -1225,7 +1225,7 @@ fn apply_estimated_usage(
 /// under the #794 or-semantics: a non-zero upstream value always wins,
 /// estimation fills only zeros. One helper so every sub-call emit site
 /// (non-streaming panel + judge, streaming panel) can't drift apart.
-async fn estimate_subcall_tokens(
+fn estimate_subcall_tokens(
     req: impl FnOnce() -> ChatFormat,
     model: &str,
     usage: &aisix_gateway::chat::UsageStats,
@@ -1238,13 +1238,12 @@ async fn estimate_subcall_tokens(
         model,
         crate::token_estimate::PromptInput::Chat(Box::new(req())),
     );
-    let filled = crate::token_estimate::fill_missing_pooled(
-        est,
+    let filled = crate::token_estimate::fill_missing(
+        &est,
         usage.prompt_tokens,
         usage.completion_tokens,
-        Some(output_text.to_owned()),
-    )
-    .await;
+        Some(output_text),
+    );
     (
         filled.prompt_tokens,
         filled.completion_tokens,
@@ -1280,14 +1279,14 @@ pub(crate) struct EffectiveSubcallUsage {
 /// between its UsageEvent, request-level Prometheus aggregate, and quota
 /// commit. The client-facing response still carries only upstream-reported
 /// usage; local estimates remain telemetry-only.
-pub(crate) async fn effective_subcall_usage(
+pub(crate) fn effective_subcall_usage(
     req: impl FnOnce() -> ChatFormat,
     model: &str,
     reported: &aisix_gateway::chat::UsageStats,
     output_text: &str,
 ) -> EffectiveSubcallUsage {
     let (prompt_tokens, completion_tokens, estimated) =
-        estimate_subcall_tokens(req, model, reported, output_text).await;
+        estimate_subcall_tokens(req, model, reported, output_text);
     let mut usage = reported.clone();
     usage.prompt_tokens = prompt_tokens;
     usage.completion_tokens = completion_tokens;
@@ -7627,16 +7626,15 @@ mod complete_on_drop_tests {
     /// usage block — prompt from the sub-call's request (one user "Hello"
     /// = 8 in the cl100k fallback), completion from its answer text
     /// ("Hello world" = 2) — and flags it.
-    #[tokio::test]
-    async fn estimate_subcall_fills_missing_usage() {
+    #[test]
+    fn estimate_subcall_fills_missing_usage() {
         let usage = aisix_gateway::chat::UsageStats::default();
         let (prompt, completion, estimated) = estimate_subcall_tokens(
             || subcall_req("Hello"),
             "relay-model",
             &usage,
             "Hello world",
-        )
-        .await;
+        );
         assert_eq!(prompt, 8);
         assert_eq!(completion, 2);
         assert!(estimated);
@@ -7644,8 +7642,8 @@ mod complete_on_drop_tests {
 
     /// #796: a sub-call whose backend DID report usage is returned
     /// verbatim and unflagged — the answer text is ignored.
-    #[tokio::test]
-    async fn estimate_subcall_preserves_reported_usage() {
+    #[test]
+    fn estimate_subcall_preserves_reported_usage() {
         let usage = aisix_gateway::chat::UsageStats {
             prompt_tokens: 17,
             completion_tokens: 23,
@@ -7657,8 +7655,7 @@ mod complete_on_drop_tests {
             "relay-model",
             &usage,
             "Hello world",
-        )
-        .await;
+        );
         assert_eq!(prompt, 17);
         assert_eq!(completion, 23);
         assert!(!estimated);
@@ -7666,8 +7663,8 @@ mod complete_on_drop_tests {
 
     /// #796: per-field or-semantics — a reported prompt is kept while a
     /// missing completion is estimated (and the record is flagged).
-    #[tokio::test]
-    async fn estimate_subcall_fills_only_missing_side() {
+    #[test]
+    fn estimate_subcall_fills_only_missing_side() {
         let usage = aisix_gateway::chat::UsageStats {
             prompt_tokens: 17,
             completion_tokens: 0,
@@ -7679,15 +7676,14 @@ mod complete_on_drop_tests {
             "relay-model",
             &usage,
             "Hello world",
-        )
-        .await;
+        );
         assert_eq!(prompt, 17, "reported prompt preserved");
         assert_eq!(completion, 2, "missing completion estimated");
         assert!(estimated);
     }
 
-    #[tokio::test]
-    async fn effective_subcall_usage_is_cache_inclusive_and_preserves_overhead() {
+    #[test]
+    fn effective_subcall_usage_is_cache_inclusive_and_preserves_overhead() {
         let reported = aisix_gateway::chat::UsageStats {
             prompt_tokens: 7,
             completion_tokens: 11,
@@ -7699,8 +7695,7 @@ mod complete_on_drop_tests {
             ..Default::default()
         };
         let effective =
-            effective_subcall_usage(|| subcall_req("Hello"), "relay-model", &reported, "reply")
-                .await;
+            effective_subcall_usage(|| subcall_req("Hello"), "relay-model", &reported, "reply");
         assert_eq!(effective.usage.total_tokens, 26);
         assert!(!effective.estimated);
 

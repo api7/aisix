@@ -282,6 +282,18 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     return { input, output };
   }
 
+  /** The caller key authenticating implies every resource seeded before
+   * it is in the gateway's snapshot (see tests/e2e/AGENTS.md). */
+  async function waitCallerKey(): Promise<void> {
+    await waitConfigPropagation(async () => {
+      const r = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${CALLER_PLAINTEXT}` },
+      });
+      await r.text();
+      return r.status === 200;
+    });
+  }
+
   /** True when an SLS record for `requestedModel` carries the
    * `usage_estimated` flag. The flattened log serializes fields in
    * struct order (requested_model before usage_estimated, which is
@@ -565,11 +577,7 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
         },
         body: JSON.stringify({ model: "est-completions", prompt: "hi" }),
       });
-    await waitConfigPropagation(async () => {
-      const r = await call();
-      await r.text();
-      return r.status === 200;
-    });
+    await waitCallerKey();
 
     const res = await call();
     expect(res.status).toBe(200);
@@ -578,7 +586,7 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     const log = await waitForSlsLog(
       sls!,
       META_LOGSTORE,
-      (l) => l.get("requested_model") === "est-completions" && l.get("status_code") === "200",
+      (l) => l.get("requested_model") === "est-completions",
       "an est-completions usage record",
     );
     expect(log.get("usage_estimated")).toBe("true");
@@ -602,11 +610,7 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
         },
         body: JSON.stringify({ model: "est-embeddings", input: "hi" }),
       });
-    await waitConfigPropagation(async () => {
-      const r = await call();
-      await r.text();
-      return r.status === 200;
-    });
+    await waitCallerKey();
 
     const res = await call();
     expect(res.status).toBe(200);
@@ -615,7 +619,7 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     const log = await waitForSlsLog(
       sls!,
       META_LOGSTORE,
-      (l) => l.get("requested_model") === "est-embeddings" && l.get("status_code") === "200",
+      (l) => l.get("requested_model") === "est-embeddings",
       "an est-embeddings usage record",
     );
     expect(log.get("usage_estimated")).toBe("true");

@@ -3467,6 +3467,9 @@ struct ResponsesUsageGuard<F: FnOnce(ResponseUsage, String, Vec<aisix_core::Guar
     /// output text before `on_complete` runs.
     estimator: Option<crate::token_estimate::Estimator>,
     counted: crate::token_estimate::CountedAhead,
+    /// The end-of-stream scan's monitor hits, kept here once the scan is
+    /// done so a disconnect during the count after it still reports them.
+    hits: Vec<aisix_core::GuardrailMonitorHit>,
 }
 
 impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
@@ -3499,10 +3502,11 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
 
     /// Complete the stream once, from the count ahead when it still fits
     /// and otherwise counting inline (Drop cannot wait).
-    fn complete(&mut self, hits: Vec<aisix_core::GuardrailMonitorHit>) {
+    fn complete(&mut self) {
         let Some((f, usage, capture)) = self.slot.take() else {
             return;
         };
+        let hits = std::mem::take(&mut self.hits);
         let mut usage = usage.unwrap_or_default();
         let out_text = capture.map(SseTextCapture::into_text).unwrap_or_default();
         if let Some(est) = self.estimator.take() {
@@ -3542,7 +3546,7 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> Dro
     for ResponsesUsageGuard<F>
 {
     fn drop(&mut self) {
-        self.complete(Vec::new());
+        self.complete();
     }
 }
 
@@ -3616,6 +3620,7 @@ where
             )),
             estimator,
             counted: Default::default(),
+            hits: Vec::new(),
         };
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
@@ -3785,8 +3790,9 @@ where
             }
             None => Vec::new(),
         };
+        guard.hits = hits;
         guard.count_ahead().await;
-        guard.complete(hits);
+        guard.complete();
     })
 }
 

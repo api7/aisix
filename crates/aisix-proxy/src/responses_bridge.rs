@@ -2835,6 +2835,12 @@ pub fn build_responses_bridge_stream(
             ));
             return;
         }
+        // A terminal event the encoder already sent live ended the response;
+        // record that before the count below, which a client closing on that
+        // event can cut short.
+        if encoder.is_finished() && !buffering {
+            guard.comp().reached_end = true;
+        }
         // Token-estimation fallback (AISIX-Cloud#1074), run HERE rather than
         // from the Drop guard below: the terminal `response.completed` this
         // relay is about to synthesize carries the client-visible usage, and
