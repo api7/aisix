@@ -17,10 +17,11 @@
 //!
 //! A stream guard's `Drop` cannot wait, and its usage emit has to happen
 //! inside that `Drop` (the request's attribution cell decides what the
-//! cancel guard and the access log write from it), so a stream the client
-//! abandons still estimates inline on its worker. Every path that can
-//! wait — a buffered response, a bridge's terminal event, a stream's
-//! normal end — comes here.
+//! cancel guard and the access log write from it). So a stream counts its
+//! estimate here before it releases its terminal frame
+//! (`token_estimate::CountedAhead`), and a client that closes on that frame
+//! leaves `Drop` a finished count; only a stream abandoned before its end
+//! still estimates inline on its worker.
 
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
@@ -33,7 +34,7 @@ type Job = Box<dyn FnOnce() + Send>;
 
 struct Pool {
     slots: Arc<Semaphore>,
-    jobs: Mutex<mpsc::Sender<Job>>,
+    jobs: mpsc::Sender<Job>,
 }
 
 /// `None` when not a single pool thread could be started (a pids cgroup
@@ -56,7 +57,7 @@ fn pool() -> Option<&'static Pool> {
             .count();
         (started > 0).then(|| Pool {
             slots: Arc::new(Semaphore::new(started * SLOTS_PER_THREAD)),
-            jobs: Mutex::new(tx),
+            jobs: tx,
         })
     })
     .as_ref()
@@ -94,11 +95,7 @@ pub(crate) async fn run<R: Send + 'static>(job: impl FnOnce() -> R + Send + 'sta
         let _ = tx.send(job());
         drop(permit);
     });
-    let sent = match pool.jobs.lock() {
-        Ok(jobs) => jobs.send(task),
-        Err(poisoned) => poisoned.into_inner().send(task),
-    };
-    if let Err(mpsc::SendError(task)) = sent {
+    if let Err(mpsc::SendError(task)) = pool.jobs.send(task) {
         task();
     }
     rx.await

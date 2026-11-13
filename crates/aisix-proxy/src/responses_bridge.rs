@@ -2847,7 +2847,11 @@ pub fn build_responses_bridge_stream(
         // The count runs on the estimation pool. The guard keeps its
         // estimator until the count is back, so a consumer that leaves
         // while it runs still gets its record filled by the guard.
-        if let Some(est) = guard.estimator.clone() {
+        let to_count = guard.estimator.clone().filter(|_| {
+            let comp = guard.comp();
+            crate::token_estimate::needs_counting(comp.prompt_tokens, comp.completion_tokens, true)
+        });
+        if let Some(est) = to_count {
             let filled = {
                 let comp = guard.comp();
                 crate::token_estimate::fill_missing_pooled(

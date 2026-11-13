@@ -3466,6 +3466,7 @@ struct ResponsesUsageGuard<F: FnOnce(ResponseUsage, String, Vec<aisix_core::Guar
     /// usage) fills the missing counters from the request + the assembled
     /// output text before `on_complete` runs.
     estimator: Option<crate::token_estimate::Estimator>,
+    counted: crate::token_estimate::CountedAhead,
 }
 
 impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
@@ -3479,42 +3480,26 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
         (&mut slot.1, slot.2.as_mut())
     }
 
-    /// The stream's normal end: the estimate runs on the estimation pool
-    /// (see `chat::CompleteOnDrop::finish`).
-    async fn finish(&mut self, hits: Vec<aisix_core::GuardrailMonitorHit>) {
-        let counted = match (&self.estimator, &self.slot) {
-            (Some(est), Some((_, usage, capture))) => {
-                let usage = usage.as_ref();
-                let prompt = usage.map_or(0, |u| u.prompt_tokens);
-                let completion = usage.map_or(0, |u| u.completion_tokens);
-                if prompt == 0 || completion == 0 {
-                    let text = capture.as_ref().map_or("", SseTextCapture::text);
-                    Some(
-                        crate::token_estimate::fill_missing_pooled(
-                            est.clone(),
-                            prompt,
-                            completion,
-                            Some(text.to_owned()),
-                        )
-                        .await,
-                    )
-                } else {
-                    None
-                }
+    /// Count the estimate ahead on the estimation pool (see
+    /// [`crate::token_estimate::CountedAhead`]), from the same inputs
+    /// [`Self::complete`] will count.
+    async fn count_ahead(&mut self) {
+        if let (Some(est), Some((_, usage, capture))) = (&self.estimator, &self.slot) {
+            let usage = usage.as_ref();
+            let prompt = usage.map_or(0, |u| u.prompt_tokens);
+            let completion = usage.map_or(0, |u| u.completion_tokens);
+            if prompt == 0 || completion == 0 {
+                let text = capture.as_ref().map_or("", SseTextCapture::text);
+                self.counted
+                    .count(est, prompt, completion, Some(text))
+                    .await;
             }
-            _ => None,
-        };
-        self.complete(hits, counted);
+        }
     }
 
-    /// Complete the stream once. `counted` is the estimate [`Self::finish`]
-    /// already took off the worker; without it (Drop) the estimate runs
-    /// here.
-    fn complete(
-        &mut self,
-        hits: Vec<aisix_core::GuardrailMonitorHit>,
-        counted: Option<crate::token_estimate::Filled>,
-    ) {
+    /// Complete the stream once, from the count ahead when it still fits
+    /// and otherwise counting inline (Drop cannot wait).
+    fn complete(&mut self, hits: Vec<aisix_core::GuardrailMonitorHit>) {
         let Some((f, usage, capture)) = self.slot.take() else {
             return;
         };
@@ -3522,14 +3507,12 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
         let out_text = capture.map(SseTextCapture::into_text).unwrap_or_default();
         if let Some(est) = self.estimator.take() {
             if usage.prompt_tokens == 0 || usage.completion_tokens == 0 {
-                let filled = counted.unwrap_or_else(|| {
-                    crate::token_estimate::fill_missing(
-                        &est,
-                        usage.prompt_tokens,
-                        usage.completion_tokens,
-                        Some(&out_text),
-                    )
-                });
+                let filled = self.counted.fill(
+                    &est,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    Some(&out_text),
+                );
                 if filled.estimated {
                     usage.prompt_tokens = filled.prompt_tokens;
                     usage.completion_tokens = filled.completion_tokens;
@@ -3541,11 +3524,25 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
     }
 }
 
+/// Whether forwarded SSE bytes carry the stream's terminal response event.
+/// A text delta that merely mentions one only triggers an early count
+/// ahead, which [`crate::token_estimate::CountedAhead`] redoes if the
+/// inputs move.
+fn carries_terminal_response(frames: &[u8]) -> bool {
+    [
+        &b"response.completed"[..],
+        b"response.incomplete",
+        b"response.failed",
+    ]
+    .iter()
+    .any(|needle| frames.windows(needle.len()).any(|w| w == *needle))
+}
+
 impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> Drop
     for ResponsesUsageGuard<F>
 {
     fn drop(&mut self) {
-        self.complete(Vec::new(), None);
+        self.complete(Vec::new());
     }
 }
 
@@ -3618,6 +3615,7 @@ where
                 capture_cap.map(SseTextCapture::new),
             )),
             estimator,
+            counted: Default::default(),
         };
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
@@ -3677,6 +3675,9 @@ where
                 if acc.downstream_latency_ms == 0 {
                     acc.downstream_latency_ms =
                         crate::attempt::measured_ms(started.elapsed());
+                }
+                if carries_terminal_response(&forward) {
+                    guard.count_ahead().await;
                 }
                 yield Ok(bytes::Bytes::from(forward));
                 continue;
@@ -3784,7 +3785,8 @@ where
             }
             None => Vec::new(),
         };
-        guard.finish(hits).await;
+        guard.count_ahead().await;
+        guard.complete(hits);
     })
 }
 

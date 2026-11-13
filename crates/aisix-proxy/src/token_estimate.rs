@@ -126,6 +126,7 @@ pub struct Estimator {
 
 /// Outcome of [`fill_missing`]: the (possibly filled) token counts and
 /// whether estimation supplied any non-zero component.
+#[derive(Clone, Copy)]
 pub struct Filled {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -231,6 +232,65 @@ pub async fn fill_missing_pooled(
         )
     })
     .await
+}
+
+/// A stream's estimate, counted on the estimation pool before the stream
+/// releases its terminal frame. A client that closes as soon as it reads
+/// that frame drops the stream there, and the guard's Drop — which must
+/// emit in place and cannot wait — then takes this count instead of
+/// tokenizing on the request worker. It answers only for the inputs it
+/// was counted from (output text only grows, so its length identifies
+/// it); for anything else the guard counts inline as before.
+#[derive(Default)]
+pub struct CountedAhead(Option<(u32, u32, Option<usize>, Filled)>);
+
+impl CountedAhead {
+    pub async fn count(
+        &mut self,
+        est: &Estimator,
+        upstream_prompt: u32,
+        upstream_completion: u32,
+        output_text: Option<&str>,
+    ) {
+        let key = (
+            upstream_prompt,
+            upstream_completion,
+            output_text.map(str::len),
+        );
+        if !needs_counting(upstream_prompt, upstream_completion, output_text.is_some())
+            || self.0.is_some_and(|(p, c, len, _)| (p, c, len) == key)
+        {
+            return;
+        }
+        let filled = fill_missing_pooled(
+            est.clone(),
+            upstream_prompt,
+            upstream_completion,
+            output_text.map(str::to_owned),
+        )
+        .await;
+        self.0 = Some((key.0, key.1, key.2, filled));
+    }
+
+    /// [`fill_missing`], taken from the count ahead when it was counted
+    /// from these same inputs.
+    pub fn fill(
+        &self,
+        est: &Estimator,
+        upstream_prompt: u32,
+        upstream_completion: u32,
+        output_text: Option<&str>,
+    ) -> Filled {
+        let key = (
+            upstream_prompt,
+            upstream_completion,
+            output_text.map(str::len),
+        );
+        match self.0 {
+            Some((p, c, len, filled)) if (p, c, len) == key => filled,
+            _ => fill_missing(est, upstream_prompt, upstream_completion, output_text),
+        }
+    }
 }
 
 fn bpe_for(model: &str) -> &'static CoreBPE {
@@ -1044,6 +1104,37 @@ mod tests {
             tool_call_id: None,
             extra: serde_json::Map::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_count_ahead_answers_only_for_the_inputs_it_was_counted_from() {
+        let est = chat_est(
+            "relay-model",
+            ChatFormat::new("relay-model", vec![msg(Role::User, "hi")]),
+        );
+        let mut ahead = CountedAhead::default();
+        ahead.count(&est, 0, 0, Some("Hello world")).await;
+
+        let same = ahead.fill(&est, 0, 0, Some("Hello world"));
+        let inline = fill_missing(&est, 0, 0, Some("Hello world"));
+        assert_eq!(
+            (same.prompt_tokens, same.completion_tokens, same.estimated),
+            (
+                inline.prompt_tokens,
+                inline.completion_tokens,
+                inline.estimated
+            ),
+        );
+
+        // More output arrived after the count ahead: it must not stand in.
+        let grown = ahead.fill(&est, 0, 0, Some("Hello world, and then some more"));
+        let fresh = fill_missing(&est, 0, 0, Some("Hello world, and then some more"));
+        assert_eq!(grown.completion_tokens, fresh.completion_tokens);
+        assert_ne!(grown.completion_tokens, same.completion_tokens);
+
+        // A counter the upstream reported after the count ahead stands.
+        let reported = ahead.fill(&est, 0, 7, Some("Hello world"));
+        assert_eq!(reported.completion_tokens, 7);
     }
 
     #[test]

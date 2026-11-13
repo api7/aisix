@@ -5822,6 +5822,7 @@ struct CompleteOnDrop<F: FnOnce(StreamCompletion)> {
     /// counters from this estimator (prompt from the captured request,
     /// completion from `est_output_text`) and sets `usage_estimated`.
     estimator: Option<crate::token_estimate::Estimator>,
+    counted: crate::token_estimate::CountedAhead,
 }
 
 impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
@@ -5833,40 +5834,35 @@ impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
             .1
     }
 
-    /// The stream's normal end, which can wait: a stream that leaves
-    /// counters to estimate counts them on the estimation pool instead of
-    /// on the request worker, then completes here. The guard stays armed
-    /// while the count runs, so a disconnect meanwhile still completes it
-    /// from Drop.
-    async fn finish(&mut self) {
+    /// Count the estimate ahead on the estimation pool (see
+    /// [`crate::token_estimate::CountedAhead`]), from the same inputs
+    /// [`Self::complete`] will count. Called before the terminal `[DONE]`
+    /// is released and again at the stream's end.
+    /// `frame_next` says a frame is about to be released, so it counts as
+    /// delivered.
+    async fn count_ahead(&mut self, frame_next: bool) {
         let delivered = self.delivered.load(Ordering::Relaxed);
-        let counted = match (&self.estimator, &self.slot) {
-            (Some(est), Some((_, c))) => {
-                let completion = if delivered == 0 {
-                    0
-                } else {
-                    c.completion_tokens
-                };
-                let output = (delivered > 0).then(|| c.est_output_text.clone());
-                Some(
-                    crate::token_estimate::fill_missing_pooled(
-                        est.clone(),
-                        c.prompt_tokens,
-                        completion,
-                        output,
-                    )
-                    .await,
-                )
-            }
-            _ => None,
+        let delivered = if frame_next {
+            delivered.max(1)
+        } else {
+            delivered
         };
-        self.complete(counted);
+        if let (Some(est), Some((_, c))) = (&self.estimator, &self.slot) {
+            let completion = if delivered == 0 {
+                0
+            } else {
+                c.completion_tokens
+            };
+            let output = (delivered > 0).then_some(c.est_output_text.as_str());
+            self.counted
+                .count(est, c.prompt_tokens, completion, output)
+                .await;
+        }
     }
 
-    /// Complete the stream once. `counted` is the estimate [`Self::finish`]
-    /// already took off the worker; without it (Drop) the estimate runs
-    /// here.
-    fn complete(&mut self, counted: Option<crate::token_estimate::Filled>) {
+    /// Complete the stream once, from the count ahead when it still fits
+    /// and otherwise counting inline (Drop cannot wait).
+    fn complete(&mut self) {
         let Some((f, mut c)) = self.slot.take() else {
             return;
         };
@@ -5901,15 +5897,9 @@ impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
         // only for counters the upstream left at zero; a stream with a
         // real usage chunk is untouched.
         let filled = self.estimator.take().map(|est| {
-            counted.unwrap_or_else(|| {
-                let output = (delivered > 0).then_some(c.est_output_text.as_str());
-                crate::token_estimate::fill_missing(
-                    &est,
-                    c.prompt_tokens,
-                    c.completion_tokens,
-                    output,
-                )
-            })
+            let output = (delivered > 0).then_some(c.est_output_text.as_str());
+            self.counted
+                .fill(&est, c.prompt_tokens, c.completion_tokens, output)
         });
         if let Some(filled) = filled.filter(|filled| filled.estimated) {
             c.prompt_tokens = filled.prompt_tokens;
@@ -5939,7 +5929,7 @@ impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
 
 impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
     fn drop(&mut self) {
-        self.complete(None);
+        self.complete();
     }
 }
 
@@ -6060,6 +6050,7 @@ where
             slot: Some((on_complete, StreamCompletion::default())),
             delivered: delivered_for_drop,
             estimator,
+            counted: Default::default(),
         };
         futures::pin_mut!(upstream);
         // Per #204: accumulate the assistant's content across chunks
@@ -6945,10 +6936,12 @@ where
         // consumers can detect truncation. The `errored` flag is
         // set by the loop above whenever an error event is yielded
         // OR by the output-guardrail check above on a Block verdict.
+        guard.count_ahead(!errored).await;
         if !errored {
             yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
         }
-        guard.finish().await;
+        guard.count_ahead(false).await;
+        guard.complete();
         // On client disconnect, the generator
         // drops at the suspension point inside the loop; Drop fires
         // there with whatever StreamCompletion has been captured up
@@ -7340,6 +7333,7 @@ mod complete_on_drop_tests {
                 )),
                 delivered,
                 estimator: None,
+                counted: Default::default(),
             };
             drop(guard);
         }
@@ -7380,6 +7374,7 @@ mod complete_on_drop_tests {
                     "relay-model",
                     crate::token_estimate::PromptInput::Chat(Box::new(req)),
                 )),
+                counted: Default::default(),
             };
             drop(guard);
         }
@@ -7858,6 +7853,7 @@ mod delivery_counter_tests {
                 )),
                 delivered: delivered_for_drop,
                 estimator: None,
+                counted: Default::default(),
             };
             // Silence unused-field warning on the test side; guard
             // is held by the body for its full lifetime.

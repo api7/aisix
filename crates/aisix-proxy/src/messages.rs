@@ -3195,7 +3195,11 @@ fn build_anthropic_sse_stream(
         // The count runs on the estimation pool. The guard keeps its
         // estimator until the count is back, so a consumer that leaves
         // while it runs still gets its record filled by the guard.
-        if let Some(est) = guard.estimator.clone() {
+        let to_count = guard.estimator.clone().filter(|_| {
+            let comp = guard.comp();
+            crate::token_estimate::needs_counting(comp.prompt_tokens, comp.completion_tokens, true)
+        });
+        if let Some(est) = to_count {
             let filled = {
                 let comp = guard.comp();
                 crate::token_estimate::fill_missing_pooled(
@@ -4124,6 +4128,7 @@ struct AnthropicStreamGuard<F: FnOnce(AnthropicStreamUsage)> {
     /// upstream never reported. Prompt from the captured request body,
     /// completion from the accumulated `response_text`.
     estimator: Option<crate::token_estimate::Estimator>,
+    counted: crate::token_estimate::CountedAhead,
 }
 
 impl<F: FnOnce(AnthropicStreamUsage)> AnthropicStreamGuard<F> {
@@ -4135,32 +4140,27 @@ impl<F: FnOnce(AnthropicStreamUsage)> AnthropicStreamGuard<F> {
             .1
     }
 
-    /// The stream's normal end: the estimate runs on the estimation pool
-    /// (see `chat::CompleteOnDrop::finish`).
-    async fn finish(&mut self) {
+    /// Count the estimate ahead on the estimation pool (see
+    /// [`crate::token_estimate::CountedAhead`]), from the same inputs
+    /// [`Self::complete`] will count.
+    /// `frame_next` says a frame is about to be released, so it counts as
+    /// delivered.
+    async fn count_ahead(&mut self, frame_next: bool) {
         let delivered = self.delivered.load(Ordering::Relaxed);
-        let counted = match (&self.estimator, &self.slot) {
-            (Some(est), Some((_, usage))) => {
-                let (prompt, completion, output) = estimate_inputs(usage, delivered);
-                Some(
-                    crate::token_estimate::fill_missing_pooled(
-                        est.clone(),
-                        prompt,
-                        completion,
-                        output.map(str::to_owned),
-                    )
-                    .await,
-                )
-            }
-            _ => None,
+        let delivered = if frame_next {
+            delivered.max(1)
+        } else {
+            delivered
         };
-        self.complete(counted);
+        if let (Some(est), Some((_, usage))) = (&self.estimator, &self.slot) {
+            let (prompt, completion, output) = estimate_inputs(usage, delivered);
+            self.counted.count(est, prompt, completion, output).await;
+        }
     }
 
-    /// Complete the stream once. `counted` is the estimate [`Self::finish`]
-    /// already took off the worker; without it (Drop) the estimate runs
-    /// here.
-    fn complete(&mut self, counted: Option<crate::token_estimate::Filled>) {
+    /// Complete the stream once, from the count ahead when it still fits
+    /// and otherwise counting inline (Drop cannot wait).
+    fn complete(&mut self) {
         if let Some((f, mut usage)) = self.slot.take() {
             let delivered = self.delivered.load(Ordering::Relaxed);
             usage.chunks_delivered = delivered;
@@ -4180,10 +4180,8 @@ impl<F: FnOnce(AnthropicStreamUsage)> AnthropicStreamGuard<F> {
             // estimates from the delivered text; max() keeps the floor when
             // the estimate has nothing to add.
             if let Some(est) = self.estimator.take() {
-                let filled = counted.unwrap_or_else(|| {
-                    let (prompt, completion, output) = estimate_inputs(&usage, delivered);
-                    crate::token_estimate::fill_missing(&est, prompt, completion, output)
-                });
+                let (prompt, completion, output) = estimate_inputs(&usage, delivered);
+                let filled = self.counted.fill(&est, prompt, completion, output);
                 if filled.estimated {
                     usage.prompt_tokens = filled.prompt_tokens;
                     usage.completion_tokens = filled.completion_tokens.max(usage.completion_tokens);
@@ -4209,8 +4207,17 @@ fn estimate_inputs(usage: &AnthropicStreamUsage, delivered: u32) -> (u32, u32, O
 
 impl<F: FnOnce(AnthropicStreamUsage)> Drop for AnthropicStreamGuard<F> {
     fn drop(&mut self) {
-        self.complete(None);
+        self.complete();
     }
+}
+
+/// Whether forwarded SSE bytes carry the stream's closing `message_stop`.
+/// A text delta that merely mentions it only triggers an early count ahead,
+/// which [`crate::token_estimate::CountedAhead`] redoes if the inputs move.
+fn carries_message_stop(frames: &[u8]) -> bool {
+    frames
+        .windows(b"message_stop".len())
+        .any(|w| w == b"message_stop")
 }
 
 /// Stream wrapper that counts delivered items (`poll_next ->
@@ -4284,6 +4291,7 @@ where
             slot: Some((on_complete, AnthropicStreamUsage::default())),
             delivered: delivered_for_drop,
             estimator,
+            counted: Default::default(),
         };
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
@@ -4407,6 +4415,9 @@ where
                         crate::attempt::measured_ms(started.elapsed());
                 }
                 keep_live_copy(&mut live_copy, &forward);
+                if carries_message_stop(&forward) {
+                    guard.count_ahead(true).await;
+                }
                 yield Ok(Bytes::from(forward));
                 continue;
             }
@@ -4733,6 +4744,7 @@ where
         // Hold-back release (#932): the scan cleared — mask the held SSE
         // bytes (channel reassembly across frames) and release them.
         if hold.is_some() && !blocked && !held.is_empty() {
+            guard.count_ahead(true).await;
             match output_guardrail
                 .as_ref()
                 .and_then(|c| crate::redact::redact_anthropic_sse(c.as_ref(), &held))
@@ -4769,7 +4781,8 @@ where
         }
         // on_complete fires (delivery-gated); an early return or a
         // disconnect leaves it to the guard's Drop.
-        guard.finish().await;
+        guard.count_ahead(false).await;
+        guard.complete();
     };
     AnthropicDeliveryCounter {
         // Re-attach the request span: the body is polled after the
@@ -6636,6 +6649,7 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
                     )),
                     delivered,
                     estimator: None,
+                    counted: Default::default(),
                 };
                 drop(guard);
             }
@@ -6711,6 +6725,7 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
                         "relay-claude",
                         crate::token_estimate::PromptInput::Anthropic(body),
                     )),
+                    counted: Default::default(),
                 };
                 drop(guard);
             }

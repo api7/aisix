@@ -578,7 +578,7 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     const log = await waitForSlsLog(
       sls!,
       META_LOGSTORE,
-      (l) => l.get("requested_model") === "est-completions",
+      (l) => l.get("requested_model") === "est-completions" && l.get("status_code") === "200",
       "an est-completions usage record",
     );
     expect(log.get("usage_estimated")).toBe("true");
@@ -615,7 +615,7 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     const log = await waitForSlsLog(
       sls!,
       META_LOGSTORE,
-      (l) => l.get("requested_model") === "est-embeddings",
+      (l) => l.get("requested_model") === "est-embeddings" && l.get("status_code") === "200",
       "an est-embeddings usage record",
     );
     expect(log.get("usage_estimated")).toBe("true");

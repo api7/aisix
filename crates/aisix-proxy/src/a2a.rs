@@ -545,24 +545,33 @@ struct StreamUsageOnDrop {
     /// the request's terminal emission, so it carries the terminal spans.
     trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     _concurrency: aisix_ratelimit::StreamConcurrencyGuard,
+    /// The words counted ahead, keyed by the request and response text
+    /// lengths they were counted at.
+    counted: Option<((usize, usize), A2aCounted)>,
     /// Set once the call's usage is emitted, by the stream's normal end or
     /// by Drop.
     emitted: bool,
 }
 
 impl StreamUsageOnDrop {
-    /// The stream's normal end: the words are counted on the estimation
-    /// pool instead of the request worker, then the usage is emitted here.
-    /// A disconnect while the count runs leaves Drop to emit it.
-    async fn finish(&mut self) {
-        let counted = count_a2a_call(&self.call).await;
-        self.emit(Some(counted));
+    /// Count the call's words ahead on the estimation pool, before the
+    /// terminal event is released: an A2A client stops reading there, and
+    /// the Drop that follows then emits this count instead of counting on
+    /// the request worker. It answers only while the words are unchanged
+    /// (both texts only grow, so their lengths identify them).
+    async fn count_ahead(&mut self) {
+        let response_text = self.call.text.response.joined();
+        let key = (self.call.text.request.len(), response_text.len());
+        if self.counted.as_ref().is_some_and(|(k, _)| *k == key) {
+            return;
+        }
+        let counted = count_a2a_text(self.call.text.request.clone(), response_text).await;
+        self.counted = Some((key, counted));
     }
 
-    /// Emit the call's usage once. `counted` is the count [`Self::finish`]
-    /// already took off the worker; without it (Drop) the words are counted
-    /// here.
-    fn emit(&mut self, counted: Option<A2aCounted>) {
+    /// Emit the call's usage once, from the count ahead while it still
+    /// fits and otherwise counting here (Drop cannot wait).
+    fn emit(&mut self) {
         if std::mem::replace(&mut self.emitted, true) {
             return;
         }
@@ -575,9 +584,12 @@ impl StreamUsageOnDrop {
         } else {
             crate::CLIENT_CLOSED_REQUEST
         };
-        let counted = counted.unwrap_or_else(|| {
-            count_a2a_words(&self.call.text.request, self.call.text.response.joined())
-        });
+        let response_text = self.call.text.response.joined();
+        let key = (self.call.text.request.len(), response_text.len());
+        let counted = match self.counted.take() {
+            Some((counted_key, counted)) if counted_key == key => counted,
+            _ => count_a2a_words(&self.call.text.request, response_text),
+        };
         // A stream can outlive several config generations, so the
         // end-of-stream emit reads a FRESH snapshot rather than the one the
         // request started on (#941).
@@ -606,7 +618,7 @@ impl Drop for StreamUsageOnDrop {
         if std::thread::panicking() {
             return;
         }
-        self.emit(None);
+        self.emit();
     }
 }
 
@@ -676,6 +688,7 @@ async fn dispatch_stream(
         failure: None,
         trace,
         _concurrency: reservation.into_stream_hold(),
+        counted: None,
         emitted: false,
     };
     let agent_label = agent.to_string();
@@ -741,6 +754,9 @@ async fn dispatch_stream(
                     if is_stream_end(&value) {
                         guard.call.stream.reached_end = true;
                     }
+                    if guard.call.stream.reached_end {
+                        guard.count_ahead().await;
+                    }
                     yield Ok::<_, std::convert::Infallible>(
                         axum::response::sse::Event::default().data(value.to_string()),
                     );
@@ -762,7 +778,8 @@ async fn dispatch_stream(
         // The upstream ran out or faulted without ever marking the stream
         // finished. Either way the caller was handed everything there was.
         guard.call.stream.reached_end = true;
-        guard.finish().await;
+        guard.count_ahead().await;
+        guard.emit();
     });
 
     // The endpoint tail below owns this request's access-log line, and from
@@ -1131,10 +1148,21 @@ struct A2aCounted {
     completion_tokens: u32,
 }
 
-/// Count `call`'s words on the estimation pool, off the request worker.
+/// Count `call`'s words, off the request worker unless they are few.
 async fn count_a2a_call(call: &A2aCall) -> A2aCounted {
-    let request = call.text.request.clone();
-    let response_text = call.text.response.joined();
+    count_a2a_text(call.text.request.clone(), call.text.response.joined()).await
+}
+
+/// Text below which an A2A count stays inline: tokenizing it costs well
+/// under a millisecond, and every A2A call counts — rejections included —
+/// so queueing those behind other requests' large estimates would only
+/// slow them down.
+const INLINE_COUNT_BELOW_BYTES: usize = 16 * 1024;
+
+async fn count_a2a_text(request: String, response_text: String) -> A2aCounted {
+    if request.len() + response_text.len() < INLINE_COUNT_BELOW_BYTES {
+        return count_a2a_words(&request, response_text);
+    }
     crate::estimate_pool::run(move || count_a2a_words(&request, response_text)).await
 }
 
