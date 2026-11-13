@@ -2539,14 +2539,14 @@ impl crate::attempt::RecordsStreamRefusal for ResponsesStreamCompletion {
     }
 }
 
-struct CompleteOnDrop<F: FnOnce(ResponsesStreamCompletion) + Send + 'static> {
+struct CompleteOnDrop<F: FnOnce(ResponsesStreamCompletion)> {
     slot: Option<(F, ResponsesStreamCompletion)>,
     /// Token-estimation fallback (AISIX-Cloud#1074); fills counters the
     /// upstream never reported before `on_complete` runs.
     estimator: Option<crate::token_estimate::Estimator>,
 }
 
-impl<F: FnOnce(ResponsesStreamCompletion) + Send + 'static> CompleteOnDrop<F> {
+impl<F: FnOnce(ResponsesStreamCompletion)> CompleteOnDrop<F> {
     fn comp(&mut self) -> &mut ResponsesStreamCompletion {
         &mut self
             .slot
@@ -2556,33 +2556,26 @@ impl<F: FnOnce(ResponsesStreamCompletion) + Send + 'static> CompleteOnDrop<F> {
     }
 }
 
-impl<F: FnOnce(ResponsesStreamCompletion) + Send + 'static> Drop for CompleteOnDrop<F> {
+impl<F: FnOnce(ResponsesStreamCompletion)> Drop for CompleteOnDrop<F> {
     fn drop(&mut self) {
         if let Some((f, mut comp)) = self.slot.take() {
             // Token-estimation fallback (AISIX-Cloud#1074): fill the
             // counters the upstream never reported from the request +
             // the accumulated output text.
-            let Some(est) = self.estimator.take() else {
-                f(comp);
-                return;
-            };
-            let output = std::mem::take(&mut comp.est_output_text);
-            let (prompt, completion) = (comp.prompt_tokens, comp.completion_tokens);
-            crate::token_estimate::fill_missing_then(
-                est,
-                prompt,
-                completion,
-                Some(output),
-                None,
-                move |filled, _| {
-                    if filled.estimated {
-                        comp.prompt_tokens = filled.prompt_tokens;
-                        comp.completion_tokens = filled.completion_tokens;
-                        comp.usage_estimated = true;
-                    }
-                    f(comp);
-                },
-            );
+            if let Some(est) = self.estimator.take() {
+                let filled = crate::token_estimate::fill_missing(
+                    &est,
+                    comp.prompt_tokens,
+                    comp.completion_tokens,
+                    Some(comp.est_output_text.as_str()),
+                );
+                if filled.estimated {
+                    comp.prompt_tokens = filled.prompt_tokens;
+                    comp.completion_tokens = filled.completion_tokens;
+                    comp.usage_estimated = true;
+                }
+            }
+            f(comp);
         }
     }
 }

@@ -3427,6 +3427,11 @@ impl SseTextCapture {
         self.terminal.unwrap_or(self.deltas)
     }
 
+    /// What [`Self::into_text`] will return, without consuming the capture.
+    fn text(&self) -> &str {
+        self.terminal.as_deref().unwrap_or(&self.deltas)
+    }
+
     /// All authoritative output carriers for the end-of-stream monitor.
     /// Capture retains its terminal preference, but a monitor must observe a
     /// visible standalone `.done`/item/part event even if the terminal
@@ -3454,9 +3459,7 @@ impl SseTextCapture {
 /// end-of-stream scan's monitor observations (AISIX-Cloud#1010) — the Drop
 /// (disconnect) path passes none: the response never completed, so there is
 /// nothing final to observe, matching the chat surface's disconnect behavior.
-struct ResponsesUsageGuard<
-    F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>) + Send + 'static,
-> {
+struct ResponsesUsageGuard<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> {
     slot: Option<(F, Option<ResponseUsage>, Option<SseTextCapture>)>,
     /// Token-estimation fallback (AISIX-Cloud#1074): a stream that ends
     /// without a terminal usage event (client abort, relay that omits
@@ -3465,7 +3468,7 @@ struct ResponsesUsageGuard<
     estimator: Option<crate::token_estimate::Estimator>,
 }
 
-impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>) + Send + 'static>
+impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
     ResponsesUsageGuard<F>
 {
     fn parts(&mut self) -> (&mut Option<ResponseUsage>, Option<&mut SseTextCapture>) {
@@ -3476,63 +3479,69 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>) + Se
         (&mut slot.1, slot.2.as_mut())
     }
 
-    fn needs_estimate(&self) -> bool {
-        match (&self.estimator, &self.slot) {
-            (Some(_), Some((_, usage, _))) => usage
-                .as_ref()
-                .is_none_or(|u| u.prompt_tokens == 0 || u.completion_tokens == 0),
-            _ => false,
-        }
-    }
-
-    /// The stream's normal end, which can wait for the estimation pool
+    /// The stream's normal end: the estimate runs on the estimation pool
     /// (see `chat::CompleteOnDrop::finish`).
     async fn finish(&mut self, hits: Vec<aisix_core::GuardrailMonitorHit>) {
-        let slot = if self.needs_estimate() {
-            Some(crate::estimate_pool::reserve().await)
-        } else {
-            None
+        let counted = match (&self.estimator, &self.slot) {
+            (Some(est), Some((_, usage, capture))) => {
+                let usage = usage.as_ref();
+                let prompt = usage.map_or(0, |u| u.prompt_tokens);
+                let completion = usage.map_or(0, |u| u.completion_tokens);
+                if prompt == 0 || completion == 0 {
+                    let text = capture.as_ref().map_or("", SseTextCapture::text);
+                    Some(
+                        crate::token_estimate::fill_missing_pooled(
+                            est.clone(),
+                            prompt,
+                            completion,
+                            Some(text.to_owned()),
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                }
+            }
+            _ => None,
         };
-        if let Some(done) = self.complete(hits, slot) {
-            let _ = done.await;
-        }
+        self.complete(hits, counted);
     }
 
+    /// Complete the stream once. `counted` is the estimate [`Self::finish`]
+    /// already took off the worker; without it (Drop) the estimate runs
+    /// here.
     fn complete(
         &mut self,
         hits: Vec<aisix_core::GuardrailMonitorHit>,
-        pool_slot: Option<crate::estimate_pool::Slot>,
-    ) -> Option<tokio::task::JoinHandle<()>> {
-        let (f, usage, capture) = self.slot.take()?;
+        counted: Option<crate::token_estimate::Filled>,
+    ) {
+        let Some((f, usage, capture)) = self.slot.take() else {
+            return;
+        };
         let mut usage = usage.unwrap_or_default();
         let out_text = capture.map(SseTextCapture::into_text).unwrap_or_default();
-        let estimator = self.estimator.take();
-        let Some(est) =
-            estimator.filter(|_| usage.prompt_tokens == 0 || usage.completion_tokens == 0)
-        else {
-            f(usage, out_text, hits);
-            return None;
-        };
-        let (prompt, completion) = (usage.prompt_tokens, usage.completion_tokens);
-        crate::token_estimate::fill_missing_then(
-            est,
-            prompt,
-            completion,
-            Some(out_text),
-            pool_slot,
-            move |filled, out_text| {
+        if let Some(est) = self.estimator.take() {
+            if usage.prompt_tokens == 0 || usage.completion_tokens == 0 {
+                let filled = counted.unwrap_or_else(|| {
+                    crate::token_estimate::fill_missing(
+                        &est,
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        Some(&out_text),
+                    )
+                });
                 if filled.estimated {
                     usage.prompt_tokens = filled.prompt_tokens;
                     usage.completion_tokens = filled.completion_tokens;
                     usage.usage_estimated = true;
                 }
-                f(usage, out_text.unwrap_or_default(), hits);
-            },
-        )
+            }
+        }
+        f(usage, out_text, hits);
     }
 }
 
-impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>) + Send + 'static> Drop
+impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> Drop
     for ResponsesUsageGuard<F>
 {
     fn drop(&mut self) {

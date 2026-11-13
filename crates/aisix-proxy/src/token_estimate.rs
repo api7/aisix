@@ -233,41 +233,6 @@ pub async fn fill_missing_pooled(
     .await
 }
 
-/// [`fill_missing`] for a guard that ends a request and emits its usage
-/// record: `then` gets the counts, and the output text back, exactly once.
-/// Where the count runs is [`crate::estimate_pool::run_then`]'s rule.
-pub fn fill_missing_then(
-    est: Estimator,
-    upstream_prompt: u32,
-    upstream_completion: u32,
-    output_text: Option<String>,
-    slot: Option<crate::estimate_pool::Slot>,
-    then: impl FnOnce(Filled, Option<String>) + Send + 'static,
-) -> Option<tokio::task::JoinHandle<()>> {
-    if !needs_counting(upstream_prompt, upstream_completion, output_text.is_some()) {
-        let unchanged = Filled {
-            prompt_tokens: upstream_prompt,
-            completion_tokens: upstream_completion,
-            estimated: false,
-        };
-        then(unchanged, output_text);
-        return None;
-    }
-    crate::estimate_pool::run_then(
-        slot,
-        move || {
-            let filled = fill_missing(
-                &est,
-                upstream_prompt,
-                upstream_completion,
-                output_text.as_deref(),
-            );
-            (filled, output_text)
-        },
-        move |(filled, output_text)| then(filled, output_text),
-    )
-}
-
 fn bpe_for(model: &str) -> &'static CoreBPE {
     match get_tokenizer(model) {
         Some(Tokenizer::O200kHarmony) => tiktoken_rs::o200k_harmony_singleton(),

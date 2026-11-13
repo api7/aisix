@@ -10,7 +10,12 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
-import { decodedTextFor, startMockSls, type MockSls } from "../harness/sls-mock.js";
+import {
+  decodedTextFor,
+  startMockSls,
+  waitForSlsLog,
+  type MockSls,
+} from "../harness/sls-mock.js";
 
 // E2E for AISIX-Cloud#1074: token metering for SSE + missing-usage upstreams.
 //
@@ -109,6 +114,22 @@ const RESPONSES_STREAM_EVENTS_NO_USAGE = [
   "[DONE]",
 ];
 
+// Legacy /v1/completions 200 with NO usage block.
+const COMPLETIONS_NO_USAGE = {
+  id: "cmpl-est-1",
+  object: "text_completion",
+  created: Math.floor(Date.now() / 1000),
+  model: "relay-mini",
+  choices: [{ index: 0, text: "Hello world", finish_reason: "stop" }],
+};
+
+// /v1/embeddings 200 with NO usage block.
+const EMBEDDINGS_NO_USAGE = {
+  object: "list",
+  model: "relay-embed",
+  data: [{ object: "embedding", index: 0, embedding: [0.1, 0.2, 0.3] }],
+};
+
 describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is locally counted and flagged", () => {
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
@@ -117,6 +138,8 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
   let chatAbortUpstream: OpenAiUpstream | undefined;
   let messagesUpstream: OpenAiUpstream | undefined;
   let responsesUpstream: OpenAiUpstream | undefined;
+  let completionsUpstream: OpenAiUpstream | undefined;
+  let embeddingsUpstream: OpenAiUpstream | undefined;
   let seed: SeedClient | undefined;
   let etcdReachable = false;
 
@@ -143,6 +166,12 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     });
     responsesUpstream = await startOpenAiUpstream({
       streamEvents: RESPONSES_STREAM_EVENTS_NO_USAGE,
+    });
+    completionsUpstream = await startOpenAiUpstream({
+      nonStreamBody: COMPLETIONS_NO_USAGE,
+    });
+    embeddingsUpstream = await startOpenAiUpstream({
+      nonStreamBody: EMBEDDINGS_NO_USAGE,
     });
 
     app = await spawnApp({
@@ -189,6 +218,8 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     await seedModel("est-chat-abort", chatAbortUpstream);
     await seedModel("est-msgs-stream", messagesUpstream, "anthropic");
     await seedModel("est-responses-stream", responsesUpstream);
+    await seedModel("est-completions", completionsUpstream);
+    await seedModel("est-embeddings", embeddingsUpstream);
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [
@@ -197,6 +228,8 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
         "est-chat-abort",
         "est-msgs-stream",
         "est-responses-stream",
+        "est-completions",
+        "est-embeddings",
       ],
     });
   });
@@ -209,6 +242,8 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     await chatAbortUpstream?.close();
     await messagesUpstream?.close();
     await responsesUpstream?.close();
+    await completionsUpstream?.close();
+    await embeddingsUpstream?.close();
   });
 
   function openai(): OpenAI {
@@ -512,5 +547,78 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     // estimated values for this surface are pinned by the Rust handler
     // tests (`estimates_usage_event_when_upstream_omits_usage_block`).
     await waitSlsFlagged("est-responses-stream");
+  }, 60_000);
+
+  // The legacy surface counts its prompt as plain text — no message
+  // framing — so "hi" is one token, and "Hello world" two.
+  test("/v1/completions 200 without usage: both counters estimated and flagged", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const call = async () =>
+      fetch(`${app!.proxyUrl}/v1/completions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ model: "est-completions", prompt: "hi" }),
+      });
+    await waitConfigPropagation(async () => {
+      const r = await call();
+      await r.text();
+      return r.status === 200;
+    });
+
+    const res = await call();
+    expect(res.status).toBe(200);
+    await res.text();
+
+    const log = await waitForSlsLog(
+      sls!,
+      META_LOGSTORE,
+      (l) => l.get("requested_model") === "est-completions",
+      "an est-completions usage record",
+    );
+    expect(log.get("usage_estimated")).toBe("true");
+    expect(log.get("prompt_tokens")).toBe("1");
+    expect(log.get("completion_tokens")).toBe(String(EXPECTED_COMPLETION_TOKENS));
+  }, 60_000);
+
+  // Embeddings are input-only: the prompt is the request `input`, counted
+  // as plain text ("hi" = 1 token).
+  test("/v1/embeddings 200 without usage: the prompt is estimated and flagged", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const call = async () =>
+      fetch(`${app!.proxyUrl}/v1/embeddings`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ model: "est-embeddings", input: "hi" }),
+      });
+    await waitConfigPropagation(async () => {
+      const r = await call();
+      await r.text();
+      return r.status === 200;
+    });
+
+    const res = await call();
+    expect(res.status).toBe(200);
+    await res.text();
+
+    const log = await waitForSlsLog(
+      sls!,
+      META_LOGSTORE,
+      (l) => l.get("requested_model") === "est-embeddings",
+      "an est-embeddings usage record",
+    );
+    expect(log.get("usage_estimated")).toBe("true");
+    expect(log.get("prompt_tokens")).toBe("1");
   }, 60_000);
 });

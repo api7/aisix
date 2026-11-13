@@ -524,7 +524,7 @@ async fn dispatch(
 /// the caller's slot the moment the response headers went out, letting a key
 /// capped at N run many more than N concurrent streams — #450, on a second
 /// endpoint.
-struct StreamUsage {
+struct StreamUsageOnDrop {
     state: ProxyState,
     auth: AuthenticatedKey,
     request_id: String,
@@ -545,25 +545,57 @@ struct StreamUsage {
     /// the request's terminal emission, so it carries the terminal spans.
     trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     _concurrency: aisix_ratelimit::StreamConcurrencyGuard,
+    /// Set once the call's usage is emitted, by the stream's normal end or
+    /// by Drop.
+    emitted: bool,
 }
 
-/// Holds the [`StreamUsage`] until the stream ends; its Drop emits it.
-struct StreamUsageOnDrop(Option<StreamUsage>);
-
-impl std::ops::Deref for StreamUsageOnDrop {
-    type Target = StreamUsage;
-    fn deref(&self) -> &StreamUsage {
-        self.0
-            .as_ref()
-            .expect("StreamUsageOnDrop accessed after drop")
+impl StreamUsageOnDrop {
+    /// The stream's normal end: the words are counted on the estimation
+    /// pool instead of the request worker, then the usage is emitted here.
+    /// A disconnect while the count runs leaves Drop to emit it.
+    async fn finish(&mut self) {
+        let counted = count_a2a_call(&self.call).await;
+        self.emit(Some(counted));
     }
-}
 
-impl std::ops::DerefMut for StreamUsageOnDrop {
-    fn deref_mut(&mut self) -> &mut StreamUsage {
-        self.0
-            .as_mut()
-            .expect("StreamUsageOnDrop accessed after drop")
+    /// Emit the call's usage once. `counted` is the count [`Self::finish`]
+    /// already took off the worker; without it (Drop) the words are counted
+    /// here.
+    fn emit(&mut self, counted: Option<A2aCounted>) {
+        if std::mem::replace(&mut self.emitted, true) {
+            return;
+        }
+        // A stream the caller abandoned mid-task is recorded as 499, the same
+        // outcome the LLM streaming paths record for the same event. Only a
+        // still-successful call is downgraded: a stream that already faulted
+        // has a truer status than the hang-up that followed it.
+        let status = if self.call.stream.reached_end || self.status != StatusCode::OK.as_u16() {
+            self.status
+        } else {
+            crate::CLIENT_CLOSED_REQUEST
+        };
+        let counted = counted.unwrap_or_else(|| {
+            count_a2a_words(&self.call.text.request, self.call.text.response.joined())
+        });
+        // A stream can outlive several config generations, so the
+        // end-of-stream emit reads a FRESH snapshot rather than the one the
+        // request started on (#941).
+        emit_a2a_usage_counted(
+            &self.state,
+            &self.state.snapshot.load(),
+            &self.auth,
+            &self.request_id,
+            &self.agent,
+            &self.call,
+            status,
+            self.started.elapsed(),
+            self.trace.as_ref(),
+            /* dispatched */ true,
+            /* refusal */ None,
+            self.failure.as_ref(),
+            counted,
+        );
     }
 }
 
@@ -574,51 +606,7 @@ impl Drop for StreamUsageOnDrop {
         if std::thread::panicking() {
             return;
         }
-        let Some(mut usage) = self.0.take() else {
-            return;
-        };
-        // A stream the caller abandoned mid-task is recorded as 499, the same
-        // outcome the LLM streaming paths record for the same event. Only a
-        // still-successful call is downgraded: a stream that already faulted
-        // has a truer status than the hang-up that followed it.
-        let status = if usage.call.stream.reached_end || usage.status != StatusCode::OK.as_u16() {
-            usage.status
-        } else {
-            crate::CLIENT_CLOSED_REQUEST
-        };
-        let elapsed = usage.started.elapsed();
-        // The words are counted on the estimation pool; the request text
-        // goes there and comes back for content capture.
-        let request = std::mem::take(&mut usage.call.text.request);
-        let response_text = usage.call.text.response.joined();
-        crate::estimate_pool::run_then(
-            None,
-            move || {
-                let counted = count_a2a_words(&request, response_text);
-                (request, counted)
-            },
-            move |(request, counted)| {
-                usage.call.text.request = request;
-                // A stream can outlive several config generations, so the
-                // end-of-stream emit reads a FRESH snapshot rather than the
-                // one the request started on (#941).
-                emit_a2a_usage_counted(
-                    &usage.state,
-                    &usage.state.snapshot.load(),
-                    &usage.auth,
-                    &usage.request_id,
-                    &usage.agent,
-                    &usage.call,
-                    status,
-                    elapsed,
-                    usage.trace.as_ref(),
-                    /* dispatched */ true,
-                    /* refusal */ None,
-                    usage.failure.as_ref(),
-                    counted,
-                );
-            },
-        );
+        self.emit(None);
     }
 }
 
@@ -677,7 +665,7 @@ async fn dispatch_stream(
         }
     };
 
-    let mut guard = StreamUsageOnDrop(Some(StreamUsage {
+    let mut guard = StreamUsageOnDrop {
         state: state.clone(),
         auth,
         request_id: request_id.to_string(),
@@ -688,7 +676,8 @@ async fn dispatch_stream(
         failure: None,
         trace,
         _concurrency: reservation.into_stream_hold(),
-    }));
+        emitted: false,
+    };
     let agent_label = agent.to_string();
 
     // Re-attach the request span: the body is polled after the request-id
@@ -773,7 +762,7 @@ async fn dispatch_stream(
         // The upstream ran out or faulted without ever marking the stream
         // finished. Either way the caller was handed everything there was.
         guard.call.stream.reached_end = true;
-        drop(guard);
+        guard.finish().await;
     });
 
     // The endpoint tail below owns this request's access-log line, and from

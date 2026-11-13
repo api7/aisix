@@ -5798,7 +5798,7 @@ pub(crate) fn emit_abandoned_ensemble(
 /// upstream, the gateway recorded nothing. Drop runs on cancellation,
 /// so the captured `StreamCompletion` (potentially zeros if the
 /// disconnect beat the upstream's `usage` chunk) is always shipped.
-struct CompleteOnDrop<F: FnOnce(StreamCompletion) + Send + 'static> {
+struct CompleteOnDrop<F: FnOnce(StreamCompletion)> {
     /// `Option<(closure, accumulator)>` — Drop calls the closure
     /// exactly once via `.take()`, so manual disarm before the
     /// natural drop is also safe (we don't currently use that, but
@@ -5824,7 +5824,7 @@ struct CompleteOnDrop<F: FnOnce(StreamCompletion) + Send + 'static> {
     estimator: Option<crate::token_estimate::Estimator>,
 }
 
-impl<F: FnOnce(StreamCompletion) + Send + 'static> CompleteOnDrop<F> {
+impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
     fn comp(&mut self) -> &mut StreamCompletion {
         &mut self
             .slot
@@ -5834,39 +5834,42 @@ impl<F: FnOnce(StreamCompletion) + Send + 'static> CompleteOnDrop<F> {
     }
 
     /// The stream's normal end, which can wait: a stream that leaves
-    /// counters to estimate waits for a place on the estimation pool and
-    /// for the count, instead of tokenizing on the request worker. A
-    /// disconnect while it waits for the place leaves the guard armed, so
-    /// Drop still completes it.
+    /// counters to estimate counts them on the estimation pool instead of
+    /// on the request worker, then completes here. The guard stays armed
+    /// while the count runs, so a disconnect meanwhile still completes it
+    /// from Drop.
     async fn finish(&mut self) {
         let delivered = self.delivered.load(Ordering::Relaxed);
-        let needs_estimate = match (&self.estimator, &self.slot) {
-            (Some(_), Some((_, c))) => crate::token_estimate::needs_counting(
-                c.prompt_tokens,
-                if delivered == 0 {
+        let counted = match (&self.estimator, &self.slot) {
+            (Some(est), Some((_, c))) => {
+                let completion = if delivered == 0 {
                     0
                 } else {
                     c.completion_tokens
-                },
-                delivered > 0,
-            ),
-            _ => false,
+                };
+                let output = (delivered > 0).then(|| c.est_output_text.clone());
+                Some(
+                    crate::token_estimate::fill_missing_pooled(
+                        est.clone(),
+                        c.prompt_tokens,
+                        completion,
+                        output,
+                    )
+                    .await,
+                )
+            }
+            _ => None,
         };
-        let slot = if needs_estimate {
-            Some(crate::estimate_pool::reserve().await)
-        } else {
-            None
-        };
-        if let Some(done) = self.complete(slot) {
-            let _ = done.await;
-        }
+        self.complete(counted);
     }
 
-    fn complete(
-        &mut self,
-        pool_slot: Option<crate::estimate_pool::Slot>,
-    ) -> Option<tokio::task::JoinHandle<()>> {
-        let (f, mut c) = self.slot.take()?;
+    /// Complete the stream once. `counted` is the estimate [`Self::finish`]
+    /// already took off the worker; without it (Drop) the estimate runs
+    /// here.
+    fn complete(&mut self, counted: Option<crate::token_estimate::Filled>) {
+        let Some((f, mut c)) = self.slot.take() else {
+            return;
+        };
         // Snapshot the wire-delivered count for telemetry visibility
         // AND for the cost-leak gate below.
         let delivered = self.delivered.load(Ordering::Relaxed);
@@ -5891,60 +5894,50 @@ impl<F: FnOnce(StreamCompletion) + Send + 'static> CompleteOnDrop<F> {
             c.cache_read_tokens = 0;
             c.total_tokens = c.prompt_tokens as u64;
         }
-        let Some(est) = self.estimator.take() else {
-            finish_stream_completion(c, None, f);
-            return None;
-        };
         // Token-estimation fallback (AISIX-Cloud#1074), after the #419
         // gate so a zero-delivered disconnect never bills estimated
         // completion tokens (the prompt still fills — upstream processed
         // it regardless, same "prompts always billed" contract). Runs
         // only for counters the upstream left at zero; a stream with a
         // real usage chunk is untouched.
-        let output = (delivered > 0).then(|| std::mem::take(&mut c.est_output_text));
-        let (prompt, completion) = (c.prompt_tokens, c.completion_tokens);
-        crate::token_estimate::fill_missing_then(
-            est,
-            prompt,
-            completion,
-            output,
-            pool_slot,
-            move |filled, _| finish_stream_completion(c, Some(filled), f),
-        )
-    }
-}
-
-fn finish_stream_completion(
-    mut c: StreamCompletion,
-    filled: Option<crate::token_estimate::Filled>,
-    f: impl FnOnce(StreamCompletion),
-) {
-    if let Some(filled) = filled.filter(|filled| filled.estimated) {
-        c.prompt_tokens = filled.prompt_tokens;
-        c.completion_tokens = filled.completion_tokens;
-        c.usage_estimated = true;
-        // Estimation only fills counters the upstream never
-        // reported, so the cache adders are zero or upstream-
-        // authoritative — the recompute stays consistent with
-        // `total_tokens_with_cache`.
-        c.total_tokens = crate::usage_attr::total_tokens_with_cache(
+        let filled = self.estimator.take().map(|est| {
+            counted.unwrap_or_else(|| {
+                let output = (delivered > 0).then_some(c.est_output_text.as_str());
+                crate::token_estimate::fill_missing(
+                    &est,
+                    c.prompt_tokens,
+                    c.completion_tokens,
+                    output,
+                )
+            })
+        });
+        if let Some(filled) = filled.filter(|filled| filled.estimated) {
+            c.prompt_tokens = filled.prompt_tokens;
+            c.completion_tokens = filled.completion_tokens;
+            c.usage_estimated = true;
+            // Estimation only fills counters the upstream never
+            // reported, so the cache adders are zero or upstream-
+            // authoritative — the recompute stays consistent with
+            // `total_tokens_with_cache`.
+            c.total_tokens = crate::usage_attr::total_tokens_with_cache(
+                c.prompt_tokens,
+                c.completion_tokens,
+                c.cache_creation_tokens,
+                c.cache_read_tokens,
+            );
+        }
+        c.total_tokens = cache_inclusive_total(
+            c.total_tokens,
             c.prompt_tokens,
             c.completion_tokens,
             c.cache_creation_tokens,
             c.cache_read_tokens,
         );
+        f(c);
     }
-    c.total_tokens = cache_inclusive_total(
-        c.total_tokens,
-        c.prompt_tokens,
-        c.completion_tokens,
-        c.cache_creation_tokens,
-        c.cache_read_tokens,
-    );
-    f(c);
 }
 
-impl<F: FnOnce(StreamCompletion) + Send + 'static> Drop for CompleteOnDrop<F> {
+impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
     fn drop(&mut self) {
         self.complete(None);
     }

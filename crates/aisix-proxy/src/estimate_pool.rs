@@ -10,14 +10,21 @@
 //! The pool is plain OS threads fed by a channel, so it serves the
 //! thread-per-core workers and the multi-thread runtime alike. It has one
 //! thread per available CPU and admits at most [`SLOTS_PER_THREAD`] jobs
-//! per thread, running or queued: a job holds the text it counts (up to
-//! `OUTPUT_ACCUMULATION_CAP`) plus its request, so the queue stays bounded
-//! and estimation demand beyond the pool waits in the requests that
-//! need it ([`reserve`]) rather than piling up here.
+//! per thread, running or queued: a job owns the text it counts (up to
+//! `OUTPUT_ACCUMULATION_CAP`) plus its request, so what the pool holds
+//! stays bounded and estimation demand beyond it waits in the requests
+//! that need it rather than piling up here.
+//!
+//! A stream guard's `Drop` cannot wait, and its usage emit has to happen
+//! inside that `Drop` (the request's attribution cell decides what the
+//! cancel guard and the access log write from it), so a stream the client
+//! abandons still estimates inline on its worker. Every path that can
+//! wait — a buffered response, a bridge's terminal event, a stream's
+//! normal end — comes here.
 
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
-use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{oneshot, Semaphore};
 
 /// Admitted jobs per pool thread: the one it runs and one waiting behind it.
 const SLOTS_PER_THREAD: usize = 2;
@@ -68,101 +75,47 @@ fn work(rx: &Mutex<mpsc::Receiver<Job>>) {
     }
 }
 
-/// An admitted place in the pool. Holding one is what lets a job be
-/// submitted; it is released when the job finishes.
-pub(crate) struct Slot(Option<OwnedSemaphorePermit>);
-
-/// Wait for a place in the pool. Cancel-safe: dropping the future before
-/// it resolves takes nothing.
-pub(crate) async fn reserve() -> Slot {
-    match pool() {
-        Some(pool) => Slot(Some(
-            Arc::clone(&pool.slots)
-                .acquire_owned()
-                .await
-                .expect("the estimation pool's semaphore is never closed"),
-        )),
-        None => Slot(None),
-    }
-}
-
-/// A place in the pool if one is free right now — for a caller that
-/// cannot wait (a Drop guard).
-pub(crate) fn try_reserve() -> Option<Slot> {
-    match pool() {
-        Some(pool) => Arc::clone(&pool.slots)
-            .try_acquire_owned()
-            .ok()
-            .map(|p| Slot(Some(p))),
-        None => Some(Slot(None)),
-    }
-}
-
-/// Start `job` in the slot. Without a pool it runs inline and the receiver
-/// is ready on return.
-pub(crate) fn submit<R: Send + 'static>(
-    slot: Slot,
-    job: impl FnOnce() -> R + Send + 'static,
-) -> oneshot::Receiver<R> {
+/// Run `job` on the pool, waiting for a place first, and return what it
+/// produced. A panic inside `job` is re-raised here.
+///
+/// Dropping the future while it waits for a place takes nothing; dropping
+/// it once the job is admitted lets the job finish and discards its
+/// product, so the job's place is held until then either way.
+pub(crate) async fn run<R: Send + 'static>(job: impl FnOnce() -> R + Send + 'static) -> R {
+    let Some(pool) = pool() else {
+        return job();
+    };
+    let permit = Arc::clone(&pool.slots)
+        .acquire_owned()
+        .await
+        .expect("the estimation pool's semaphore is never closed");
     let (tx, rx) = oneshot::channel();
-    let Slot(permit) = slot;
     let task: Job = Box::new(move || {
         let _ = tx.send(job());
         drop(permit);
     });
-    match pool() {
-        Some(pool) => {
-            let sent = match pool.jobs.lock() {
-                Ok(jobs) => jobs.send(task),
-                Err(poisoned) => poisoned.into_inner().send(task),
-            };
-            if let Err(mpsc::SendError(task)) = sent {
-                task();
-            }
-        }
-        None => task(),
+    let sent = match pool.jobs.lock() {
+        Ok(jobs) => jobs.send(task),
+        Err(poisoned) => poisoned.into_inner().send(task),
+    };
+    if let Err(mpsc::SendError(task)) = sent {
+        task();
     }
-    rx
-}
-
-/// Run `job` on the pool, waiting for a place first, and return what it
-/// produced. A panic inside `job` is re-raised here.
-pub(crate) async fn run<R: Send + 'static>(job: impl FnOnce() -> R + Send + 'static) -> R {
-    let slot = reserve().await;
-    submit(slot, job)
-        .await
+    rx.await
         .unwrap_or_else(|_| panic!("token estimation job panicked"))
 }
 
-/// Run `job` on the pool for a caller that ends a request but cannot wait
-/// (a Drop guard), handing its product to `then` exactly once.
-///
-/// `slot` is a place a caller that could wait reserved first (a stream's
-/// normal end); with `None`, a free place is taken if there is one. With a
-/// place, `job` runs on the pool and `then` on the caller's runtime once
-/// it is done, in a task of its own so nothing dropped afterwards can lose
-/// it; the returned handle lets a caller that can wait await it. Without
-/// one — the pool is full, or there is no runtime to finish on — `job`
-/// runs inline here, as before the pool existed: the work is never lost,
-/// and what is pending never grows past the pool's bound.
-pub(crate) fn run_then<R: Send + 'static>(
-    slot: Option<Slot>,
-    job: impl FnOnce() -> R + Send + 'static,
-    then: impl FnOnce(R) + Send + 'static,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let runtime = tokio::runtime::Handle::try_current().ok();
-    let slot = runtime.as_ref().and_then(|_| slot.or_else(try_reserve));
-    let (Some(runtime), Some(slot)) = (runtime, slot) else {
-        then(job());
-        return None;
-    };
-    let done = submit(slot, job);
-    Some(runtime.spawn(tracing::Instrument::instrument(
-        async move {
-            if let Ok(product) = done.await {
-                then(product);
-            }
-        },
-        tracing::Span::current(),
-    )))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jobs_run_off_the_calling_thread() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let caller = std::thread::current().id();
+        let ran_on = rt.block_on(run(|| std::thread::current().id()));
+        assert_ne!(ran_on, caller);
+    }
 }
