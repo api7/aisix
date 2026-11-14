@@ -25,6 +25,8 @@
 //!
 //! Small estimates never come here: [`run`] counts them on the caller.
 
+mod json_len;
+
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 use tokio::sync::{oneshot, Semaphore};
@@ -118,30 +120,14 @@ pub(crate) async fn run<R: Send + 'static>(
         .unwrap_or_else(|_| panic!("token estimation job panicked"))
 }
 
-/// The serialized size of `value`, an upper bound on the text an estimate
-/// tokenizes from it. Serialization stops once the size passes
-/// [`INLINE_MAX_BYTES`], so probing a large request costs no more than a
-/// small one; any such size, or a value that fails to serialize, is
-/// reported as `INLINE_MAX_BYTES + 1`.
+/// An upper bound on the text an estimate tokenizes from `value`: its
+/// compact-JSON length with strings counted unescaped (the tokenizer sees
+/// unescaped text, and escaping only lengthens JSON). Measuring stops once
+/// the length passes [`INLINE_MAX_BYTES`], and a string costs one addition
+/// whatever its length, so probing a large request costs no more than a
+/// small one. Any such length is reported as `INLINE_MAX_BYTES + 1`.
 pub(crate) fn serialized_bytes_bound(value: &impl serde::Serialize) -> usize {
-    struct Counter(usize);
-    impl std::io::Write for Counter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len();
-            if self.0 > INLINE_MAX_BYTES {
-                return Err(std::io::ErrorKind::WriteZero.into());
-            }
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter(0);
-    match serde_json::to_writer(&mut counter, value) {
-        Ok(()) => counter.0,
-        Err(_) => INLINE_MAX_BYTES + 1,
-    }
+    json_len::json_len_within(value, INLINE_MAX_BYTES).unwrap_or(INLINE_MAX_BYTES + 1)
 }
 
 #[cfg(test)]
@@ -171,10 +157,7 @@ mod tests {
     #[test]
     fn serialized_bound_stops_past_the_inline_limit() {
         let small = serde_json::json!({"input": "x".repeat(100)});
-        assert_eq!(
-            serialized_bytes_bound(&small),
-            serde_json::to_vec(&small).unwrap().len()
-        );
+        assert!(serialized_bytes_bound(&small) >= serde_json::to_vec(&small).unwrap().len());
         let large = serde_json::json!({"input": "x".repeat(10 * INLINE_MAX_BYTES)});
         assert_eq!(serialized_bytes_bound(&large), INLINE_MAX_BYTES + 1);
     }
