@@ -220,6 +220,7 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     await seedModel("est-responses-stream", responsesUpstream);
     await seedModel("est-completions", completionsUpstream);
     await seedModel("est-embeddings", embeddingsUpstream);
+    await seedModel("est-embeddings-pooled", embeddingsUpstream);
     await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: [
@@ -230,6 +231,7 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
         "est-responses-stream",
         "est-completions",
         "est-embeddings",
+        "est-embeddings-pooled",
       ],
     });
   });
@@ -624,5 +626,35 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     );
     expect(log.get("usage_estimated")).toBe("true");
     expect(log.get("prompt_tokens")).toBe("1");
+  }, 60_000);
+
+  // 9000 one-token inputs total 18000 bytes, past the 16 KiB an estimate
+  // may tokenize inline, so this count runs on the estimation pool.
+  test("/v1/embeddings 200 without usage, input past the inline size: counted on the pool", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    await waitCallerKey();
+
+    const res = await fetch(`${app!.proxyUrl}/v1/embeddings`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: "est-embeddings-pooled", input: Array(9000).fill("hi") }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+
+    const log = await waitForSlsLog(
+      sls!,
+      META_LOGSTORE,
+      (l) => l.get("requested_model") === "est-embeddings-pooled",
+      "an est-embeddings-pooled usage record",
+    );
+    expect(log.get("usage_estimated")).toBe("true");
+    expect(log.get("prompt_tokens")).toBe("9000");
   }, 60_000);
 });
