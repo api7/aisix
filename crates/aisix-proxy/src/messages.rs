@@ -2106,10 +2106,9 @@ async fn fill_missing_anthropic_metrics(
         upstream_model,
         crate::token_estimate::PromptInput::Anthropic(prompt()),
     );
-    let filled = crate::token_estimate::fill_missing_pooled(
+    let filled = crate::token_estimate::fill_missing_recorded(
         est,
-        metrics.prompt_tokens,
-        metrics.completion_tokens,
+        metrics.usage_stats(),
         Some(output_text()),
     )
     .await;
@@ -3541,6 +3540,23 @@ struct AnthropicUsageMetrics {
     finish_reason: String,
     upstream_ttft_ms: u32,
     downstream_latency_ms: u32,
+}
+
+impl AnthropicUsageMetrics {
+    fn usage_stats(&self) -> aisix_gateway::UsageStats {
+        aisix_gateway::UsageStats {
+            cached_prompt_tokens: self.cached_prompt_tokens,
+            cache_write_tokens: self.cache_write_tokens,
+            modality: self.modality,
+            cache_creation_ttl: self.cache_creation_ttl,
+            reasoning_tokens: self.reasoning_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            upstream_total_tokens: self.upstream_total_tokens,
+            reasoning_folded_into_completion: self.reasoning_folded_into_completion,
+            ..aisix_gateway::UsageStats::new(self.prompt_tokens, self.completion_tokens)
+        }
+    }
 }
 
 /// Emit a UsageEvent for a `/v1/messages` request. Mirrors

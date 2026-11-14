@@ -1152,9 +1152,30 @@ struct A2aCounted {
     completion_tokens: u32,
 }
 
-/// Count `call`'s words, off the request worker unless they are few.
+/// Count `call`'s words, off the request worker unless they are few. A
+/// caller that hangs up while they are counted off the worker still gets
+/// them on its row (see [`crate::token_estimate::run_recorded_on_cancel`]).
 async fn count_a2a_call(call: &A2aCall) -> A2aCounted {
-    count_a2a_text(call.text.request.clone(), call.text.response.joined()).await
+    let request = call.text.request.clone();
+    let response_text = std::sync::Arc::new(call.text.response.joined());
+    let counting = std::sync::Arc::clone(&response_text);
+    let (prompt_tokens, completion_tokens) = crate::token_estimate::run_recorded_on_cancel(
+        request.len() + response_text.len(),
+        move || a2a_word_counts(&request, &counting),
+        |(prompt_tokens, completion_tokens)| crate::token_estimate::CancelledUsage {
+            usage: aisix_gateway::UsageStats::new(prompt_tokens, completion_tokens),
+            usage_estimated: true,
+        },
+    )
+    .await;
+    A2aCounted {
+        // The count's own handle is normally gone by now; copying is only
+        // the fallback for a pool thread that has not dropped it yet.
+        response_text: std::sync::Arc::try_unwrap(response_text)
+            .unwrap_or_else(|shared| shared.as_ref().clone()),
+        prompt_tokens,
+        completion_tokens,
+    }
 }
 
 async fn count_a2a_text(request: String, response_text: String) -> A2aCounted {
@@ -1165,13 +1186,22 @@ async fn count_a2a_text(request: String, response_text: String) -> A2aCounted {
 }
 
 fn count_a2a_words(request: &str, response_text: String) -> A2aCounted {
+    let (prompt_tokens, completion_tokens) = a2a_word_counts(request, &response_text);
+    A2aCounted {
+        response_text,
+        prompt_tokens,
+        completion_tokens,
+    }
+}
+
+/// `(prompt, completion)` tokens of one call's words.
+fn a2a_word_counts(request: &str, response_text: &str) -> (u32, u32) {
     // No model resolves on this endpoint, so the estimator falls back to its
     // default encoding — the same thing it does for any non-OpenAI model.
-    A2aCounted {
-        prompt_tokens: crate::token_estimate::count_text("", request),
-        completion_tokens: crate::token_estimate::count_text("", &response_text),
-        response_text,
-    }
+    (
+        crate::token_estimate::count_text("", request),
+        crate::token_estimate::count_text("", response_text),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2094,6 +2124,87 @@ mod tests {
             event.usage_estimated,
             "the gateway counted these, not the agent — the flag says so"
         );
+    }
+
+    /// An agent that answers at once with more text than an estimate counts
+    /// inline, so the call's count goes to the estimation pool.
+    async fn spawn_verbose_agent(text: String) -> String {
+        let app = axum::Router::new().route(
+            "/a2a",
+            axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+                let text = text.clone();
+                async move {
+                    axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": body.0["id"],
+                        "result": {
+                            "kind": "message",
+                            "messageId": "m-1",
+                            "role": "agent",
+                            "parts": [{"kind": "text", "text": text}],
+                        }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}/a2a")
+    }
+
+    /// The agent answered, and the caller hung up while the gateway was
+    /// still counting the answer's words on the estimation pool. The row the
+    /// cancel guard files must bill those words, not read zero tokens.
+    #[tokio::test]
+    async fn a_call_abandoned_while_its_words_are_counted_still_bills_them() {
+        use aisix_obs::{UsageEvent, UsageSink};
+
+        let text = "word ".repeat(5_000);
+        let agent_url = spawn_verbose_agent(text.clone()).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UsageEvent>(8);
+        let handle = SnapshotHandle::new(snapshot_with(&agent_url, true, serde_json::json!(["*"])));
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle, hub, &proxy_cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let router = build_router(state);
+
+        let held = crate::estimate_pool::hold_every_slot().await;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(1_000),
+            router.oneshot(
+                HttpRequest::post("/a2a/invoice")
+                    .header("host", "gw.example.com")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":"s","method":"message/send"}"#,
+                    ))
+                    .unwrap(),
+            ),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the call finished — its count never waited for the pool",
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("an abandoned A2A call emitted no usage event")
+            .expect("sender dropped without sending");
+        drop(held);
+        assert_eq!(event.status_code, crate::CLIENT_CLOSED_REQUEST, "{event:?}");
+        assert_eq!(event.error_class, "client_disconnected", "{event:?}");
+        // 5000 words, about one token each.
+        assert!(event.completion_tokens >= 4_900, "{event:?}");
+        assert!(event.usage_estimated, "{event:?}");
+        assert!(rx.try_recv().is_err(), "one call, one row");
     }
 
     /// An agent that answers with words rather than a bare task record.

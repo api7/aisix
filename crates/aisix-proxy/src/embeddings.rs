@@ -718,14 +718,21 @@ async fn dispatch(
                         let input = req.input.clone();
                         let input_bytes =
                             input.iter().fold(0usize, |n, s| n.saturating_add(s.len()));
-                        crate::estimate_pool::run(input_bytes, move || {
-                            input.iter().fold(0u32, |acc, s| {
-                                acc.saturating_add(crate::token_estimate::count_text(
-                                    &upstream_model,
-                                    s,
-                                ))
-                            })
-                        })
+                        crate::token_estimate::run_recorded_on_cancel(
+                            input_bytes,
+                            move || {
+                                input.iter().fold(0u32, |acc, s| {
+                                    acc.saturating_add(crate::token_estimate::count_text(
+                                        &upstream_model,
+                                        s,
+                                    ))
+                                })
+                            },
+                            |prompt_tokens| crate::token_estimate::CancelledUsage {
+                                usage: aisix_gateway::UsageStats::new(prompt_tokens, 0),
+                                usage_estimated: prompt_tokens > 0,
+                            },
+                        )
                         .await
                     }
                 };

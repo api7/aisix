@@ -221,6 +221,25 @@ pub fn needs_counting(upstream_prompt: u32, upstream_completion: u32, has_output
     upstream_prompt == 0 || (upstream_completion == 0 && has_output)
 }
 
+/// An upper bound on the text [`fill_missing`] tokenizes for these inputs.
+fn estimate_bytes(
+    est: &Estimator,
+    upstream_prompt: u32,
+    upstream_completion: u32,
+    output_text: Option<&str>,
+) -> usize {
+    let prompt_bytes = if upstream_prompt == 0 {
+        est.prompt_bytes_bound()
+    } else {
+        0
+    };
+    let output_bytes = match output_text {
+        Some(text) if upstream_completion == 0 => text.len(),
+        _ => 0,
+    };
+    prompt_bytes.saturating_add(output_bytes)
+}
+
 /// [`fill_missing`] through [`crate::estimate_pool::run`], so a large count
 /// never runs on a request worker. The caller waits; the worker's other
 /// connections do not. Counters that need no counting return without
@@ -238,16 +257,13 @@ pub async fn fill_missing_pooled(
             estimated: false,
         };
     }
-    let prompt_bytes = if upstream_prompt == 0 {
-        est.prompt_bytes_bound()
-    } else {
-        0
-    };
-    let output_bytes = match &output_text {
-        Some(text) if upstream_completion == 0 => text.len(),
-        _ => 0,
-    };
-    crate::estimate_pool::run(prompt_bytes.saturating_add(output_bytes), move || {
+    let text_bytes = estimate_bytes(
+        &est,
+        upstream_prompt,
+        upstream_completion,
+        output_text.as_deref(),
+    );
+    crate::estimate_pool::run(text_bytes, move || {
         fill_missing(
             &est,
             upstream_prompt,
@@ -255,6 +271,114 @@ pub async fn fill_missing_pooled(
             output_text.as_deref(),
         )
     })
+    .await
+}
+
+/// What the cancel guard records for a call whose caller left while its
+/// estimate was pending: the usage as the handler's own record would carry
+/// it, with the estimate filled in.
+#[derive(Default)]
+pub(crate) struct CancelledUsage {
+    pub usage: aisix_gateway::chat::UsageStats,
+    pub usage_estimated: bool,
+}
+
+pub(crate) type CancelledUsageFn = Box<dyn FnOnce() -> CancelledUsage + Send>;
+
+impl CancelledUsage {
+    /// The upstream's counters with [`fill_missing`]'s result in place.
+    pub(crate) fn filled(upstream: aisix_gateway::chat::UsageStats, filled: Filled) -> Self {
+        Self {
+            usage: aisix_gateway::chat::UsageStats {
+                prompt_tokens: filled.prompt_tokens,
+                completion_tokens: filled.completion_tokens,
+                ..upstream
+            },
+            usage_estimated: filled.estimated,
+        }
+    }
+
+    /// Write the counters onto the cancel guard's terminal event the way a
+    /// handler's own record writes them.
+    pub(crate) fn apply(self, event: &mut aisix_obs::UsageEvent) {
+        let u = self.usage;
+        event.prompt_tokens = u.prompt_tokens;
+        event.completion_tokens = aisix_gateway::chat::recorded_completion_tokens(
+            u.prompt_tokens,
+            u.completion_tokens,
+            u.reasoning_tokens,
+            u.reasoning_folded_into_completion,
+            u.upstream_total_tokens,
+        );
+        event.total_tokens = u.upstream_total_tokens;
+        event.cached_prompt_tokens = u.cached_prompt_tokens;
+        event.cache_write_tokens = u.cache_write_tokens;
+        event.modality_tokens = u.modality;
+        event.cache_creation_ttl = u.cache_creation_ttl;
+        event.reasoning_tokens = u.reasoning_tokens;
+        event.cache_creation_tokens = u.cache_creation_tokens;
+        event.cache_read_tokens = u.cache_read_tokens;
+        event.usage_estimated = self.usage_estimated;
+    }
+}
+
+/// Run a non-streamed call's estimate through [`crate::estimate_pool::run`]
+/// after its upstream answered. While a pooled count is awaited, a caller
+/// that hangs up drops the handler before it records the call; the cancel
+/// guard then runs `job` inline from its `Drop` and records `on_cancel` of
+/// the result, so the row bills the call instead of reading zero tokens.
+pub(crate) async fn run_recorded_on_cancel<R: Send + 'static>(
+    text_bytes: usize,
+    job: impl Fn() -> R + Send + Sync + 'static,
+    on_cancel: impl FnOnce(R) -> CancelledUsage + Send + 'static,
+) -> R {
+    if text_bytes <= crate::estimate_pool::INLINE_MAX_BYTES {
+        return job();
+    }
+    let job = std::sync::Arc::new(job);
+    let inline = std::sync::Arc::clone(&job);
+    crate::attribution::publish_cancelled_usage(Box::new(move || on_cancel(inline())));
+    let result = crate::estimate_pool::run(text_bytes, move || job()).await;
+    crate::attribution::settle_cancelled_usage();
+    result
+}
+
+/// [`fill_missing`] for a non-streamed response, recorded by the cancel
+/// guard if the caller leaves while it is counted (see
+/// [`run_recorded_on_cancel`]). `upstream` is the response's usage as the
+/// upstream reported it, whose counters the record carries beside these.
+pub(crate) async fn fill_missing_recorded(
+    est: Estimator,
+    upstream: aisix_gateway::chat::UsageStats,
+    output_text: Option<String>,
+) -> Filled {
+    let (upstream_prompt, upstream_completion) =
+        (upstream.prompt_tokens, upstream.completion_tokens);
+    if !needs_counting(upstream_prompt, upstream_completion, output_text.is_some()) {
+        return Filled {
+            prompt_tokens: upstream_prompt,
+            completion_tokens: upstream_completion,
+            estimated: false,
+        };
+    }
+    let text_bytes = estimate_bytes(
+        &est,
+        upstream_prompt,
+        upstream_completion,
+        output_text.as_deref(),
+    );
+    run_recorded_on_cancel(
+        text_bytes,
+        move || {
+            fill_missing(
+                &est,
+                upstream_prompt,
+                upstream_completion,
+                output_text.as_deref(),
+            )
+        },
+        move |filled| CancelledUsage::filled(upstream, filled),
+    )
     .await
 }
 

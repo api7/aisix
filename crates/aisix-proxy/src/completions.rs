@@ -639,14 +639,45 @@ async fn dispatch(
                         .as_ref()
                         .map_or(0, crate::estimate_pool::serialized_bytes_bound)
                         .saturating_add(output.as_ref().map_or(0, String::len));
-                    let (prompt_n, completion_n) =
-                        crate::estimate_pool::run(text_bytes, move || {
+                    let upstream = UsageStats {
+                        cached_prompt_tokens: u.cached_prompt_tokens,
+                        cache_write_tokens: u.cache_write_tokens,
+                        cache_creation_ttl: u.cache_write_ttl,
+                        modality: u.modality,
+                        reasoning_tokens: u.reasoning_tokens,
+                        upstream_total_tokens: u.upstream_total_tokens,
+                        ..UsageStats::new(u.prompt_tokens, u.completion_tokens)
+                    };
+                    let (prompt_n, completion_n) = crate::token_estimate::run_recorded_on_cancel(
+                        text_bytes,
+                        move || {
                             (
-                                prompt.map(|p| count_completion_prompt(&est_model, p.as_ref())),
-                                output.map(|o| crate::token_estimate::count_text(&est_model, &o)),
+                                prompt
+                                    .as_ref()
+                                    .map(|p| count_completion_prompt(&est_model, p.as_ref())),
+                                output
+                                    .as_deref()
+                                    .map(|o| crate::token_estimate::count_text(&est_model, o)),
                             )
-                        })
-                        .await;
+                        },
+                        move |(prompt_n, completion_n): (Option<u32>, Option<u32>)| {
+                            let mut usage = upstream;
+                            let mut usage_estimated = false;
+                            if let Some(n) = prompt_n.filter(|n| *n > 0) {
+                                usage.prompt_tokens = n;
+                                usage_estimated = true;
+                            }
+                            if let Some(n) = completion_n.filter(|n| *n > 0) {
+                                usage.completion_tokens = n;
+                                usage_estimated = true;
+                            }
+                            crate::token_estimate::CancelledUsage {
+                                usage,
+                                usage_estimated,
+                            }
+                        },
+                    )
+                    .await;
                     if let Some(n) = prompt_n.filter(|n| *n > 0) {
                         u.prompt_tokens = n;
                         u.usage_estimated = true;

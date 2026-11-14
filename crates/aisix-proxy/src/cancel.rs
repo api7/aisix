@@ -20,8 +20,12 @@
 //!   no exit of the handler settled, with its tokens charged as the run
 //!   would have charged them (`crate::chat::PendingEnsemble`);
 //! - one terminal event for the request itself, `499` /
-//!   `client_disconnected`, zero tokens and zero cost, naming the target
-//!   that was in flight when the caller went away.
+//!   `client_disconnected`, naming the target that was in flight when the
+//!   caller went away. It carries zero tokens and zero cost, except when
+//!   the upstream had answered and the call's local token estimate was
+//!   still being counted off the worker: the guard counts it inline and
+//!   the row carries those tokens
+//!   ([`crate::token_estimate::run_recorded_on_cancel`]).
 //!
 //! Exactly one emitter ever speaks for a given request. The guard rides the
 //! request from the middleware to the end of its response body and writes
@@ -212,6 +216,9 @@ pub(crate) fn emit(
     if ctx.emitted_terminal {
         return;
     }
+    // The caller left while the answered call's estimate was being counted
+    // off the worker: count it here, so the row bills the call.
+    let cancelled_usage = ctx.cancelled_usage.take().map(|count| count());
     // The attempt this event speaks for: the one in flight, else the one
     // that WON and was still being processed when the caller left. A failed
     // attempt is never chosen — the loop above already emitted its event,
@@ -293,6 +300,10 @@ pub(crate) fn emit(
         error_message: phase.message().to_string(),
         ..base_event(request_id, resolved, &ctx, &client, inbound_protocol, &pk)
     };
+    let mut event = event;
+    if let Some(usage) = cancelled_usage {
+        usage.apply(&mut event);
+    }
     let dispatched = attempt.as_ref().is_some_and(|a| a.dispatched);
     emit_one(
         state,

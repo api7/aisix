@@ -1166,9 +1166,12 @@ async fn estimate_missing_chat_usage(
         upstream_model,
         crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
     );
-    let filled =
-        crate::token_estimate::fill_missing_pooled(est, p, c, Some(estimation_output_text(resp)))
-            .await;
+    let filled = crate::token_estimate::fill_missing_recorded(
+        est,
+        resp.usage.clone(),
+        Some(estimation_output_text(resp)),
+    )
+    .await;
     (
         filled.prompt_tokens,
         filled.completion_tokens,

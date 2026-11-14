@@ -44,6 +44,8 @@ type Job = Box<dyn FnOnce() + Send>;
 
 struct Pool {
     slots: Arc<Semaphore>,
+    #[cfg(test)]
+    capacity: u32,
     jobs: mpsc::Sender<Job>,
 }
 
@@ -67,6 +69,8 @@ fn pool() -> Option<&'static Pool> {
             .count();
         (started > 0).then(|| Pool {
             slots: Arc::new(Semaphore::new(started * SLOTS_PER_THREAD)),
+            #[cfg(test)]
+            capacity: (started * SLOTS_PER_THREAD) as u32,
             jobs: tx,
         })
     })
@@ -128,6 +132,17 @@ pub(crate) async fn run<R: Send + 'static>(
 /// small one. Any such length is reported as `INLINE_MAX_BYTES + 1`.
 pub(crate) fn serialized_bytes_bound(value: &impl serde::Serialize) -> usize {
     json_len::json_len_within(value, INLINE_MAX_BYTES).unwrap_or(INLINE_MAX_BYTES + 1)
+}
+
+/// Take every place in the pool, so a test can hold a pooled estimate in
+/// its wait for as long as it keeps the permit.
+#[cfg(test)]
+pub(crate) async fn hold_every_slot() -> tokio::sync::OwnedSemaphorePermit {
+    let pool = pool().expect("the estimation pool starts its threads under test");
+    Arc::clone(&pool.slots)
+        .acquire_many_owned(pool.capacity)
+        .await
+        .expect("the estimation pool's semaphore is never closed")
 }
 
 #[cfg(test)]

@@ -1760,10 +1760,9 @@ async fn responses_to_target(
                         &body_bytes,
                     )),
                 );
-                let filled = crate::token_estimate::fill_missing_pooled(
+                let filled = crate::token_estimate::fill_missing_recorded(
                     est,
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
+                    usage.usage_stats(),
                     Some(responses_sse_output_text(&buf)),
                 )
                 .await;
@@ -2216,10 +2215,9 @@ async fn responses_to_target(
                         &body_bytes,
                     )),
                 );
-                let filled = crate::token_estimate::fill_missing_pooled(
+                let filled = crate::token_estimate::fill_missing_recorded(
                     est,
-                    u.prompt_tokens,
-                    u.completion_tokens,
+                    u.usage_stats(),
                     Some(responses_output_text(&json_body)),
                 )
                 .await;
@@ -2808,10 +2806,9 @@ async fn responses_cross_provider_to_target(
                 model.upstream_model().unwrap_or("unknown"),
                 crate::token_estimate::PromptInput::Responses(body.clone()),
             );
-            let filled = crate::token_estimate::fill_missing_pooled(
+            let filled = crate::token_estimate::fill_missing_recorded(
                 est,
-                u.prompt_tokens,
-                u.completion_tokens,
+                u.usage_stats(),
                 Some(crate::chat::estimation_output_text(&resp)),
             )
             .await;
