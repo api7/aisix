@@ -1166,17 +1166,11 @@ async fn count_a2a_call(call: &A2aCall) -> A2aCounted {
     count_a2a_text(call.text.request.clone(), call.text.response.joined()).await
 }
 
-/// Text below which an A2A count stays inline: tokenizing it costs well
-/// under a millisecond, and every A2A call counts — rejections included —
-/// so queueing those behind other requests' large estimates would only
-/// slow them down.
-const INLINE_COUNT_BELOW_BYTES: usize = 16 * 1024;
-
 async fn count_a2a_text(request: String, response_text: String) -> A2aCounted {
-    if request.len() + response_text.len() < INLINE_COUNT_BELOW_BYTES {
-        return count_a2a_words(&request, response_text);
-    }
-    crate::estimate_pool::run(move || count_a2a_words(&request, response_text)).await
+    crate::estimate_pool::run(request.len() + response_text.len(), move || {
+        count_a2a_words(&request, response_text)
+    })
+    .await
 }
 
 fn count_a2a_words(request: &str, response_text: String) -> A2aCounted {

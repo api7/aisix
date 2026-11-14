@@ -22,10 +22,18 @@
 //! (`token_estimate::CountedAhead`), and a client that closes on that frame
 //! leaves `Drop` a finished count; only a stream abandoned before its end
 //! still estimates inline on its worker.
+//!
+//! Small estimates never come here: [`run`] counts them on the caller.
 
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 use tokio::sync::{oneshot, Semaphore};
+
+/// Text an estimate tokenizes, at most, to be counted inline on the calling
+/// worker. Tokenizing costs about 35 ns per byte, so this blocks a worker
+/// for at most ~0.6 ms; below it, handing the job to the pool and waking
+/// the caller costs more CPU than the count itself.
+pub(crate) const INLINE_MAX_BYTES: usize = 16 * 1024;
 
 /// Admitted jobs per pool thread: the one it runs and one waiting behind it.
 const SLOTS_PER_THREAD: usize = 2;
@@ -76,13 +84,21 @@ fn work(rx: &Mutex<mpsc::Receiver<Job>>) {
     }
 }
 
-/// Run `job` on the pool, waiting for a place first, and return what it
-/// produced. A panic inside `job` is re-raised here.
+/// Run `job`, an estimate tokenizing at most `text_bytes` bytes, and return
+/// what it produced: inline when that is at most [`INLINE_MAX_BYTES`],
+/// otherwise on the pool, waiting for a place first. A panic inside `job`
+/// is re-raised here.
 ///
 /// Dropping the future while it waits for a place takes nothing; dropping
 /// it once the job is admitted lets the job finish and discards its
 /// product, so the job's place is held until then either way.
-pub(crate) async fn run<R: Send + 'static>(job: impl FnOnce() -> R + Send + 'static) -> R {
+pub(crate) async fn run<R: Send + 'static>(
+    text_bytes: usize,
+    job: impl FnOnce() -> R + Send + 'static,
+) -> R {
+    if text_bytes <= INLINE_MAX_BYTES {
+        return job();
+    }
     let Some(pool) = pool() else {
         return job();
     };
@@ -102,6 +118,32 @@ pub(crate) async fn run<R: Send + 'static>(job: impl FnOnce() -> R + Send + 'sta
         .unwrap_or_else(|_| panic!("token estimation job panicked"))
 }
 
+/// The serialized size of `value`, an upper bound on the text an estimate
+/// tokenizes from it. Serialization stops once the size passes
+/// [`INLINE_MAX_BYTES`], so probing a large request costs no more than a
+/// small one; any such size, or a value that fails to serialize, is
+/// reported as `INLINE_MAX_BYTES + 1`.
+pub(crate) fn serialized_bytes_bound(value: &impl serde::Serialize) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            if self.0 > INLINE_MAX_BYTES {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => counter.0,
+        Err(_) => INLINE_MAX_BYTES + 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,7 +154,28 @@ mod tests {
             .build()
             .unwrap();
         let caller = std::thread::current().id();
-        let ran_on = rt.block_on(run(|| std::thread::current().id()));
+        let ran_on = rt.block_on(run(INLINE_MAX_BYTES + 1, || std::thread::current().id()));
         assert_ne!(ran_on, caller);
+    }
+
+    #[test]
+    fn small_jobs_run_on_the_calling_thread() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let caller = std::thread::current().id();
+        let ran_on = rt.block_on(run(INLINE_MAX_BYTES, || std::thread::current().id()));
+        assert_eq!(ran_on, caller);
+    }
+
+    #[test]
+    fn serialized_bound_stops_past_the_inline_limit() {
+        let small = serde_json::json!({"input": "x".repeat(100)});
+        assert_eq!(
+            serialized_bytes_bound(&small),
+            serde_json::to_vec(&small).unwrap().len()
+        );
+        let large = serde_json::json!({"input": "x".repeat(10 * INLINE_MAX_BYTES)});
+        assert_eq!(serialized_bytes_bound(&large), INLINE_MAX_BYTES + 1);
     }
 }

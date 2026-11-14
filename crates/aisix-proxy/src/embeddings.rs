@@ -713,10 +713,12 @@ async fn dispatch(
                 let estimated = match &req.token_input {
                     Some(tokens) => token_id_count(tokens),
                     None => {
-                        // Counted on the estimation pool, off the request worker.
+                        // Counted off the request worker unless the input is small.
                         let upstream_model = model.upstream_model().unwrap_or("unknown").to_owned();
                         let input = req.input.clone();
-                        crate::estimate_pool::run(move || {
+                        let input_bytes =
+                            input.iter().fold(0usize, |n, s| n.saturating_add(s.len()));
+                        crate::estimate_pool::run(input_bytes, move || {
                             input.iter().fold(0u32, |acc, s| {
                                 acc.saturating_add(crate::token_estimate::count_text(
                                     &upstream_model,

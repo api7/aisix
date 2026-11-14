@@ -630,18 +630,23 @@ async fn dispatch(
                     usage_estimated: false,
                 });
                 if u.prompt_tokens == 0 || u.completion_tokens == 0 {
-                    // Counted on the estimation pool, off the request worker.
+                    // Counted off the request worker unless the text is small.
                     let est_model = model.upstream_model().unwrap_or("unknown").to_owned();
                     let prompt = (u.prompt_tokens == 0).then(|| body.get("prompt").cloned());
                     let output =
                         (u.completion_tokens == 0).then(|| completion_output_text(&resp_json));
-                    let (prompt_n, completion_n) = crate::estimate_pool::run(move || {
-                        (
-                            prompt.map(|p| count_completion_prompt(&est_model, p.as_ref())),
-                            output.map(|o| crate::token_estimate::count_text(&est_model, &o)),
-                        )
-                    })
-                    .await;
+                    let text_bytes = prompt
+                        .as_ref()
+                        .map_or(0, crate::estimate_pool::serialized_bytes_bound)
+                        .saturating_add(output.as_ref().map_or(0, String::len));
+                    let (prompt_n, completion_n) =
+                        crate::estimate_pool::run(text_bytes, move || {
+                            (
+                                prompt.map(|p| count_completion_prompt(&est_model, p.as_ref())),
+                                output.map(|o| crate::token_estimate::count_text(&est_model, &o)),
+                            )
+                        })
+                        .await;
                     if let Some(n) = prompt_n.filter(|n| *n > 0) {
                         u.prompt_tokens = n;
                         u.usage_estimated = true;

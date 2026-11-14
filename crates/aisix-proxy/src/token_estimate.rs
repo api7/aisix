@@ -160,6 +160,20 @@ impl Estimator {
     pub fn count_output(&self, text: &str) -> u32 {
         count_text(&self.model, text)
     }
+
+    /// An upper bound on the prompt text [`Self::count_prompt`] tokenizes,
+    /// for [`crate::estimate_pool::run`]: the stored wire bytes, or the
+    /// captured request's serialized size up to the inline limit.
+    fn prompt_bytes_bound(&self) -> usize {
+        use crate::estimate_pool::serialized_bytes_bound;
+        match &*self.input {
+            PromptInput::Chat(req) => serialized_bytes_bound(req),
+            PromptInput::Anthropic(body) | PromptInput::Responses(body) => {
+                serialized_bytes_bound(body)
+            }
+            PromptInput::ResponsesWire(wire) | PromptInput::AnthropicWire(wire) => wire.len(),
+        }
+    }
 }
 
 /// Count `text` as plain text with the model's encoding — the
@@ -207,9 +221,10 @@ pub fn needs_counting(upstream_prompt: u32, upstream_completion: u32, has_output
     upstream_prompt == 0 || (upstream_completion == 0 && has_output)
 }
 
-/// [`fill_missing`] on the estimation pool, so the tokenizer never runs on
-/// a request worker. The caller waits; the worker's other connections do
-/// not. Counters that need no counting return without leaving the worker.
+/// [`fill_missing`] through [`crate::estimate_pool::run`], so a large count
+/// never runs on a request worker. The caller waits; the worker's other
+/// connections do not. Counters that need no counting return without
+/// leaving the worker.
 pub async fn fill_missing_pooled(
     est: Estimator,
     upstream_prompt: u32,
@@ -223,7 +238,16 @@ pub async fn fill_missing_pooled(
             estimated: false,
         };
     }
-    crate::estimate_pool::run(move || {
+    let prompt_bytes = if upstream_prompt == 0 {
+        est.prompt_bytes_bound()
+    } else {
+        0
+    };
+    let output_bytes = match &output_text {
+        Some(text) if upstream_completion == 0 => text.len(),
+        _ => 0,
+    };
+    crate::estimate_pool::run(prompt_bytes.saturating_add(output_bytes), move || {
         fill_missing(
             &est,
             upstream_prompt,
