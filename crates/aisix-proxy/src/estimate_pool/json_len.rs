@@ -48,7 +48,7 @@ impl JsonLen {
     }
 }
 
-impl<'a> ser::Serializer for &'a mut JsonLen {
+impl ser::Serializer for &mut JsonLen {
     type Ok = ();
     type Error = OverLimit;
     type SerializeSeq = Self;
