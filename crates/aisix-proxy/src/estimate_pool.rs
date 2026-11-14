@@ -77,7 +77,18 @@ fn pool() -> Option<&'static Pool> {
     .as_ref()
 }
 
+thread_local! {
+    static ON_POOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the caller is one of the pool's threads, which count with their
+/// own tokenizer instances (`token_estimate::pool_bpe_for`).
+pub(crate) fn on_pool_thread() -> bool {
+    ON_POOL.with(std::cell::Cell::get)
+}
+
 fn work(rx: &Mutex<mpsc::Receiver<Job>>) {
+    ON_POOL.with(|on| on.set(true));
     loop {
         let job = match rx.lock() {
             Ok(rx) => rx.recv(),

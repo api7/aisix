@@ -627,7 +627,11 @@ impl StreamEstimate {
 }
 
 fn bpe_for(model: &str) -> &'static CoreBPE {
-    match get_tokenizer(model) {
+    let tokenizer = get_tokenizer(model);
+    if crate::estimate_pool::on_pool_thread() {
+        return pool_bpe_for(tokenizer);
+    }
+    match tokenizer {
         Some(Tokenizer::O200kHarmony) => tiktoken_rs::o200k_harmony_singleton(),
         Some(Tokenizer::O200kBase) => tiktoken_rs::o200k_base_singleton(),
         Some(Tokenizer::P50kBase) => tiktoken_rs::p50k_base_singleton(),
@@ -635,6 +639,26 @@ fn bpe_for(model: &str) -> &'static CoreBPE {
         Some(Tokenizer::R50kBase | Tokenizer::Gpt2) => tiktoken_rs::r50k_base_singleton(),
         Some(Tokenizer::Cl100kBase) | None => tiktoken_rs::cl100k_base_singleton(),
     }
+}
+
+/// The estimate pool's own instance of each encoding, apart from the
+/// singletons the request workers count with. Clones of a tiktoken
+/// `CoreBPE`'s regex share one regex cache pool, and only the first thread
+/// to use that pool gets its lock-free fast path. A worker counting a small
+/// estimate inline would otherwise take it for good and leave every pool
+/// thread on the locked path for each regex match. Built on first use: it
+/// is one more vocabulary copy for each encoding the pool counts with.
+fn pool_bpe_for(tokenizer: Option<Tokenizer>) -> &'static CoreBPE {
+    static INSTANCES: [std::sync::OnceLock<CoreBPE>; 6] = [const { std::sync::OnceLock::new() }; 6];
+    let (slot, build): (usize, fn() -> Result<CoreBPE, _>) = match tokenizer {
+        Some(Tokenizer::O200kHarmony) => (0, tiktoken_rs::o200k_harmony),
+        Some(Tokenizer::O200kBase) => (1, tiktoken_rs::o200k_base),
+        Some(Tokenizer::P50kBase) => (2, tiktoken_rs::p50k_base),
+        Some(Tokenizer::P50kEdit) => (3, tiktoken_rs::p50k_edit),
+        Some(Tokenizer::R50kBase | Tokenizer::Gpt2) => (4, tiktoken_rs::r50k_base),
+        Some(Tokenizer::Cl100kBase) | None => (5, tiktoken_rs::cl100k_base),
+    };
+    INSTANCES[slot].get_or_init(|| build().expect("tiktoken's bundled encodings load"))
 }
 
 fn clamp(n: usize) -> u32 {
@@ -1541,6 +1565,28 @@ mod tests {
             bpe_for(""),
             tiktoken_rs::cl100k_base_singleton(),
         ));
+    }
+
+    /// The pool's threads never count with the workers' singletons, so a
+    /// worker counting first cannot hold the regex cache's fast path from
+    /// them; counts come out the same from either instance.
+    #[tokio::test]
+    async fn the_pool_counts_with_its_own_tokenizer_instances() {
+        let text = "pooled words, ".repeat(2_000);
+        for model in ["gpt-4o", "gpt-4", "claude-sonnet-4-5"] {
+            let on_worker = count_text(model, &text);
+            let (m, t) = (model.to_owned(), text.clone());
+            let (instance, on_pool) = crate::estimate_pool::run(t.len(), move || {
+                (bpe_for(&m) as *const CoreBPE as usize, count_text(&m, &t))
+            })
+            .await;
+            assert_ne!(
+                instance,
+                bpe_for(model) as *const CoreBPE as usize,
+                "{model}: the pool counted with the workers' instance",
+            );
+            assert_eq!(on_pool, on_worker, "{model}");
+        }
     }
 
     #[test]
