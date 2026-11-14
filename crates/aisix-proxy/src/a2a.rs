@@ -423,7 +423,8 @@ async fn dispatch(
                 /* dispatched */ false,
                 Some(&err),
                 None,
-            );
+            )
+            .await;
             let response = err.into_response();
             return response;
         }
@@ -480,7 +481,8 @@ async fn dispatch(
                 /* dispatched */ true,
                 /* refusal */ None,
                 in_band.as_ref(),
-            );
+            )
+            .await;
             axum::Json(response_value).into_response()
         }
         Err(err) => {
@@ -502,7 +504,8 @@ async fn dispatch(
                 /* dispatched */ true,
                 /* refusal */ None,
                 Some(&A2aFailure::of(&err)),
-            );
+            )
+            .await;
             a2a_error_response(rpc_id, status, &err.to_string())
         }
     }
@@ -542,13 +545,34 @@ struct StreamUsageOnDrop {
     /// the request's terminal emission, so it carries the terminal spans.
     trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     _concurrency: aisix_ratelimit::StreamConcurrencyGuard,
+    /// The words counted ahead, keyed by the request length and response
+    /// revision they were counted at.
+    counted: crate::token_estimate::CountedAhead<(usize, u32), A2aCounted>,
+    /// Set once the call's usage is emitted, by the stream's normal end or
+    /// by Drop.
+    emitted: bool,
 }
 
-impl Drop for StreamUsageOnDrop {
-    fn drop(&mut self) {
-        // A panic is already unwinding; emitting here would at best double-report
-        // and at worst panic again while panicking.
-        if std::thread::panicking() {
+impl StreamUsageOnDrop {
+    /// Count the call's words ahead, before the terminal event is released:
+    /// an A2A client stops reading there, and the Drop that follows then
+    /// emits this count instead of counting on the request worker. It
+    /// answers only while the words are unchanged: the request only grows,
+    /// so its length identifies it, and the response's revision changes
+    /// with every update to it.
+    async fn count_ahead(&mut self) {
+        let text = &self.call.text;
+        self.counted
+            .count(words_key(text), || {
+                count_a2a_text(text.request.clone(), text.response.joined())
+            })
+            .await;
+    }
+
+    /// Emit the call's usage once, from the count ahead while it still
+    /// fits and otherwise counting here (Drop cannot wait).
+    fn emit(&mut self) {
+        if std::mem::replace(&mut self.emitted, true) {
             return;
         }
         // A stream the caller abandoned mid-task is recorded as 499, the same
@@ -560,10 +584,14 @@ impl Drop for StreamUsageOnDrop {
         } else {
             crate::CLIENT_CLOSED_REQUEST
         };
+        let text = &self.call.text;
+        let counted = self.counted.take_or(&words_key(text), || {
+            count_a2a_words(&text.request, text.response.joined())
+        });
         // A stream can outlive several config generations, so the
         // end-of-stream emit reads a FRESH snapshot rather than the one the
         // request started on (#941).
-        emit_a2a_usage(
+        emit_a2a_usage_counted(
             &self.state,
             &self.state.snapshot.load(),
             &self.auth,
@@ -576,7 +604,24 @@ impl Drop for StreamUsageOnDrop {
             /* dispatched */ true,
             /* refusal */ None,
             self.failure.as_ref(),
+            counted,
         );
+    }
+}
+
+/// What identifies the words a count was taken from.
+fn words_key(text: &A2aCallText) -> (usize, u32) {
+    (text.request.len(), text.response.revision())
+}
+
+impl Drop for StreamUsageOnDrop {
+    fn drop(&mut self) {
+        // A panic is already unwinding; emitting here would at best double-report
+        // and at worst panic again while panicking.
+        if std::thread::panicking() {
+            return;
+        }
+        self.emit();
     }
 }
 
@@ -629,7 +674,8 @@ async fn dispatch_stream(
                 /* dispatched */ true,
                 /* refusal */ None,
                 Some(&A2aFailure::of(&err)),
-            );
+            )
+            .await;
             return a2a_error_response(rpc_id, status, &err.to_string());
         }
     };
@@ -645,6 +691,8 @@ async fn dispatch_stream(
         failure: None,
         trace,
         _concurrency: reservation.into_stream_hold(),
+        counted: Default::default(),
+        emitted: false,
     };
     let agent_label = agent.to_string();
 
@@ -674,11 +722,12 @@ async fn dispatch_stream(
                             .response
                             .observe(&value, crate::token_estimate::push_capped);
                     }
+                    // A caller stops reading at an in-band error, as at a
+                    // terminal event, and that is not abandoning the stream.
+                    let mut ends_stream = is_stream_end(&value);
                     if let Some(failure) = A2aFailure::in_band(&value) {
                         guard.failure.get_or_insert(failure);
-                        // A caller stops reading at the error, as at a terminal
-                        // event, and that is not abandoning the stream.
-                        guard.call.stream.reached_end = true;
+                        ends_stream = true;
                         crate::usage_attr::note_client_error_body(
                             &guard.state.snapshot.load(),
                             || value.to_string(),
@@ -705,8 +754,11 @@ async fn dispatch_stream(
                     // for an agent that leaves the connection open after
                     // finishing, never happens. Marking the end at the loop
                     // exit instead reported every such completed task as
-                    // abandoned.
-                    if is_stream_end(&value) {
+                    // abandoned. The words are counted ahead first, so a
+                    // caller gone during that count is still recorded as
+                    // abandoned: the event never reached it.
+                    if ends_stream {
+                        guard.count_ahead().await;
                         guard.call.stream.reached_end = true;
                     }
                     yield Ok::<_, std::convert::Infallible>(
@@ -730,7 +782,8 @@ async fn dispatch_stream(
         // The upstream ran out or faulted without ever marking the stream
         // finished. Either way the caller was handed everything there was.
         guard.call.stream.reached_end = true;
-        drop(guard);
+        guard.count_ahead().await;
+        guard.emit();
     });
 
     // The endpoint tail below owns this request's access-log line, and from
@@ -1021,7 +1074,8 @@ async fn guardrail_block_response(
         // This IS the guardrail refusal.
         Some(&refusal),
         None,
-    );
+    )
+    .await;
     Some(response)
 }
 
@@ -1058,7 +1112,103 @@ fn a2a_error_envelope(id: Option<serde_json::Value>, message: &str) -> serde_jso
 /// families ride here too: a path that accounts for a call cannot skip
 /// metering it.
 #[allow(clippy::too_many_arguments)]
-fn emit_a2a_usage(
+async fn emit_a2a_usage(
+    state: &ProxyState,
+    snap: &aisix_core::AisixSnapshot,
+    auth: &AuthenticatedKey,
+    request_id: &str,
+    agent: &str,
+    call: &A2aCall,
+    status_code: u16,
+    latency: Duration,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
+    dispatched: bool,
+    refusal: Option<&crate::error::ProxyError>,
+    failure: Option<&A2aFailure>,
+) {
+    let counted = count_a2a_call(call).await;
+    emit_a2a_usage_counted(
+        state,
+        snap,
+        auth,
+        request_id,
+        agent,
+        call,
+        status_code,
+        latency,
+        trace,
+        dispatched,
+        refusal,
+        failure,
+        counted,
+    );
+}
+
+/// The gateway's count of the words on one A2A call, with the agent's
+/// joined text it was taken from (content capture reads it too).
+struct A2aCounted {
+    response_text: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+}
+
+/// Count `call`'s words, off the request worker unless they are few. A
+/// caller that hangs up while they are counted off the worker still gets
+/// them on its row (see [`crate::token_estimate::run_recorded_on_cancel`]).
+async fn count_a2a_call(call: &A2aCall) -> A2aCounted {
+    let request = call.text.request.clone();
+    let response_text = std::sync::Arc::new(call.text.response.joined());
+    let counting = std::sync::Arc::clone(&response_text);
+    let (prompt_tokens, completion_tokens) = crate::token_estimate::run_recorded_on_cancel(
+        request.len() + response_text.len(),
+        move || a2a_word_counts(&request, &counting),
+        |(prompt_tokens, completion_tokens)| crate::token_estimate::CancelledUsage {
+            usage: aisix_gateway::UsageStats::new(prompt_tokens, completion_tokens),
+            usage_estimated: true,
+            answered_after_ms: None,
+        },
+        // A2A commits no tokens to a rate-limit window.
+        || None,
+    )
+    .await;
+    A2aCounted {
+        // The count's own handle is normally gone by now; copying is only
+        // the fallback for a pool thread that has not dropped it yet.
+        response_text: std::sync::Arc::try_unwrap(response_text)
+            .unwrap_or_else(|shared| shared.as_ref().clone()),
+        prompt_tokens,
+        completion_tokens,
+    }
+}
+
+async fn count_a2a_text(request: String, response_text: String) -> A2aCounted {
+    crate::estimate_pool::run(request.len() + response_text.len(), move || {
+        count_a2a_words(&request, response_text)
+    })
+    .await
+}
+
+fn count_a2a_words(request: &str, response_text: String) -> A2aCounted {
+    let (prompt_tokens, completion_tokens) = a2a_word_counts(request, &response_text);
+    A2aCounted {
+        response_text,
+        prompt_tokens,
+        completion_tokens,
+    }
+}
+
+/// `(prompt, completion)` tokens of one call's words.
+fn a2a_word_counts(request: &str, response_text: &str) -> (u32, u32) {
+    // No model resolves on this endpoint, so the estimator falls back to its
+    // default encoding — the same thing it does for any non-OpenAI model.
+    (
+        crate::token_estimate::count_text("", request),
+        crate::token_estimate::count_text("", response_text),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_a2a_usage_counted(
     state: &ProxyState,
     // The request's snapshot, loaded once by the caller (#941).
     snap: &aisix_core::AisixSnapshot,
@@ -1080,13 +1230,14 @@ fn emit_a2a_usage(
     refusal: Option<&crate::error::ProxyError>,
     // The upstream agent's failure, for a call that reached it.
     failure: Option<&A2aFailure>,
+    counted: A2aCounted,
 ) {
     let guardrail_blocked = refusal.is_some_and(crate::error::ProxyError::is_guardrail_block);
-    // No model resolves on this endpoint, so the estimator falls back to its
-    // default encoding — the same thing it does for any non-OpenAI model.
-    let response_text = call.text.response.joined();
-    let prompt_tokens = crate::token_estimate::count_text("", &call.text.request);
-    let completion_tokens = crate::token_estimate::count_text("", &response_text);
+    let A2aCounted {
+        response_text,
+        prompt_tokens,
+        completion_tokens,
+    } = counted;
     let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
@@ -1976,6 +2127,89 @@ mod tests {
             event.usage_estimated,
             "the gateway counted these, not the agent — the flag says so"
         );
+    }
+
+    /// An agent that answers at once with more text than an estimate counts
+    /// inline, so the call's count goes to the estimation pool.
+    async fn spawn_verbose_agent(text: String) -> String {
+        let app = axum::Router::new().route(
+            "/a2a",
+            axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+                let text = text.clone();
+                async move {
+                    axum::Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": body.0["id"],
+                        "result": {
+                            "kind": "message",
+                            "messageId": "m-1",
+                            "role": "agent",
+                            "parts": [{"kind": "text", "text": text}],
+                        }
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}/a2a")
+    }
+
+    /// The agent answered, and the caller hung up while the gateway was
+    /// still counting the answer's words on the estimation pool. The row the
+    /// cancel guard files must bill those words, not read zero tokens.
+    #[tokio::test]
+    async fn a_call_abandoned_while_its_words_are_counted_still_bills_them() {
+        use aisix_obs::{UsageEvent, UsageSink};
+
+        let text = "word ".repeat(5_000);
+        let agent_url = spawn_verbose_agent(text.clone()).await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UsageEvent>(8);
+        let handle = SnapshotHandle::new(snapshot_with(&agent_url, true, serde_json::json!(["*"])));
+        let hub = Arc::new(aisix_gateway::Hub::new());
+        let state = ProxyState::new(handle, hub, &proxy_cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let router = build_router(state);
+
+        let held = crate::estimate_pool::hold_every_slot().await;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            router.oneshot(
+                HttpRequest::post("/a2a/invoice")
+                    .header("host", "gw.example.com")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":"s","method":"message/send"}"#,
+                    ))
+                    .unwrap(),
+            ),
+        )
+        .await;
+        // The pool is shared with every other test in this binary: free it
+        // as soon as the request is gone.
+        drop(held);
+        assert!(
+            outcome.is_err(),
+            "the call finished — its count never waited for the pool",
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("an abandoned A2A call emitted no usage event")
+            .expect("sender dropped without sending");
+        assert_eq!(event.status_code, crate::CLIENT_CLOSED_REQUEST, "{event:?}");
+        assert_eq!(event.error_class, "client_disconnected", "{event:?}");
+        // 5000 words, about one token each.
+        assert!(event.completion_tokens >= 4_900, "{event:?}");
+        assert!(event.usage_estimated, "{event:?}");
+        assert!(rx.try_recv().is_err(), "one call, one row");
     }
 
     /// An agent that answers with words rather than a bare task record.

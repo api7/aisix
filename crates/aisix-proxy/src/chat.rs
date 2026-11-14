@@ -1153,10 +1153,11 @@ pub(crate) fn estimation_output_text(resp: &aisix_gateway::ChatResponse) -> Stri
 /// response (AISIX-Cloud#1074): the token counters the upstream never
 /// reported, counted locally. Per counter, so a number it did report
 /// always stands. Returns `(prompt, completion, estimated)`.
-fn estimate_missing_chat_usage(
+async fn estimate_missing_chat_usage(
     resp: &aisix_gateway::ChatResponse,
     upstream_model: &str,
     req: &ChatFormat,
+    rate: impl FnOnce() -> Option<crate::token_estimate::RateCommit>,
 ) -> (u32, u32, bool) {
     let (p, c) = (resp.usage.prompt_tokens, resp.usage.completion_tokens);
     if p != 0 && c != 0 {
@@ -1166,8 +1167,15 @@ fn estimate_missing_chat_usage(
         upstream_model,
         crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
     );
-    let filled =
-        crate::token_estimate::fill_missing(&est, p, c, Some(&estimation_output_text(resp)));
+    let filled = crate::token_estimate::fill_missing_recorded(
+        est,
+        resp.usage.clone(),
+        Some(estimation_output_text(resp)),
+        rate,
+        // The winning attempt is already settled.
+        None,
+    )
+    .await;
     (
         filled.prompt_tokens,
         filled.completion_tokens,
@@ -1247,6 +1255,18 @@ fn estimate_subcall_tokens(
         filled.prompt_tokens,
         filled.completion_tokens,
         filled.estimated,
+    )
+}
+
+/// The token cost a non-streamed chat call commits to its rate-limit
+/// layers for `usage`.
+fn chat_committed_tokens(usage: &aisix_gateway::chat::UsageStats) -> u64 {
+    cache_inclusive_total(
+        u64::from(usage.total_tokens),
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cache_creation_tokens,
+        usage.cache_read_tokens,
     )
 }
 
@@ -2801,12 +2821,13 @@ async fn dispatch(
                         entry_model.upstream_model().unwrap_or(&producer_model),
                         crate::token_estimate::PromptInput::Chat(Box::new(req.clone())),
                     );
-                    let filled = crate::token_estimate::fill_missing(
-                        &est,
+                    let filled = crate::token_estimate::fill_missing_pooled(
+                        est,
                         prompt as u32,
                         completion as u32,
-                        Some(&estimation_output_text(&cached)),
-                    );
+                        Some(estimation_output_text(&cached)),
+                    )
+                    .await;
                     if filled.estimated {
                         let total = crate::usage_attr::total_tokens_with_cache(
                             filled.prompt_tokens,
@@ -3272,7 +3293,14 @@ async fn dispatch(
     // exit below — see `apply_estimated_usage` for why the cache write and
     // the quota total in between must still see the upstream's own.
     let (prompt_tokens_u32, completion_tokens_u32, usage_estimated) =
-        estimate_missing_chat_usage(&upstream, &upstream_model, req);
+        estimate_missing_chat_usage(&upstream, &upstream_model, req, || {
+            crate::token_estimate::RateCommit::new(
+                &state.limiter,
+                [Some(&reservation), won_member_reservation.as_ref()],
+                chat_committed_tokens,
+            )
+        })
+        .await;
     let prompt = prompt_tokens_u32 as u64;
     let completion = completion_tokens_u32 as u64;
     let total = cache_inclusive_total(
@@ -5818,7 +5846,26 @@ struct CompleteOnDrop<F: FnOnce(StreamCompletion)> {
     /// ends with no upstream-reported usage, Drop fills the missing
     /// counters from this estimator (prompt from the captured request,
     /// completion from `est_output_text`) and sets `usage_estimated`.
-    estimator: Option<crate::token_estimate::Estimator>,
+    estimate: crate::token_estimate::StreamEstimate,
+}
+
+/// What the stream's estimate counts, after the #419 gate: the completion
+/// side only once something was delivered.
+fn chat_estimate_inputs(
+    c: &StreamCompletion,
+    delivered: u32,
+) -> crate::token_estimate::EstimateInputs<'_> {
+    crate::token_estimate::EstimateInputs {
+        upstream_prompt: c.prompt_tokens,
+        upstream_completion: if delivered == 0 {
+            0
+        } else {
+            c.completion_tokens
+        },
+        output: (delivered > 0).then_some(c.est_output_text.as_str()),
+        // The output buffer only grows: its length identifies it.
+        output_revision: 0,
+    }
 }
 
 impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
@@ -5829,74 +5876,93 @@ impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
             .expect("CompleteOnDrop guard accessed after take")
             .1
     }
-}
 
-impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
-    fn drop(&mut self) {
-        if let Some((f, mut c)) = self.slot.take() {
-            // Snapshot the wire-delivered count for telemetry visibility
-            // AND for the cost-leak gate below.
-            let delivered = self.delivered.load(Ordering::Relaxed);
-            c.chunks_delivered = delivered;
-            // Issue #419 — cost-leak gate. If the consumer disconnected
-            // before any chunk was delivered (e.g. AbortController.abort()
-            // mid-`upstream.next().await`, or axum dropped the response
-            // future before the first chunk was pulled), the upstream's
-            // `usage` block is meaningless for billing — no completion
-            // tokens crossed the wire to the client. Zero out the
-            // completion-side counters but keep `prompt_tokens` (the
-            // prompt was processed by upstream regardless, and the
-            // industry contract is "prompts always billed").
-            if delivered == 0 {
-                c.completion_tokens = 0;
-                c.reasoning_tokens = 0;
-                // The upstream's total describes counters no longer being
-                // recorded.
-                c.upstream_total_tokens = None;
-                c.cache_creation_tokens = 0;
-                c.cache_creation_ttl = c.cache_creation_ttl.without_cache_creation();
-                c.cache_read_tokens = 0;
-                c.total_tokens = c.prompt_tokens as u64;
-            }
-            // Token-estimation fallback (AISIX-Cloud#1074), after the #419
-            // gate so a zero-delivered disconnect never bills estimated
-            // completion tokens (the prompt still fills — upstream processed
-            // it regardless, same "prompts always billed" contract). Runs
-            // only for counters the upstream left at zero; a stream with a
-            // real usage chunk is untouched.
-            if let Some(est) = self.estimator.take() {
-                let output = (delivered > 0).then_some(c.est_output_text.as_str());
-                let filled = crate::token_estimate::fill_missing(
-                    &est,
-                    c.prompt_tokens,
-                    c.completion_tokens,
-                    output,
-                );
-                if filled.estimated {
-                    c.prompt_tokens = filled.prompt_tokens;
-                    c.completion_tokens = filled.completion_tokens;
-                    c.usage_estimated = true;
-                    // Estimation only fills counters the upstream never
-                    // reported, so the cache adders are zero or upstream-
-                    // authoritative — the recompute stays consistent with
-                    // `total_tokens_with_cache`.
-                    c.total_tokens = crate::usage_attr::total_tokens_with_cache(
-                        c.prompt_tokens,
-                        c.completion_tokens,
-                        c.cache_creation_tokens,
-                        c.cache_read_tokens,
-                    );
-                }
-            }
-            c.total_tokens = cache_inclusive_total(
-                c.total_tokens,
+    /// Count the estimate ahead on the estimation pool (see
+    /// [`crate::token_estimate::CountedAhead`]), from the same inputs
+    /// [`Self::complete`] will count. Called before the terminal `[DONE]`
+    /// is released and again at the stream's end.
+    /// `frame_next` says a frame is about to be released, so it counts as
+    /// delivered.
+    async fn count_ahead(&mut self, frame_next: bool) {
+        let delivered = self.delivered.load(Ordering::Relaxed);
+        let delivered = if frame_next {
+            delivered.max(1)
+        } else {
+            delivered
+        };
+        if let Some((_, c)) = &self.slot {
+            self.estimate
+                .count_ahead(chat_estimate_inputs(c, delivered))
+                .await;
+        }
+    }
+
+    /// Complete the stream once, from the count ahead when it still fits
+    /// and otherwise counting inline (Drop cannot wait).
+    fn complete(&mut self) {
+        let Some((f, mut c)) = self.slot.take() else {
+            return;
+        };
+        // Snapshot the wire-delivered count for telemetry visibility
+        // AND for the cost-leak gate below.
+        let delivered = self.delivered.load(Ordering::Relaxed);
+        c.chunks_delivered = delivered;
+        // Issue #419 — cost-leak gate. If the consumer disconnected
+        // before any chunk was delivered (e.g. AbortController.abort()
+        // mid-`upstream.next().await`, or axum dropped the response
+        // future before the first chunk was pulled), the upstream's
+        // `usage` block is meaningless for billing — no completion
+        // tokens crossed the wire to the client. Zero out the
+        // completion-side counters but keep `prompt_tokens` (the
+        // prompt was processed by upstream regardless, and the
+        // industry contract is "prompts always billed").
+        if delivered == 0 {
+            c.completion_tokens = 0;
+            c.reasoning_tokens = 0;
+            // The upstream's total describes counters no longer being
+            // recorded.
+            c.upstream_total_tokens = None;
+            c.cache_creation_tokens = 0;
+            c.cache_creation_ttl = c.cache_creation_ttl.without_cache_creation();
+            c.cache_read_tokens = 0;
+            c.total_tokens = c.prompt_tokens as u64;
+        }
+        // Token-estimation fallback (AISIX-Cloud#1074), after the #419
+        // gate so a zero-delivered disconnect never bills estimated
+        // completion tokens (the prompt still fills — upstream processed
+        // it regardless, same "prompts always billed" contract). Runs
+        // only for counters the upstream left at zero; a stream with a
+        // real usage chunk is untouched.
+        let filled = self.estimate.fill(chat_estimate_inputs(&c, delivered));
+        if let Some(filled) = filled.filter(|filled| filled.estimated) {
+            c.prompt_tokens = filled.prompt_tokens;
+            c.completion_tokens = filled.completion_tokens;
+            c.usage_estimated = true;
+            // Estimation only fills counters the upstream never
+            // reported, so the cache adders are zero or upstream-
+            // authoritative — the recompute stays consistent with
+            // `total_tokens_with_cache`.
+            c.total_tokens = crate::usage_attr::total_tokens_with_cache(
                 c.prompt_tokens,
                 c.completion_tokens,
                 c.cache_creation_tokens,
                 c.cache_read_tokens,
             );
-            f(c);
         }
+        c.total_tokens = cache_inclusive_total(
+            c.total_tokens,
+            c.prompt_tokens,
+            c.completion_tokens,
+            c.cache_creation_tokens,
+            c.cache_read_tokens,
+        );
+        f(c);
+    }
+}
+
+impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
+    fn drop(&mut self) {
+        self.complete();
     }
 }
 
@@ -6016,7 +6082,7 @@ where
         let mut guard = CompleteOnDrop {
             slot: Some((on_complete, StreamCompletion::default())),
             delivered: delivered_for_drop,
-            estimator,
+            estimate: crate::token_estimate::StreamEstimate::new(estimator),
         };
         futures::pin_mut!(upstream);
         // Per #204: accumulate the assistant's content across chunks
@@ -6902,10 +6968,13 @@ where
         // consumers can detect truncation. The `errored` flag is
         // set by the loop above whenever an error event is yielded
         // OR by the output-guardrail check above on a Block verdict.
+        guard.count_ahead(!errored).await;
         if !errored {
             yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
         }
-        // `guard` drops here. On client disconnect, the generator
+        guard.count_ahead(false).await;
+        guard.complete();
+        // On client disconnect, the generator
         // drops at the suspension point inside the loop; Drop fires
         // there with whatever StreamCompletion has been captured up
         // to that point — `reached_end` still false.
@@ -7295,7 +7364,7 @@ mod complete_on_drop_tests {
                     comp,
                 )),
                 delivered,
-                estimator: None,
+                estimate: Default::default(),
             };
             drop(guard);
         }
@@ -7332,9 +7401,11 @@ mod complete_on_drop_tests {
                     comp,
                 )),
                 delivered,
-                estimator: Some(crate::token_estimate::Estimator::new(
-                    "relay-model",
-                    crate::token_estimate::PromptInput::Chat(Box::new(req)),
+                estimate: crate::token_estimate::StreamEstimate::new(Some(
+                    crate::token_estimate::Estimator::new(
+                        "relay-model",
+                        crate::token_estimate::PromptInput::Chat(Box::new(req)),
+                    ),
                 )),
             };
             drop(guard);
@@ -7468,15 +7539,15 @@ mod complete_on_drop_tests {
     /// the client reads the projection, not the struct: a filled
     /// `completion_tokens` beside an echoed stale `total_tokens` would
     /// hand the caller a total that does not add up.
-    #[test]
-    fn non_streaming_usage_fill_reaches_the_client_projection() {
+    #[tokio::test]
+    async fn non_streaming_usage_fill_reaches_the_client_projection() {
         let req = subcall_req("Hello");
         let mut resp = chat_response_for_estimation("Hello world", UsageStats::new(17, 0));
         // The upstream reported a total beside the zero completion count.
         resp.usage.total_tokens = 17;
 
         let (prompt, completion, estimated) =
-            estimate_missing_chat_usage(&resp, "relay-model", &req);
+            estimate_missing_chat_usage(&resp, "relay-model", &req, || None).await;
         assert!(estimated);
         assert_eq!(prompt, 17, "a reported counter stands");
         assert_eq!(completion, 2, "the zero is filled");
@@ -7493,14 +7564,14 @@ mod complete_on_drop_tests {
 
     /// The mirror half: a response whose upstream reported both counters is
     /// left alone, so no estimate can displace real numbers.
-    #[test]
-    fn non_streaming_usage_fill_leaves_reported_usage_alone() {
+    #[tokio::test]
+    async fn non_streaming_usage_fill_leaves_reported_usage_alone() {
         let req = subcall_req("Hello");
         let mut resp = chat_response_for_estimation("Hello world", UsageStats::new(17, 23));
         resp.usage.total_tokens = 99;
 
         let (prompt, completion, estimated) =
-            estimate_missing_chat_usage(&resp, "relay-model", &req);
+            estimate_missing_chat_usage(&resp, "relay-model", &req, || None).await;
         assert!(!estimated);
         assert_eq!((prompt, completion), (17, 23));
 
@@ -7520,8 +7591,8 @@ mod complete_on_drop_tests {
     /// bare total larger than the counters it broke out (overhead we
     /// cannot see) would otherwise be silently corrected downward — i.e.
     /// under-billed.
-    #[test]
-    fn estimating_does_not_change_what_is_billed() {
+    #[tokio::test]
+    async fn estimating_does_not_change_what_is_billed() {
         let req = subcall_req("Hello");
         // A degenerate upstream: a bare total, no breakdown at all.
         let resp = chat_response_for_estimation("Hello world", UsageStats::new(0, 0));
@@ -7529,7 +7600,7 @@ mod complete_on_drop_tests {
         resp.usage.total_tokens = 42;
 
         let (prompt, completion, estimated) =
-            estimate_missing_chat_usage(&resp, "relay-model", &req);
+            estimate_missing_chat_usage(&resp, "relay-model", &req, || None).await;
         assert!(estimated);
         assert_eq!(
             (
@@ -7809,7 +7880,7 @@ mod delivery_counter_tests {
                     },
                 )),
                 delivered: delivered_for_drop,
-                estimator: None,
+                estimate: Default::default(),
             };
             // Silence unused-field warning on the test side; guard
             // is held by the body for its full lifetime.

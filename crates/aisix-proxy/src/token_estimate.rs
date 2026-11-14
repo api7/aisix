@@ -115,13 +115,18 @@ pub enum PromptInput {
 }
 
 /// Prompt shape + the model name that selects the tokenizer encoding.
+/// Cloning shares the captured request: a stream's terminal fill hands a
+/// clone to the estimation pool while its guard keeps the original, so a
+/// disconnect during the count still leaves the guard able to estimate.
+#[derive(Clone)]
 pub struct Estimator {
     model: String,
-    input: PromptInput,
+    input: std::sync::Arc<PromptInput>,
 }
 
 /// Outcome of [`fill_missing`]: the (possibly filled) token counts and
 /// whether estimation supplied any non-zero component.
+#[derive(Clone, Copy)]
 pub struct Filled {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -132,14 +137,14 @@ impl Estimator {
     pub fn new(model: impl Into<String>, input: PromptInput) -> Self {
         Self {
             model: model.into(),
-            input,
+            input: std::sync::Arc::new(input),
         }
     }
 
     /// Count the prompt side of the captured request.
     pub fn count_prompt(&self) -> u32 {
         let bpe = bpe_for(&self.model);
-        match &self.input {
+        match &*self.input {
             PromptInput::Chat(req) => count_chat_prompt(bpe, req),
             PromptInput::Anthropic(body) => count_anthropic_prompt(bpe, body),
             PromptInput::Responses(body) => count_responses_prompt(bpe, body),
@@ -155,12 +160,79 @@ impl Estimator {
     pub fn count_output(&self, text: &str) -> u32 {
         count_text(&self.model, text)
     }
+
+    /// The size of the prompt text [`Self::count_prompt`] tokenizes, for
+    /// [`crate::estimate_pool::run`]: the stored wire bytes, or the captured
+    /// request's serialized size up to the inline limit (see
+    /// [`crate::estimate_pool::serialized_bytes_bound`] for how far that
+    /// bounds it).
+    fn prompt_bytes_bound(&self) -> usize {
+        use crate::estimate_pool::serialized_bytes_bound;
+        match &*self.input {
+            PromptInput::Chat(req) => serialized_bytes_bound(&ChatPromptProbe(req)),
+            PromptInput::Anthropic(body) | PromptInput::Responses(body) => {
+                serialized_bytes_bound(body)
+            }
+            PromptInput::ResponsesWire(wire) | PromptInput::AnthropicWire(wire) => wire.len(),
+        }
+    }
 }
 
 /// Count `text` as plain text with the model's encoding — the
 /// completion-side rule (no message overhead).
 pub fn count_text(model: &str, text: &str) -> u32 {
     enc(bpe_for(model), text)
+}
+
+/// [`count_text`] summed over `texts`, with the model's encoding resolved
+/// once for the batch.
+pub fn count_texts<'a>(model: &str, texts: impl IntoIterator<Item = &'a str>) -> u32 {
+    let bpe = bpe_for(model);
+    texts
+        .into_iter()
+        .fold(0u32, |n, text| n.saturating_add(enc(bpe, text)))
+}
+
+/// What [`count_chat_prompt`] reads of a chat request, for the size probe:
+/// the messages as stored and the request's extra fields (`tools`,
+/// `tool_choice`). `ChatMessage`'s own `Serialize` writes a block-array
+/// message's joined text out as `content`, which would build that text
+/// before the probe could stop.
+struct ChatPromptProbe<'a>(&'a aisix_gateway::chat::ChatFormat);
+
+struct ChatMessageProbe<'a>(&'a aisix_gateway::chat::ChatMessage);
+
+impl serde::Serialize for ChatPromptProbe<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("ChatPromptProbe", 2)?;
+        s.serialize_field(
+            "messages",
+            &self
+                .0
+                .messages
+                .iter()
+                .map(ChatMessageProbe)
+                .collect::<Vec<_>>(),
+        )?;
+        s.serialize_field("extra", &self.0.extra)?;
+        s.end()
+    }
+}
+
+impl serde::Serialize for ChatMessageProbe<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let m = self.0;
+        let mut s = serializer.serialize_struct("ChatMessageProbe", 6)?;
+        s.serialize_field("role", role_label(&m.role))?;
+        s.serialize_field("content", &m.content)?;
+        s.serialize_field("content_blocks", &m.content_blocks)?;
+        s.serialize_field("name", &m.name)?;
+        s.serialize_field("tool_call_id", &m.tool_call_id)?;
+        s.serialize_field("extra", &m.extra)?;
+        s.end()
+    }
 }
 
 /// Per-field `or` fill: upstream values win when non-zero; zeros are
@@ -197,14 +269,408 @@ pub fn fill_missing(
     filled
 }
 
+/// Whether [`fill_missing`] has anything to tokenize for these counters.
+pub fn needs_counting(upstream_prompt: u32, upstream_completion: u32, has_output: bool) -> bool {
+    upstream_prompt == 0 || (upstream_completion == 0 && has_output)
+}
+
+/// An upper bound on the text [`fill_missing`] tokenizes for these inputs.
+fn estimate_bytes(
+    est: &Estimator,
+    upstream_prompt: u32,
+    upstream_completion: u32,
+    output_text: Option<&str>,
+) -> usize {
+    let prompt_bytes = if upstream_prompt == 0 {
+        est.prompt_bytes_bound()
+    } else {
+        0
+    };
+    let output_bytes = match output_text {
+        Some(text) if upstream_completion == 0 => text.len(),
+        _ => 0,
+    };
+    prompt_bytes.saturating_add(output_bytes)
+}
+
+/// [`fill_missing`] through [`crate::estimate_pool::run`], so a large count
+/// never runs on a request worker. The caller waits; the worker's other
+/// connections do not. Counters that need no counting return without
+/// leaving the worker.
+pub async fn fill_missing_pooled(
+    est: Estimator,
+    upstream_prompt: u32,
+    upstream_completion: u32,
+    output_text: Option<String>,
+) -> Filled {
+    if !needs_counting(upstream_prompt, upstream_completion, output_text.is_some()) {
+        return Filled {
+            prompt_tokens: upstream_prompt,
+            completion_tokens: upstream_completion,
+            estimated: false,
+        };
+    }
+    let text_bytes = estimate_bytes(
+        &est,
+        upstream_prompt,
+        upstream_completion,
+        output_text.as_deref(),
+    );
+    crate::estimate_pool::run(text_bytes, move || {
+        fill_missing(
+            &est,
+            upstream_prompt,
+            upstream_completion,
+            output_text.as_deref(),
+        )
+    })
+    .await
+}
+
+/// What the cancel guard records for a call whose caller left while its
+/// estimate was pending: the usage as the handler's own record would carry
+/// it, with the estimate filled in.
+#[derive(Default)]
+pub(crate) struct CancelledUsage {
+    pub usage: aisix_gateway::chat::UsageStats,
+    pub usage_estimated: bool,
+    /// How long the attempt took to answer, for a family whose attempt is
+    /// settled only after the estimate: the row then says the call reached
+    /// its upstream and how long it took, as the settled attempt would.
+    pub answered_after_ms: Option<u32>,
+}
+
+pub(crate) type CancelledUsageFn = Box<dyn FnOnce() -> CancelledUsage + Send>;
+
+impl CancelledUsage {
+    /// The upstream's counters with [`fill_missing`]'s result in place.
+    pub(crate) fn filled(
+        upstream: aisix_gateway::chat::UsageStats,
+        filled: Filled,
+        answered_after_ms: Option<u32>,
+    ) -> Self {
+        Self {
+            usage: aisix_gateway::chat::UsageStats {
+                prompt_tokens: filled.prompt_tokens,
+                completion_tokens: filled.completion_tokens,
+                ..upstream
+            },
+            usage_estimated: filled.estimated,
+            answered_after_ms,
+        }
+    }
+
+    /// Write the counters onto the cancel guard's terminal event the way a
+    /// handler's own record writes them.
+    pub(crate) fn apply(self, event: &mut aisix_obs::UsageEvent) {
+        let u = self.usage;
+        event.prompt_tokens = u.prompt_tokens;
+        event.completion_tokens = aisix_gateway::chat::recorded_completion_tokens(
+            u.prompt_tokens,
+            u.completion_tokens,
+            u.reasoning_tokens,
+            u.reasoning_folded_into_completion,
+            u.upstream_total_tokens,
+        );
+        event.total_tokens = u.upstream_total_tokens;
+        event.cached_prompt_tokens = u.cached_prompt_tokens;
+        event.cache_write_tokens = u.cache_write_tokens;
+        event.modality_tokens = u.modality;
+        event.cache_creation_ttl = u.cache_creation_ttl;
+        event.reasoning_tokens = u.reasoning_tokens;
+        event.cache_creation_tokens = u.cache_creation_tokens;
+        event.cache_read_tokens = u.cache_read_tokens;
+        event.usage_estimated = self.usage_estimated;
+        if let Some(ms) = self.answered_after_ms {
+            event.upstream_latency_ms = ms;
+        }
+    }
+}
+
+/// The rate-limit layers a non-streamed call commits its tokens to once
+/// its usage is known, and the token cost its handler commits for a given
+/// usage. Carried into [`run_recorded_on_cancel`] so a caller that leaves
+/// during the count still has the call's tokens counted against TPM/TPD.
+pub(crate) struct RateCommit {
+    limiter: std::sync::Arc<aisix_ratelimit::Limiter>,
+    keys: Vec<aisix_ratelimit::BucketKey>,
+    tokens: fn(&aisix_gateway::chat::UsageStats) -> u64,
+}
+
+impl RateCommit {
+    /// The layers of `reservations` that a commit would charge; `None`
+    /// when there are none.
+    pub(crate) fn new<'a>(
+        limiter: &std::sync::Arc<aisix_ratelimit::Limiter>,
+        reservations: impl IntoIterator<Item = Option<&'a aisix_ratelimit::MultiReservation>>,
+        tokens: fn(&aisix_gateway::chat::UsageStats) -> u64,
+    ) -> Option<Self> {
+        let keys: Vec<_> = reservations
+            .into_iter()
+            .flatten()
+            .flat_map(aisix_ratelimit::MultiReservation::keys)
+            .collect();
+        (!keys.is_empty()).then(|| Self {
+            limiter: std::sync::Arc::clone(limiter),
+            keys,
+            tokens,
+        })
+    }
+
+    /// Charge `usage`'s token cost to every layer, as the handler's own
+    /// `commit_tokens` would; the dropped reservations release their
+    /// concurrency slots themselves.
+    fn commit(&self, usage: &aisix_gateway::chat::UsageStats) {
+        let tokens = (self.tokens)(usage);
+        for key in &self.keys {
+            self.limiter.add_tokens_post_stream(key, tokens);
+        }
+    }
+}
+
+/// Run a non-streamed call's estimate through [`crate::estimate_pool::run`]
+/// after its upstream answered. While a pooled count is awaited, a caller
+/// that hangs up drops the handler before it records the call or commits
+/// its tokens; the cancel guard then runs `job` inline from its `Drop`,
+/// records `on_cancel` of the result, and charges `rate` with it, so the
+/// row bills the call and TPM/TPD count it instead of reading zero.
+pub(crate) async fn run_recorded_on_cancel<R: Send + 'static>(
+    text_bytes: usize,
+    job: impl Fn() -> R + Send + Sync + 'static,
+    on_cancel: impl FnOnce(R) -> CancelledUsage + Send + 'static,
+    // Built only when the count is pooled: most calls never need it.
+    rate: impl FnOnce() -> Option<RateCommit>,
+) -> R {
+    if text_bytes <= crate::estimate_pool::INLINE_MAX_BYTES {
+        return job();
+    }
+    let rate = rate();
+    let job = std::sync::Arc::new(job);
+    let inline = std::sync::Arc::clone(&job);
+    crate::attribution::publish_cancelled_usage(Box::new(move || {
+        let usage = on_cancel(inline());
+        if let Some(rate) = rate {
+            rate.commit(&usage.usage);
+        }
+        usage
+    }));
+    let result = crate::estimate_pool::run(text_bytes, move || job()).await;
+    crate::attribution::settle_cancelled_usage();
+    result
+}
+
+/// [`fill_missing`] for a non-streamed response, recorded by the cancel
+/// guard if the caller leaves while it is counted (see
+/// [`run_recorded_on_cancel`]). `upstream` is the response's usage as the
+/// upstream reported it, whose counters the record carries beside these.
+pub(crate) async fn fill_missing_recorded(
+    est: Estimator,
+    upstream: aisix_gateway::chat::UsageStats,
+    output_text: Option<String>,
+    rate: impl FnOnce() -> Option<RateCommit>,
+    // When the caller's attempt began, for a family that settles its
+    // attempt only after this count (see `CancelledUsage::answered_after_ms`).
+    attempt_started: Option<std::time::Instant>,
+) -> Filled {
+    let (upstream_prompt, upstream_completion) =
+        (upstream.prompt_tokens, upstream.completion_tokens);
+    if !needs_counting(upstream_prompt, upstream_completion, output_text.is_some()) {
+        return Filled {
+            prompt_tokens: upstream_prompt,
+            completion_tokens: upstream_completion,
+            estimated: false,
+        };
+    }
+    let text_bytes = estimate_bytes(
+        &est,
+        upstream_prompt,
+        upstream_completion,
+        output_text.as_deref(),
+    );
+    let answered_after_ms = attempt_started.map(|t| crate::attempt::measured_ms(t.elapsed()));
+    run_recorded_on_cancel(
+        text_bytes,
+        move || {
+            fill_missing(
+                &est,
+                upstream_prompt,
+                upstream_completion,
+                output_text.as_deref(),
+            )
+        },
+        move |filled| CancelledUsage::filled(upstream, filled, answered_after_ms),
+        rate,
+    )
+    .await
+}
+
+/// A count made ahead of the moment it is needed, keyed by the inputs it
+/// was made from. A stream counts before it releases its terminal frame: a
+/// client that closes as soon as it reads that frame drops the stream there,
+/// and the guard's Drop — which must emit in place and cannot wait — then
+/// takes this count instead of counting on the request worker. It answers
+/// only for the key it was counted at; for any other the caller counts
+/// inline as before.
+pub struct CountedAhead<K, V>(Option<(K, V)>);
+
+impl<K, V> Default for CountedAhead<K, V> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<K: PartialEq, V> CountedAhead<K, V> {
+    /// Count at `key` unless the count already held is for it.
+    pub async fn count<Fut: std::future::Future<Output = V>>(
+        &mut self,
+        key: K,
+        count: impl FnOnce() -> Fut,
+    ) {
+        if self.0.as_ref().is_some_and(|(counted, _)| *counted == key) {
+            return;
+        }
+        let value = count().await;
+        self.0 = Some((key, value));
+    }
+
+    /// The count held for `key`, else `inline()`.
+    pub fn take_or(&mut self, key: &K, inline: impl FnOnce() -> V) -> V {
+        match self.0.take() {
+            Some((counted, value)) if counted == *key => value,
+            _ => inline(),
+        }
+    }
+}
+
+/// What one stream estimate counts: the upstream counters (zero where it
+/// reported none) and the delivered output text. The output is identified
+/// by its length and a revision: a buffer that only grows is identified by
+/// its length alone (revision 0), and one that can be replaced by other
+/// text bumps the revision on each replacement.
+#[derive(Clone, Copy)]
+pub struct EstimateInputs<'a> {
+    pub upstream_prompt: u32,
+    pub upstream_completion: u32,
+    pub output: Option<&'a str>,
+    pub output_revision: u32,
+}
+
+type CountKey = (u32, u32, Option<(usize, u32)>);
+
+impl EstimateInputs<'_> {
+    fn key(&self) -> CountKey {
+        (
+            self.upstream_prompt,
+            self.upstream_completion,
+            self.output.map(|t| (t.len(), self.output_revision)),
+        )
+    }
+}
+
+/// A stream's estimator and its count ahead. Each streaming guard builds
+/// its [`EstimateInputs`] in one place and passes them to both
+/// [`Self::count_ahead`] and [`Self::fill`], so the count ahead cannot
+/// drift from what the guard's completion counts.
+#[derive(Default)]
+pub struct StreamEstimate {
+    estimator: Option<Estimator>,
+    counted: CountedAhead<CountKey, Filled>,
+}
+
+impl StreamEstimate {
+    pub fn new(estimator: Option<Estimator>) -> Self {
+        Self {
+            estimator,
+            counted: CountedAhead::default(),
+        }
+    }
+
+    /// Count the estimate ahead, through [`crate::estimate_pool::run`].
+    pub async fn count_ahead(&mut self, inputs: EstimateInputs<'_>) {
+        let Self { estimator, counted } = self;
+        let Some(est) = estimator.as_ref() else {
+            return;
+        };
+        if !needs_counting(
+            inputs.upstream_prompt,
+            inputs.upstream_completion,
+            inputs.output.is_some(),
+        ) {
+            return;
+        }
+        counted
+            .count(inputs.key(), || {
+                fill_missing_pooled(
+                    est.clone(),
+                    inputs.upstream_prompt,
+                    inputs.upstream_completion,
+                    inputs.output.map(str::to_owned),
+                )
+            })
+            .await;
+    }
+
+    /// [`fill_missing`], once: from the count ahead when it was counted from
+    /// these same inputs, otherwise inline (Drop cannot wait). `None` when
+    /// there is no estimator, or it was already used.
+    pub fn fill(&mut self, inputs: EstimateInputs<'_>) -> Option<Filled> {
+        let est = self.estimator.take()?;
+        Some(self.counted.take_or(&inputs.key(), || {
+            fill_missing(
+                &est,
+                inputs.upstream_prompt,
+                inputs.upstream_completion,
+                inputs.output,
+            )
+        }))
+    }
+}
+
+/// The model's encoding. The estimate pool's threads count with instances
+/// of their own, apart from the singletons every other thread uses: a
+/// `CoreBPE`'s per-thread regex clones share one regex cache pool, and only
+/// the first thread to take from it ever gets its lock-free fast path. A
+/// worker counting a small estimate inline would otherwise take it for good
+/// and leave the pool on the locked path for every regex match. Among the
+/// pool's threads one still owns each instance, as before. The instances
+/// are built with the encoding constructors, never cloned from a singleton
+/// (a clone shares its regex cache pool), on first use: one more vocabulary
+/// copy for each encoding the pool counts with.
 fn bpe_for(model: &str) -> &'static CoreBPE {
-    match get_tokenizer(model) {
-        Some(Tokenizer::O200kHarmony) => tiktoken_rs::o200k_harmony_singleton(),
-        Some(Tokenizer::O200kBase) => tiktoken_rs::o200k_base_singleton(),
-        Some(Tokenizer::P50kBase) => tiktoken_rs::p50k_base_singleton(),
-        Some(Tokenizer::P50kEdit) => tiktoken_rs::p50k_edit_singleton(),
-        Some(Tokenizer::R50kBase | Tokenizer::Gpt2) => tiktoken_rs::r50k_base_singleton(),
-        Some(Tokenizer::Cl100kBase) | None => tiktoken_rs::cl100k_base_singleton(),
+    type Singleton = fn() -> &'static CoreBPE;
+    static POOL_INSTANCES: [std::sync::OnceLock<CoreBPE>; 6] =
+        [const { std::sync::OnceLock::new() }; 6];
+    let (slot, singleton, build): (usize, Singleton, fn() -> Result<CoreBPE, _>) =
+        match get_tokenizer(model) {
+            Some(Tokenizer::O200kHarmony) => (
+                0,
+                tiktoken_rs::o200k_harmony_singleton,
+                tiktoken_rs::o200k_harmony,
+            ),
+            Some(Tokenizer::O200kBase) => (
+                1,
+                tiktoken_rs::o200k_base_singleton,
+                tiktoken_rs::o200k_base,
+            ),
+            Some(Tokenizer::P50kBase) => {
+                (2, tiktoken_rs::p50k_base_singleton, tiktoken_rs::p50k_base)
+            }
+            Some(Tokenizer::P50kEdit) => {
+                (3, tiktoken_rs::p50k_edit_singleton, tiktoken_rs::p50k_edit)
+            }
+            Some(Tokenizer::R50kBase | Tokenizer::Gpt2) => {
+                (4, tiktoken_rs::r50k_base_singleton, tiktoken_rs::r50k_base)
+            }
+            Some(Tokenizer::Cl100kBase) | None => (
+                5,
+                tiktoken_rs::cl100k_base_singleton,
+                tiktoken_rs::cl100k_base,
+            ),
+        };
+    if crate::estimate_pool::on_pool_thread() {
+        POOL_INSTANCES[slot].get_or_init(|| build().expect("tiktoken's bundled encodings load"))
+    } else {
+        singleton()
     }
 }
 
@@ -1011,6 +1477,89 @@ mod tests {
     }
 
     #[test]
+    fn the_chat_size_probe_bounds_block_text_without_building_it() {
+        let mut big = msg(Role::User, "");
+        big.content = None;
+        big.content_blocks = Some(vec![
+            serde_json::json!({"type": "text", "text": "x".repeat(1 << 20)}),
+        ]);
+        let est = chat_est("relay-model", ChatFormat::new("relay-model", vec![big]));
+        assert_eq!(
+            est.prompt_bytes_bound(),
+            crate::estimate_pool::INLINE_MAX_BYTES + 1
+        );
+
+        let small = chat_est(
+            "relay-model",
+            ChatFormat::new("relay-model", vec![msg(Role::User, "hello there")]),
+        );
+        let bound = small.prompt_bytes_bound();
+        assert!(bound >= "user".len() + "hello there".len(), "{bound}");
+        assert!(bound <= crate::estimate_pool::INLINE_MAX_BYTES, "{bound}");
+    }
+
+    #[tokio::test]
+    async fn a_count_ahead_answers_only_for_the_inputs_it_was_counted_from() {
+        let est = chat_est(
+            "relay-model",
+            ChatFormat::new("relay-model", vec![msg(Role::User, "hi")]),
+        );
+        let inputs = |completion: u32, output: &'static str, revision: u32| EstimateInputs {
+            upstream_prompt: 0,
+            upstream_completion: completion,
+            output: Some(output),
+            output_revision: revision,
+        };
+        let mut once = StreamEstimate::new(Some(est.clone()));
+        once.count_ahead(inputs(0, "Hello world", 0)).await;
+
+        // Fill each case from a fresh count made at the same inputs.
+        async fn filled(est: &Estimator, later: EstimateInputs<'static>) -> Filled {
+            let mut ahead = StreamEstimate::new(Some(est.clone()));
+            ahead
+                .count_ahead(EstimateInputs {
+                    upstream_prompt: 0,
+                    upstream_completion: 0,
+                    output: Some("Hello world"),
+                    output_revision: 0,
+                })
+                .await;
+            ahead.fill(later).unwrap()
+        }
+
+        let same = filled(&est, inputs(0, "Hello world", 0)).await;
+        let inline = fill_missing(&est, 0, 0, Some("Hello world"));
+        assert_eq!(
+            (same.prompt_tokens, same.completion_tokens, same.estimated),
+            (
+                inline.prompt_tokens,
+                inline.completion_tokens,
+                inline.estimated
+            ),
+        );
+
+        // More output arrived after the count ahead: it must not stand in.
+        let grown = filled(&est, inputs(0, "Hello world, and then some more", 0)).await;
+        let fresh = fill_missing(&est, 0, 0, Some("Hello world, and then some more"));
+        assert_eq!(grown.completion_tokens, fresh.completion_tokens);
+        assert_ne!(grown.completion_tokens, same.completion_tokens);
+
+        // A counter the upstream reported after the count ahead stands.
+        let reported = filled(&est, inputs(7, "Hello world", 0)).await;
+        assert_eq!(reported.completion_tokens, 7);
+
+        // Output replaced by other text of the same length.
+        let replaced = filled(&est, inputs(0, "1 2 3 4 5 6", 1)).await;
+        let fresh = fill_missing(&est, 0, 0, Some("1 2 3 4 5 6"));
+        assert_eq!(replaced.completion_tokens, fresh.completion_tokens);
+        assert_ne!(replaced.completion_tokens, same.completion_tokens);
+
+        // An estimate fills once.
+        assert!(once.fill(inputs(0, "Hello world", 0)).is_some());
+        assert!(once.fill(inputs(0, "Hello world", 0)).is_none());
+    }
+
+    #[test]
     fn encoding_selection_mirrors_tiktoken_model_map() {
         assert!(std::ptr::eq(
             bpe_for("gpt-4o-2024-08-06"),
@@ -1029,6 +1578,38 @@ mod tests {
             bpe_for(""),
             tiktoken_rs::cl100k_base_singleton(),
         ));
+    }
+
+    /// The pool's threads never count with the workers' singletons, so a
+    /// worker counting first cannot hold the regex cache's fast path from
+    /// them; counts come out the same from either instance.
+    #[tokio::test]
+    async fn the_pool_counts_with_its_own_tokenizer_instances() {
+        let text = "pooled words, ".repeat(2_000);
+        // One model per encoding, and one no encoding maps.
+        for model in [
+            "gpt-oss-20b",
+            "gpt-4o",
+            "text-davinci-003",
+            "text-davinci-edit-001",
+            "davinci",
+            "gpt2",
+            "gpt-4",
+            "claude-sonnet-4-5",
+        ] {
+            let on_worker = count_text(model, &text);
+            let (m, t) = (model.to_owned(), text.clone());
+            let (instance, on_pool) = crate::estimate_pool::run(t.len(), move || {
+                (bpe_for(&m) as *const CoreBPE as usize, count_text(&m, &t))
+            })
+            .await;
+            assert_ne!(
+                instance,
+                bpe_for(model) as *const CoreBPE as usize,
+                "{model}: the pool counted with the workers' instance",
+            );
+            assert_eq!(on_pool, on_worker, "{model}");
+        }
     }
 
     #[test]

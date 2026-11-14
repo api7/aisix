@@ -47,6 +47,7 @@ mod embeddings;
 mod ensemble;
 mod error;
 mod error_translate;
+mod estimate_pool;
 #[cfg(test)]
 mod guardrail_blocked_telemetry;
 #[cfg(test)]
@@ -5521,6 +5522,347 @@ data: [DONE]\n\n";
         let body_bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(v["error"]["type"], "rate_limit_exceeded");
+    }
+
+    /// The upstream answered with no usage, and the caller hung up while the
+    /// gateway counted the estimate on the pool. The handler never reached
+    /// its own commit, so the cancel guard must charge the counted tokens to
+    /// TPM; otherwise every such hang-up spends tokens the limit never sees.
+    #[tokio::test]
+    async fn a_caller_leaving_during_a_pooled_estimate_still_counts_against_tpm() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }]
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot_with_limits(
+            "my-gpt4",
+            &["my-gpt4"],
+            &upstream.uri(),
+            serde_json::json!({"tpm": 1_000}),
+        );
+        let state = build_state(snap, hub);
+        let make_req = |content: &str| {
+            let body = serde_json::json!({
+                "model": "my-gpt4",
+                "messages": [{"role": "user", "content": content}]
+            });
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // About 5000 prompt tokens, past the 16 KiB counted inline.
+        let held = crate::estimate_pool::hold_every_slot().await;
+        let abandoned = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            run(
+                build_router(state.clone()),
+                make_req(&"word ".repeat(5_000)),
+            ),
+        )
+        .await;
+        drop(held);
+        assert!(
+            abandoned.is_err(),
+            "the request finished — its estimate never waited for the pool",
+        );
+
+        // Those tokens are over the 1000 TPM, so the next request is refused.
+        let resp = run(build_router(state), make_req("hi")).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// A buffered `/v1/messages` or `/v1/responses` call whose caller hangs
+    /// up while the output guardrail is still checking the answer. The
+    /// upstream already spent the tokens, so they must count against TPM
+    /// like chat's do: the attempt commits before the check, not after it.
+    async fn assert_hangup_during_output_check_counts_against_tpm(
+        snap: AisixSnapshot,
+        hub: Arc<Hub>,
+        model: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) {
+        let scanner = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(&scanner)
+            .await;
+        snap.apikeys.insert(apikey_entry_with_limits(
+            "sk-caller",
+            &[model],
+            Some(serde_json::json!({"tpm": 1_000})),
+        ));
+        let state = build_state(snap, hub);
+        seed_guardrail(
+            &state.snapshot,
+            "g-slow-output",
+            &format!(
+                r#"{{"name":"slow-output","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k"}}"#,
+                scanner.uri()
+            ),
+        );
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let abandoned = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            run(build_router(state.clone()), make_req()),
+        )
+        .await;
+        assert!(
+            abandoned.is_err(),
+            "{uri} finished — it never waited on the output guardrail",
+        );
+
+        // 20000 tokens are over the 1000 TPM, so the next request is refused
+        // before it reaches the upstream (and the slow guardrail).
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run(build_router(state), make_req()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{uri}: the abandoned call's tokens were never counted"));
+        assert_eq!(next.status(), StatusCode::TOO_MANY_REQUESTS, "{uri}");
+    }
+
+    fn anthropic_message_body() -> serde_json::Value {
+        serde_json::json!({
+            "id": "msg_up",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-3-5-haiku-20241022",
+            "content": [{"type": "text", "text": "hello"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10_000, "output_tokens": 10_000}
+        })
+    }
+
+    fn anthropic_snapshot(api_base: &str) -> (AisixSnapshot, Arc<Hub>) {
+        use aisix_provider_anthropic::AnthropicBridge;
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(matrix_anthropic_pk(api_base));
+        snap.models.insert(anthropic_model_entry("my-claude"));
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        (snap, hub)
+    }
+
+    #[tokio::test]
+    async fn messages_passthrough_hangup_during_output_check_counts_against_tpm() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_message_body()))
+            .mount(&upstream)
+            .await;
+        let (snap, hub) = anthropic_snapshot(&upstream.uri());
+        assert_hangup_during_output_check_counts_against_tpm(
+            snap,
+            hub,
+            "my-claude",
+            "/v1/messages",
+            serde_json::json!({
+                "model": "my-claude",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn messages_bridged_hangup_during_output_check_counts_against_tpm() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 10_000, "completion_tokens": 10_000, "total_tokens": 20_000}
+            })))
+            .mount(&upstream)
+            .await;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &[], &upstream.uri());
+        assert_hangup_during_output_check_counts_against_tpm(
+            snap,
+            hub,
+            "my-gpt4",
+            "/v1/messages",
+            serde_json::json!({
+                "model": "my-gpt4",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        )
+        .await;
+    }
+
+    /// An answer the output guardrail refuses was still generated and billed
+    /// upstream, so its tokens count against TPM, as chat's do.
+    #[tokio::test]
+    async fn messages_output_blocked_answer_counts_against_tpm() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_message_body()))
+            .mount(&upstream)
+            .await;
+        let (snap, hub) = anthropic_snapshot(&upstream.uri());
+        snap.apikeys.insert(apikey_entry_with_limits(
+            "sk-caller",
+            &["my-claude"],
+            Some(serde_json::json!({"tpm": 1_000})),
+        ));
+        let state = build_state(snap, hub);
+        seed_guardrail(
+            &state.snapshot,
+            "g-block-output",
+            r#"{"name":"block-output","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"hello"}]}"#,
+        );
+        let make_req = || {
+            let body = serde_json::json!({
+                "model": "my-claude",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let blocked = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(blocked.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let next = run(build_router(state), make_req()).await;
+        assert_eq!(next.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn responses_passthrough_hangup_during_output_check_counts_against_tpm() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp-up",
+                "object": "response",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello"}]
+                }],
+                "usage": {"input_tokens": 10_000, "output_tokens": 10_000}
+            })))
+            .mount(&upstream)
+            .await;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &[], &upstream.uri());
+        assert_hangup_during_output_check_counts_against_tpm(
+            snap,
+            hub,
+            "my-gpt4",
+            "/v1/responses",
+            serde_json::json!({"model": "my-gpt4", "input": "hi"}),
+        )
+        .await;
+    }
+
+    /// `stream: true` with a block-capable output guardrail holds the whole
+    /// SSE response back and scans it before release — buffered, like the
+    /// non-streaming path.
+    #[tokio::test]
+    async fn responses_held_back_stream_hangup_during_output_check_counts_against_tpm() {
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-up",
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "hello"}]
+                }],
+                "usage": {"input_tokens": 10_000, "output_tokens": 10_000}
+            }
+        });
+        let sse = format!(
+            "event: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {completed}\n\n",
+            serde_json::json!({"type": "response.output_text.delta", "delta": "hello"}),
+        );
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &[], &upstream.uri());
+        assert_hangup_during_output_check_counts_against_tpm(
+            snap,
+            hub,
+            "my-gpt4",
+            "/v1/responses",
+            serde_json::json!({"model": "my-gpt4", "input": "hi", "stream": true}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn responses_bridged_hangup_during_output_check_counts_against_tpm() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_message_body()))
+            .mount(&upstream)
+            .await;
+        let (snap, hub) = anthropic_snapshot(&upstream.uri());
+        assert_hangup_during_output_check_counts_against_tpm(
+            snap,
+            hub,
+            "my-claude",
+            "/v1/responses",
+            serde_json::json!({"model": "my-claude", "input": "hi"}),
+        )
+        .await;
     }
 
     #[tokio::test]

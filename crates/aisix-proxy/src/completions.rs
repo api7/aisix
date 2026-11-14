@@ -629,20 +629,71 @@ async fn dispatch(
                     upstream_total_tokens: 0,
                     usage_estimated: false,
                 });
-                let est_model = model.upstream_model().unwrap_or("unknown");
-                if u.prompt_tokens == 0 {
-                    let n = count_completion_prompt(est_model, body.get("prompt"));
-                    if n > 0 {
+                if u.prompt_tokens == 0 || u.completion_tokens == 0 {
+                    // Counted off the request worker unless the text is small.
+                    let est_model = model.upstream_model().unwrap_or("unknown").to_owned();
+                    let prompt = (u.prompt_tokens == 0).then(|| body.get("prompt").cloned());
+                    let output =
+                        (u.completion_tokens == 0).then(|| completion_output_text(&resp_json));
+                    let text_bytes = prompt
+                        .as_ref()
+                        .map_or(0, crate::estimate_pool::serialized_bytes_bound)
+                        .saturating_add(output.as_ref().map_or(0, String::len));
+                    let upstream = UsageStats {
+                        cached_prompt_tokens: u.cached_prompt_tokens,
+                        cache_write_tokens: u.cache_write_tokens,
+                        cache_creation_ttl: u.cache_write_ttl,
+                        modality: u.modality,
+                        reasoning_tokens: u.reasoning_tokens,
+                        upstream_total_tokens: u.upstream_total_tokens,
+                        ..UsageStats::new(u.prompt_tokens, u.completion_tokens)
+                    };
+                    let (prompt_n, completion_n) = crate::token_estimate::run_recorded_on_cancel(
+                        text_bytes,
+                        move || {
+                            (
+                                prompt
+                                    .as_ref()
+                                    .map(|p| count_completion_prompt(&est_model, p.as_ref())),
+                                output
+                                    .as_deref()
+                                    .map(|o| crate::token_estimate::count_text(&est_model, o)),
+                            )
+                        },
+                        move |(prompt_n, completion_n): (Option<u32>, Option<u32>)| {
+                            let mut usage = upstream;
+                            let mut usage_estimated = false;
+                            if let Some(n) = prompt_n.filter(|n| *n > 0) {
+                                usage.prompt_tokens = n;
+                                usage_estimated = true;
+                            }
+                            if let Some(n) = completion_n.filter(|n| *n > 0) {
+                                usage.completion_tokens = n;
+                                usage_estimated = true;
+                            }
+                            crate::token_estimate::CancelledUsage {
+                                usage,
+                                usage_estimated,
+                                answered_after_ms: None,
+                            }
+                        },
+                        || {
+                            crate::token_estimate::RateCommit::new(
+                                &state.limiter,
+                                [Some(&reservation)],
+                                |usage| {
+                                    u64::from(usage.prompt_tokens)
+                                        + u64::from(usage.completion_tokens)
+                                },
+                            )
+                        },
+                    )
+                    .await;
+                    if let Some(n) = prompt_n.filter(|n| *n > 0) {
                         u.prompt_tokens = n;
                         u.usage_estimated = true;
                     }
-                }
-                if u.completion_tokens == 0 {
-                    let n = crate::token_estimate::count_text(
-                        est_model,
-                        &completion_output_text(&resp_json),
-                    );
-                    if n > 0 {
+                    if let Some(n) = completion_n.filter(|n| *n > 0) {
                         u.completion_tokens = n;
                         u.usage_estimated = true;
                     }

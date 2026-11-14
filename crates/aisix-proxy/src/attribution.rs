@@ -243,6 +243,11 @@ pub(crate) struct CancelContext {
     /// An ensemble's returned sub-calls, while no exit of the request's own
     /// has settled them. See [`crate::chat::PendingEnsemble`].
     pub ensemble: Option<crate::chat::PendingEnsemble>,
+    /// The usage of a call whose upstream answered while its local estimate
+    /// is still being counted off the worker. The guard runs it inline, so
+    /// the terminal row bills what the handler would have. See
+    /// [`crate::token_estimate::run_recorded_on_cancel`].
+    pub cancelled_usage: Option<crate::token_estimate::CancelledUsageFn>,
     /// The request body as every failure row of this request reports it; only
     /// ever set under a full-content export. See
     /// [`crate::usage_attr::note_failure_request`].
@@ -1235,6 +1240,17 @@ fn with(f: impl FnOnce(&mut Resolved)) {
 /// Same, for the cancel half of the cell.
 fn with_cancel(f: impl FnOnce(&mut CancelContext)) {
     let _ = CURRENT.try_with(|a| f(&mut a.lock().cancel));
+}
+
+/// Publish how the cancel guard counts the usage of a call whose estimate
+/// is pending. See [`crate::token_estimate::run_recorded_on_cancel`].
+pub(crate) fn publish_cancelled_usage(usage: crate::token_estimate::CancelledUsageFn) {
+    with_cancel(|c| c.cancelled_usage = Some(usage));
+}
+
+/// The pending estimate came back; the handler records the usage itself.
+pub(crate) fn settle_cancelled_usage() {
+    with_cancel(|c| c.cancelled_usage = None);
 }
 
 /// Publish an ensemble's pending sub-calls for the cancel guard to report.

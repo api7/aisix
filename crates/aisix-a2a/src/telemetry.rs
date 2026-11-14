@@ -326,6 +326,9 @@ pub struct ResultText {
     /// The agent's latest word about the task. Only ever the latest: a
     /// progress note supersedes the one before it and restates nothing.
     statement: String,
+    /// Bumped on every change to either segment, so a caller can tell the
+    /// text it counted from the text there now without rebuilding it.
+    revision: u32,
 }
 
 impl ResultText {
@@ -363,6 +366,7 @@ impl ResultText {
                 }
             }
             push(&mut self.artifacts, &fresh);
+            self.revision = self.revision.wrapping_add(1);
             return;
         }
 
@@ -378,6 +382,7 @@ impl ResultText {
                 self.artifacts.clear();
                 self.artifact_id.clear();
                 push(&mut self.artifacts, &fresh);
+                self.revision = self.revision.wrapping_add(1);
             }
         }
 
@@ -391,7 +396,13 @@ impl ResultText {
         if !fresh.is_empty() {
             self.statement.clear();
             push(&mut self.statement, &fresh);
+            self.revision = self.revision.wrapping_add(1);
         }
+    }
+
+    /// Changes whenever [`Self::joined`] may have.
+    pub fn revision(&self) -> u32 {
+        self.revision
     }
 
     /// Everything the agent produced, for counting or capture. Empty when it
@@ -883,6 +894,19 @@ mod tests {
             push,
         );
         assert_eq!(artifact.joined(), "chunk");
+    }
+
+    #[test]
+    fn a_replacement_of_the_same_length_changes_the_revision() {
+        let mut text = ResultText::default();
+        text.observe(&artifact_chunk("r", "abc", None), push);
+        let first = text.revision();
+        text.observe(&artifact_chunk("r", "xyz", None), push);
+        assert_eq!(text.joined(), "xyz");
+        assert_ne!(text.revision(), first);
+        let second = text.revision();
+        text.observe(&json!({"error": {"code": -1, "message": "x"}}), push);
+        assert_eq!(text.revision(), second);
     }
 
     #[test]

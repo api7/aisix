@@ -2543,7 +2543,20 @@ struct CompleteOnDrop<F: FnOnce(ResponsesStreamCompletion)> {
     slot: Option<(F, ResponsesStreamCompletion)>,
     /// Token-estimation fallback (AISIX-Cloud#1074); fills counters the
     /// upstream never reported before `on_complete` runs.
-    estimator: Option<crate::token_estimate::Estimator>,
+    estimate: crate::token_estimate::StreamEstimate,
+}
+
+/// What the bridged stream's estimate counts.
+fn bridged_responses_estimate_inputs(
+    comp: &ResponsesStreamCompletion,
+) -> crate::token_estimate::EstimateInputs<'_> {
+    crate::token_estimate::EstimateInputs {
+        upstream_prompt: comp.prompt_tokens,
+        upstream_completion: comp.completion_tokens,
+        output: Some(comp.est_output_text.as_str()),
+        // The output buffer only grows: its length identifies it.
+        output_revision: 0,
+    }
 }
 
 impl<F: FnOnce(ResponsesStreamCompletion)> CompleteOnDrop<F> {
@@ -2554,6 +2567,24 @@ impl<F: FnOnce(ResponsesStreamCompletion)> CompleteOnDrop<F> {
             .expect("stream completion guard accessed after drop")
             .1
     }
+
+    /// Count the estimate ahead (see
+    /// [`crate::token_estimate::StreamEstimate`]) before the terminal event
+    /// is released, so a client that closes on it leaves Drop a finished
+    /// count.
+    async fn count_ahead(&mut self) {
+        if let Some((_, comp)) = &self.slot {
+            self.estimate
+                .count_ahead(bridged_responses_estimate_inputs(comp))
+                .await;
+        }
+    }
+
+    /// Fill the counters the upstream never reported, once.
+    fn fill_estimate(&mut self) -> Option<crate::token_estimate::Filled> {
+        let (_, comp) = self.slot.as_ref()?;
+        self.estimate.fill(bridged_responses_estimate_inputs(comp))
+    }
 }
 
 impl<F: FnOnce(ResponsesStreamCompletion)> Drop for CompleteOnDrop<F> {
@@ -2562,18 +2593,11 @@ impl<F: FnOnce(ResponsesStreamCompletion)> Drop for CompleteOnDrop<F> {
             // Token-estimation fallback (AISIX-Cloud#1074): fill the
             // counters the upstream never reported from the request +
             // the accumulated output text.
-            if let Some(est) = self.estimator.take() {
-                let filled = crate::token_estimate::fill_missing(
-                    &est,
-                    comp.prompt_tokens,
-                    comp.completion_tokens,
-                    Some(comp.est_output_text.as_str()),
-                );
-                if filled.estimated {
-                    comp.prompt_tokens = filled.prompt_tokens;
-                    comp.completion_tokens = filled.completion_tokens;
-                    comp.usage_estimated = true;
-                }
+            let filled = self.estimate.fill(bridged_responses_estimate_inputs(&comp));
+            if let Some(filled) = filled.filter(|filled| filled.estimated) {
+                comp.prompt_tokens = filled.prompt_tokens;
+                comp.completion_tokens = filled.completion_tokens;
+                comp.usage_estimated = true;
             }
             f(comp);
         }
@@ -2626,7 +2650,7 @@ pub fn build_responses_bridge_stream(
     let stream = async_stream::stream! {
         let mut guard = CompleteOnDrop {
             slot: Some((on_complete, ResponsesStreamCompletion::default())),
-            estimator,
+            estimate: crate::token_estimate::StreamEstimate::new(estimator),
         };
         // Whether any event has left for the client yet; a failure that
         // would be the first one opens the stream itself.
@@ -2748,7 +2772,11 @@ pub fn build_responses_bridge_stream(
                     if buffering {
                         held_content.hold(crate::held_content::chat_delta(&chunk.delta), 0);
                     }
-                    for ev in encoder.next_events(&chunk) {
+                    let events = encoder.next_events(&chunk);
+                    if encoder.is_finished() {
+                        guard.count_ahead().await;
+                    }
+                    for ev in events {
                         let b = bytes::Bytes::from(ev.to_sse_string());
                         if buffering {
                             held_content.hold(0, b.len());
@@ -2835,6 +2863,22 @@ pub fn build_responses_bridge_stream(
             ));
             return;
         }
+        // A terminal event the encoder already sent live ended the response;
+        // record that before the count below, which a client closing on that
+        // event can cut short.
+        if encoder.is_finished() && !buffering {
+            guard.comp().reached_end = true;
+        }
+        // A fail-closed overflow in the loop already decided this response's
+        // outcome; record the refusal before the count, for the same reason.
+        let overflow_recorded = match output_guardrail.as_ref() {
+            Some(chain) if overflowed && !released => {
+                guard.comp().record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
+                aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain.as_ref());
+                true
+            }
+            _ => false,
+        };
         // Token-estimation fallback (AISIX-Cloud#1074), run HERE rather than
         // from the Drop guard below: the terminal `response.completed` this
         // relay is about to synthesize carries the client-visible usage, and
@@ -2843,23 +2887,16 @@ pub fn build_responses_bridge_stream(
         // to reconcile that with the dashboard. The guard keeps its own copy
         // of this fill for the stream a consumer abandoned before EOF, where
         // no terminal event is emitted at all.
-        if let Some(est) = guard.estimator.take() {
-            let filled = {
-                let comp = guard.comp();
-                crate::token_estimate::fill_missing(
-                    &est,
-                    comp.prompt_tokens,
-                    comp.completion_tokens,
-                    Some(comp.est_output_text.as_str()),
-                )
-            };
-            if filled.estimated {
-                let comp = guard.comp();
-                comp.prompt_tokens = filled.prompt_tokens;
-                comp.completion_tokens = filled.completion_tokens;
-                comp.usage_estimated = true;
-                encoder.set_estimated_usage(filled.prompt_tokens, filled.completion_tokens);
-            }
+        //
+        // Counted ahead first, so a consumer that leaves during the count
+        // still gets its record filled by the guard.
+        guard.count_ahead().await;
+        if let Some(filled) = guard.fill_estimate().filter(|filled| filled.estimated) {
+            let comp = guard.comp();
+            comp.prompt_tokens = filled.prompt_tokens;
+            comp.completion_tokens = filled.completion_tokens;
+            comp.usage_estimated = true;
+            encoder.set_estimated_usage(filled.prompt_tokens, filled.completion_tokens);
         }
 
         if !overflowed && !encoder.is_finished() {
@@ -2917,8 +2954,10 @@ pub fn build_responses_bridge_stream(
                 max_buffer_bytes,
                 "streaming /v1/responses (cross-provider) output exceeded buffer cap; failing closed",
             );
-            guard.comp().record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
-            aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain.as_ref());
+            if !overflow_recorded {
+                guard.comp().record_refusal(None, Some(crate::error::TAG_OUTPUT_BUFFER_EXCEEDED));
+                aisix_guardrails::Guardrail::record_output_buffer_exceeded(chain.as_ref());
+            }
             yield Ok(guardrail_failure_frames(
                 &mut encoder,
                 sent_downstream,

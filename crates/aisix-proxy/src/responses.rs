@@ -941,36 +941,19 @@ async fn dispatch(
                         },
                     );
                     success.routing = routing;
-                    // #911 [21]: commit the reserved layers with the actual
-                    // token cost so TPM/TPD is enforced for /v1/responses like
-                    // chat + embeddings. The buffered / non-streaming paths
-                    // carry `usage` here and commit now; the streaming path
-                    // already `take()`-d the reservation into its end-of-stream
-                    // guard (#688), so `reservation` is `None` and this is
-                    // skipped.
+                    // #911 [21]: TPM/TPD is enforced for /v1/responses like
+                    // chat + embeddings. A buffered attempt that reached its
+                    // output guardrail committed before the check, and the
+                    // streaming path `take()`-d the reservation into its
+                    // end-of-stream guard (#688); this commits the rest (a
+                    // response refused before any usage was read).
                     if !success.usage_handled_by_stream {
-                        if let Some(mut r) = reservation.take() {
-                            // Fold this target's model-layer reservation in
-                            // (AISIX-Cloud#1087) so one commit bills the
-                            // member's TPM/TPD too. Already `None` when the
-                            // streaming path folded it into the guard.
-                            if let Some(member) = member_reservation.take() {
-                                r.merge(member);
-                            }
-                            let total = success
-                                .usage
-                                .as_ref()
-                                .map(|u| {
-                                    total_tokens_with_cache(
-                                        u.prompt_tokens,
-                                        u.completion_tokens,
-                                        u.cache_creation_tokens,
-                                        u.cache_read_tokens,
-                                    )
-                                })
-                                .unwrap_or(0);
-                            r.commit_tokens(total).await;
-                        }
+                        crate::quota::commit_answered_attempt(
+                            &mut reservation,
+                            &mut member_reservation,
+                            success.usage.as_ref().map_or(0, response_usage_tokens),
+                        )
+                        .await;
                     }
                     if state.expose_debug_headers {
                         crate::dispatch_plan::insert_route_header(
@@ -1760,18 +1743,32 @@ async fn responses_to_target(
                         &body_bytes,
                     )),
                 );
-                let filled = crate::token_estimate::fill_missing(
-                    &est,
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    Some(&responses_sse_output_text(&buf)),
-                );
+                let filled = crate::token_estimate::fill_missing_recorded(
+                    est,
+                    usage.usage_stats(),
+                    Some(responses_sse_output_text(&buf)),
+                    || {
+                        crate::token_estimate::RateCommit::new(
+                            &state.limiter,
+                            [reservation.as_ref(), member_reservation.as_ref()],
+                            responses_committed_tokens,
+                        )
+                    },
+                    Some(attempt_started),
+                )
+                .await;
                 if filled.estimated {
                     usage.prompt_tokens = filled.prompt_tokens;
                     usage.completion_tokens = filled.completion_tokens;
                     usage.usage_estimated = true;
                 }
             }
+            crate::quota::commit_answered_attempt(
+                reservation,
+                member_reservation,
+                response_usage_tokens(&usage),
+            )
+            .await;
             let mut out_text = responses_sse_guardrail_text(&buf);
             // #1100: an excised frame is not released, but a forbidden
             // literal inside it must still block the response — the block
@@ -2055,28 +2052,13 @@ async fn responses_to_target(
             eos_scan,
             requested_model.to_string(),
             mark,
-            move |mut usage, out_text, output_hits| {
+            // Token-estimation fallback (AISIX-Cloud#1074): the stream's
+            // guard fills the missing counters BEFORE the TPM accounting and
+            // the emit below.
+            Some(estimator_c),
+            move |usage, out_text, output_hits| {
                 // Streams that reach here are committed 200s — the
                 // `!status.is_success()` guard above returned early on errors.
-                //
-                // Token-estimation fallback (AISIX-Cloud#1074): a stream that
-                // ends without a terminal usage event (client abort, relay
-                // that omits usage) fills the missing counters from the
-                // request + the assembled output text, BEFORE the TPM
-                // accounting and the emit below.
-                if usage.prompt_tokens == 0 || usage.completion_tokens == 0 {
-                    let filled = crate::token_estimate::fill_missing(
-                        &estimator_c,
-                        usage.prompt_tokens,
-                        usage.completion_tokens,
-                        Some(&out_text),
-                    );
-                    if filled.estimated {
-                        usage.prompt_tokens = filled.prompt_tokens;
-                        usage.completion_tokens = filled.completion_tokens;
-                        usage.usage_estimated = true;
-                    }
-                }
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
                 // reservation's async `commit_tokens`, which this closure can't await).
@@ -2230,12 +2212,20 @@ async fn responses_to_target(
                         &body_bytes,
                     )),
                 );
-                let filled = crate::token_estimate::fill_missing(
-                    &est,
-                    u.prompt_tokens,
-                    u.completion_tokens,
-                    Some(&responses_output_text(&json_body)),
-                );
+                let filled = crate::token_estimate::fill_missing_recorded(
+                    est,
+                    u.usage_stats(),
+                    Some(responses_output_text(&json_body)),
+                    || {
+                        crate::token_estimate::RateCommit::new(
+                            &state.limiter,
+                            [reservation.as_ref(), member_reservation.as_ref()],
+                            responses_committed_tokens,
+                        )
+                    },
+                    Some(attempt_started),
+                )
+                .await;
                 if filled.estimated {
                     u.prompt_tokens = filled.prompt_tokens;
                     u.completion_tokens = filled.completion_tokens;
@@ -2244,6 +2234,12 @@ async fn responses_to_target(
             }
             Some(u)
         };
+        crate::quota::commit_answered_attempt(
+            reservation,
+            member_reservation,
+            usage.as_ref().map_or(0, response_usage_tokens),
+        )
+        .await;
 
         // #719: run the output guardrail chain on the assistant's text so a
         // configured output block isn't bypassable by calling /v1/responses
@@ -2821,12 +2817,20 @@ async fn responses_cross_provider_to_target(
                 model.upstream_model().unwrap_or("unknown"),
                 crate::token_estimate::PromptInput::Responses(body.clone()),
             );
-            let filled = crate::token_estimate::fill_missing(
-                &est,
-                u.prompt_tokens,
-                u.completion_tokens,
-                Some(&crate::chat::estimation_output_text(&resp)),
-            );
+            let filled = crate::token_estimate::fill_missing_recorded(
+                est,
+                u.usage_stats(),
+                Some(crate::chat::estimation_output_text(&resp)),
+                || {
+                    crate::token_estimate::RateCommit::new(
+                        &state.limiter,
+                        [reservation.as_ref(), member_reservation.as_ref()],
+                        responses_committed_tokens,
+                    )
+                },
+                Some(attempt_started),
+            )
+            .await;
             if filled.estimated {
                 u.prompt_tokens = filled.prompt_tokens;
                 u.completion_tokens = filled.completion_tokens;
@@ -2842,6 +2846,12 @@ async fn responses_cross_provider_to_target(
         }
         u
     };
+    crate::quota::commit_answered_attempt(
+        reservation,
+        member_reservation,
+        response_usage_tokens(&usage),
+    )
+    .await;
 
     // #719: run output guardrails on the bridged response before re-encoding
     // it as Responses JSON — the assistant text + tool calls are
@@ -3072,12 +3082,16 @@ pub(crate) fn terminal_response_service_tier(event: &Value) -> Option<String> {
 /// gate is applied to `json.response`.
 /// <https://platform.openai.com/docs/api-reference/responses-streaming>
 fn parse_responses_terminal_usage(json: &Value) -> Option<ResponseUsage> {
+    is_terminal_response_event(json)
+        .then(|| json.get("response").and_then(extract_response_usage))
+        .flatten()
+}
+
+fn is_terminal_response_event(json: &Value) -> bool {
     matches!(
         json.get("type").and_then(|t| t.as_str()),
         Some("response.completed" | "response.incomplete" | "response.failed")
     )
-    .then(|| json.get("response").and_then(extract_response_usage))
-    .flatten()
 }
 
 impl ResponseUsage {
@@ -3095,6 +3109,27 @@ impl ResponseUsage {
             ..aisix_gateway::UsageStats::new(self.prompt_tokens, self.completion_tokens)
         }
     }
+}
+
+/// The token cost a non-streamed `/v1/responses` call commits to its
+/// rate-limit layers for `usage`.
+fn responses_committed_tokens(usage: &aisix_gateway::UsageStats) -> u64 {
+    total_tokens_with_cache(
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cache_creation_tokens,
+        usage.cache_read_tokens,
+    )
+}
+
+/// [`responses_committed_tokens`] for an attempt's recorded usage.
+fn response_usage_tokens(usage: &ResponseUsage) -> u64 {
+    total_tokens_with_cache(
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cache_creation_tokens,
+        usage.cache_read_tokens,
+    )
 }
 
 /// This endpoint's reading of a buffered Responses body's usage
@@ -3221,7 +3256,8 @@ fn drain_responses_sse_frames(
     client_facing_model: &str,
     mark: &crate::responses_affinity::ResponseMark,
     out: &mut Vec<u8>,
-) {
+) -> bool {
+    let mut terminal = false;
     while let Some(end) = aisix_gateway::sse::find_frame_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
         let restamped = crate::model_echo::restamp_sse_frame(
@@ -3247,6 +3283,7 @@ fn drain_responses_sse_frames(
                 continue;
             }
             if let Ok(json) = serde_json::from_str::<Value>(data) {
+                terminal |= is_terminal_response_event(&json);
                 // First parsed frame of ANY type (`response.created`
                 // included) → upstream TTFT. The industry convention
                 // (LiteLLM, caller-side gateways) stamps the same event, so
@@ -3316,6 +3353,7 @@ fn drain_responses_sse_frames(
             }
         }
     }
+    terminal
 }
 
 /// The upstream failure a Responses-API stream event reports, if it is one:
@@ -3385,6 +3423,9 @@ struct SseTextCapture {
     /// response is present, because an upstream can send a mismatching
     /// authoritative aggregate after clean deltas.
     saw_non_terminal_visible: bool,
+    /// Bumped each time a terminal snapshot replaces the text [`Self::text`]
+    /// returns, which can leave its length unchanged.
+    revision: u32,
 }
 
 impl SseTextCapture {
@@ -3395,6 +3436,7 @@ impl SseTextCapture {
             terminal: None,
             terminal_response: None,
             saw_non_terminal_visible: false,
+            revision: 0,
         }
     }
 
@@ -3418,6 +3460,7 @@ impl SseTextCapture {
                     self.terminal_response = (full.len() <= self.cap).then(|| resp.clone());
                     if !full.is_empty() {
                         self.terminal = Some(full);
+                        self.revision += 1;
                     }
                 }
             }
@@ -3437,6 +3480,11 @@ impl SseTextCapture {
     /// accumulated deltas. `CapturedContent::new` re-truncates to the cap.
     fn into_text(self) -> String {
         self.terminal.unwrap_or(self.deltas)
+    }
+
+    /// What [`Self::into_text`] will return, without consuming the capture.
+    fn text(&self) -> &str {
+        self.terminal.as_deref().unwrap_or(&self.deltas)
     }
 
     /// All authoritative output carriers for the end-of-stream monitor.
@@ -3468,6 +3516,14 @@ impl SseTextCapture {
 /// nothing final to observe, matching the chat surface's disconnect behavior.
 struct ResponsesUsageGuard<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> {
     slot: Option<(F, Option<ResponseUsage>, Option<SseTextCapture>)>,
+    /// Token-estimation fallback (AISIX-Cloud#1074): a stream that ends
+    /// without a terminal usage event (client abort, relay that omits
+    /// usage) fills the missing counters from the request + the assembled
+    /// output text before `on_complete` runs.
+    estimate: crate::token_estimate::StreamEstimate,
+    /// The end-of-stream scan's monitor hits, kept here once the scan is
+    /// done so a disconnect during the count after it still reports them.
+    hits: Vec<aisix_core::GuardrailMonitorHit>,
 }
 
 impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
@@ -3480,19 +3536,63 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
             .expect("ResponsesUsageGuard accessed after take");
         (&mut slot.1, slot.2.as_mut())
     }
+
+    /// Count the estimate ahead on the estimation pool (see
+    /// [`crate::token_estimate::CountedAhead`]), from the same inputs
+    /// [`Self::complete`] will count.
+    async fn count_ahead(&mut self) {
+        if let Some((_, usage, capture)) = &self.slot {
+            let text = capture.as_ref().map_or("", SseTextCapture::text);
+            let revision = capture.as_ref().map_or(0, |c| c.revision);
+            self.estimate
+                .count_ahead(responses_estimate_inputs(usage.as_ref(), text, revision))
+                .await;
+        }
+    }
+
+    /// Complete the stream once, from the count ahead when it still fits
+    /// and otherwise counting inline (Drop cannot wait).
+    fn complete(&mut self) {
+        let Some((f, usage, capture)) = self.slot.take() else {
+            return;
+        };
+        let hits = std::mem::take(&mut self.hits);
+        let mut usage = usage.unwrap_or_default();
+        let revision = capture.as_ref().map_or(0, |c| c.revision);
+        let out_text = capture.map(SseTextCapture::into_text).unwrap_or_default();
+        let filled =
+            self.estimate
+                .fill(responses_estimate_inputs(Some(&usage), &out_text, revision));
+        if let Some(filled) = filled.filter(|filled| filled.estimated) {
+            usage.prompt_tokens = filled.prompt_tokens;
+            usage.completion_tokens = filled.completion_tokens;
+            usage.usage_estimated = true;
+        }
+        f(usage, out_text, hits);
+    }
+}
+
+/// What the passthrough stream's estimate counts: the upstream counters
+/// and the captured output text, whose revision the capture bumps when a
+/// terminal snapshot replaces it.
+fn responses_estimate_inputs<'a>(
+    usage: Option<&ResponseUsage>,
+    text: &'a str,
+    revision: u32,
+) -> crate::token_estimate::EstimateInputs<'a> {
+    crate::token_estimate::EstimateInputs {
+        upstream_prompt: usage.map_or(0, |u| u.prompt_tokens),
+        upstream_completion: usage.map_or(0, |u| u.completion_tokens),
+        output: Some(text),
+        output_revision: revision,
+    }
 }
 
 impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> Drop
     for ResponsesUsageGuard<F>
 {
     fn drop(&mut self) {
-        if let Some((f, usage, capture)) = self.slot.take() {
-            f(
-                usage.unwrap_or_default(),
-                capture.map(SseTextCapture::into_text).unwrap_or_default(),
-                Vec::new(),
-            );
-        }
+        self.complete();
     }
 }
 
@@ -3524,6 +3624,9 @@ fn build_responses_passthrough_stream<S, F>(
     // Context tags applied to the forwarded frames only; the usage and
     // capture parsers read each frame as the upstream sent it.
     mark: crate::responses_affinity::ResponseMark,
+    // Token-estimation fallback context (AISIX-Cloud#1074); see
+    // `ResponsesUsageGuard::estimator`.
+    estimator: Option<crate::token_estimate::Estimator>,
     on_complete: F,
 ) -> impl futures::Stream<Item = reqwest::Result<bytes::Bytes>>
 where
@@ -3561,6 +3664,8 @@ where
                 }),
                 capture_cap.map(SseTextCapture::new),
             )),
+            estimate: crate::token_estimate::StreamEstimate::new(estimator),
+            hits: Vec::new(),
         };
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
@@ -3574,7 +3679,7 @@ where
                 buf.extend_from_slice(bytes);
                 let mut forward: Vec<u8> = Vec::new();
                 let (usage_acc, capture) = guard.parts();
-                drain_responses_sse_frames(
+                let terminal = drain_responses_sse_frames(
                     &mut buf,
                     usage_acc,
                     capture,
@@ -3620,6 +3725,9 @@ where
                 if acc.downstream_latency_ms == 0 {
                     acc.downstream_latency_ms =
                         crate::attempt::measured_ms(started.elapsed());
+                }
+                if terminal {
+                    guard.count_ahead().await;
                 }
                 yield Ok(bytes::Bytes::from(forward));
                 continue;
@@ -3727,13 +3835,9 @@ where
             }
             None => Vec::new(),
         };
-        if let Some((f, usage, capture)) = guard.slot.take() {
-            f(
-                usage.unwrap_or_default(),
-                capture.map(SseTextCapture::into_text).unwrap_or_default(),
-                hits,
-            );
-        }
+        guard.hits = hits;
+        guard.count_ahead().await;
+        guard.complete();
     })
 }
 
@@ -7731,6 +7835,29 @@ data: [DONE]\n\n";
         assert_eq!(usage.prompt_tokens, 4321);
         assert_eq!(usage.completion_tokens, 765);
         assert_eq!(usage.provider_request_id, "resp_ml");
+    }
+
+    #[test]
+    fn only_a_terminal_event_marks_the_end_not_text_naming_it() {
+        let drain = |frames: &[u8]| {
+            let mut buf = frames.to_vec();
+            super::drain_responses_sse_frames(
+                &mut buf,
+                &mut None,
+                None,
+                std::time::Instant::now(),
+                &mut false,
+                "client-facing",
+                &Default::default(),
+                &mut Vec::new(),
+            )
+        };
+        assert!(!drain(
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"response.completed\"}\n\n"
+        ));
+        assert!(drain(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+        ));
     }
 
     /// The same drain on a CRLF-framed stream with no `[DONE]` sentinel —
