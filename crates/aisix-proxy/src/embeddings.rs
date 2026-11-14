@@ -735,14 +735,16 @@ async fn dispatch(
                                 usage_estimated: prompt_tokens > 0,
                                 answered_after_ms: None,
                             },
-                            crate::token_estimate::RateCommit::new(
-                                &state.limiter,
-                                [Some(&reservation)],
-                                // The estimate stands in for a usage the
-                                // upstream reported none of, so the commit
-                                // below is the prompt alone.
-                                |usage| u64::from(usage.prompt_tokens),
-                            ),
+                            || {
+                                crate::token_estimate::RateCommit::new(
+                                    &state.limiter,
+                                    [Some(&reservation)],
+                                    // The estimate stands in for a usage the
+                                    // upstream reported none of, so the commit
+                                    // below is the prompt alone.
+                                    |usage| u64::from(usage.prompt_tokens),
+                                )
+                            },
                         )
                         .await
                     }

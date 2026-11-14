@@ -1168,7 +1168,7 @@ async fn count_a2a_call(call: &A2aCall) -> A2aCounted {
             answered_after_ms: None,
         },
         // A2A commits no tokens to a rate-limit window.
-        None,
+        || None,
     )
     .await;
     A2aCounted {

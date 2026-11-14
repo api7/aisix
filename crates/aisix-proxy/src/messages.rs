@@ -1837,11 +1837,13 @@ async fn anthropic_passthrough_dispatch(
             &upstream_model,
             || crate::util::outbound_value(&body_bytes),
             || anthropic_estimation_output_text(&json_body),
-            crate::token_estimate::RateCommit::new(
-                &state.limiter,
-                [reservation.as_ref(), member_reservation.as_ref()],
-                messages_committed_tokens,
-            ),
+            || {
+                crate::token_estimate::RateCommit::new(
+                    &state.limiter,
+                    [reservation.as_ref(), member_reservation.as_ref()],
+                    messages_committed_tokens,
+                )
+            },
             Some(attempt_started),
         )
         .await;
@@ -2104,7 +2106,7 @@ async fn fill_missing_anthropic_metrics(
     upstream_model: &str,
     prompt: impl FnOnce() -> Value,
     output_text: impl FnOnce() -> String,
-    rate: Option<crate::token_estimate::RateCommit>,
+    rate: impl FnOnce() -> Option<crate::token_estimate::RateCommit>,
     attempt_started: Option<Instant>,
 ) {
     if metrics.prompt_tokens != 0 && metrics.completion_tokens != 0 {
@@ -2775,11 +2777,13 @@ async fn cross_provider_dispatch(
         &upstream_model,
         || body.clone(),
         || crate::chat::estimation_output_text(&resp),
-        crate::token_estimate::RateCommit::new(
-            &state.limiter,
-            [reservation.as_ref(), member_reservation.as_ref()],
-            messages_committed_tokens,
-        ),
+        || {
+            crate::token_estimate::RateCommit::new(
+                &state.limiter,
+                [reservation.as_ref(), member_reservation.as_ref()],
+                messages_committed_tokens,
+            )
+        },
         Some(attempt_started),
     )
     .await;
@@ -6899,7 +6903,7 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
             "relay-claude",
             || body.clone(),
             || anthropic_estimation_output_text(&resp),
-            None,
+            || None,
             None,
         )
         .await;
@@ -6918,7 +6922,7 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
             "relay-claude",
             || body.clone(),
             || panic!("output extractor must not run when usage is complete"),
-            None,
+            || None,
             None,
         )
         .await;

@@ -438,11 +438,13 @@ pub(crate) async fn run_recorded_on_cancel<R: Send + 'static>(
     text_bytes: usize,
     job: impl Fn() -> R + Send + Sync + 'static,
     on_cancel: impl FnOnce(R) -> CancelledUsage + Send + 'static,
-    rate: Option<RateCommit>,
+    // Built only when the count is pooled: most calls never need it.
+    rate: impl FnOnce() -> Option<RateCommit>,
 ) -> R {
     if text_bytes <= crate::estimate_pool::INLINE_MAX_BYTES {
         return job();
     }
+    let rate = rate();
     let job = std::sync::Arc::new(job);
     let inline = std::sync::Arc::clone(&job);
     crate::attribution::publish_cancelled_usage(Box::new(move || {
@@ -465,7 +467,7 @@ pub(crate) async fn fill_missing_recorded(
     est: Estimator,
     upstream: aisix_gateway::chat::UsageStats,
     output_text: Option<String>,
-    rate: Option<RateCommit>,
+    rate: impl FnOnce() -> Option<RateCommit>,
     // When the caller's attempt began, for a family that settles its
     // attempt only after this count (see `CancelledUsage::answered_after_ms`).
     attempt_started: Option<std::time::Instant>,

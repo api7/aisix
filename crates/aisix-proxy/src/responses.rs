@@ -1764,11 +1764,13 @@ async fn responses_to_target(
                     est,
                     usage.usage_stats(),
                     Some(responses_sse_output_text(&buf)),
-                    crate::token_estimate::RateCommit::new(
-                        &state.limiter,
-                        [reservation.as_ref(), member_reservation.as_ref()],
-                        responses_committed_tokens,
-                    ),
+                    || {
+                        crate::token_estimate::RateCommit::new(
+                            &state.limiter,
+                            [reservation.as_ref(), member_reservation.as_ref()],
+                            responses_committed_tokens,
+                        )
+                    },
                     Some(attempt_started),
                 )
                 .await;
@@ -2225,11 +2227,13 @@ async fn responses_to_target(
                     est,
                     u.usage_stats(),
                     Some(responses_output_text(&json_body)),
-                    crate::token_estimate::RateCommit::new(
-                        &state.limiter,
-                        [reservation.as_ref(), member_reservation.as_ref()],
-                        responses_committed_tokens,
-                    ),
+                    || {
+                        crate::token_estimate::RateCommit::new(
+                            &state.limiter,
+                            [reservation.as_ref(), member_reservation.as_ref()],
+                            responses_committed_tokens,
+                        )
+                    },
                     Some(attempt_started),
                 )
                 .await;
@@ -2822,11 +2826,13 @@ async fn responses_cross_provider_to_target(
                 est,
                 u.usage_stats(),
                 Some(crate::chat::estimation_output_text(&resp)),
-                crate::token_estimate::RateCommit::new(
-                    &state.limiter,
-                    [reservation.as_ref(), member_reservation.as_ref()],
-                    responses_committed_tokens,
-                ),
+                || {
+                    crate::token_estimate::RateCommit::new(
+                        &state.limiter,
+                        [reservation.as_ref(), member_reservation.as_ref()],
+                        responses_committed_tokens,
+                    )
+                },
                 Some(attempt_started),
             )
             .await;

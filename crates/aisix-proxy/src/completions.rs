@@ -677,13 +677,16 @@ async fn dispatch(
                                 answered_after_ms: None,
                             }
                         },
-                        crate::token_estimate::RateCommit::new(
-                            &state.limiter,
-                            [Some(&reservation)],
-                            |usage| {
-                                u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens)
-                            },
-                        ),
+                        || {
+                            crate::token_estimate::RateCommit::new(
+                                &state.limiter,
+                                [Some(&reservation)],
+                                |usage| {
+                                    u64::from(usage.prompt_tokens)
+                                        + u64::from(usage.completion_tokens)
+                                },
+                            )
+                        },
                     )
                     .await;
                     if let Some(n) = prompt_n.filter(|n| *n > 0) {
