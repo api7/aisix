@@ -258,69 +258,125 @@ pub async fn fill_missing_pooled(
     .await
 }
 
-/// A stream's estimate, counted on the estimation pool before the stream
-/// releases its terminal frame. A client that closes as soon as it reads
-/// that frame drops the stream there, and the guard's Drop — which must
-/// emit in place and cannot wait — then takes this count instead of
-/// tokenizing on the request worker. It answers only for the inputs it
-/// was counted from; for anything else the guard counts inline as before.
-///
-/// The output is identified by its length and a revision: a buffer that
-/// only grows is identified by its length alone (revision 0), and one that
-/// can be replaced by other text bumps the revision on each replacement.
-#[derive(Default)]
-pub struct CountedAhead(Option<(CountKey, Filled)>);
+/// A count made ahead of the moment it is needed, keyed by the inputs it
+/// was made from. A stream counts before it releases its terminal frame: a
+/// client that closes as soon as it reads that frame drops the stream there,
+/// and the guard's Drop — which must emit in place and cannot wait — then
+/// takes this count instead of counting on the request worker. It answers
+/// only for the key it was counted at; for any other the caller counts
+/// inline as before.
+pub struct CountedAhead<K, V>(Option<(K, V)>);
+
+impl<K, V> Default for CountedAhead<K, V> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<K: PartialEq, V> CountedAhead<K, V> {
+    /// Count at `key` unless the count already held is for it.
+    pub async fn count<Fut: std::future::Future<Output = V>>(
+        &mut self,
+        key: K,
+        count: impl FnOnce() -> Fut,
+    ) {
+        if self.0.as_ref().is_some_and(|(counted, _)| *counted == key) {
+            return;
+        }
+        let value = count().await;
+        self.0 = Some((key, value));
+    }
+
+    /// The count held for `key`, else `inline()`.
+    pub fn take_or(&mut self, key: &K, inline: impl FnOnce() -> V) -> V {
+        match self.0.take() {
+            Some((counted, value)) if counted == *key => value,
+            _ => inline(),
+        }
+    }
+}
+
+/// What one stream estimate counts: the upstream counters (zero where it
+/// reported none) and the delivered output text. The output is identified
+/// by its length and a revision: a buffer that only grows is identified by
+/// its length alone (revision 0), and one that can be replaced by other
+/// text bumps the revision on each replacement.
+#[derive(Clone, Copy)]
+pub struct EstimateInputs<'a> {
+    pub upstream_prompt: u32,
+    pub upstream_completion: u32,
+    pub output: Option<&'a str>,
+    pub output_revision: u32,
+}
 
 type CountKey = (u32, u32, Option<(usize, u32)>);
 
-impl CountedAhead {
-    pub async fn count(
-        &mut self,
-        est: &Estimator,
-        upstream_prompt: u32,
-        upstream_completion: u32,
-        output_text: Option<&str>,
-        output_revision: u32,
-    ) {
-        let key = (
-            upstream_prompt,
-            upstream_completion,
-            output_text.map(|t| (t.len(), output_revision)),
-        );
-        if !needs_counting(upstream_prompt, upstream_completion, output_text.is_some())
-            || self.0.is_some_and(|(counted, _)| counted == key)
-        {
-            return;
-        }
-        let filled = fill_missing_pooled(
-            est.clone(),
-            upstream_prompt,
-            upstream_completion,
-            output_text.map(str::to_owned),
+impl EstimateInputs<'_> {
+    fn key(&self) -> CountKey {
+        (
+            self.upstream_prompt,
+            self.upstream_completion,
+            self.output.map(|t| (t.len(), self.output_revision)),
         )
-        .await;
-        self.0 = Some((key, filled));
+    }
+}
+
+/// A stream's estimator and its count ahead. Each streaming guard builds
+/// its [`EstimateInputs`] in one place and passes them to both
+/// [`Self::count_ahead`] and [`Self::fill`], so the count ahead cannot
+/// drift from what the guard's completion counts.
+#[derive(Default)]
+pub struct StreamEstimate {
+    estimator: Option<Estimator>,
+    counted: CountedAhead<CountKey, Filled>,
+}
+
+impl StreamEstimate {
+    pub fn new(estimator: Option<Estimator>) -> Self {
+        Self {
+            estimator,
+            counted: CountedAhead::default(),
+        }
     }
 
-    /// [`fill_missing`], taken from the count ahead when it was counted
-    /// from these same inputs.
-    pub fn fill(
-        &self,
-        est: &Estimator,
-        upstream_prompt: u32,
-        upstream_completion: u32,
-        output_text: Option<&str>,
-        output_revision: u32,
-    ) -> Filled {
-        let key = (
-            upstream_prompt,
-            upstream_completion,
-            output_text.map(|t| (t.len(), output_revision)),
-        );
-        match self.0 {
-            Some((counted, filled)) if counted == key => filled,
-            _ => fill_missing(est, upstream_prompt, upstream_completion, output_text),
+    /// Count the estimate ahead, through [`crate::estimate_pool::run`].
+    pub async fn count_ahead(&mut self, inputs: EstimateInputs<'_>) {
+        let Self { estimator, counted } = self;
+        let Some(est) = estimator.as_ref() else {
+            return;
+        };
+        if !needs_counting(
+            inputs.upstream_prompt,
+            inputs.upstream_completion,
+            inputs.output.is_some(),
+        ) {
+            return;
         }
+        counted
+            .count(inputs.key(), || {
+                fill_missing_pooled(
+                    est.clone(),
+                    inputs.upstream_prompt,
+                    inputs.upstream_completion,
+                    inputs.output.map(str::to_owned),
+                )
+            })
+            .await;
+    }
+
+    /// [`fill_missing`], once: from the count ahead when it was counted from
+    /// these same inputs, otherwise inline (Drop cannot wait). `None` when
+    /// there is no estimator, or it was already used.
+    pub fn fill(&mut self, inputs: EstimateInputs<'_>) -> Option<Filled> {
+        let est = self.estimator.take()?;
+        Some(self.counted.take_or(&inputs.key(), || {
+            fill_missing(
+                &est,
+                inputs.upstream_prompt,
+                inputs.upstream_completion,
+                inputs.output,
+            )
+        }))
     }
 }
 
@@ -1143,10 +1199,30 @@ mod tests {
             "relay-model",
             ChatFormat::new("relay-model", vec![msg(Role::User, "hi")]),
         );
-        let mut ahead = CountedAhead::default();
-        ahead.count(&est, 0, 0, Some("Hello world"), 0).await;
+        let inputs = |completion: u32, output: &'static str, revision: u32| EstimateInputs {
+            upstream_prompt: 0,
+            upstream_completion: completion,
+            output: Some(output),
+            output_revision: revision,
+        };
+        let mut once = StreamEstimate::new(Some(est.clone()));
+        once.count_ahead(inputs(0, "Hello world", 0)).await;
 
-        let same = ahead.fill(&est, 0, 0, Some("Hello world"), 0);
+        // Fill each case from a fresh count made at the same inputs.
+        async fn filled(est: &Estimator, later: EstimateInputs<'static>) -> Filled {
+            let mut ahead = StreamEstimate::new(Some(est.clone()));
+            ahead
+                .count_ahead(EstimateInputs {
+                    upstream_prompt: 0,
+                    upstream_completion: 0,
+                    output: Some("Hello world"),
+                    output_revision: 0,
+                })
+                .await;
+            ahead.fill(later).unwrap()
+        }
+
+        let same = filled(&est, inputs(0, "Hello world", 0)).await;
         let inline = fill_missing(&est, 0, 0, Some("Hello world"));
         assert_eq!(
             (same.prompt_tokens, same.completion_tokens, same.estimated),
@@ -1158,20 +1234,24 @@ mod tests {
         );
 
         // More output arrived after the count ahead: it must not stand in.
-        let grown = ahead.fill(&est, 0, 0, Some("Hello world, and then some more"), 0);
+        let grown = filled(&est, inputs(0, "Hello world, and then some more", 0)).await;
         let fresh = fill_missing(&est, 0, 0, Some("Hello world, and then some more"));
         assert_eq!(grown.completion_tokens, fresh.completion_tokens);
         assert_ne!(grown.completion_tokens, same.completion_tokens);
 
         // A counter the upstream reported after the count ahead stands.
-        let reported = ahead.fill(&est, 0, 7, Some("Hello world"), 0);
+        let reported = filled(&est, inputs(7, "Hello world", 0)).await;
         assert_eq!(reported.completion_tokens, 7);
 
         // Output replaced by other text of the same length.
-        let replaced = ahead.fill(&est, 0, 0, Some("1 2 3 4 5 6"), 1);
+        let replaced = filled(&est, inputs(0, "1 2 3 4 5 6", 1)).await;
         let fresh = fill_missing(&est, 0, 0, Some("1 2 3 4 5 6"));
         assert_eq!(replaced.completion_tokens, fresh.completion_tokens);
         assert_ne!(replaced.completion_tokens, same.completion_tokens);
+
+        // An estimate fills once.
+        assert!(once.fill(inputs(0, "Hello world", 0)).is_some());
+        assert!(once.fill(inputs(0, "Hello world", 0)).is_none());
     }
 
     #[test]

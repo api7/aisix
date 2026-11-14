@@ -2863,7 +2863,7 @@ fn build_anthropic_sse_stream(
     let stream = async_stream::stream! {
         let mut guard = CompleteAnthropicStreamOnDrop {
             slot: Some((on_complete, AnthropicStreamCompletion::default())),
-            estimator,
+            estimate: crate::token_estimate::StreamEstimate::new(estimator),
         };
         let mut upstream = upstream;
         let mut first_chunk_seen = false;
@@ -3003,7 +3003,11 @@ fn build_anthropic_sse_stream(
                             crate::guardrail_stream::release_output_buffer_unscanned(chain.as_ref());
                         }
                         for chunk in held_chunks.drain(..) {
-                            for ev in encoder.next_events(&chunk) {
+                            let events = encoder.next_events(&chunk);
+                            if encoder.is_finished() {
+                                guard.count_ahead().await;
+                            }
+                            for ev in events {
                                 yield Ok::<_, std::io::Error>(downstream_bytes!(guard, ev));
                             }
                             if encoder.is_finished() {
@@ -3016,7 +3020,11 @@ fn build_anthropic_sse_stream(
                         }
                         continue;
                     }
-                    for ev in encoder.next_events(&chunk) {
+                    let events = encoder.next_events(&chunk);
+                    if encoder.is_finished() {
+                        guard.count_ahead().await;
+                    }
+                    for ev in events {
                         yield Ok::<_, std::io::Error>(downstream_bytes!(guard, ev));
                     }
                     if encoder.is_finished() {
@@ -3176,7 +3184,11 @@ fn build_anthropic_sse_stream(
                 }
             }
             for chunk in held_chunks.drain(..) {
-                for ev in encoder.next_events(&chunk) {
+                let events = encoder.next_events(&chunk);
+                if encoder.is_finished() {
+                    guard.count_ahead().await;
+                }
+                for ev in events {
                     yield Ok::<_, std::io::Error>(downstream_bytes!(guard, ev));
                 }
                 if encoder.is_finished() {
@@ -3192,32 +3204,15 @@ fn build_anthropic_sse_stream(
         // its own copy of this fill for the stream a consumer abandoned
         // before EOF, where no closing pair is emitted at all.
         //
-        // The count runs on the estimation pool. The guard keeps its
-        // estimator until the count is back, so a consumer that leaves
-        // while it runs still gets its record filled by the guard.
-        let to_count = guard.estimator.clone().filter(|_| {
+        // Counted ahead first, so a consumer that leaves during the count
+        // still gets its record filled by the guard.
+        guard.count_ahead().await;
+        if let Some(filled) = guard.fill_estimate().filter(|filled| filled.estimated) {
             let comp = guard.comp();
-            crate::token_estimate::needs_counting(comp.prompt_tokens, comp.completion_tokens, true)
-        });
-        if let Some(est) = to_count {
-            let filled = {
-                let comp = guard.comp();
-                crate::token_estimate::fill_missing_pooled(
-                    est,
-                    comp.prompt_tokens,
-                    comp.completion_tokens,
-                    Some(comp.est_output_text.clone()),
-                )
-            }
-            .await;
-            guard.estimator = None;
-            if filled.estimated {
-                let comp = guard.comp();
-                comp.prompt_tokens = filled.prompt_tokens;
-                comp.completion_tokens = filled.completion_tokens;
-                comp.usage_estimated = true;
-                encoder.set_estimated_usage(filled.prompt_tokens, filled.completion_tokens);
-            }
+            comp.prompt_tokens = filled.prompt_tokens;
+            comp.completion_tokens = filled.completion_tokens;
+            comp.usage_estimated = true;
+            encoder.set_estimated_usage(filled.prompt_tokens, filled.completion_tokens);
         }
         if !encoder.is_finished() {
             for ev in encoder.force_finish() {
@@ -3383,7 +3378,22 @@ struct CompleteAnthropicStreamOnDrop<F: FnOnce(AnthropicStreamCompletion)> {
     slot: Option<(F, AnthropicStreamCompletion)>,
     /// Token-estimation fallback (AISIX-Cloud#1074); fills counters the
     /// upstream never reported before `on_complete` runs.
-    estimator: Option<crate::token_estimate::Estimator>,
+    estimate: crate::token_estimate::StreamEstimate,
+}
+
+/// What the bridged stream's estimate counts. This surface has no
+/// delivered-count gate (unlike chat.rs / the passthrough guard), so the
+/// estimate covers whatever the bridge produced.
+fn bridged_anthropic_estimate_inputs(
+    c: &AnthropicStreamCompletion,
+) -> crate::token_estimate::EstimateInputs<'_> {
+    crate::token_estimate::EstimateInputs {
+        upstream_prompt: c.prompt_tokens,
+        upstream_completion: c.completion_tokens,
+        output: Some(c.est_output_text.as_str()),
+        // The output buffer only grows: its length identifies it.
+        output_revision: 0,
+    }
 }
 
 impl<F: FnOnce(AnthropicStreamCompletion)> CompleteAnthropicStreamOnDrop<F> {
@@ -3394,28 +3404,36 @@ impl<F: FnOnce(AnthropicStreamCompletion)> CompleteAnthropicStreamOnDrop<F> {
             .expect("stream completion guard accessed after drop")
             .1
     }
+
+    /// Count the estimate ahead (see
+    /// [`crate::token_estimate::StreamEstimate`]) before the closing events
+    /// are released, so a client that closes on them leaves Drop a finished
+    /// count.
+    async fn count_ahead(&mut self) {
+        if let Some((_, c)) = &self.slot {
+            self.estimate
+                .count_ahead(bridged_anthropic_estimate_inputs(c))
+                .await;
+        }
+    }
+
+    /// Fill the counters the upstream never reported, once.
+    fn fill_estimate(&mut self) -> Option<crate::token_estimate::Filled> {
+        let (_, c) = self.slot.as_ref()?;
+        self.estimate.fill(bridged_anthropic_estimate_inputs(c))
+    }
 }
 
 impl<F: FnOnce(AnthropicStreamCompletion)> Drop for CompleteAnthropicStreamOnDrop<F> {
     fn drop(&mut self) {
         if let Some((f, mut c)) = self.slot.take() {
             // Token-estimation fallback (AISIX-Cloud#1074): fill the
-            // counters the upstream never reported. This surface has no
-            // delivered-count gate (unlike chat.rs / the passthrough
-            // guard), so the estimate covers whatever the bridge produced
-            // before the stream ended.
-            if let Some(est) = self.estimator.take() {
-                let filled = crate::token_estimate::fill_missing(
-                    &est,
-                    c.prompt_tokens,
-                    c.completion_tokens,
-                    Some(c.est_output_text.as_str()),
-                );
-                if filled.estimated {
-                    c.prompt_tokens = filled.prompt_tokens;
-                    c.completion_tokens = filled.completion_tokens;
-                    c.usage_estimated = true;
-                }
+            // counters the upstream never reported.
+            let filled = self.estimate.fill(bridged_anthropic_estimate_inputs(&c));
+            if let Some(filled) = filled.filter(|filled| filled.estimated) {
+                c.prompt_tokens = filled.prompt_tokens;
+                c.completion_tokens = filled.completion_tokens;
+                c.usage_estimated = true;
             }
             f(c);
         }
@@ -4130,8 +4148,7 @@ struct AnthropicStreamGuard<F: FnOnce(AnthropicStreamUsage)> {
     /// Token-estimation fallback (AISIX-Cloud#1074): fills counters the
     /// upstream never reported. Prompt from the captured request body,
     /// completion from the accumulated `response_text`.
-    estimator: Option<crate::token_estimate::Estimator>,
-    counted: crate::token_estimate::CountedAhead,
+    estimate: crate::token_estimate::StreamEstimate,
 }
 
 impl<F: FnOnce(AnthropicStreamUsage)> AnthropicStreamGuard<F> {
@@ -4155,10 +4172,10 @@ impl<F: FnOnce(AnthropicStreamUsage)> AnthropicStreamGuard<F> {
         } else {
             delivered
         };
-        if let (Some(est), Some((_, usage))) = (&self.estimator, &self.slot) {
-            let (prompt, completion, output) = estimate_inputs(usage, delivered);
-            // The output buffer only grows: its length identifies it.
-            self.counted.count(est, prompt, completion, output, 0).await;
+        if let Some((_, usage)) = &self.slot {
+            self.estimate
+                .count_ahead(estimate_inputs(usage, delivered))
+                .await;
         }
     }
 
@@ -4183,9 +4200,7 @@ impl<F: FnOnce(AnthropicStreamUsage)> AnthropicStreamGuard<F> {
             // no message_delta) is treated as missing so an aborted stream
             // estimates from the delivered text; max() keeps the floor when
             // the estimate has nothing to add.
-            if let Some(est) = self.estimator.take() {
-                let (prompt, completion, output) = estimate_inputs(&usage, delivered);
-                let filled = self.counted.fill(&est, prompt, completion, output, 0);
+            if let Some(filled) = self.estimate.fill(estimate_inputs(&usage, delivered)) {
                 if filled.estimated {
                     usage.prompt_tokens = filled.prompt_tokens;
                     usage.completion_tokens = filled.completion_tokens.max(usage.completion_tokens);
@@ -4197,16 +4212,23 @@ impl<F: FnOnce(AnthropicStreamUsage)> AnthropicStreamGuard<F> {
     }
 }
 
-/// What the passthrough stream's estimate counts, after the #419 gate:
-/// `(upstream prompt, upstream completion, delivered output text)`.
-fn estimate_inputs(usage: &AnthropicStreamUsage, delivered: u32) -> (u32, u32, Option<&str>) {
+/// What the passthrough stream's estimate counts, after the #419 gate.
+fn estimate_inputs(
+    usage: &AnthropicStreamUsage,
+    delivered: u32,
+) -> crate::token_estimate::EstimateInputs<'_> {
     let upstream_completion = if delivered > 0 && usage.output_tokens_from_delta {
         usage.completion_tokens
     } else {
         0
     };
-    let output = (delivered > 0).then_some(usage.est_output_text.as_str());
-    (usage.prompt_tokens, upstream_completion, output)
+    crate::token_estimate::EstimateInputs {
+        upstream_prompt: usage.prompt_tokens,
+        upstream_completion,
+        output: (delivered > 0).then_some(usage.est_output_text.as_str()),
+        // The output buffer only grows: its length identifies it.
+        output_revision: 0,
+    }
 }
 
 impl<F: FnOnce(AnthropicStreamUsage)> Drop for AnthropicStreamGuard<F> {
@@ -4285,8 +4307,7 @@ where
         let mut guard = AnthropicStreamGuard {
             slot: Some((on_complete, AnthropicStreamUsage::default())),
             delivered: delivered_for_drop,
-            estimator,
-            counted: Default::default(),
+            estimate: crate::token_estimate::StreamEstimate::new(estimator),
         };
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
@@ -6669,8 +6690,7 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
                         usage,
                     )),
                     delivered,
-                    estimator: None,
-                    counted: Default::default(),
+                    estimate: Default::default(),
                 };
                 drop(guard);
             }
@@ -6742,11 +6762,12 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
                         usage,
                     )),
                     delivered,
-                    estimator: Some(crate::token_estimate::Estimator::new(
-                        "relay-claude",
-                        crate::token_estimate::PromptInput::Anthropic(body),
+                    estimate: crate::token_estimate::StreamEstimate::new(Some(
+                        crate::token_estimate::Estimator::new(
+                            "relay-claude",
+                            crate::token_estimate::PromptInput::Anthropic(body),
+                        ),
                     )),
-                    counted: Default::default(),
                 };
                 drop(guard);
             }

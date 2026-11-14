@@ -5820,8 +5820,26 @@ struct CompleteOnDrop<F: FnOnce(StreamCompletion)> {
     /// ends with no upstream-reported usage, Drop fills the missing
     /// counters from this estimator (prompt from the captured request,
     /// completion from `est_output_text`) and sets `usage_estimated`.
-    estimator: Option<crate::token_estimate::Estimator>,
-    counted: crate::token_estimate::CountedAhead,
+    estimate: crate::token_estimate::StreamEstimate,
+}
+
+/// What the stream's estimate counts, after the #419 gate: the completion
+/// side only once something was delivered.
+fn chat_estimate_inputs(
+    c: &StreamCompletion,
+    delivered: u32,
+) -> crate::token_estimate::EstimateInputs<'_> {
+    crate::token_estimate::EstimateInputs {
+        upstream_prompt: c.prompt_tokens,
+        upstream_completion: if delivered == 0 {
+            0
+        } else {
+            c.completion_tokens
+        },
+        output: (delivered > 0).then_some(c.est_output_text.as_str()),
+        // The output buffer only grows: its length identifies it.
+        output_revision: 0,
+    }
 }
 
 impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
@@ -5846,16 +5864,9 @@ impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
         } else {
             delivered
         };
-        if let (Some(est), Some((_, c))) = (&self.estimator, &self.slot) {
-            let completion = if delivered == 0 {
-                0
-            } else {
-                c.completion_tokens
-            };
-            let output = (delivered > 0).then_some(c.est_output_text.as_str());
-            // The output buffer only grows: its length identifies it.
-            self.counted
-                .count(est, c.prompt_tokens, completion, output, 0)
+        if let Some((_, c)) = &self.slot {
+            self.estimate
+                .count_ahead(chat_estimate_inputs(c, delivered))
                 .await;
         }
     }
@@ -5896,11 +5907,7 @@ impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
         // it regardless, same "prompts always billed" contract). Runs
         // only for counters the upstream left at zero; a stream with a
         // real usage chunk is untouched.
-        let filled = self.estimator.take().map(|est| {
-            let output = (delivered > 0).then_some(c.est_output_text.as_str());
-            self.counted
-                .fill(&est, c.prompt_tokens, c.completion_tokens, output, 0)
-        });
+        let filled = self.estimate.fill(chat_estimate_inputs(&c, delivered));
         if let Some(filled) = filled.filter(|filled| filled.estimated) {
             c.prompt_tokens = filled.prompt_tokens;
             c.completion_tokens = filled.completion_tokens;
@@ -6049,8 +6056,7 @@ where
         let mut guard = CompleteOnDrop {
             slot: Some((on_complete, StreamCompletion::default())),
             delivered: delivered_for_drop,
-            estimator,
-            counted: Default::default(),
+            estimate: crate::token_estimate::StreamEstimate::new(estimator),
         };
         futures::pin_mut!(upstream);
         // Per #204: accumulate the assistant's content across chunks
@@ -7332,8 +7338,7 @@ mod complete_on_drop_tests {
                     comp,
                 )),
                 delivered,
-                estimator: None,
-                counted: Default::default(),
+                estimate: Default::default(),
             };
             drop(guard);
         }
@@ -7370,11 +7375,12 @@ mod complete_on_drop_tests {
                     comp,
                 )),
                 delivered,
-                estimator: Some(crate::token_estimate::Estimator::new(
-                    "relay-model",
-                    crate::token_estimate::PromptInput::Chat(Box::new(req)),
+                estimate: crate::token_estimate::StreamEstimate::new(Some(
+                    crate::token_estimate::Estimator::new(
+                        "relay-model",
+                        crate::token_estimate::PromptInput::Chat(Box::new(req)),
+                    ),
                 )),
-                counted: Default::default(),
             };
             drop(guard);
         }
@@ -7848,8 +7854,7 @@ mod delivery_counter_tests {
                     },
                 )),
                 delivered: delivered_for_drop,
-                estimator: None,
-                counted: Default::default(),
+                estimate: Default::default(),
             };
             // Silence unused-field warning on the test side; guard
             // is held by the body for its full lifetime.

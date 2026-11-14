@@ -3477,8 +3477,7 @@ struct ResponsesUsageGuard<F: FnOnce(ResponseUsage, String, Vec<aisix_core::Guar
     /// without a terminal usage event (client abort, relay that omits
     /// usage) fills the missing counters from the request + the assembled
     /// output text before `on_complete` runs.
-    estimator: Option<crate::token_estimate::Estimator>,
-    counted: crate::token_estimate::CountedAhead,
+    estimate: crate::token_estimate::StreamEstimate,
     /// The end-of-stream scan's monitor hits, kept here once the scan is
     /// done so a disconnect during the count after it still reports them.
     hits: Vec<aisix_core::GuardrailMonitorHit>,
@@ -3499,17 +3498,12 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
     /// [`crate::token_estimate::CountedAhead`]), from the same inputs
     /// [`Self::complete`] will count.
     async fn count_ahead(&mut self) {
-        if let (Some(est), Some((_, usage, capture))) = (&self.estimator, &self.slot) {
-            let usage = usage.as_ref();
-            let prompt = usage.map_or(0, |u| u.prompt_tokens);
-            let completion = usage.map_or(0, |u| u.completion_tokens);
-            if prompt == 0 || completion == 0 {
-                let text = capture.as_ref().map_or("", SseTextCapture::text);
-                let revision = capture.as_ref().map_or(0, |c| c.revision);
-                self.counted
-                    .count(est, prompt, completion, Some(text), revision)
-                    .await;
-            }
+        if let Some((_, usage, capture)) = &self.slot {
+            let text = capture.as_ref().map_or("", SseTextCapture::text);
+            let revision = capture.as_ref().map_or(0, |c| c.revision);
+            self.estimate
+                .count_ahead(responses_estimate_inputs(usage.as_ref(), text, revision))
+                .await;
         }
     }
 
@@ -3523,23 +3517,31 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
         let mut usage = usage.unwrap_or_default();
         let revision = capture.as_ref().map_or(0, |c| c.revision);
         let out_text = capture.map(SseTextCapture::into_text).unwrap_or_default();
-        if let Some(est) = self.estimator.take() {
-            if usage.prompt_tokens == 0 || usage.completion_tokens == 0 {
-                let filled = self.counted.fill(
-                    &est,
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    Some(&out_text),
-                    revision,
-                );
-                if filled.estimated {
-                    usage.prompt_tokens = filled.prompt_tokens;
-                    usage.completion_tokens = filled.completion_tokens;
-                    usage.usage_estimated = true;
-                }
-            }
+        let filled =
+            self.estimate
+                .fill(responses_estimate_inputs(Some(&usage), &out_text, revision));
+        if let Some(filled) = filled.filter(|filled| filled.estimated) {
+            usage.prompt_tokens = filled.prompt_tokens;
+            usage.completion_tokens = filled.completion_tokens;
+            usage.usage_estimated = true;
         }
         f(usage, out_text, hits);
+    }
+}
+
+/// What the passthrough stream's estimate counts: the upstream counters
+/// and the captured output text, whose revision the capture bumps when a
+/// terminal snapshot replaces it.
+fn responses_estimate_inputs<'a>(
+    usage: Option<&ResponseUsage>,
+    text: &'a str,
+    revision: u32,
+) -> crate::token_estimate::EstimateInputs<'a> {
+    crate::token_estimate::EstimateInputs {
+        upstream_prompt: usage.map_or(0, |u| u.prompt_tokens),
+        upstream_completion: usage.map_or(0, |u| u.completion_tokens),
+        output: Some(text),
+        output_revision: revision,
     }
 }
 
@@ -3619,8 +3621,7 @@ where
                 }),
                 capture_cap.map(SseTextCapture::new),
             )),
-            estimator,
-            counted: Default::default(),
+            estimate: crate::token_estimate::StreamEstimate::new(estimator),
             hits: Vec::new(),
         };
         futures::pin_mut!(upstream);
