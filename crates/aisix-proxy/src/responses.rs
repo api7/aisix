@@ -941,36 +941,19 @@ async fn dispatch(
                         },
                     );
                     success.routing = routing;
-                    // #911 [21]: commit the reserved layers with the actual
-                    // token cost so TPM/TPD is enforced for /v1/responses like
-                    // chat + embeddings. The buffered / non-streaming paths
-                    // carry `usage` here and commit now; the streaming path
-                    // already `take()`-d the reservation into its end-of-stream
-                    // guard (#688), so `reservation` is `None` and this is
-                    // skipped.
+                    // #911 [21]: TPM/TPD is enforced for /v1/responses like
+                    // chat + embeddings. A buffered attempt that reached its
+                    // output guardrail committed before the check, and the
+                    // streaming path `take()`-d the reservation into its
+                    // end-of-stream guard (#688); this commits the rest (a
+                    // response refused before any usage was read).
                     if !success.usage_handled_by_stream {
-                        if let Some(mut r) = reservation.take() {
-                            // Fold this target's model-layer reservation in
-                            // (AISIX-Cloud#1087) so one commit bills the
-                            // member's TPM/TPD too. Already `None` when the
-                            // streaming path folded it into the guard.
-                            if let Some(member) = member_reservation.take() {
-                                r.merge(member);
-                            }
-                            let total = success
-                                .usage
-                                .as_ref()
-                                .map(|u| {
-                                    total_tokens_with_cache(
-                                        u.prompt_tokens,
-                                        u.completion_tokens,
-                                        u.cache_creation_tokens,
-                                        u.cache_read_tokens,
-                                    )
-                                })
-                                .unwrap_or(0);
-                            r.commit_tokens(total).await;
-                        }
+                        crate::quota::commit_answered_attempt(
+                            &mut reservation,
+                            &mut member_reservation,
+                            success.usage.as_ref().map_or(0, response_usage_tokens),
+                        )
+                        .await;
                     }
                     if state.expose_debug_headers {
                         crate::dispatch_plan::insert_route_header(
@@ -1780,6 +1763,12 @@ async fn responses_to_target(
                     usage.usage_estimated = true;
                 }
             }
+            crate::quota::commit_answered_attempt(
+                reservation,
+                member_reservation,
+                response_usage_tokens(&usage),
+            )
+            .await;
             let mut out_text = responses_sse_guardrail_text(&buf);
             // #1100: an excised frame is not released, but a forbidden
             // literal inside it must still block the response — the block
@@ -2245,6 +2234,12 @@ async fn responses_to_target(
             }
             Some(u)
         };
+        crate::quota::commit_answered_attempt(
+            reservation,
+            member_reservation,
+            usage.as_ref().map_or(0, response_usage_tokens),
+        )
+        .await;
 
         // #719: run the output guardrail chain on the assistant's text so a
         // configured output block isn't bypassable by calling /v1/responses
@@ -2851,6 +2846,12 @@ async fn responses_cross_provider_to_target(
         }
         u
     };
+    crate::quota::commit_answered_attempt(
+        reservation,
+        member_reservation,
+        response_usage_tokens(&usage),
+    )
+    .await;
 
     // #719: run output guardrails on the bridged response before re-encoding
     // it as Responses JSON — the assistant text + tool calls are
@@ -3113,6 +3114,16 @@ impl ResponseUsage {
 /// The token cost a non-streamed `/v1/responses` call commits to its
 /// rate-limit layers for `usage`.
 fn responses_committed_tokens(usage: &aisix_gateway::UsageStats) -> u64 {
+    total_tokens_with_cache(
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cache_creation_tokens,
+        usage.cache_read_tokens,
+    )
+}
+
+/// [`responses_committed_tokens`] for an attempt's recorded usage.
+fn response_usage_tokens(usage: &ResponseUsage) -> u64 {
     total_tokens_with_cache(
         usage.prompt_tokens,
         usage.completion_tokens,

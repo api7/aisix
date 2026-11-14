@@ -906,30 +906,18 @@ async fn dispatch(
                         },
                     );
                     outcome.routing = routing;
-                    // #911 [21]: commit the reserved layers with the actual
-                    // token cost so TPM/TPD is enforced for /v1/messages like
-                    // chat + embeddings. The non-streaming path carries the
-                    // counts in `outcome.metrics` and commits here; the
-                    // streaming path already `take()`-d the reservation into its
-                    // end-of-stream guard (#688), so `reservation` is `None` and
-                    // this is skipped.
+                    // #911 [21]: TPM/TPD is enforced for /v1/messages like
+                    // chat + embeddings. The non-streaming paths already
+                    // committed before their output guardrail ran, and the
+                    // streaming path `take()`-d the reservation into its
+                    // end-of-stream guard (#688), so this is normally a no-op.
                     if !outcome.usage_handled_by_stream {
-                        if let Some(mut r) = reservation.take() {
-                            // Fold this target's model-layer reservation in
-                            // (AISIX-Cloud#1087) so one commit bills the
-                            // member's TPM/TPD too. Already `None` when the
-                            // streaming path folded it into the guard.
-                            if let Some(member) = member_reservation.take() {
-                                r.merge(member);
-                            }
-                            let total = total_tokens_with_cache(
-                                outcome.metrics.prompt_tokens,
-                                outcome.metrics.completion_tokens,
-                                outcome.metrics.cache_creation_tokens,
-                                outcome.metrics.cache_read_tokens,
-                            );
-                            r.commit_tokens(total).await;
-                        }
+                        crate::quota::commit_answered_attempt(
+                            &mut reservation,
+                            &mut member_reservation,
+                            messages_metrics_tokens(&outcome.metrics),
+                        )
+                        .await;
                     }
                     if state.expose_debug_headers {
                         crate::dispatch_plan::insert_route_header(
@@ -1845,6 +1833,12 @@ async fn anthropic_passthrough_dispatch(
                 )
             },
             Some(attempt_started),
+        )
+        .await;
+        crate::quota::commit_answered_attempt(
+            reservation,
+            member_reservation,
+            messages_metrics_tokens(&metrics),
         )
         .await;
 
@@ -3570,6 +3564,16 @@ fn messages_committed_tokens(usage: &aisix_gateway::UsageStats) -> u64 {
         usage.completion_tokens,
         usage.cache_creation_tokens,
         usage.cache_read_tokens,
+    )
+}
+
+/// [`messages_committed_tokens`] for an attempt's recorded metrics.
+fn messages_metrics_tokens(metrics: &AnthropicUsageMetrics) -> u64 {
+    total_tokens_with_cache(
+        metrics.prompt_tokens,
+        metrics.completion_tokens,
+        metrics.cache_creation_tokens,
+        metrics.cache_read_tokens,
     )
 }
 

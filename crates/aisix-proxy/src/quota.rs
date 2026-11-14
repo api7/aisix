@@ -930,6 +930,29 @@ impl<'a> TargetGate<'a> {
     }
 }
 
+/// Commit a buffered attempt's token cost to the request's reservation,
+/// with the winning target's model layers folded in (AISIX-Cloud#1087), and
+/// leave both `None` so no later site commits them again.
+///
+/// `/v1/messages` and `/v1/responses` call this as soon as the attempt's
+/// usage is known, before the output guardrail is awaited, as chat does:
+/// the upstream already spent the tokens, and a caller that hangs up during
+/// the check drops the handler before it could commit, so the reservation
+/// would be released uncounted. Their handlers call it again on success,
+/// which is a no-op once the attempt committed here.
+pub(crate) async fn commit_answered_attempt(
+    reservation: &mut Option<MultiReservation>,
+    member_reservation: &mut Option<MultiReservation>,
+    tokens: u64,
+) {
+    if let Some(mut r) = reservation.take() {
+        if let Some(member) = member_reservation.take() {
+            r.merge(member);
+        }
+        r.commit_tokens(tokens).await;
+    }
+}
+
 /// Seconds until the offending window reopens, for a
 /// [`TargetGate::reserve`] rejection. `chat.rs` funnels its rejection
 /// through a `BridgeError`, which would otherwise drop the hint the
