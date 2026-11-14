@@ -4092,7 +4092,8 @@ fn drain_anthropic_sse_frames(
     first_token_seen: &mut bool,
     client_facing_model: &str,
     out: &mut Vec<u8>,
-) {
+) -> bool {
+    let mut message_stop = false;
     while let Some(end) = aisix_gateway::sse::find_frame_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
         // The frame's WHOLE payload, not just its first `data:` line: this
@@ -4101,6 +4102,7 @@ fn drain_anthropic_sse_frames(
         // parses only once they are joined (#1100).
         if let Some(payload) = crate::redact::frame_payload(&frame) {
             if let Ok(json) = serde_json::from_str::<Value>(payload.trim()) {
+                message_stop |= json.get("type").and_then(Value::as_str) == Some("message_stop");
                 update_anthropic_usage(acc, &json, attempt_started, first_token_seen);
             }
         }
@@ -4113,6 +4115,7 @@ fn drain_anthropic_sse_frames(
             None => out.extend_from_slice(&frame),
         }
     }
+    message_stop
 }
 
 /// Drop guard that fires `on_complete` exactly once with the
@@ -4212,15 +4215,6 @@ impl<F: FnOnce(AnthropicStreamUsage)> Drop for AnthropicStreamGuard<F> {
     }
 }
 
-/// Whether forwarded SSE bytes carry the stream's closing `message_stop`.
-/// A text delta that merely mentions it only triggers an early count ahead,
-/// which [`crate::token_estimate::CountedAhead`] redoes if the inputs move.
-fn carries_message_stop(frames: &[u8]) -> bool {
-    frames
-        .windows(b"message_stop".len())
-        .any(|w| w == b"message_stop")
-}
-
 /// Stream wrapper that counts delivered items (`poll_next ->
 /// Ready(Some)`) into a shared atomic, read by the Drop guard for the
 /// #419 cost-leak gate. Mirrors chat.rs's `DeliveryCounter`.
@@ -4297,6 +4291,9 @@ where
         futures::pin_mut!(upstream);
         let mut buf: Vec<u8> = Vec::new();
         let mut first_token_seen = false;
+        // A drained frame was `message_stop`; once it is forwarded (live, or
+        // released from the hold-back buffer) the count runs ahead of it.
+        let mut message_stop_seen = false;
         // Whole-response hold-back buffer (BufferFull policies only).
         let mut held: Vec<u8> = Vec::new();
         let mut held_len = crate::held_content::HeldBytes::default();
@@ -4326,7 +4323,7 @@ where
                 // trailing remainder until its terminator arrives.
                 buf.extend_from_slice(bytes);
                 let mut forward: Vec<u8> = Vec::new();
-                drain_anthropic_sse_frames(
+                message_stop_seen |= drain_anthropic_sse_frames(
                     &mut buf,
                     guard.usage(),
                     attempt_started,
@@ -4416,7 +4413,7 @@ where
                         crate::attempt::measured_ms(started.elapsed());
                 }
                 keep_live_copy(&mut live_copy, &forward);
-                if carries_message_stop(&forward) {
+                if message_stop_seen {
                     guard.count_ahead(true).await;
                 }
                 yield Ok(Bytes::from(forward));
@@ -6478,6 +6475,29 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     /// A bare `\r` ends a line too. A CR-framed upstream is framed as it
     /// arrives, read for usage, and restamped, and its bytes reach the
     /// client in their own framing.
+    #[test]
+    fn only_a_message_stop_event_marks_the_end_not_text_naming_it() {
+        use super::{drain_anthropic_sse_frames, AnthropicStreamUsage};
+
+        let drain = |frames: &[u8]| {
+            let mut buf = frames.to_vec();
+            drain_anthropic_sse_frames(
+                &mut buf,
+                &mut AnthropicStreamUsage::default(),
+                std::time::Instant::now(),
+                &mut false,
+                "gw-alias",
+                &mut Vec::new(),
+            )
+        };
+        assert!(!drain(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"event: message_stop\"}}\n\n"
+        ));
+        assert!(drain(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        ));
+    }
+
     #[test]
     fn sse_frame_parser_reads_a_cr_framed_stream() {
         use super::{drain_anthropic_sse_frames, AnthropicStreamUsage};

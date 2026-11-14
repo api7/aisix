@@ -3060,12 +3060,16 @@ pub(crate) fn terminal_response_service_tier(event: &Value) -> Option<String> {
 /// gate is applied to `json.response`.
 /// <https://platform.openai.com/docs/api-reference/responses-streaming>
 fn parse_responses_terminal_usage(json: &Value) -> Option<ResponseUsage> {
+    is_terminal_response_event(json)
+        .then(|| json.get("response").and_then(extract_response_usage))
+        .flatten()
+}
+
+fn is_terminal_response_event(json: &Value) -> bool {
     matches!(
         json.get("type").and_then(|t| t.as_str()),
         Some("response.completed" | "response.incomplete" | "response.failed")
     )
-    .then(|| json.get("response").and_then(extract_response_usage))
-    .flatten()
 }
 
 impl ResponseUsage {
@@ -3209,7 +3213,8 @@ fn drain_responses_sse_frames(
     client_facing_model: &str,
     mark: &crate::responses_affinity::ResponseMark,
     out: &mut Vec<u8>,
-) {
+) -> bool {
+    let mut terminal = false;
     while let Some(end) = aisix_gateway::sse::find_frame_end(buf) {
         let frame: Vec<u8> = buf.drain(..end).collect();
         let restamped = crate::model_echo::restamp_sse_frame(
@@ -3235,6 +3240,7 @@ fn drain_responses_sse_frames(
                 continue;
             }
             if let Ok(json) = serde_json::from_str::<Value>(data) {
+                terminal |= is_terminal_response_event(&json);
                 // First parsed frame of ANY type (`response.created`
                 // included) → upstream TTFT. The industry convention
                 // (LiteLLM, caller-side gateways) stamps the same event, so
@@ -3304,6 +3310,7 @@ fn drain_responses_sse_frames(
             }
         }
     }
+    terminal
 }
 
 /// The upstream failure a Responses-API stream event reports, if it is one:
@@ -3536,20 +3543,6 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
     }
 }
 
-/// Whether forwarded SSE bytes carry the stream's terminal response event.
-/// A text delta that merely mentions one only triggers an early count
-/// ahead, which [`crate::token_estimate::CountedAhead`] redoes if the
-/// inputs move.
-fn carries_terminal_response(frames: &[u8]) -> bool {
-    [
-        &b"response.completed"[..],
-        b"response.incomplete",
-        b"response.failed",
-    ]
-    .iter()
-    .any(|needle| frames.windows(needle.len()).any(|w| w == *needle))
-}
-
 impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)> Drop
     for ResponsesUsageGuard<F>
 {
@@ -3642,7 +3635,7 @@ where
                 buf.extend_from_slice(bytes);
                 let mut forward: Vec<u8> = Vec::new();
                 let (usage_acc, capture) = guard.parts();
-                drain_responses_sse_frames(
+                let terminal = drain_responses_sse_frames(
                     &mut buf,
                     usage_acc,
                     capture,
@@ -3689,7 +3682,7 @@ where
                     acc.downstream_latency_ms =
                         crate::attempt::measured_ms(started.elapsed());
                 }
-                if carries_terminal_response(&forward) {
+                if terminal {
                     guard.count_ahead().await;
                 }
                 yield Ok(bytes::Bytes::from(forward));
@@ -7798,6 +7791,29 @@ data: [DONE]\n\n";
         assert_eq!(usage.prompt_tokens, 4321);
         assert_eq!(usage.completion_tokens, 765);
         assert_eq!(usage.provider_request_id, "resp_ml");
+    }
+
+    #[test]
+    fn only_a_terminal_event_marks_the_end_not_text_naming_it() {
+        let drain = |frames: &[u8]| {
+            let mut buf = frames.to_vec();
+            super::drain_responses_sse_frames(
+                &mut buf,
+                &mut None,
+                None,
+                std::time::Instant::now(),
+                &mut false,
+                "client-facing",
+                &Default::default(),
+                &mut Vec::new(),
+            )
+        };
+        assert!(!drain(
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"response.completed\"}\n\n"
+        ));
+        assert!(drain(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n"
+        ));
     }
 
     /// The same drain on a CRLF-framed stream with no `[DONE]` sentinel —
