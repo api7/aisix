@@ -82,7 +82,7 @@ thread_local! {
 }
 
 /// Whether the caller is one of the pool's threads, which count with their
-/// own tokenizer instances (`token_estimate::pool_bpe_for`).
+/// own tokenizer instances (`token_estimate::bpe_for`).
 pub(crate) fn on_pool_thread() -> bool {
     ON_POOL.with(std::cell::Cell::get)
 }
