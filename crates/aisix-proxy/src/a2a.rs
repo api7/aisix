@@ -545,9 +545,9 @@ struct StreamUsageOnDrop {
     /// the request's terminal emission, so it carries the terminal spans.
     trace: Option<std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     _concurrency: aisix_ratelimit::StreamConcurrencyGuard,
-    /// The words counted ahead, keyed by the request and response text
-    /// lengths they were counted at.
-    counted: Option<((usize, usize), A2aCounted)>,
+    /// The words counted ahead and the request length they were counted
+    /// at; the response text they were counted from is kept on the count.
+    counted: Option<(usize, A2aCounted)>,
     /// Set once the call's usage is emitted, by the stream's normal end or
     /// by Drop.
     emitted: bool,
@@ -557,16 +557,24 @@ impl StreamUsageOnDrop {
     /// Count the call's words ahead on the estimation pool, before the
     /// terminal event is released: an A2A client stops reading there, and
     /// the Drop that follows then emits this count instead of counting on
-    /// the request worker. It answers only while the words are unchanged
-    /// (both texts only grow, so their lengths identify them).
+    /// the request worker. It answers only while the words are unchanged:
+    /// the request only grows, so its length identifies it, but an artifact
+    /// can be replaced by other text of the same length, so the response is
+    /// compared whole.
     async fn count_ahead(&mut self) {
         let response_text = self.call.text.response.joined();
-        let key = (self.call.text.request.len(), response_text.len());
-        if self.counted.as_ref().is_some_and(|(k, _)| *k == key) {
+        let request_len = self.call.text.request.len();
+        if self.counted_matches(request_len, &response_text) {
             return;
         }
         let counted = count_a2a_text(self.call.text.request.clone(), response_text).await;
-        self.counted = Some((key, counted));
+        self.counted = Some((request_len, counted));
+    }
+
+    fn counted_matches(&self, request_len: usize, response_text: &str) -> bool {
+        self.counted
+            .as_ref()
+            .is_some_and(|(len, c)| *len == request_len && c.response_text == response_text)
     }
 
     /// Emit the call's usage once, from the count ahead while it still
@@ -585,9 +593,13 @@ impl StreamUsageOnDrop {
             crate::CLIENT_CLOSED_REQUEST
         };
         let response_text = self.call.text.response.joined();
-        let key = (self.call.text.request.len(), response_text.len());
+        let request_len = self.call.text.request.len();
         let counted = match self.counted.take() {
-            Some((counted_key, counted)) if counted_key == key => counted,
+            Some((len, counted))
+                if len == request_len && counted.response_text == response_text =>
+            {
+                counted
+            }
             _ => count_a2a_words(&self.call.text.request, response_text),
         };
         // A stream can outlive several config generations, so the
