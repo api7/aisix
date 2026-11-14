@@ -2688,6 +2688,61 @@ async fn cross_provider_dispatch(
     state.health.record_success(&model.display_name);
     state.runtime_status.mark_healthy(model_id);
 
+    let mut metrics = AnthropicUsageMetrics {
+        prompt_tokens: resp.usage.prompt_tokens,
+        completion_tokens: resp.usage.completion_tokens,
+        cached_prompt_tokens: resp.usage.cached_prompt_tokens,
+        cache_write_tokens: resp.usage.cache_write_tokens,
+        modality: resp.usage.modality,
+        cache_creation_ttl: resp.usage.cache_creation_ttl,
+        cache_creation_tokens: resp.usage.cache_creation_tokens,
+        cache_read_tokens: resp.usage.cache_read_tokens,
+        reasoning_tokens: resp.usage.reasoning_tokens,
+        upstream_total_tokens: resp.usage.upstream_total_tokens,
+        reasoning_folded_into_completion: resp.usage.reasoning_folded_into_completion,
+        usage_estimated: false,
+        provider_request_id: crate::usage_attr::sanitize_provider_response_id(&resp.id),
+        provider_model_version: resp.model.clone(),
+        service_tier: resp.service_tier.as_ref().map(|t| t.as_str().to_owned()),
+        finish_reason: finish_reason_label(&resp.finish_reason),
+        upstream_ttft_ms: 0,
+        // Non-streaming: stamped by the handler, which holds the request clock.
+        downstream_latency_ms: 0,
+    };
+    // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
+    // bridged upstream never reported, and carry the SAME numbers into the
+    // Anthropic JSON rendered below. The client-visible usage and the usage
+    // record are one number: a caller told `output_tokens: 0` for a
+    // response it can read the text of has no way to reconcile that with
+    // what the dashboard bills. The estimate is reported in the ordinary
+    // usage shape — there is no client-facing marker saying it was
+    // estimated.
+    fill_missing_anthropic_metrics(
+        &mut metrics,
+        &upstream_model,
+        || body.clone(),
+        || crate::chat::estimation_output_text(&resp),
+        || {
+            crate::token_estimate::RateCommit::new(
+                &state.limiter,
+                [reservation.as_ref(), member_reservation.as_ref()],
+                messages_committed_tokens,
+            )
+        },
+        Some(attempt_started),
+    )
+    .await;
+    if metrics.usage_estimated {
+        resp.usage.prompt_tokens = metrics.prompt_tokens;
+        resp.usage.completion_tokens = metrics.completion_tokens;
+    }
+    crate::quota::commit_answered_attempt(
+        reservation,
+        member_reservation,
+        messages_metrics_tokens(&metrics),
+    )
+    .await;
+
     // #448 (#22): run output guardrails on the cross-provider response
     // before rendering it back as Anthropic JSON — the response is
     // client-visible output just like /v1/chat/completions.
@@ -2737,54 +2792,6 @@ async fn cross_provider_dispatch(
         crate::redact::redact_chat_response(resolved_chain.as_ref(), &mut resp);
     crate::redact::merge_counts(&mut output_redactions, output_seg_counts);
 
-    let mut metrics = AnthropicUsageMetrics {
-        prompt_tokens: resp.usage.prompt_tokens,
-        completion_tokens: resp.usage.completion_tokens,
-        cached_prompt_tokens: resp.usage.cached_prompt_tokens,
-        cache_write_tokens: resp.usage.cache_write_tokens,
-        modality: resp.usage.modality,
-        cache_creation_ttl: resp.usage.cache_creation_ttl,
-        cache_creation_tokens: resp.usage.cache_creation_tokens,
-        cache_read_tokens: resp.usage.cache_read_tokens,
-        reasoning_tokens: resp.usage.reasoning_tokens,
-        upstream_total_tokens: resp.usage.upstream_total_tokens,
-        reasoning_folded_into_completion: resp.usage.reasoning_folded_into_completion,
-        usage_estimated: false,
-        provider_request_id: crate::usage_attr::sanitize_provider_response_id(&resp.id),
-        provider_model_version: resp.model.clone(),
-        service_tier: resp.service_tier.as_ref().map(|t| t.as_str().to_owned()),
-        finish_reason: finish_reason_label(&resp.finish_reason),
-        upstream_ttft_ms: 0,
-        // Non-streaming: stamped by the handler, which holds the request clock.
-        downstream_latency_ms: 0,
-    };
-    // Token-estimation fallback (AISIX-Cloud#1074): fill counters the
-    // bridged upstream never reported, and carry the SAME numbers into the
-    // Anthropic JSON rendered below. The client-visible usage and the usage
-    // record are one number: a caller told `output_tokens: 0` for a
-    // response it can read the text of has no way to reconcile that with
-    // what the dashboard bills. The estimate is reported in the ordinary
-    // usage shape — there is no client-facing marker saying it was
-    // estimated.
-    fill_missing_anthropic_metrics(
-        &mut metrics,
-        &upstream_model,
-        || body.clone(),
-        || crate::chat::estimation_output_text(&resp),
-        || {
-            crate::token_estimate::RateCommit::new(
-                &state.limiter,
-                [reservation.as_ref(), member_reservation.as_ref()],
-                messages_committed_tokens,
-            )
-        },
-        Some(attempt_started),
-    )
-    .await;
-    if metrics.usage_estimated {
-        resp.usage.prompt_tokens = metrics.prompt_tokens;
-        resp.usage.completion_tokens = metrics.completion_tokens;
-    }
     // Capture the prompt (the Anthropic request body) + assembled assistant
     // text for content-capturing exporters (gated); threaded to `fan_out` via
     // `DispatchOutcome`, never to the CP sink.

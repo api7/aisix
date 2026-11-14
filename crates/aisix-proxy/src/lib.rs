@@ -5698,6 +5698,39 @@ data: [DONE]\n\n";
         .await;
     }
 
+    #[tokio::test]
+    async fn messages_bridged_hangup_during_output_check_counts_against_tpm() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 10_000, "completion_tokens": 10_000, "total_tokens": 20_000}
+            })))
+            .mount(&upstream)
+            .await;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &[], &upstream.uri());
+        assert_hangup_during_output_check_counts_against_tpm(
+            snap,
+            hub,
+            "my-gpt4",
+            "/v1/messages",
+            serde_json::json!({
+                "model": "my-gpt4",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        )
+        .await;
+    }
+
     /// An answer the output guardrail refuses was still generated and billed
     /// upstream, so its tokens count against TPM, as chat's do.
     #[tokio::test]
