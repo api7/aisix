@@ -2176,7 +2176,7 @@ mod tests {
 
         let held = crate::estimate_pool::hold_every_slot().await;
         let outcome = tokio::time::timeout(
-            std::time::Duration::from_millis(1_000),
+            std::time::Duration::from_millis(500),
             router.oneshot(
                 HttpRequest::post("/a2a/invoice")
                     .header("host", "gw.example.com")
@@ -2189,6 +2189,9 @@ mod tests {
             ),
         )
         .await;
+        // The pool is shared with every other test in this binary: free it
+        // as soon as the request is gone.
+        drop(held);
         assert!(
             outcome.is_err(),
             "the call finished — its count never waited for the pool",
@@ -2198,7 +2201,6 @@ mod tests {
             .await
             .expect("an abandoned A2A call emitted no usage event")
             .expect("sender dropped without sending");
-        drop(held);
         assert_eq!(event.status_code, crate::CLIENT_CLOSED_REQUEST, "{event:?}");
         assert_eq!(event.error_class, "client_disconnected", "{event:?}");
         // 5000 words, about one token each.

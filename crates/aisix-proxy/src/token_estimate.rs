@@ -167,7 +167,7 @@ impl Estimator {
     fn prompt_bytes_bound(&self) -> usize {
         use crate::estimate_pool::serialized_bytes_bound;
         match &*self.input {
-            PromptInput::Chat(req) => serialized_bytes_bound(req),
+            PromptInput::Chat(req) => serialized_bytes_bound(&ChatPromptProbe(req)),
             PromptInput::Anthropic(body) | PromptInput::Responses(body) => {
                 serialized_bytes_bound(body)
             }
@@ -180,6 +180,48 @@ impl Estimator {
 /// completion-side rule (no message overhead).
 pub fn count_text(model: &str, text: &str) -> u32 {
     enc(bpe_for(model), text)
+}
+
+/// What [`count_chat_prompt`] reads of a chat request, for the size probe:
+/// the messages as stored and the request's extra fields (`tools`,
+/// `tool_choice`). `ChatMessage`'s own `Serialize` writes a block-array
+/// message's joined text out as `content`, which would build that text
+/// before the probe could stop.
+struct ChatPromptProbe<'a>(&'a aisix_gateway::chat::ChatFormat);
+
+struct ChatMessageProbe<'a>(&'a aisix_gateway::chat::ChatMessage);
+
+impl serde::Serialize for ChatPromptProbe<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("ChatPromptProbe", 2)?;
+        s.serialize_field(
+            "messages",
+            &self
+                .0
+                .messages
+                .iter()
+                .map(ChatMessageProbe)
+                .collect::<Vec<_>>(),
+        )?;
+        s.serialize_field("extra", &self.0.extra)?;
+        s.end()
+    }
+}
+
+impl serde::Serialize for ChatMessageProbe<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let m = self.0;
+        let mut s = serializer.serialize_struct("ChatMessageProbe", 6)?;
+        s.serialize_field("role", role_label(&m.role))?;
+        s.serialize_field("content", &m.content)?;
+        s.serialize_field("content_blocks", &m.content_blocks)?;
+        s.serialize_field("name", &m.name)?;
+        s.serialize_field("tool_call_id", &m.tool_call_id)?;
+        s.serialize_field("extra", &m.extra)?;
+        s.end()
+    }
 }
 
 /// Per-field `or` fill: upstream values win when non-zero; zeros are
@@ -1315,6 +1357,28 @@ mod tests {
             tool_call_id: None,
             extra: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn the_chat_size_probe_bounds_block_text_without_building_it() {
+        let mut big = msg(Role::User, "");
+        big.content = None;
+        big.content_blocks = Some(vec![
+            serde_json::json!({"type": "text", "text": "x".repeat(1 << 20)}),
+        ]);
+        let est = chat_est("relay-model", ChatFormat::new("relay-model", vec![big]));
+        assert_eq!(
+            est.prompt_bytes_bound(),
+            crate::estimate_pool::INLINE_MAX_BYTES + 1
+        );
+
+        let small = chat_est(
+            "relay-model",
+            ChatFormat::new("relay-model", vec![msg(Role::User, "hello there")]),
+        );
+        let bound = small.prompt_bytes_bound();
+        assert!(bound >= "user".len() + "hello there".len(), "{bound}");
+        assert!(bound <= crate::estimate_pool::INLINE_MAX_BYTES, "{bound}");
     }
 
     #[tokio::test]
