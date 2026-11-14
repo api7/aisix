@@ -124,12 +124,14 @@ pub(crate) async fn run<R: Send + 'static>(
         .unwrap_or_else(|_| panic!("token estimation job panicked"))
 }
 
-/// An upper bound on the text an estimate tokenizes from `value`: its
-/// compact-JSON length with strings counted unescaped (the tokenizer sees
-/// unescaped text, and escaping only lengthens JSON). Measuring stops once
-/// the length passes [`INLINE_MAX_BYTES`], and a string costs one addition
-/// whatever its length, so probing a large request costs no more than a
-/// small one. Any such length is reported as `INLINE_MAX_BYTES + 1`.
+/// The size of the text an estimate tokenizes from `value`: its
+/// compact-JSON length with strings counted unescaped. That bounds the
+/// unescaped text the estimator reads; the subtrees it tokenizes as
+/// escaped JSON (`count_json`) can exceed it by the escape expansion, at
+/// worst about 6x for control characters. Measuring stops once the length
+/// passes [`INLINE_MAX_BYTES`], and a string costs one addition whatever
+/// its length, so probing a large request costs no more than a small one.
+/// Any such length is reported as `INLINE_MAX_BYTES + 1`.
 pub(crate) fn serialized_bytes_bound(value: &impl serde::Serialize) -> usize {
     json_len::json_len_within(value, INLINE_MAX_BYTES).unwrap_or(INLINE_MAX_BYTES + 1)
 }

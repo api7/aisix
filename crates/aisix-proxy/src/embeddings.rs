@@ -716,22 +716,33 @@ async fn dispatch(
                         // Counted off the request worker unless the input is small.
                         let upstream_model = model.upstream_model().unwrap_or("unknown").to_owned();
                         let input = req.input.clone();
-                        let input_bytes =
-                            input.iter().fold(0usize, |n, s| n.saturating_add(s.len()));
+                        // The JSON-length rule of the prompt probe: each
+                        // input with its quotes and a separator, so the
+                        // number of inputs is inside the bound too.
+                        let input_bytes = input
+                            .iter()
+                            .fold(0usize, |n, s| n.saturating_add(s.len()).saturating_add(3));
                         crate::token_estimate::run_recorded_on_cancel(
                             input_bytes,
                             move || {
-                                input.iter().fold(0u32, |acc, s| {
-                                    acc.saturating_add(crate::token_estimate::count_text(
-                                        &upstream_model,
-                                        s,
-                                    ))
-                                })
+                                crate::token_estimate::count_texts(
+                                    &upstream_model,
+                                    input.iter().map(String::as_str),
+                                )
                             },
                             |prompt_tokens| crate::token_estimate::CancelledUsage {
                                 usage: aisix_gateway::UsageStats::new(prompt_tokens, 0),
                                 usage_estimated: prompt_tokens > 0,
+                                answered_after_ms: None,
                             },
+                            crate::token_estimate::RateCommit::new(
+                                &state.limiter,
+                                [Some(&reservation)],
+                                // The estimate stands in for a usage the
+                                // upstream reported none of, so the commit
+                                // below is the prompt alone.
+                                |usage| u64::from(usage.prompt_tokens),
+                            ),
                         )
                         .await
                     }

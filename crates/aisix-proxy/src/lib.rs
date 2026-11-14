@@ -5524,6 +5524,71 @@ data: [DONE]\n\n";
         assert_eq!(v["error"]["type"], "rate_limit_exceeded");
     }
 
+    /// The upstream answered with no usage, and the caller hung up while the
+    /// gateway counted the estimate on the pool. The handler never reached
+    /// its own commit, so the cancel guard must charge the counted tokens to
+    /// TPM; otherwise every such hang-up spends tokens the limit never sees.
+    #[tokio::test]
+    async fn a_caller_leaving_during_a_pooled_estimate_still_counts_against_tpm() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }]
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot_with_limits(
+            "my-gpt4",
+            &["my-gpt4"],
+            &upstream.uri(),
+            serde_json::json!({"tpm": 1_000}),
+        );
+        let state = build_state(snap, hub);
+        let make_req = |content: &str| {
+            let body = serde_json::json!({
+                "model": "my-gpt4",
+                "messages": [{"role": "user", "content": content}]
+            });
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // About 5000 prompt tokens, past the 16 KiB counted inline.
+        let held = crate::estimate_pool::hold_every_slot().await;
+        let abandoned = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            run(
+                build_router(state.clone()),
+                make_req(&"word ".repeat(5_000)),
+            ),
+        )
+        .await;
+        drop(held);
+        assert!(
+            abandoned.is_err(),
+            "the request finished — its estimate never waited for the pool",
+        );
+
+        // Those tokens are over the 1000 TPM, so the next request is refused.
+        let resp = run(build_router(state), make_req("hi")).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
     #[tokio::test]
     async fn request_lifecycle_increments_metrics_counters() {
         let upstream = MockServer::builder().start().await;

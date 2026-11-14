@@ -1157,6 +1157,7 @@ async fn estimate_missing_chat_usage(
     resp: &aisix_gateway::ChatResponse,
     upstream_model: &str,
     req: &ChatFormat,
+    rate: Option<crate::token_estimate::RateCommit>,
 ) -> (u32, u32, bool) {
     let (p, c) = (resp.usage.prompt_tokens, resp.usage.completion_tokens);
     if p != 0 && c != 0 {
@@ -1170,6 +1171,9 @@ async fn estimate_missing_chat_usage(
         est,
         resp.usage.clone(),
         Some(estimation_output_text(resp)),
+        rate,
+        // The winning attempt is already settled.
+        None,
     )
     .await;
     (
@@ -1257,6 +1261,18 @@ fn estimate_subcall_tokens(
 /// Preserve any provider-reported overhead while ensuring Anthropic-shaped
 /// cache counters, which sit beside input tokens, are included in the
 /// canonical total used for quotas and Prometheus.
+/// The token cost a non-streamed chat call commits to its rate-limit
+/// layers for `usage`.
+fn chat_committed_tokens(usage: &aisix_gateway::chat::UsageStats) -> u64 {
+    cache_inclusive_total(
+        u64::from(usage.total_tokens),
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cache_creation_tokens,
+        usage.cache_read_tokens,
+    )
+}
+
 fn cache_inclusive_total(
     reported_total: u64,
     prompt_tokens: u32,
@@ -3276,8 +3292,17 @@ async fn dispatch(
     // silent zeros. The same numbers reach the client, but only at the
     // exit below — see `apply_estimated_usage` for why the cache write and
     // the quota total in between must still see the upstream's own.
-    let (prompt_tokens_u32, completion_tokens_u32, usage_estimated) =
-        estimate_missing_chat_usage(&upstream, &upstream_model, req).await;
+    let (prompt_tokens_u32, completion_tokens_u32, usage_estimated) = estimate_missing_chat_usage(
+        &upstream,
+        &upstream_model,
+        req,
+        crate::token_estimate::RateCommit::new(
+            &state.limiter,
+            [Some(&reservation), won_member_reservation.as_ref()],
+            chat_committed_tokens,
+        ),
+    )
+    .await;
     let prompt = prompt_tokens_u32 as u64;
     let completion = completion_tokens_u32 as u64;
     let total = cache_inclusive_total(
@@ -7524,7 +7549,7 @@ mod complete_on_drop_tests {
         resp.usage.total_tokens = 17;
 
         let (prompt, completion, estimated) =
-            estimate_missing_chat_usage(&resp, "relay-model", &req).await;
+            estimate_missing_chat_usage(&resp, "relay-model", &req, None).await;
         assert!(estimated);
         assert_eq!(prompt, 17, "a reported counter stands");
         assert_eq!(completion, 2, "the zero is filled");
@@ -7548,7 +7573,7 @@ mod complete_on_drop_tests {
         resp.usage.total_tokens = 99;
 
         let (prompt, completion, estimated) =
-            estimate_missing_chat_usage(&resp, "relay-model", &req).await;
+            estimate_missing_chat_usage(&resp, "relay-model", &req, None).await;
         assert!(!estimated);
         assert_eq!((prompt, completion), (17, 23));
 
@@ -7577,7 +7602,7 @@ mod complete_on_drop_tests {
         resp.usage.total_tokens = 42;
 
         let (prompt, completion, estimated) =
-            estimate_missing_chat_usage(&resp, "relay-model", &req).await;
+            estimate_missing_chat_usage(&resp, "relay-model", &req, None).await;
         assert!(estimated);
         assert_eq!(
             (

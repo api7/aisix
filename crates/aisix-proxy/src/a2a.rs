@@ -1165,7 +1165,10 @@ async fn count_a2a_call(call: &A2aCall) -> A2aCounted {
         |(prompt_tokens, completion_tokens)| crate::token_estimate::CancelledUsage {
             usage: aisix_gateway::UsageStats::new(prompt_tokens, completion_tokens),
             usage_estimated: true,
+            answered_after_ms: None,
         },
+        // A2A commits no tokens to a rate-limit window.
+        None,
     )
     .await;
     A2aCounted {

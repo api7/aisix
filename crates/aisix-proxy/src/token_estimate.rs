@@ -161,9 +161,11 @@ impl Estimator {
         count_text(&self.model, text)
     }
 
-    /// An upper bound on the prompt text [`Self::count_prompt`] tokenizes,
-    /// for [`crate::estimate_pool::run`]: the stored wire bytes, or the
-    /// captured request's serialized size up to the inline limit.
+    /// The size of the prompt text [`Self::count_prompt`] tokenizes, for
+    /// [`crate::estimate_pool::run`]: the stored wire bytes, or the captured
+    /// request's serialized size up to the inline limit (see
+    /// [`crate::estimate_pool::serialized_bytes_bound`] for how far that
+    /// bounds it).
     fn prompt_bytes_bound(&self) -> usize {
         use crate::estimate_pool::serialized_bytes_bound;
         match &*self.input {
@@ -180,6 +182,15 @@ impl Estimator {
 /// completion-side rule (no message overhead).
 pub fn count_text(model: &str, text: &str) -> u32 {
     enc(bpe_for(model), text)
+}
+
+/// [`count_text`] summed over `texts`, with the model's encoding resolved
+/// once for the batch.
+pub fn count_texts<'a>(model: &str, texts: impl IntoIterator<Item = &'a str>) -> u32 {
+    let bpe = bpe_for(model);
+    texts
+        .into_iter()
+        .fold(0u32, |n, text| n.saturating_add(enc(bpe, text)))
 }
 
 /// What [`count_chat_prompt`] reads of a chat request, for the size probe:
@@ -323,13 +334,21 @@ pub async fn fill_missing_pooled(
 pub(crate) struct CancelledUsage {
     pub usage: aisix_gateway::chat::UsageStats,
     pub usage_estimated: bool,
+    /// How long the attempt took to answer, for a family whose attempt is
+    /// settled only after the estimate: the row then says the call reached
+    /// its upstream and how long it took, as the settled attempt would.
+    pub answered_after_ms: Option<u32>,
 }
 
 pub(crate) type CancelledUsageFn = Box<dyn FnOnce() -> CancelledUsage + Send>;
 
 impl CancelledUsage {
     /// The upstream's counters with [`fill_missing`]'s result in place.
-    pub(crate) fn filled(upstream: aisix_gateway::chat::UsageStats, filled: Filled) -> Self {
+    pub(crate) fn filled(
+        upstream: aisix_gateway::chat::UsageStats,
+        filled: Filled,
+        answered_after_ms: Option<u32>,
+    ) -> Self {
         Self {
             usage: aisix_gateway::chat::UsageStats {
                 prompt_tokens: filled.prompt_tokens,
@@ -337,6 +356,7 @@ impl CancelledUsage {
                 ..upstream
             },
             usage_estimated: filled.estimated,
+            answered_after_ms,
         }
     }
 
@@ -361,25 +381,77 @@ impl CancelledUsage {
         event.cache_creation_tokens = u.cache_creation_tokens;
         event.cache_read_tokens = u.cache_read_tokens;
         event.usage_estimated = self.usage_estimated;
+        if let Some(ms) = self.answered_after_ms {
+            event.upstream_latency_ms = ms;
+        }
+    }
+}
+
+/// The rate-limit layers a non-streamed call commits its tokens to once
+/// its usage is known, and the token cost its handler commits for a given
+/// usage. Carried into [`run_recorded_on_cancel`] so a caller that leaves
+/// during the count still has the call's tokens counted against TPM/TPD.
+pub(crate) struct RateCommit {
+    limiter: std::sync::Arc<aisix_ratelimit::Limiter>,
+    keys: Vec<aisix_ratelimit::BucketKey>,
+    tokens: fn(&aisix_gateway::chat::UsageStats) -> u64,
+}
+
+impl RateCommit {
+    /// The layers of `reservations` that a commit would charge; `None`
+    /// when there are none.
+    pub(crate) fn new<'a>(
+        limiter: &std::sync::Arc<aisix_ratelimit::Limiter>,
+        reservations: impl IntoIterator<Item = Option<&'a aisix_ratelimit::MultiReservation>>,
+        tokens: fn(&aisix_gateway::chat::UsageStats) -> u64,
+    ) -> Option<Self> {
+        let keys: Vec<_> = reservations
+            .into_iter()
+            .flatten()
+            .flat_map(aisix_ratelimit::MultiReservation::keys)
+            .collect();
+        (!keys.is_empty()).then(|| Self {
+            limiter: std::sync::Arc::clone(limiter),
+            keys,
+            tokens,
+        })
+    }
+
+    /// Charge `usage`'s token cost to every layer, as the handler's own
+    /// `commit_tokens` would; the dropped reservations release their
+    /// concurrency slots themselves.
+    fn commit(&self, usage: &aisix_gateway::chat::UsageStats) {
+        let tokens = (self.tokens)(usage);
+        for key in &self.keys {
+            self.limiter.add_tokens_post_stream(key, tokens);
+        }
     }
 }
 
 /// Run a non-streamed call's estimate through [`crate::estimate_pool::run`]
 /// after its upstream answered. While a pooled count is awaited, a caller
-/// that hangs up drops the handler before it records the call; the cancel
-/// guard then runs `job` inline from its `Drop` and records `on_cancel` of
-/// the result, so the row bills the call instead of reading zero tokens.
+/// that hangs up drops the handler before it records the call or commits
+/// its tokens; the cancel guard then runs `job` inline from its `Drop`,
+/// records `on_cancel` of the result, and charges `rate` with it, so the
+/// row bills the call and TPM/TPD count it instead of reading zero.
 pub(crate) async fn run_recorded_on_cancel<R: Send + 'static>(
     text_bytes: usize,
     job: impl Fn() -> R + Send + Sync + 'static,
     on_cancel: impl FnOnce(R) -> CancelledUsage + Send + 'static,
+    rate: Option<RateCommit>,
 ) -> R {
     if text_bytes <= crate::estimate_pool::INLINE_MAX_BYTES {
         return job();
     }
     let job = std::sync::Arc::new(job);
     let inline = std::sync::Arc::clone(&job);
-    crate::attribution::publish_cancelled_usage(Box::new(move || on_cancel(inline())));
+    crate::attribution::publish_cancelled_usage(Box::new(move || {
+        let usage = on_cancel(inline());
+        if let Some(rate) = rate {
+            rate.commit(&usage.usage);
+        }
+        usage
+    }));
     let result = crate::estimate_pool::run(text_bytes, move || job()).await;
     crate::attribution::settle_cancelled_usage();
     result
@@ -393,6 +465,10 @@ pub(crate) async fn fill_missing_recorded(
     est: Estimator,
     upstream: aisix_gateway::chat::UsageStats,
     output_text: Option<String>,
+    rate: Option<RateCommit>,
+    // When the caller's attempt began, for a family that settles its
+    // attempt only after this count (see `CancelledUsage::answered_after_ms`).
+    attempt_started: Option<std::time::Instant>,
 ) -> Filled {
     let (upstream_prompt, upstream_completion) =
         (upstream.prompt_tokens, upstream.completion_tokens);
@@ -409,6 +485,7 @@ pub(crate) async fn fill_missing_recorded(
         upstream_completion,
         output_text.as_deref(),
     );
+    let answered_after_ms = attempt_started.map(|t| crate::attempt::measured_ms(t.elapsed()));
     run_recorded_on_cancel(
         text_bytes,
         move || {
@@ -419,7 +496,8 @@ pub(crate) async fn fill_missing_recorded(
                 output_text.as_deref(),
             )
         },
-        move |filled| CancelledUsage::filled(upstream, filled),
+        move |filled| CancelledUsage::filled(upstream, filled, answered_after_ms),
+        rate,
     )
     .await
 }

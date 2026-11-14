@@ -1837,6 +1837,12 @@ async fn anthropic_passthrough_dispatch(
             &upstream_model,
             || crate::util::outbound_value(&body_bytes),
             || anthropic_estimation_output_text(&json_body),
+            crate::token_estimate::RateCommit::new(
+                &state.limiter,
+                [reservation.as_ref(), member_reservation.as_ref()],
+                messages_committed_tokens,
+            ),
+            Some(attempt_started),
         )
         .await;
 
@@ -2098,6 +2104,8 @@ async fn fill_missing_anthropic_metrics(
     upstream_model: &str,
     prompt: impl FnOnce() -> Value,
     output_text: impl FnOnce() -> String,
+    rate: Option<crate::token_estimate::RateCommit>,
+    attempt_started: Option<Instant>,
 ) {
     if metrics.prompt_tokens != 0 && metrics.completion_tokens != 0 {
         return;
@@ -2110,6 +2118,8 @@ async fn fill_missing_anthropic_metrics(
         est,
         metrics.usage_stats(),
         Some(output_text()),
+        rate,
+        attempt_started,
     )
     .await;
     if filled.estimated {
@@ -2765,6 +2775,12 @@ async fn cross_provider_dispatch(
         &upstream_model,
         || body.clone(),
         || crate::chat::estimation_output_text(&resp),
+        crate::token_estimate::RateCommit::new(
+            &state.limiter,
+            [reservation.as_ref(), member_reservation.as_ref()],
+            messages_committed_tokens,
+        ),
+        Some(attempt_started),
     )
     .await;
     if metrics.usage_estimated {
@@ -3540,6 +3556,17 @@ struct AnthropicUsageMetrics {
     finish_reason: String,
     upstream_ttft_ms: u32,
     downstream_latency_ms: u32,
+}
+
+/// The token cost a non-streamed `/v1/messages` call commits to its
+/// rate-limit layers for `usage`.
+fn messages_committed_tokens(usage: &aisix_gateway::UsageStats) -> u64 {
+    total_tokens_with_cache(
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cache_creation_tokens,
+        usage.cache_read_tokens,
+    )
 }
 
 impl AnthropicUsageMetrics {
@@ -6872,6 +6899,8 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
             "relay-claude",
             || body.clone(),
             || anthropic_estimation_output_text(&resp),
+            None,
+            None,
         )
         .await;
         assert_eq!(m.prompt_tokens, 8);
@@ -6889,6 +6918,8 @@ event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"
             "relay-claude",
             || body.clone(),
             || panic!("output extractor must not run when usage is complete"),
+            None,
+            None,
         )
         .await;
         assert_eq!((m.prompt_tokens, m.completion_tokens), (11, 7));

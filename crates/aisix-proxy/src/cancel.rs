@@ -301,10 +301,11 @@ pub(crate) fn emit(
         ..base_event(request_id, resolved, &ctx, &client, inbound_protocol, &pk)
     };
     let mut event = event;
+    let mut dispatched = attempt.as_ref().is_some_and(|a| a.dispatched);
     if let Some(usage) = cancelled_usage {
+        dispatched |= usage.answered_after_ms.is_some();
         usage.apply(&mut event);
     }
-    let dispatched = attempt.as_ref().is_some_and(|a| a.dispatched);
     emit_one(
         state,
         &snap,

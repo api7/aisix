@@ -1764,6 +1764,12 @@ async fn responses_to_target(
                     est,
                     usage.usage_stats(),
                     Some(responses_sse_output_text(&buf)),
+                    crate::token_estimate::RateCommit::new(
+                        &state.limiter,
+                        [reservation.as_ref(), member_reservation.as_ref()],
+                        responses_committed_tokens,
+                    ),
+                    Some(attempt_started),
                 )
                 .await;
                 if filled.estimated {
@@ -2219,6 +2225,12 @@ async fn responses_to_target(
                     est,
                     u.usage_stats(),
                     Some(responses_output_text(&json_body)),
+                    crate::token_estimate::RateCommit::new(
+                        &state.limiter,
+                        [reservation.as_ref(), member_reservation.as_ref()],
+                        responses_committed_tokens,
+                    ),
+                    Some(attempt_started),
                 )
                 .await;
                 if filled.estimated {
@@ -2810,6 +2822,12 @@ async fn responses_cross_provider_to_target(
                 est,
                 u.usage_stats(),
                 Some(crate::chat::estimation_output_text(&resp)),
+                crate::token_estimate::RateCommit::new(
+                    &state.limiter,
+                    [reservation.as_ref(), member_reservation.as_ref()],
+                    responses_committed_tokens,
+                ),
+                Some(attempt_started),
             )
             .await;
             if filled.estimated {
@@ -3084,6 +3102,17 @@ impl ResponseUsage {
             ..aisix_gateway::UsageStats::new(self.prompt_tokens, self.completion_tokens)
         }
     }
+}
+
+/// The token cost a non-streamed `/v1/responses` call commits to its
+/// rate-limit layers for `usage`.
+fn responses_committed_tokens(usage: &aisix_gateway::UsageStats) -> u64 {
+    total_tokens_with_cache(
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.cache_creation_tokens,
+        usage.cache_read_tokens,
+    )
 }
 
 /// This endpoint's reading of a buffered Responses body's usage
