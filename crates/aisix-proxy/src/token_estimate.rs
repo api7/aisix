@@ -1631,18 +1631,24 @@ mod tests {
                         instance, singleton,
                         "{model}: a pool thread counted with the workers' instance",
                     );
-                    let kept = *seen.entry(thread).or_insert(instance);
+                    let (kept, jobs) = seen.entry(thread).or_insert((instance, 0));
                     assert_eq!(
-                        kept, instance,
+                        *kept, instance,
                         "{model}: a pool thread rebuilt its instance"
                     );
+                    *jobs += 1;
                 }
-                if seen.len() >= 2 {
+                // Two threads, each seen on more than one job.
+                if seen.values().filter(|(_, jobs)| *jobs >= 2).count() >= 2 {
                     break;
                 }
             }
-            assert!(seen.len() >= 2, "{model}: no two pool threads ran its jobs");
-            let instances: std::collections::HashSet<_> = seen.values().collect();
+            assert!(
+                seen.values().filter(|(_, jobs)| *jobs >= 2).count() >= 2,
+                "{model}: no two pool threads ran two of its jobs each",
+            );
+            let instances: std::collections::HashSet<_> =
+                seen.values().map(|(instance, _)| instance).collect();
             assert_eq!(
                 instances.len(),
                 seen.len(),
