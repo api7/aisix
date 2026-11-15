@@ -768,9 +768,9 @@ pub struct ProxyConfig {
     /// process, which follows the CPU limits applied by a container
     /// runtime, cgroup, or `taskset`. Must be at least 1.
     ///
-    /// Also sizes the token-estimate pool. Each pool thread holds its own
-    /// tokenizer copy per encoding it counts with, about 40 MiB per thread
-    /// when both cl100k and o200k are used.
+    /// Also sizes the token-estimate pool: one thread per worker, each holding
+    /// one tokenizer instance per encoding it has counted with (about 17 MiB
+    /// for cl100k, 27 MiB for o200k, 39 MiB for o200k_harmony).
     ///
     /// Applied at startup. Changing it requires a restart.
     #[serde(default)]

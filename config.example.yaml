@@ -142,9 +142,9 @@ proxy:
   # thread_per_core: true
   # Number of proxy worker threads. Omitted, it follows the parallelism
   # available to the process, so a container CPU limit or a taskset
-  # affinity mask sizes it. Also sizes the token-estimate pool, whose
-  # threads each hold their own tokenizer copy per encoding they count
-  # with (about 40 MiB per thread when both cl100k and o200k are used).
+  # affinity mask sizes it. Also sizes the token-estimate pool: one thread
+  # per worker, each holding one tokenizer instance per encoding it has
+  # counted with (about 17 MiB cl100k, 27 MiB o200k, 39 MiB o200k_harmony).
   # Applied at startup.
   # workers: 4
   # Entry-level URL rewriting: map legacy URL shapes onto AISIX endpoints
