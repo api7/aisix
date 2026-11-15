@@ -10,10 +10,10 @@
 //! The pool is plain OS threads fed by a channel, so it serves the
 //! thread-per-core workers and the multi-thread runtime alike. It has as
 //! many threads as the proxy has workers ([`configure`]) and admits at most
-//! [`SLOTS_PER_THREAD`] jobs per thread, running or queued: a job owns the text it counts (up to
-//! `OUTPUT_ACCUMULATION_CAP`) plus its request, so what the pool holds
-//! stays bounded and estimation demand beyond it waits in the requests
-//! that need it rather than piling up here.
+//! [`SLOTS_PER_THREAD`] jobs per thread, running or queued: a job owns the
+//! text it counts (up to `OUTPUT_ACCUMULATION_CAP`) plus its request, so
+//! what the pool holds stays bounded and estimation demand beyond it waits
+//! in the requests that need it rather than piling up here.
 //!
 //! A stream guard's `Drop` cannot wait, and its usage emit has to happen
 //! inside that `Drop` (the request's attribution cell decides what the
