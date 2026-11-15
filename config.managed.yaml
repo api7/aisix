@@ -133,7 +133,10 @@ proxy:
   #   - addr: "0.0.0.0:3000"
   # Serving topology; on for Linux by default. A managed deployment
   # reaches these through the environment rather than by editing this
-  # file: AISIX_PROXY__THREAD_PER_CORE, AISIX_PROXY__WORKERS.
+  # file: AISIX_PROXY__THREAD_PER_CORE, AISIX_PROXY__WORKERS. `workers`
+  # also sizes the token-estimate pool: one thread per worker, each holding
+  # one tokenizer instance per encoding it has counted with (about 17 MiB
+  # cl100k, 27 MiB o200k, 39 MiB o200k_harmony).
   # thread_per_core: true
   # workers: 4
   # Headers a caller may hand the gateway its own request id in; that id

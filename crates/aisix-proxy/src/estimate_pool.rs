@@ -8,12 +8,12 @@
 //! threads of its own, and the request that needs it awaits the result.
 //!
 //! The pool is plain OS threads fed by a channel, so it serves the
-//! thread-per-core workers and the multi-thread runtime alike. It has one
-//! thread per available CPU and admits at most [`SLOTS_PER_THREAD`] jobs
-//! per thread, running or queued: a job owns the text it counts (up to
-//! `OUTPUT_ACCUMULATION_CAP`) plus its request, so what the pool holds
-//! stays bounded and estimation demand beyond it waits in the requests
-//! that need it rather than piling up here.
+//! thread-per-core workers and the multi-thread runtime alike. It has as
+//! many threads as the proxy has workers ([`configure`]) and admits at most
+//! [`SLOTS_PER_THREAD`] jobs per thread, running or queued: a job owns the
+//! text it counts (up to `OUTPUT_ACCUMULATION_CAP`) plus its request, so
+//! what the pool holds stays bounded and estimation demand beyond it waits
+//! in the requests that need it rather than piling up here.
 //!
 //! A stream guard's `Drop` cannot wait, and its usage emit has to happen
 //! inside that `Drop` (the request's attribution cell decides what the
@@ -49,13 +49,27 @@ struct Pool {
     jobs: mpsc::Sender<Job>,
 }
 
+static THREADS: OnceLock<usize> = OnceLock::new();
+
+/// Size the pool by the proxy's worker count, `proxy.workers` or the
+/// available parallelism when that is unset. Each pool thread holds its own
+/// tokenizer instances (`token_estimate::bpe_for`), so this is what bounds
+/// the pool's memory. Takes effect only before the first pooled estimate;
+/// without it the pool follows the available parallelism.
+pub fn configure(cfg: &aisix_core::ProxyConfig) {
+    let _ = THREADS.set(cfg.worker_threads());
+}
+
 /// `None` when not a single pool thread could be started (a pids cgroup
 /// refusing threads): estimation then runs inline, as it did before the
 /// pool existed, rather than queueing for threads that do not exist.
 fn pool() -> Option<&'static Pool> {
     static POOL: OnceLock<Option<Pool>> = OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let threads = THREADS
+            .get()
+            .copied()
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
         let (tx, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
         let started = (0..threads)

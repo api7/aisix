@@ -626,20 +626,22 @@ impl StreamEstimate {
     }
 }
 
-/// The model's encoding. The estimate pool's threads count with instances
-/// of their own, apart from the singletons every other thread uses: a
+/// The model's encoding. Each estimate-pool thread counts with instances of
+/// its own, apart from the singletons every other thread uses: a
 /// `CoreBPE`'s per-thread regex clones share one regex cache pool, and only
-/// the first thread to take from it ever gets its lock-free fast path. A
-/// worker counting a small estimate inline would otherwise take it for good
-/// and leave the pool on the locked path for every regex match. Among the
-/// pool's threads one still owns each instance, as before. The instances
-/// are built with the encoding constructors, never cloned from a singleton
-/// (a clone shares its regex cache pool), on first use: one more vocabulary
-/// copy for each encoding the pool counts with.
+/// the first thread to take from it ever gets its lock-free fast path, so
+/// any instance two threads share leaves one of them on the locked path for
+/// every regex match. The instances are built with the encoding
+/// constructors, never cloned (a clone shares its regex cache pool), on a
+/// pool thread's first estimate with that encoding, and leaked: the pool's
+/// threads live as long as the process. That is one vocabulary copy per
+/// pool thread for each encoding it counts with.
 fn bpe_for(model: &str) -> &'static CoreBPE {
     type Singleton = fn() -> &'static CoreBPE;
-    static POOL_INSTANCES: [std::sync::OnceLock<CoreBPE>; 6] =
-        [const { std::sync::OnceLock::new() }; 6];
+    thread_local! {
+        static POOL_INSTANCES: [std::cell::OnceCell<&'static CoreBPE>; 6] =
+            const { [const { std::cell::OnceCell::new() }; 6] };
+    }
     let (slot, singleton, build): (usize, Singleton, fn() -> Result<CoreBPE, _>) =
         match get_tokenizer(model) {
             Some(Tokenizer::O200kHarmony) => (
@@ -668,7 +670,13 @@ fn bpe_for(model: &str) -> &'static CoreBPE {
             ),
         };
     if crate::estimate_pool::on_pool_thread() {
-        POOL_INSTANCES[slot].get_or_init(|| build().expect("tiktoken's bundled encodings load"))
+        POOL_INSTANCES.with(|instances| {
+            *instances[slot].get_or_init(|| {
+                Box::leak(Box::new(
+                    build().expect("tiktoken's bundled encodings load"),
+                ))
+            })
+        })
     } else {
         singleton()
     }
@@ -1580,11 +1588,12 @@ mod tests {
         ));
     }
 
-    /// The pool's threads never count with the workers' singletons, so a
-    /// worker counting first cannot hold the regex cache's fast path from
-    /// them; counts come out the same from either instance.
+    /// Each pool thread counts with instances of its own, which it keeps:
+    /// never the workers' singletons, and never another pool thread's, so no
+    /// thread can hold the regex cache's fast path from another; counts come
+    /// out the same from every instance.
     #[tokio::test]
-    async fn the_pool_counts_with_its_own_tokenizer_instances() {
+    async fn each_pool_thread_counts_with_its_own_tokenizer_instances() {
         let text = "pooled words, ".repeat(2_000);
         // One model per encoding, and one no encoding maps.
         for model in [
@@ -1598,17 +1607,53 @@ mod tests {
             "claude-sonnet-4-5",
         ] {
             let on_worker = count_text(model, &text);
-            let (m, t) = (model.to_owned(), text.clone());
-            let (instance, on_pool) = crate::estimate_pool::run(t.len(), move || {
-                (bpe_for(&m) as *const CoreBPE as usize, count_text(&m, &t))
-            })
-            .await;
-            assert_ne!(
-                instance,
-                bpe_for(model) as *const CoreBPE as usize,
-                "{model}: the pool counted with the workers' instance",
+            let singleton = bpe_for(model) as *const CoreBPE as usize;
+            let job = || {
+                let (m, t) = (model.to_owned(), text.clone());
+                crate::estimate_pool::run(t.len(), move || {
+                    // Long enough that a job sent meanwhile goes to another
+                    // pool thread; nothing waits on another job, so a test
+                    // holding the pool's slots cannot deadlock this one.
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    (
+                        std::thread::current().id(),
+                        bpe_for(&m) as *const CoreBPE as usize,
+                        count_text(&m, &t),
+                    )
+                })
+            };
+            let mut seen = std::collections::HashMap::new();
+            for _ in 0..200 {
+                let (a, b) = tokio::join!(job(), job());
+                for (thread, instance, count) in [a, b] {
+                    assert_eq!(count, on_worker, "{model}");
+                    assert_ne!(
+                        instance, singleton,
+                        "{model}: a pool thread counted with the workers' instance",
+                    );
+                    let (kept, jobs) = seen.entry(thread).or_insert((instance, 0));
+                    assert_eq!(
+                        *kept, instance,
+                        "{model}: a pool thread rebuilt its instance"
+                    );
+                    *jobs += 1;
+                }
+                // Two threads, each seen on more than one job.
+                if seen.values().filter(|(_, jobs)| *jobs >= 2).count() >= 2 {
+                    break;
+                }
+            }
+            assert!(
+                seen.values().filter(|(_, jobs)| *jobs >= 2).count() >= 2,
+                "{model}: no two pool threads ran two of its jobs each",
             );
-            assert_eq!(on_pool, on_worker, "{model}");
+            let instances: std::collections::HashSet<_> =
+                seen.values().map(|(instance, _)| instance).collect();
+            assert_eq!(
+                instances.len(),
+                seen.len(),
+                "{model}: two pool threads counted with one instance",
+            );
         }
     }
 

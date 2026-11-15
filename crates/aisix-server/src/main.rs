@@ -1250,6 +1250,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     }
     let cache = Some(cache_backends);
 
+    aisix_proxy::configure_estimate_pool(&cfg.proxy);
     let mut proxy_state = ProxyState::with_components(
         snapshot_handle.clone(),
         hub.clone(),
