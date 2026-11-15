@@ -1588,17 +1588,12 @@ mod tests {
         ));
     }
 
-    /// Each pool thread counts with instances of its own: never the workers'
-    /// singletons, and never another pool thread's, so no thread can hold
-    /// the regex cache's fast path from another; counts come out the same
-    /// from every instance.
+    /// Each pool thread counts with instances of its own, which it keeps:
+    /// never the workers' singletons, and never another pool thread's, so no
+    /// thread can hold the regex cache's fast path from another; counts come
+    /// out the same from every instance.
     #[tokio::test]
     async fn each_pool_thread_counts_with_its_own_tokenizer_instances() {
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        assert!(
-            threads >= 2,
-            "the pool needs two threads for this test, has {threads}"
-        );
         let text = "pooled words, ".repeat(2_000);
         // One model per encoding, and one no encoding maps.
         for model in [
@@ -1612,12 +1607,14 @@ mod tests {
             "claude-sonnet-4-5",
         ] {
             let on_worker = count_text(model, &text);
-            // Both jobs wait for each other, so two pool threads run them.
-            let both = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let singleton = bpe_for(model) as *const CoreBPE as usize;
             let job = || {
-                let (m, t, both) = (model.to_owned(), text.clone(), std::sync::Arc::clone(&both));
+                let (m, t) = (model.to_owned(), text.clone());
                 crate::estimate_pool::run(t.len(), move || {
-                    both.wait();
+                    // Long enough that a job sent meanwhile goes to another
+                    // pool thread; nothing waits on another job, so a test
+                    // holding the pool's slots cannot deadlock this one.
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                     (
                         std::thread::current().id(),
                         bpe_for(&m) as *const CoreBPE as usize,
@@ -1625,20 +1622,32 @@ mod tests {
                     )
                 })
             };
-            let ((thread_a, a, count_a), (thread_b, b, count_b)) = tokio::join!(job(), job());
-            assert_ne!(thread_a, thread_b, "{model}");
-            let singleton = bpe_for(model) as *const CoreBPE as usize;
-            assert_ne!(
-                a, singleton,
-                "{model}: a pool thread counted with the workers' instance"
+            let mut seen = std::collections::HashMap::new();
+            for _ in 0..200 {
+                let (a, b) = tokio::join!(job(), job());
+                for (thread, instance, count) in [a, b] {
+                    assert_eq!(count, on_worker, "{model}");
+                    assert_ne!(
+                        instance, singleton,
+                        "{model}: a pool thread counted with the workers' instance",
+                    );
+                    let kept = *seen.entry(thread).or_insert(instance);
+                    assert_eq!(
+                        kept, instance,
+                        "{model}: a pool thread rebuilt its instance"
+                    );
+                }
+                if seen.len() >= 2 {
+                    break;
+                }
+            }
+            assert!(seen.len() >= 2, "{model}: no two pool threads ran its jobs");
+            let instances: std::collections::HashSet<_> = seen.values().collect();
+            assert_eq!(
+                instances.len(),
+                seen.len(),
+                "{model}: two pool threads counted with one instance",
             );
-            assert_ne!(
-                b, singleton,
-                "{model}: a pool thread counted with the workers' instance"
-            );
-            assert_ne!(a, b, "{model}: two pool threads counted with one instance");
-            assert_eq!(count_a, on_worker, "{model}");
-            assert_eq!(count_b, on_worker, "{model}");
         }
     }
 
