@@ -542,6 +542,33 @@ api_keys:
     load(&ok, &env).expect("the same file without the field loads");
 }
 
+#[test]
+fn allow_all_models_loads_from_the_file_source() {
+    let contents = r#"
+_format_version: "1"
+models:
+  - display_name: m
+    provider: openai
+    model_name: x
+    provider_key: pk
+provider_keys:
+  - display_name: pk
+    api_key: sk-x
+api_keys:
+  - display_name: k
+    key_env: CALLER_KEY
+    allow_all_models: true
+"#;
+    let env = env_of(&[("CALLER_KEY", "sk-caller")]);
+    let snap = load(contents, &env).expect("loads");
+    let key = snap
+        .apikeys
+        .get_by_name(&ApiKey::hash_bearer("sk-caller"))
+        .unwrap();
+    assert!(key.value.allow_all_models);
+    assert!(key.value.can_access(&snap, "m"));
+}
+
 /// The MCP server references with an id spelling are refused the same way,
 /// each at the nesting site it appears at. Each is asserted twice: once
 /// with the id field (one error naming it and the name-form field that

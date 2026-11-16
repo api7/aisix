@@ -216,6 +216,10 @@
     }
   },
   "properties": {
+    "allow_all_models": {
+      "description": "Grants every model in the environment, of every kind, including models created after this key. When `true` it takes precedence over both `allowed_model_ids` and `allowed_models`, which are then not read at all. Omitted or `false`, model access is decided by those two fields alone. It grants models only: agents, passthrough routes and MCP tools are still governed by their own fields.",
+      "type": "boolean"
+    },
     "allowed_agents": {
       "description": "A2A agents this key may reach, named by their registered names. Entries are matched as single-`*` globs, mirroring `allowed_models`: `\"*\"` grants every agent and an entry without a `*` matches one agent exactly. When omitted, set to `null`, or set to an empty list, the key has no A2A agent access — access is granted explicitly.",
       "items": {

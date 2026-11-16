@@ -1568,6 +1568,10 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "9b1b6d9c-1f5e-4c1e-9f8f-2f5f5b9d1c11"
             ]
           },
+          "allow_all_models": {
+            "type": "boolean",
+            "description": "When true, this caller API key may use every model in the environment, of every kind, including models created after the key, and both `allowed_model_ids` and `allowed_models` are ignored. Omitted when false."
+          },
           "rate_limit": {
             "$ref": "#/components/schemas/RateLimit",
             "description": "Request, token, and concurrency limits for this key."
