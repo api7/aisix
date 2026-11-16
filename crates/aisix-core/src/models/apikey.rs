@@ -35,7 +35,8 @@ pub struct ApiKey {
     /// Model names this key may use, matched as single-`*` globs. Read only
     /// when `allowed_model_ids` is absent; ignored entirely when it is
     /// present. When both are omitted the key may use no model — model
-    /// access is granted explicitly.
+    /// access is granted explicitly. Not read at all when `allow_all_models`
+    /// is `true`.
     #[serde(default)]
     pub allowed_models: Vec<String>,
 
@@ -53,8 +54,20 @@ pub struct ApiKey {
     /// `allowed_models`. A producer must therefore write `[]`, never
     /// `null`, for a key that is meant to grant no model — the two are
     /// opposite grants, and an empty list is the one that is authoritative.
+    ///
+    /// Not read at all when `allow_all_models` is `true`, which grants every
+    /// model whatever this list holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_model_ids: Option<Vec<String>>,
+
+    /// Grants every model in the environment, of every kind, including
+    /// models created after this key. When `true` it takes precedence over
+    /// both `allowed_model_ids` and `allowed_models`, which are then not read
+    /// at all. Omitted or `false`, model access is decided by those two
+    /// fields alone. It grants models only: agents, passthrough routes and
+    /// MCP tools are still governed by their own fields.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_all_models: bool,
 
     /// Request, token, and concurrency limits for this key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -231,7 +244,9 @@ impl ApiKey {
     /// the stored name of the entry it references — and never on whatever
     /// target dispatch later picks, for every model kind.
     ///
-    /// The key grants models one of two ways:
+    /// `allow_all_models` short-circuits everything below: such a key may
+    /// use any name, and neither list is read. Otherwise the key grants
+    /// models one of two ways:
     ///
     /// - `allowed_model_ids` present (an empty array included): each id is
     ///   resolved to the current name of the model carrying it and that name
@@ -246,6 +261,9 @@ impl ApiKey {
     /// request against the live table rather than cached, so a model rename
     /// takes effect on the next request with no rewrite of any key document.
     pub fn can_access(&self, snapshot: &super::AisixSnapshot, model_name: &str) -> bool {
+        if self.allow_all_models {
+            return true;
+        }
         match &self.allowed_model_ids {
             Some(ids) => ids.iter().any(|id| {
                 snapshot
@@ -454,6 +472,7 @@ mod tests {
             display_name: None,
             allowed_models: vec![],
             allowed_model_ids: None,
+            allow_all_models: false,
             rate_limit: None,
             team_id: None,
             user_id: None,
@@ -778,6 +797,45 @@ mod tests {
         )
         .unwrap();
         assert!(!widened.can_access(&snap, "my-gpt4"));
+    }
+
+    #[test]
+    fn allow_all_models_wins_over_both_lists() {
+        let snap = snapshot_with_models(&[("m-1", "my-gpt4"), ("m-2", "my-claude")]);
+        for doc in [
+            r#"{"key_hash":"h","allow_all_models":true,"allowed_model_ids":[]}"#,
+            r#"{"key_hash":"h","allow_all_models":true,"allowed_model_ids":["m-1"]}"#,
+            r#"{"key_hash":"h","allow_all_models":true,"allowed_models":["my-gpt4"]}"#,
+        ] {
+            let k: ApiKey = serde_json::from_str(doc).unwrap();
+            assert!(k.can_access(&snap, "my-gpt4"), "{doc}");
+            assert!(k.can_access(&snap, "my-claude"), "{doc}");
+            // A name no model carries yet: the grant covers models added later.
+            assert!(k.can_access(&snap, "added-later"), "{doc}");
+            assert_eq!(
+                k.accessible_models(&snap, ["my-gpt4", "my-claude"].into_iter()),
+                ["my-gpt4", "my-claude"],
+                "{doc}"
+            );
+        }
+
+        let off: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"h","allow_all_models":false,"allowed_model_ids":["m-1"]}"#,
+        )
+        .unwrap();
+        assert!(off.can_access(&snap, "my-gpt4"));
+        assert!(!off.can_access(&snap, "my-claude"));
+        let off_names: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"h","allow_all_models":false,"allowed_models":["my-claude"]}"#,
+        )
+        .unwrap();
+        assert!(!off_names.can_access(&snap, "my-gpt4"));
+        assert!(off_names.can_access(&snap, "my-claude"));
+        // `false` is the default and stays off the wire.
+        assert!(serde_json::to_value(&off)
+            .unwrap()
+            .get("allow_all_models")
+            .is_none());
     }
 
     #[test]

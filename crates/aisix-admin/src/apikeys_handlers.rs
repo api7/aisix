@@ -26,6 +26,9 @@ pub struct PublicApiKey {
     /// key's ACL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_model_ids: Option<Vec<String>>,
+    /// Shown whenever it is set, because it overrides both lists above.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allow_all_models: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<aisix_core::models::RateLimit>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -44,6 +47,7 @@ impl From<ApiKey> for PublicApiKey {
             key_hash: value.key_hash,
             allowed_models: value.allowed_models,
             allowed_model_ids: value.allowed_model_ids,
+            allow_all_models: value.allow_all_models,
             rate_limit: value.rate_limit,
             mcp_access: value.mcp_access,
             allowed_agents: value.allowed_agents,
@@ -93,4 +97,26 @@ pub async fn get_apikey(
         .await?
         .ok_or(AdminError::NotFound)?;
     Ok(Json(public_entry(entry)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn public(doc: serde_json::Value) -> serde_json::Value {
+        let key: ApiKey = serde_json::from_value(doc).unwrap();
+        serde_json::to_value(PublicApiKey::from(key)).unwrap()
+    }
+
+    #[test]
+    fn allow_all_models_is_shown_when_set() {
+        let v = public(serde_json::json!({
+            "key_hash": "h", "allow_all_models": true, "allowed_model_ids": []
+        }));
+        assert_eq!(v["allow_all_models"], true);
+        assert_eq!(v["allowed_model_ids"], serde_json::json!([]));
+        assert!(public(serde_json::json!({"key_hash": "h"}))
+            .get("allow_all_models")
+            .is_none());
+    }
 }
