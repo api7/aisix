@@ -6,7 +6,8 @@ use serde_json::Value;
 /// [`serde_json::to_value`] widens an `f32` to `f64`, so a configured `0.9`
 /// would come out as `0.8999999761581421` wherever the `Value` is written.
 /// Serializing to text and parsing that back yields the number the field
-/// holds.
+/// holds (exact for `f64` too, which is why this crate enables
+/// `float_roundtrip`).
 pub fn to_value<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<Value> {
     serde_json::from_slice(&serde_json::to_vec(value)?)
 }

@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
@@ -106,12 +106,7 @@ describe("usage events sent to the control plane carry configured numbers as wri
       },
       { attach: false },
     );
-    await seed.update("guardrail_attachments", randomUUID(), {
-      guardrail_id: guardrail.id,
-      scope_type: "model",
-      scope_id: chat.id,
-      priority: 100,
-    });
+    await seed.attachGuardrailToModel(guardrail.id, chat.id);
     await seed.createApiKey({ key_hash: hash(KEY), allowed_models: ["*"] });
 
     await waitConfigPropagation(async () => {
