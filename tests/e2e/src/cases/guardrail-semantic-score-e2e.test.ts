@@ -323,7 +323,7 @@ describe("semantic guardrail similarity scores on usage events", () => {
     expect(scores[0].hook).toBe("input");
     expect(scores[0].direction).toBe("deny");
     expect(scores[0].score).toBeCloseTo(NEAR_MISS, 5);
-    expect(scores[0].threshold).toBeCloseTo(DENY_THRESHOLD, 5);
+    expect(scores[0].threshold).toBe(DENY_THRESHOLD);
     expect(scores[0].matched).toBe(false);
     // The second example is the closest one, so this is not a default.
     expect(scores[0].top_example_index).toBe(1);

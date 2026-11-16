@@ -634,7 +634,7 @@ where
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for entry in entries {
         let id = identity(&entry.value);
-        let mut doc = match serde_json::to_value(&entry.value) {
+        let mut doc = match aisix_core::json::to_value(&entry.value) {
             Ok(Value::Object(map)) => Value::Object(map),
             Ok(other) => {
                 diag.warnings.push(format!(
