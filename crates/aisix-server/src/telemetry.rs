@@ -173,11 +173,14 @@ pub const TELEMETRY_PATH: &str = "/dp/telemetry";
 /// is the absolute `/dp/telemetry` endpoint on cp-api, the bundle is
 /// the externally provisioned on-disk mTLS material, and `interval`
 /// is the flush cadence (kept overridable so tests can speed up).
+/// `max_body_bytes` is [`MAX_BODY_BYTES`]; tests lower it so a split
+/// needs small bodies only.
 #[derive(Debug, Clone)]
 pub struct TelemetryConfig {
     pub url: String,
     pub interval: Duration,
     pub mtls: MtlsBundle,
+    pub max_body_bytes: usize,
 }
 
 impl TelemetryConfig {
@@ -187,6 +190,7 @@ impl TelemetryConfig {
             url,
             interval: FLUSH_INTERVAL,
             mtls,
+            max_body_bytes: MAX_BODY_BYTES,
         }
     }
 }
@@ -443,7 +447,7 @@ async fn flush(
     }
     // Each part is its own batch: its own id, and every re-send of it posts
     // the same bytes.
-    for part in split_by_body_size(&wire, MAX_BODY_BYTES) {
+    for part in split_by_body_size(&wire, cfg.max_body_bytes) {
         // A shutdown seen while an earlier part waited to re-send was
         // consumed there; the parts after it get one attempt each.
         let retry = if *cancel.borrow() {
@@ -2608,17 +2612,16 @@ mod tests {
         assert_eq!(drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED), 0);
     }
 
-    /// Two events of ~3 MiB each: one POST cannot carry both.
-    fn two_parts() -> Vec<UsageEvent> {
-        (0..2)
-            .map(|i| {
-                let mut event = sample_event(&format!("big-{i}"));
-                event.tags = (0..384)
-                    .map(|k| (format!("k{k}"), "v".repeat(FREE_TEXT_MAX_BYTES)))
-                    .collect();
-                event
-            })
-            .collect()
+    /// Two events, and a body bound that only fits one of them.
+    fn two_parts(cfg: &mut TelemetryConfig) -> Vec<UsageEvent> {
+        let events: Vec<_> = (0..2).map(|i| sample_event(&format!("part-{i}"))).collect();
+        let one = events
+            .iter()
+            .map(|e| wire_event(e).unwrap().len())
+            .max()
+            .unwrap();
+        cfg.max_body_bytes = BODY_ENVELOPE.len() + one;
+        events
     }
 
     /// Shutdown during one part's re-send is seen by the parts after it,
@@ -2627,14 +2630,15 @@ mod tests {
     async fn shutdown_mid_split_gives_each_later_part_one_attempt() {
         let (server, posts) = scripted_server(vec![dedups(503)]).await;
         let dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let mut cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let events = two_parts(&mut cfg);
         let metrics = Metrics::new(false);
         let (cancel_tx, mut cancel_rx) = watch::channel(false);
         let (tx, rx) = tokio::sync::mpsc::channel(BACKLOG_QUEUE);
         tokio::time::pause();
         let mut sender = Box::pin(run(cfg, metrics.clone(), rx, &mut cancel_rx));
         assert!(poll_sender(sender.as_mut()).await.is_pending());
-        for event in two_parts() {
+        for event in events {
             tx.try_send(event).unwrap();
         }
         assert!(poll_sender(sender.as_mut()).await.is_pending());
@@ -2674,14 +2678,15 @@ mod tests {
     async fn a_delivered_part_leaves_the_next_part_waiting() {
         let (server, posts) = scripted_server(vec![dedups(200), dedups(503)]).await;
         let dir = tempfile::tempdir().unwrap();
-        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let mut cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let events = two_parts(&mut cfg);
         let metrics = Metrics::new(false);
         let (_cancel_tx, mut cancel_rx) = watch::channel(false);
         let (tx, rx) = tokio::sync::mpsc::channel(BACKLOG_QUEUE);
         tokio::time::pause();
         let mut sender = Box::pin(run(cfg, metrics.clone(), rx, &mut cancel_rx));
         assert!(poll_sender(sender.as_mut()).await.is_pending());
-        for event in two_parts() {
+        for event in events {
             tx.try_send(event).unwrap();
         }
         assert!(poll_sender(sender.as_mut()).await.is_pending());
