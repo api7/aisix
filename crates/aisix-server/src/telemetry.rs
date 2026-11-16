@@ -6,6 +6,7 @@
 //!   to push one event per chat completion onto an mpsc channel.
 //! - This worker drains the channel, batches up to [`MAX_BATCH`]
 //!   events or every [`FLUSH_INTERVAL`] (whichever fires first),
+//!   splits a batch whose body would pass [`MAX_BODY_BYTES`],
 //!   POSTs the batch as `{ events: [...] }` to the CP's
 //!   `/dp/telemetry` URL, and logs the outcome.
 //! - On HTTP error the batch is re-sent — but only while the control
@@ -2576,18 +2577,29 @@ mod tests {
 
         assert_eq!(event.requested_model, "é".repeat(256));
         assert_eq!(event.error_message, "é".repeat(4_096));
-        assert_eq!(event.service_tier.as_deref(), Some("x".repeat(8_192).as_str()));
+        assert_eq!(
+            event.service_tier.as_deref(),
+            Some("x".repeat(8_192).as_str())
+        );
         assert_eq!(event.a2a_method, "short");
 
         let mut odd = sample_event("r");
         odd.finish_reason = format!("a{}", "é".repeat(5_000));
         bound_for_control_plane(&mut odd);
-        assert_eq!(odd.finish_reason.len(), 8_191, "the cut backs off to a character boundary");
+        assert_eq!(
+            odd.finish_reason.len(),
+            8_191,
+            "the cut backs off to a character boundary"
+        );
     }
 
     #[test]
     fn a_batch_is_split_at_the_body_bound_in_order() {
-        let body_len = |part: &[UsageEvent]| serde_json::to_vec(&TelemetryBody { events: part }).unwrap().len();
+        let body_len = |part: &[UsageEvent]| {
+            serde_json::to_vec(&TelemetryBody { events: part })
+                .unwrap()
+                .len()
+        };
         let events: Vec<_> = (0..10)
             .map(|i| {
                 let mut event = sample_event(&format!("r{i}"));
@@ -2599,17 +2611,32 @@ mod tests {
         let max = body_len(&events[..3]);
 
         let parts = split_by_body_size(&events, max);
-        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), vec![3, 3, 3, 1]);
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![3, 3, 3, 1]
+        );
         for part in &parts {
             assert!(body_len(part) <= max);
         }
-        let ids: Vec<_> = parts.iter().flat_map(|p| p.iter().map(|e| e.request_id.clone())).collect();
-        assert_eq!(ids, events.iter().map(|e| e.request_id.clone()).collect::<Vec<_>>());
+        let ids: Vec<_> = parts
+            .iter()
+            .flat_map(|p| p.iter().map(|e| e.request_id.clone()))
+            .collect();
+        assert_eq!(
+            ids,
+            events
+                .iter()
+                .map(|e| e.request_id.clone())
+                .collect::<Vec<_>>()
+        );
 
         // Exactly at the bound stays whole; an event over it goes out alone.
         assert_eq!(split_by_body_size(&events[..3], max).len(), 1);
         assert_eq!(
-            split_by_body_size(&events[..2], one - 1).iter().map(|p| p.len()).collect::<Vec<_>>(),
+            split_by_body_size(&events[..2], one - 1)
+                .iter()
+                .map(|p| p.len())
+                .collect::<Vec<_>>(),
             vec![1, 1]
         );
     }

@@ -26,7 +26,7 @@
 //!   the sink wrapper, and lets server-side wire up the consumer.
 //!
 //! See prd-09a §9A.7B Phase 1 for the upstream protocol; the DP-side
-//! batch contract (5s interval / 100-event ceiling) lives in the worker
+//! batch contract (5s interval / 100-event / 4 MiB ceiling) lives in the worker
 //! (aisix-server), not here.
 
 use crate::metrics::UsageEventLabels;
