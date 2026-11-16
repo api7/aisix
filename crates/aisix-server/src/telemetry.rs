@@ -47,6 +47,20 @@ use crate::heartbeat::MtlsBundle;
 /// receiving side, and we'd rather flush more often than tune that.
 const MAX_BATCH: usize = 100;
 
+/// Ceiling on one POST's body. A batch whose events serialize larger is sent
+/// as several batches, so a few large events cannot take a whole flush past
+/// what the control plane reads.
+const MAX_BODY_BYTES: usize = 4 << 20;
+
+/// What the control plane stores of `requested_model`, in characters
+/// (`MaxRequestedModelLen` on its side).
+const REQUESTED_MODEL_MAX_CHARS: usize = 256;
+
+/// Ceiling, in UTF-8 bytes, on each free-text field the caller or the upstream
+/// writes into an event — the longest string the control plane keeps from a
+/// telemetry batch.
+const FREE_TEXT_MAX_BYTES: usize = 8 << 10;
+
 /// Cadence at which the worker flushes whatever it has buffered, even
 /// if the buffer hasn't filled. Keeps fresh requests visible on
 /// /usage and /logs within ~5s end-to-end.
@@ -408,10 +422,89 @@ async fn flush(
     // Move events out into the request body; clear the buffer
     // unconditionally so a hung CP doesn't grow the buffer
     // indefinitely (worst case we drop the batch on error).
-    let events: Vec<UsageEvent> = std::mem::take(buffer);
+    let mut events: Vec<UsageEvent> = std::mem::take(buffer);
     buffer.reserve(MAX_BATCH);
 
-    deliver(client, cfg, metrics, state, &events, retry, cancel).await;
+    for event in &mut events {
+        bound_for_control_plane(event);
+    }
+    // Each part is its own batch: its own id, re-sent on its own.
+    for part in split_by_body_size(&events, MAX_BODY_BYTES) {
+        deliver(client, cfg, metrics, state, part, retry, cancel).await;
+    }
+}
+
+/// Clip what the caller or the upstream wrote into an event to what the
+/// control plane keeps of it, so one oversized value cannot make a batch
+/// the control plane refuses — a refusal costs every row the batch carries.
+///
+/// Only the events queued for the control plane pass through here; the
+/// exporters are handed their records separately and keep the full values.
+fn bound_for_control_plane(event: &mut UsageEvent) {
+    truncate_to_chars(&mut event.requested_model, REQUESTED_MODEL_MAX_CHARS);
+    for field in [
+        &mut event.error_message,
+        &mut event.provider_request_id,
+        &mut event.provider_model_version,
+        &mut event.finish_reason,
+        &mut event.mcp_server_name,
+        &mut event.mcp_tool_name,
+        &mut event.a2a_method,
+        &mut event.a2a_task_id,
+        &mut event.a2a_context_id,
+    ] {
+        truncate_to_bytes(field, FREE_TEXT_MAX_BYTES);
+    }
+    if let Some(tier) = event.service_tier.as_mut() {
+        truncate_to_bytes(tier, FREE_TEXT_MAX_BYTES);
+    }
+}
+
+fn truncate_to_chars(value: &mut String, max: usize) {
+    // A string of at most `max` bytes has at most `max` characters.
+    if value.len() <= max {
+        return;
+    }
+    if let Some((end, _)) = value.char_indices().nth(max) {
+        value.truncate(end);
+    }
+}
+
+fn truncate_to_bytes(value: &mut String, max: usize) {
+    if value.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+}
+
+/// Split `events` into consecutive runs whose `{"events":[...]}` body stays
+/// within `max_bytes`, keeping their order. An event too large for the bound
+/// on its own still goes out, alone.
+fn split_by_body_size(events: &[UsageEvent], max_bytes: usize) -> Vec<&[UsageEvent]> {
+    // `{"events":[` + `]}`; one comma between events.
+    const ENVELOPE: usize = 13;
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut size = ENVELOPE;
+    for (i, event) in events.iter().enumerate() {
+        let len = serde_json::to_vec(event).map_or(0, |bytes| bytes.len());
+        let added = if i == start { len } else { len + 1 };
+        if i > start && size + added > max_bytes {
+            parts.push(&events[start..i]);
+            start = i;
+            size = ENVELOPE + len;
+        } else {
+            size += added;
+        }
+    }
+    if start < events.len() {
+        parts.push(&events[start..]);
+    }
+    parts
 }
 
 /// Deliver one batch, re-sending the SAME batch — same id, same events, same
@@ -2469,5 +2562,55 @@ mod tests {
         );
         assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 4);
         assert_eq!(drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED), 0);
+    }
+
+    #[test]
+    fn caller_text_is_clipped_to_what_the_control_plane_keeps() {
+        let mut event = sample_event("r");
+        // Two-byte characters, so a byte cut could land mid-character.
+        event.requested_model = "é".repeat(300);
+        event.error_message = "é".repeat(5_000);
+        event.service_tier = Some("x".repeat(9_000));
+        event.a2a_method = "short".to_string();
+        bound_for_control_plane(&mut event);
+
+        assert_eq!(event.requested_model, "é".repeat(256));
+        assert_eq!(event.error_message, "é".repeat(4_096));
+        assert_eq!(event.service_tier.as_deref(), Some("x".repeat(8_192).as_str()));
+        assert_eq!(event.a2a_method, "short");
+
+        let mut odd = sample_event("r");
+        odd.finish_reason = format!("a{}", "é".repeat(5_000));
+        bound_for_control_plane(&mut odd);
+        assert_eq!(odd.finish_reason.len(), 8_191, "the cut backs off to a character boundary");
+    }
+
+    #[test]
+    fn a_batch_is_split_at_the_body_bound_in_order() {
+        let body_len = |part: &[UsageEvent]| serde_json::to_vec(&TelemetryBody { events: part }).unwrap().len();
+        let events: Vec<_> = (0..10)
+            .map(|i| {
+                let mut event = sample_event(&format!("r{i}"));
+                event.error_message = "x".repeat(1_000);
+                event
+            })
+            .collect();
+        let one = body_len(&events[..1]);
+        let max = body_len(&events[..3]);
+
+        let parts = split_by_body_size(&events, max);
+        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), vec![3, 3, 3, 1]);
+        for part in &parts {
+            assert!(body_len(part) <= max);
+        }
+        let ids: Vec<_> = parts.iter().flat_map(|p| p.iter().map(|e| e.request_id.clone())).collect();
+        assert_eq!(ids, events.iter().map(|e| e.request_id.clone()).collect::<Vec<_>>());
+
+        // Exactly at the bound stays whole; an event over it goes out alone.
+        assert_eq!(split_by_body_size(&events[..3], max).len(), 1);
+        assert_eq!(
+            split_by_body_size(&events[..2], one - 1).iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![1, 1]
+        );
     }
 }

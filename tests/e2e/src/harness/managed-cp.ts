@@ -44,6 +44,8 @@ export interface MockControlPlane {
   storeWrites: string[];
   /** Every `/dp/telemetry` body, in arrival order. */
   telemetryBodies: string[];
+  /** The `X-Aisix-Usage-Batch-Id` of every `/dp/telemetry` POST, beside `telemetryBodies`. */
+  telemetryBatchIds: string[];
   close(): Promise<void>;
 }
 
@@ -160,6 +162,7 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
     storeStatusOverride: undefined,
     storeWrites: [],
     telemetryBodies: [],
+    telemetryBatchIds: [],
     close: async () => {},
   };
 
@@ -176,6 +179,7 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
         res.end("{}");
       } else if (req.method === "POST" && path === "/dp/telemetry") {
         cp.telemetryBodies.push(Buffer.concat(chunks).toString("utf8"));
+        cp.telemetryBatchIds.push(String(req.headers["x-aisix-usage-batch-id"] ?? ""));
         const status = cp.telemetryStatus;
         cp.telemetryAnswers.push(status);
         res.writeHead(status, { "content-type": "application/json" });
