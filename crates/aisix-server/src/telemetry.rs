@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::watch;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -57,9 +57,9 @@ const MAX_BODY_BYTES: usize = 4 << 20;
 /// (`MaxRequestedModelLen` on its side).
 const REQUESTED_MODEL_MAX_CHARS: usize = 256;
 
-/// Ceiling, in UTF-8 bytes, on each free-text field the caller or the upstream
-/// writes into an event — the longest string the control plane keeps from a
-/// telemetry batch.
+/// Ceiling, in UTF-8 bytes, on each string of an event sent to the control
+/// plane. The control plane keeps at most 8 KiB of each string's JSON-escaped
+/// form, so an escape-heavy string may be clipped further there.
 const FREE_TEXT_MAX_BYTES: usize = 8 << 10;
 
 /// Cadence at which the worker flushes whatever it has buffered, even
@@ -423,89 +423,126 @@ async fn flush(
     // Move events out into the request body; clear the buffer
     // unconditionally so a hung CP doesn't grow the buffer
     // indefinitely (worst case we drop the batch on error).
-    let mut events: Vec<UsageEvent> = std::mem::take(buffer);
+    let events: Vec<UsageEvent> = std::mem::take(buffer);
     buffer.reserve(MAX_BATCH);
 
-    for event in &mut events {
-        bound_for_control_plane(event);
+    let mut kept = Vec::with_capacity(events.len());
+    let mut wire = Vec::with_capacity(events.len());
+    for event in events {
+        match wire_event(&event) {
+            Ok(bytes) => {
+                kept.push(event);
+                wire.push(bytes);
+            }
+            Err(error) => tracing::error!(
+                request_id = %event.request_id,
+                %error,
+                "telemetry: usage event does not serialize (event dropped)",
+            ),
+        }
     }
-    // Each part is its own batch: its own id, re-sent on its own.
-    for part in split_by_body_size(&events, MAX_BODY_BYTES) {
-        deliver(client, cfg, metrics, state, part, retry, cancel).await;
+    // Each part is its own batch: its own id, and every re-send of it posts
+    // the same bytes.
+    for part in split_by_body_size(&wire, MAX_BODY_BYTES) {
+        // A shutdown seen while an earlier part waited to re-send was
+        // consumed there; the parts after it get one attempt each.
+        let retry = if *cancel.borrow() {
+            Retry::Disabled
+        } else {
+            retry
+        };
+        let batch = Batch {
+            body: telemetry_body(&wire[part.clone()]),
+            events: &kept[part],
+        };
+        deliver(client, cfg, metrics, state, &batch, retry, cancel).await;
     }
 }
 
-/// Clip what the caller or the upstream wrote into an event to what the
-/// control plane keeps of it, so one oversized value cannot make a batch
-/// the control plane refuses — a refusal costs every row the batch carries.
+/// One event as the control plane receives it, with what the caller or the
+/// upstream wrote into it clipped to what the control plane keeps — so one
+/// oversized value cannot make a batch the control plane refuses, which
+/// would cost every row the batch carries.
 ///
-/// Only the events queued for the control plane pass through here; the
-/// exporters are handed their records separately and keep the full values.
-fn bound_for_control_plane(event: &mut UsageEvent) {
-    truncate_to_chars(&mut event.requested_model, REQUESTED_MODEL_MAX_CHARS);
-    for field in [
-        &mut event.error_message,
-        &mut event.provider_request_id,
-        &mut event.provider_model_version,
-        &mut event.finish_reason,
-        &mut event.mcp_server_name,
-        &mut event.mcp_tool_name,
-        &mut event.a2a_method,
-        &mut event.a2a_task_id,
-        &mut event.a2a_context_id,
-    ] {
-        truncate_to_bytes(field, FREE_TEXT_MAX_BYTES);
+/// Every string is clipped, not a list of fields, so a field added later is
+/// bounded too; the ones already bounded tighter are left as they are. Only
+/// the control-plane copy is clipped: the exporters are handed their records
+/// separately and keep the full values.
+fn wire_event(event: &UsageEvent) -> serde_json::Result<Vec<u8>> {
+    let mut value = serde_json::to_value(event)?;
+    clip_strings(&mut value);
+    if let Some(serde_json::Value::String(model)) = value.get_mut("requested_model") {
+        truncate_to_chars(model, REQUESTED_MODEL_MAX_CHARS);
     }
-    if let Some(tier) = event.service_tier.as_mut() {
-        truncate_to_bytes(tier, FREE_TEXT_MAX_BYTES);
+    serde_json::to_vec(&value)
+}
+
+fn clip_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            text.truncate(text.floor_char_boundary(FREE_TEXT_MAX_BYTES))
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(clip_strings),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(clip_strings),
+        _ => {}
     }
 }
 
 fn truncate_to_chars(value: &mut String, max: usize) {
-    // A string of at most `max` bytes has at most `max` characters.
-    if value.len() <= max {
-        return;
-    }
     if let Some((end, _)) = value.char_indices().nth(max) {
         value.truncate(end);
     }
 }
 
-fn truncate_to_bytes(value: &mut String, max: usize) {
-    if value.len() <= max {
-        return;
+/// `{"events":[...]}` around already-serialized events.
+fn telemetry_body(events: &[Vec<u8>]) -> Vec<u8> {
+    let len = events.iter().map(|e| e.len() + 1).sum::<usize>();
+    let mut body = Vec::with_capacity(BODY_ENVELOPE.len() + len);
+    body.extend_from_slice(b"{\"events\":[");
+    for (i, event) in events.iter().enumerate() {
+        if i > 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(event);
     }
-    let mut end = max;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value.truncate(end);
+    body.extend_from_slice(b"]}");
+    body
 }
 
-/// Split `events` into consecutive runs whose `{"events":[...]}` body stays
-/// within `max_bytes`, keeping their order. An event too large for the bound
-/// on its own still goes out, alone.
-fn split_by_body_size(events: &[UsageEvent], max_bytes: usize) -> Vec<&[UsageEvent]> {
-    // `{"events":[` + `]}`; one comma between events.
-    const ENVELOPE: usize = 13;
+/// `{"events":[` and `]}` together.
+const BODY_ENVELOPE: &str = r#"{"events":[]}"#;
+
+/// Split serialized events into consecutive runs whose body stays within
+/// `max_bytes`, keeping their order. An event too large for the bound on its
+/// own still goes out, alone.
+fn split_by_body_size(events: &[Vec<u8>], max_bytes: usize) -> Vec<std::ops::Range<usize>> {
     let mut parts = Vec::new();
     let mut start = 0;
-    let mut size = ENVELOPE;
+    let mut size = BODY_ENVELOPE.len();
     for (i, event) in events.iter().enumerate() {
-        let len = serde_json::to_vec(event).map_or(0, |bytes| bytes.len());
-        let added = if i == start { len } else { len + 1 };
+        let added = if i == start {
+            event.len()
+        } else {
+            event.len() + 1
+        };
         if i > start && size + added > max_bytes {
-            parts.push(&events[start..i]);
+            parts.push(start..i);
             start = i;
-            size = ENVELOPE + len;
+            size = BODY_ENVELOPE.len() + event.len();
         } else {
             size += added;
         }
     }
     if start < events.len() {
-        parts.push(&events[start..]);
+        parts.push(start..events.len());
     }
     parts
+}
+
+/// One batch: its events, and the body that carries them on every attempt.
+struct Batch<'a> {
+    events: &'a [UsageEvent],
+    body: Vec<u8>,
 }
 
 /// Deliver one batch, re-sending the SAME batch — same id, same events, same
@@ -517,10 +554,11 @@ async fn deliver(
     cfg: &TelemetryConfig,
     metrics: &Metrics,
     state: &mut SenderState,
-    events: &[UsageEvent],
+    batch: &Batch<'_>,
     retry: Retry,
     cancel: &mut watch::Receiver<bool>,
 ) {
+    let events = batch.events;
     let batch_id = Uuid::new_v4();
     let count = events.len();
     let budget = remaining_budget(events);
@@ -549,7 +587,7 @@ async fn deliver(
 
     loop {
         attempts += 1;
-        let failure = match send(client, cfg, batch_id, events).await {
+        let failure = match send(client, cfg, batch_id, &batch.body).await {
             Attempt::Delivered { dedup, rejected } => {
                 metrics.usage_delivery().note_reached();
                 state.dedup_seen = dedup;
@@ -730,11 +768,6 @@ fn non_empty(value: &str) -> &str {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct TelemetryBody<'a> {
-    events: &'a [UsageEvent],
-}
-
 /// The control plane's `2xx` answer to a batch. Decoded loosely — a newer
 /// control plane may add fields or drop this one.
 #[derive(Debug, Deserialize)]
@@ -799,14 +832,15 @@ async fn send(
     client: &reqwest::Client,
     cfg: &TelemetryConfig,
     batch_id: Uuid,
-    events: &[UsageEvent],
+    body: &[u8],
 ) -> Attempt {
     let resp = client
         .post(&cfg.url)
         // Same as /dp/heartbeat — no Authorization header; cp-api
         // derives identity from the peer cert SAN URI.
         .header(USAGE_BATCH_ID_HEADER, batch_id.to_string())
-        .json(&TelemetryBody { events })
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_vec())
         .send()
         .await
         .with_context(|| format!("POST {}", cfg.url));
@@ -992,7 +1026,7 @@ mod tests {
         let events = vec![sample_event("req-1"), sample_event("req-2")];
         let batch_id = Uuid::new_v4();
 
-        let attempt = send(&plain_client(), &cfg, batch_id, &events).await;
+        let attempt = send(&plain_client(), &cfg, batch_id, &body_of(&events)).await;
         // A control plane that does not set the header still delivers; it
         // is re-sending that its absence rules out.
         assert!(
@@ -1042,7 +1076,7 @@ mod tests {
         event.upstream_tpot_ms = Some(2.5);
         event.service_tier = Some("priority".into());
         event.modality_tokens.prompt_audio_tokens = Some(7);
-        send(&plain_client(), &cfg, Uuid::new_v4(), &[event]).await;
+        send(&plain_client(), &cfg, Uuid::new_v4(), &body_of(&[event])).await;
 
         let received = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
@@ -1082,7 +1116,7 @@ mod tests {
             &plain_client(),
             &cfg,
             Uuid::new_v4(),
-            &[sample_event("req-1")],
+            &body_of(&[sample_event("req-1")]),
         )
         .await;
         let Attempt::Failed(failure) = attempt else {
@@ -1918,7 +1952,13 @@ mod tests {
             .await;
             let dir = tempfile::tempdir().unwrap();
             let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
-            let attempt = send(&plain_client(), &cfg, Uuid::new_v4(), &[sample_event("r")]).await;
+            let attempt = send(
+                &plain_client(),
+                &cfg,
+                Uuid::new_v4(),
+                &body_of(&[sample_event("r")]),
+            )
+            .await;
             assert!(
                 matches!(attempt, Attempt::Delivered { rejected: 0, .. }),
                 "{attempt:?}"
@@ -2565,6 +2605,15 @@ mod tests {
         assert_eq!(drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED), 0);
     }
 
+    fn body_of(events: &[UsageEvent]) -> Vec<u8> {
+        let wire: Vec<_> = events.iter().map(|e| wire_event(e).unwrap()).collect();
+        telemetry_body(&wire)
+    }
+
+    fn on_the_wire(event: &UsageEvent) -> serde_json::Value {
+        serde_json::from_slice(&wire_event(event).unwrap()).unwrap()
+    }
+
     #[test]
     fn caller_text_is_clipped_to_what_the_control_plane_keeps() {
         let mut event = sample_event("r");
@@ -2572,72 +2621,50 @@ mod tests {
         event.requested_model = "é".repeat(300);
         event.error_message = "é".repeat(5_000);
         event.service_tier = Some("x".repeat(9_000));
+        event.mcp_tool_name = format!("a{}", "é".repeat(5_000));
+        event.a2a_context_id = "y".repeat(10_000);
         event.a2a_method = "short".to_string();
-        bound_for_control_plane(&mut event);
 
-        assert_eq!(event.requested_model, "é".repeat(256));
-        assert_eq!(event.error_message, "é".repeat(4_096));
+        let wire = on_the_wire(&event);
+        assert_eq!(wire["requested_model"], "é".repeat(256));
+        assert_eq!(wire["error_message"], "é".repeat(4_096));
+        assert_eq!(wire["service_tier"], "x".repeat(8_192));
         assert_eq!(
-            event.service_tier.as_deref(),
-            Some("x".repeat(8_192).as_str())
-        );
-        assert_eq!(event.a2a_method, "short");
-
-        let mut odd = sample_event("r");
-        odd.finish_reason = format!("a{}", "é".repeat(5_000));
-        bound_for_control_plane(&mut odd);
-        assert_eq!(
-            odd.finish_reason.len(),
+            wire["mcp_tool_name"].as_str().unwrap().len(),
             8_191,
             "the cut backs off to a character boundary"
         );
+        assert_eq!(wire["a2a_context_id"], "y".repeat(8_192));
+        assert_eq!(wire["a2a_method"], "short");
+        assert_eq!(wire["request_id"], "r");
+        // The event itself — what anything else reads — is untouched.
+        assert_eq!(event.requested_model, "é".repeat(300));
+        assert_eq!(event.error_message.chars().count(), 5_000);
     }
 
     #[test]
     fn a_batch_is_split_at_the_body_bound_in_order() {
-        let body_len = |part: &[UsageEvent]| {
-            serde_json::to_vec(&TelemetryBody { events: part })
-                .unwrap()
-                .len()
-        };
-        let events: Vec<_> = (0..10)
+        let wire: Vec<_> = (0..10)
             .map(|i| {
                 let mut event = sample_event(&format!("r{i}"));
                 event.error_message = "x".repeat(1_000);
-                event
+                wire_event(&event).unwrap()
             })
             .collect();
-        let one = body_len(&events[..1]);
-        let max = body_len(&events[..3]);
+        let one = telemetry_body(&wire[..1]).len();
+        let max = telemetry_body(&wire[..3]).len();
 
-        let parts = split_by_body_size(&events, max);
-        assert_eq!(
-            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
-            vec![3, 3, 3, 1]
-        );
+        let parts = split_by_body_size(&wire, max);
+        assert_eq!(parts, vec![0..3, 3..6, 6..9, 9..10]);
         for part in &parts {
-            assert!(body_len(part) <= max);
+            let body = telemetry_body(&wire[part.clone()]);
+            assert!(body.len() <= max);
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["events"].as_array().unwrap().len(), part.len());
         }
-        let ids: Vec<_> = parts
-            .iter()
-            .flat_map(|p| p.iter().map(|e| e.request_id.clone()))
-            .collect();
-        assert_eq!(
-            ids,
-            events
-                .iter()
-                .map(|e| e.request_id.clone())
-                .collect::<Vec<_>>()
-        );
 
         // Exactly at the bound stays whole; an event over it goes out alone.
-        assert_eq!(split_by_body_size(&events[..3], max).len(), 1);
-        assert_eq!(
-            split_by_body_size(&events[..2], one - 1)
-                .iter()
-                .map(|p| p.len())
-                .collect::<Vec<_>>(),
-            vec![1, 1]
-        );
+        assert_eq!(split_by_body_size(&wire[..3], max), vec![0..3]);
+        assert_eq!(split_by_body_size(&wire[..2], one - 1), vec![0..1, 1..2]);
     }
 }

@@ -78,9 +78,12 @@ describe("usage events sent to the control plane are bounded", () => {
     await waitConfigPropagation(async () => {
       try {
         return (await new ProxyClient(app!.proxyUrl, KEY).listModels()).status === 200;
-      } catch {
-        // The proxy listener binds once the first configuration applies.
-        return false;
+      } catch (e) {
+        // The proxy listener binds once the first configuration applies;
+        // anything else is a real failure.
+        const err = e as { code?: string; cause?: { code?: string } };
+        if ((err.code ?? err.cause?.code) === "ECONNREFUSED") return false;
+        throw e;
       }
     });
   });
@@ -134,9 +137,16 @@ describe("usage events sent to the control plane are bounded", () => {
     expect(new Set(recorded.map((e) => e.request_id)).size).toBe(count);
     for (const e of recorded) {
       // The upstream's metadata arrives, clipped, rather than costing the row.
-      expect(e.provider_model_version?.startsWith("gpt-\u0001")).toBe(true);
-      expect(Buffer.byteLength(e.provider_model_version!)).toBeLessThanOrEqual(8 * 1024);
-      expect(Buffer.byteLength(e.service_tier!)).toBeLessThanOrEqual(8 * 1024);
+      for (const [field, prefix] of [
+        ["provider_request_id", "chatcmpl-"],
+        ["provider_model_version", "gpt-"],
+        ["service_tier", "tier-"],
+        ["finish_reason", "why-"],
+      ] as const) {
+        const value = e[field];
+        expect(value?.startsWith(prefix), field).toBe(true);
+        expect(Buffer.byteLength(value!), field).toBeLessThanOrEqual(8 * 1024);
+      }
     }
 
     const posts = cp!.telemetryBodies.slice(firstPost);
