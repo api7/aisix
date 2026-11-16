@@ -451,6 +451,9 @@ async fn flush(
         } else {
             retry
         };
+        // An earlier part that landed cleared the waiting mark; this one's
+        // events are still waiting.
+        metrics.usage_delivery().note_waiting();
         let batch = Batch {
             body: telemetry_body(&wire[part.clone()]),
             events: &kept[part],
@@ -2603,6 +2606,57 @@ mod tests {
         );
         assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 4);
         assert_eq!(drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED), 0);
+    }
+
+    /// A part that lands must not mark the parts behind it delivered: strict
+    /// budget mode reads the waiting mark while those still re-send.
+    #[tokio::test]
+    async fn a_delivered_part_leaves_the_next_part_waiting() {
+        let (server, posts) = scripted_server(vec![dedups(200), dedups(503)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let (tx, rx) = tokio::sync::mpsc::channel(BACKLOG_QUEUE);
+        tokio::time::pause();
+        let mut sender = Box::pin(run(cfg, metrics.clone(), rx, &mut cancel_rx));
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        // Two events of ~3 MiB each: one POST cannot carry both.
+        for i in 0..2 {
+            let mut event = sample_event(&format!("big-{i}"));
+            event.tags = (0..384)
+                .map(|k| (format!("k{k}"), "v".repeat(FREE_TEXT_MAX_BYTES)))
+                .collect();
+            tx.try_send(event).unwrap();
+        }
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        tokio::time::advance(FLUSH_INTERVAL).await;
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || posts.lock().unwrap().len() >= 2,
+            "the second part was never posted",
+        )
+        .await;
+        {
+            let posts = posts.lock().unwrap();
+            assert_ne!(posts[0].0, posts[1].0, "each part is its own batch");
+            assert_eq!(posts[0].1["events"].as_array().unwrap().len(), 1);
+        }
+        // Give the sender the second answer before reading the mark.
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || posts.lock().unwrap().len() >= 3,
+            "the second part was never re-sent",
+        )
+        .await;
+        assert!(
+            metrics.usage_delivery().is_waiting(),
+            "the second part is still being re-sent"
+        );
+        drop(tx);
+        drop(sender);
     }
 
     fn body_of(events: &[UsageEvent]) -> Vec<u8> {
