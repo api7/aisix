@@ -117,25 +117,32 @@ describe("usage events sent to the control plane are bounded", () => {
   test("a flush larger than one POST carries is split, and every event arrives exactly once", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const client = new ProxyClient(app.proxyUrl, KEY);
-    const firstPost = cp!.telemetryBodies.length;
+    const chat = (model: string) => client.chat({ model, messages: [{ role: "user", content: "hi" }] });
     const count = 100;
 
-    const responses = await Promise.all(
-      Array.from({ length: count }, () =>
-        client.chat({ model: "tcb-verbose", messages: [{ role: "user", content: "hi" }] }),
-      ),
-    );
+    // Hold the control plane on one POST so the next requests' events all
+    // queue behind it and go out in a single flush once it answers.
+    let release!: () => void;
+    cp!.telemetryHold = new Promise<void>((resolve) => (release = resolve));
+    const held = cp!.telemetryBodies.length;
+    expect((await chat("tcb/warm")).status).toBe(200);
+    await waitConfigPropagation(async () => cp!.telemetryBodies.length > held, 20_000);
+
+    const responses = await Promise.all(Array.from({ length: count }, () => chat("tcb-verbose")));
     expect(responses.map((r) => r.status)).toEqual(Array(count).fill(200));
+    const firstPost = cp!.telemetryBodies.length;
+    cp!.telemetryHold = undefined;
+    release();
 
-    const verbose = () => events().filter((e) => e.requested_model === "tcb-verbose");
-    await waitConfigPropagation(async () => verbose().length >= count, 30_000);
-    // One more flush interval: a POST that re-delivered events would land here.
-    await new Promise((resolve) => setTimeout(resolve, 6_000));
+    // Barrier: the sender posts in order, one POST at a time, so once this
+    // later request's event is in, every POST carrying the earlier ones is too.
+    expect((await chat("tcb/barrier")).status).toBe(200);
+    await waitConfigPropagation(async () => events().some((e) => e.requested_model === "tcb/barrier"), 30_000);
 
-    const recorded = verbose();
-    expect(recorded).toHaveLength(count);
-    expect(new Set(recorded.map((e) => e.request_id)).size).toBe(count);
-    for (const e of recorded) {
+    const verbose = events().filter((e) => e.requested_model === "tcb-verbose");
+    expect(verbose).toHaveLength(count);
+    expect(new Set(verbose.map((e) => e.request_id)).size).toBe(count);
+    for (const e of verbose) {
       // The upstream's metadata arrives, clipped, rather than costing the row.
       for (const [field, prefix] of [
         ["provider_request_id", "chatcmpl-"],
@@ -149,13 +156,16 @@ describe("usage events sent to the control plane are bounded", () => {
       }
     }
 
-    const posts = cp!.telemetryBodies.slice(firstPost);
-    const sizes = posts.map((body) => Buffer.byteLength(body));
+    const posts = cp!.telemetryBodies
+      .slice(firstPost)
+      .map((body, i) => ({ body, id: cp!.telemetryBatchIds[firstPost + i]! }))
+      .filter(({ body }) => body.includes('"requested_model":"tcb-verbose"'));
+    expect(posts.length).toBeGreaterThan(1);
+    const sizes = posts.map(({ body }) => Buffer.byteLength(body));
     for (const size of sizes) expect(size).toBeLessThanOrEqual(MAX_POST_BYTES);
-    // The events did not fit one POST, so the bound actually split them.
+    // One flush's events did not fit one POST, so the bound split them.
     expect(sizes.reduce((a, b) => a + b, 0)).toBeGreaterThan(MAX_POST_BYTES);
-    const ids = cp!.telemetryBatchIds.slice(firstPost);
-    expect(new Set(ids).size).toBe(ids.length);
-    expect(cp!.telemetryAnswers.slice(firstPost).every((status) => status === 200)).toBe(true);
+    expect(new Set(posts.map(({ id }) => id)).size).toBe(posts.length);
+    expect(cp!.telemetryAnswers.every((status) => status === 200)).toBe(true);
   }, 90_000);
 });

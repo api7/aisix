@@ -46,6 +46,8 @@ export interface MockControlPlane {
   telemetryBodies: string[];
   /** The `X-Aisix-Usage-Batch-Id` of every `/dp/telemetry` POST, beside `telemetryBodies`. */
   telemetryBatchIds: string[];
+  /** While set, `/dp/telemetry` POSTs are recorded on arrival and answered once it resolves. */
+  telemetryHold: Promise<void> | undefined;
   close(): Promise<void>;
 }
 
@@ -163,6 +165,7 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
     storeWrites: [],
     telemetryBodies: [],
     telemetryBatchIds: [],
+    telemetryHold: undefined,
     close: async () => {},
   };
 
@@ -180,10 +183,12 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
       } else if (req.method === "POST" && path === "/dp/telemetry") {
         cp.telemetryBodies.push(Buffer.concat(chunks).toString("utf8"));
         cp.telemetryBatchIds.push(String(req.headers["x-aisix-usage-batch-id"] ?? ""));
-        const status = cp.telemetryStatus;
-        cp.telemetryAnswers.push(status);
-        res.writeHead(status, { "content-type": "application/json" });
-        res.end(status < 300 ? '{"accepted":0,"rejected":0}' : '{"error":"unavailable"}');
+        void (cp.telemetryHold ?? Promise.resolve()).then(() => {
+          const status = cp.telemetryStatus;
+          cp.telemetryAnswers.push(status);
+          res.writeHead(status, { "content-type": "application/json" });
+          res.end(status < 300 ? '{"accepted":0,"rejected":0}' : '{"error":"unavailable"}');
+        });
       } else {
         res.writeHead(404);
         res.end();
