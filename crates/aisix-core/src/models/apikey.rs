@@ -35,7 +35,8 @@ pub struct ApiKey {
     /// Model names this key may use, matched as single-`*` globs. Read only
     /// when `allowed_model_ids` is absent; ignored entirely when it is
     /// present. When both are omitted the key may use no model — model
-    /// access is granted explicitly.
+    /// access is granted explicitly. Not read at all when `allow_all_models`
+    /// is `true`.
     #[serde(default)]
     pub allowed_models: Vec<String>,
 
@@ -53,6 +54,9 @@ pub struct ApiKey {
     /// `allowed_models`. A producer must therefore write `[]`, never
     /// `null`, for a key that is meant to grant no model — the two are
     /// opposite grants, and an empty list is the one that is authoritative.
+    ///
+    /// Not read at all when `allow_all_models` is `true`, which grants every
+    /// model whatever this list holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_model_ids: Option<Vec<String>>,
 
