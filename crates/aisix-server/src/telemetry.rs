@@ -2608,6 +2608,66 @@ mod tests {
         assert_eq!(drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED), 0);
     }
 
+    /// Two events of ~3 MiB each: one POST cannot carry both.
+    fn two_parts() -> Vec<UsageEvent> {
+        (0..2)
+            .map(|i| {
+                let mut event = sample_event(&format!("big-{i}"));
+                event.tags = (0..384)
+                    .map(|k| (format!("k{k}"), "v".repeat(FREE_TEXT_MAX_BYTES)))
+                    .collect();
+                event
+            })
+            .collect()
+    }
+
+    /// Shutdown during one part's re-send is seen by the parts after it,
+    /// though that part consumed the notification: each gets one attempt.
+    #[tokio::test]
+    async fn shutdown_mid_split_gives_each_later_part_one_attempt() {
+        let (server, posts) = scripted_server(vec![dedups(503)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let metrics = Metrics::new(false);
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let (tx, rx) = tokio::sync::mpsc::channel(BACKLOG_QUEUE);
+        tokio::time::pause();
+        let mut sender = Box::pin(run(cfg, metrics.clone(), rx, &mut cancel_rx));
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        for event in two_parts() {
+            tx.try_send(event).unwrap();
+        }
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        tokio::time::advance(FLUSH_INTERVAL).await;
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || posts.lock().unwrap().len() >= 2,
+            "the first part was never re-sent",
+        )
+        .await;
+        let attempts = posts.lock().unwrap().len();
+
+        cancel_tx.send(true).unwrap();
+        finish_sender(sender.as_mut()).await;
+
+        let posts = posts.lock().unwrap();
+        assert_eq!(
+            posts.len(),
+            attempts + 2,
+            "one final attempt at the part in hand, one at the part after it"
+        );
+        let first = &posts[0].0;
+        assert!(posts[..=attempts].iter().all(|(id, _)| id == first));
+        assert_ne!(
+            &posts[attempts + 1].0,
+            first,
+            "the second part is its own batch"
+        );
+        assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 2);
+        drop(tx);
+    }
+
     /// A part that lands must not mark the parts behind it delivered: strict
     /// budget mode reads the waiting mark while those still re-send.
     #[tokio::test]
@@ -2621,12 +2681,7 @@ mod tests {
         tokio::time::pause();
         let mut sender = Box::pin(run(cfg, metrics.clone(), rx, &mut cancel_rx));
         assert!(poll_sender(sender.as_mut()).await.is_pending());
-        // Two events of ~3 MiB each: one POST cannot carry both.
-        for i in 0..2 {
-            let mut event = sample_event(&format!("big-{i}"));
-            event.tags = (0..384)
-                .map(|k| (format!("k{k}"), "v".repeat(FREE_TEXT_MAX_BYTES)))
-                .collect();
+        for event in two_parts() {
             tx.try_send(event).unwrap();
         }
         assert!(poll_sender(sender.as_mut()).await.is_pending());
