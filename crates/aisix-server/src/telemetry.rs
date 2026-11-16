@@ -6,6 +6,7 @@
 //!   to push one event per chat completion onto an mpsc channel.
 //! - This worker drains the channel, batches up to [`MAX_BATCH`]
 //!   events or every [`FLUSH_INTERVAL`] (whichever fires first),
+//!   splits a batch whose body would pass [`MAX_BODY_BYTES`],
 //!   POSTs the batch as `{ events: [...] }` to the CP's
 //!   `/dp/telemetry` URL, and logs the outcome.
 //! - On HTTP error the batch is re-sent — but only while the control
@@ -32,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::watch;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -46,6 +47,20 @@ use crate::heartbeat::MtlsBundle;
 /// approaches gin's default `MaxMultipartMemory` plumbing on the
 /// receiving side, and we'd rather flush more often than tune that.
 const MAX_BATCH: usize = 100;
+
+/// Ceiling on one POST's body. A batch whose events serialize larger is sent
+/// as several batches, so a few large events cannot take a whole flush past
+/// what the control plane reads.
+const MAX_BODY_BYTES: usize = 4 << 20;
+
+/// What the control plane stores of `requested_model`, in characters
+/// (`MaxRequestedModelLen` on its side).
+const REQUESTED_MODEL_MAX_CHARS: usize = 256;
+
+/// Ceiling, in UTF-8 bytes, on each string of an event sent to the control
+/// plane. The control plane keeps at most 8 KiB of each string's JSON-escaped
+/// form, so an escape-heavy string may be clipped further there.
+const FREE_TEXT_MAX_BYTES: usize = 8 << 10;
 
 /// Cadence at which the worker flushes whatever it has buffered, even
 /// if the buffer hasn't filled. Keeps fresh requests visible on
@@ -158,11 +173,14 @@ pub const TELEMETRY_PATH: &str = "/dp/telemetry";
 /// is the absolute `/dp/telemetry` endpoint on cp-api, the bundle is
 /// the externally provisioned on-disk mTLS material, and `interval`
 /// is the flush cadence (kept overridable so tests can speed up).
+/// `max_body_bytes` is [`MAX_BODY_BYTES`]; tests lower it so a split
+/// needs small bodies only.
 #[derive(Debug, Clone)]
 pub struct TelemetryConfig {
     pub url: String,
     pub interval: Duration,
     pub mtls: MtlsBundle,
+    pub max_body_bytes: usize,
 }
 
 impl TelemetryConfig {
@@ -172,6 +190,7 @@ impl TelemetryConfig {
             url,
             interval: FLUSH_INTERVAL,
             mtls,
+            max_body_bytes: MAX_BODY_BYTES,
         }
     }
 }
@@ -411,7 +430,126 @@ async fn flush(
     let events: Vec<UsageEvent> = std::mem::take(buffer);
     buffer.reserve(MAX_BATCH);
 
-    deliver(client, cfg, metrics, state, &events, retry, cancel).await;
+    let mut kept = Vec::with_capacity(events.len());
+    let mut wire = Vec::with_capacity(events.len());
+    for event in events {
+        match wire_event(&event) {
+            Ok(bytes) => {
+                kept.push(event);
+                wire.push(bytes);
+            }
+            Err(error) => tracing::error!(
+                request_id = %event.request_id,
+                %error,
+                "telemetry: usage event does not serialize (event dropped)",
+            ),
+        }
+    }
+    // Each part is its own batch: its own id, and every re-send of it posts
+    // the same bytes.
+    for part in split_by_body_size(&wire, cfg.max_body_bytes) {
+        // A shutdown seen while an earlier part waited to re-send was
+        // consumed there; the parts after it get one attempt each.
+        let retry = if *cancel.borrow() {
+            Retry::Disabled
+        } else {
+            retry
+        };
+        // An earlier part that landed cleared the waiting mark; this one's
+        // events are still waiting.
+        metrics.usage_delivery().note_waiting();
+        let batch = Batch {
+            body: telemetry_body(&wire[part.clone()]),
+            events: &kept[part],
+        };
+        deliver(client, cfg, metrics, state, &batch, retry, cancel).await;
+    }
+}
+
+/// One event as the control plane receives it, with what the caller or the
+/// upstream wrote into it clipped to what the control plane keeps — so one
+/// oversized value cannot make a batch the control plane refuses, which
+/// would cost every row the batch carries.
+///
+/// Every string is clipped, not a list of fields, so a field added later is
+/// bounded too; the ones already bounded tighter are left as they are. Only
+/// the control-plane copy is clipped: the exporters are handed their records
+/// separately and keep the full values.
+fn wire_event(event: &UsageEvent) -> serde_json::Result<Vec<u8>> {
+    let mut value = serde_json::to_value(event)?;
+    clip_strings(&mut value);
+    if let Some(serde_json::Value::String(model)) = value.get_mut("requested_model") {
+        truncate_to_chars(model, REQUESTED_MODEL_MAX_CHARS);
+    }
+    serde_json::to_vec(&value)
+}
+
+fn clip_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            text.truncate(text.floor_char_boundary(FREE_TEXT_MAX_BYTES))
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(clip_strings),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(clip_strings),
+        _ => {}
+    }
+}
+
+fn truncate_to_chars(value: &mut String, max: usize) {
+    if let Some((end, _)) = value.char_indices().nth(max) {
+        value.truncate(end);
+    }
+}
+
+/// `{"events":[...]}` around already-serialized events.
+fn telemetry_body(events: &[Vec<u8>]) -> Vec<u8> {
+    let len = events.iter().map(|e| e.len() + 1).sum::<usize>();
+    let mut body = Vec::with_capacity(BODY_ENVELOPE.len() + len);
+    body.extend_from_slice(b"{\"events\":[");
+    for (i, event) in events.iter().enumerate() {
+        if i > 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(event);
+    }
+    body.extend_from_slice(b"]}");
+    body
+}
+
+/// `{"events":[` and `]}` together.
+const BODY_ENVELOPE: &str = r#"{"events":[]}"#;
+
+/// Split serialized events into consecutive runs whose body stays within
+/// `max_bytes`, keeping their order. An event too large for the bound on its
+/// own still goes out, alone.
+fn split_by_body_size(events: &[Vec<u8>], max_bytes: usize) -> Vec<std::ops::Range<usize>> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut size = BODY_ENVELOPE.len();
+    for (i, event) in events.iter().enumerate() {
+        let added = if i == start {
+            event.len()
+        } else {
+            event.len() + 1
+        };
+        if i > start && size + added > max_bytes {
+            parts.push(start..i);
+            start = i;
+            size = BODY_ENVELOPE.len() + event.len();
+        } else {
+            size += added;
+        }
+    }
+    if start < events.len() {
+        parts.push(start..events.len());
+    }
+    parts
+}
+
+/// One batch: its events, and the body that carries them on every attempt.
+struct Batch<'a> {
+    events: &'a [UsageEvent],
+    body: Vec<u8>,
 }
 
 /// Deliver one batch, re-sending the SAME batch — same id, same events, same
@@ -423,10 +561,11 @@ async fn deliver(
     cfg: &TelemetryConfig,
     metrics: &Metrics,
     state: &mut SenderState,
-    events: &[UsageEvent],
+    batch: &Batch<'_>,
     retry: Retry,
     cancel: &mut watch::Receiver<bool>,
 ) {
+    let events = batch.events;
     let batch_id = Uuid::new_v4();
     let count = events.len();
     let budget = remaining_budget(events);
@@ -455,7 +594,7 @@ async fn deliver(
 
     loop {
         attempts += 1;
-        let failure = match send(client, cfg, batch_id, events).await {
+        let failure = match send(client, cfg, batch_id, &batch.body).await {
             Attempt::Delivered { dedup, rejected } => {
                 metrics.usage_delivery().note_reached();
                 state.dedup_seen = dedup;
@@ -636,11 +775,6 @@ fn non_empty(value: &str) -> &str {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct TelemetryBody<'a> {
-    events: &'a [UsageEvent],
-}
-
 /// The control plane's `2xx` answer to a batch. Decoded loosely — a newer
 /// control plane may add fields or drop this one.
 #[derive(Debug, Deserialize)]
@@ -705,14 +839,15 @@ async fn send(
     client: &reqwest::Client,
     cfg: &TelemetryConfig,
     batch_id: Uuid,
-    events: &[UsageEvent],
+    body: &[u8],
 ) -> Attempt {
     let resp = client
         .post(&cfg.url)
         // Same as /dp/heartbeat — no Authorization header; cp-api
         // derives identity from the peer cert SAN URI.
         .header(USAGE_BATCH_ID_HEADER, batch_id.to_string())
-        .json(&TelemetryBody { events })
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_vec())
         .send()
         .await
         .with_context(|| format!("POST {}", cfg.url));
@@ -898,7 +1033,7 @@ mod tests {
         let events = vec![sample_event("req-1"), sample_event("req-2")];
         let batch_id = Uuid::new_v4();
 
-        let attempt = send(&plain_client(), &cfg, batch_id, &events).await;
+        let attempt = send(&plain_client(), &cfg, batch_id, &body_of(&events)).await;
         // A control plane that does not set the header still delivers; it
         // is re-sending that its absence rules out.
         assert!(
@@ -948,7 +1083,7 @@ mod tests {
         event.upstream_tpot_ms = Some(2.5);
         event.service_tier = Some("priority".into());
         event.modality_tokens.prompt_audio_tokens = Some(7);
-        send(&plain_client(), &cfg, Uuid::new_v4(), &[event]).await;
+        send(&plain_client(), &cfg, Uuid::new_v4(), &body_of(&[event])).await;
 
         let received = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
@@ -988,7 +1123,7 @@ mod tests {
             &plain_client(),
             &cfg,
             Uuid::new_v4(),
-            &[sample_event("req-1")],
+            &body_of(&[sample_event("req-1")]),
         )
         .await;
         let Attempt::Failed(failure) = attempt else {
@@ -1824,7 +1959,13 @@ mod tests {
             .await;
             let dir = tempfile::tempdir().unwrap();
             let cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
-            let attempt = send(&plain_client(), &cfg, Uuid::new_v4(), &[sample_event("r")]).await;
+            let attempt = send(
+                &plain_client(),
+                &cfg,
+                Uuid::new_v4(),
+                &body_of(&[sample_event("r")]),
+            )
+            .await;
             assert!(
                 matches!(attempt, Attempt::Delivered { rejected: 0, .. }),
                 "{attempt:?}"
@@ -2469,5 +2610,175 @@ mod tests {
         );
         assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 4);
         assert_eq!(drops_with_reason(&metrics, DROP_RETRY_BUDGET_EXHAUSTED), 0);
+    }
+
+    /// Two events, and a body bound that only fits one of them.
+    fn two_parts(cfg: &mut TelemetryConfig) -> Vec<UsageEvent> {
+        let events: Vec<_> = (0..2).map(|i| sample_event(&format!("part-{i}"))).collect();
+        let one = events
+            .iter()
+            .map(|e| wire_event(e).unwrap().len())
+            .max()
+            .unwrap();
+        cfg.max_body_bytes = BODY_ENVELOPE.len() + one;
+        events
+    }
+
+    /// Shutdown during one part's re-send is seen by the parts after it,
+    /// though that part consumed the notification: each gets one attempt.
+    #[tokio::test]
+    async fn shutdown_mid_split_gives_each_later_part_one_attempt() {
+        let (server, posts) = scripted_server(vec![dedups(503)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let events = two_parts(&mut cfg);
+        let metrics = Metrics::new(false);
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let (tx, rx) = tokio::sync::mpsc::channel(BACKLOG_QUEUE);
+        tokio::time::pause();
+        let mut sender = Box::pin(run(cfg, metrics.clone(), rx, &mut cancel_rx));
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        for event in events {
+            tx.try_send(event).unwrap();
+        }
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        tokio::time::advance(FLUSH_INTERVAL).await;
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || posts.lock().unwrap().len() >= 2,
+            "the first part was never re-sent",
+        )
+        .await;
+        let attempts = posts.lock().unwrap().len();
+
+        cancel_tx.send(true).unwrap();
+        finish_sender(sender.as_mut()).await;
+
+        let posts = posts.lock().unwrap();
+        assert_eq!(
+            posts.len(),
+            attempts + 2,
+            "one final attempt at the part in hand, one at the part after it"
+        );
+        let first = &posts[0].0;
+        assert!(posts[..=attempts].iter().all(|(id, _)| id == first));
+        assert_ne!(
+            &posts[attempts + 1].0,
+            first,
+            "the second part is its own batch"
+        );
+        assert_eq!(drops_with_reason(&metrics, DROP_SEND_FAILED), 2);
+        drop(tx);
+    }
+
+    /// A part that lands must not mark the parts behind it delivered: strict
+    /// budget mode reads the waiting mark while those still re-send.
+    #[tokio::test]
+    async fn a_delivered_part_leaves_the_next_part_waiting() {
+        let (server, posts) = scripted_server(vec![dedups(200), dedups(503)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(format!("{}/dp/telemetry", server.uri()), &dir);
+        let events = two_parts(&mut cfg);
+        let metrics = Metrics::new(false);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let (tx, rx) = tokio::sync::mpsc::channel(BACKLOG_QUEUE);
+        tokio::time::pause();
+        let mut sender = Box::pin(run(cfg, metrics.clone(), rx, &mut cancel_rx));
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        for event in events {
+            tx.try_send(event).unwrap();
+        }
+        assert!(poll_sender(sender.as_mut()).await.is_pending());
+        tokio::time::advance(FLUSH_INTERVAL).await;
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || posts.lock().unwrap().len() >= 2,
+            "the second part was never posted",
+        )
+        .await;
+        {
+            let posts = posts.lock().unwrap();
+            assert_ne!(posts[0].0, posts[1].0, "each part is its own batch");
+            assert_eq!(posts[0].1["events"].as_array().unwrap().len(), 1);
+        }
+        // Give the sender the second answer before reading the mark.
+        drive_until(
+            sender.as_mut(),
+            STEP_WHILE_SERVING,
+            || posts.lock().unwrap().len() >= 3,
+            "the second part was never re-sent",
+        )
+        .await;
+        assert!(
+            metrics.usage_delivery().is_waiting(),
+            "the second part is still being re-sent"
+        );
+        drop(tx);
+        drop(sender);
+    }
+
+    fn body_of(events: &[UsageEvent]) -> Vec<u8> {
+        let wire: Vec<_> = events.iter().map(|e| wire_event(e).unwrap()).collect();
+        telemetry_body(&wire)
+    }
+
+    fn on_the_wire(event: &UsageEvent) -> serde_json::Value {
+        serde_json::from_slice(&wire_event(event).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn caller_text_is_clipped_to_what_the_control_plane_keeps() {
+        let mut event = sample_event("r");
+        // Two-byte characters, so a byte cut could land mid-character.
+        event.requested_model = "é".repeat(300);
+        event.error_message = "é".repeat(5_000);
+        event.service_tier = Some("x".repeat(9_000));
+        event.mcp_tool_name = format!("a{}", "é".repeat(5_000));
+        event.a2a_context_id = "y".repeat(10_000);
+        event.a2a_method = "short".to_string();
+
+        let wire = on_the_wire(&event);
+        assert_eq!(wire["requested_model"], "é".repeat(256));
+        assert_eq!(wire["error_message"], "é".repeat(4_096));
+        assert_eq!(wire["service_tier"], "x".repeat(8_192));
+        assert_eq!(
+            wire["mcp_tool_name"].as_str().unwrap().len(),
+            8_191,
+            "the cut backs off to a character boundary"
+        );
+        assert_eq!(wire["a2a_context_id"], "y".repeat(8_192));
+        assert_eq!(wire["a2a_method"], "short");
+        assert_eq!(wire["request_id"], "r");
+        // The event itself — what anything else reads — is untouched.
+        assert_eq!(event.requested_model, "é".repeat(300));
+        assert_eq!(event.error_message.chars().count(), 5_000);
+    }
+
+    #[test]
+    fn a_batch_is_split_at_the_body_bound_in_order() {
+        let wire: Vec<_> = (0..10)
+            .map(|i| {
+                let mut event = sample_event(&format!("r{i}"));
+                event.error_message = "x".repeat(1_000);
+                wire_event(&event).unwrap()
+            })
+            .collect();
+        let one = telemetry_body(&wire[..1]).len();
+        let max = telemetry_body(&wire[..3]).len();
+
+        let parts = split_by_body_size(&wire, max);
+        assert_eq!(parts, vec![0..3, 3..6, 6..9, 9..10]);
+        for part in &parts {
+            let body = telemetry_body(&wire[part.clone()]);
+            assert!(body.len() <= max);
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["events"].as_array().unwrap().len(), part.len());
+        }
+
+        // Exactly at the bound stays whole; an event over it goes out alone.
+        assert_eq!(split_by_body_size(&wire[..3], max), vec![0..3]);
+        assert_eq!(split_by_body_size(&wire[..2], one - 1), vec![0..1, 1..2]);
     }
 }
