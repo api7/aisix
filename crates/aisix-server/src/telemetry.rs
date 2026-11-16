@@ -2770,13 +2770,14 @@ mod tests {
             format!("{}/dp/telemetry", server.uri()),
             write_test_bundle(dir.path()),
         );
-        send(
+        let attempt = send(
             &plain_client(),
             &cfg,
             Uuid::new_v4(),
             &body_of(&[event_with_floats()]),
         )
         .await;
+        assert!(matches!(attempt, Attempt::Delivered { .. }), "{attempt:?}");
 
         let received = server.received_requests().await.unwrap();
         let body = std::str::from_utf8(&received[0].body).unwrap();
