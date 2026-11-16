@@ -220,7 +220,7 @@ impl DatadogSink {
 
         // Flatten the usage metadata, remapping each field to its GenAI semconv
         // (or `aisix.`) key. Empty strings are skipped; numeric 0 / false stay.
-        if let Ok(Value::Object(fields)) = serde_json::to_value(&record.usage) {
+        if let Ok(Value::Object(fields)) = aisix_core::json::to_value(&record.usage) {
             for (key, value) in fields {
                 let Some(rendered) = render_scalar(&value) else {
                     continue;
@@ -495,6 +495,30 @@ mod tests {
 
     fn batch_of(records: Vec<SinkRecord>) -> EventBatch {
         EventBatch::new(records.into_iter().map(Arc::new).collect())
+    }
+
+    /// An `f32` field reaches the log as the number it holds, not widened to
+    /// `f64` (`0.9` as `0.8999999761581421`).
+    #[tokio::test]
+    async fn f32_fields_are_written_as_they_read() {
+        let server = MockServer::builder().start().await;
+        let sink = sink_for(&server, &[]);
+        let log = sink.to_log(&SinkRecord::metadata_only(UsageEvent {
+            cache_similarity: Some(0.9123),
+            guardrail_scores: vec![aisix_core::GuardrailScore {
+                score: 0.812,
+                threshold: 0.9,
+                ..Default::default()
+            }],
+            ..UsageEvent::default()
+        }));
+        let text = serde_json::to_string(&log).unwrap();
+        assert!(
+            text.contains(r#""aisix.cache_similarity":0.9123"#),
+            "{text}"
+        );
+        assert!(text.contains(r#""score":0.812,"#), "{text}");
+        assert!(text.contains(r#""threshold":0.9,"#), "{text}");
     }
 
     /// Datadog's GenAI output count includes reasoning counted beside the

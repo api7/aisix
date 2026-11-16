@@ -238,7 +238,7 @@ fn to_log(record: &SinkRecord) -> Result<Log, SinkError> {
     let mut log = Log::from_unixtime(now_unix_secs());
     log.add_content_kv("schema_version", record.schema_version);
 
-    let usage = serde_json::to_value(&record.usage)
+    let usage = aisix_core::json::to_value(&record.usage)
         .map_err(|e| SinkError::Permanent(format!("sls: serialize usage: {e}")))?;
     if let serde_json::Value::Object(fields) = usage {
         for (key, value) in fields {
@@ -514,6 +514,31 @@ mod tests {
 
     fn batch_of(records: Vec<SinkRecord>) -> EventBatch {
         EventBatch::new(records.into_iter().map(Arc::new).collect())
+    }
+
+    /// An `f32` field reaches the log as the number it holds, not widened to
+    /// `f64` (`0.9` as `0.8999999761581421`).
+    #[test]
+    fn f32_fields_are_written_as_they_read() {
+        let log = super::to_log(&SinkRecord::metadata_only(UsageEvent {
+            cache_similarity: Some(0.9123),
+            guardrail_scores: vec![aisix_core::GuardrailScore {
+                score: 0.812,
+                threshold: 0.9,
+                ..Default::default()
+            }],
+            ..UsageEvent::default()
+        }))
+        .unwrap();
+        let contents: HashMap<String, String> = log
+            .contents()
+            .iter()
+            .map(|c| (c.key().clone(), c.value().clone()))
+            .collect();
+        assert_eq!(contents["cache_similarity"], "0.9123");
+        let scores = &contents["guardrail_scores"];
+        assert!(scores.contains(r#""score":0.812,"#), "{scores}");
+        assert!(scores.contains(r#""threshold":0.9,"#), "{scores}");
     }
 
     #[tokio::test]

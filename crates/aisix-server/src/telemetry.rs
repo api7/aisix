@@ -42,6 +42,8 @@ use aisix_obs::{Metrics, UsageEvent, UsageEventLabels, UsageSink};
 
 use crate::heartbeat::MtlsBundle;
 
+mod clip;
+
 /// Maximum number of events accumulated per outbound POST. Pinned in
 /// code rather than config — at >100 events/batch the request body
 /// approaches gin's default `MaxMultipartMemory` plumbing on the
@@ -475,30 +477,28 @@ async fn flush(
 /// bounded too; the ones already bounded tighter are left as they are. Only
 /// the control-plane copy is clipped: the exporters are handed their records
 /// separately and keep the full values.
+///
+/// The event is serialized directly, never through `serde_json::Value`, which
+/// would widen each `f32` (`0.9` would read `0.8999999761581421`).
 fn wire_event(event: &UsageEvent) -> serde_json::Result<Vec<u8>> {
-    let mut value = serde_json::to_value(event)?;
-    clip_strings(&mut value);
-    if let Some(serde_json::Value::String(model)) = value.get_mut("requested_model") {
-        truncate_to_chars(model, REQUESTED_MODEL_MAX_CHARS);
-    }
-    serde_json::to_vec(&value)
-}
-
-fn clip_strings(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::String(text) => {
-            text.truncate(text.floor_char_boundary(FREE_TEXT_MAX_BYTES))
+    let clipped_model;
+    let event = match event
+        .requested_model
+        .char_indices()
+        .nth(REQUESTED_MODEL_MAX_CHARS)
+    {
+        Some((end, _)) => {
+            let mut copy = event.clone();
+            copy.requested_model.truncate(end);
+            clipped_model = copy;
+            &clipped_model
         }
-        serde_json::Value::Array(items) => items.iter_mut().for_each(clip_strings),
-        serde_json::Value::Object(fields) => fields.values_mut().for_each(clip_strings),
-        _ => {}
-    }
-}
-
-fn truncate_to_chars(value: &mut String, max: usize) {
-    if let Some((end, _)) = value.char_indices().nth(max) {
-        value.truncate(end);
-    }
+        None => event,
+    };
+    serde_json::to_vec(&clip::Clipped {
+        value: event,
+        max_bytes: FREE_TEXT_MAX_BYTES,
+    })
 }
 
 /// `{"events":[...]}` around already-serialized events.
@@ -2728,6 +2728,62 @@ mod tests {
         serde_json::from_slice(&wire_event(event).unwrap()).unwrap()
     }
 
+    fn event_with_floats() -> UsageEvent {
+        let mut event = sample_event("floats");
+        event.cache_similarity = Some(0.9123);
+        event.guardrail_scores = vec![aisix_core::GuardrailScore {
+            guardrail_name: "topic-guard".into(),
+            hook: "input".into(),
+            direction: "deny".into(),
+            score: 0.000_001_234,
+            threshold: 0.9,
+            matched: false,
+            top_example_index: 0,
+            embedding_model: "embed".into(),
+        }];
+        event
+    }
+
+    /// Clipping changes nothing else: an event with nothing to clip reaches
+    /// the control plane as the bytes it serializes to, each `f32` written
+    /// as itself rather than widened to `f64`.
+    #[test]
+    fn an_event_with_nothing_to_clip_goes_out_as_it_serializes() {
+        let event = event_with_floats();
+        let wire = String::from_utf8(wire_event(&event).unwrap()).unwrap();
+        assert!(wire.contains(r#""threshold":0.9,"#), "{wire}");
+        assert!(wire.contains(r#""score":0.000001234,"#), "{wire}");
+        assert!(wire.contains(r#""cache_similarity":0.9123,"#), "{wire}");
+        assert_eq!(wire, serde_json::to_string(&event).unwrap());
+    }
+
+    #[tokio::test]
+    async fn the_posted_body_carries_each_float_as_written() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/telemetry"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TelemetryConfig::new(
+            format!("{}/dp/telemetry", server.uri()),
+            write_test_bundle(dir.path()),
+        );
+        send(
+            &plain_client(),
+            &cfg,
+            Uuid::new_v4(),
+            &body_of(&[event_with_floats()]),
+        )
+        .await;
+
+        let received = server.received_requests().await.unwrap();
+        let body = std::str::from_utf8(&received[0].body).unwrap();
+        assert!(body.contains(r#""threshold":0.9,"#), "{body}");
+        assert!(body.contains(r#""cache_similarity":0.9123,"#), "{body}");
+    }
+
     #[test]
     fn caller_text_is_clipped_to_what_the_control_plane_keeps() {
         let mut event = sample_event("r");
@@ -2738,6 +2794,13 @@ mod tests {
         event.mcp_tool_name = format!("a{}", "é".repeat(5_000));
         event.a2a_context_id = "y".repeat(10_000);
         event.a2a_method = "short".to_string();
+        // Nested strings: a list of structs, and a map's values (its keys
+        // are left as they are).
+        event.guardrail_scores = vec![aisix_core::GuardrailScore {
+            guardrail_name: "g".repeat(9_000),
+            ..Default::default()
+        }];
+        event.tags = [("k".repeat(9_000), "v".repeat(9_000))].into();
 
         let wire = on_the_wire(&event);
         assert_eq!(wire["requested_model"], "é".repeat(256));
@@ -2750,6 +2813,11 @@ mod tests {
         );
         assert_eq!(wire["a2a_context_id"], "y".repeat(8_192));
         assert_eq!(wire["a2a_method"], "short");
+        assert_eq!(
+            wire["guardrail_scores"][0]["guardrail_name"],
+            "g".repeat(8_192)
+        );
+        assert_eq!(wire["tags"]["k".repeat(9_000)], "v".repeat(8_192));
         assert_eq!(wire["request_id"], "r");
         // The event itself — what anything else reads — is untouched.
         assert_eq!(event.requested_model, "é".repeat(300));

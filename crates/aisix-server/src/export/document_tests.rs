@@ -1129,6 +1129,41 @@ fn guardrail_embedder_id_resugars_to_a_name() {
     );
 }
 
+/// A configured `f32` exports as the number the operator wrote, not widened
+/// to `f64` (`0.9` as `0.8999999761581421`).
+#[test]
+fn f32_settings_export_as_written() {
+    let snap = AisixSnapshot::new();
+    let guardrail: aisix_core::models::Guardrail = serde_json::from_value(json!({
+        "name": "topic",
+        "kind": "semantic",
+        "embedding_model_id": "m-embed",
+        "deny_examples": ["x"],
+        "deny_threshold": 0.9
+    }))
+    .unwrap();
+    snap.guardrails
+        .insert(ResourceEntry::new("g-1", guardrail, 1));
+    let policy: aisix_core::models::CachePolicy = serde_json::from_value(json!({
+        "name": "faq",
+        "applies_to": "all",
+        "semantic": {"embedding_model_id": "m-embed", "threshold": 0.92}
+    }))
+    .unwrap();
+    snap.cache_policies
+        .insert(ResourceEntry::new("cp-1", policy, 1));
+
+    let doc = build_export_document(&snap, false);
+    assert_eq!(
+        find(&doc, "guardrails")[0]["deny_threshold"].to_string(),
+        "0.9"
+    );
+    assert_eq!(
+        find(&doc, "cache_policies")[0]["semantic"]["threshold"].to_string(),
+        "0.92"
+    );
+}
+
 /// Register `(id, name)` MCP servers on `snap`.
 fn register_mcp_servers(snap: &AisixSnapshot, servers: &[(&str, &str)]) {
     for (id, name) in servers {
