@@ -76,7 +76,8 @@ const ROUTED_ID_PREFIX: &str = "aisix-";
 /// jobs routes (`/openai/files`, `/openai/batches`,
 /// `/openai/fine_tuning/jobs`) when the Provider Key sets no
 /// `api_version`; callers can override per request via an explicit
-/// `api-version` query parameter.
+/// `api-version` query parameter. On the v1 route the gateway adds none,
+/// and a caller's own query is forwarded as sent.
 const AZURE_JOBS_API_VERSION: &str = "2024-10-21";
 
 /// Timeout for the background output-file download of the batch cost
@@ -2674,6 +2675,102 @@ mod tests {
             upstream_a.received_requests().await.unwrap().is_empty(),
             "upstream A must not be touched"
         );
+    }
+
+    #[test]
+    fn azure_jobs_url_follows_the_key_api_version() {
+        let b = "https://acme.openai.azure.com";
+        assert_eq!(
+            azure_jobs_url(b, None, "/files", false),
+            format!("{b}/openai/files?api-version={AZURE_JOBS_API_VERSION}")
+        );
+        assert_eq!(
+            azure_jobs_url(b, Some("2025-03-01-preview"), "/batches", false),
+            format!("{b}/openai/batches?api-version=2025-03-01-preview")
+        );
+        // The client's own api-version is the one sent.
+        assert_eq!(
+            azure_jobs_url(b, Some("2025-03-01-preview"), "/batches", true),
+            format!("{b}/openai/batches")
+        );
+        for v in ["v1", "preview", "latest"] {
+            assert_eq!(
+                azure_jobs_url(b, Some(v), "/fine_tuning/jobs", false),
+                format!("{b}/openai/v1/fine_tuning/jobs")
+            );
+        }
+    }
+
+    /// The detached output download for cost attribution takes the same
+    /// route as the request that observed the batch complete.
+    #[tokio::test]
+    async fn azure_v1_batch_attribution_downloads_on_the_v1_route() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/openai/v1/batches/batch_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch_1",
+                "object": "batch",
+                "status": "completed",
+                "input_file_id": "file-in",
+                "output_file_id": "file-out"
+            })))
+            .mount(&upstream)
+            .await;
+        let line = serde_json::json!({
+            "id": "batch_req_1",
+            "custom_id": "r1",
+            "response": {"status_code": 200, "body": {
+                "model": "gpt-4o",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+            }}
+        });
+        Mock::given(wm_method("GET"))
+            .and(path("/openai/v1/files/file-out/content"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(format!("{line}\n"), "application/jsonl"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        let mut pk = azure_pk(PK_A, &upstream.uri());
+        pk.value.api_version = Some("v1".into());
+        snap.provider_keys.insert(pk);
+        snap.models.insert(model("m-a", "jobs-az", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let (app, mut rx) = build_app_with_sink(snap);
+
+        let encoded = encode_routed_id("batch_1", "jobs-az");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/batches/{encoded}"))
+                    .header("authorization", "Bearer sk-caller")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut batch_event = false;
+        for _ in 0..2 {
+            let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .expect("expected a usage event")
+                .expect("sink closed");
+            batch_event |= ev.inbound_protocol == "batch";
+        }
+        assert!(
+            batch_event,
+            "the attribution download must reach the v1 route"
+        );
+        for req in upstream.received_requests().await.unwrap() {
+            assert_eq!(req.url.query(), None, "v1 route carries no api-version");
+            assert_eq!(req.headers.get("api-key").unwrap(), "az-secret");
+        }
     }
 
     #[tokio::test]

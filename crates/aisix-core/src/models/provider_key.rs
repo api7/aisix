@@ -72,7 +72,11 @@ pub struct ProviderKey {
     /// operations addressed to a deployment, the deployment name as the
     /// request's `model` (realtime sessions take it as the `model` query
     /// parameter); `preview` and `latest` are
-    /// accepted as aliases of `v1` and behave identically.
+    /// accepted as aliases of `v1` and behave identically. A dated value
+    /// applies to every operation sent with this key, so it must be one
+    /// that each operation in use supports (realtime sessions, for
+    /// example, are not in every dated version); use a separate key per
+    /// version when they differ.
     ///
     /// When omitted, each operation uses its own default dated version:
     /// `2024-10-21` for chat completions (and the Responses and Messages
