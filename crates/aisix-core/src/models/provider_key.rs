@@ -58,6 +58,36 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<Adapter>,
 
+    /// Azure OpenAI REST API version for this key's requests. Applies only
+    /// when `adapter` is `azure-openai`; every other adapter ignores it.
+    ///
+    /// A dated version (`2024-10-21`, `2025-04-01-preview`) keeps each
+    /// request on its versioned route with that value as the `api-version`
+    /// query parameter: `/openai/deployments/<deployment>/<operation>` for
+    /// chat completions, embeddings, images and audio,
+    /// `/openai/realtime?deployment=<deployment>` for realtime sessions, and
+    /// `/openai/files`, `/openai/batches` and `/openai/fine_tuning/jobs` for
+    /// files, batches and fine-tuning. `v1` sends requests to the v1 API,
+    /// `/openai/v1/<operation>`, with no `api-version` query and, for the
+    /// operations addressed to a deployment, the deployment name as the
+    /// request's `model` (realtime sessions take it as the `model` query
+    /// parameter); `preview` and `latest` are
+    /// accepted as aliases of `v1` and behave identically. A dated value
+    /// applies to every operation sent with this key, so it must be one
+    /// that each operation in use supports (realtime sessions, for
+    /// example, are not in every dated version); use a separate key per
+    /// version when they differ.
+    ///
+    /// When omitted, each operation uses its own default dated version:
+    /// `2024-10-21` for chat completions (and the Responses and Messages
+    /// requests translated to it), embeddings, audio transcriptions, audio
+    /// translations, files, batches and fine-tuning; `2025-04-01-preview` for
+    /// audio speech, image generations and image edits; `2024-10-01-preview`
+    /// for realtime sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = r"^(\d{4}-\d{2}-\d{2}(-preview)?|v1|preview|latest)$"))]
+    pub api_version: Option<String>,
+
     /// API surfaces this upstream serves natively, beyond the one its
     /// `adapter` already implies, and the base URL each one lives at.
     ///
@@ -961,6 +991,7 @@ mod tests {
             api_base: None,
             provider: String::new(),
             adapter: None,
+            api_version: None,
             apis: None,
             telemetry_tags: TelemetryTags::default(),
             request: None,

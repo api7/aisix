@@ -81,7 +81,8 @@ use crate::error::ProxyError;
 use crate::state::ProxyState;
 use aisix_gateway::BridgeError;
 
-/// Azure Realtime GA api-version (see the jobs surface twin constant).
+/// Azure Realtime api-version when the Provider Key sets no `api_version`
+/// (see the jobs surface twin constant).
 const AZURE_REALTIME_API_VERSION: &str = "2024-10-01-preview";
 
 /// Subprotocol item carrying the caller's API key in the browser flow.
@@ -795,20 +796,34 @@ async fn prepare(
                 })?
                 .trim_end_matches('/')
                 .to_string();
-            let url = format!(
-                "{}/openai/realtime?api-version={AZURE_REALTIME_API_VERSION}&deployment={}",
-                to_ws_scheme(&base)?,
-                urlencode(&upstream_model)
-            );
+            // The v1 route names the deployment as `model` and takes no
+            // api-version; the dated route names it as `deployment`.
+            let url = match aisix_provider_azure_openai::dated_api_version(
+                pk_entry.value.api_version.as_deref(),
+                AZURE_REALTIME_API_VERSION,
+            ) {
+                Some(version) => format!(
+                    "{}/openai/realtime?api-version={version}&deployment={}",
+                    to_ws_scheme(&base)?,
+                    urlencode(&upstream_model)
+                ),
+                None => format!(
+                    "{}/openai/v1/realtime?model={}",
+                    to_ws_scheme(&base)?,
+                    urlencode(&upstream_model)
+                ),
+            };
             let mut req = url.into_client_request().map_err(|e| {
                 ProxyError::InvalidRequest(format!("invalid upstream realtime URL: {e}"))
             })?;
-            req.headers_mut().insert(
-                "api-key",
-                secret.parse().map_err(|_| {
-                    ProxyError::InvalidRequest("provider secret is not header-safe".into())
-                })?,
-            );
+            // A resource key goes out as `api-key`; an Entra ID
+            // client-credentials secret is exchanged for a bearer token.
+            let credential = aisix_provider_azure_openai::resolve_credential(&secret)
+                .await
+                .map_err(ProxyError::Bridge)?;
+            let (name, value) = aisix_provider_azure_openai::auth_header(&credential)
+                .map_err(ProxyError::Bridge)?;
+            req.headers_mut().insert(name, value);
             req
         }
         _ => {

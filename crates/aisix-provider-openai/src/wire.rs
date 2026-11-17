@@ -841,7 +841,7 @@ pub fn stream_chunk_into_chat_chunks(
 /// "both pass through" and #162.
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
-pub(crate) enum OpenAiEmbedInput<'a> {
+pub enum OpenAiEmbedInput<'a> {
     /// Single-string form. Used when the caller's request body had
     /// `input: "..."` (string), preserving the wire shape on the
     /// upstream side.
@@ -856,7 +856,7 @@ pub(crate) enum OpenAiEmbedInput<'a> {
 
 /// Request body forwarded to OpenAI `/v1/embeddings`.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct OpenAiEmbedRequest<'a> {
+pub struct OpenAiEmbedRequest<'a> {
     pub model: &'a str,
     pub input: OpenAiEmbedInput<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -884,7 +884,7 @@ pub(crate) struct OpenAiEmbedRequest<'a> {
 /// serialises from proto3 and omits a zero `index`, so a single-input
 /// response carries none. A missing one is filled from the item's position.
 #[derive(Debug, Deserialize)]
-pub(crate) struct OpenAiEmbeddingObject {
+pub struct OpenAiEmbeddingObject {
     #[serde(default)]
     pub index: Option<u32>,
     pub object: String,
@@ -906,7 +906,7 @@ pub struct OpenAiEmbedUsage {
 
 /// Full response body from OpenAI `/v1/embeddings`.
 #[derive(Debug, Deserialize)]
-pub(crate) struct OpenAiEmbedResponse {
+pub struct OpenAiEmbedResponse {
     pub object: String,
     /// Defaults to empty, as on [`OpenAiResponse`].
     #[serde(default)]
@@ -916,7 +916,7 @@ pub(crate) struct OpenAiEmbedResponse {
     pub usage: Option<OpenAiEmbedUsage>,
 }
 
-pub(crate) fn embed_request_body<'a>(
+pub fn embed_request_body<'a>(
     req: &'a EmbeddingRequest,
     upstream_model: &'a str,
 ) -> OpenAiEmbedRequest<'a> {
@@ -947,7 +947,7 @@ pub(crate) fn embed_request_body<'a>(
     }
 }
 
-pub(crate) fn embed_response_into(raw: OpenAiEmbedResponse) -> EmbeddingResponse {
+pub fn embed_response_into(raw: OpenAiEmbedResponse) -> EmbeddingResponse {
     let OpenAiEmbedResponse {
         object,
         model,

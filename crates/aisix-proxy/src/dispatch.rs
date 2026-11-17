@@ -330,6 +330,61 @@ pub(crate) fn responses_served_natively_with(
         && (reads_additional_tools || !declares_additional_tools)
 }
 
+/// Whether a direct-upstream route (audio, image edits) dispatches this key
+/// on the Azure OpenAI routes rather than the OpenAI ones.
+pub(crate) fn is_azure_key(provider_key: &ProviderKey) -> bool {
+    provider_key.adapter == Some(aisix_core::Adapter::AzureOpenai)
+}
+
+/// [`is_azure_key`] for the key `model` references, read without
+/// [`resolve_provider_key`]'s target attribution — for a gate that may
+/// still refuse the target.
+pub(crate) fn references_azure_key(snapshot: &AisixSnapshot, model: &Model) -> bool {
+    model
+        .provider_key_id
+        .as_deref()
+        .and_then(|id| snapshot.provider_keys.get_by_id(id))
+        .is_some_and(|entry| is_azure_key(&entry.value))
+}
+
+/// The URL and auth header a direct-upstream route sends `operation` to on
+/// an Azure key: the shared Azure builder's URL, and the key's secret as
+/// `api-key` (or a minted Entra ID token as a bearer), never as a bearer
+/// API key. The error is the bridge's, for the caller to count against the
+/// target's cooldown as the bridge paths do.
+pub(crate) async fn azure_upstream(
+    pk_entry: &ResourceEntry<ProviderKey>,
+    deployment: &str,
+    operation: aisix_provider_azure_openai::AzureOperation,
+) -> Result<
+    (
+        aisix_gateway::url_cache::EndpointUrl,
+        (axum::http::HeaderName, axum::http::HeaderValue),
+    ),
+    BridgeError,
+> {
+    let url = aisix_provider_azure_openai::endpoint_url(
+        &pk_entry.id,
+        &pk_entry.value,
+        deployment,
+        operation,
+    )?;
+    let credential =
+        aisix_provider_azure_openai::resolve_credential(&pk_entry.value.api_key).await?;
+    let auth = aisix_provider_azure_openai::auth_header(&credential)?;
+    Ok((url, auth))
+}
+
+/// The error of a non-2xx answer on a direct-upstream route, parsed by the
+/// wire the key speaks.
+pub(crate) async fn held_route_http_error(azure: bool, resp: reqwest::Response) -> BridgeError {
+    if azure {
+        aisix_provider_azure_openai::held_route_http_error(resp).await
+    } else {
+        aisix_provider_openai::held_route_http_error(resp).await
+    }
+}
+
 /// Required upstream model id (`model_name`) for a non-routing Model.
 pub(crate) fn require_upstream_model(model: &Model) -> Result<&str, ProxyError> {
     model.model_name.as_deref().ok_or_else(|| {

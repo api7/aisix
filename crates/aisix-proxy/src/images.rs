@@ -448,21 +448,19 @@ async fn dispatch(
         |target, timeouts| {
             let body = &body;
             async move {
-                // Per #168: only OpenAI's API has the documented
-                // `/v1/images/generations` route + body shape. Anthropic has no
-                // image-generation API at all; Gemini's image generation lives
-                // at a different URL (`/v1beta/models/...:generateContent`) with
-                // a different body shape; DeepSeek doesn't expose image
-                // generation. Routing a non-OpenAI Model here would silently
-                // dispatch to an upstream that 404s — a confusing failure for
-                // callers who follow `docs/api-proxy.md` §4.9 configuration
-                // verbatim. Reject explicitly with 400 (parallel to
-                // /v1/responses §4.6) so the configuration error is visible
-                // at the gateway boundary.
-                if target.model.provider.as_deref() != Some("openai") {
+                // Per #168: only OpenAI's API and Azure OpenAI serve the
+                // documented `/v1/images/generations` route + body shape.
+                // Anthropic has no image-generation API at all; Gemini's image
+                // generation lives at a different URL with a different body
+                // shape; DeepSeek doesn't expose image generation. Routing any
+                // other Model here would dispatch to an upstream that 404s, so
+                // reject explicitly with 400 at the gateway boundary.
+                if target.model.provider.as_deref() != Some("openai")
+                    && !crate::dispatch::references_azure_key(snapshot, &target.model)
+                {
                     return Err(ProxyError::InvalidRequest(format!(
                         "{} is not an OpenAI provider; \
-                         /v1/images/generations requires OpenAI",
+                         /v1/images/generations requires OpenAI or Azure OpenAI",
                         crate::routing::refused_model_label(model_name, &target.model)
                     )));
                 }

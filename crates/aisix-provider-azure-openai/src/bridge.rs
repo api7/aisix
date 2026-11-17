@@ -17,7 +17,8 @@
 use aisix_core::{RequestOverrides, ResponseOverrides, StreamDoneMarker};
 use aisix_gateway::{
     apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream,
-    ChatFormat, ChatResponse, SseDecoder, SseEvent, UpstreamHeaderContext,
+    ChatFormat, ChatResponse, EmbeddingRequest, EmbeddingResponse, SseDecoder, SseEvent,
+    UpstreamHeaderContext,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -37,17 +38,19 @@ use aisix_provider_openai::overrides::{
 };
 use aisix_provider_openai::reasoning::{is_reasoning_model, ReasoningFamily};
 use aisix_provider_openai::wire::{
-    build_request, messages_from, response_into_chat_response, stream_chunk_into_chat_chunks,
-    DeveloperRoleMode, OpenAiResponse, OpenAiStreamChunk, ToolCallIndexer,
+    build_request, embed_request_body, embed_response_into, messages_from,
+    response_into_chat_response, stream_chunk_into_chat_chunks, DeveloperRoleMode,
+    OpenAiEmbedResponse, OpenAiResponse, OpenAiStreamChunk, ToolCallIndexer,
 };
 
 use crate::aad_token_mint::TokenMinter;
+use crate::endpoint::AzureOperation;
 use crate::wire;
 
 use std::sync::Arc;
 
-/// The bridge pins Azure API version `2024-10-21`, whose request-message
-/// union does not define `developer`. Azure documents developer instructions
+/// Azure API version `2024-10-21`, the chat default, has a request-message
+/// union that does not define `developer`. Azure documents developer instructions
 /// as functionally equivalent to system instructions, so both chat paths map
 /// them to the supported `system` wire role.
 const AZURE_DEVELOPER_ROLE_MODE: DeveloperRoleMode = DeveloperRoleMode::MapToSystem;
@@ -121,38 +124,34 @@ impl AzureOpenAiBridge {
         self
     }
 
-    /// Resolve the URL the bridge will POST to. Returns
-    /// `upstream.chat_completions_url()` in production; tests can
-    /// override via [`Self::with_url_override`].
-    ///
-    /// Cached per (Provider Key, deployment): the URL embeds the
-    /// deployment name, so a key fronting several deployments needs a row
-    /// each — keying only by Provider Key would make every deployment
-    /// invalidate the previous one's row and rebuild on every request.
-    /// The fingerprint is the raw `api_base`, the one input
-    /// `AzureUpstreamRef::resolve` derives the rest from; the api-version
-    /// is a pinned constant.
+    /// Resolve the URL the bridge will POST to for `operation`; tests can
+    /// override the chat-completions one via [`Self::with_url_override`].
     fn resolve_url(
         &self,
         ctx: &BridgeContext,
-        upstream: &AzureUpstreamRef,
-    ) -> aisix_gateway::url_cache::EndpointUrl {
+        deployment: &str,
+        operation: AzureOperation,
+    ) -> Result<aisix_gateway::url_cache::EndpointUrl, BridgeError> {
         #[cfg(test)]
-        if let Some(u) = &self.url_override {
+        if let Some(u) = self
+            .url_override
+            .as_ref()
+            .filter(|_| operation == AzureOperation::ChatCompletions)
+        {
             // Uncached, and handed over as a raw string so reqwest
             // parses it exactly as it always did: the override exists so
             // wiremock can stand in for a canonical Azure host, and each
             // test server is a different port under one `api_base`.
-            return aisix_gateway::url_cache::EndpointUrl::Unparsed(u.clone());
+            // Validated first, so a test sees the refusal production gives.
+            AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
+            return Ok(aisix_gateway::url_cache::EndpointUrl::Unparsed(u.clone()));
         }
-        aisix_gateway::url_cache::cached_model_endpoint_url(
+        crate::endpoint::endpoint_url(
             &ctx.provider_key_id,
-            "azure/chat",
-            &upstream.deployment,
-            &[ctx.provider_key.api_base.as_deref().unwrap_or("")],
-            || Ok::<_, std::convert::Infallible>(upstream.chat_completions_url()),
+            &ctx.provider_key,
+            deployment,
+            operation,
         )
-        .unwrap_or_else(|never| match never {})
     }
 
     /// Test-only seam: rewrite the POST URL so wiremock can stand
@@ -212,7 +211,9 @@ fn default_client() -> Client {
 ///
 /// - `resource` — the Azure resource name, e.g. `acme-prod-west-us`
 /// - `deployment` — operator-named deployment, e.g. `gpt4o-prod`
-/// - `api_version` — Azure's date-stamped API version, e.g. `2024-10-21`
+///
+/// The URL itself (route, version, operation path) is built by
+/// [`crate::endpoint_url`]; this type only resolves `api_base`.
 ///
 /// The resolver is intentionally cautious — any missing piece produces
 /// a clear `BridgeError::Config` so an operator can fix the
@@ -228,7 +229,6 @@ fn default_client() -> Client {
 pub struct AzureUpstreamRef {
     pub resource: String,
     pub deployment: String,
-    pub api_version: String,
     /// Operator-supplied verbatim upstream base URL, used when
     /// `ProviderKey.api_base` does NOT match the canonical
     /// `<resource>.openai.azure.com` host shape. Set for corporate
@@ -260,11 +260,10 @@ pub struct AzureUpstreamRef {
 }
 
 impl AzureUpstreamRef {
-    /// Most recent GA REST API version at crate publish time.
-    /// Operators **must** pin an explicit version via
-    /// `provider_key.api_base` for production traffic — this constant
-    /// is a stop-gap default. Azure deprecates older versions on a
-    /// published schedule:
+    /// The version chat completions, embeddings and audio transcription /
+    /// translation use when the Provider Key sets no `api_version` (see
+    /// [`crate::AzureOperation::default_api_version`]). Azure deprecates
+    /// older versions on a published schedule:
     /// <https://learn.microsoft.com/en-us/azure/ai-services/openai/api-version-deprecation>.
     ///
     /// Pinned at a GA shape (`YYYY-MM-DD`, no `-preview` suffix) so a
@@ -315,7 +314,6 @@ impl AzureUpstreamRef {
                     return Ok(Self {
                         resource: host_resource.to_string(),
                         deployment: deployment.to_string(),
-                        api_version: Self::DEFAULT_API_VERSION.to_string(),
                         upstream_override: None,
                     });
                 }
@@ -344,7 +342,6 @@ impl AzureUpstreamRef {
             return Ok(Self {
                 resource: String::new(),
                 deployment: deployment.to_string(),
-                api_version: Self::DEFAULT_API_VERSION.to_string(),
                 upstream_override: Some(override_base),
             });
         }
@@ -354,30 +351,28 @@ impl AzureUpstreamRef {
         Ok(Self {
             resource: base.to_string(),
             deployment: deployment.to_string(),
-            api_version: Self::DEFAULT_API_VERSION.to_string(),
             upstream_override: None,
         })
     }
 
-    /// Build the chat-completions URL for this Azure upstream.
-    ///
-    /// Two shapes:
-    ///   - Canonical (no override): `https://<resource>.openai.azure.com/openai/deployments/<deployment>/chat/completions?api-version=<v>`
-    ///   - Verbatim override: `<override>/openai/deployments/<deployment>/chat/completions?api-version=<v>`
-    ///
-    /// The deployment path + api-version are always appended by the
-    /// bridge — operators set just the host root in `api_base`,
-    /// never a full chat-completions URL (the `?` / `#` rejection
-    /// in `resolve()` enforces this).
-    pub fn chat_completions_url(&self) -> String {
-        let base = self
-            .upstream_override
-            .clone()
-            .unwrap_or_else(|| format!("https://{}.openai.azure.com", self.resource));
+    /// The default-version chat-completions URL, for the `api_base`
+    /// resolution tests; dispatch builds URLs through [`crate::endpoint_url`].
+    #[cfg(test)]
+    pub(crate) fn chat_completions_url(&self) -> String {
         format!(
             "{}/openai/deployments/{}/chat/completions?api-version={}",
-            base, self.deployment, self.api_version,
+            self.base_url(),
+            self.deployment,
+            Self::DEFAULT_API_VERSION,
         )
+    }
+
+    /// The scheme-and-host root every Azure route is appended to: the
+    /// verbatim override, or the canonical resource host.
+    pub(crate) fn base_url(&self) -> String {
+        self.upstream_override
+            .clone()
+            .unwrap_or_else(|| format!("https://{}.openai.azure.com", self.resource))
     }
 }
 
@@ -508,6 +503,18 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     aisix_gateway::capture_upstream_error_http(
         status,
+        resp,
+        aisix_gateway::UpstreamWire::AzureOpenAI,
+        parse_azure_error_envelope,
+    )
+    .await
+}
+
+/// The error of a non-2xx Azure answer on a route that sends the request
+/// itself rather than through the bridge (audio, image edits): what
+/// [`map_http_error`] gives chat.
+pub async fn held_route_http_error(resp: reqwest::Response) -> BridgeError {
+    aisix_gateway::upstream_status_parsed_from_response(
         resp,
         aisix_gateway::UpstreamWire::AzureOpenAI,
         parse_azure_error_envelope,
@@ -717,7 +724,9 @@ impl Bridge for AzureOpenAiBridge {
     ) -> Result<ChatResponse, BridgeError> {
         let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let deployment = upstream_model(ctx)?;
-        let upstream = AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
+        // Before auth, so an unusable `api_base` or deployment name fails
+        // without an Entra ID round-trip.
+        let url = self.resolve_url(ctx, deployment, AzureOperation::ChatCompletions)?;
         // Keep reserved-config helpers reachable from the public surface
         // so a future override-validation PR can wire them in without
         // re-exposing private state.
@@ -747,7 +756,6 @@ impl Bridge for AzureOpenAiBridge {
         // The owned request is not needed past its wire bytes.
         drop(req);
         let headers = build_request_headers(&auth, &ctx.request_id, false, &ctx.header_ctx())?;
-        let url = self.resolve_url(ctx, &upstream);
         let client = self.client_for(ctx);
         let started = Instant::now();
 
@@ -788,6 +796,97 @@ impl Bridge for AzureOpenAiBridge {
             .await
     }
 
+    async fn embed(
+        &self,
+        req: &EmbeddingRequest,
+        ctx: &BridgeContext,
+    ) -> Result<EmbeddingResponse, BridgeError> {
+        let deployment = upstream_model(ctx)?;
+        let url = self.resolve_url(ctx, deployment, AzureOperation::Embeddings)?;
+        let auth = self.resolve_auth(ctx).await?;
+        let body = aisix_gateway::json_body(&prepare_outbound_body(
+            &embed_request_body(req, deployment),
+            false,
+            false,
+            ctx.provider_key.request.as_ref(),
+            ctx.provider_key.response.as_ref(),
+        )?)
+        .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
+        let headers = build_request_headers(&auth, &ctx.request_id, false, &ctx.header_ctx())?;
+        let client = self.client_for(ctx);
+        let started = Instant::now();
+        with_deadline(ctx.deadline, started, async move {
+            let resp = url
+                .post_on(&client)
+                .headers(headers)
+                .body(body)
+                .send()
+                .await
+                .map_err(aisix_gateway::send_error)?;
+            aisix_gateway::note_upstream_response(resp.headers());
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(map_http_error(status, resp).await);
+            }
+            let parsed: OpenAiEmbedResponse =
+                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::AzureOpenAI)
+                    .await?;
+            Ok(embed_response_into(parsed))
+        })
+        .await
+    }
+
+    /// The client's body is forwarded as sent, apart from `model`: the
+    /// deployment name on the v1 route, removed on the deployment route
+    /// (see [`AzureOperation::sends_body_model`]). The response comes back
+    /// as Azure sent it.
+    async fn generate_image(
+        &self,
+        body: &Value,
+        ctx: &BridgeContext,
+    ) -> Result<Value, BridgeError> {
+        let deployment = upstream_model(ctx)?;
+        let op = AzureOperation::ImageGenerations;
+        let url = self.resolve_url(ctx, deployment, op)?;
+        let auth = self.resolve_auth(ctx).await?;
+        let mut outbound = body.clone();
+        if let Some(obj) = outbound.as_object_mut() {
+            if op.sends_body_model(&ctx.provider_key) {
+                obj.insert("model".to_string(), Value::String(deployment.to_string()));
+            } else {
+                obj.remove("model");
+            }
+        }
+        let outbound = prepare_outbound_body(
+            &outbound,
+            false,
+            false,
+            ctx.provider_key.request.as_ref(),
+            ctx.provider_key.response.as_ref(),
+        )?;
+        let outbound = aisix_gateway::json_body(&outbound)
+            .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
+        let headers = build_request_headers(&auth, &ctx.request_id, false, &ctx.header_ctx())?;
+        let client = self.client_for(ctx);
+        let started = Instant::now();
+        with_deadline(ctx.deadline, started, async move {
+            let resp = url
+                .post_on(&client)
+                .headers(headers)
+                .body(outbound)
+                .send()
+                .await
+                .map_err(aisix_gateway::send_error)?;
+            aisix_gateway::note_upstream_response(resp.headers());
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(map_http_error(status, resp).await);
+            }
+            aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::AzureOpenAI).await
+        })
+        .await
+    }
+
     async fn chat_stream_cow(
         &self,
         req: std::borrow::Cow<'_, ChatFormat>,
@@ -795,7 +894,9 @@ impl Bridge for AzureOpenAiBridge {
     ) -> Result<ChatChunkStream, BridgeError> {
         let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let deployment = upstream_model(ctx)?;
-        let upstream = AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
+        // Before auth, so an unusable `api_base` or deployment name fails
+        // without an Entra ID round-trip.
+        let url = self.resolve_url(ctx, deployment, AzureOperation::ChatCompletions)?;
         let _ = wire::reserved_query_params();
         let _ = wire::reserved_auth_headers();
 
@@ -816,7 +917,6 @@ impl Bridge for AzureOpenAiBridge {
         // The owned request is not needed past its wire bytes.
         drop(req);
         let headers = build_request_headers(&auth, &ctx.request_id, true, &ctx.header_ctx())?;
-        let url = self.resolve_url(ctx, &upstream);
         let client = self.client_for(ctx);
         let started = Instant::now();
 
@@ -1103,7 +1203,6 @@ mod tests {
             .unwrap();
         assert_eq!(r.resource, "acme-west");
         assert_eq!(r.deployment, "gpt4o-prod");
-        assert_eq!(r.api_version, AzureUpstreamRef::DEFAULT_API_VERSION);
     }
 
     #[test]
@@ -1156,7 +1255,6 @@ mod tests {
         let r = AzureUpstreamRef {
             resource: "acme-west".into(),
             deployment: "gpt4o-prod".into(),
-            api_version: "2024-10-21".into(),
             upstream_override: None,
         };
         assert_eq!(
