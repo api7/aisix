@@ -1010,6 +1010,39 @@ describe("every proxy route emits every per-request metric family", () => {
     expect(failures, "route × family cells that did not move").toEqual([]);
   }, 180_000);
 
+  test("the MCP surface, its OAuth discovery documents included, is counted as mcp", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const mcpRoutes = [
+      "/mcp",
+      "/mcp/",
+      "/mcp/:server",
+      "/.well-known/oauth-protected-resource",
+      "/.well-known/oauth-protected-resource/mcp",
+      "/.well-known/oauth-protected-resource/mcp/:server",
+      "/.well-known/oauth-authorization-server/mcp/:server",
+      "/mcp/:server/.well-known/openid-configuration",
+      "/mcp/:server/.well-known/jwks.json",
+      "/mcp/:server/oauth/register",
+      "/mcp/:server/oauth/authorize",
+      "/mcp/:server/oauth/token",
+      "/mcp/:server/oauth/credential",
+      "/mcp-oauth/callback",
+      "/mcp-oauth/login/callback",
+      "/mcp-oauth/consent",
+    ];
+    const mcpRows = ROWS.filter((r) => mcpRoutes.includes(r.route));
+    expect(mcpRows.map((r) => r.route)).toEqual(expect.arrayContaining(mcpRoutes));
+    const failures: string[] = [];
+    for (const row of mcpRows) {
+      const before = await scrape();
+      await row.drive();
+      const after = await scrape();
+      const want = { endpoint: row.endpoint, inbound_protocol: "mcp" };
+      if (metricDelta(before, after, "aisix_proxy_requests_total", want) <= 0) failures.push(row.name);
+    }
+    expect(failures, "MCP rows not counted under inbound_protocol=mcp").toEqual([]);
+  }, 60_000);
+
   test("an authentication denial is counted on every extractor-authenticated route", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     const failures: string[] = [];

@@ -165,10 +165,35 @@ impl UserOAuthServer {
         }
     }
 
-    /// Scopes to advertise to MCP clients.
-    pub fn scopes(&self) -> &[String] {
-        &self.scopes
+    /// The configured scopes as this server's protected-resource metadata
+    /// lists them. The gateway issues no ID token, so `openid` is not its to
+    /// offer; and whether a client gets a refresh token is the gateway's
+    /// decision, not that scope's, so `offline_access` is not either.
+    pub fn advertised_scopes(&self) -> Vec<&str> {
+        self.scopes
+            .iter()
+            .map(String::as_str)
+            .filter(|scope| !is_unadvertised(scope))
+            .collect()
     }
+
+    /// A client's requested `scope`, as passed on to the upstream: a client
+    /// builds it from [`Self::advertised_scopes`], so the configured scopes
+    /// left out there are added back, and the upstream is asked for what it
+    /// was configured to be asked for.
+    fn upstream_scope(&self, requested: &str) -> String {
+        let mut scopes: Vec<&str> = requested.split_whitespace().collect();
+        for scope in self.scopes.iter().map(String::as_str) {
+            if is_unadvertised(scope) && !scopes.contains(&scope) {
+                scopes.push(scope);
+            }
+        }
+        scopes.join(" ")
+    }
+}
+
+fn is_unadvertised(scope: &str) -> bool {
+    matches!(scope, "openid" | "offline_access")
 }
 
 /// The gateway's OAuth client at the upstream authorization server, when it

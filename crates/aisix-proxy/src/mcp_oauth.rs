@@ -403,8 +403,9 @@ pub(crate) async fn protected_resource(
             "authorization_servers": [resource],
             "bearer_methods_supported": ["header"],
         });
-        if !oauth.scopes().is_empty() {
-            document["scopes_supported"] = json!(oauth.scopes());
+        let scopes = oauth.advertised_scopes();
+        if !scopes.is_empty() {
+            document["scopes_supported"] = json!(scopes);
         }
         json_document(request.method(), document)
     })
@@ -426,14 +427,13 @@ pub(crate) async fn authorization_server(
 ) -> Response {
     observed(&state, None, request, async |state, request| {
         let snapshot = state.snapshot.load();
-        let (Some(oauth), Some(base)) = (
-            sign_in_server(&snapshot, &server),
-            crate::mcp_auth::public_base(&snapshot),
-        ) else {
+        let Some(base) = crate::mcp_auth::public_base(&snapshot)
+            .filter(|_| sign_in_server(&snapshot, &server).is_some())
+        else {
             return StatusCode::NOT_FOUND.into_response();
         };
         let issuer = scoped_url(&base, &server);
-        let mut document = json!({
+        let document = json!({
             "issuer": issuer,
             "authorization_endpoint": format!("{issuer}/oauth/authorize"),
             "token_endpoint": format!("{issuer}/oauth/token"),
@@ -445,10 +445,9 @@ pub(crate) async fn authorization_server(
             "jwks_uri": format!("{issuer}/.well-known/jwks.json"),
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256"],
+            // The upstream's scopes are the gateway's to request, not to grant.
+            "scopes_supported": [],
         });
-        if !oauth.scopes().is_empty() {
-            document["scopes_supported"] = json!(oauth.scopes());
-        }
         json_document(request.method(), document)
     })
     .await
