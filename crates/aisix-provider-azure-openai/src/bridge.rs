@@ -142,6 +142,8 @@ impl AzureOpenAiBridge {
             // parses it exactly as it always did: the override exists so
             // wiremock can stand in for a canonical Azure host, and each
             // test server is a different port under one `api_base`.
+            // Validated first, so a test sees the refusal production gives.
+            AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
             return Ok(aisix_gateway::url_cache::EndpointUrl::Unparsed(u.clone()));
         }
         crate::endpoint::endpoint_url(
