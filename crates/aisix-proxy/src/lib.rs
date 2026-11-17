@@ -488,6 +488,9 @@ fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
     } else if endpoint == "/mcp"
         || endpoint.starts_with("/mcp/")
         || endpoint.starts_with("/mcp-oauth/")
+        // Every root-level OAuth discovery document the gateway serves is the
+        // MCP surface's.
+        || endpoint.starts_with("/.well-known/oauth-")
     {
         "mcp"
     } else if endpoint == "/a2a" || endpoint == "/a2a/{agent}/.well-known/agent-card.json" {
