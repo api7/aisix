@@ -255,7 +255,9 @@ pub struct AzureUpstreamRef {
     /// segment (e.g. `https://corp-proxy/azure-passthrough`) is
     /// preserved verbatim. The bridge appends `/openai/deployments/<d>/...`
     /// to whatever the operator supplied, including any internal
-    /// prefix.
+    /// prefix. A trailing `/openai` or `/openai/v1` is the exception:
+    /// it is the route prefix itself, so it is dropped before any route
+    /// is appended.
     pub upstream_override: Option<String>,
 }
 
@@ -348,10 +350,14 @@ impl AzureUpstreamRef {
                     "azure api_base {base:?} must not contain a fragment"
                 )));
             }
-            return Ok((
-                String::new(),
-                Some(format!("{scheme}{}", rest.trim_end_matches('/'))),
-            ));
+            // A pasted `/openai` or `/openai/v1` is the route prefix every
+            // operation appends itself, so it is dropped rather than doubled.
+            let rest = rest.trim_end_matches('/');
+            let rest = rest
+                .strip_suffix("/openai/v1")
+                .or_else(|| rest.strip_suffix("/openai"))
+                .unwrap_or(rest);
+            return Ok((String::new(), Some(format!("{scheme}{rest}"))));
         }
 
         // Bare-resource shorthand (`acme-east` → canonical Azure URL).
@@ -1466,6 +1472,15 @@ mod tests {
                 "https://acme.openai.azure.com",
             ),
             ("HTTP://corp-proxy:8080/", "http://corp-proxy:8080"),
+            ("https://h/openai/v1/", "https://h"),
+            ("https://h/openai", "https://h"),
+            ("https://h/proxy/openai/v1", "https://h/proxy"),
+            ("https://h/proxy", "https://h/proxy"),
+            ("https://h/openai/v1beta", "https://h/openai/v1beta"),
+            (
+                "https://acme.cognitiveservices.azure.com/openai/v1",
+                "https://acme.cognitiveservices.azure.com",
+            ),
             (
                 "https://corp-proxy:8443/azure/",
                 "https://corp-proxy:8443/azure",
