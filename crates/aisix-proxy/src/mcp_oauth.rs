@@ -427,10 +427,9 @@ pub(crate) async fn authorization_server(
 ) -> Response {
     observed(&state, None, request, async |state, request| {
         let snapshot = state.snapshot.load();
-        let (Some(_), Some(base)) = (
-            sign_in_server(&snapshot, &server),
-            crate::mcp_auth::public_base(&snapshot),
-        ) else {
+        let Some(base) = crate::mcp_auth::public_base(&snapshot)
+            .filter(|_| sign_in_server(&snapshot, &server).is_some())
+        else {
             return StatusCode::NOT_FOUND.into_response();
         };
         let issuer = scoped_url(&base, &server);

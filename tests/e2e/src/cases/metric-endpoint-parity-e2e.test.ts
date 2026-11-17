@@ -1012,21 +1012,26 @@ describe("every proxy route emits every per-request metric family", () => {
 
   test("the MCP surface, its OAuth discovery documents included, is counted as mcp", async (ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
-    const mcpRows = ROWS.filter(
-      (r) =>
-        r.route === "/mcp" ||
-        r.route.startsWith("/mcp/") ||
-        r.route.startsWith("/mcp-oauth/") ||
-        r.route.startsWith("/.well-known/oauth-"),
-    );
-    expect(mcpRows.map((r) => r.route)).toEqual(
-      expect.arrayContaining([
-        "/.well-known/oauth-protected-resource",
-        "/.well-known/oauth-protected-resource/mcp",
-        "/.well-known/oauth-protected-resource/mcp/:server",
-        "/.well-known/oauth-authorization-server/mcp/:server",
-      ]),
-    );
+    const mcpRoutes = [
+      "/mcp",
+      "/mcp/",
+      "/mcp/:server",
+      "/.well-known/oauth-protected-resource",
+      "/.well-known/oauth-protected-resource/mcp",
+      "/.well-known/oauth-protected-resource/mcp/:server",
+      "/.well-known/oauth-authorization-server/mcp/:server",
+      "/mcp/:server/.well-known/openid-configuration",
+      "/mcp/:server/.well-known/jwks.json",
+      "/mcp/:server/oauth/register",
+      "/mcp/:server/oauth/authorize",
+      "/mcp/:server/oauth/token",
+      "/mcp/:server/oauth/credential",
+      "/mcp-oauth/callback",
+      "/mcp-oauth/login/callback",
+      "/mcp-oauth/consent",
+    ];
+    const mcpRows = ROWS.filter((r) => mcpRoutes.includes(r.route));
+    expect(mcpRows.map((r) => r.route)).toEqual(expect.arrayContaining(mcpRoutes));
     const failures: string[] = [];
     for (const row of mcpRows) {
       const before = await scrape();
