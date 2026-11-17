@@ -26,10 +26,10 @@
 //!   `Authorization: Bearer <token>` instead of the `api-key:` header.
 //!   Backward-compatible — existing api-key deployments keep working
 //!   unchanged.
-//! - [ ] D6.4 — Per-PK `api_version` override. Today the bridge pins
-//!   `AzureUpstreamRef::DEFAULT_API_VERSION` (GA). Follow-up will
-//!   accept an explicit version from `provider_key.api_base` query
-//!   string or a dedicated PK field.
+//! - [x] D6.4 — Per-PK `api_version` (`ProviderKey::api_version`): a dated
+//!   value selects the deployment route, `v1` / `preview` / `latest` the
+//!   v1 route; unset falls back to each operation's default (see
+//!   [`AzureOperation`]).
 //!
 //! # Why Azure-OpenAI is a separate `Adapter::AzureOpenai` family bridge
 //!
@@ -70,6 +70,10 @@
 
 mod aad_token_mint;
 mod bridge;
+mod endpoint;
 mod wire;
 
-pub use bridge::{resolve_credential, AzureCredential, AzureOpenAiBridge, AzureUpstreamRef};
+pub use bridge::{
+    held_route_http_error, resolve_credential, AzureCredential, AzureOpenAiBridge, AzureUpstreamRef,
+};
+pub use endpoint::{auth_header, endpoint_url, uses_v1_route, AzureOperation};

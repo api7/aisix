@@ -58,6 +58,25 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<Adapter>,
 
+    /// Azure OpenAI REST API version this key's requests use. Applies only
+    /// when `adapter` is `azure-openai`; every other adapter ignores it.
+    ///
+    /// A dated version (`2024-10-21`, `2025-04-01-preview`) sends requests to
+    /// the deployment route, `/openai/deployments/<deployment>/<operation>`,
+    /// with that value as the `api-version` query parameter. `v1`, `preview`
+    /// or `latest` sends them to the v1 route, `/openai/v1/<operation>`,
+    /// with no `api-version` query and the deployment name as the request's
+    /// `model`.
+    ///
+    /// When omitted, each operation uses its own default dated version:
+    /// `2024-10-21` for chat completions (and the Responses and Messages
+    /// requests translated to it), embeddings, audio transcriptions and
+    /// audio translations; `2025-04-01-preview` for audio speech, image
+    /// generations and image edits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = r"^(\d{4}-\d{2}-\d{2}(-preview)?|v1|preview|latest)$"))]
+    pub api_version: Option<String>,
+
     /// API surfaces this upstream serves natively, beyond the one its
     /// `adapter` already implies, and the base URL each one lives at.
     ///
@@ -961,6 +980,7 @@ mod tests {
             api_base: None,
             provider: String::new(),
             adapter: None,
+            api_version: None,
             apis: None,
             telemetry_tags: TelemetryTags::default(),
             request: None,
