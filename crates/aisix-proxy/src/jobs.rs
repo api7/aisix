@@ -74,11 +74,9 @@ const ROUTED_ID_PREFIX: &str = "aisix-";
 
 /// Azure OpenAI data-plane API version used for the resource-scoped
 /// jobs routes (`/openai/files`, `/openai/batches`,
-/// `/openai/fine_tuning/jobs`). Latest GA at authoring time; callers
-/// can override per request via an explicit `api-version` query
-/// parameter. Mirrors `AzureUpstreamRef::DEFAULT_API_VERSION` in
-/// aisix-provider-azure-openai (kept as a local const — this crate
-/// does not depend on the provider crates).
+/// `/openai/fine_tuning/jobs`) when the Provider Key sets no
+/// `api_version`; callers can override per request via an explicit
+/// `api-version` query parameter.
 const AZURE_JOBS_API_VERSION: &str = "2024-10-21";
 
 /// Timeout for the background output-file download of the batch cost
@@ -309,21 +307,40 @@ fn upstream_url(target: &JobTarget, path: &str, query: &str) -> Result<String, P
                 })?
                 .trim_end_matches('/')
                 .to_string();
-            let mut url = format!("{base}/openai{path}");
             let has_api_version = query
                 .split('&')
                 .any(|pair| pair.split('=').next() == Some("api-version"));
-            if query.is_empty() {
-                url = format!("{url}?api-version={AZURE_JOBS_API_VERSION}");
-            } else if has_api_version {
-                url = format!("{url}?{query}");
-            } else {
-                url = format!("{url}?{query}&api-version={AZURE_JOBS_API_VERSION}");
+            let mut url = azure_jobs_url(
+                &base,
+                target.pk_entry.value.api_version.as_deref(),
+                path,
+                has_api_version,
+            );
+            if !query.is_empty() {
+                url.push(if url.contains('?') { '&' } else { '?' });
+                url.push_str(query);
             }
             Ok(url)
         }
         // resolve_target only admits the two adapters above.
         _ => unreachable!("unsupported adapter reached upstream_url"),
+    }
+}
+
+/// The Azure jobs URL for `path`, before the client's query: the dated
+/// route `{base}/openai{path}?api-version=…` (the key's `api_version`, else
+/// [`AZURE_JOBS_API_VERSION`]; left off when the client sent its own), or
+/// the v1 route `{base}/openai/v1{path}` with none.
+fn azure_jobs_url(
+    base: &str,
+    api_version: Option<&str>,
+    path: &str,
+    client_sent_api_version: bool,
+) -> String {
+    match aisix_provider_azure_openai::dated_api_version(api_version, AZURE_JOBS_API_VERSION) {
+        Some(_) if client_sent_api_version => format!("{base}/openai{path}"),
+        Some(version) => format!("{base}/openai{path}?api-version={version}"),
+        None => format!("{base}/openai/v1{path}"),
     }
 }
 
@@ -2048,6 +2065,7 @@ fn maybe_attribute_batch(
     let secret = target.secret.clone();
     let adapter = target.adapter;
     let api_base = target.pk_entry.value.api_base.clone();
+    let api_version = target.pk_entry.value.api_version.clone();
     let pk_conn = target.pk_entry.value.upstream_connection();
     let raw_batch_id = raw_batch_id.to_string();
 
@@ -2064,6 +2082,7 @@ fn maybe_attribute_batch(
             &secret,
             adapter,
             api_base.as_deref(),
+            api_version.as_deref(),
             pk_conn.as_ref(),
             &raw_batch_id,
             &output_file_id,
@@ -2097,6 +2116,7 @@ async fn attribute_batch_usage(
     secret: &str,
     adapter: Adapter,
     api_base: Option<&str>,
+    api_version: Option<&str>,
     conn: Option<&aisix_core::models::provider_key::UpstreamConnection>,
     raw_batch_id: &str,
     output_file_id: &str,
@@ -2108,8 +2128,11 @@ async fn attribute_batch_usage(
                 .filter(|b| !b.is_empty())
                 .ok_or("azure provider_key has no api_base")?
                 .trim_end_matches('/');
-            format!(
-                "{base}/openai/files/{output_file_id}/content?api-version={AZURE_JOBS_API_VERSION}"
+            azure_jobs_url(
+                base,
+                api_version,
+                &format!("/files/{output_file_id}/content"),
+                false,
             )
         }
         _ => {

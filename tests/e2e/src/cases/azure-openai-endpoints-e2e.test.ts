@@ -64,6 +64,7 @@ describe("azure-openai keys dispatch every endpoint on Azure's routes", () => {
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
   const upstreams = {} as Record<Kind, OpenAiUpstream>;
+  let missing: OpenAiUpstream | undefined;
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -84,6 +85,13 @@ describe("azure-openai keys dispatch every endpoint on Azure's routes", () => {
     upstreams.speech = await startOpenAiUpstream({
       rawBody: Buffer.from([0x49, 0x44, 0x33, 0x04]),
       rawContentType: "audio/mpeg",
+    });
+    // Azure's answer for a deployment the resource does not have.
+    missing = await startOpenAiUpstream({
+      status: 404,
+      errorBody: {
+        error: { code: "DeploymentNotFound", message: "The API deployment for this resource does not exist." },
+      },
     });
     sls = await startMockSls();
 
@@ -121,6 +129,19 @@ describe("azure-openai keys dispatch every endpoint on Azure's routes", () => {
         });
       }
     }
+    const missingPk = await seed.createProviderKey({
+      display_name: "az-missing-pk",
+      provider: "azure",
+      adapter: "azure-openai",
+      api_key: SECRET,
+      api_base: missing.baseUrl,
+    });
+    await seed.createModel({
+      display_name: "az-missing",
+      provider: "azure",
+      model_name: "dep-missing",
+      provider_key_id: missingPk.id,
+    });
     await seed.createApiKey({ key_hash: CALLER_HASH, allowed_models: ["*"] });
     await waitConfigPropagation(async () => {
       const res = await fetch(`${app!.proxyUrl}/v1/models`, {
@@ -134,6 +155,7 @@ describe("azure-openai keys dispatch every endpoint on Azure's routes", () => {
   afterAll(async () => {
     await app?.exit();
     await sls?.close();
+    await missing?.close();
     await Promise.all(Object.values(upstreams).map((u) => u.close()));
   });
 
@@ -293,5 +315,42 @@ describe("azure-openai keys dispatch every endpoint on Azure's routes", () => {
     expect(Number(row.get("total_tokens"))).toBe(210);
     expect(Number(row.get("prompt_image_tokens"))).toBe(4);
     expect(row.get("requested_model")).toBe(modelName("images", "unset"));
+  });
+
+  // The routes that send the request themselves parse Azure's error
+  // envelope as chat does: `DeploymentNotFound` reaches the client as
+  // `model_not_found`, with Azure's status and message.
+  const failing: [string, () => Promise<Response>][] = [
+    [
+      "image edits",
+      () => {
+        const form = new FormData();
+        form.set("model", "az-missing");
+        form.set("prompt", "add a hat");
+        form.append("image", new Blob([new Uint8Array([0x89, 0x50])], { type: "image/png" }), "cat.png");
+        return postForm("/v1/images/edits", form);
+      },
+    ],
+    [
+      "audio transcriptions",
+      () => {
+        const form = new FormData();
+        form.set("model", "az-missing");
+        form.set("file", new Blob([new Uint8Array([0x49, 0x44, 0x33])], { type: "audio/mpeg" }), "a.mp3");
+        return postForm("/v1/audio/transcriptions", form);
+      },
+    ],
+    ["audio speech", () => postJson("/v1/audio/speech", { model: "az-missing", input: "hi", voice: "alloy" })],
+  ];
+  test.each(failing)("an Azure error on %s keeps Azure's meaning", async (_name, call) => {
+    if (!etcdReachable || !app || !missing) return;
+    const before = missing.receivedRequests.length;
+    const res = await call();
+    const body = (await res.json()) as { error?: { code?: string; message?: string } };
+    expect(res.status).toBe(404);
+    expect(body.error?.code).toBe("model_not_found");
+    expect(body.error?.message).toContain("deployment for this resource does not exist");
+    // A 404 is not retried, so exactly one upstream call.
+    expect(missing.receivedRequests.length - before).toBe(1);
   });
 });

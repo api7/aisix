@@ -81,10 +81,20 @@ impl AzureOperation {
 
 /// Whether the key's `api_version` selects the v1 route.
 pub fn uses_v1_route(provider_key: &ProviderKey) -> bool {
-    matches!(
-        provider_key.api_version.as_deref(),
-        Some("v1" | "preview" | "latest")
-    )
+    dated_api_version(provider_key.api_version.as_deref(), "").is_none()
+}
+
+/// The `api-version` a request sends for a configured `api_version`:
+/// `None` for `v1` / `preview` / `latest`, which select the v1 route and
+/// send none (the three are aliases), else the configured dated value or
+/// `default`. For the routes that build their own URL shape (realtime,
+/// files / batches / fine-tuning).
+pub fn dated_api_version<'a>(api_version: Option<&'a str>, default: &'a str) -> Option<&'a str> {
+    match api_version {
+        Some("v1" | "preview" | "latest") => None,
+        Some(dated) => Some(dated),
+        None => Some(default),
+    }
 }
 
 /// The URL `operation` posts to for `deployment` on this key, cached per

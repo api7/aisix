@@ -76,4 +76,4 @@ mod wire;
 pub use bridge::{
     held_route_http_error, resolve_credential, AzureCredential, AzureOpenAiBridge, AzureUpstreamRef,
 };
-pub use endpoint::{auth_header, endpoint_url, uses_v1_route, AzureOperation};
+pub use endpoint::{auth_header, dated_api_version, endpoint_url, uses_v1_route, AzureOperation};
