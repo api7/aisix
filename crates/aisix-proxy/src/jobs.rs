@@ -2077,8 +2077,7 @@ fn maybe_attribute_batch(
     let pk_id = target.pk_entry.id.to_string();
     let secret = target.secret.clone();
     let adapter = target.adapter;
-    let api_base = target.pk_entry.value.api_base.clone();
-    let api_version = target.pk_entry.value.api_version.clone();
+    let pk_entry = target.pk_entry.clone();
     let pk_conn = target.pk_entry.value.upstream_connection();
     let raw_batch_id = raw_batch_id.to_string();
 
@@ -2094,8 +2093,7 @@ fn maybe_attribute_batch(
             &pk_id,
             &secret,
             adapter,
-            api_base.as_deref(),
-            api_version.as_deref(),
+            &pk_entry.value,
             pk_conn.as_ref(),
             &raw_batch_id,
             &output_file_id,
@@ -2128,32 +2126,28 @@ async fn attribute_batch_usage(
     pk_id: &str,
     secret: &str,
     adapter: Adapter,
-    api_base: Option<&str>,
-    api_version: Option<&str>,
+    provider_key: &ProviderKey,
     conn: Option<&aisix_core::models::provider_key::UpstreamConnection>,
     raw_batch_id: &str,
     output_file_id: &str,
 ) -> Result<(), String> {
     let url = match adapter {
         Adapter::AzureOpenai => {
-            let base = aisix_provider_azure_openai::AzureUpstreamRef::api_base_url(api_base)
-                .map_err(|e| e.to_string())?;
+            let base = aisix_provider_azure_openai::AzureUpstreamRef::api_base_url(
+                provider_key.api_base.as_deref(),
+            )
+            .map_err(|e| e.to_string())?;
             azure_jobs_url(
                 &base,
-                api_version,
+                provider_key.api_version.as_deref(),
                 &format!("/files/{output_file_id}/content"),
                 false,
             )
         }
         _ => {
-            let base = api_base
-                .map(str::trim)
-                .filter(|b| !b.is_empty())
-                .ok_or("provider_key has no api_base")?;
-            crate::dispatch::build_openai_url(
-                base.trim_end_matches('/'),
-                &format!("/files/{output_file_id}/content"),
-            )
+            let base =
+                crate::dispatch::resolve_base_url(provider_key).map_err(|e| e.to_string())?;
+            crate::dispatch::build_openai_url(&base, &format!("/files/{output_file_id}/content"))
         }
     };
 
@@ -2787,6 +2781,74 @@ mod tests {
             assert_eq!(req.url.query(), None, "v1 route carries no api-version");
             assert_eq!(req.headers.get("api-key").unwrap(), "az-secret");
         }
+    }
+
+    #[tokio::test]
+    async fn batch_attribution_downloads_from_the_base_the_retrieve_used() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/batches/batch_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "batch_1",
+                "object": "batch",
+                "status": "completed",
+                "input_file_id": "file-in",
+                "output_file_id": "file-out"
+            })))
+            .mount(&upstream)
+            .await;
+        let line = serde_json::json!({
+            "id": "batch_req_1",
+            "custom_id": "r1",
+            "response": {"status_code": 200, "body": {
+                "model": "gpt-4o",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+            }}
+        });
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/files/file-out/content"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(format!("{line}\n"), "application/jsonl"),
+            )
+            .mount(&upstream)
+            .await;
+
+        // A pasted endpoint URL: the request routes strip the suffix.
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(
+            PK_A,
+            &format!("{}/v1/chat/completions", upstream.uri()),
+        ));
+        snap.models.insert(model("m-a", "jobs-a", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let (app, mut rx) = build_app_with_sink(snap);
+
+        let encoded = encode_routed_id("batch_1", "jobs-a");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/batches/{encoded}"))
+                    .header("authorization", "Bearer sk-caller")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut batch_event = false;
+        for _ in 0..2 {
+            let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await
+                .expect("expected a usage event")
+                .expect("sink closed");
+            batch_event |= ev.inbound_protocol == "batch";
+        }
+        assert!(
+            batch_event,
+            "the attribution download must reach the same base as the retrieve"
+        );
     }
 
     #[tokio::test]

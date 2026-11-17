@@ -302,10 +302,14 @@ impl AzureUpstreamRef {
             ));
         }
 
-        if let Some(rest) = base
-            .strip_prefix("https://")
-            .or_else(|| base.strip_prefix("http://"))
-        {
+        // The scheme is case-insensitive (RFC 3986 §3.1), and the control
+        // plane saves `HTTPS://…` as written.
+        let scheme = ["https://", "http://"].into_iter().find(|scheme| {
+            base.get(..scheme.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        });
+        if let Some(scheme) = scheme {
+            let rest = &base[scheme.len()..];
             // Canonical form: split off the leading host segment
             // before the first `.`. If the remainder of the host is
             // `openai.azure.com` and the segment is a resource name,
@@ -344,7 +348,10 @@ impl AzureUpstreamRef {
                     "azure api_base {base:?} must not contain a fragment"
                 )));
             }
-            return Ok((String::new(), Some(base.trim_end_matches('/').to_string())));
+            return Ok((
+                String::new(),
+                Some(format!("{scheme}{}", rest.trim_end_matches('/'))),
+            ));
         }
 
         // Bare-resource shorthand (`acme-east` → canonical Azure URL).
@@ -1454,6 +1461,11 @@ mod tests {
                 "https://acme.openai.azure.com",
             ),
             ("acme", "https://acme.openai.azure.com"),
+            (
+                "HTTPS://acme.openai.azure.com/openai/v1",
+                "https://acme.openai.azure.com",
+            ),
+            ("HTTP://corp-proxy:8080/", "http://corp-proxy:8080"),
             (
                 "https://corp-proxy:8443/azure/",
                 "https://corp-proxy:8443/azure",
