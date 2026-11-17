@@ -782,20 +782,10 @@ async fn prepare(
             req
         }
         Some(Adapter::AzureOpenai) => {
-            let base = pk_entry
-                .value
-                .api_base
-                .as_deref()
-                .map(str::trim)
-                .filter(|b| !b.is_empty())
-                .ok_or_else(|| {
-                    ProxyError::InvalidRequest(format!(
-                        "azure provider_key {:?} has no api_base",
-                        pk_entry.value.display_name
-                    ))
-                })?
-                .trim_end_matches('/')
-                .to_string();
+            let base = aisix_provider_azure_openai::AzureUpstreamRef::api_base_url(
+                pk_entry.value.api_base.as_deref(),
+            )
+            .map_err(ProxyError::Bridge)?;
             // The v1 route names the deployment as `model` and takes no
             // api-version; the dated route names it as `deployment`.
             let url = match aisix_provider_azure_openai::dated_api_version(
