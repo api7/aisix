@@ -147,18 +147,17 @@ async function firstFrame(app: SpawnedApp, model: string): Promise<{ type: strin
   const c = new WsClient(`${app.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=${model}`, {
     headers: { authorization: `Bearer ${CALLER}` },
   });
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`no frame relayed on ${model} within 10s`)), 10_000);
+      timer = setTimeout(() => reject(new Error(`no frame relayed on ${model} within 10s`)), 10_000);
       c.on("open", () => c.send(JSON.stringify({ type: "session.update" })));
-      c.on("message", (d) => {
-        clearTimeout(timer);
-        resolve(JSON.parse(d.toString()));
-      });
+      c.on("message", (d) => resolve(JSON.parse(d.toString())));
       c.on("unexpected-response", (_q, res) => reject(new Error(`upgrade refused: ${res.statusCode}`)));
       c.on("error", reject);
     });
   } finally {
+    clearTimeout(timer);
     c.terminate();
   }
 }

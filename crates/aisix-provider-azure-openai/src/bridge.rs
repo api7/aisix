@@ -229,7 +229,8 @@ fn default_client() -> Client {
 pub struct AzureUpstreamRef {
     pub resource: String,
     pub deployment: String,
-    /// Operator-supplied verbatim upstream base URL, used when
+    /// Operator-supplied upstream base URL (kept as written, less a
+    /// trailing `/openai` or `/openai/v1`), used when
     /// `ProviderKey.api_base` does NOT match the canonical
     /// `<resource>.openai.azure.com` host shape. Set for corporate
     /// proxies, private-VPC endpoints, mock services. When `Some(_)`,
@@ -299,7 +300,7 @@ impl AzureUpstreamRef {
             return Err(BridgeError::InvalidUpstreamConfig(
                 "azure provider_key has no api_base — \
                  expected https://<resource>.openai.azure.com, a bare resource name, \
-                 or a verbatim override URL (https://<host>[:<port>])"
+                 or an override URL (https://<host>[:<port>][/<path>])"
                     .into(),
             ));
         }
@@ -356,7 +357,8 @@ impl AzureUpstreamRef {
             let rest = rest
                 .strip_suffix("/openai/v1")
                 .or_else(|| rest.strip_suffix("/openai"))
-                .unwrap_or(rest);
+                .unwrap_or(rest)
+                .trim_end_matches('/');
             return Ok((String::new(), Some(format!("{scheme}{rest}"))));
         }
 
@@ -1476,6 +1478,7 @@ mod tests {
             ("https://h/openai", "https://h"),
             ("https://h/proxy/openai/v1", "https://h/proxy"),
             ("https://h/proxy", "https://h/proxy"),
+            ("https://h/proxy//openai", "https://h/proxy"),
             ("https://h/openai/v1beta", "https://h/openai/v1beta"),
             (
                 "https://acme.cognitiveservices.azure.com/openai/v1",
