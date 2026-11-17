@@ -281,7 +281,17 @@ impl AzureUpstreamRef {
     /// the dispatch to an attacker-pinned API version.
     pub fn resolve(deployment: &str, api_base: Option<&str>) -> Result<Self, BridgeError> {
         validate_url_token("deployment name", deployment)?;
+        let (resource, upstream_override) = Self::resolve_api_base(api_base)?;
+        Ok(Self {
+            resource,
+            deployment: deployment.to_string(),
+            upstream_override,
+        })
+    }
 
+    /// The `(resource, upstream_override)` pair an `api_base` names, for
+    /// [`Self::resolve`] and the routes that are not deployment-scoped.
+    fn resolve_api_base(api_base: Option<&str>) -> Result<(String, Option<String>), BridgeError> {
         let base = api_base.unwrap_or_default().trim();
         if base.is_empty() {
             return Err(BridgeError::InvalidUpstreamConfig(
@@ -311,11 +321,7 @@ impl AzureUpstreamRef {
                 if host_tail_core == "openai.azure.com"
                     && validate_url_token("resource name", host_resource).is_ok()
                 {
-                    return Ok(Self {
-                        resource: host_resource.to_string(),
-                        deployment: deployment.to_string(),
-                        upstream_override: None,
-                    });
+                    return Ok((host_resource.to_string(), None));
                 }
             }
 
@@ -338,21 +344,12 @@ impl AzureUpstreamRef {
                     "azure api_base {base:?} must not contain a fragment"
                 )));
             }
-            let override_base = base.trim_end_matches('/').to_string();
-            return Ok(Self {
-                resource: String::new(),
-                deployment: deployment.to_string(),
-                upstream_override: Some(override_base),
-            });
+            return Ok((String::new(), Some(base.trim_end_matches('/').to_string())));
         }
 
         // Bare-resource shorthand (`acme-east` → canonical Azure URL).
         validate_url_token("resource name", base)?;
-        Ok(Self {
-            resource: base.to_string(),
-            deployment: deployment.to_string(),
-            upstream_override: None,
-        })
+        Ok((base.to_string(), None))
     }
 
     /// The default-version chat-completions URL, for the `api_base`
@@ -370,9 +367,24 @@ impl AzureUpstreamRef {
     /// The scheme-and-host root every Azure route is appended to: the
     /// verbatim override, or the canonical resource host.
     pub(crate) fn base_url(&self) -> String {
-        self.upstream_override
-            .clone()
-            .unwrap_or_else(|| format!("https://{}.openai.azure.com", self.resource))
+        Self::root_url(&self.resource, self.upstream_override.as_deref())
+    }
+
+    fn root_url(resource: &str, upstream_override: Option<&str>) -> String {
+        upstream_override.map_or_else(
+            || format!("https://{resource}.openai.azure.com"),
+            str::to_string,
+        )
+    }
+
+    /// The root URL an `api_base` resolves to, for the routes that are not
+    /// deployment-scoped (files, batches, fine-tuning) or build their own
+    /// URL shape (realtime). Resolved exactly as [`Self::resolve`] does for
+    /// every deployment route, so one key reaches the same host and prefix
+    /// on all of them.
+    pub fn api_base_url(api_base: Option<&str>) -> Result<String, BridgeError> {
+        let (resource, upstream_override) = Self::resolve_api_base(api_base)?;
+        Ok(Self::root_url(&resource, upstream_override.as_deref()))
     }
 }
 
@@ -1420,6 +1432,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.resource, "acme-west");
+    }
+
+    #[test]
+    fn api_base_url_resolves_like_the_deployment_routes() {
+        for (api_base, root) in [
+            (
+                "https://acme.openai.azure.com",
+                "https://acme.openai.azure.com",
+            ),
+            (
+                "https://acme.openai.azure.com/openai/v1",
+                "https://acme.openai.azure.com",
+            ),
+            (
+                "https://acme.openai.azure.com/openai/v1/",
+                "https://acme.openai.azure.com",
+            ),
+            (
+                "https://acme.openai.azure.com/openai",
+                "https://acme.openai.azure.com",
+            ),
+            ("acme", "https://acme.openai.azure.com"),
+            (
+                "https://corp-proxy:8443/azure/",
+                "https://corp-proxy:8443/azure",
+            ),
+        ] {
+            assert_eq!(
+                AzureUpstreamRef::api_base_url(Some(api_base)).unwrap(),
+                root,
+                "{api_base}"
+            );
+            assert_eq!(
+                AzureUpstreamRef::resolve("d", Some(api_base))
+                    .unwrap()
+                    .base_url(),
+                root,
+                "{api_base}"
+            );
+        }
+        assert!(AzureUpstreamRef::api_base_url(None).is_err());
+        assert!(AzureUpstreamRef::api_base_url(Some("https://corp-proxy/?x=1")).is_err());
     }
 
     #[test]

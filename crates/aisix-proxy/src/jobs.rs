@@ -293,21 +293,10 @@ fn upstream_url(target: &JobTarget, path: &str, query: &str) -> Result<String, P
         Adapter::AzureOpenai => {
             // Resource-scoped Azure route: {base}/openai{path}?api-version=…
             // (files/batches/fine-tuning are not deployment-scoped).
-            let base = target
-                .pk_entry
-                .value
-                .api_base
-                .as_deref()
-                .map(str::trim)
-                .filter(|b| !b.is_empty())
-                .ok_or_else(|| {
-                    ProxyError::InvalidRequest(format!(
-                        "azure provider_key {:?} has no api_base",
-                        target.pk_entry.value.display_name
-                    ))
-                })?
-                .trim_end_matches('/')
-                .to_string();
+            let base = aisix_provider_azure_openai::AzureUpstreamRef::api_base_url(
+                target.pk_entry.value.api_base.as_deref(),
+            )
+            .map_err(ProxyError::Bridge)?;
             let has_api_version = query
                 .split('&')
                 .any(|pair| pair.split('=').next() == Some("api-version"));
@@ -2147,13 +2136,10 @@ async fn attribute_batch_usage(
 ) -> Result<(), String> {
     let url = match adapter {
         Adapter::AzureOpenai => {
-            let base = api_base
-                .map(str::trim)
-                .filter(|b| !b.is_empty())
-                .ok_or("azure provider_key has no api_base")?
-                .trim_end_matches('/');
+            let base = aisix_provider_azure_openai::AzureUpstreamRef::api_base_url(api_base)
+                .map_err(|e| e.to_string())?;
             azure_jobs_url(
-                base,
+                &base,
                 api_version,
                 &format!("/files/{output_file_id}/content"),
                 false,
