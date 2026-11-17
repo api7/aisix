@@ -207,4 +207,20 @@ describe("advertised scopes when sign-in is relayed with the caller's gateway cr
     if (!etcdReachable) return;
     await expectMetadata(gw.app.proxyUrl);
   });
+
+  test("a client asking for the advertised scopes still has the upstream asked for openid and offline_access", async () => {
+    if (!etcdReachable) return;
+    const server = `${gw.app.proxyUrl}/mcp/scoped`;
+    const prm = await getJson(`${gw.app.proxyUrl}/.well-known/oauth-protected-resource/mcp/scoped`);
+    const upstreamScope = async (scope: string) => {
+      const res = await fetch(authorizeUrl(server, { scope }), { redirect: "manual" });
+      expect(res.status).toBe(302);
+      const location = new URL(res.headers.get("location")!);
+      expect(`${location.origin}${location.pathname}`).toBe(`${upstream.url}/authorize`);
+      return location.searchParams.get("scope")!.split(" ").sort();
+    };
+    expect(await upstreamScope((prm.scopes_supported as string[]).join(" "))).toEqual([...UPSTREAM_SCOPES].sort());
+    // A narrower request of the client's own stays narrow otherwise.
+    expect(await upstreamScope("files:read")).toEqual(["files:read", "offline_access", "openid"]);
+  });
 });

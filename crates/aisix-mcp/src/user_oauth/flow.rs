@@ -334,7 +334,7 @@ impl UserOAuthManager {
             .or_else(|| registered.as_ref().map(|c| c.client_id.clone()))
             .ok_or(UserOAuthFailure::Misconfigured)?;
 
-        let scope = scope.map(str::to_owned).or_else(|| {
+        let scope = scope.map(|scope| server.upstream_scope(scope)).or_else(|| {
             let scopes = if server.scopes.is_empty() {
                 &endpoints.scopes
             } else {
