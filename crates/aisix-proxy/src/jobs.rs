@@ -76,8 +76,8 @@ const ROUTED_ID_PREFIX: &str = "aisix-";
 /// jobs routes (`/openai/files`, `/openai/batches`,
 /// `/openai/fine_tuning/jobs`) when the Provider Key sets no
 /// `api_version`; callers can override per request via an explicit
-/// `api-version` query parameter. On the v1 route the gateway adds none,
-/// and a caller's own query is forwarded as sent.
+/// `api-version` query parameter. On the v1 route none is sent, a
+/// caller's own included.
 const AZURE_JOBS_API_VERSION: &str = "2024-10-21";
 
 /// Timeout for the background output-file download of the batch cost
@@ -317,9 +317,24 @@ fn upstream_url(target: &JobTarget, path: &str, query: &str) -> Result<String, P
                 path,
                 has_api_version,
             );
+            // The v1 route takes no api-version, the caller's included.
+            let query = if aisix_provider_azure_openai::dated_api_version(
+                target.pk_entry.value.api_version.as_deref(),
+                "",
+            )
+            .is_none()
+            {
+                query
+                    .split('&')
+                    .filter(|pair| pair.split('=').next() != Some("api-version"))
+                    .collect::<Vec<_>>()
+                    .join("&")
+            } else {
+                query.to_string()
+            };
             if !query.is_empty() {
                 url.push(if url.contains('?') { '&' } else { '?' });
-                url.push_str(query);
+                url.push_str(&query);
             }
             Ok(url)
         }
@@ -389,15 +404,23 @@ async fn send_upstream(
     // is what keeps a colliding operator header from putting two values of
     // e.g. `x-aisix-request-id` on the wire.
     let mut headers = HeaderMap::new();
-    let (auth_name, auth_value) = match target.adapter {
-        Adapter::AzureOpenai => (
-            axum::http::HeaderName::from_static("api-key"),
-            target.secret.clone(),
-        ),
-        _ => (header::AUTHORIZATION, format!("Bearer {}", target.secret)),
-    };
-    if let Ok(v) = axum::http::HeaderValue::from_str(&auth_value) {
-        headers.insert(auth_name, v);
+    match target.adapter {
+        // An Entra ID client-credentials secret is exchanged for a bearer
+        // token, as on every other Azure route; a resource key goes out as
+        // `api-key`.
+        Adapter::AzureOpenai => {
+            let credential = aisix_provider_azure_openai::resolve_credential(&target.secret)
+                .await
+                .map_err(ProxyError::Bridge)?;
+            let (name, value) = aisix_provider_azure_openai::auth_header(&credential)
+                .map_err(ProxyError::Bridge)?;
+            headers.insert(name, value);
+        }
+        _ => {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&format!("Bearer {}", target.secret)) {
+                headers.insert(header::AUTHORIZATION, v);
+            }
+        }
     }
     if let Ok(v) = axum::http::HeaderValue::from_str(request_id) {
         headers.insert(axum::http::HeaderName::from_static("x-aisix-request-id"), v);
@@ -2151,7 +2174,14 @@ async fn attribute_batch_usage(
     let client = crate::http_client::client_for(conn);
     let mut builder = client.get(&url).timeout(BATCH_ATTRIBUTION_TIMEOUT);
     builder = match adapter {
-        Adapter::AzureOpenai => builder.header("api-key", secret),
+        Adapter::AzureOpenai => {
+            let credential = aisix_provider_azure_openai::resolve_credential(secret)
+                .await
+                .map_err(|e| e.to_string())?;
+            let (name, value) =
+                aisix_provider_azure_openai::auth_header(&credential).map_err(|e| e.to_string())?;
+            builder.header(name, value)
+        }
         _ => builder.header(header::AUTHORIZATION, format!("Bearer {secret}")),
     };
     let resp = builder
@@ -3005,6 +3035,39 @@ mod tests {
             !received[0].headers.contains_key("authorization"),
             "no Bearer header on the azure wire"
         );
+    }
+
+    #[tokio::test]
+    async fn azure_v1_key_sends_no_api_version_not_even_the_callers() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/openai/v1/files"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"object": "list", "data": []})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        let mut pk = azure_pk(PK_A, &upstream.uri());
+        pk.value.api_version = Some("v1".into());
+        snap.provider_keys.insert(pk);
+        snap.models.insert(model("m-az", "jobs-az", PK_A));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/files?model=jobs-az&api-version=2024-10-21&limit=2")
+            .header("authorization", "Bearer sk-caller")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].url.query(), Some("limit=2"));
     }
 
     // ---- guards ----

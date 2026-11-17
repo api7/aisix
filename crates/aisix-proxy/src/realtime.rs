@@ -816,12 +816,14 @@ async fn prepare(
             let mut req = url.into_client_request().map_err(|e| {
                 ProxyError::InvalidRequest(format!("invalid upstream realtime URL: {e}"))
             })?;
-            req.headers_mut().insert(
-                "api-key",
-                secret.parse().map_err(|_| {
-                    ProxyError::InvalidRequest("provider secret is not header-safe".into())
-                })?,
-            );
+            // A resource key goes out as `api-key`; an Entra ID
+            // client-credentials secret is exchanged for a bearer token.
+            let credential = aisix_provider_azure_openai::resolve_credential(&secret)
+                .await
+                .map_err(ProxyError::Bridge)?;
+            let (name, value) = aisix_provider_azure_openai::auth_header(&credential)
+                .map_err(ProxyError::Bridge)?;
+            req.headers_mut().insert(name, value);
             req
         }
         _ => {
