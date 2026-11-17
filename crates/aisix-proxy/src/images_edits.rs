@@ -528,8 +528,7 @@ async fn dispatch(
                 // reject explicitly at the gateway boundary instead. Cross-provider
                 // editing wires (Gemini / Vertex / BFL) are the AISIX-Cloud#1360
                 // Phase 2 follow-up.
-                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
-                let azure = crate::dispatch::is_azure_key(&pk_entry.value);
+                let azure = crate::dispatch::references_azure_key(snapshot, model);
                 if model.provider.as_deref() != Some("openai") && !azure {
                     return Err(ProxyError::InvalidRequest(format!(
                         "{} is not an OpenAI provider; \
@@ -540,6 +539,7 @@ async fn dispatch(
 
                 let provider = crate::dispatch::require_provider(model)?.to_string();
                 let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
                 let api_key = crate::dispatch::require_api_key(&pk_entry.value, model)?;
 
                 let (url, auth) = if azure {
@@ -548,7 +548,15 @@ async fn dispatch(
                         &upstream_model,
                         aisix_provider_azure_openai::AzureOperation::ImageEdits,
                     )
-                    .await?
+                    .await
+                    .map_err(|e| {
+                        ProxyError::Bridge(crate::cooldown::note_failure(
+                            &state.runtime_status,
+                            &target.id,
+                            model.cooldown.as_ref(),
+                            e,
+                        ))
+                    })?
                 } else {
                     let url = aisix_gateway::url_cache::cached_endpoint_url(
                         &pk_entry.id,

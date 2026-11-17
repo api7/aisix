@@ -455,9 +455,8 @@ async fn dispatch(
                 // shape; DeepSeek doesn't expose image generation. Routing any
                 // other Model here would dispatch to an upstream that 404s, so
                 // reject explicitly with 400 at the gateway boundary.
-                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &target.model)?;
                 if target.model.provider.as_deref() != Some("openai")
-                    && !crate::dispatch::is_azure_key(&pk_entry.value)
+                    && !crate::dispatch::references_azure_key(snapshot, &target.model)
                 {
                     return Err(ProxyError::InvalidRequest(format!(
                         "{} is not an OpenAI provider; \
@@ -467,6 +466,7 @@ async fn dispatch(
                 }
                 let provider =
                     crate::dispatch::require_provider(&target.model)?.to_ascii_lowercase();
+                let pk_entry = crate::dispatch::resolve_provider_key(snapshot, &target.model)?;
                 let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
                     .ok_or(ProxyError::ProviderUnavailable)?;
                 // #554: apply the configured request `timeout` as the upstream deadline.

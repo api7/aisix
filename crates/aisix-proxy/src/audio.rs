@@ -1424,7 +1424,16 @@ async fn multipart_dispatch(
                     } else {
                         aisix_provider_azure_openai::AzureOperation::AudioTranscriptions
                     };
-                    crate::dispatch::azure_upstream(&pk_entry, &upstream_model, operation).await?
+                    crate::dispatch::azure_upstream(&pk_entry, &upstream_model, operation)
+                        .await
+                        .map_err(|e| {
+                            ProxyError::Bridge(crate::cooldown::note_failure(
+                                &state.runtime_status,
+                                &target.id,
+                                model.cooldown.as_ref(),
+                                e,
+                            ))
+                        })?
                 } else {
                     // Cache key must be `'static`; both callers pass fixed literals.
                     let url_cache_key: &'static str = if upstream_path == "/audio/translations" {
@@ -2301,7 +2310,15 @@ async fn speech_dispatch(
                     &upstream_model,
                     aisix_provider_azure_openai::AzureOperation::AudioSpeech,
                 )
-                .await?
+                .await
+                .map_err(|e| {
+                    ProxyError::Bridge(crate::cooldown::note_failure(
+                        &state.runtime_status,
+                        &target.id,
+                        model.cooldown.as_ref(),
+                        e,
+                    ))
+                })?
             } else {
                 let speech_url = aisix_gateway::url_cache::cached_endpoint_url(
                     &pk_entry.id,

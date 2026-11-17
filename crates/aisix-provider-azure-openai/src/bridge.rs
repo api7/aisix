@@ -209,7 +209,9 @@ fn default_client() -> Client {
 ///
 /// - `resource` — the Azure resource name, e.g. `acme-prod-west-us`
 /// - `deployment` — operator-named deployment, e.g. `gpt4o-prod`
-/// - `api_version` — Azure's date-stamped API version, e.g. `2024-10-21`
+///
+/// The URL itself (route, version, operation path) is built by
+/// [`crate::endpoint_url`]; this type only resolves `api_base`.
 ///
 /// The resolver is intentionally cautious — any missing piece produces
 /// a clear `BridgeError::Config` so an operator can fix the
@@ -225,7 +227,6 @@ fn default_client() -> Client {
 pub struct AzureUpstreamRef {
     pub resource: String,
     pub deployment: String,
-    pub api_version: String,
     /// Operator-supplied verbatim upstream base URL, used when
     /// `ProviderKey.api_base` does NOT match the canonical
     /// `<resource>.openai.azure.com` host shape. Set for corporate
@@ -311,7 +312,6 @@ impl AzureUpstreamRef {
                     return Ok(Self {
                         resource: host_resource.to_string(),
                         deployment: deployment.to_string(),
-                        api_version: Self::DEFAULT_API_VERSION.to_string(),
                         upstream_override: None,
                     });
                 }
@@ -340,7 +340,6 @@ impl AzureUpstreamRef {
             return Ok(Self {
                 resource: String::new(),
                 deployment: deployment.to_string(),
-                api_version: Self::DEFAULT_API_VERSION.to_string(),
                 upstream_override: Some(override_base),
             });
         }
@@ -350,27 +349,19 @@ impl AzureUpstreamRef {
         Ok(Self {
             resource: base.to_string(),
             deployment: deployment.to_string(),
-            api_version: Self::DEFAULT_API_VERSION.to_string(),
             upstream_override: None,
         })
     }
 
-    /// Build the chat-completions URL for this Azure upstream.
-    ///
-    /// Two shapes:
-    ///   - Canonical (no override): `https://<resource>.openai.azure.com/openai/deployments/<deployment>/chat/completions?api-version=<v>`
-    ///   - Verbatim override: `<override>/openai/deployments/<deployment>/chat/completions?api-version=<v>`
-    ///
-    /// The deployment path + api-version are always appended by the
-    /// bridge — operators set just the host root in `api_base`,
-    /// never a full chat-completions URL (the `?` / `#` rejection
-    /// in `resolve()` enforces this).
-    pub fn chat_completions_url(&self) -> String {
+    /// The default-version chat-completions URL, for the `api_base`
+    /// resolution tests; dispatch builds URLs through [`crate::endpoint_url`].
+    #[cfg(test)]
+    pub(crate) fn chat_completions_url(&self) -> String {
         format!(
             "{}/openai/deployments/{}/chat/completions?api-version={}",
             self.base_url(),
             self.deployment,
-            self.api_version,
+            Self::DEFAULT_API_VERSION,
         )
     }
 
@@ -731,9 +722,9 @@ impl Bridge for AzureOpenAiBridge {
     ) -> Result<ChatResponse, BridgeError> {
         let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let deployment = upstream_model(ctx)?;
-        // Validates `api_base` and the deployment name before any auth
-        // round-trip; the URL itself comes from `resolve_url`.
-        AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
+        // Before auth, so an unusable `api_base` or deployment name fails
+        // without an Entra ID round-trip.
+        let url = self.resolve_url(ctx, deployment, AzureOperation::ChatCompletions)?;
         // Keep reserved-config helpers reachable from the public surface
         // so a future override-validation PR can wire them in without
         // re-exposing private state.
@@ -763,7 +754,6 @@ impl Bridge for AzureOpenAiBridge {
         // The owned request is not needed past its wire bytes.
         drop(req);
         let headers = build_request_headers(&auth, &ctx.request_id, false, &ctx.header_ctx())?;
-        let url = self.resolve_url(ctx, deployment, AzureOperation::ChatCompletions)?;
         let client = self.client_for(ctx);
         let started = Instant::now();
 
@@ -902,9 +892,9 @@ impl Bridge for AzureOpenAiBridge {
     ) -> Result<ChatChunkStream, BridgeError> {
         let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let deployment = upstream_model(ctx)?;
-        // Validates `api_base` and the deployment name before any auth
-        // round-trip; the URL itself comes from `resolve_url`.
-        AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
+        // Before auth, so an unusable `api_base` or deployment name fails
+        // without an Entra ID round-trip.
+        let url = self.resolve_url(ctx, deployment, AzureOperation::ChatCompletions)?;
         let _ = wire::reserved_query_params();
         let _ = wire::reserved_auth_headers();
 
@@ -925,7 +915,6 @@ impl Bridge for AzureOpenAiBridge {
         // The owned request is not needed past its wire bytes.
         drop(req);
         let headers = build_request_headers(&auth, &ctx.request_id, true, &ctx.header_ctx())?;
-        let url = self.resolve_url(ctx, deployment, AzureOperation::ChatCompletions)?;
         let client = self.client_for(ctx);
         let started = Instant::now();
 
@@ -1212,7 +1201,6 @@ mod tests {
             .unwrap();
         assert_eq!(r.resource, "acme-west");
         assert_eq!(r.deployment, "gpt4o-prod");
-        assert_eq!(r.api_version, AzureUpstreamRef::DEFAULT_API_VERSION);
     }
 
     #[test]
@@ -1265,7 +1253,6 @@ mod tests {
         let r = AzureUpstreamRef {
             resource: "acme-west".into(),
             deployment: "gpt4o-prod".into(),
-            api_version: "2024-10-21".into(),
             upstream_override: None,
         };
         assert_eq!(

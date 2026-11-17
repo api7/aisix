@@ -250,4 +250,23 @@ mod tests {
             ("authorization", "Bearer t1")
         );
     }
+
+    #[test]
+    fn a_changed_api_version_is_not_served_from_the_url_cache() {
+        let dated = pk("http://127.0.0.1:9", Some("2024-10-21"));
+        let v1 = pk("http://127.0.0.1:9", Some("v1"));
+        let url = |key: &ProviderKey| match endpoint_url(
+            "pk-cache-test",
+            key,
+            "dep",
+            AzureOperation::ChatCompletions,
+        )
+        .unwrap()
+        {
+            EndpointUrl::Parsed(u) => u.to_string(),
+            EndpointUrl::Unparsed(s) => s,
+        };
+        assert!(url(&dated).contains("/deployments/dep/"));
+        assert_eq!(url(&v1), "http://127.0.0.1:9/openai/v1/chat/completions");
+    }
 }

@@ -58,8 +58,12 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<Adapter>,
 
-    /// Azure OpenAI REST API version this key's requests use. Applies only
-    /// when `adapter` is `azure-openai`; every other adapter ignores it.
+    /// Azure OpenAI REST API version for this key's chat completions (and the
+    /// Responses and Messages requests translated to it), embeddings, image
+    /// generations, image edits, audio speech, audio transcriptions and audio
+    /// translations. Applies only when `adapter` is `azure-openai`; every
+    /// other adapter ignores it. Realtime sessions and the files, batches and
+    /// fine-tuning endpoints keep their own fixed versions and do not read it.
     ///
     /// A dated version (`2024-10-21`, `2025-04-01-preview`) sends requests to
     /// the deployment route, `/openai/deployments/<deployment>/<operation>`,

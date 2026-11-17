@@ -336,10 +336,22 @@ pub(crate) fn is_azure_key(provider_key: &ProviderKey) -> bool {
     provider_key.adapter == Some(aisix_core::Adapter::AzureOpenai)
 }
 
+/// [`is_azure_key`] for the key `model` references, read without
+/// [`resolve_provider_key`]'s target attribution — for a gate that may
+/// still refuse the target.
+pub(crate) fn references_azure_key(snapshot: &AisixSnapshot, model: &Model) -> bool {
+    model
+        .provider_key_id
+        .as_deref()
+        .and_then(|id| snapshot.provider_keys.get_by_id(id))
+        .is_some_and(|entry| is_azure_key(&entry.value))
+}
+
 /// The URL and auth header a direct-upstream route sends `operation` to on
 /// an Azure key: the shared Azure builder's URL, and the key's secret as
 /// `api-key` (or a minted Entra ID token as a bearer), never as a bearer
-/// API key.
+/// API key. The error is the bridge's, for the caller to count against the
+/// target's cooldown as the bridge paths do.
 pub(crate) async fn azure_upstream(
     pk_entry: &ResourceEntry<ProviderKey>,
     deployment: &str,
@@ -349,19 +361,17 @@ pub(crate) async fn azure_upstream(
         aisix_gateway::url_cache::EndpointUrl,
         (axum::http::HeaderName, axum::http::HeaderValue),
     ),
-    ProxyError,
+    BridgeError,
 > {
     let url = aisix_provider_azure_openai::endpoint_url(
         &pk_entry.id,
         &pk_entry.value,
         deployment,
         operation,
-    )
-    .map_err(ProxyError::Bridge)?;
-    let credential = aisix_provider_azure_openai::resolve_credential(&pk_entry.value.api_key)
-        .await
-        .map_err(ProxyError::Bridge)?;
-    let auth = aisix_provider_azure_openai::auth_header(&credential).map_err(ProxyError::Bridge)?;
+    )?;
+    let credential =
+        aisix_provider_azure_openai::resolve_credential(&pk_entry.value.api_key).await?;
+    let auth = aisix_provider_azure_openai::auth_header(&credential)?;
     Ok((url, auth))
 }
 

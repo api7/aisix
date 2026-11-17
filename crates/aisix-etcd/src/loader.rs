@@ -1154,9 +1154,9 @@ mod tests {
     #[test]
     fn provider_key_azure_resource_payload_loads_partially_compatible() {
         // Same decision as aws_region: the Azure bridge derives the
-        // resource name from `api_base` and pins its own API version —
-        // neither top-level field is consumed — YELLOW load, fields
-        // reported.
+        // resource name from `api_base`, so `azure_resource_name` is not
+        // consumed — YELLOW load, field reported. `api_version` is a
+        // Provider Key field and is not reported.
         let entries = vec![raw(
             "/aisix/provider_keys/pk-azure",
             br#"{"display_name":"azure-pk","secret":"x","provider":"azure","azure_resource_name":"my-azure","api_version":"2024-02-01"}"#,
@@ -1164,21 +1164,15 @@ mod tests {
         )];
         let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 1, "rejections: {:?}", stats.rejections);
-        assert!(snap.provider_keys.get_by_id("pk-azure").is_some());
+        let pk = snap.provider_keys.get_by_id("pk-azure").unwrap();
+        assert_eq!(pk.value.api_version.as_deref(), Some("2024-02-01"));
         assert_eq!(
             stats.partially_compatible,
-            vec![
-                PartialCompatEntry {
-                    kind: "provider_keys".into(),
-                    field: "api_version".into(),
-                    count: 1,
-                },
-                PartialCompatEntry {
-                    kind: "provider_keys".into(),
-                    field: "azure_resource_name".into(),
-                    count: 1,
-                },
-            ]
+            vec![PartialCompatEntry {
+                kind: "provider_keys".into(),
+                field: "azure_resource_name".into(),
+                count: 1,
+            }]
         );
     }
 
