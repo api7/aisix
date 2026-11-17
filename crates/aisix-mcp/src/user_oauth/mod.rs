@@ -165,9 +165,16 @@ impl UserOAuthServer {
         }
     }
 
-    /// Scopes to advertise to MCP clients.
-    pub fn scopes(&self) -> &[String] {
-        &self.scopes
+    /// The configured scopes as this server's protected-resource metadata
+    /// lists them. The gateway issues no ID token, so `openid` is not its to
+    /// offer; and whether a client gets a refresh token is the gateway's
+    /// decision, not that scope's, so `offline_access` is not either.
+    pub fn advertised_scopes(&self) -> Vec<&str> {
+        self.scopes
+            .iter()
+            .map(String::as_str)
+            .filter(|scope| !matches!(*scope, "openid" | "offline_access"))
+            .collect()
     }
 }
 

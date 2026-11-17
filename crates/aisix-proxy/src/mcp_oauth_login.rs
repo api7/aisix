@@ -1294,7 +1294,6 @@ fn session_response(
         "token_type": "Bearer",
         "expires_in": ACCESS_TOKEN_TTL_SECS,
         "refresh_token": pair.refresh_token,
-        "scope": oauth.scopes().join(" "),
     }))
     .into_response();
     no_store(&mut response);

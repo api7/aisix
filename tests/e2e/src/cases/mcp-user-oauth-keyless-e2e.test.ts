@@ -75,7 +75,6 @@ interface Tokens {
   refresh_token: string;
   token_type: string;
   expires_in: number;
-  scope: string;
 }
 
 const tokenRequest = (serverUrl: string, form: Record<string, string>) =>
@@ -455,7 +454,7 @@ describe("keyless sign-in on managed gateways", () => {
     expect(second.refresh_token).not.toBe(first.refresh_token);
     expect(second.access_token).not.toBe(first.access_token);
     expect(second.expires_in).toBe(3600);
-    expect(typeof second.scope).toBe("string");
+    expect(second).not.toHaveProperty("scope");
 
     const used = [...cp.store].filter(([id]) => id.startsWith("mcp_oauth_refresh_used/"));
     expect(used).toHaveLength(1);
