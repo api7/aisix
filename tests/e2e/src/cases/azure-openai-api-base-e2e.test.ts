@@ -152,7 +152,13 @@ async function firstFrame(app: SpawnedApp, model: string): Promise<{ type: strin
     return await new Promise((resolve, reject) => {
       timer = setTimeout(() => reject(new Error(`no frame relayed on ${model} within 10s`)), 10_000);
       c.on("open", () => c.send(JSON.stringify({ type: "session.update" })));
-      c.on("message", (d) => resolve(JSON.parse(d.toString())));
+      c.on("message", (d) => {
+        try {
+          resolve(JSON.parse(d.toString()));
+        } catch (e) {
+          reject(e);
+        }
+      });
       c.on("unexpected-response", (_q, res) => reject(new Error(`upgrade refused: ${res.statusCode}`)));
       c.on("error", reject);
     });
