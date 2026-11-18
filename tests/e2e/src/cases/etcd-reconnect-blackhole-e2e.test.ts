@@ -6,6 +6,7 @@ import {
   SeedClient,
   completeLines,
   etcdEndpoint,
+  waitForLogLine,
   spawnApp,
   startMockControlPlane,
   waitConfigPropagation,
@@ -26,6 +27,18 @@ import {
 const hash = (plaintext: string) => createHash("sha256").update(plaintext).digest("hex");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const RECOVERED = "etcd watch established after a failed cycle";
+const FAILED = "etcd watch failed";
+
+/**
+ * The number of complete log lines once everything the gateway wrote
+ * before this call is in: a request's access-log line is behind all of it
+ * in the gateway's FIFO log queue.
+ */
+const logBarrier = async (app: SpawnedApp, key: string): Promise<number> => {
+  const { requestId } = await new ProxyClient(app.proxyUrl, key).listModels();
+  await waitForLogLine(app, (line) => line.includes(requestId), `the access-log line of ${requestId}`);
+  return completeLines(app).length;
+};
 
 const authenticates = async (app: SpawnedApp, key: string): Promise<boolean> => {
   let status: number;
@@ -93,7 +106,7 @@ for (const requestTimeoutMs of [undefined, 3000]) {
 
     test("a change written after the path recovers is applied", async (ctx) => {
       if (!etcdReachable || !app || !cp) return ctx.skip();
-      const checkpoint = completeLines(app).length;
+      const checkpoint = await logBarrier(app, key("warm"));
 
       // Connections reset: the watch fails and reconnect attempts start.
       cp.setEtcdPath("reset");
@@ -119,11 +132,15 @@ for (const requestTimeoutMs of [undefined, 3000]) {
             .some((line) => line.includes(RECOVERED) && line.includes(envPrefix)),
         10_000,
       );
+      const recovered = await logBarrier(app, key("second"));
 
-      // And it delivers: a change written now arrives over the watch.
+      // And it delivers: a change written now arrives over the watch, with
+      // no failed cycle (and so no full re-read) in between.
       await addKey("third");
       await waitConfigPropagation(() => authenticates(app!, key("third")));
-      expect(await authenticates(app, key("third"))).toBe(true);
+      const after = await logBarrier(app, key("third"));
+      const between = completeLines(app).slice(recovered, after);
+      expect(between.filter((line) => line.includes(FAILED) || line.includes(RECOVERED))).toEqual([]);
     }, 180_000);
   });
 }
