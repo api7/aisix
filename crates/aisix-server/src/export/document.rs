@@ -271,18 +271,26 @@ pub fn build_export_document(
     // to `_` (or share a name outright) derive the SAME placeholder
     // variable, so the operator can only supply one value for both secrets
     // — silently feeding one credential to the wrong entry.
-    let mut var_owner: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut var_owner: BTreeMap<&str, &SecretPlaceholder> = BTreeMap::new();
     for placeholder in &placeholders {
         match var_owner.get(placeholder.env_var.as_str()) {
-            Some(&owner) if owner != placeholder.id => warnings.push(format!(
-                "secret placeholder ${{{}}} is derived for both {} {:?} and {:?}; their names \
-                 collapse to the same environment variable, so one real credential cannot be \
-                 supplied to each — rename one entry or edit one placeholder",
-                placeholder.env_var, placeholder.kind, owner, placeholder.id
-            )),
+            Some(owner) if (&owner.id, &owner.field) != (&placeholder.id, &placeholder.field) => {
+                warnings.push(format!(
+                    "secret placeholder ${{{}}} is derived for both {} {:?} {} and {} {:?} {}; \
+                     they collapse to the same environment variable, so one real credential \
+                     cannot be supplied to each — rename one or edit one placeholder",
+                    placeholder.env_var,
+                    owner.kind,
+                    owner.id,
+                    owner.field,
+                    placeholder.kind,
+                    placeholder.id,
+                    placeholder.field
+                ))
+            }
             Some(_) => {}
             None => {
-                var_owner.insert(&placeholder.env_var, &placeholder.id);
+                var_owner.insert(&placeholder.env_var, placeholder);
             }
         }
     }

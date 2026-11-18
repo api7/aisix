@@ -353,3 +353,21 @@ fn a_model_priced_by_a_pricing_document_is_reported() {
         doc.warnings[0]
     );
 }
+
+#[test]
+fn two_fields_of_one_entry_sharing_a_placeholder_are_reported() {
+    let doc = export(
+        &[(
+            "provider_keys",
+            PK,
+            json!({
+                "display_name": "pk",
+                "api_key": "a",
+                "request": {"default_headers": {"x-tenant-token": "t1", "x_tenant_token": "t2"}}
+            }),
+        )],
+        false,
+    );
+    assert_eq!(doc.warnings.len(), 1, "{:?}", doc.warnings);
+    assert!(doc.warnings[0].contains("same environment variable"), "{}", doc.warnings[0]);
+}

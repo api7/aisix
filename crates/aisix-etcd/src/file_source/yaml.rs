@@ -48,10 +48,12 @@ fn interpolate_str(input: &str, env: EnvLookup<'_>) -> Result<String, String> {
                     name.push(c2);
                 }
                 if !closed {
-                    return Err(format!(
-                        "unterminated `${{` in value {input:?} — close it with `}}` \
-                         or escape the dollar sign as `$$`"
-                    ));
+                    // The value is not quoted: it can be a credential.
+                    return Err(
+                        "unterminated `${` — close it with `}` or escape the dollar \
+                                sign as `$$`"
+                            .into(),
+                    );
                 }
                 if name.is_empty() {
                     return Err("empty variable name in `${}`".into());

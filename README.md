@@ -127,7 +127,9 @@ keeps the last configuration serving. Check a file before booting with
 
 Full walkthrough: the
 [Gateway Quickstart](https://docs.api7.ai/ai-gateway/getting-started/gateway-quickstart) ·
-every field: the [resources file reference](https://docs.api7.ai/ai-gateway/reference/resources-file).
+every field: the [resources file reference](https://docs.api7.ai/ai-gateway/reference/resources-file)
+(still being updated for format `"2"`; each entry's fields are the resource's document, see
+[`schemas/resources/`](schemas/resources/)).
 For a multi-replica cluster, point the gateway at etcd instead — `resources_file` and
 `etcd` are mutually exclusive.
 

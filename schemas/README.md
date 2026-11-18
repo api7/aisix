@@ -69,14 +69,17 @@ etcd, and a **raw direct etcd put gets no synchronous validation** —
 the document is only checked on read, by the lenient loader below.
 Validate documents before putting them.
 
-The gateway's **etcd read path is deliberately more lenient** (#871): a
+The gateway's **read path — etcd, and a `resources_file`, which goes
+through the same loader — is deliberately more lenient** (#871): a
 stored document carrying fields outside these schemas still loads, with
 the unknown fields ignored and reported as partially compatible on
 `GET /status/config`, the heartbeat, and the
 `aisix_config_partially_compatible_resources` metric. This keeps an
-older gateway serving documents written by a newer control plane. Every
-other constraint in these files — types, required fields, ranges, closed
-enum value sets — applies on both paths.
+older gateway serving documents written by a newer control plane. Types,
+required fields, ranges and closed enum value sets apply on the read path
+too, except for the write-only checks `resources-lenient/` relaxes (an
+empty `effort_mapping` value, for one) — diff the two sets for the exact
+difference. `aisix validate --resources` checks the read contract.
 
 That read contract is published too, as `resources-lenient/` — see below.
 

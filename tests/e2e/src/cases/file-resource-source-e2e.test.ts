@@ -574,12 +574,20 @@ guardrails:
   test("a file that cannot be read keeps the configuration that is serving", async () => {
     if (!app || !upstream || !app.resourcesPath) throw new Error("setup failed");
     const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    // Apply a model this test owns first, so "still serving" below can only
+    // mean the configuration applied right before the failed reload.
+    await writeFile(app.resourcesPath, reloadFile(upstream.baseUrl, ["reload-a", "reload-d"]), "utf8");
+    app.signal("SIGHUP");
+    await waitConfigPropagation(async () => {
+      const r = await proxy.listModels();
+      return (r.body as { data: Array<{ id: string }> }).data.some((m) => m.id === "reload-d");
+    });
     await writeFile(app.resourcesPath, "_format_version: \"2\"\nmodels: [\n", "utf8");
     app.signal("SIGHUP");
     // Handled once the status surface reports the file rejected as a whole.
     await waitConfigPropagation(async () => (await statusConfig()).state === "out_of_sync");
     const stillServing = await proxy.chat({
-      model: "reload-a",
+      model: "reload-d",
       messages: [{ role: "user", content: "still-alive" }],
     });
     expect(stillServing.status).toBe(200);
@@ -637,8 +645,9 @@ api_keys:
 
   test("a row the loader rejects does not stop the gateway", async () => {
     const upstream = await startOpenAiUpstream();
-    const app = await spawnApp({
-      resourcesFile: `
+    try {
+      const app = await spawnApp({
+        resourcesFile: `
 _format_version: "2"
 provider_keys:
   - id: ${fileId("boot-pk")}
@@ -659,23 +668,25 @@ api_keys:
     key_hash: ${CALLER_KEY_HASH}
     allow_all_models: true
 `,
-    });
-    try {
-      const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
-      const r = await proxy.chat({
-        model: "boot-model",
-        messages: [{ role: "user", content: "hello" }],
       });
-      expect(r.status).toBe(200);
-      const res = await fetch(`${app.metricsUrl}/status/config`);
-      const status = (await res.json()) as {
-        rejected: Array<{ resource_kind: string; resource_id: string }>;
-      };
-      expect(status.rejected).toEqual([
-        expect.objectContaining({ resource_kind: "models", resource_id: fileId("boot-broken") }),
-      ]);
+      try {
+        const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+        const r = await proxy.chat({
+          model: "boot-model",
+          messages: [{ role: "user", content: "hello" }],
+        });
+        expect(r.status).toBe(200);
+        const res = await fetch(`${app.metricsUrl}/status/config`);
+        const status = (await res.json()) as {
+          rejected: Array<{ resource_kind: string; resource_id: string }>;
+        };
+        expect(status.rejected).toEqual([
+          expect.objectContaining({ resource_kind: "models", resource_id: fileId("boot-broken") }),
+        ]);
+      } finally {
+        await app.exit();
+      }
     } finally {
-      await app.exit();
       await upstream.close();
     }
   }, 30_000);

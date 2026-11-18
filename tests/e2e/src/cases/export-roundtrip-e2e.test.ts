@@ -46,6 +46,8 @@ const ETCD_ENDPOINT = etcdEndpoint();
 
 const CALLER_PLAINTEXT = "sk-export-roundtrip-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
+const OTHER_PLAINTEXT = "sk-export-roundtrip-uncached";
+const OTHER_KEY_HASH = createHash("sha256").update(OTHER_PLAINTEXT).digest("hex");
 // A distinctive marker so the no-leak assertion is unambiguous.
 const PROVIDER_SECRET = "sk-provider-secret-must-not-leak-1a2b3c";
 
@@ -95,16 +97,23 @@ describe("aisix export: etcd → export → file round-trip", () => {
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    const key = await seed.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_model_ids: [allowed.id],
-    });
     // Scoped to the caller key by its id: the reference a file could not
-    // carry while its ids were derived from entry names.
+    // carry while its ids were derived from entry names. The key itself is
+    // seeded last, so it authenticating means everything else has landed.
+    const key = { id: randomUUID() };
     const policy = await seed.createCachePolicy({
       name: "rt-per-key-cache",
       enabled: true,
       applies_to: `api_key:${key.id}`,
+    });
+    // A second caller the policy does not scope.
+    await seed.createApiKey({
+      key_hash: OTHER_KEY_HASH,
+      allowed_model_ids: [allowed.id],
+    });
+    await seed.update("api_keys", key.id, {
+      key_hash: CALLER_KEY_HASH,
+      allowed_model_ids: [allowed.id],
     });
     Object.assign(ids, {
       pk: pk.id,
@@ -114,16 +123,10 @@ describe("aisix export: etcd → export → file round-trip", () => {
       policy: policy.id,
     });
 
-    // etcd propagates asynchronously — gate on the allowed model serving
-    // before the test reads etcd via export.
+    // etcd propagates asynchronously — gate on the last-seeded key
+    // authenticating before the test reads etcd via export.
     const probe = new ProxyClient(etcdApp.proxyUrl, CALLER_PLAINTEXT);
-    await waitConfigPropagation(async () => {
-      const r = await probe.chat({
-        model: "rt-allowed",
-        messages: [{ role: "user", content: "ready-probe" }],
-      });
-      return r.status === 200;
-    });
+    await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
   });
 
   afterAll(async () => {
@@ -166,8 +169,8 @@ describe("aisix export: etcd → export → file round-trip", () => {
     const idsOf = (kind: string) => doc[kind]!.map((e) => e.id).sort();
     expect(idsOf("provider_keys")).toEqual([ids.pk]);
     expect(idsOf("models")).toEqual([ids.allowed, ids.forbidden].sort());
-    expect(idsOf("api_keys")).toEqual([ids.key]);
-    expect(doc.api_keys![0]!.allowed_model_ids).toEqual([ids.allowed]);
+    expect(idsOf("api_keys")).toContain(ids.key);
+    expect(doc.api_keys!.find((k) => k.id === ids.key)!.allowed_model_ids).toEqual([ids.allowed]);
     expect(doc.cache_policies![0]).toMatchObject({
       id: ids.policy,
       applies_to: `api_key:${ids.key}`,
@@ -194,8 +197,9 @@ describe("aisix export: etcd → export → file round-trip", () => {
       expect(res.status).toBe(200);
       return ((await res.json()) as Array<{ id: string }>).map((e) => e.id).sort();
     };
+    expect(await listIds("provider_keys")).toEqual([ids.pk]);
     expect(await listIds("models")).toEqual([ids.allowed, ids.forbidden].sort());
-    expect(await listIds("api_keys")).toEqual([ids.key]);
+    expect(await listIds("api_keys")).toContain(ids.key);
     expect(await listIds("cache_policies")).toEqual([ids.policy]);
 
     const fileProxy = new ProxyClient(fileApp.proxyUrl, CALLER_PLAINTEXT);
@@ -257,11 +261,11 @@ describe("aisix export: etcd → export → file round-trip", () => {
     // file side: the repeat is served from cache and never reaches the
     // upstream.
     const prompt = `cache-${randomUUID()}`;
-    const cachedChat = () =>
+    const cachedChat = (caller = CALLER_PLAINTEXT) =>
       fetch(`${fileApp!.proxyUrl}/v1/chat/completions`, {
         method: "POST",
         headers: {
-          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          authorization: `Bearer ${caller}`,
           "content-type": "application/json",
         },
         body: JSON.stringify({ model: "rt-allowed", messages: [{ role: "user", content: prompt }] }),
@@ -276,6 +280,16 @@ describe("aisix export: etcd → export → file round-trip", () => {
     expect(second.headers.get("x-aisix-cache")).toBe("hit");
     await second.text();
     expect(upstream.receivedRequests.length).toBe(hitsBefore);
+
+    // A caller the policy does not scope is not served from that cache.
+    for (let i = 0; i < 2; i++) {
+      const before = upstream.receivedRequests.length;
+      const res = await cachedChat(OTHER_PLAINTEXT);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-aisix-cache")).not.toBe("hit");
+      await res.text();
+      expect(upstream.receivedRequests.length).toBe(before + 1);
+    }
   });
 
   test("default export redacts a live secret on every secret-bearing kind", async (ctx) => {
