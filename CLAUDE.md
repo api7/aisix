@@ -102,6 +102,10 @@ Output HIGH/MEDIUM/LOW per finding with **concrete suggested code**, not vague "
 
 This repo is developed end-to-end by agents — no human reviewer needs small review units — and CodeRabbit bills and rate-limits **per PR**. Fanning one effort into many small PRs burns review quota and stalls the session on throttled bot reviews. Keep ONE open PR per session and push follow-up and related work to it as additional commits (rule and doc riders included) instead of opening another. Split only when a fix must merge independently ahead of the batch, or when the user asks for separate delivery.
 
+## The Advisories Gate Is Fixed Where It Goes Red
+
+The `cargo deny (advisories)` CI job checks the root `Cargo.lock` against the RustSec database on every pull request and on `main`; a vulnerability advisory fails it (policy in `deny.toml`). Because the database moves on its own, the job can turn red on a PR that touched no dependency — fix it in that PR anyway, by updating or replacing the affected crate, rather than leaving it for someone else. An `ignore` entry in `deny.toml` needs a written `reason` naming why the advisory does not apply or cannot be fixed yet, and a maintainer's sign-off on the PR that adds it.
+
 ## A Behavior Change Is Stated in the PR Description
 
 **Release notes are assembled at release time from what the release contains, read as PR bodies rather than commit subjects — so a behavior change written nowhere but the diff never reaches users.** State it plainly in the description: what changed, what an existing configuration or caller experiences after upgrading, and whether anything has to be edited.

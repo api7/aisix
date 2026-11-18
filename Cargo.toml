@@ -101,6 +101,9 @@ rustls = "0.23"
 rustls-native-certs = "0.8"
 rustls-pemfile = "2"
 webpki-roots = "0.26"
+# The same Mozilla set as DER, for clients that take root certificates one
+# by one (the object-store sink).
+webpki-root-certs = "1"
 
 # Serialization / validation
 serde = { version = "1", features = ["derive"] }
@@ -194,9 +197,9 @@ redis = { version = "0.27", features = ["tokio-comp", "tokio-rustls-comp", "conn
 # Object-storage observability sink (aisix-obs): ONE crate covering S3 / GCS /
 # Azure Blob (+ S3-compatible MinIO/R2) behind a single `ObjectStore` trait, so
 # the sink is written once, not per-provider. The cloud features pull reqwest
-# default-features=false + rustls, so this stays rustls-only — no OpenSSL /
+# 0.13 default-features=false + rustls, so this stays rustls-only — no OpenSSL /
 # native-tls (same posture as the SLS sub-crates above).
-object_store = { version = "0.13", default-features = false, features = ["aws", "gcp", "azure", "tls-webpki-roots"] }
+object_store = { version = "0.14", default-features = false, features = ["aws", "gcp", "azure"] }
 # NDJSON gzip for the object-storage sink. flate2's default miniz_oxide backend
 # is pure Rust — no zlib/C, consistent with the no-OpenSSL posture.
 flate2 = "1"

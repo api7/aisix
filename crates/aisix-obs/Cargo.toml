@@ -33,6 +33,7 @@ parking_lot.workspace = true
 # Object-storage sink (S3/GCS/Azure behind one `ObjectStore` trait). `chrono`
 # renders the date-partitioned object key; `flate2` gzips NDJSON before upload.
 object_store.workspace = true
+webpki-root-certs.workspace = true
 chrono.workspace = true
 flate2.workspace = true
 sha2.workspace = true

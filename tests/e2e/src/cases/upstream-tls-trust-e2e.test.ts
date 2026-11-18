@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, writeFileSync } from "node:fs";
+import { createServer as createHttpsServer } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
@@ -10,6 +11,7 @@ import {
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForLogLine,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -257,6 +259,90 @@ describe("outbound TLS trust (#860)", () => {
     await settle(app);
 
     expect((await chat(app)).status).toBe(200);
+  });
+
+  // The object-store exporter runs on its own HTTP client stack, so the
+  // trust settings are pinned on it separately: a private-CA S3 endpoint is
+  // rejected by default and trusted through upstream.tls.ca_file.
+  test.for([
+    ["rejects a private-CA S3 endpoint with no TLS config", undefined],
+    ["trusts a private-CA S3 endpoint through upstream.tls.ca_file", "ca_file"],
+  ] as const)("the object-store exporter %s", { timeout: 60_000 }, async ([, tls], ctx) => {
+    if (!etcdReachable || !haveOpenssl) {
+      ctx.skip();
+      return;
+    }
+    const puts: string[] = [];
+    const s3 = createHttpsServer({ key: pki!.serverKey, cert: pki!.serverCert }, (req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        if (req.method === "PUT") puts.push(Buffer.concat(chunks).toString("utf8"));
+        res.statusCode = 200;
+        res.setHeader("etag", '"e2e-etag"');
+        res.end();
+      });
+    });
+    await new Promise<void>((resolve) => s3.listen(0, "127.0.0.1", resolve));
+    const port = (s3.address() as { port: number }).port;
+    try {
+      const app = await spawnApp({
+        ...(tls ? { extra: { upstream: { tls: { ca_file: pki!.caCertPath } } } } : {}),
+        extraEnv: {
+          OBJSTORE_CRED_TLS_S3_AWS_ACCESS_KEY_ID: "AKIDE2E",
+          OBJSTORE_CRED_TLS_S3_AWS_SECRET_ACCESS_KEY: "secret-e2e",
+        },
+      });
+      apps.push(app);
+      const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
+      await seed.createObservabilityExporter({
+        name: "s3-private-ca",
+        enabled: true,
+        kind: "object_store",
+        provider: "s3",
+        bucket: "private-ca-bucket",
+        prefix: "p",
+        region: "us-east-1",
+        endpoint: `https://127.0.0.1:${port}`,
+        compression: "none",
+        credential_ref: "tls-s3",
+      });
+      const ready = await startOpenAiUpstream({ nonStreamBody: REPLY });
+      try {
+        const pk = await seed.createProviderKey({
+          display_name: `plain-pk-${app.etcdPrefix}`,
+          secret: "sk-mock",
+          api_base: ready.baseUrl,
+        });
+        await seed.createModel({
+          display_name: MODEL,
+          provider: "openai",
+          model_name: "gpt-4o-mini",
+          provider_key_id: pk.id,
+        });
+        await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: [MODEL] });
+        await waitConfigPropagation(async () => (await chat(app)).status === 200);
+        if (tls) {
+          const deadline = Date.now() + 30_000;
+          while (puts.length === 0 && Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 200));
+          }
+          expect(puts.length, "an object upload reaches the private-CA endpoint").toBeGreaterThan(0);
+        } else {
+          await waitForLogLine(
+            app,
+            (line) => line.includes("s3-private-ca") && line.toLowerCase().includes("certificate"),
+            "the exporter's certificate failure",
+            30_000,
+          );
+          expect(puts).toEqual([]);
+        }
+      } finally {
+        await ready.close();
+      }
+    } finally {
+      await new Promise<void>((resolve) => s3.close(() => resolve()));
+    }
   });
 
   test("a ca_file that is not a certificate fails the boot instead of trusting nothing", async (ctx) => {

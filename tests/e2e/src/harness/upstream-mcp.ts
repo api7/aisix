@@ -35,6 +35,8 @@ export interface McpUpstream {
 export type McpToolFault =
   | { kind: "http"; status: number; body: string; contentType?: string }
   | { kind: "jsonrpc"; code: number; message: string }
+  /** A `200` carrying a text result of exactly `textBytes` ASCII bytes. */
+  | { kind: "large"; textBytes: number; framing: "json" | "sse" }
   | { kind: "hang" };
 
 export interface McpUpstreamOptions {
@@ -158,6 +160,21 @@ async function handle(
       res
         .writeHead(fault.status, { "content-type": fault.contentType ?? "text/plain" })
         .end(fault.body);
+      return;
+    }
+    if (fault?.kind === "large") {
+      const message = JSON.stringify({
+        jsonrpc: "2.0",
+        id: call.id,
+        result: { content: [{ type: "text", text: "x".repeat(fault.textBytes) }] },
+      });
+      if (fault.framing === "sse") {
+        res
+          .writeHead(200, { "content-type": "text/event-stream" })
+          .end(`event: message\ndata: ${message}\n\n`);
+      } else {
+        res.writeHead(200, { "content-type": "application/json" }).end(message);
+      }
       return;
     }
     if (fault?.kind === "jsonrpc") {

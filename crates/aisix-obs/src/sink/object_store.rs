@@ -268,6 +268,15 @@ fn client_options_for(
     if let Some(n) = cfg.pool_max_idle_per_host {
         options = options.with_pool_max_idle_per_host(n);
     }
+    // `object_store`'s client trusts the platform store only; the bundled
+    // Mozilla set keeps it trusting what the gateway's other clients trust
+    // on a host or image without system CA certificates.
+    for root in webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .filter_map(|der| object_store::Certificate::from_der(der).ok())
+    {
+        options = options.with_root_certificate(root);
+    }
     if let Some(pem) = &tls.extra_ca_pem {
         // Validated at boot by `TlsSettings::load`.
         match object_store::Certificate::from_pem_bundle(pem) {

@@ -41,6 +41,21 @@ jobs:
       - name: check guardrails without provider features
         run: cargo check --locked -p aisix-guardrails --no-default-features
 
+  advisories:
+    # RustSec vulnerability gate over the root Cargo.lock. Policy (what fails,
+    # what only warns, how an ignore is justified) lives in deny.toml.
+    name: cargo deny (advisories)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@cargo-deny
+      - name: cargo deny check advisories
+        run: cargo deny --locked check -W unmaintained -W unsound -W notice advisories
+
   schema-drift:
     name: schema drift (resources)
     runs-on: ubuntu-latest

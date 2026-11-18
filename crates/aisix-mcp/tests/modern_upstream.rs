@@ -45,6 +45,8 @@ struct StubRecorder {
     discover: AtomicUsize,
     /// JSON-RPC method sequence, in arrival order.
     sequence: Mutex<Vec<String>>,
+    /// `params.protocolVersion` of every `initialize`, in arrival order.
+    initialize_versions: Mutex<Vec<String>>,
     /// Headers seen on the most recent `tools/call`.
     call_headers: Mutex<Vec<(String, String)>>,
 }
@@ -108,6 +110,16 @@ async fn stub_mcp(
     match method.as_str() {
         "initialize" => {
             stub.recorder.initialize.fetch_add(1, Ordering::SeqCst);
+            stub.recorder
+                .initialize_versions
+                .lock()
+                .expect("versions lock")
+                .push(
+                    message["params"]["protocolVersion"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
             match stub.generation {
                 StubGeneration::ModernOnly => method_not_found("initialize"),
                 StubGeneration::Legacy { stateful } => {
@@ -437,5 +449,50 @@ async fn stateful_legacy_upstream_receives_the_full_handshake_sequence() {
             "tools/call".to_string(),
         ],
         "every bridge session must run the full legacy lifecycle"
+    );
+}
+
+/// An upstream that answers `server/discover` with a plain HTTP 4xx (a wrong
+/// path, say) is reported by that status, as the same failure under the
+/// legacy handshake is — not as an in-band JSON-RPC error.
+#[tokio::test]
+async fn discover_rejected_with_http_404_reports_the_status() {
+    let app = axum::Router::new().route(
+        "/mcp",
+        axum::routing::post(|| async { (axum::http::StatusCode::NOT_FOUND, "no such endpoint") }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let upstream =
+        McpUpstream::new(format!("http://{addr}/mcp")).with_protocol(McpProtocol::V20260728);
+    let error = match RmcpBridge::connect(&upstream).await {
+        Ok(_) => panic!("a 404 must fail the connect"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.tool_call_failure(),
+        Some(aisix_mcp::ToolCallFailure::UpstreamStatus(404)),
+        "{error}"
+    );
+}
+
+/// The default (handshake) lifecycle asks the upstream for `2025-11-25`, a
+/// revision that has an `initialize` handshake — never the SDK's newest
+/// version, which has none and would move the session onto the stateless
+/// lifecycle if the upstream echoed it.
+#[tokio::test]
+async fn legacy_handshake_requests_2025_11_25() {
+    let (addr, recorder) = spawn_stub(StubGeneration::Legacy { stateful: false }).await;
+    RmcpBridge::connect(&McpUpstream::new(format!("http://{addr}/mcp")))
+        .await
+        .expect("legacy upstream connects under the default config");
+    assert_eq!(
+        *recorder.initialize_versions.lock().expect("versions lock"),
+        vec!["2025-11-25".to_string()]
     );
 }
