@@ -523,6 +523,32 @@ fn a_model_priced_by_a_key_no_exported_pricing_document_carries_is_reported() {
 }
 
 #[test]
+fn of_two_prices_sharing_a_key_only_the_one_the_gateway_applies_is_exported() {
+    // The newer row has the smaller id, so a file that stamps both with one
+    // revision would apply the older price.
+    let older = "ffffffff-0000-4000-8000-000000000000";
+    let newer = "00000000-ffff-4000-8000-000000000000";
+    let entries: Vec<RawEntry> = [(older, 1, 1), (newer, 2, 9)]
+        .into_iter()
+        .map(|(id, revision, price)| RawEntry {
+            key: format!("/aisix/global/pricing/{id}"),
+            value: serde_json::to_vec(
+                &json!({"key": "openai/gpt-4o", "input_per_1k": price, "output_per_1k": price}),
+            )
+            .unwrap(),
+            revision,
+        })
+        .collect();
+    let doc = export_entries(&entries);
+    let rows = &doc.global_collections[0].1;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["id"], json!(newer));
+    assert_eq!(rows[0]["input_per_1k"], json!(9));
+    assert_eq!(doc.warnings.len(), 1, "{:?}", doc.warnings);
+    assert!(doc.warnings[0].contains(older), "{}", doc.warnings[0]);
+}
+
+#[test]
 fn two_fields_of_one_entry_sharing_a_placeholder_are_reported() {
     let doc = export(
         &[(

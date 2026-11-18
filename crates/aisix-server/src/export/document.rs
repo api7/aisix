@@ -153,6 +153,24 @@ pub fn build_export_document(
     raw: &RawDocs,
     reveal_secrets: bool,
 ) -> ExportDocument {
+    let mut warnings = Vec::new();
+    // Only the price the gateway applies is written: a file stamps every
+    // row with one revision, so a superseded row could win there instead.
+    let mut raw = raw.clone();
+    for (table, raw_kind) in [
+        (&snapshot.pricing, "pricing"),
+        (&snapshot.global_pricing, "global_pricing"),
+    ] {
+        for (id, key, winner) in superseded_prices(table) {
+            raw.remove(&(raw_kind.to_string(), id.clone()));
+            warnings.push(format!(
+                "{raw_kind} {id:?} carries key {key:?}, which the newer {winner:?} also carries; \
+                 only the newer one, the price the gateway applies, is exported"
+            ));
+        }
+    }
+    let raw = &raw;
+
     let mut placeholders = Vec::new();
     let mut collections: Vec<(&'static str, Vec<Value>)> = Vec::new();
     let mut global_collections: Vec<(&'static str, Vec<Value>)> = Vec::new();
@@ -336,17 +354,19 @@ pub fn build_export_document(
         |_, _| {}
     );
 
-    let mut warnings = dangling_references(snapshot);
+    warnings.extend(dangling_references(snapshot));
 
     // The catalog is read from `<prefix>/global/`, so an export of an
     // environment prefix (`<base>/<env_id>`) does not reach the catalog the
-    // gateway reads from `<base>/global/`.
-    let exported_keys: BTreeSet<String> = snapshot
-        .pricing
-        .entries()
-        .into_iter()
-        .chain(snapshot.global_pricing.entries())
-        .map(|e| e.value.key.clone())
+    // gateway reads from `<base>/global/`. Keyed off the written rows, so
+    // a price left out of the file counts as missing too.
+    let exported_keys: BTreeSet<String> = collections
+        .iter()
+        .chain(&global_collections)
+        .filter(|(kind, _)| *kind == "pricing")
+        .flat_map(|(_, entries)| entries)
+        .filter_map(|e| e.get("key").and_then(Value::as_str))
+        .map(|key| key.replace("$$", "$"))
         .collect();
     for entry in snapshot.models.entries() {
         let model = &entry.value;
@@ -414,6 +434,31 @@ pub fn build_export_document(
         secret_placeholders: placeholders,
         warnings,
     }
+}
+
+/// `(id, key, winner id)` of every price another row of the same table
+/// overrides under the gateway's rule: highest revision, then highest id.
+fn superseded_prices(
+    table: &aisix_core::snapshot::ResourceTable<aisix_core::models::Pricing>,
+) -> Vec<(String, String, String)> {
+    let entries = table.entries();
+    let mut winners: BTreeMap<&str, (i64, &str)> = BTreeMap::new();
+    for e in &entries {
+        let candidate = (e.revision, e.id.as_str());
+        let slot = winners.entry(e.value.key.as_str()).or_insert(candidate);
+        if candidate > *slot {
+            *slot = candidate;
+        }
+    }
+    let mut out: Vec<(String, String, String)> = entries
+        .iter()
+        .filter_map(|e| {
+            let (_, winner) = winners[e.value.key.as_str()];
+            (winner != e.id).then(|| (e.id.clone(), e.value.key.clone(), winner.to_string()))
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 fn push_kind(

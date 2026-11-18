@@ -9,6 +9,8 @@ import { parse as parseYaml } from "yaml";
 import {
   awaitWindowHeadroom,
   droppedRows,
+  metricDelta,
+  scrapeMetrics,
   EtcdClient,
   etcdEndpoint,
   ProxyClient,
@@ -433,12 +435,23 @@ describe("aisix export: the kinds that are not routes round-trip too", () => {
       ctx.skip();
       return;
     }
-    const cheap = await startOpenAiUpstream({ nonStreamBody: chatBody("rt-cheap-served") });
-    const pricey = await startOpenAiUpstream({ nonStreamBody: chatBody("rt-pricey-served") });
-    const estimated = await startOpenAiUpstream({ nonStreamBody: chatBody(ESTIMATE_ANSWER, false) });
-    upstreams.push(cheap, pricey, estimated);
+    const start = async (body: Record<string, unknown>) => {
+      const upstream = await startOpenAiUpstream({ nonStreamBody: body });
+      upstreams.push(upstream);
+      return upstream;
+    };
+    const cheap = await start(chatBody("rt-cheap-served"));
+    const pricey = await start(chatBody("rt-pricey-served"));
+    const estimated = await start(chatBody(ESTIMATE_ANSWER, false));
 
-    const source = await spawnApp();
+    // The caller's team and member names are read from the `teams` and
+    // `users` documents, so the label shows whether those reached the file.
+    const labels = {
+      AISIX_OBSERVABILITY__METRICS__LABELS: JSON.stringify({
+        aisix_proxy_requests_total: ["team_name", "user_name"],
+      }),
+    };
+    const source = await spawnApp({ extraEnv: labels });
     apps.push(source);
     const seed = new SeedClient(etcd, source.etcdPrefix);
     // The shared catalog the gateway reads beside its own prefix.
@@ -511,6 +524,8 @@ describe("aisix export: the kinds that are not routes round-trip too", () => {
     await seed.createApiKey({
       key_hash: createHash("sha256").update(priceCaller).digest("hex"),
       allowed_models: ["*"],
+      team_id: ids.team,
+      user_id: ids.user,
     });
     for (const caller of [capCaller, priceCaller]) {
       const probe = new ProxyClient(source.proxyUrl, caller);
@@ -545,7 +560,7 @@ describe("aisix export: the kinds that are not routes round-trip too", () => {
     const vars = placeholderVars(yaml);
     const file = await spawnApp({
       resourcesFile: yaml,
-      extraEnv: Object.fromEntries(vars.map((v) => [v, "sk-mock"])),
+      extraEnv: { ...labels, ...Object.fromEntries(vars.map((v) => [v, "sk-mock"])) },
     });
     apps.push(file);
     expect(await droppedRows(file)).toEqual({ rejected: [], unknown_kinds: [] });
@@ -567,10 +582,18 @@ describe("aisix export: the kinds that are not routes round-trip too", () => {
 
     for (const app of [source, file]) {
       // The catalog price, not the inline cost, ranks the targets.
+      const before = await scrapeMetrics(app.metricsUrl);
       const res = await post(app, priceCaller, "rt-least-cost", "cheapest please");
       expect(res.status).toBe(200);
       const body = (await res.json()) as { choices: Array<{ message: { content: string } }> };
       expect(body.choices[0]?.message.content).toBe("rt-cheap-served");
+      const after = await scrapeMetrics(app.metricsUrl);
+      expect(
+        metricDelta(before, after, "aisix_proxy_requests_total", {
+          team_name: "rt-team",
+          user_name: "rt-user",
+        }),
+      ).toBe(1);
 
       // The upstream reports no usage, so every request is estimated at
       // more than the key's TPM — and none of it counts.
