@@ -14,6 +14,12 @@
 //! A reference naming an id that is not among the exported entries is
 //! reported as a warning: the file carries it as stored, and a gateway
 //! loading it resolves it to nothing, exactly as the source gateway does.
+//!
+//! Every kind the gateway reads is exported, from the environment prefix
+//! and the shared `global/` one, except `budgets`: a budget's `exhausted`
+//! state is written at run time by the control plane's usage aggregator,
+//! and file mode has nothing to update it, so the file would freeze an
+//! exhausted budget refusing traffic.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -42,6 +48,9 @@ pub struct ExportDocument {
     /// `(kind, entries)` in a fixed collection order; only non-empty kinds
     /// are included. Every entry carries its `id`.
     pub collections: Vec<(&'static str, Vec<Value>)>,
+    /// The same, for the documents of the shared `global/` prefix — the
+    /// file's `global:` section.
+    pub global_collections: Vec<(&'static str, Vec<Value>)>,
     /// Placeholders substituted for live credentials (empty when
     /// `reveal_secrets` is set).
     pub secret_placeholders: Vec<SecretPlaceholder>,
@@ -53,11 +62,12 @@ pub struct ExportDocument {
 /// Which credentials of one kind's documents are redacted.
 type Redact = fn(&mut Value, &mut RedactionCtx<'_>);
 
-/// The stored documents, keyed by `(kind, id)`.
+/// The stored documents, keyed by `(table, id)` — the snapshot table, so a
+/// global `pricing` document is keyed `global_pricing`.
 pub type RawDocs = BTreeMap<(String, String), serde_json::Map<String, Value>>;
 
-/// The stored documents of the rows the loader accepted, environment
-/// prefix only, with every field the loader ignored on them removed.
+/// The stored documents of the rows the loader accepted, with every field
+/// the loader ignored on them removed.
 ///
 /// An ignored field is one this gateway does not define, so it configures
 /// nothing here — and nothing knows whether it holds a credential, so it is
@@ -84,9 +94,6 @@ pub fn stored_documents(
         let Ok(key) = prefixes.resolve(&entry.key) else {
             continue;
         };
-        if key.scope != aisix_etcd::PrefixScope::Environment {
-            continue;
-        }
         let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(&entry.value) else {
             continue;
         };
@@ -111,7 +118,7 @@ pub fn stored_documents(
             ));
         }
         let Value::Object(doc) = doc else { continue };
-        docs.insert((key.kind.to_string(), key.id.to_string()), doc);
+        docs.insert((key.table_kind().to_string(), key.id.to_string()), doc);
     }
     (docs, notes)
 }
@@ -146,17 +153,40 @@ pub fn build_export_document(
     raw: &RawDocs,
     reveal_secrets: bool,
 ) -> ExportDocument {
+    let mut warnings = Vec::new();
+    // Only the price the gateway applies is written: a file stamps every
+    // row with one revision, so a superseded row could win there instead.
+    let mut raw = raw.clone();
+    for (table, raw_kind) in [
+        (&snapshot.pricing, "pricing"),
+        (&snapshot.global_pricing, "global_pricing"),
+    ] {
+        for (id, key, winner) in superseded_prices(table) {
+            raw.remove(&(raw_kind.to_string(), id.clone()));
+            warnings.push(format!(
+                "{raw_kind} {id:?} carries key {key:?}, which the newer {winner:?} also carries; \
+                 only the newer one, the price the gateway applies, is exported"
+            ));
+        }
+    }
+    let raw = &raw;
+
     let mut placeholders = Vec::new();
     let mut collections: Vec<(&'static str, Vec<Value>)> = Vec::new();
+    let mut global_collections: Vec<(&'static str, Vec<Value>)> = Vec::new();
 
     macro_rules! export {
         ($table:ident, $kind:literal, $token:literal, $name:expr, $redact:expr) => {
+            export!(collections, $table, $kind, $kind, $token, $name, $redact)
+        };
+        ($into:ident, $table:ident, $raw:literal, $kind:literal, $token:literal, $name:expr, $redact:expr) => {
             push_kind(
-                &mut collections,
+                &mut $into,
                 $kind,
                 emit_entries(
                     &snapshot.$table,
                     raw,
+                    $raw,
                     $kind,
                     $token,
                     $name,
@@ -297,68 +327,77 @@ pub fn build_export_document(
         |_| String::new(),
         |_, _| {}
     );
+    export!(teams, "teams", "TEAM", |t| t.name.clone(), |_, _| {});
+    export!(users, "users", "USER", |u| u.name.clone(), |_, _| {});
+    export!(
+        budget_policy,
+        "budget_policy",
+        "BUDGET_POLICY",
+        |_| String::new(),
+        |_, _| {}
+    );
+    export!(
+        usage_accounting,
+        "usage_accounting",
+        "USAGE_ACCOUNTING",
+        |_| String::new(),
+        |_, _| {}
+    );
+    export!(pricing, "pricing", "PRICING", |p| p.key.clone(), |_, _| {});
+    export!(
+        global_collections,
+        global_pricing,
+        "global_pricing",
+        "pricing",
+        "PRICING",
+        |p| p.key.clone(),
+        |_, _| {}
+    );
 
-    let mut warnings = dangling_references(snapshot);
+    warnings.extend(dangling_references(snapshot));
 
-    // Pricing documents are not exported, so a model priced by one changes
-    // price on a gateway loading this file.
+    // The catalog is read from `<prefix>/global/`, so an export of an
+    // environment prefix (`<base>/<env_id>`) does not reach the catalog the
+    // gateway reads from `<base>/global/`. Keyed off the written rows, so
+    // a price left out of the file counts as missing too.
+    let exported_keys: BTreeSet<String> = collections
+        .iter()
+        .chain(&global_collections)
+        .filter(|(kind, _)| *kind == "pricing")
+        .flat_map(|(_, entries)| entries)
+        .filter_map(|e| e.get("key").and_then(Value::as_str))
+        .map(|key| key.replace("$$", "$"))
+        .collect();
     for entry in snapshot.models.entries() {
         let model = &entry.value;
         let Some(key) = model.pricing_key.as_deref() else {
             continue;
         };
-        // Read off the stored document: a model's price is otherwise only
-        // ever read through the pricing resolver.
+        if exported_keys.contains(key) {
+            continue;
+        }
         let has_cost = raw
             .get(&("models".to_string(), entry.id.clone()))
             .is_some_and(|doc| doc.contains_key("cost"));
         let effect = if has_cost {
-            "falls back to its inline `cost`, a different price whenever the two disagree"
+            "falls back to its inline `cost`"
         } else {
-            "carries no price and ranks last under `least_cost`; set `cost` if the price matters"
+            "carries no price and ranks last under `least_cost`"
         };
         warnings.push(format!(
-            "model {:?} ({}) is priced by the pricing document {key:?}, which is not exported \
+            "model {:?} ({}) is priced by {key:?}, which no exported pricing document carries \
              — on a gateway loading this file it {effect}",
             model.display_name, entry.id
         ));
     }
 
-    // Pricing, teams, users, budgets and usage accounting are not exported: a gateway loading
-    // this file runs without them, and says so here.
-    for (kind, count, effect) in [
-        (
-            "teams",
-            snapshot.teams.len(),
-            "the `team_name` metric label reads `unknown`",
-        ),
-        (
-            "users",
-            snapshot.users.len(),
-            "the `user_name` metric label falls back to each api key's own `user_name`",
-        ),
-        ("budgets", snapshot.budgets.len(), "no budget is enforced"),
-        (
-            "budget_policy",
-            snapshot.budget_policy.len(),
-            "budgeted traffic behaves as `sticky`",
-        ),
-        (
-            "usage_accounting",
-            snapshot.usage_accounting.len(),
-            "estimated usage counts toward token rate limits",
-        ),
-        (
-            "pricing",
-            snapshot.pricing.len() + snapshot.global_pricing.len(),
-            "a model with a `pricing_key` falls back to its inline `cost`",
-        ),
-    ] {
-        if count > 0 {
-            warnings.push(format!(
-                "{count} {kind} document(s) not exported — on a gateway loading this file {effect}"
-            ));
-        }
+    if !snapshot.budgets.is_empty() {
+        warnings.push(format!(
+            "{} budgets document(s) not exported — a budget's `exhausted` state is written at \
+             run time by the control plane, which a file-mode gateway does not have to clear \
+             it; on a gateway loading this file no budget is enforced",
+            snapshot.budgets.len()
+        ));
     }
 
     // Two entries whose names differ only in characters `sanitize` folds
@@ -391,9 +430,35 @@ pub fn build_export_document(
 
     ExportDocument {
         collections,
+        global_collections,
         secret_placeholders: placeholders,
         warnings,
     }
+}
+
+/// `(id, key, winner id)` of every price another row of the same table
+/// overrides under the gateway's rule: highest revision, then highest id.
+fn superseded_prices(
+    table: &aisix_core::snapshot::ResourceTable<aisix_core::models::Pricing>,
+) -> Vec<(String, String, String)> {
+    let entries = table.entries();
+    let mut winners: BTreeMap<&str, (i64, &str)> = BTreeMap::new();
+    for e in &entries {
+        let candidate = (e.revision, e.id.as_str());
+        let slot = winners.entry(e.value.key.as_str()).or_insert(candidate);
+        if candidate > *slot {
+            *slot = candidate;
+        }
+    }
+    let mut out: Vec<(String, String, String)> = entries
+        .iter()
+        .filter_map(|e| {
+            let (_, winner) = winners[e.value.key.as_str()];
+            (winner != e.id).then(|| (e.id.clone(), e.value.key.clone(), winner.to_string()))
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 fn push_kind(
@@ -419,6 +484,7 @@ fn push_kind(
 fn emit_entries<T, N>(
     table: &aisix_core::snapshot::ResourceTable<T>,
     raw: &RawDocs,
+    raw_kind: &str,
     kind: &'static str,
     kind_token: &'static str,
     name: N,
@@ -435,7 +501,7 @@ where
 
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
-        let Some(stored) = raw.get(&(kind.to_string(), entry.id.clone())) else {
+        let Some(stored) = raw.get(&(raw_kind.to_string(), entry.id.clone())) else {
             continue;
         };
         // `id` from the key, never from a stray `id` field in the document.

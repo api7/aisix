@@ -279,25 +279,121 @@ fn dollars_in_stored_strings_are_escaped() {
     );
 }
 
+const TEAM: &str = "1b2c3d4e-5f60-4718-8a9b-0c1d2e3f4a5b";
+const USER: &str = "2c3d4e5f-6071-4829-9bac-1d2e3f4a5b6c";
+const ENV: &str = "3d4e5f60-7182-493a-acbd-2e3f4a5b6c7d";
+const PRICE: &str = "4e5f6071-8293-4a4b-bdce-3f4a5b6c7d8e";
+const CATALOG_PRICE: &str = "5f607182-93a4-4b5c-8edf-4a5b6c7d8e9f";
+const BUDGET: &str = "60718293-a4b5-4c6d-9fe0-5b6c7d8e9fa0";
+
+/// One document of every kind beside the ones `rows()` carries that the
+/// gateway reads, the catalog price under the global prefix.
+fn every_other_kind() -> Vec<RawEntry> {
+    [
+        ("/aisix/teams", TEAM, json!({"name": "eng"})),
+        ("/aisix/users", USER, json!({"name": "ana"})),
+        (
+            "/aisix/budget_policy",
+            ENV,
+            json!({"fail_mode": "closed", "closed_grace_seconds": 600}),
+        ),
+        (
+            "/aisix/usage_accounting",
+            ENV,
+            json!({"exclude_estimated_usage": true}),
+        ),
+        (
+            "/aisix/pricing",
+            PRICE,
+            json!({"key": "openai/gpt-4o", "input_per_1k": 5, "output_per_1k": 15}),
+        ),
+        (
+            "/aisix/global/pricing",
+            CATALOG_PRICE,
+            json!({"key": "openai/gpt-4o", "input_per_1k": 2.5, "output_per_1k": 10}),
+        ),
+        (
+            "/aisix/budgets",
+            BUDGET,
+            json!({"scope": "api_key", "scope_ref": KEY, "period": "month", "exhausted": {"reason": {}}}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, (prefix, id, value))| RawEntry {
+        key: format!("{prefix}/{id}"),
+        value: serde_json::to_vec(&value).unwrap(),
+        revision: i as i64 + 100,
+    })
+    .collect()
+}
+
+/// `aisix export` over raw etcd rows, environment and global prefix both.
+fn export_entries(entries: &[RawEntry]) -> ExportDocument {
+    let prefixes = PrefixSet::new(vec![
+        WatchedPrefix::environment("/aisix"),
+        WatchedPrefix::global("/aisix/global/"),
+    ]);
+    let (snap, stats) = build_snapshot(&prefixes, entries);
+    assert!(stats.rejections.is_empty(), "{:?}", stats.rejections);
+    let (raw, notes) = stored_documents(&prefixes, entries, &stats);
+    assert!(notes.is_empty(), "{notes:?}");
+    build_export_document(&snap, &raw, false)
+}
+
 #[test]
-fn kinds_a_file_does_not_carry_are_reported() {
-    let doc = export(
-        &[
-            ("teams", PK, json!({"name": "eng"})),
-            ("users", MODEL, json!({"name": "ana"})),
-        ],
-        false,
+fn every_kind_the_gateway_reads_is_exported_except_budgets() {
+    let doc = export_entries(&every_other_kind());
+    for (kind, id) in [
+        ("teams", TEAM),
+        ("users", USER),
+        ("budget_policy", ENV),
+        ("usage_accounting", ENV),
+        ("pricing", PRICE),
+    ] {
+        assert_eq!(find(&doc, kind)[0]["id"], json!(id), "{kind}");
+    }
+    assert_eq!(
+        find(&doc, "usage_accounting")[0]["exclude_estimated_usage"],
+        json!(true)
     );
-    assert!(doc.collections.is_empty());
-    let warnings = doc.warnings.join("\n");
+    assert_eq!(
+        doc.global_collections,
+        vec![(
+            "pricing",
+            vec![json!({
+                "id": CATALOG_PRICE,
+                "key": "openai/gpt-4o",
+                "input_per_1k": 2.5,
+                "output_per_1k": 10
+            })]
+        )]
+    );
+    assert!(doc.collections.iter().all(|(k, _)| *k != "budgets"));
+    assert_eq!(doc.warnings.len(), 1, "{:?}", doc.warnings);
     assert!(
-        warnings.contains("1 teams document(s) not exported"),
-        "{warnings}"
+        doc.warnings[0].contains("1 budgets document(s) not exported"),
+        "{}",
+        doc.warnings[0]
     );
-    assert!(
-        warnings.contains("1 users document(s) not exported"),
-        "{warnings}"
-    );
+}
+
+#[test]
+fn every_exported_kind_loads_back_from_the_file() {
+    let doc = export_entries(&every_other_kind());
+    let yaml = super::super::yaml_emit::emit_yaml(&doc).unwrap();
+    let entries = aisix_etcd::file_source::read_str(&yaml, "exported.yaml", 1, &|_| None)
+        .unwrap_or_else(|e| panic!("{e}\n{yaml}"));
+    let (loaded, stats) = build_snapshot(&aisix_etcd::file_source::prefixes(), &entries);
+    assert!(stats.rejections.is_empty(), "{:?}", stats.rejections);
+    assert!(loaded.teams.get_by_id(TEAM).is_some());
+    assert!(loaded.users.get_by_id(USER).is_some());
+    assert!(loaded.budget_policy.get_by_id(ENV).is_some());
+    assert!(loaded.excludes_estimated_usage());
+    assert!(loaded.pricing.get_by_id(PRICE).is_some());
+    assert!(loaded.global_pricing.get_by_id(CATALOG_PRICE).is_some());
+    assert!(loaded.pricing.get_by_id(CATALOG_PRICE).is_none());
+    assert!(loaded.budgets.is_empty());
 }
 
 #[test]
@@ -400,11 +496,16 @@ fn a_custom_guardrail_s_script_secrets_are_redacted() {
 }
 
 #[test]
-fn a_model_priced_by_a_pricing_document_is_reported() {
+fn a_model_priced_by_a_key_no_exported_pricing_document_carries_is_reported() {
     let mut rows = rows();
     rows[1].2["pricing_key"] = json!("openai/gpt-4o");
     let doc = export(&rows, false);
     assert_eq!(doc.warnings.len(), 1, "{:?}", doc.warnings);
+    assert!(
+        doc.warnings[0].contains("carries no price"),
+        "{}",
+        doc.warnings[0]
+    );
     rows[1].2["cost"] = json!({"input_per_1k": 1, "output_per_1k": 2});
     let with_cost = export(&rows, false);
     assert!(
@@ -412,11 +513,39 @@ fn a_model_priced_by_a_pricing_document_is_reported() {
         "{}",
         with_cost.warnings[0]
     );
-    assert!(
-        doc.warnings[0].contains("carries no price"),
-        "{}",
-        doc.warnings[0]
-    );
+    rows.push((
+        "pricing",
+        PRICE,
+        json!({"key": "openai/gpt-4o", "input_per_1k": 5, "output_per_1k": 15}),
+    ));
+    let priced = export(&rows, false);
+    assert!(priced.warnings.is_empty(), "{:?}", priced.warnings);
+}
+
+#[test]
+fn of_two_prices_sharing_a_key_only_the_one_the_gateway_applies_is_exported() {
+    // The newer row has the smaller id, so a file that stamps both with one
+    // revision would apply the older price.
+    let older = "ffffffff-0000-4000-8000-000000000000";
+    let newer = "00000000-ffff-4000-8000-000000000000";
+    let entries: Vec<RawEntry> = [(older, 1, 1), (newer, 2, 9)]
+        .into_iter()
+        .map(|(id, revision, price)| RawEntry {
+            key: format!("/aisix/global/pricing/{id}"),
+            value: serde_json::to_vec(
+                &json!({"key": "openai/gpt-4o", "input_per_1k": price, "output_per_1k": price}),
+            )
+            .unwrap(),
+            revision,
+        })
+        .collect();
+    let doc = export_entries(&entries);
+    let rows = &doc.global_collections[0].1;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["id"], json!(newer));
+    assert_eq!(rows[0]["input_per_1k"], json!(9));
+    assert_eq!(doc.warnings.len(), 1, "{:?}", doc.warnings);
+    assert!(doc.warnings[0].contains(older), "{}", doc.warnings[0]);
 }
 
 #[test]

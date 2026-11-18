@@ -20,10 +20,12 @@
 //! the pre-#1143 behavior byte for byte: every `/mcp` request needs a
 //! valid gateway credential and no discovery surface is published.
 //!
-//! At most one row exists per environment. The declarative resources
-//! file rejects a document carrying more than one entry at load, and the
-//! runtime resolvers fail closed if a duplicate reaches a live snapshot
-//! anyway (a stale etcd key), rather than picking one by id order.
+//! The control plane writes at most one row per environment. Neither the
+//! loader nor the resources file refuses a second one, so a duplicate (a
+//! stale etcd key, or a second entry in the file) loads; the proxy then
+//! fails closed rather than picking one by id order: with more than one
+//! row, both OAuth discovery and anonymous access stay off until exactly
+//! one remains (`settings_row` in `aisix-proxy/src/mcp_auth.rs`).
 
 use serde::{Deserialize, Serialize};
 

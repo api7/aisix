@@ -78,15 +78,12 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("etcd range read under {:?} failed: {e}", args.prefix))?;
 
     // Decode through the identical loader path the gateway uses, so the
-    // exported set is exactly what the running gateway would serve.
-    // The catalog prefix is declared alongside the exported one even
-    // though export never emits a pricing document. When `--prefix` is
-    // the bare base — the pre-`env_id` shape — the range read also
-    // returns `<base>/global/pricing/*`, and resolved against the base
-    // alone those keys parse as kind `global` and are reported as
-    // rejected rows the operator did nothing wrong to produce. Declaring
-    // the prefix resolves them as the prices they are; they simply have
-    // no file form to be emitted into.
+    // exported set is exactly what the running gateway would serve. With
+    // `--prefix` the bare base (no `env_id`), the range read also returns the
+    // shared catalog under `<base>/global/`; declaring it resolves those keys
+    // as the global prices they are rather than as a kind `global`. An
+    // environment prefix (`<base>/<env_id>`) does not reach the catalog, which
+    // the per-model pricing warning then reports.
     let prefixes = PrefixSet::new(vec![
         WatchedPrefix::environment(&args.prefix),
         WatchedPrefix::global(format!("{}/global/", args.prefix.trim_end_matches('/'))),
@@ -100,6 +97,7 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
     let resource_count = document
         .collections
         .iter()
+        .chain(&document.global_collections)
         .map(|(_, entries)| entries.len())
         .sum::<usize>();
 
@@ -127,7 +125,14 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
     let invalid_ids: Vec<String> = document
         .collections
         .iter()
-        .flat_map(|(kind, entries)| entries.iter().map(move |e| (kind, e)))
+        .map(|(kind, entries)| (kind.to_string(), entries))
+        .chain(
+            document
+                .global_collections
+                .iter()
+                .map(|(kind, entries)| (format!("global.{kind}"), entries)),
+        )
+        .flat_map(|(kind, entries)| entries.iter().map(move |e| (kind.clone(), e)))
         .filter_map(|(kind, entry)| {
             let id = entry
                 .get("id")
@@ -262,5 +267,9 @@ fn report_secrets(document: &document::ExportDocument, reveal_secrets: bool) {
 }
 
 fn document_has_any_entry(document: &document::ExportDocument) -> bool {
-    document.collections.iter().any(|(_, e)| !e.is_empty())
+    document
+        .collections
+        .iter()
+        .chain(&document.global_collections)
+        .any(|(_, e)| !e.is_empty())
 }
