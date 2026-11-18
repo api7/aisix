@@ -40,7 +40,7 @@ const GUARDRAIL_SECRET_KEYS: &[&str] = &[
 /// information the command reports on stderr.
 pub struct ExportDocument {
     /// `(kind, entries)` in a fixed collection order; only non-empty kinds
-    /// are included. Every entry carries its `id` first.
+    /// are included. Every entry carries its `id`.
     pub collections: Vec<(&'static str, Vec<Value>)>,
     /// Placeholders substituted for live credentials (empty when
     /// `reveal_secrets` is set).
