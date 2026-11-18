@@ -296,6 +296,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "webpki-root-certs",
  "wiremock",
 ]
 
