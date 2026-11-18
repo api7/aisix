@@ -1752,12 +1752,15 @@ impl<P: ConfigProvider> Supervisor<P> {
         // reached steady state (applied its read and opened its watches).
         let mut preceding_delay = Duration::ZERO;
         let mut steady_since = None;
+        let mut after_failure = false;
         loop {
             if *cancel.borrow() {
                 return;
             }
 
-            match self.cycle(&cancel, &mut steady_since).await {
+            let outcome = self.cycle(&cancel, &mut steady_since, after_failure).await;
+            after_failure = matches!(outcome, Err(SupervisorError::Provider(_)));
+            match outcome {
                 Ok(()) => {
                     // Graceful stream end (compaction or server-initiated
                     // close). Reset backoff, but still yield a short
@@ -1847,6 +1850,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         &self,
         cancel: &tokio::sync::watch::Receiver<bool>,
         steady_since: &mut Option<tokio::time::Instant>,
+        after_failure: bool,
     ) -> Result<(), SupervisorError> {
         *steady_since = None;
         let load = tokio::select! {
@@ -1877,7 +1881,16 @@ impl<P: ConfigProvider> Supervisor<P> {
                 watch = source.provider.watch(from + 1) => watch,
             };
             match watch {
-                Ok(stream) => streams.push(stream),
+                Ok(stream) => {
+                    if after_failure {
+                        tracing::info!(
+                            prefix = %source.prefix.prefix,
+                            start_revision = from + 1,
+                            "etcd watch re-established after a failure",
+                        );
+                    }
+                    streams.push(stream);
+                }
                 Err(err) if source.tolerates(&err) => {
                     // No stream for this prefix this cycle. It is retried
                     // whenever the cycle restarts — which is what a
@@ -3494,7 +3507,8 @@ mod tests {
         );
         let (_tx, rx) = tokio::sync::watch::channel(false);
 
-        let cycle = tokio::time::timeout(Duration::from_secs(5), sup.cycle(&rx, &mut None)).await;
+        let cycle =
+            tokio::time::timeout(Duration::from_secs(5), sup.cycle(&rx, &mut None, false)).await;
         assert!(
             matches!(cycle, Ok(Ok(()))),
             "the environment watch ended, so the cycle must return and let \
@@ -3521,7 +3535,9 @@ mod tests {
         let sup = scoped_supervisor(Arc::clone(&env), Arc::clone(&global));
 
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        sup.cycle(&rx, &mut None).await.expect("cycle completes");
+        sup.cycle(&rx, &mut None, false)
+            .await
+            .expect("cycle completes");
 
         assert_eq!(
             *env.watched_from.lock().unwrap(),
@@ -3549,7 +3565,7 @@ mod tests {
         // The environment stream is empty, so the cycle drains it and
         // returns Ok — a refusal on the catalog would have surfaced here
         // as SupervisorError::Provider.
-        sup.cycle(&rx, &mut None)
+        sup.cycle(&rx, &mut None, false)
             .await
             .expect("cycle survives the refusal");
         assert_eq!(sup.handle().load().models.len(), 1);
@@ -3781,7 +3797,7 @@ mod tests {
 
         let (_tx, rx) = tokio::sync::watch::channel(false);
         // One cycle: load_all, then drain the whole prepared stream.
-        let _ = sup.cycle(&rx, &mut None).await;
+        let _ = sup.cycle(&rx, &mut None, false).await;
 
         let snap = sup.handle().load();
         assert_eq!(snap.models.len(), 6);
@@ -3825,7 +3841,7 @@ mod tests {
         let provider = Arc::new(FakeProvider::new(vec![], 0).with_events(events));
         let sup = Arc::new(Supervisor::new(provider, "/aisix"));
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        let _ = sup.cycle(&rx, &mut None).await;
+        let _ = sup.cycle(&rx, &mut None, false).await;
 
         let snap = sup.handle().load();
         assert_eq!(snap.models.len(), 1, "the put after the delete survived");
@@ -3977,7 +3993,7 @@ mod tests {
         let provider = Arc::new(FakeProvider::new(vec![], 0).with_events(events));
         let sup = Arc::new(Supervisor::new(provider, "/aisix"));
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        let _ = sup.cycle(&rx, &mut None).await;
+        let _ = sup.cycle(&rx, &mut None, false).await;
 
         let snap = sup.handle().load();
         assert_eq!(snap.models.len(), 1, "the pinned last known good serves");
@@ -4082,7 +4098,7 @@ mod tests {
         let watcher = tokio::spawn({
             let sup = sup.clone();
             async move {
-                let _ = sup.cycle(&cancel_rx, &mut None).await;
+                let _ = sup.cycle(&cancel_rx, &mut None, false).await;
             }
         });
 
@@ -4149,7 +4165,7 @@ mod tests {
         let watcher = tokio::spawn({
             let sup = sup.clone();
             async move {
-                let _ = sup.cycle(&cancel_rx, &mut None).await;
+                let _ = sup.cycle(&cancel_rx, &mut None, false).await;
             }
         });
 
@@ -4210,7 +4226,7 @@ mod tests {
 
         let watcher = tokio::spawn({
             let sup = sup.clone();
-            async move { sup.cycle(&cancel_rx, &mut None).await }
+            async move { sup.cycle(&cancel_rx, &mut None, false).await }
         });
         let load_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while sup.handle().version() == 0 {
@@ -4263,7 +4279,7 @@ mod tests {
 
         let watcher = tokio::spawn({
             let sup = sup.clone();
-            async move { sup.cycle(&cancel_rx, &mut None).await }
+            async move { sup.cycle(&cancel_rx, &mut None, false).await }
         });
         let load_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while sup.handle().version() == 0 {

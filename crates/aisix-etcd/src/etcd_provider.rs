@@ -21,7 +21,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::client::{
-    classify, format_etcd_error, kv_client, watch_client, CallError, ConnectError, LazyEtcdClient,
+    announce_while_pending, classify, format_etcd_error, kv_client, watch_client, CallError,
+    ConnectError, LazyEtcdClient, DIAL_WAIT_LOG_INTERVAL,
 };
 use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 
@@ -254,9 +255,59 @@ fn provider_error(
     }
 }
 
+impl EtcdConfigProvider {
+    /// `fut`, with a WARN every [`DIAL_WAIT_LOG_INTERVAL`] it stays
+    /// pending: a cycle stuck on one call is otherwise silent.
+    async fn reporting<T>(
+        &self,
+        what: &'static str,
+        fut: impl std::future::Future<Output = T>,
+    ) -> T {
+        announce_while_pending(DIAL_WAIT_LOG_INTERVAL, fut, |waited| {
+            tracing::warn!(
+                prefix = %self.prefix,
+                call = what,
+                waited_secs = waited.as_secs(),
+                "etcd call still pending — configuration changes under this prefix are not \
+                 applied until it completes",
+            )
+        })
+        .await
+    }
+
+    /// See [`LazyEtcdClient::probe`]. A failure here has already retired
+    /// the connection, so the supervisor's next cycle dials a new one.
+    ///
+    /// Skipped when `etcd.request_timeout_ms` is set: the calls are then
+    /// bounded themselves, and an expiry retires the connection the same
+    /// way.
+    async fn probe(&self) -> Result<(), ProviderError> {
+        if self.request_timeout.is_some() {
+            return Ok(());
+        }
+        self.reporting("liveness probe", self.client.probe(self.prefix.as_bytes()))
+            .await
+            .map_err(|err| match err {
+                CallError::ConnectTimeout(d) | CallError::CallTimeout(d) => {
+                    ProviderError::Connect(format!(
+                        "etcd did not answer a liveness read within {} ms (a bound derived \
+                         from etcd.dial_timeout_ms); dropping the connection to dial a new one",
+                        d.as_millis()
+                    ))
+                }
+                other => provider_error(other, "liveness read", ProviderError::Range),
+            })
+    }
+}
+
 #[async_trait]
 impl ConfigProvider for EtcdConfigProvider {
     async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
+        // The full read below stays unbounded by default (its cost scales
+        // with the configuration), so it is only issued once a cheap
+        // bounded read has shown the connection answers at all.
+        self.probe().await?;
+
         // Through `LazyEtcdClient::call`, so the read is bounded, and so
         // a token etcd has forgotten — it restarted, or the token's TTL
         // elapsed — is re-authenticated and retried here instead of
@@ -271,15 +322,17 @@ impl ConfigProvider for EtcdConfigProvider {
         // recorded, and `/status/config` still reporting connected.
         let prefix = self.prefix.as_bytes().to_vec();
         let resp = self
-            .client
-            .call(self.request_timeout, move |client| {
-                let prefix = prefix.clone();
-                async move {
-                    kv_client(&client)
-                        .get(prefix, Some(GetOptions::new().with_prefix()))
-                        .await
-                }
-            })
+            .reporting(
+                "range read",
+                self.client.call(self.request_timeout, move |client| {
+                    let prefix = prefix.clone();
+                    async move {
+                        kv_client(&client)
+                            .get(prefix, Some(GetOptions::new().with_prefix()))
+                            .await
+                    }
+                }),
+            )
             .await
             .map_err(|e| provider_error(e, "range read", ProviderError::Range))?;
 
@@ -316,17 +369,24 @@ impl ConfigProvider for EtcdConfigProvider {
         // reads but never confirms the watch leaves the gateway serving
         // its first snapshot forever, blind to every later change, while
         // `/status/config` still reports it connected.
-        let (watcher, stream) = self
-            .client
-            .call(self.request_timeout, move |client| {
-                let prefix = prefix.clone();
-                async move {
-                    let opts = WatchOptions::new()
-                        .with_prefix()
-                        .with_start_revision(start_revision);
-                    watch_client(&client).watch(prefix, Some(opts)).await
-                }
-            })
+        //
+        // Probed first for the same reason the range read is: the
+        // connection can have broken and be stuck reconnecting since.
+        self.probe().await?;
+        let ((watcher, stream), generation) = self
+            .reporting(
+                "watch create",
+                self.client
+                    .call_tagged(self.request_timeout, move |client| {
+                        let prefix = prefix.clone();
+                        async move {
+                            let opts = WatchOptions::new()
+                                .with_prefix()
+                                .with_start_revision(start_revision);
+                            watch_client(&client).watch(prefix, Some(opts)).await
+                        }
+                    }),
+            )
             .await
             .map_err(|e| provider_error(e, "watch create", ProviderError::Watch))?;
         // etcd-client consumes the create response itself, reason and all,
@@ -346,6 +406,7 @@ impl ConfigProvider for EtcdConfigProvider {
             inner: stream,
             _watcher: watcher,
             buf: VecDeque::new(),
+            connection: Some((Arc::clone(&self.client), generation)),
         }))
     }
 }
@@ -362,6 +423,10 @@ pub struct EtcdWatchStream {
     // half of the gRPC stream, causing the server to tear down the watch.
     _watcher: etcd_client::Watcher,
     buf: VecDeque<WatchEvent>,
+    /// The connection the stream runs on, retired when the stream fails
+    /// on transport so the next cycle does not reuse a channel that may
+    /// be stuck reconnecting. Taken on first use.
+    connection: Option<(Arc<LazyEtcdClient>, u64)>,
 }
 
 /// The watch id etcd (and kine) answer with when a create is refused.
@@ -433,7 +498,13 @@ impl Stream for EtcdWatchStream {
                     // this is the one call site where that is not true.
                     Poll::Ready(Some(Err(match classify(&err) {
                         ConnectError::Rejected(detail) => ProviderError::Rejected(detail),
-                        ConnectError::Unreachable(_) | ConnectError::Unauthenticated(_) => {
+                        ConnectError::Unreachable(_) => {
+                            if let Some((client, generation)) = self.connection.take() {
+                                client.invalidate_in_background(generation);
+                            }
+                            ProviderError::Watch(format_etcd_error(&err))
+                        }
+                        ConnectError::Unauthenticated(_) => {
                             ProviderError::Watch(format_etcd_error(&err))
                         }
                     })))

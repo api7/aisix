@@ -7,7 +7,7 @@
 //! built here so no call site can drift back onto tonic's default; test
 //! fixtures that talk to etcd directly are their own business.
 
-use etcd_client::{Client, ConnectOptions, Error as EtcdError, KvClient, WatchClient};
+use etcd_client::{Client, ConnectOptions, Error as EtcdError, GetOptions, KvClient, WatchClient};
 use std::error::Error as StdError;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -294,7 +294,7 @@ pub enum CallError {
 /// reports the other half of the same wait: that gate explains why the
 /// proxy listener is still closed, this one explains why no configuration
 /// has arrived to open it.
-const DIAL_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(10);
+pub(crate) const DIAL_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Run `fut`, saying every `interval` that it has not finished yet.
 ///
@@ -309,10 +309,10 @@ const DIAL_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 ///
 /// First tick one interval in, not immediately, so a healthy dial — which
 /// finishes in milliseconds — logs nothing at all.
-async fn announce_while_pending<T>(
+pub(crate) async fn announce_while_pending<T>(
     interval: Duration,
-    endpoints: &[String],
     fut: impl Future<Output = T>,
+    on_tick: impl Fn(Duration),
 ) -> T {
     tokio::pin!(fut);
     let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
@@ -329,14 +329,7 @@ async fn announce_while_pending<T>(
             // tick reports success rather than one last complaint.
             biased;
             outcome = &mut fut => return outcome,
-            _ = ticker.tick() => {
-                tracing::warn!(
-                    endpoints = ?endpoints,
-                    waited_secs = started.elapsed().as_secs(),
-                    "still connecting to etcd — nothing waiting on this connection can \
-                     proceed until it answers",
-                );
-            }
+            _ = ticker.tick() => on_tick(started.elapsed()),
         }
     }
 }
@@ -406,6 +399,16 @@ impl std::fmt::Debug for LazyEtcdClient {
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// SO_KEEPALIVE idle time on etcd sockets, for a connection that carries
+/// no stream and so gets no HTTP/2 PING.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+
+/// How many dial budgets a [`LazyEtcdClient::probe`] may take. The probe
+/// carries channel establishment (TCP, TLS, `Authenticate`), which the
+/// dial budget is sized for, plus one tiny read; the rest is headroom for
+/// a server queueing reads behind a fleet that reconnected at once.
+const PROBE_BOUND_DIAL_BUDGETS: u32 = 4;
+
 impl LazyEtcdClient {
     pub fn new(
         endpoints: Vec<String>,
@@ -421,7 +424,8 @@ impl LazyEtcdClient {
                     // `ConnectOptions::new()` turns idle pings on, and a
                     // server that does not permit them sends GOAWAY
                     // `too_many_pings` to a connection with no stream.
-                    .with_keep_alive_while_idle(false),
+                    .with_keep_alive_while_idle(false)
+                    .with_tcp_keepalive(TCP_KEEPALIVE),
             ),
             dial_timeout,
             connected: Mutex::new(None),
@@ -492,11 +496,22 @@ impl LazyEtcdClient {
     /// as [`CallError`]'s two timeout variants say — rather than the pair
     /// of them together, so a re-authenticated retry gets the same window
     /// the original call had instead of whatever was left of it.
-    pub async fn call<T, F, Fut>(
+    pub async fn call<T, F, Fut>(&self, timeout: Option<Duration>, op: F) -> Result<T, CallError>
+    where
+        F: FnMut(Client) -> Fut,
+        Fut: Future<Output = Result<T, EtcdError>>,
+    {
+        self.call_tagged(timeout, op).await.map(|(value, _)| value)
+    }
+
+    /// [`Self::call`], also returning the generation of the connection
+    /// the call succeeded on — for a stream that outlives the call and
+    /// must be able to retire that connection when it breaks.
+    pub async fn call_tagged<T, F, Fut>(
         &self,
         timeout: Option<Duration>,
         mut op: F,
-    ) -> Result<T, CallError>
+    ) -> Result<(T, u64), CallError>
     where
         F: FnMut(Client) -> Fut,
         Fut: Future<Output = Result<T, EtcdError>>,
@@ -514,17 +529,21 @@ impl LazyEtcdClient {
             let call = op(client);
             let outcome = match timeout {
                 None => call.await,
-                Some(d) => tokio::time::timeout(d, call)
-                    .await
-                    .map_err(|_| CallError::CallTimeout(d))?,
+                Some(d) => match tokio::time::timeout(d, call).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        self.invalidate(generation).await;
+                        return Err(CallError::CallTimeout(d));
+                    }
+                },
             };
 
-            match outcome {
-                Ok(value) => return Ok(value),
-                Err(err) if !reauthenticated => {
-                    let ConnectError::Unauthenticated(detail) = classify(&err) else {
-                        return Err(CallError::Call(err));
-                    };
+            let err = match outcome {
+                Ok(value) => return Ok((value, generation)),
+                Err(err) => err,
+            };
+            match classify(&err) {
+                ConnectError::Unauthenticated(detail) if !reauthenticated => {
                     tracing::info!(
                         error = %detail,
                         "etcd no longer accepts this connection's auth token — \
@@ -533,16 +552,67 @@ impl LazyEtcdClient {
                     self.invalidate(generation).await;
                     reauthenticated = true;
                 }
-                Err(err) => return Err(CallError::Call(err)),
+                // The channel may be wedged rather than merely failed:
+                // tonic reconnects inside the same channel, and a
+                // reconnect whose TLS handshake never completes holds
+                // every later call on it forever. Only a new channel is
+                // certain to dial again.
+                ConnectError::Unreachable(_) => {
+                    self.invalidate(generation).await;
+                    return Err(CallError::Call(err));
+                }
+                _ => return Err(CallError::Call(err)),
             }
         }
+    }
+
+    /// The bound on [`Self::probe`]: [`PROBE_BOUND_DIAL_BUDGETS`] dial
+    /// budgets. `None` only when `etcd.dial_timeout_ms` is an explicit `0`.
+    pub fn probe_bound(&self) -> Option<Duration> {
+        self.dial_timeout
+            .map(|d| d.saturating_mul(PROBE_BOUND_DIAL_BUDGETS))
+    }
+
+    /// A count-only read of `prefix` under [`Self::probe_bound`], run
+    /// before a call that is deliberately unbounded (the full
+    /// configuration read) so that a connection that cannot answer at all
+    /// is found, and replaced, in bounded time. Same key range as the full
+    /// read, so whatever authorizes that read authorizes this one.
+    pub async fn probe(&self, prefix: &[u8]) -> Result<(), CallError> {
+        self.call(self.probe_bound(), |client| {
+            let prefix = prefix.to_vec();
+            async move {
+                kv_client(&client)
+                    .get(
+                        prefix,
+                        Some(GetOptions::new().with_prefix().with_count_only()),
+                    )
+                    .await
+                    .map(|_| ())
+            }
+        })
+        .await
+    }
+
+    /// [`Self::invalidate`] for a caller that cannot await — a stream's
+    /// `poll_next`.
+    pub fn invalidate_in_background(self: &std::sync::Arc<Self>, stale: u64) {
+        let client = std::sync::Arc::clone(self);
+        tokio::spawn(async move { client.invalidate(stale).await });
     }
 
     async fn dial(&self) -> Result<Client, ConnectError> {
         let connect = announce_while_pending(
             DIAL_WAIT_LOG_INTERVAL,
-            &self.endpoints,
             Client::connect(&self.endpoints, self.options.clone()),
+            |waited| {
+                tracing::warn!(
+                    endpoints = ?self.endpoints,
+                    waited_secs = waited.as_secs(),
+                    "still connecting to etcd — nothing waiting on this connection can \
+                     proceed until it answers",
+                )
+            },
         );
         let outcome = match self.dial_timeout {
             None => connect.await,
