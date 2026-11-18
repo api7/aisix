@@ -512,7 +512,9 @@ async fn dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             return Err(e);
         }
     };
@@ -540,7 +542,9 @@ async fn dispatch(
             let total_tokens = usage.as_ref().map_or(0, |u| {
                 u64::from(u.prompt_tokens) + u64::from(u.completion_tokens)
             });
-            reservation.commit_tokens(total_tokens).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::reported(total_tokens))
+                .await;
             // Content capture (#700): CapturedContent::new truncates to the cap.
             let captured_content = match (&captured_prompt, content_cap) {
                 (Some(prompt), Some(cap)) => Some(CapturedContent::new(
@@ -568,7 +572,9 @@ async fn dispatch(
         // other failure left through the dispatch.
         Err(e) => {
             // No upstream call → no tokens to count; release the reservation.
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(ImageDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),

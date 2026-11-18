@@ -1057,6 +1057,7 @@ fn published_strict_schemas_are_what_the_write_path_compiles() {
 ///   BOTH sets.
 const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
     ("budget", &["/allOf"]),
+    ("usage_accounting", &["/required"]),
     (
         "api_key",
         &[
@@ -1483,6 +1484,11 @@ const UNKNOWN_FIELD_TOLERANCE: &[Probe] = &[
         resource: "budget_policy",
         pointer: "",
         document: || json!({"fail_mode": "closed", "closed_grace_seconds": 300}),
+    },
+    Probe {
+        resource: "usage_accounting",
+        pointer: "",
+        document: || json!({"exclude_estimated_usage": true}),
     },
 ];
 

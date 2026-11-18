@@ -952,7 +952,10 @@ async fn dispatch(
                         crate::quota::commit_answered_attempt(
                             &mut reservation,
                             &mut member_reservation,
-                            success.usage.as_ref().map_or(0, response_usage_tokens),
+                            success
+                                .usage
+                                .as_ref()
+                                .map_or(aisix_ratelimit::TokenCharge::NONE, response_usage_charge),
                         )
                         .await;
                     }
@@ -1767,7 +1770,7 @@ async fn responses_to_target(
             crate::quota::commit_answered_attempt(
                 reservation,
                 member_reservation,
-                response_usage_tokens(&usage),
+                response_usage_charge(&usage),
             )
             .await;
             let mut out_text = responses_sse_guardrail_text(&buf);
@@ -2063,14 +2066,9 @@ async fn responses_to_target(
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
                 // reservation's async `commit_tokens`, which this closure can't await).
-                let streamed_tokens = total_tokens_with_cache(
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    usage.cache_creation_tokens,
-                    usage.cache_read_tokens,
-                );
+                let charge = response_usage_charge(&usage);
                 for key in &post_stream_keys {
-                    limiter_c.add_tokens_post_stream(key, streamed_tokens);
+                    limiter_c.add_tokens_post_stream(key, charge);
                 }
                 drop(stream_hold);
                 // least_busy: stream over — this target is no longer
@@ -2238,7 +2236,9 @@ async fn responses_to_target(
         crate::quota::commit_answered_attempt(
             reservation,
             member_reservation,
-            usage.as_ref().map_or(0, response_usage_tokens),
+            usage
+                .as_ref()
+                .map_or(aisix_ratelimit::TokenCharge::NONE, response_usage_charge),
         )
         .await;
 
@@ -2631,8 +2631,10 @@ async fn responses_cross_provider_to_target(
                     comp.cache_creation_tokens,
                     comp.cache_read_tokens,
                 );
+                let charge =
+                    aisix_ratelimit::TokenCharge::new(streamed_tokens, comp.usage_estimated);
                 for key in &post_stream_keys {
-                    limiter_c.add_tokens_post_stream(key, streamed_tokens);
+                    limiter_c.add_tokens_post_stream(key, charge);
                 }
                 drop(stream_hold);
                 // least_busy: stream over — this target is no longer
@@ -2850,7 +2852,7 @@ async fn responses_cross_provider_to_target(
     crate::quota::commit_answered_attempt(
         reservation,
         member_reservation,
-        response_usage_tokens(&usage),
+        response_usage_charge(&usage),
     )
     .await;
 
@@ -3124,12 +3126,15 @@ fn responses_committed_tokens(usage: &aisix_gateway::UsageStats) -> u64 {
 }
 
 /// [`responses_committed_tokens`] for an attempt's recorded usage.
-fn response_usage_tokens(usage: &ResponseUsage) -> u64 {
-    total_tokens_with_cache(
-        usage.prompt_tokens,
-        usage.completion_tokens,
-        usage.cache_creation_tokens,
-        usage.cache_read_tokens,
+fn response_usage_charge(usage: &ResponseUsage) -> aisix_ratelimit::TokenCharge {
+    aisix_ratelimit::TokenCharge::new(
+        total_tokens_with_cache(
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.cache_creation_tokens,
+            usage.cache_read_tokens,
+        ),
+        usage.usage_estimated,
     )
 }
 

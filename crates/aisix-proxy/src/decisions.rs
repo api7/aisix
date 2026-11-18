@@ -612,7 +612,9 @@ async fn dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             return Err(e);
         }
     };
@@ -648,7 +650,9 @@ async fn dispatch(
     };
     let usage = usage.unwrap_or_default();
     reservation
-        .commit_tokens(u64::from(usage.input) + u64::from(usage.output))
+        .commit_tokens(aisix_ratelimit::TokenCharge::reported(
+            u64::from(usage.input) + u64::from(usage.output),
+        ))
         .await;
 
     let client_body = match (answers, &converted) {

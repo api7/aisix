@@ -1986,13 +1986,17 @@ async fn dispatch_create(
             d.value
         }
         Err(e) => {
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             return Err(e);
         }
     };
     // Zero tokens on the videos surface — commit releases the
     // concurrency permit and finalises RPM.
-    reservation.commit_tokens(0).await;
+    reservation
+        .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+        .await;
     let (target, resp) = match submitted {
         Submitted::Accepted(target, resp) => (*target, resp),
         Submitted::Unsupported(unsupported) => {
@@ -2144,7 +2148,9 @@ pub async fn get_video(
         let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
         crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_id)?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
-        reservation.commit_tokens(0).await;
+        reservation
+            .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+            .await;
         let poll = result?;
         // Echo the name the caller submitted under, not the row's own — the
         // two differ for a wildcard row, and the submit response already
@@ -2219,7 +2225,9 @@ pub async fn video_content(
         let reservation = crate::quota::enforce(&state, &snapshot, &auth, None).await?;
         crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_id)?;
         let result = poll_task(&state, &target, &task_id, &client.request_id).await;
-        reservation.commit_tokens(0).await;
+        reservation
+            .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+            .await;
         let poll = result?;
 
         let mut relays_body = false;

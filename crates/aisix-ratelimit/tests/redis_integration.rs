@@ -15,7 +15,7 @@ const FIXED: RateLimitWindowType = RateLimitWindowType::Fixed;
 use aisix_obs::metrics::Metrics;
 use aisix_ratelimit::{
     store::redis::DEFAULT_PREFIX, Limiter, MultiReservation, RateLimitError, RateStore, RedisStore,
-    StreamLeaseRefresh,
+    StreamLeaseRefresh, TokenCharge,
 };
 
 fn redis_url() -> Option<String> {
@@ -1712,12 +1712,12 @@ async fn sliding_tokens_land_in_their_own_sub_buckets() {
         .pre_commit(&key, &limits)
         .await
         .unwrap()
-        .commit_tokens(60)
+        .commit_tokens(TokenCharge::reported(60))
         .await;
     let held = MultiReservation::new(vec![limiter.pre_commit(&key, &limits).await.unwrap()]);
     let buckets = held.keys();
     drop(held.into_stream_hold());
-    limiter.add_tokens_post_stream(&buckets[0], 50);
+    limiter.add_tokens_post_stream(&buckets[0], TokenCharge::reported(50));
 
     let tpm = format!("{DEFAULT_PREFIX}:{{{key}}}:sw:tpm");
     let tpd = format!("{DEFAULT_PREFIX}:{{{key}}}:sw:tpd");
@@ -1783,7 +1783,7 @@ async fn sliding_peek_reports_rolling_usage_on_the_shared_backend() {
         .pre_commit(&key, &limits)
         .await
         .unwrap()
-        .commit_tokens(30)
+        .commit_tokens(TokenCharge::reported(30))
         .await;
     let s = limiter.peek(&key, &limits).await.unwrap();
     let after = server_now(&mut raw).await;

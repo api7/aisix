@@ -194,7 +194,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
 
     let mut warnings = dangling_references(snapshot);
 
-    // Pricing, teams, users and budgets are not exported: a gateway loading
+    // Pricing, teams, users, budgets and usage accounting are not exported: a gateway loading
     // this file runs without them, and says so here.
     for (kind, count, effect) in [
         (
@@ -212,6 +212,11 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             "budget_policy",
             snapshot.budget_policy.len(),
             "budgeted traffic behaves as `sticky`",
+        ),
+        (
+            "usage_accounting",
+            snapshot.usage_accounting.len(),
+            "estimated usage counts toward token rate limits",
         ),
         (
             "pricing",

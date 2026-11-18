@@ -1514,7 +1514,9 @@ async fn run_session(
 
     let elapsed = started.elapsed();
     let total_tokens = usage.input_tokens + usage.output_tokens;
-    reservation.commit_tokens(total_tokens).await;
+    reservation
+        .commit_tokens(aisix_ratelimit::TokenCharge::reported(total_tokens))
+        .await;
 
     emit_access_log(
         &Method::GET,
