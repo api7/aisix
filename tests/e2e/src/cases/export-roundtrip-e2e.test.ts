@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { parse as parseYaml } from "yaml";
 import {
+  awaitWindowHeadroom,
   droppedRows,
   EtcdClient,
   etcdEndpoint,
@@ -50,6 +51,31 @@ const OTHER_PLAINTEXT = "sk-export-roundtrip-uncached";
 const OTHER_KEY_HASH = createHash("sha256").update(OTHER_PLAINTEXT).digest("hex");
 // A distinctive marker so the no-leak assertion is unambiguous.
 const PROVIDER_SECRET = "sk-provider-secret-must-not-leak-1a2b3c";
+
+// For the kinds that shape a request without being a route: a token cap far
+// below what one request is estimated at, and a prompt and answer long
+// enough to exceed it.
+const TPM = 5;
+const ESTIMATE_PROMPT = "Please summarise the quarterly report for the regional sales team in detail.";
+const ESTIMATE_ANSWER =
+  "The regional sales team grew revenue in every month of the quarter, led by new accounts.";
+
+function chatBody(content: string, usage = true) {
+  return {
+    id: `chatcmpl-${content}`,
+    object: "chat.completion",
+    created: 0,
+    model: "gpt-4o-mini",
+    choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+    ...(usage ? { usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } } : {}),
+  };
+}
+
+async function resourceCounts(app: SpawnedApp): Promise<Record<string, number>> {
+  const res = await fetch(`${app.metricsUrl}/status/config`);
+  const body = (await res.json()) as { applied?: { resource_counts?: Record<string, number> } };
+  return body.applied?.resource_counts ?? {};
+}
 
 /** Extract every `${VAR}` interpolation reference the export emitted. */
 function placeholderVars(yaml: string): string[] {
@@ -388,6 +414,175 @@ describe("aisix export: etcd → export → file round-trip", () => {
       }
     } finally {
       await etcd.deletePrefix(prefix);
+    }
+  });
+});
+
+describe("aisix export: the kinds that are not routes round-trip too", () => {
+  const apps: SpawnedApp[] = [];
+  const upstreams: OpenAiUpstream[] = [];
+
+  afterAll(async () => {
+    for (const app of apps) await app.exit();
+    for (const u of upstreams) await u.close();
+  });
+
+  test("usage accounting and the global price catalog behave the same from the file; budgets stay out", async (ctx) => {
+    const etcd = new EtcdClient();
+    if (!(await etcd.ping())) {
+      ctx.skip();
+      return;
+    }
+    const cheap = await startOpenAiUpstream({ nonStreamBody: chatBody("rt-cheap-served") });
+    const pricey = await startOpenAiUpstream({ nonStreamBody: chatBody("rt-pricey-served") });
+    const estimated = await startOpenAiUpstream({ nonStreamBody: chatBody(ESTIMATE_ANSWER, false) });
+    upstreams.push(cheap, pricey, estimated);
+
+    const source = await spawnApp();
+    apps.push(source);
+    const seed = new SeedClient(etcd, source.etcdPrefix);
+    // The shared catalog the gateway reads beside its own prefix.
+    const catalog = new SeedClient(etcd, `${source.etcdPrefix}/global`);
+
+    await seed.update("usage_accounting", randomUUID(), { exclude_estimated_usage: true });
+    const ids = {
+      team: randomUUID(),
+      user: randomUUID(),
+      policy: randomUUID(),
+      budget: randomUUID(),
+    };
+    await seed.update("teams", ids.team, { name: "rt-team" });
+    await seed.update("users", ids.user, { name: "rt-user" });
+    await seed.update("budget_policy", ids.policy, { fail_mode: "sticky", closed_grace_seconds: 600 });
+    // Exhausted, as the control plane's aggregator would leave it.
+    await seed.update("budgets", ids.budget, {
+      scope: "api_key",
+      scope_ref: randomUUID(),
+      period: "month",
+      exhausted: { reason: {} },
+    });
+    const cheapPrice = await catalog.createPricing({
+      key: "vendor/rt-cheap",
+      input_per_1k: 0.1,
+      output_per_1k: 0.1,
+    });
+    const priceyPrice = await catalog.createPricing({
+      key: "vendor/rt-pricey",
+      input_per_1k: 10,
+      output_per_1k: 10,
+    });
+
+    const model = async (name: string, upstream: OpenAiUpstream, extra: Record<string, unknown> = {}) => {
+      const pk = await seed.createProviderKey({
+        display_name: `${name}-pk`,
+        api_key: "sk-mock",
+        api_base: `${upstream.baseUrl}/v1`,
+      });
+      await seed.createModel({
+        display_name: name,
+        provider: "openai",
+        model_name: "gpt-4o-mini",
+        provider_key_id: pk.id,
+        ...extra,
+      });
+    };
+    // The inline `cost` says the opposite of the catalog, so a gateway
+    // without the catalog routes to the other target.
+    await model("rt-cheap", cheap, {
+      pricing_key: "vendor/rt-cheap",
+      cost: { input_per_1k: 50, output_per_1k: 50 },
+    });
+    await model("rt-pricey", pricey, {
+      pricing_key: "vendor/rt-pricey",
+      cost: { input_per_1k: 0.01, output_per_1k: 0.01 },
+    });
+    await seed.createModel({
+      display_name: "rt-least-cost",
+      routing: { strategy: "least_cost", targets: [{ model: "rt-pricey" }, { model: "rt-cheap" }] },
+    });
+    await model("rt-estimated", estimated);
+    const priceCaller = `sk-export-rt-price-${randomUUID()}`;
+    const capCaller = `sk-export-rt-cap-${randomUUID()}`;
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update(capCaller).digest("hex"),
+      allowed_models: ["*"],
+      rate_limit: { tpm: TPM },
+    });
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update(priceCaller).digest("hex"),
+      allowed_models: ["*"],
+    });
+    for (const caller of [capCaller, priceCaller]) {
+      const probe = new ProxyClient(source.proxyUrl, caller);
+      await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
+    }
+    // The catalog is on its own watch, so the keys above do not imply it.
+    await waitConfigPropagation(async () => ((await resourceCounts(source)).global_pricing ?? 0) >= 2);
+
+    const { stdout: yaml, stderr } = await execFileP(BIN_PATH, [
+      "export",
+      "--etcd",
+      ETCD_ENDPOINT,
+      "--prefix",
+      source.etcdPrefix,
+    ]);
+    const doc = parseYaml(yaml) as Record<string, unknown> & {
+      global?: Record<string, Array<Record<string, unknown>>>;
+    };
+    const idsOf = (entries: unknown) => (entries as Array<{ id: string }>).map((e) => e.id).sort();
+    expect(idsOf(doc.global?.pricing)).toEqual([cheapPrice.id, priceyPrice.id].sort());
+    expect(idsOf(doc.teams)).toEqual([ids.team]);
+    expect(idsOf(doc.users)).toEqual([ids.user]);
+    expect(idsOf(doc.budget_policy)).toEqual([ids.policy]);
+    expect(doc.usage_accounting).toEqual([
+      expect.objectContaining({ exclude_estimated_usage: true }),
+    ]);
+    // A budget's exhausted state is the control plane's to clear, so it
+    // is never frozen into a file.
+    expect(doc.budgets).toBeUndefined();
+    expect(stderr).toContain("1 budgets document(s) not exported");
+
+    const vars = placeholderVars(yaml);
+    const file = await spawnApp({
+      resourcesFile: yaml,
+      extraEnv: Object.fromEntries(vars.map((v) => [v, "sk-mock"])),
+    });
+    apps.push(file);
+    expect(await droppedRows(file)).toEqual({ rejected: [], unknown_kinds: [] });
+    expect(await resourceCounts(file)).toMatchObject({
+      global_pricing: 2,
+      usage_accounting: 1,
+      teams: 1,
+      users: 1,
+      budget_policy: 1,
+    });
+    expect((await resourceCounts(file)).budgets).toBeUndefined();
+
+    const post = (app: SpawnedApp, caller: string, model: string, content: string) =>
+      fetch(`${app.proxyUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${caller}`, "content-type": "application/json" },
+        body: JSON.stringify({ model, messages: [{ role: "user", content }] }),
+      });
+
+    for (const app of [source, file]) {
+      // The catalog price, not the inline cost, ranks the targets.
+      const res = await post(app, priceCaller, "rt-least-cost", "cheapest please");
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { choices: Array<{ message: { content: string } }> };
+      expect(body.choices[0]?.message.content).toBe("rt-cheap-served");
+
+      // The upstream reports no usage, so every request is estimated at
+      // more than the key's TPM — and none of it counts.
+      await awaitWindowHeadroom(20);
+      const statuses: number[] = [];
+      for (let i = 0; i < 4; i++) {
+        const r = await post(app, capCaller, "rt-estimated", ESTIMATE_PROMPT);
+        await r.text();
+        statuses.push(r.status);
+        await new Promise((done) => setTimeout(done, 300));
+      }
+      expect(statuses).toEqual([200, 200, 200, 200]);
     }
   });
 });
