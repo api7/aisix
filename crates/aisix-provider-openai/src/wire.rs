@@ -1980,8 +1980,14 @@ mod tests {
                 serde_json::json!({"include_usage": false, "continuous_usage_stats": true}),
                 serde_json::json!({"include_usage": true, "continuous_usage_stats": true}),
             ),
-            (serde_json::json!({}), serde_json::json!({"include_usage": true})),
-            (serde_json::Value::Null, serde_json::json!({"include_usage": true})),
+            (
+                serde_json::json!({}),
+                serde_json::json!({"include_usage": true}),
+            ),
+            (
+                serde_json::Value::Null,
+                serde_json::json!({"include_usage": true}),
+            ),
         ] {
             let mut extra = serde_json::Map::new();
             extra.insert("stream_options".into(), client.clone());
@@ -1999,8 +2005,7 @@ mod tests {
                 extra,
             };
             let msgs = messages_from(&req, DeveloperRoleMode::Preserve);
-            let raw =
-                serde_json::to_string(&build_request(&req, "gpt-4o", &msgs, true)).unwrap();
+            let raw = serde_json::to_string(&build_request(&req, "gpt-4o", &msgs, true)).unwrap();
             assert_eq!(raw.matches("stream_options").count(), 1, "client {client}");
             let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
             assert_eq!(json["stream_options"], expected, "client {client}");
