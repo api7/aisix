@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  awaitWindowHeadroom,
   EtcdClient,
   etcdEndpoint,
   ProxyClient,
@@ -104,9 +105,11 @@ describe("aisix export: a conditional rate-limit policy on model and api_key lea
     await upstream?.close();
   });
 
-  test("the exported file loads and throttles what the etcd gateway throttles", async () => {
+  test("the exported file loads and throttles what the etcd gateway throttles", { timeout: 60_000 }, async () => {
     fileApp = await spawnApp({ resourcesFile: exported });
     for (const app of [etcdApp!, fileApp]) {
+      // `rpm` counts in a wall-clock minute; keep the pair inside one.
+      await awaitWindowHeadroom(10);
       expect((await chat(app, LIMITED_KEY, LIMITED_MODEL)).status).toBe(200);
       expect((await chat(app, LIMITED_KEY, LIMITED_MODEL)).status).toBe(429);
       // Neither leaf alone matches.

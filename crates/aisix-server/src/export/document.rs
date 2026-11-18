@@ -735,8 +735,11 @@ fn resugar_provider_key(
 /// for gateways that predate `model_id`. They are dropped rather than
 /// exported, so a key that pair names is neither demanded from the export
 /// nor shown in the file as if it were used. When `model_id` names no
-/// exported model the export is blocked anyway, and the pair is kept: it is
-/// what the operator can fall back to by deleting the dangling `model_ref`.
+/// exported model the export is blocked anyway, and the pair is kept as a
+/// fallback: deleting the dangling `model_ref` restores a loadable
+/// classifier only when the pair's key resolved to an exported provider
+/// key too; otherwise the pair's `provider_key_id` stays a raw id (blocking
+/// on its own) and has to be replaced with an exported `provider_key`.
 fn resugar_classifier_provider_key(
     doc: &mut Value,
     model: &str,
