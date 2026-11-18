@@ -1118,11 +1118,13 @@ async fn classify_inner(
         .body(body)
         .send()
         .await;
+    // A refusal's body is never read: the router falls back on the status.
     let read = match sent {
-        Ok(resp) => {
+        Ok(resp) if resp.status().is_success() => {
             let status = resp.status();
             resp.bytes().await.map(|bytes| (status, bytes))
         }
+        Ok(resp) => Ok((resp.status(), bytes::Bytes::new())),
         Err(e) => Err(e),
     };
     let mut call = child.settle();

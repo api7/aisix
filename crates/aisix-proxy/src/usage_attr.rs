@@ -1544,6 +1544,7 @@ mod tests {
     /// the terminal row; the parent carries the route target and the
     /// children do not.
     #[tokio::test]
+    #[allow(clippy::field_reassign_with_default)]
     async fn internal_calls_go_out_once_as_children_of_the_terminal_event() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let state = crate::ProxyState::new(
@@ -1583,15 +1584,16 @@ mod tests {
             call.prompt_tokens = 7;
             guard.record(call);
 
-            let parent = |attempt_index| UsageEvent {
-                request_id: "req-1".into(),
-                requested_model: "router".into(),
-                model_id: "m-target".into(),
-                api_key_id: "ak-1".into(),
-                team_id: "team-1".into(),
-                status_code: 200,
-                attempt_index,
-                ..Default::default()
+            let parent = |attempt_index| {
+                let mut event = UsageEvent::default();
+                event.request_id = "req-1".into();
+                event.requested_model = "router".into();
+                event.model_id = "m-target".into();
+                event.api_key_id = "ak-1".into();
+                event.team_id = "team-1".into();
+                event.status_code = 200;
+                event.attempt_index = attempt_index;
+                event
             };
             let emit = |event, terminal| {
                 emit_usage(

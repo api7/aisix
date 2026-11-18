@@ -731,7 +731,9 @@ pub struct UsageEvent {
     // So a request's caller-facing latency is read off the single event
     // carrying `downstream_latency_ms` — never by summing attempts.
     /// 0-based index of this attempt within the request. Together with
-    /// `request_id` it uniquely identifies one attempt.
+    /// `request_id` it uniquely identifies one attempt. A child event
+    /// (`internal_call_purpose` set) is not an attempt and leaves it at 0, so
+    /// a reader identifying attempts excludes children first.
     #[serde(default)]
     pub attempt_index: u32,
 
