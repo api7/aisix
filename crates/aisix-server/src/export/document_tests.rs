@@ -89,6 +89,79 @@ fn classifier_provider_key_ref_resugars_to_name() {
     );
 }
 
+/// A classifier naming its direct model by control-plane id exports the
+/// model's name under `model_ref`, and drops the inline `provider_key_id` +
+/// `model` the control plane writes beside it for older gateways: the
+/// gateway never reads them while `model_id` is set. An id naming no
+/// exported model is blocking, like every other reference a model carries,
+/// and then the inline pair is kept as the fallback.
+#[test]
+fn classifier_model_id_resugars_to_model_ref_and_drops_the_inline_pair() {
+    let snap = AisixSnapshot::new();
+    snap.provider_keys.insert(ResourceEntry::new(
+        "pk-uuid-ts",
+        provider_key("typesafe-prod", "ts-live"),
+        1,
+    ));
+    snap.models.insert(ResourceEntry::new(
+        "m-uuid-jev",
+        model_value(json!({
+            "display_name": "jev-direct",
+            "provider": "typesafe",
+            "model_name": "jev-1.13.0",
+            "provider_key_id": "pk-uuid-ts"
+        })),
+        1,
+    ));
+    let router = |model_id: &str| {
+        model_value(json!({
+            "display_name": "jev-router",
+            "semantic": {
+                "classifier": {
+                    "type": "jev",
+                    "model_id": model_id,
+                    "provider_key_id": "pk-not-exported",
+                    "model": "jev-inline"
+                },
+                "routes": [{"name": "code", "target": "jev-direct", "description": "code"}],
+                "default": "jev-direct"
+            }
+        }))
+    };
+    snap.models
+        .insert(ResourceEntry::new("m-uuid-r", router("m-uuid-jev"), 1));
+    let doc = build_export_document(&snap, false);
+    let exported = find(&doc, "models")
+        .iter()
+        .find(|m| m["display_name"] == json!("jev-router"))
+        .unwrap();
+    let classifier = &exported["semantic"]["classifier"];
+    assert_eq!(classifier["model_ref"], json!("jev-direct"));
+    for gone in ["model_id", "provider_key_id", "provider_key", "model"] {
+        assert!(classifier.get(gone).is_none(), "{gone}: {classifier}");
+    }
+    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+
+    snap.models
+        .insert(ResourceEntry::new("m-uuid-r", router("m-gone"), 1));
+    let doc = build_export_document(&snap, false);
+    let exported = find(&doc, "models")
+        .iter()
+        .find(|m| m["display_name"] == json!("jev-router"))
+        .unwrap();
+    let classifier = &exported["semantic"]["classifier"];
+    assert_eq!(classifier["model_ref"], json!("m-gone"));
+    assert_eq!(classifier["model"], json!("jev-inline"));
+    assert_eq!(classifier["provider_key_id"], json!("pk-not-exported"));
+    assert!(
+        doc.blocking
+            .iter()
+            .any(|w| w.contains("jev-router") && w.contains("m-gone")),
+        "{:?}",
+        doc.blocking
+    );
+}
+
 #[test]
 fn dangling_provider_key_ref_is_kept_and_warned() {
     let snap = AisixSnapshot::new();
@@ -176,6 +249,59 @@ fn scope_ref_resolves_for_model_and_api_key_scopes() {
     );
     // team scope passes through verbatim.
     assert_eq!(by_name("cap-team")["scope_ref"], json!("team-uuid-9"));
+}
+
+/// Condition leaves on the `model` / `api_key` dimensions carry ids and
+/// export as names, through group nodes; other dimensions are untouched,
+/// and an id naming no exported entry is kept and blocking.
+#[test]
+fn condition_leaf_refs_resolve_for_model_and_api_key_dimensions() {
+    let snap = AisixSnapshot::new();
+    let key_hash = "bb".repeat(32);
+    snap.provider_keys
+        .insert(ResourceEntry::new("pk", provider_key("pk", "sk"), 1));
+    snap.models.insert(ResourceEntry::new(
+        "m-uuid-1",
+        model_value(json!({"display_name": "gpt-4o", "provider": "openai", "model_name": "x", "provider_key_id": "pk"})),
+        1,
+    ));
+    snap.apikeys.insert(ResourceEntry::new(
+        "k-uuid-1",
+        serde_json::from_value(json!({"key_hash": key_hash, "allowed_models": ["*"]})).unwrap(),
+        1,
+    ));
+    snap.rate_limit_policies.insert(ResourceEntry::new(
+        "rlp-cond",
+        serde_json::from_value(json!({
+            "name": "cond",
+            "conditions": [
+                {"dimension": "model", "operator": "in", "value": ["m-uuid-1", "m-gone"]},
+                {"logic": "or", "children": [
+                    {"dimension": "api_key", "operator": "==", "value": "k-uuid-1"},
+                    {"dimension": "team", "operator": "==", "value": "team-uuid-9"}
+                ]}
+            ],
+            "group_by": ["model"],
+            "limits": {"rpm": 1}
+        }))
+        .unwrap(),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    let conditions = &find(&doc, "rate_limit_policies")[0]["conditions"];
+    assert_eq!(conditions[0]["value"], json!(["gpt-4o", "m-gone"]));
+    assert_eq!(
+        conditions[1]["children"][0]["value"],
+        json!(synthetic_api_key_name(&key_hash))
+    );
+    assert_eq!(conditions[1]["children"][1]["value"], json!("team-uuid-9"));
+    assert_eq!(doc.blocking.len(), 1, "{:?}", doc.blocking);
+    assert!(
+        doc.blocking[0].contains("\"cond\"") && doc.blocking[0].contains("m-gone"),
+        "{:?}",
+        doc.blocking
+    );
 }
 
 #[test]
