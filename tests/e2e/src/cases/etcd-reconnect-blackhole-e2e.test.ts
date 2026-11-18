@@ -6,6 +6,8 @@ import {
   SeedClient,
   completeLines,
   etcdEndpoint,
+  scrapeMetrics,
+  sumMetric,
   waitForLogLine,
   spawnApp,
   startMockControlPlane,
@@ -27,7 +29,6 @@ import {
 const hash = (plaintext: string) => createHash("sha256").update(plaintext).digest("hex");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const RECOVERED = "etcd watch established after a failed cycle";
-const FAILED = "etcd watch failed";
 
 /**
  * The number of complete log lines once everything the gateway wrote
@@ -132,15 +133,16 @@ for (const requestTimeoutMs of [undefined, 3000]) {
             .some((line) => line.includes(RECOVERED) && line.includes(envPrefix)),
         10_000,
       );
-      const recovered = await logBarrier(app, key("second"));
 
-      // And it delivers: a change written now arrives over the watch, with
-      // no failed cycle (and so no full re-read) in between.
+      // And it delivers: a change written now arrives as a watch apply, with
+      // no full (re)load in between.
+      const applies = async (trigger: string) =>
+        sumMetric(await scrapeMetrics(app!.metricsUrl), "aisix_config_apply_duration_seconds_count", { trigger });
+      const [fullBefore, watchBefore] = [await applies("full"), await applies("watch")];
       await addKey("third");
       await waitConfigPropagation(() => authenticates(app!, key("third")));
-      const after = await logBarrier(app, key("third"));
-      const between = completeLines(app).slice(recovered, after);
-      expect(between.filter((line) => line.includes(FAILED) || line.includes(RECOVERED))).toEqual([]);
+      await waitConfigPropagation(async () => (await applies("watch")) > watchBefore, 10_000);
+      expect(await applies("full")).toBe(fullBefore);
     }, 180_000);
   });
 }

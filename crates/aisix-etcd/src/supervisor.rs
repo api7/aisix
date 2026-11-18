@@ -1873,12 +1873,8 @@ impl<P: ConfigProvider> Supervisor<P> {
             _ = wait_for_cancel(cancel.clone()) => return Err(SupervisorError::Cancelled),
             load = self.load_all_prefixes() => match load {
                 Ok(load) => load,
-                // The first read's revision was compacted before a later
-                // prefix could be read at it: start over from a fresh read.
-                Err(ProviderError::Compacted) => {
-                    tracing::warn!("etcd compacted the revision of this cycle's read — reading again");
-                    return Ok(());
-                }
+                // Including a first read's revision compacted before a later
+                // prefix could be read at it: the next cycle reads afresh.
                 Err(err) => return Err(SupervisorError::Provider(err)),
             },
         };

@@ -129,7 +129,10 @@ impl EtcdConfigStore {
         // one queued behind it forever; the failed probe replaces it.
         if self.request_timeout.is_none() {
             self.client
-                .probe(format!("{}/", self.prefix).as_bytes(), false)
+                .probe(
+                    aisix_etcd::etcd_provider::probe_key(&self.prefix).as_bytes(),
+                    false,
+                )
                 .await
                 .map_err(|err| StoreError::Backend(err.to_string()))?;
         }

@@ -287,7 +287,7 @@ impl EtcdConfigProvider {
         }
         self.reporting(
             "liveness probe",
-            self.client.probe(self.prefix.as_bytes(), true),
+            self.client.probe(probe_key(&self.prefix).as_bytes(), false),
         )
         .await
         .map_err(|err| match err {
@@ -301,6 +301,13 @@ impl EtcdConfigProvider {
             other => provider_error(other, "liveness read", ProviderError::Range),
         })
     }
+}
+
+/// A key under `prefix` that nothing writes: a point read of it costs the
+/// server one index lookup, and it lies inside every range that
+/// authorizes reading the prefix.
+pub fn probe_key(prefix: &str) -> String {
+    format!("{}/aisix-liveness-probe", prefix.trim_end_matches('/'))
 }
 
 impl EtcdConfigProvider {
@@ -338,7 +345,9 @@ impl EtcdConfigProvider {
             )
             .await
             .map_err(|e| match e {
-                CallError::Call(err) if is_compaction(&err.to_string()) => ProviderError::Compacted,
+                CallError::Call(err) if err.to_string().contains("has been compacted") => {
+                    ProviderError::Compacted
+                }
                 e => provider_error(e, "range read", ProviderError::Range),
             })?;
 
@@ -408,7 +417,17 @@ impl ConfigProvider for EtcdConfigProvider {
                 }),
             )
             .await
-            .map_err(|e| provider_error(e, "watch create", ProviderError::Watch))?;
+            .map_err(|e| match e {
+                CallError::ConnectTimeout(d) | CallError::CallTimeout(d)
+                    if self.request_timeout.is_none() =>
+                {
+                    ProviderError::Watch(format!(
+                        "watch create exceeded {} ms (a bound derived from etcd.dial_timeout_ms)",
+                        d.as_millis()
+                    ))
+                }
+                e => provider_error(e, "watch create", ProviderError::Watch),
+            })?;
         // etcd-client consumes the create response itself, reason and all,
         // and keeps only its id. A server that refuses the watch outright
         // answers with a response that is both created and cancelled under

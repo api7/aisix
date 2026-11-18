@@ -332,7 +332,7 @@ struct HeartbeatBody<'a> {
     /// against the revision returned by its own kine writes: a DP with
     /// `applied_revision >= write_revision` has seen that write.
     applied_revision: i64,
-    /// Always `true`: every configuration event at or below
+    /// `true` whenever a revision is reported: every configuration event at or below
     /// `applied_revision`, in every prefix this gateway watches, has been
     /// processed (applied or rejected). Gateways before this field could
     /// report a revision below an event they had processed, so a control
@@ -525,7 +525,7 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
             version: &aisix_core::HEARTBEAT_VERSION,
             supported_guardrail_kinds: aisix_guardrails::supported_kinds(),
             applied_revision,
-            applied_revision_complete: true,
+            applied_revision_complete: cfg.applied_revision_fetcher.is_some(),
             config_hash,
             exporter_health,
             rejected_resources: rejections,
