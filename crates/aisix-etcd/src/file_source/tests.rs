@@ -196,7 +196,7 @@ async fn the_passive_provider_reports_the_generation_of_the_last_read() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("resources.yaml");
     std::fs::write(&path, "_format_version: \"2\"\n").unwrap();
-    let provider = FileConfigProvider::new(&path);
+    let provider = FileConfigProvider::new(&path).unwrap();
     let passive = provider.passive();
     assert_eq!(provider.load_all().await.unwrap().1, 1);
     assert_eq!(provider.load_all().await.unwrap().1, 2);
@@ -223,7 +223,11 @@ async fn a_file_runs_through_the_supervisor_like_etcd() {
     };
     write("gpt-4o");
     let status = aisix_core::ConfigStatus::new(SourceKind::File);
-    let provider = Arc::new(FileConfigProvider::new(&path).with_status(status.clone()));
+    let provider = Arc::new(
+        FileConfigProvider::new(&path)
+            .unwrap()
+            .with_status(status.clone()),
+    );
     let passive = Arc::new(provider.passive());
     let supervisor = Supervisor::with_sources(
         vec![
@@ -276,7 +280,11 @@ async fn a_reload_that_cannot_be_read_is_reported_out_of_sync() {
     )
     .unwrap();
     let status = aisix_core::ConfigStatus::new(SourceKind::File);
-    let provider = Arc::new(FileConfigProvider::new(&path).with_status(status.clone()));
+    let provider = Arc::new(
+        FileConfigProvider::new(&path)
+            .unwrap()
+            .with_status(status.clone()),
+    );
     let supervisor = Supervisor::with_sources(
         vec![(
             WatchedPrefix::environment(ENV_PREFIX),
@@ -335,7 +343,11 @@ async fn a_file_gone_after_the_first_apply_leaves_that_apply_serving() {
     )
     .unwrap();
     let status = aisix_core::ConfigStatus::new(SourceKind::File);
-    let provider = Arc::new(FileConfigProvider::new(&path).with_status(status.clone()));
+    let provider = Arc::new(
+        FileConfigProvider::new(&path)
+            .unwrap()
+            .with_status(status.clone()),
+    );
     let supervisor = Supervisor::with_sources(
         vec![(WatchedPrefix::environment(ENV_PREFIX), provider)],
         SnapshotCache::disabled(),
@@ -356,4 +368,31 @@ async fn a_file_gone_after_the_first_apply_leaves_that_apply_serving() {
         .get_by_id(PK)
         .is_some());
     assert_ne!(status.view().state, ConfigState::NeverLoaded);
+}
+
+/// A SIGHUP that arrives after the provider exists but before its watch
+/// starts — the window between the boot apply opening readiness and the
+/// supervisor reaching `watch` — is queued for the watch, not lost and not
+/// the default action that would end the process.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_sighup_before_the_watch_starts_is_delivered_to_it() {
+    use futures::StreamExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resources.yaml");
+    std::fs::write(&path, "_format_version: \"2\"\n").unwrap();
+    let provider = FileConfigProvider::new(&path).unwrap();
+    let status = std::process::Command::new("kill")
+        .args(["-HUP", &std::process::id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let mut stream = provider.watch(0).await.unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("the queued SIGHUP reaches the watch")
+        .expect("the stream is open")
+        .expect("the file reads");
+    assert!(matches!(event, WatchEvent::Resync { .. }));
 }

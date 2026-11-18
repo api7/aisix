@@ -336,20 +336,24 @@ pub struct FileConfigProvider {
 }
 
 impl FileConfigProvider {
-    /// Inside a Tokio runtime on unix this installs the SIGHUP receiver;
-    /// outside one, [`ConfigProvider::watch`] installs it instead.
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
+    /// Inside a Tokio runtime on unix this installs the SIGHUP receiver,
+    /// and fails if it cannot; outside one, [`ConfigProvider::watch`]
+    /// installs it instead.
+    pub fn new(path: impl Into<PathBuf>) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        let hup = match tokio::runtime::Handle::try_current() {
+            Ok(_) => Some(tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::hangup(),
+            )?),
+            Err(_) => None,
+        };
+        Ok(Self {
             path: Some(path.into()),
             generation: Arc::default(),
             status: None,
             #[cfg(unix)]
-            hup: Arc::new(std::sync::Mutex::new(
-                tokio::runtime::Handle::try_current().ok().and_then(|_| {
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok()
-                }),
-            )),
-        }
+            hup: Arc::new(std::sync::Mutex::new(hup)),
+        })
     }
 
     /// Where a failed SIGHUP reload is reported: the supervisor's own
