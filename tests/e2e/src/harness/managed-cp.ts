@@ -54,8 +54,9 @@ export interface MockControlPlane {
    * reads and discards whatever arrives and never answers or closes — a
    * middlebox that ACKs and then goes silent, so a TLS handshake started
    * there never completes. Switching to `reset` also resets every
-   * connection already open. A blackholed connection stays dead after the
-   * mode changes, as a dead network flow would.
+   * connection already open, blackholed ones included; otherwise a
+   * blackholed connection stays dead after the mode changes, as a dead
+   * network flow would.
    */
   setEtcdPath(mode: "pass" | "reset" | "blackhole"): void;
   /** TCP connections the etcd endpoint has accepted into the blackhole so far. */

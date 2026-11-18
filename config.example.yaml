@@ -38,7 +38,10 @@ etcd:
   # configuration range read at boot and on every reconnect, creating the
   # watch, and the admin API's reads. It deliberately does not apply to
   # the established watch stream, which is long-lived and would be torn
-  # down by any such bound.
+  # down by any such bound. While it is unset, creating the watch and a
+  # count-only liveness read sent ahead of each unbounded read are still
+  # bounded, by `dial_timeout_ms x endpoints x 4` (at least 30 s), so a
+  # connection that cannot answer is replaced instead of waited on.
   #
   # Leave `request_timeout_ms` unset unless you specifically want a slow
   # etcd to fail fast: the range read grows with the size of your

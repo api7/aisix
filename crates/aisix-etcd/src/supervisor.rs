@@ -1886,7 +1886,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                         tracing::info!(
                             prefix = %source.prefix.prefix,
                             start_revision = from + 1,
-                            "etcd watch re-established after a failure",
+                            "etcd watch established after a failed cycle",
                         );
                     }
                     streams.push(stream);

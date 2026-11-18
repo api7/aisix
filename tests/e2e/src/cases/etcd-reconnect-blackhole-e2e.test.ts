@@ -94,14 +94,14 @@ for (const requestTimeoutMs of [undefined, 3000]) {
       cp.setEtcdPath("pass");
 
       await seed!.createApiKey({ key_hash: hash(`sk-rb-${tag}-second`), allowed_models: ["*"] });
-      await waitConfigPropagation(() => authenticates(app!, `sk-rb-${tag}-second`), 60_000);
+      await waitConfigPropagation(() => authenticates(app!, `sk-rb-${tag}-second`), 90_000);
       expect(await authenticates(app, `sk-rb-${tag}-second`)).toBe(true);
 
       await waitForLogLine(
         app,
-        (line) => line.includes("etcd watch re-established after a failure"),
+        (line) => line.includes("etcd watch established after a failed cycle"),
         "the INFO line announcing the recovered watch",
       );
-    }, 120_000);
+    }, 180_000);
   });
 }

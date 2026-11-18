@@ -21,8 +21,8 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::client::{
-    announce_while_pending, classify, format_etcd_error, kv_client, watch_client, CallError,
-    ConnectError, LazyEtcdClient, DIAL_WAIT_LOG_INTERVAL,
+    announce_while_pending, classify, failed_on_transport, format_etcd_error, kv_client,
+    watch_client, CallError, ConnectError, LazyEtcdClient, DIAL_WAIT_LOG_INTERVAL,
 };
 use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 
@@ -370,22 +370,23 @@ impl ConfigProvider for EtcdConfigProvider {
         // its first snapshot forever, blind to every later change, while
         // `/status/config` still reports it connected.
         //
-        // Probed first for the same reason the range read is: the
-        // connection can have broken and be stuck reconnecting since.
-        self.probe().await?;
+        // Unlike the range read it carries no configuration, so with
+        // `request_timeout_ms` unset it takes the probe's bound: the
+        // connection can have broken since the read and be stuck
+        // reconnecting.
+        let bound = self.request_timeout.or(self.client.probe_bound());
         let ((watcher, stream), generation) = self
             .reporting(
                 "watch create",
-                self.client
-                    .call_tagged(self.request_timeout, move |client| {
-                        let prefix = prefix.clone();
-                        async move {
-                            let opts = WatchOptions::new()
-                                .with_prefix()
-                                .with_start_revision(start_revision);
-                            watch_client(&client).watch(prefix, Some(opts)).await
-                        }
-                    }),
+                self.client.call_tagged(bound, move |client| {
+                    let prefix = prefix.clone();
+                    async move {
+                        let opts = WatchOptions::new()
+                            .with_prefix()
+                            .with_start_revision(start_revision);
+                        watch_client(&client).watch(prefix, Some(opts)).await
+                    }
+                }),
             )
             .await
             .map_err(|e| provider_error(e, "watch create", ProviderError::Watch))?;
@@ -498,13 +499,12 @@ impl Stream for EtcdWatchStream {
                     // this is the one call site where that is not true.
                     Poll::Ready(Some(Err(match classify(&err) {
                         ConnectError::Rejected(detail) => ProviderError::Rejected(detail),
-                        ConnectError::Unreachable(_) => {
-                            if let Some((client, generation)) = self.connection.take() {
-                                client.invalidate_in_background(generation);
+                        ConnectError::Unreachable(_) | ConnectError::Unauthenticated(_) => {
+                            if failed_on_transport(&err) {
+                                if let Some((client, generation)) = self.connection.take() {
+                                    client.invalidate_in_background(generation);
+                                }
                             }
-                            ProviderError::Watch(format_etcd_error(&err))
-                        }
-                        ConnectError::Unauthenticated(_) => {
                             ProviderError::Watch(format_etcd_error(&err))
                         }
                     })))

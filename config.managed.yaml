@@ -100,7 +100,10 @@ etcd:
   # `request_timeout_ms` is unset by default, and unset means unbounded.
   # It bounds a single request/response call (the configuration range
   # read, creating the watch, the admin reads) but never the established
-  # watch stream. A `request_timeout_ms` the range read cannot finish
+  # watch stream. While it is unset, creating the watch and a count-only
+  # liveness read sent ahead of each unbounded read are still bounded, by
+  # `dial_timeout_ms x endpoints x 4` (at least 30 s), so a connection that
+  # cannot answer is replaced instead of waited on. A `request_timeout_ms` the range read cannot finish
   # inside makes the gateway retry it forever without ever serving
   # traffic, so leave it unset unless a slow etcd must fail fast.
   # dial_timeout_ms: 5000   # this is the default; 0 = unbounded

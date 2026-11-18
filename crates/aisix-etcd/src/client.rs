@@ -266,6 +266,17 @@ pub(crate) fn classify(err: &EtcdError) -> ConnectError {
     }
 }
 
+/// Whether `err` came from the connection rather than from etcd: tonic
+/// attaches the transport or HTTP/2 cause as the status source, while a
+/// status etcd sent itself has none.
+pub(crate) fn failed_on_transport(err: &EtcdError) -> bool {
+    match err {
+        EtcdError::TransportError(_) | EtcdError::IoError(_) => true,
+        EtcdError::GRpcStatus(status) => StdError::source(status).is_some(),
+        _ => false,
+    }
+}
+
 /// Why one [`LazyEtcdClient::call`] attempt failed.
 ///
 /// Split by step so a caller can attribute it in its own error type: the
@@ -408,6 +419,10 @@ const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 /// dial budget is sized for, plus one tiny read; the rest is headroom for
 /// a server queueing reads behind a fleet that reconnected at once.
 const PROBE_BOUND_DIAL_BUDGETS: u32 = 4;
+
+/// Floor under [`LazyEtcdClient::probe_bound`], so a dial budget tuned
+/// short for fast failover does not also cut a read the server queued.
+const PROBE_BOUND_FLOOR: Duration = Duration::from_secs(30);
 
 impl LazyEtcdClient {
     pub fn new(
@@ -552,12 +567,14 @@ impl LazyEtcdClient {
                     self.invalidate(generation).await;
                     reauthenticated = true;
                 }
-                // The channel may be wedged rather than merely failed:
+                // A transport failure, not an answer from etcd (an etcd
+                // without a leader keeps its connection). The channel may
+                // be wedged rather than merely failed:
                 // tonic reconnects inside the same channel, and a
                 // reconnect whose TLS handshake never completes holds
                 // every later call on it forever. Only a new channel is
                 // certain to dial again.
-                ConnectError::Unreachable(_) => {
+                _ if failed_on_transport(&err) => {
                     self.invalidate(generation).await;
                     return Err(CallError::Call(err));
                 }
@@ -567,10 +584,13 @@ impl LazyEtcdClient {
     }
 
     /// The bound on [`Self::probe`]: [`PROBE_BOUND_DIAL_BUDGETS`] dial
-    /// budgets. `None` only when `etcd.dial_timeout_ms` is an explicit `0`.
+    /// budgets, at least [`PROBE_BOUND_FLOOR`]. `None` only when
+    /// `etcd.dial_timeout_ms` is an explicit `0`.
     pub fn probe_bound(&self) -> Option<Duration> {
-        self.dial_timeout
-            .map(|d| d.saturating_mul(PROBE_BOUND_DIAL_BUDGETS))
+        self.dial_timeout.map(|d| {
+            d.saturating_mul(PROBE_BOUND_DIAL_BUDGETS)
+                .max(PROBE_BOUND_FLOOR)
+        })
     }
 
     /// A count-only read of `prefix` under [`Self::probe_bound`], run
@@ -965,6 +985,130 @@ mod reauth_tests {
             1,
             "a refused credential must not cause a re-dial",
         );
+    }
+
+    /// Answers every call on every connection with `Unavailable`, except
+    /// that the first `silent` connections are accepted and never spoken
+    /// to — the shape of a reconnect stuck in a handshake.
+    async fn spawn_partly_silent_etcd(silent: usize) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let conns = connections.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                if conns.fetch_add(1, Ordering::Relaxed) < silent {
+                    held.push(socket);
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let Ok(mut conn) = h2::server::handshake(socket).await else {
+                        return;
+                    };
+                    while let Some(Ok((_req, mut respond))) = conn.accept().await {
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .header("grpc-status", "14")
+                            .header("grpc-message", "etcdserver: no leader")
+                            .body(())
+                            .unwrap();
+                        let _ = respond.send_response(response, true);
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), connections)
+    }
+
+    async fn read_on(client: &LazyEtcdClient, timeout: Option<Duration>) -> Result<(), CallError> {
+        client
+            .call(timeout, |c| async move {
+                kv_client(&c).get("/aisix", None).await.map(|_| ())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_call_that_outruns_its_bound_retires_the_connection() {
+        // A channel whose connect never completes holds every later call
+        // on it. Retiring it on the timeout is what lets the next call
+        // reach a server that answers.
+        let (endpoint, connections) = spawn_partly_silent_etcd(1).await;
+        let client = LazyEtcdClient::new(vec![endpoint], None, None);
+
+        let err = read_on(&client, Some(Duration::from_millis(300)))
+            .await
+            .expect_err("the first connection never answers");
+        assert!(matches!(err, CallError::CallTimeout(_)), "{err:?}");
+
+        let err = read_on(&client, Some(Duration::from_secs(5)))
+            .await
+            .expect_err("the server answers Unavailable");
+        assert!(
+            matches!(err, CallError::Call(_)),
+            "a new connection must answer: {err:?}"
+        );
+        assert_eq!(connections.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn an_answer_from_etcd_keeps_the_connection() {
+        // `no leader` is etcd speaking over a working connection; dialling
+        // again (and re-authenticating) would only add load to a cluster
+        // that is already struggling.
+        let (endpoint, connections) = spawn_partly_silent_etcd(0).await;
+        let client = LazyEtcdClient::new(vec![endpoint], None, None);
+        for _ in 0..2 {
+            read_on(&client, None).await.expect_err("Unavailable");
+        }
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_connection_lost_mid_call_is_retired() {
+        // The server drops the first TCP connection as soon as a request
+        // arrives on it: a transport failure, not an answer.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let conns = connections.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let first = conns.fetch_add(1, Ordering::Relaxed) == 0;
+                tokio::spawn(async move {
+                    let Ok(mut conn) = h2::server::handshake(socket).await else {
+                        return;
+                    };
+                    if first {
+                        let _ = conn.accept().await;
+                        return;
+                    }
+                    while let Some(Ok((_req, mut respond))) = conn.accept().await {
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .header("grpc-status", "14")
+                            .body(())
+                            .unwrap();
+                        let _ = respond.send_response(response, true);
+                    }
+                });
+            }
+        });
+        let client = LazyEtcdClient::new(vec![format!("http://{addr}")], None, None);
+        let first = read_on(&client, Some(Duration::from_secs(5)))
+            .await
+            .expect_err("the connection is dropped");
+        let CallError::Call(err) = &first else {
+            panic!("{first:?}");
+        };
+        assert!(failed_on_transport(err), "{err:?}");
+        read_on(&client, Some(Duration::from_secs(5)))
+            .await
+            .expect_err("Unavailable");
+        assert_eq!(connections.load(Ordering::Relaxed), 2);
     }
 
     /// A writer every clone of which appends to the same buffer, so a
