@@ -681,7 +681,9 @@ async fn dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             return Err(e);
         }
     };
@@ -772,7 +774,9 @@ async fn dispatch(
         .as_ref()
         .map(|u| u64::from(u.prompt_tokens))
         .unwrap_or(0);
-    reservation.commit_tokens(total_tokens).await;
+    reservation
+        .commit_tokens(aisix_ratelimit::TokenCharge::reported(total_tokens))
+        .await;
 
     Ok(RerankDispatchSuccess {
         response: resp,

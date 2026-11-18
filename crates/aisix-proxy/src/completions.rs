@@ -586,7 +586,9 @@ async fn dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             return Err(e);
         }
     };
@@ -705,11 +707,15 @@ async fn dispatch(
             // Pre-fix the reservation dropped uncommitted, so the token
             // counter never moved and a caller could bypass token limits by
             // routing traffic through this endpoint.
-            let total_tokens = usage
+            let charge = usage
                 .as_ref()
-                .map(|u| u64::from(u.prompt_tokens) + u64::from(u.completion_tokens))
-                .unwrap_or(0);
-            reservation.commit_tokens(total_tokens).await;
+                .map_or(aisix_ratelimit::TokenCharge::NONE, |u| {
+                    aisix_ratelimit::TokenCharge::new(
+                        u64::from(u.prompt_tokens) + u64::from(u.completion_tokens),
+                        u.usage_estimated,
+                    )
+                });
+            reservation.commit_tokens(charge).await;
 
             // #911 [23]: /v1/completions must run OUTPUT guardrails too. The
             // input hook above scans the prompt, but pre-fix the model's reply
@@ -841,7 +847,9 @@ async fn dispatch(
         // that refusal — every other failure left through the dispatch).
         Err(e) => {
             // No upstream call → no tokens to count; release the reservation.
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(CompletionDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),

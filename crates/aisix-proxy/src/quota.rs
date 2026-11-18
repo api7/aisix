@@ -396,9 +396,7 @@ async fn reserve_request_layers(
     // Layer 1: API key inline rate limit.
     let key_limits = auth.key().rate_limit.clone().unwrap_or_default();
     if !key_limits.is_unrestricted() {
-        let r = state
-            .limiter
-            .pre_commit(&auth.entry.id, &key_limits)
+        let r = pre_commit(state, snapshot, &auth.entry.id, &key_limits)
             .await
             .map_err(|e| reject(state, e, "api_key", None))?;
         reservations.push(r);
@@ -408,9 +406,7 @@ async fn reserve_request_layers(
     if let Some(mrl) = model_rl {
         if let Some(ref limits) = mrl.limits {
             let key = format!("model:{}", mrl.bucket_name);
-            let r = state
-                .limiter
-                .pre_commit(&key, limits)
+            let r = pre_commit(state, snapshot, &key, limits)
                 .await
                 .map_err(|e| reject(state, e, "model", None))?;
             reservations.push(r);
@@ -432,9 +428,7 @@ async fn reserve_request_layers(
             let rl = RateLimit::from(limit.limits);
             if !rl.is_unrestricted() {
                 let key = format!("mcp:{}:{}", auth.entry.id, limit.bucket);
-                let r = state
-                    .limiter
-                    .pre_commit(&key, &rl)
+                let r = pre_commit(state, snapshot, &key, &rl)
                     .await
                     .map_err(|e| reject(state, e, "mcp", None))?;
                 reservations.push(r);
@@ -508,9 +502,7 @@ async fn reserve_policy_layers(
         let caller_facing = caller_scoped
             .as_deref_mut()
             .filter(|_| is_caller_facing(policy, input));
-        let r = state
-            .limiter
-            .pre_commit(&layer.bucket_key, &layer.limits)
+        let r = pre_commit(state, snap, &layer.bucket_key, &layer.limits)
             .await
             .map_err(|e| reject(state, e, "policy", Some((&entry.id, &policy.name))))?;
         match caller_facing {
@@ -554,6 +546,22 @@ fn is_caller_facing(policy: &RateLimitPolicy, input: &ConditionInput<'_>) -> boo
             policy.conditions.as_deref().unwrap_or_default(),
             input,
         ) == Some(true)
+}
+
+/// [`aisix_ratelimit::Limiter::pre_commit`] under the environment's
+/// `usage_accounting`, which decides whether the reservation later counts an
+/// estimated token charge. Every layer reserves through here.
+async fn pre_commit(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    key: &str,
+    limits: &RateLimit,
+) -> Result<aisix_ratelimit::Reservation, aisix_ratelimit::RateLimitError> {
+    Ok(state
+        .limiter
+        .pre_commit(key, limits)
+        .await?
+        .excluding_estimated(snapshot.excludes_estimated_usage()))
 }
 
 /// Convert a store-level rejection into the surfaced [`ProxyError`],
@@ -742,9 +750,7 @@ pub(crate) async fn reserve_semantic_group(
     let reserved = async {
         if let Some(ref limits) = mrl.limits {
             let key = format!("model:{}", mrl.bucket_name);
-            let r = state
-                .limiter
-                .pre_commit(&key, limits)
+            let r = pre_commit(state, snapshot, &key, limits)
                 .await
                 .map_err(|e| reject(state, e, "model", None))?;
             reservations.push(r);
@@ -785,9 +791,7 @@ async fn reserve_target_layers(
         // Inline model rate limit.
         if let Some(ref limits) = mrl.limits {
             let key = format!("model:{}", mrl.bucket_name);
-            let r = state
-                .limiter
-                .pre_commit(&key, limits)
+            let r = pre_commit(state, snapshot, &key, limits)
                 .await
                 .map_err(|e| reject(state, e, "model", None))?;
             reservations.push(r);
@@ -943,13 +947,13 @@ impl<'a> TargetGate<'a> {
 pub(crate) async fn commit_answered_attempt(
     reservation: &mut Option<MultiReservation>,
     member_reservation: &mut Option<MultiReservation>,
-    tokens: u64,
+    charge: aisix_ratelimit::TokenCharge,
 ) {
     if let Some(mut r) = reservation.take() {
         if let Some(member) = member_reservation.take() {
             r.merge(member);
         }
-        r.commit_tokens(tokens).await;
+        r.commit_tokens(charge).await;
     }
 }
 

@@ -1659,7 +1659,9 @@ async fn multipart_dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             return Err(e);
         }
     };
@@ -1753,7 +1755,10 @@ async fn multipart_dispatch(
                         duration_cost_basis(outcome.duration_seconds, || probed_seconds);
                     let total = u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens);
                     for key in &post_stream_keys {
-                        limiter.add_tokens_post_stream(key, total);
+                        limiter.add_tokens_post_stream(
+                            key,
+                            aisix_ratelimit::TokenCharge::reported(total),
+                        );
                     }
                     drop(stream_hold);
                     drop(in_flight_hold);
@@ -1899,7 +1904,9 @@ async fn multipart_dispatch(
     let total_tokens = usage.as_ref().map_or(0, |u| {
         u64::from(u.prompt_tokens) + u64::from(u.completion_tokens)
     });
-    reservation.commit_tokens(total_tokens).await;
+    reservation
+        .commit_tokens(aisix_ratelimit::TokenCharge::reported(total_tokens))
+        .await;
 
     // #696: run the output guardrail chain on the transcript — it is
     // caller-visible model output, scanned like chat's replies. Pre-fix an
@@ -2448,7 +2455,9 @@ async fn speech_dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             return Err(e);
         }
     };

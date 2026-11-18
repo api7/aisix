@@ -76,6 +76,7 @@ pub struct Schemas {
     pub user: Validator,
     pub budget: Validator,
     pub budget_policy: Validator,
+    pub usage_accounting: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile(true)));
@@ -89,7 +90,7 @@ pub static LENIENT_SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::
 /// [`resource_root_schema`] takes. The published schema files and the
 /// validator sets are built from this list, so a new resource cannot reach
 /// one without reaching the other.
-pub const RESOURCES: [&str; 20] = [
+pub const RESOURCES: [&str; 21] = [
     "model",
     "api_key",
     "provider_key",
@@ -110,6 +111,7 @@ pub const RESOURCES: [&str; 20] = [
     "user",
     "budget",
     "budget_policy",
+    "usage_accounting",
 ];
 
 /// Whether a resource's write contract closes unknown top-level fields.
@@ -152,6 +154,7 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "user" => user_root_schema(strict),
         "budget" => budget_root_schema(strict),
         "budget_policy" => budget_policy_root_schema(),
+        "usage_accounting" => usage_accounting_root_schema(strict),
         other => panic!("unknown resource {other:?}"),
     };
     if strict {
@@ -192,6 +195,7 @@ impl Schemas {
             user: build("user"),
             budget: build("budget"),
             budget_policy: build("budget_policy"),
+            usage_accounting: build("usage_accounting"),
         }
     }
 }
@@ -803,6 +807,14 @@ pub fn validate_budget_policy(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_budget_policy_lenient(value: &Value) -> Result<(), SchemaError> {
     validate(&LENIENT_SCHEMAS.budget_policy, value)
+}
+
+pub fn validate_usage_accounting(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.usage_accounting, value)
+}
+
+pub fn validate_usage_accounting_lenient(value: &Value) -> Result<(), SchemaError> {
+    validate(&LENIENT_SCHEMAS.usage_accounting, value)
 }
 
 pub fn validate_observability_exporter_lenient(value: &Value) -> Result<(), SchemaError> {
@@ -2365,6 +2377,16 @@ pub fn budget_root_schema(strict: bool) -> Value {
 /// [`BudgetPolicy`](crate::models::BudgetPolicy) struct.
 pub fn budget_policy_root_schema() -> Value {
     struct_root_schema::<crate::models::BudgetPolicy>(false)
+}
+
+/// Canonical JSON Schema for the `usage_accounting` resource, derived from
+/// the [`UsageAccounting`](crate::models::UsageAccounting) struct.
+pub fn usage_accounting_root_schema(strict: bool) -> Value {
+    let mut schema = struct_root_schema::<crate::models::UsageAccounting>(false);
+    if strict {
+        require_property(&mut schema, "exclude_estimated_usage");
+    }
+    schema
 }
 
 /// Canonical JSON Schema for the `team` resource, derived from the

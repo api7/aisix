@@ -675,7 +675,9 @@ async fn dispatch(
     } = match dispatched {
         Ok(d) => d,
         Err(e) => {
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             return Err(e);
         }
     };
@@ -758,8 +760,9 @@ async fn dispatch(
             // fallback above keeps this accurate for upstreams that
             // report no usage.
             reservation
-                .commit_tokens(u64::from(
-                    (embed_resp.usage.total_tokens).max(prompt_tokens),
+                .commit_tokens(aisix_ratelimit::TokenCharge::new(
+                    u64::from((embed_resp.usage.total_tokens).max(prompt_tokens)),
+                    usage_estimated,
                 ))
                 .await;
             let provider_label = provider.clone();
@@ -799,7 +802,9 @@ async fn dispatch(
             // Drop the reservation without committing — the request
             // didn't hit the upstream. The handler emits no usage unless a
             // guardrail decision was already recorded before this branch.
-            reservation.commit_tokens(0).await;
+            reservation
+                .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                .await;
             let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(EmbedDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
