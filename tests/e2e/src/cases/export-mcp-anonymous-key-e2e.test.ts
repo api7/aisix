@@ -46,7 +46,13 @@ describe("aisix export: anonymous MCP access bound to an api key", () => {
       body: JSON.stringify(body),
     });
     const text = await res.text();
-    return { status: res.status, json: text ? JSON.parse(text) : undefined };
+    let json;
+    try {
+      json = text ? JSON.parse(text) : undefined;
+    } catch {
+      json = undefined;
+    }
+    return { status: res.status, json };
   };
 
   /** Anonymous `initialize` + `tools/list` on `path`; names on success. */
@@ -118,7 +124,7 @@ describe("aisix export: anonymous MCP access bound to an api key", () => {
   });
 
   test("the exported file serves anonymous callers as the etcd gateway does", async () => {
-    expect(exportStderr).not.toContain("mcp_auth_settings");
+    expect(exportStderr).not.toContain("anonymous");
     fileApp = await spawnApp({ resourcesFile: exported });
     for (const [label, app] of [["etcd", etcdApp!], ["file", fileApp]] as const) {
       const listed = await anonymousTools(app, "/mcp/docs");
