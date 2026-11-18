@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
-import { connect, type Socket } from "node:net";
+import { connect, createServer as createNetServer, type Server as NetServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer as createTlsServer, type Server as TlsServer } from "node:tls";
@@ -48,6 +48,37 @@ export interface MockControlPlane {
   telemetryBatchIds: string[];
   /** While set, `/dp/telemetry` POSTs are recorded on arrival and answered once it resolves. */
   telemetryHold: Promise<void> | undefined;
+  /**
+   * How the etcd endpoint treats NEW TCP connections from now on: `pass`
+   * serves them; `reset` answers each with an RST; `blackhole` accepts it,
+   * reads and discards whatever arrives and never answers or closes — a
+   * middlebox that ACKs and then goes silent, so a TLS handshake started
+   * there never completes. Switching to `reset` also resets every
+   * connection already open, blackholed ones included; otherwise a
+   * blackholed connection stays dead after the mode changes, as a dead
+   * network flow would.
+   */
+  setEtcdPath(mode: "pass" | "reset" | "blackhole"): void;
+  /** TCP connections the etcd endpoint has accepted into the blackhole so far. */
+  etcdBlackholed(): number;
+  /**
+   * Hold the `n`th TCP connection the etcd endpoint accepts (1-based,
+   * counted from startup) unanswered until `releaseEtcdConnection()`,
+   * then serve it as usual.
+   */
+  holdEtcdConnection(n: number): void;
+  /** Whether the connection `holdEtcdConnection` named has arrived and is held. */
+  etcdConnectionHeld(): boolean;
+  releaseEtcdConnection(): void;
+  /**
+   * Stop delivering etcd's replies on the `n`th accepted connection (same
+   * numbering) while the gateway's requests still reach etcd, until
+   * `resumeEtcdConnection(n)` delivers everything withheld.
+   */
+  stallEtcdConnection(n: number): void;
+  resumeEtcdConnection(n: number): void;
+  /** Every `/dp/heartbeat` body, in arrival order. */
+  heartbeatBodies: string[];
   close(): Promise<void>;
 }
 
@@ -166,6 +197,14 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
     telemetryBodies: [],
     telemetryBatchIds: [],
     telemetryHold: undefined,
+    setEtcdPath: () => {},
+    etcdBlackholed: () => 0,
+    holdEtcdConnection: () => {},
+    etcdConnectionHeld: () => false,
+    stallEtcdConnection: () => {},
+    resumeEtcdConnection: () => {},
+    releaseEtcdConnection: () => {},
+    heartbeatBodies: [],
     close: async () => {},
   };
 
@@ -178,6 +217,7 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
       if (path.startsWith("/dp/store/v1/")) {
         serveStore(cp, req, Buffer.concat(chunks).toString("utf8"), res);
       } else if (req.method === "POST" && path === "/dp/heartbeat") {
+        cp.heartbeatBodies.push(Buffer.concat(chunks).toString("utf8"));
         res.writeHead(200, { "content-type": "application/json" });
         res.end("{}");
       } else if (req.method === "POST" && path === "/dp/telemetry") {
@@ -201,8 +241,14 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
   // gRPC over TLS in front of the plain etcd every spec shares.
   const target = new URL(etcdEndpoint());
   const sockets = new Set<Socket>();
+  // Accepted connection number by the gateway's source port, and the
+  // etcd-side socket and gateway-side socket of each served one.
+  const connectionByPort = new Map<number, number>();
+  const served = new Map<number, { client: Socket; upstream: Socket }>();
   const etcdFront: TlsServer = createTlsServer({ ...tlsMaterial, ALPNProtocols: ["h2"] }, (client) => {
     const upstream = connect(Number(target.port), target.hostname);
+    const n = connectionByPort.get(client.remotePort ?? -1);
+    if (n !== undefined) served.set(n, { client, upstream });
     for (const s of [client, upstream]) {
       sockets.add(s);
       s.on("close", () => sockets.delete(s));
@@ -213,14 +259,66 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
     client.pipe(upstream);
     upstream.pipe(client);
   });
-  etcdFront.listen(0, "127.0.0.1");
-  await once(etcdFront, "listening");
+  // TCP in front of the TLS front, so a connection can be faulted before
+  // its TLS handshake starts.
+  let etcdPath: "pass" | "reset" | "blackhole" = "pass";
+  let blackholed = 0;
+  let accepted = 0;
+  let holdNth = 0;
+  let heldSocket: Socket | undefined;
+  const tcpSockets = new Set<Socket>();
+  const etcdTcp: NetServer = createNetServer((socket) => {
+    tcpSockets.add(socket);
+    socket.on("close", () => tcpSockets.delete(socket));
+    socket.on("error", () => socket.destroy());
+    accepted += 1;
+    if (socket.remotePort !== undefined) connectionByPort.set(socket.remotePort, accepted);
+    if (accepted === holdNth) {
+      heldSocket = socket;
+      socket.on("close", () => {
+        if (heldSocket === socket) heldSocket = undefined;
+      });
+    } else if (etcdPath === "reset") {
+      socket.resetAndDestroy();
+    } else if (etcdPath === "blackhole") {
+      blackholed += 1;
+      socket.resume();
+    } else {
+      etcdFront.emit("connection", socket);
+    }
+  });
+  etcdTcp.listen(0, "127.0.0.1");
+  await once(etcdTcp, "listening");
+  cp.setEtcdPath = (mode) => {
+    etcdPath = mode;
+    if (mode === "reset") for (const s of tcpSockets) s.resetAndDestroy();
+  };
+  cp.etcdBlackholed = () => blackholed;
+  cp.holdEtcdConnection = (n) => {
+    holdNth = n;
+  };
+  cp.etcdConnectionHeld = () => heldSocket !== undefined && !heldSocket.destroyed;
+  cp.stallEtcdConnection = (n) => {
+    const pair = served.get(n);
+    if (!pair) throw new Error(`etcd connection ${n} is not being served`);
+    pair.upstream.unpipe(pair.client);
+    pair.upstream.pause();
+  };
+  cp.resumeEtcdConnection = (n) => {
+    const pair = served.get(n);
+    if (pair) pair.upstream.pipe(pair.client);
+  };
+  cp.releaseEtcdConnection = () => {
+    const socket = heldSocket;
+    heldSocket = undefined;
+    if (socket && !socket.destroyed) etcdFront.emit("connection", socket);
+  };
 
-  const port = (server: HttpsServer | TlsServer) => (server.address() as { port: number }).port;
+  const port = (server: HttpsServer | NetServer) => (server.address() as { port: number }).port;
   cp.managed = {
     enabled: true,
     cp_base_url: `https://127.0.0.1:${port(rest)}`,
-    cp_etcd_endpoint: `127.0.0.1:${port(etcdFront)}`,
+    cp_etcd_endpoint: `127.0.0.1:${port(etcdTcp)}`,
     cp_cert_file: join(dir, "client.crt"),
     cp_key_file: join(dir, "client.key"),
     cp_ca_file: join(dir, "ca.crt"),
@@ -229,10 +327,11 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
   };
   cp.close = async () => {
     for (const s of sockets) s.destroy();
+    for (const s of tcpSockets) s.destroy();
     rest.closeAllConnections();
     await Promise.all([
       new Promise<void>((resolve) => rest.close(() => resolve())),
-      new Promise<void>((resolve) => etcdFront.close(() => resolve())),
+      new Promise<void>((resolve) => etcdTcp.close(() => resolve())),
     ]);
     rmSync(dir, { recursive: true, force: true });
   };

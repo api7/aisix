@@ -245,6 +245,19 @@ export class EtcdClient {
     await res.body.dump();
   }
 
+  /** The revision `key` was last written at; undefined when absent. */
+  async modRevision(key: string): Promise<number | undefined> {
+    const res = await harnessRequest(`${this.endpoint}/v3/kv/range`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key: Buffer.from(key, "utf8").toString("base64"), keys_only: true }),
+    });
+    const text = await res.body.text();
+    if (res.statusCode >= 300) throw new Error(`etcd range failed (${res.statusCode}): ${text}`);
+    const rev = (JSON.parse(text) as { kvs?: Array<{ mod_revision: string }> }).kvs?.[0]?.mod_revision;
+    return rev === undefined ? undefined : Number(rev);
+  }
+
   /** The store's current revision (the header of an empty range read). */
   async currentRevision(): Promise<number> {
     const res = await harnessRequest(`${this.endpoint}/v3/kv/range`, {

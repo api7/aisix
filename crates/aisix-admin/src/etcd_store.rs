@@ -125,6 +125,17 @@ impl EtcdConfigStore {
         F: FnMut(etcd_client::Client) -> Fut,
         Fut: std::future::Future<Output = Result<T, etcd_client::Error>>,
     {
+        // Unbounded, a wedged connection would hold this read and every
+        // one queued behind it forever; the failed probe replaces it.
+        if self.request_timeout.is_none() {
+            self.client
+                .probe(
+                    aisix_etcd::etcd_provider::probe_key(&self.prefix).as_bytes(),
+                    false,
+                )
+                .await
+                .map_err(|err| StoreError::Backend(err.to_string()))?;
+        }
         self.client
             .call(self.request_timeout, op)
             .await

@@ -173,7 +173,11 @@ pub struct EtcdConfig {
     pub dial_timeout_ms: Option<u64>,
     /// Bound on a single request/response etcd call, in milliseconds.
     /// Unset — the default — and `0` both mean unbounded (see the note on
-    /// `0` below).
+    /// `0` below), except the watch-create handshake, which then gets four
+    /// `dial_budget`s (at least 30 s), and a count-only point read of
+    /// `<prefix>/aisix-liveness-probe` that precedes the unbounded reads
+    /// under the same bound. With `dial_timeout_ms: 0` as well, those are
+    /// unbounded too.
     ///
     /// When set it covers the configuration range read (`load_all`), the
     /// watch-create handshake, and the admin surface's reads — including

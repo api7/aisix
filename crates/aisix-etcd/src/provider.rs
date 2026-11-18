@@ -82,6 +82,16 @@ pub trait ConfigProvider: Send + Sync + 'static {
     /// the supervisor starts its watch from `revision + 1`.
     async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError>;
 
+    /// [`Self::load_all`] as of `revision` rather than now, so several
+    /// prefixes can be read as one consistent snapshot. A revision the
+    /// store has compacted away is [`ProviderError::Compacted`].
+    ///
+    /// The default reads now, for sources with a single fixed revision.
+    async fn load_all_at(&self, revision: i64) -> Result<(Vec<RawEntry>, i64), ProviderError> {
+        let _ = revision;
+        self.load_all().await
+    }
+
     /// Open a watch stream starting from `start_revision`. The stream's
     /// items are individual events; `Resync` is *not* emitted on this
     /// channel — the supervisor is responsible for detecting compaction
