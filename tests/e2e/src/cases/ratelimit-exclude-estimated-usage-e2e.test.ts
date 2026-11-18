@@ -52,6 +52,27 @@ const CHAT_BODY_NO_USAGE = {
   model: "relay-2028",
   choices: [{ index: 0, message: { role: "assistant", content: ANSWER }, finish_reason: "stop" }],
 };
+const RESPONSES_BODY_NO_USAGE = {
+  id: "resp_2028",
+  object: "response",
+  status: "completed",
+  model: "relay-2028",
+  output: [
+    { type: "message", id: "msg_2028", role: "assistant", content: [{ type: "output_text", text: ANSWER }] },
+  ],
+};
+const COMPLETIONS_BODY_NO_USAGE = {
+  id: "cmpl-2028",
+  object: "text_completion",
+  created: 0,
+  model: "relay-2028",
+  choices: [{ index: 0, text: ANSWER, finish_reason: "stop" }],
+};
+const EMBEDDINGS_BODY_NO_USAGE = {
+  object: "list",
+  model: "relay-2028",
+  data: [{ index: 0, object: "embedding", embedding: [0.1, 0.2, 0.3] }],
+};
 const RESPONSES_STREAM_NO_USAGE = [
   JSON.stringify({ type: "response.created", response: { id: "resp_2028" } }),
   JSON.stringify({ type: "response.output_text.delta", delta: ANSWER }),
@@ -116,6 +137,16 @@ const ensembleStream: Call = (app, key) =>
     stream: true,
     messages: [{ role: "user", content: PROMPT }],
   });
+const messagesBuffered: Call = (app, key) =>
+  post(app, key, "/v1/messages", {
+    model: "est-chat-buffered",
+    max_tokens: 200,
+    messages: [{ role: "user", content: PROMPT }],
+  });
+const responsesBuffered: Call = (app, key) =>
+  post(app, key, "/v1/responses", { model: "est-responses-buffered", input: PROMPT });
+const completions: Call = (app, key) => post(app, key, "/v1/completions", { model: "est-completions", prompt: PROMPT });
+const embeddings: Call = (app, key) => post(app, key, "/v1/embeddings", { model: "est-embeddings", input: PROMPT });
 const reportedChatStream: Call = (app, key) =>
   post(app, key, "/v1/chat/completions", {
     model: "reported-chat",
@@ -163,7 +194,8 @@ describe.each(BACKENDS)("estimated usage and token rate limits ($name counters)"
     if (gateway === "on") {
       await seed.update("usage_accounting", randomUUID(), { exclude_estimated_usage: true });
     }
-    const [chatUp, bufferedUp, responsesUp, reportedUp] = upstreams;
+    const [chatUp, bufferedUp, responsesUp, reportedUp, responsesBufferedUp, completionsUp, embeddingsUp] =
+      upstreams;
     const model = async (display_name: string, upstream: OpenAiUpstream) => {
       const pk = await seed.createProviderKey({
         display_name: `${display_name}-pk`,
@@ -185,6 +217,9 @@ describe.each(BACKENDS)("estimated usage and token rate limits ($name counters)"
       ensemble: { panel, judge: { model: "est-chat" }, min_responses: 2 },
     });
     await model("est-responses", responsesUp);
+    await model("est-responses-buffered", responsesBufferedUp);
+    await model("est-completions", completionsUp);
+    await model("est-embeddings", embeddingsUp);
     await model("reported-chat", reportedUp);
     for (const label of labels) {
       await seed.createApiKey({
@@ -207,6 +242,9 @@ describe.each(BACKENDS)("estimated usage and token rate limits ($name counters)"
       await startOpenAiUpstream({ nonStreamBody: CHAT_BODY_NO_USAGE }),
       await startOpenAiUpstream({ streamEvents: RESPONSES_STREAM_NO_USAGE }),
       await startOpenAiUpstream({ streamEvents: CHAT_STREAM_WITH_USAGE }),
+      await startOpenAiUpstream({ nonStreamBody: RESPONSES_BODY_NO_USAGE }),
+      await startOpenAiUpstream({ nonStreamBody: COMPLETIONS_BODY_NO_USAGE }),
+      await startOpenAiUpstream({ nonStreamBody: EMBEDDINGS_BODY_NO_USAGE }),
     );
     const extra = ratelimit ? { ratelimit } : undefined;
     apps.on = await spawnApp(extra ? { extra } : {});
@@ -215,7 +253,11 @@ describe.each(BACKENDS)("estimated usage and token rate limits ($name counters)"
       "chat-stream",
       "chat-buffered",
       "messages",
+      "messages-buffered",
       "responses",
+      "responses-buffered",
+      "completions",
+      "embeddings",
       "ensemble-buffered",
       "ensemble-stream",
       "reported",
@@ -233,7 +275,11 @@ describe.each(BACKENDS)("estimated usage and token rate limits ($name counters)"
     ["chat-stream", chatStream],
     ["chat-buffered", chatBuffered],
     ["messages", messagesStream],
+    ["messages-buffered", messagesBuffered],
     ["responses", responsesStream],
+    ["responses-buffered", responsesBuffered],
+    ["completions", completions],
+    ["embeddings", embeddings],
     ["ensemble-buffered", ensembleBuffered],
     ["ensemble-stream", ensembleStream],
   ];

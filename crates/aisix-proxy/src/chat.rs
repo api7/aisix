@@ -3884,7 +3884,7 @@ async fn dispatch_ensemble(
             });
         // From here to the stream's completion the published
         // `PendingEnsemble` still speaks for the panel if the caller leaves.
-        let panel_charge_tokens = survivor_charge(&panel);
+        let panel_spent = survivor_charge(&panel);
 
         // The judge's prompt renders the caller's messages, so it is rebuilt
         // where it is needed (`build_judge_req` below) rather than held
@@ -3905,7 +3905,7 @@ async fn dispatch_ensemble(
                 Some(&judge_failure(&err, false, Instant::now())),
                 ProxyError::Bridge(err),
             );
-            reservation.commit_tokens(panel_charge_tokens).await;
+            reservation.commit_tokens(panel_spent).await;
             return Err(failure);
         };
         let judge_model = &judge_entry.value;
@@ -3935,7 +3935,7 @@ async fn dispatch_ensemble(
                     Some(&judge_failure(&err, false, Instant::now())),
                     ProxyError::Bridge(err),
                 );
-                reservation.commit_tokens(panel_charge_tokens).await;
+                reservation.commit_tokens(panel_spent).await;
                 return Err(failure);
             }
         };
@@ -3949,7 +3949,7 @@ async fn dispatch_ensemble(
                 Some(&judge_failure(&err, false, Instant::now())),
                 refused,
             );
-            reservation.commit_tokens(panel_charge_tokens).await;
+            reservation.commit_tokens(panel_spent).await;
             return Err(failure);
         }
         let Some(judge_bridge) = crate::dispatch::resolve_bridge(&state.hub, &judge_pk.value)
@@ -3962,7 +3962,7 @@ async fn dispatch_ensemble(
                 Some(&judge_failure(&err, false, Instant::now())),
                 ProxyError::Bridge(err),
             );
-            reservation.commit_tokens(panel_charge_tokens).await;
+            reservation.commit_tokens(panel_spent).await;
             return Err(failure);
         };
         let mut judge_ctx = crate::dispatch::bridge_ctx(
@@ -4013,7 +4013,7 @@ async fn dispatch_ensemble(
                     Some(&judge_failure(&err, true, Instant::now())),
                     ProxyError::Bridge(err),
                 );
-                reservation.commit_tokens(panel_charge_tokens).await;
+                reservation.commit_tokens(panel_spent).await;
                 return Err(failure);
             }
         };
@@ -4038,7 +4038,7 @@ async fn dispatch_ensemble(
                     Some(&judge_failure(&be, false, judge_started)),
                     ProxyError::Bridge(be),
                 );
-                reservation.commit_tokens(panel_charge_tokens).await;
+                reservation.commit_tokens(panel_spent).await;
                 return Err(failure);
             }
         };
@@ -4098,7 +4098,7 @@ async fn dispatch_ensemble(
                 .fold(aisix_gateway::chat::UsageStats::default(), |acc, p| {
                     acc.saturating_add(&p.effective_usage)
                 }),
-            panel_charge_tokens.estimated,
+            panel_spent.estimated,
             &row_ctx,
         );
         let panel_rows: Vec<(u32, EnsembleSubcall)> = panel
@@ -5171,7 +5171,7 @@ fn created_ts() -> i64 {
 /// most recently seen `total_tokens` and, on stream end, hand it to
 /// `on_complete` so the caller can post-account it against TPM/TPD.
 ///
-/// Pre-fix the streaming path called `reservation.commit_tokens(aisix_ratelimit::TokenCharge::NONE)`
+/// Pre-fix the streaming path called `reservation.commit_tokens(0)`
 /// up front and never revisited the counter, leaving TPM caps silently
 /// bypassed for all streaming traffic and the cost/usage telemetry
 /// reporting `$0`. See issue #108.

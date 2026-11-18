@@ -955,7 +955,7 @@ async fn dispatch(
                             success
                                 .usage
                                 .as_ref()
-                                .map_or(aisix_ratelimit::TokenCharge::NONE, response_usage_tokens),
+                                .map_or(aisix_ratelimit::TokenCharge::NONE, response_usage_charge),
                         )
                         .await;
                     }
@@ -1770,7 +1770,7 @@ async fn responses_to_target(
             crate::quota::commit_answered_attempt(
                 reservation,
                 member_reservation,
-                response_usage_tokens(&usage),
+                response_usage_charge(&usage),
             )
             .await;
             let mut out_text = responses_sse_guardrail_text(&buf);
@@ -2245,7 +2245,7 @@ async fn responses_to_target(
             member_reservation,
             usage
                 .as_ref()
-                .map_or(aisix_ratelimit::TokenCharge::NONE, response_usage_tokens),
+                .map_or(aisix_ratelimit::TokenCharge::NONE, response_usage_charge),
         )
         .await;
 
@@ -2859,7 +2859,7 @@ async fn responses_cross_provider_to_target(
     crate::quota::commit_answered_attempt(
         reservation,
         member_reservation,
-        response_usage_tokens(&usage),
+        response_usage_charge(&usage),
     )
     .await;
 
@@ -3133,7 +3133,7 @@ fn responses_committed_tokens(usage: &aisix_gateway::UsageStats) -> u64 {
 }
 
 /// [`responses_committed_tokens`] for an attempt's recorded usage.
-fn response_usage_tokens(usage: &ResponseUsage) -> aisix_ratelimit::TokenCharge {
+fn response_usage_charge(usage: &ResponseUsage) -> aisix_ratelimit::TokenCharge {
     aisix_ratelimit::TokenCharge::new(
         total_tokens_with_cache(
             usage.prompt_tokens,

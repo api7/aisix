@@ -148,10 +148,12 @@ impl AisixSnapshot {
     /// Whether estimated usage is kept out of token rate limits. Two rows
     /// can only be a stale key; either one switching it on wins.
     pub fn excludes_estimated_usage(&self) -> bool {
-        self.usage_accounting
-            .entries()
-            .iter()
-            .any(|e| e.value.exclude_estimated_usage)
+        !self.usage_accounting.is_empty()
+            && self
+                .usage_accounting
+                .entries()
+                .iter()
+                .any(|e| e.value.exclude_estimated_usage)
     }
 }
 

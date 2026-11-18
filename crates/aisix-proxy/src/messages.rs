@@ -916,7 +916,7 @@ async fn dispatch(
                         crate::quota::commit_answered_attempt(
                             &mut reservation,
                             &mut member_reservation,
-                            messages_metrics_tokens(&outcome.metrics),
+                            messages_metrics_charge(&outcome.metrics),
                         )
                         .await;
                     }
@@ -1841,7 +1841,7 @@ async fn anthropic_passthrough_dispatch(
         crate::quota::commit_answered_attempt(
             reservation,
             member_reservation,
-            messages_metrics_tokens(&metrics),
+            messages_metrics_charge(&metrics),
         )
         .await;
 
@@ -2744,7 +2744,7 @@ async fn cross_provider_dispatch(
     crate::quota::commit_answered_attempt(
         reservation,
         member_reservation,
-        messages_metrics_tokens(&metrics),
+        messages_metrics_charge(&metrics),
     )
     .await;
 
@@ -3580,7 +3580,7 @@ fn messages_committed_tokens(usage: &aisix_gateway::UsageStats) -> u64 {
 }
 
 /// [`messages_committed_tokens`] for an attempt's recorded metrics.
-fn messages_metrics_tokens(metrics: &AnthropicUsageMetrics) -> aisix_ratelimit::TokenCharge {
+fn messages_metrics_charge(metrics: &AnthropicUsageMetrics) -> aisix_ratelimit::TokenCharge {
     aisix_ratelimit::TokenCharge::new(
         total_tokens_with_cache(
             metrics.prompt_tokens,

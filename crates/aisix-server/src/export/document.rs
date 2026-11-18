@@ -410,7 +410,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
         ),
         (
             "usage_accounting",
-            snapshot.usage_accounting.len(),
+            usize::from(snapshot.excludes_estimated_usage()),
             "estimated usage counts toward token rate limits",
         ),
     ] {
