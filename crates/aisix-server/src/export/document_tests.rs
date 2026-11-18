@@ -347,6 +347,13 @@ fn a_model_priced_by_a_pricing_document_is_reported() {
     rows[1].2["pricing_key"] = json!("openai/gpt-4o");
     let doc = export(&rows, false);
     assert_eq!(doc.warnings.len(), 1, "{:?}", doc.warnings);
+    rows[1].2["cost"] = json!({"input_per_1k": 1, "output_per_1k": 2});
+    let with_cost = export(&rows, false);
+    assert!(
+        with_cost.warnings[0].contains("falls back to its inline `cost`"),
+        "{}",
+        with_cost.warnings[0]
+    );
     assert!(
         doc.warnings[0].contains("carries no price"),
         "{}",

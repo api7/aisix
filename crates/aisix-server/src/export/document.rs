@@ -218,7 +218,12 @@ pub fn build_export_document(
         let Some(key) = model.pricing_key.as_deref() else {
             continue;
         };
-        let effect = if model.cost.is_some() {
+        // Read off the stored document: a model's price is otherwise only
+        // ever read through the pricing resolver.
+        let has_cost = raw
+            .get(&("models".to_string(), entry.id.clone()))
+            .is_some_and(|doc| doc.contains_key("cost"));
+        let effect = if has_cost {
             "falls back to its inline `cost`, a different price whenever the two disagree"
         } else {
             "carries no price and ranks last under `least_cost`; set `cost` if the price matters"
