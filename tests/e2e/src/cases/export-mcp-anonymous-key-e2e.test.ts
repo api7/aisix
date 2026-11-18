@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { parse as parseYaml } from "yaml";
 import {
+  droppedRows,
   EtcdClient,
   etcdEndpoint,
   ProxyClient,
@@ -135,6 +136,7 @@ describe("aisix export: anonymous MCP access bound to an api key", () => {
     expect(doc.mcp_auth_settings[0]!.anonymous.api_key_id).toBe(principalId);
     expect(doc.api_keys.map((k) => k.id)).toContain(principalId);
     fileApp = await spawnApp({ resourcesFile: exported });
+    expect(await droppedRows(fileApp)).toEqual({ rejected: [], unknown_kinds: [] });
     for (const [label, app] of [["etcd", etcdApp!], ["file", fileApp]] as const) {
       const listed = await anonymousTools(app, "/mcp/docs");
       expect(listed.status, label).toBe(200);

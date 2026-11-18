@@ -223,7 +223,7 @@ There is no implicit scope. `build_index_from_snapshot` puts a guardrail in the 
 
 An implicit default would key on the ABSENCE of rows, which is what makes it dangerous: deleting the one model a guardrail was scoped to removes its last attachment, and a zero-attachment default would thereby WIDEN the guardrail to all traffic, silently, on a security control. Do not reintroduce a default of any shape, and in particular do not give the resources file one "for convenience": a resources file carries `guardrail_attachments` documents exactly as the control plane projects them and the same loader reads both sources, so they answer the scoping question the same way. A convenience default in one of them is a divergence a standalone user cannot see.
 
-The export follows from that: `aisix export` emits every guardrail plus every attachment it can name. An attachment it cannot name — `team`, which has no file collection, or a `scope_id` missing from the snapshot — is dropped with a warning rather than emitted dangling, because losing a scope makes the guardrail govern LESS. Inventing one would make it govern more.
+The export follows from that: `aisix export` emits every guardrail and every attachment as stored, and warns about an attachment whose `scope_id` names nothing it exported — never drops or rewrites one, because the file must scope exactly what etcd scoped.
 
 ## An Absent Config Block Means Off
 

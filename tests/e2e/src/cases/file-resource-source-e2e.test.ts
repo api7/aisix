@@ -581,11 +581,30 @@ guardrails:
       async () =>
         (app!.output().match(/resources file could not be read/g) ?? []).length > failuresBefore,
     );
+    // Reported on the status surface too: the file as a whole is rejected.
+    expect((await statusConfig()).state).toBe("out_of_sync");
     const stillServing = await proxy.chat({
       model: "reload-a",
       messages: [{ role: "user", content: "still-alive" }],
     });
     expect(stillServing.status).toBe(200);
+
+    // Fixed and signalled again, the file applies — and a SIGHUP replaces
+    // the whole configuration, so a model the file no longer has is gone.
+    await writeFile(app.resourcesPath, reloadFile(upstream.baseUrl, ["reload-a"]), "utf8");
+    app.signal("SIGHUP");
+    await waitConfigPropagation(async () => {
+      const r = await proxy.listModels();
+      const ids = (r.body as { data: Array<{ id: string }> }).data.map((m) => m.id);
+      return r.status === 200 && ids.length === 1;
+    });
+    const res = await proxy.listModels();
+    expect((res.body as { data: Array<{ id: string }> }).data.map((m) => m.id)).toEqual([
+      "reload-a",
+    ]);
+    const status = await statusConfig();
+    expect(status.state).toBe("synced");
+    expect(status.rejected).toEqual([]);
   });
 });
 
@@ -617,7 +636,7 @@ api_keys:
     expect(msg).toContain("exited early with code=1");
     expect(msg).toMatch(/3 error\(s\)/);
     expect(msg).toContain("models[0]: `id` is required");
-    expect(msg).toContain('api_keys[0]: `id` must be a UUID string, found "not-a-uuid"');
+    expect(msg).toContain('api_keys[0]: `id` must be a UUID string in lowercase hyphenated form');
     expect(msg).toContain(`api_keys[2]: duplicate id "${fileId("dup")}"`);
   }, 30_000);
 

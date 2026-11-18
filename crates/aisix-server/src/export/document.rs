@@ -2,8 +2,10 @@
 //!
 //! A resources file is the set of etcd documents written down (see
 //! `aisix_etcd::file_source`), so every entry is emitted as its etcd id
-//! plus the document the gateway serves for it, references included
-//! exactly as stored. Two things are done to each document on the way:
+//! plus the document exactly as etcd stores it — never re-serialized from
+//! the typed model, which writes defaults and nulls the read schema does
+//! not accept back. Only rows the loader accepted are emitted. Two things
+//! are done to each document on the way:
 //!
 //! - **`$`-escaping** — the file interpolates `${VAR}` and unescapes `$$`
 //!   in every string it reads, so a stored `$` is written as `$$`;
@@ -51,8 +53,16 @@ pub struct ExportDocument {
 /// Which credentials of one kind's documents are redacted.
 type Redact = fn(&mut Value, &mut RedactionCtx<'_>);
 
-/// Build the resources-file document from a decoded etcd snapshot.
-pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> ExportDocument {
+/// The stored documents, keyed by `(kind, id)`.
+pub type RawDocs = BTreeMap<(String, String), serde_json::Map<String, Value>>;
+
+/// Build the resources-file document from the stored documents and the
+/// snapshot the loader decoded from them (which decides what was accepted).
+pub fn build_export_document(
+    snapshot: &AisixSnapshot,
+    raw: &RawDocs,
+    reveal_secrets: bool,
+) -> ExportDocument {
     let mut placeholders = Vec::new();
     let mut collections: Vec<(&'static str, Vec<Value>)> = Vec::new();
 
@@ -63,6 +73,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
                 $kind,
                 emit_entries(
                     &snapshot.$table,
+                    raw,
                     $kind,
                     $token,
                     $name,
@@ -80,7 +91,9 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
         "PROVIDER_KEY",
         |pk| pk.display_name.clone(),
         |doc, ctx| {
+            // `secret` is the former spelling of `api_key`, still loaded.
             redact_top_level(doc, "api_key", ctx);
+            redact_top_level(doc, "secret", ctx);
             // `request.default_headers` are outbound auth headers to the
             // upstream and `request.default_body_fields` can carry a
             // secondary credential — neither is covered by `api_key`.
@@ -220,7 +233,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
         ),
         (
             "pricing",
-            snapshot.pricing.len(),
+            snapshot.pricing.len() + snapshot.global_pricing.len(),
             "a model with a `pricing_key` falls back to its inline `cost`",
         ),
     ] {
@@ -268,17 +281,19 @@ fn push_kind(
     }
 }
 
-/// Serialize every entry of a table (sorted by id for stable output) as
-/// `id` + document, then `$`-escape every literal string, then swap
-/// secrets for `${VAR}` placeholders.
+/// Emit every accepted entry of a table (sorted by id for stable output) as
+/// `id` + its stored document, then `$`-escape every literal string, then
+/// swap secrets for `${VAR}` placeholders.
 ///
 /// The order matters: the file unescapes `$$` on every string scalar it
 /// reads, so a stored value that literally contains `$` (e.g. a guardrail
 /// regex matching `${jndi:`) is escaped to survive the round trip — but
 /// the placeholders redaction inserts are the one thing that *should*
 /// interpolate, so they are added after escaping.
+#[allow(clippy::too_many_arguments)]
 fn emit_entries<T, N>(
     table: &aisix_core::snapshot::ResourceTable<T>,
+    raw: &RawDocs,
     kind: &'static str,
     kind_token: &'static str,
     name: N,
@@ -287,7 +302,7 @@ fn emit_entries<T, N>(
     placeholders: &mut Vec<SecretPlaceholder>,
 ) -> Vec<Value>
 where
-    T: aisix_core::resource::Resource + Serialize,
+    T: aisix_core::resource::Resource,
     N: Fn(&T) -> String,
 {
     let mut entries = table.entries();
@@ -295,12 +310,12 @@ where
 
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
+        let Some(stored) = raw.get(&(kind.to_string(), entry.id.clone())) else {
+            continue;
+        };
         let mut doc = serde_json::Map::new();
         doc.insert("id".into(), Value::String(entry.id.clone()));
-        match aisix_core::json::to_value(&entry.value) {
-            Ok(Value::Object(map)) => doc.extend(map),
-            other => unreachable!("a resource serializes to a document, got {other:?}"),
-        }
+        doc.extend(stored.iter().map(|(k, v)| (k.clone(), v.clone())));
         let mut doc = Value::Object(doc);
         escape_dollars(&mut doc);
         let label = name(&entry.value);
@@ -468,6 +483,7 @@ fn reference_paths(kind: &str) -> &'static [(&'static str, &'static str)] {
             ("semantic.embedding_model_id", "models"),
             ("semantic.on_embedding_failure.target_id", "models"),
             ("semantic.classifier.model_id", "models"),
+            ("semantic.classifier.provider_key_id", "provider_keys"),
             ("semantic.classifier.on_failure.target_id", "models"),
         ],
         "api_keys" => &[

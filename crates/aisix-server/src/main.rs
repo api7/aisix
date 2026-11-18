@@ -123,10 +123,11 @@ struct Cli {
 #[derive(Debug, clap::Subcommand)]
 enum CliCommand {
     /// Validate a resources file (the `resources_file` source) without
-    /// booting any listener: the identical read → interpolate → desugar
-    /// → validate pipeline runs and the process exits 0 on success or
-    /// non-zero with the full aggregated error report. `${VAR}`
-    /// references resolve against this process's environment.
+    /// booting any listener: the file is read and interpolated as file
+    /// mode reads it, and its documents go through the loader the gateway
+    /// uses for etcd. Exits non-zero if the file cannot be read as rows or
+    /// any row is rejected. `${VAR}` references resolve against this
+    /// process's environment.
     Validate {
         /// Path to the resources file to validate.
         #[arg(long)]
@@ -134,11 +135,10 @@ enum CliCommand {
     },
     /// Export the resources currently stored in etcd as a `resources.yaml`
     /// the file source (`resources_file`) can load back — the migration /
-    /// backup path for a standalone deployment moving from the Admin API
-    /// plus etcd to the declarative file. References are resugared to
-    /// names, ids are dropped (the file derives them), and live
-    /// credentials are replaced with `${VAR}` placeholders unless
-    /// `--reveal-secrets` is given.
+    /// backup path for a standalone deployment moving from etcd to the
+    /// declarative file. Each resource is written under its etcd id with
+    /// its references as stored, and live credentials are replaced with
+    /// `${VAR}` placeholders unless `--reveal-secrets` is given.
     Export {
         /// etcd endpoints to read from (comma-separated or repeated).
         #[arg(long, value_delimiter = ',', required = true)]
@@ -750,163 +750,166 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // slot closes that gap: applies before the registry exists (the boot
     // load) report into nothing, every later one lands.
     let metrics_slot: Arc<std::sync::OnceLock<Arc<Metrics>>> = Arc::new(std::sync::OnceLock::new());
-    let (snapshot_handle, supervisor, watch_task, admin_client, config_status) =
-        if let Some(path) = &file_source_path {
-            // FILE MODE: the file is a channel into the same supervisor
-            // etcd feeds — the same loader, last-known-good retention and
-            // `/status/config` report. A file that cannot be read as rows
-            // at all fails the boot here; SIGHUP re-reads it.
-            let provider = Arc::new(aisix_etcd::FileConfigProvider::new(path));
-            let entries = provider
-                .read()
-                .map_err(|report| anyhow::anyhow!("{report}"))?
-                .0;
-            tracing::info!(
-                file = %path.display(),
-                entries = entries.len(),
-                "resources file read",
-            );
-            let passive = Arc::new(provider.passive());
-            let observed = Arc::clone(&metrics_slot);
-            let supervisor = Arc::new(
-                Supervisor::with_sources(
-                    vec![
-                        (
-                            WatchedPrefix::environment(aisix_etcd::file_source::ENV_PREFIX),
-                            provider,
-                        ),
-                        (
-                            WatchedPrefix::global(aisix_etcd::file_source::GLOBAL_PREFIX),
-                            passive,
-                        ),
-                    ],
-                    SnapshotCache::disabled(),
-                )
-                .with_source_kind(SourceKind::File)
-                .with_apply_observer(Arc::new(move |trigger, events, elapsed| {
-                    if let Some(metrics) = observed.get() {
-                        metrics.record_config_apply(trigger, events, elapsed);
-                    }
-                })),
-            );
-            let config_status = supervisor.config_status();
-            let handle = supervisor.handle();
-            let watch_task = tokio::spawn(supervisor.run(cancel_rx.clone()));
-            (handle, None, watch_task, None, config_status)
-        } else {
-            // ETCD MODE (unchanged behavior).
-            //
-            // Before handing endpoints to tonic, probe each one via the
-            // stdlib resolver. tonic's HTTP connector collapses any DNS
-            // failure into an opaque "dns error" Status (see
-            // hyper-util/src/client/legacy/connect/http.rs) — even after the
-            // cause-chain logging in aisix-etcd, the deepest cause we see is
-            // still whatever getaddrinfo returned. The probe either logs the
-            // resolved addresses (DNS works; the failure is higher in the
-            // tonic / TLS stack) or logs the raw io::Error (DNS actually
-            // fails). Both outcomes narrow triage substantially.
-            probe_etcd_dns(&cfg.etcd.endpoints).await;
-
-            // Same extra trust root reused by the etcd connect options.
-            let connect_options =
-                build_etcd_connect_options_with_extra_ca(&cfg.etcd, extra_ca_pem.as_deref())?;
-            // effective_prefix() is `<prefix>/<env_id>` in v3 managed mode
-            // (env_id populated from the register response above), bare
-            // `<prefix>` in self-hosted dev where env_id is empty.
-            let etcd_prefix = cfg.etcd.effective_prefix();
-            // The shared pricing catalog, watched alongside the
-            // environment's own prefix and folded into the same snapshot.
-            // A control plane that does not grant read access to it is
-            // tolerated: the supervisor serves without prices rather than
-            // without configuration.
-            let global_prefix = cfg.etcd.global_prefix();
-            // Only a refusal ends the boot here: an etcd that cannot be
-            // reached leaves the connection pending and the supervisor
-            // dials it again, so the gateway waits for its source instead
-            // of exiting on it. See `EtcdConfigProvider::connect`.
-            let provider = Arc::new(
-                EtcdConfigProvider::connect(
-                    &cfg.etcd.endpoints,
-                    etcd_prefix.clone(),
-                    connect_options.clone(),
-                    cfg.etcd.request_timeout(),
-                    cfg.etcd.dial_budget(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
-            );
-            // Its own connection, for the same reason the admin surface
-            // has one: the catalog's range read and watch never queue
-            // behind the environment's, and a refusal on one channel does
-            // not disturb the other.
-            let global_provider = Arc::new(
-                EtcdConfigProvider::connect(
-                    &cfg.etcd.endpoints,
-                    global_prefix.clone(),
-                    connect_options.clone(),
-                    cfg.etcd.request_timeout(),
-                    cfg.etcd.dial_budget(),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
-            );
-            // Separate connection for the admin read surface — only needed
-            // when the admin listener is bound. It could share the config
-            // provider's, but keeping two means an admin read and the watch
-            // stream never queue behind the same connect, and neither can
-            // stall the other's channel.
-            // Skipped whenever the admin listener is not bound — managed mode,
-            // or `admin.enabled = false` — so admin-off doesn't pay for (or
-            // fail boot on) a connection it immediately drops; `/status/models`
-            // then reads through the snapshot, as it does in managed mode.
-            let admin_client = if cfg.managed.is_managed() || !cfg.admin.enabled {
-                None
-            } else {
-                Some((
-                    Arc::new(aisix_etcd::LazyEtcdClient::new(
-                        cfg.etcd.endpoints.clone(),
-                        connect_options.clone(),
-                        cfg.etcd.dial_budget(),
-                    )),
-                    etcd_prefix.clone(),
-                    cfg.etcd.request_timeout(),
-                ))
-            };
-            // Disk recovery is opt-in in both managed and self-hosted modes.
-            let snapshot_cache = match cfg.managed.effective_snapshot_cache_path() {
-                Some(path) => SnapshotCache::new(path),
-                None => SnapshotCache::disabled(),
-            };
-            let observed = Arc::clone(&metrics_slot);
-            let supervisor = Arc::new(
-                Supervisor::with_sources(
-                    vec![
-                        (WatchedPrefix::environment(etcd_prefix), provider),
-                        (WatchedPrefix::global(global_prefix), global_provider),
-                    ],
-                    snapshot_cache,
-                )
-                .with_apply_observer(Arc::new(move |trigger, events, elapsed| {
-                    if let Some(metrics) = observed.get() {
-                        metrics.record_config_apply(trigger, events, elapsed);
-                    }
-                })),
-            );
-            // Seed the snapshot from disk before the etcd cycle starts so the
-            // proxy is ready to serve from cached config the moment the watch
-            // task takes its first iteration.
-            supervisor.restore_from_cache();
-            let config_status = supervisor.config_status();
-            let handle = supervisor.handle();
-            let watch_task = tokio::spawn(supervisor.clone().run(cancel_rx.clone()));
-            (
-                handle,
-                Some(supervisor),
-                watch_task,
-                admin_client,
-                config_status,
+    let (snapshot_handle, supervisor, watch_task, admin_client, config_status) = if let Some(path) =
+        &file_source_path
+    {
+        // FILE MODE: the file is a channel into the same supervisor
+        // etcd feeds — the same loader, last-known-good retention and
+        // `/status/config` report. A file that cannot be read as rows
+        // at all fails the boot here; SIGHUP re-reads it.
+        let config_status = ConfigStatus::new(SourceKind::File);
+        let provider =
+            Arc::new(aisix_etcd::FileConfigProvider::new(path).with_status(config_status.clone()));
+        let passive = Arc::new(provider.passive());
+        let observed = Arc::clone(&metrics_slot);
+        let supervisor = Arc::new(
+            Supervisor::with_sources(
+                vec![
+                    (
+                        WatchedPrefix::environment(aisix_etcd::file_source::ENV_PREFIX),
+                        provider,
+                    ),
+                    (
+                        WatchedPrefix::global(aisix_etcd::file_source::GLOBAL_PREFIX),
+                        passive,
+                    ),
+                ],
+                SnapshotCache::disabled(),
             )
+            .with_config_status(config_status.clone())
+            .with_apply_observer(Arc::new(move |trigger, events, elapsed| {
+                if let Some(metrics) = observed.get() {
+                    metrics.record_config_apply(trigger, events, elapsed);
+                }
+            })),
+        );
+        let stats = supervisor
+            .load_once()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        tracing::info!(
+            file = %path.display(),
+            accepted = stats.accepted,
+            rejected = stats.rejections.len(),
+            "resources file loaded",
+        );
+        let handle = supervisor.handle();
+        let watch_task = tokio::spawn(supervisor.run(cancel_rx.clone()));
+        (handle, None, watch_task, None, config_status)
+    } else {
+        // ETCD MODE (unchanged behavior).
+        //
+        // Before handing endpoints to tonic, probe each one via the
+        // stdlib resolver. tonic's HTTP connector collapses any DNS
+        // failure into an opaque "dns error" Status (see
+        // hyper-util/src/client/legacy/connect/http.rs) — even after the
+        // cause-chain logging in aisix-etcd, the deepest cause we see is
+        // still whatever getaddrinfo returned. The probe either logs the
+        // resolved addresses (DNS works; the failure is higher in the
+        // tonic / TLS stack) or logs the raw io::Error (DNS actually
+        // fails). Both outcomes narrow triage substantially.
+        probe_etcd_dns(&cfg.etcd.endpoints).await;
+
+        // Same extra trust root reused by the etcd connect options.
+        let connect_options =
+            build_etcd_connect_options_with_extra_ca(&cfg.etcd, extra_ca_pem.as_deref())?;
+        // effective_prefix() is `<prefix>/<env_id>` in v3 managed mode
+        // (env_id populated from the register response above), bare
+        // `<prefix>` in self-hosted dev where env_id is empty.
+        let etcd_prefix = cfg.etcd.effective_prefix();
+        // The shared pricing catalog, watched alongside the
+        // environment's own prefix and folded into the same snapshot.
+        // A control plane that does not grant read access to it is
+        // tolerated: the supervisor serves without prices rather than
+        // without configuration.
+        let global_prefix = cfg.etcd.global_prefix();
+        // Only a refusal ends the boot here: an etcd that cannot be
+        // reached leaves the connection pending and the supervisor
+        // dials it again, so the gateway waits for its source instead
+        // of exiting on it. See `EtcdConfigProvider::connect`.
+        let provider = Arc::new(
+            EtcdConfigProvider::connect(
+                &cfg.etcd.endpoints,
+                etcd_prefix.clone(),
+                connect_options.clone(),
+                cfg.etcd.request_timeout(),
+                cfg.etcd.dial_budget(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
+        );
+        // Its own connection, for the same reason the admin surface
+        // has one: the catalog's range read and watch never queue
+        // behind the environment's, and a refusal on one channel does
+        // not disturb the other.
+        let global_provider = Arc::new(
+            EtcdConfigProvider::connect(
+                &cfg.etcd.endpoints,
+                global_prefix.clone(),
+                connect_options.clone(),
+                cfg.etcd.request_timeout(),
+                cfg.etcd.dial_budget(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
+        );
+        // Separate connection for the admin read surface — only needed
+        // when the admin listener is bound. It could share the config
+        // provider's, but keeping two means an admin read and the watch
+        // stream never queue behind the same connect, and neither can
+        // stall the other's channel.
+        // Skipped whenever the admin listener is not bound — managed mode,
+        // or `admin.enabled = false` — so admin-off doesn't pay for (or
+        // fail boot on) a connection it immediately drops; `/status/models`
+        // then reads through the snapshot, as it does in managed mode.
+        let admin_client = if cfg.managed.is_managed() || !cfg.admin.enabled {
+            None
+        } else {
+            Some((
+                Arc::new(aisix_etcd::LazyEtcdClient::new(
+                    cfg.etcd.endpoints.clone(),
+                    connect_options.clone(),
+                    cfg.etcd.dial_budget(),
+                )),
+                etcd_prefix.clone(),
+                cfg.etcd.request_timeout(),
+            ))
         };
+        // Disk recovery is opt-in in both managed and self-hosted modes.
+        let snapshot_cache = match cfg.managed.effective_snapshot_cache_path() {
+            Some(path) => SnapshotCache::new(path),
+            None => SnapshotCache::disabled(),
+        };
+        let observed = Arc::clone(&metrics_slot);
+        let supervisor = Arc::new(
+            Supervisor::with_sources(
+                vec![
+                    (WatchedPrefix::environment(etcd_prefix), provider),
+                    (WatchedPrefix::global(global_prefix), global_provider),
+                ],
+                snapshot_cache,
+            )
+            .with_apply_observer(Arc::new(move |trigger, events, elapsed| {
+                if let Some(metrics) = observed.get() {
+                    metrics.record_config_apply(trigger, events, elapsed);
+                }
+            })),
+        );
+        // Seed the snapshot from disk before the etcd cycle starts so the
+        // proxy is ready to serve from cached config the moment the watch
+        // task takes its first iteration.
+        supervisor.restore_from_cache();
+        let config_status = supervisor.config_status();
+        let handle = supervisor.handle();
+        let watch_task = tokio::spawn(supervisor.clone().run(cancel_rx.clone()));
+        (
+            handle,
+            Some(supervisor),
+            watch_task,
+            admin_client,
+            config_status,
+        )
+    };
     // Spawn heartbeat worker if we have a config for it. The
     // JoinHandle is awaited after graceful shutdown below so the
     // final in-flight beat drains cleanly.

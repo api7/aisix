@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  droppedRows,
   EtcdClient,
   etcdEndpoint,
   ProxyClient,
@@ -224,6 +225,7 @@ describe("aisix export: a classifier that names its direct model by id", () => {
       exposeDebugHeaders: true,
       extraEnv: slsEnv,
     });
+    expect(await droppedRows(fileApp)).toEqual({ rejected: [], unknown_kinds: [] });
   });
 
   afterAll(async () => {

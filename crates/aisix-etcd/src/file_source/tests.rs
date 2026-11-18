@@ -113,18 +113,28 @@ provider_keys:
   - id: 42
   - id: {PK}
   - id: {PK}
+  - id: 0B6F3C1E-2F0A-4C5E-9D55-7D1A8B0C2E11
+  - id: "{{0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11}}"
 "#
     ));
+    let not_canonical = |i: usize, found: &str| {
+        format!(
+            "provider_keys[{i}]: `id` must be a UUID string in lowercase hyphenated form, \
+             found {found}"
+        )
+    };
     assert_eq!(
         errors,
         [
             "provider_keys[0]: `id` is required (the resource's UUID)".to_string(),
-            "provider_keys[1]: `id` must be a UUID string, found \"openai-prod\"".to_string(),
-            "provider_keys[2]: `id` must be a UUID string, found 42".to_string(),
+            not_canonical(1, "\"openai-prod\""),
+            not_canonical(2, "42"),
             format!(
                 "provider_keys[4]: duplicate id \"{PK}\" — every entry of `provider_keys` needs \
                  its own id"
             ),
+            not_canonical(5, "\"0B6F3C1E-2F0A-4C5E-9D55-7D1A8B0C2E11\""),
+            not_canonical(6, "\"{0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11}\""),
         ]
     );
 }
@@ -215,7 +225,8 @@ async fn a_file_runs_through_the_supervisor_like_etcd() {
         .unwrap()
     };
     write("gpt-4o");
-    let provider = Arc::new(FileConfigProvider::new(&path));
+    let status = aisix_core::ConfigStatus::new(SourceKind::File);
+    let provider = Arc::new(FileConfigProvider::new(&path).with_status(status.clone()));
     let passive = Arc::new(provider.passive());
     let supervisor = Supervisor::with_sources(
         vec![
@@ -224,7 +235,7 @@ async fn a_file_runs_through_the_supervisor_like_etcd() {
         ],
         SnapshotCache::disabled(),
     )
-    .with_source_kind(SourceKind::File);
+    .with_config_status(status.clone());
 
     supervisor.load_once().await.unwrap();
     let snap = supervisor.handle().load();
@@ -253,4 +264,49 @@ async fn a_file_runs_through_the_supervisor_like_etcd() {
     let rejected = serde_json::to_value(&view).unwrap()["rejected"].clone();
     assert_eq!(rejected[0]["resource_kind"], "models");
     assert_eq!(rejected[0]["resource_id"], MODEL);
+}
+
+#[tokio::test]
+async fn a_reload_that_cannot_be_read_is_reported_out_of_sync() {
+    use crate::{SnapshotCache, Supervisor};
+    use aisix_core::config_status::{ConfigState, SourceKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resources.yaml");
+    std::fs::write(
+        &path,
+        format!("_format_version: \"2\"\nprovider_keys:\n  - id: {PK}\n    display_name: pk\n    api_key: x\n"),
+    )
+    .unwrap();
+    let status = aisix_core::ConfigStatus::new(SourceKind::File);
+    let provider = Arc::new(FileConfigProvider::new(&path).with_status(status.clone()));
+    let supervisor = Supervisor::with_sources(
+        vec![(
+            WatchedPrefix::environment(ENV_PREFIX),
+            Arc::clone(&provider),
+        )],
+        SnapshotCache::disabled(),
+    )
+    .with_config_status(status.clone());
+    supervisor.load_once().await.unwrap();
+    assert_eq!(status.view().state, ConfigState::Synced);
+
+    std::fs::write(
+        &path,
+        "_format_version: \"2\"\nmodels:\n  - display_name: no-id\n",
+    )
+    .unwrap();
+    let report = provider.read().unwrap_err();
+    provider.report_failure(&report);
+    let view = serde_json::to_value(status.view()).unwrap();
+    assert_eq!(status.view().state, ConfigState::OutOfSync);
+    assert_eq!(view["rejected"][0]["resource_kind"], "models");
+    assert_eq!(view["rejected"][0]["last_error_kind"], "bad_key");
+    // The configuration that was serving still serves.
+    assert!(supervisor
+        .handle()
+        .load()
+        .provider_keys
+        .get_by_id(PK)
+        .is_some());
 }

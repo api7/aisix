@@ -92,8 +92,24 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
         WatchedPrefix::global(format!("{}/global/", args.prefix.trim_end_matches('/'))),
     ]);
     let (snapshot, stats) = build_snapshot(&prefixes, &entries);
+    let rejected: std::collections::HashSet<&str> =
+        stats.rejections.iter().map(|r| r.key.as_str()).collect();
+    let raw: document::RawDocs = entries
+        .iter()
+        .filter(|e| !rejected.contains(e.key.as_str()))
+        .filter_map(|e| {
+            let key = prefixes.resolve(&e.key).ok()?;
+            if key.scope != aisix_etcd::PrefixScope::Environment {
+                return None;
+            }
+            let serde_json::Value::Object(doc) = serde_json::from_slice(&e.value).ok()? else {
+                return None;
+            };
+            Some(((key.kind.to_string(), key.id.to_string()), doc))
+        })
+        .collect();
 
-    let document = build_export_document(&snapshot, args.reveal_secrets);
+    let document = build_export_document(&snapshot, &raw, args.reveal_secrets);
     let yaml = emit_yaml(&document).map_err(|e| anyhow::anyhow!(e))?;
 
     let resource_count = document
@@ -119,6 +135,38 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
     report_rejections(&stats);
     report_warnings(&document.warnings);
     report_secrets(&document, args.reveal_secrets);
+
+    // A resources file keys every entry by a canonical UUID; etcd takes any
+    // id segment, so a hand-written store can hold one the file refuses.
+    let invalid_ids: Vec<String> = document
+        .collections
+        .iter()
+        .flat_map(|(kind, entries)| entries.iter().map(move |e| (kind, e)))
+        .filter_map(|(kind, entry)| {
+            let id = entry
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let canonical =
+                uuid::Uuid::try_parse(id).is_ok_and(|u| u.hyphenated().to_string() == id);
+            (!canonical).then(|| format!("{kind} {id:?}"))
+        })
+        .collect();
+    if !invalid_ids.is_empty() {
+        eprintln!(
+            "\n{} resource(s) are stored under an id that is not a lowercase hyphenated UUID, \
+             which a resources file does not accept — the written file will not load until they \
+             are re-keyed:",
+            invalid_ids.len()
+        );
+        for id in &invalid_ids {
+            eprintln!("  - {id}");
+        }
+        anyhow::bail!(
+            "export completed with {} id(s) a resources file cannot carry",
+            invalid_ids.len()
+        );
+    }
 
     // The file is written for inspection either way, but a scripted
     // migration must not mistake an incomplete export for a finished one:

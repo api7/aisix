@@ -15,3 +15,18 @@ export function fileId(seed: string): string {
 export function keyHash(plaintext: string): string {
   return createHash("sha256").update(plaintext).digest("hex");
 }
+
+/**
+ * What `/status/config` says the gateway dropped: a row the loader
+ * rejected, or one of a kind it does not know. A file-mode gateway boots
+ * past both, so a spec loading a file it expects to load whole asserts
+ * this is empty.
+ */
+export async function droppedRows(app: { metricsUrl: string }): Promise<{
+  rejected: unknown[];
+  unknown_kinds: unknown[];
+}> {
+  const res = await fetch(`${app.metricsUrl}/status/config`);
+  const body = (await res.json()) as { rejected?: unknown[]; unknown_kinds?: unknown[] };
+  return { rejected: body.rejected ?? [], unknown_kinds: body.unknown_kinds ?? [] };
+}

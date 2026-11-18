@@ -610,10 +610,12 @@ impl<P: ConfigProvider> Supervisor<P> {
         }
     }
 
-    /// Report load state as coming from `kind` — a resources file runs
-    /// through this same supervisor (see [`crate::file_source`]).
-    pub fn with_source_kind(mut self, kind: SourceKind) -> Self {
-        self.config_status = ConfigStatus::new(kind);
+    /// Report load state on `status` instead of a fresh etcd one — a
+    /// resources file runs through this same supervisor, and its provider
+    /// reports a reload it could not read on the same handle (see
+    /// [`crate::file_source`]).
+    pub fn with_config_status(mut self, status: ConfigStatus) -> Self {
+        self.config_status = status;
         self
     }
 

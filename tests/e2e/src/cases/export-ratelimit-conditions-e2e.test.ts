@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { parse as parseYaml } from "yaml";
 import {
+  droppedRows,
   awaitWindowHeadroom,
   EtcdClient,
   etcdEndpoint,
@@ -118,6 +119,7 @@ describe("aisix export: a conditional rate-limit policy on model and api_key lea
       expect.objectContaining({ dimension: "api_key", value: limitedKeyId }),
     ]);
     fileApp = await spawnApp({ resourcesFile: exported });
+    expect(await droppedRows(fileApp)).toEqual({ rejected: [], unknown_kinds: [] });
     for (const app of [etcdApp!, fileApp]) {
       // `rpm` counts in a wall-clock minute; keep the pair inside one.
       await awaitWindowHeadroom(10);

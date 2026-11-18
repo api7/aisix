@@ -25,6 +25,21 @@ fn snapshot(rows: &[(&str, &str, Value)]) -> AisixSnapshot {
     snap
 }
 
+/// Export `rows` as `aisix export` does: the stored documents, filtered by
+/// what the loader accepted.
+fn export(rows: &[(&str, &str, Value)], reveal: bool) -> ExportDocument {
+    let raw: RawDocs = rows
+        .iter()
+        .map(|(kind, id, value)| {
+            let Value::Object(doc) = value.clone() else {
+                unreachable!()
+            };
+            ((kind.to_string(), id.to_string()), doc)
+        })
+        .collect();
+    build_export_document(&snapshot(rows), &raw, reveal)
+}
+
 fn find<'a>(doc: &'a ExportDocument, kind: &str) -> &'a [Value] {
     doc.collections
         .iter()
@@ -65,7 +80,7 @@ fn rows() -> Vec<(&'static str, &'static str, Value)> {
 
 #[test]
 fn every_entry_carries_its_etcd_id_and_its_references_as_stored() {
-    let doc = build_export_document(&snapshot(&rows()), false);
+    let doc = export(&rows(), false);
     assert_eq!(find(&doc, "provider_keys")[0]["id"], json!(PK));
     let model = &find(&doc, "models")[0];
     assert_eq!(model["id"], json!(MODEL));
@@ -84,8 +99,7 @@ fn every_entry_carries_its_etcd_id_and_its_references_as_stored() {
 
 #[test]
 fn the_exported_file_loads_back_as_the_same_rows() {
-    let source = snapshot(&rows());
-    let doc = build_export_document(&source, false);
+    let doc = export(&rows(), false);
     let yaml = super::super::yaml_emit::emit_yaml(&doc).unwrap();
     let env = |name: &str| {
         (name == "AISIXSECRET_PROVIDER_KEY_OPENAI_PROD_API_KEY").then(|| "sk-live".to_string())
@@ -126,7 +140,7 @@ fn a_reference_to_an_id_not_exported_is_kept_and_warned() {
             "max_requests": 10
         }),
     ));
-    let doc = build_export_document(&snapshot(&rows), false);
+    let doc = export(&rows, false);
     assert_eq!(find(&doc, "models")[0]["provider_key_id"], json!(GONE));
     let warnings = doc.warnings.join("\n");
     for field in [
@@ -145,12 +159,12 @@ fn a_reference_to_an_id_not_exported_is_kept_and_warned() {
 
 #[test]
 fn a_dangling_attachment_scope_is_warned() {
-    let doc = build_export_document(
-        &snapshot(&[(
+    let doc = export(
+        &[(
             "guardrail_attachments",
             POLICY,
             json!({"guardrail_id": GONE, "scope_type": "model", "scope_id": MODEL, "priority": 1}),
-        )]),
+        )],
         false,
     );
     let warnings = doc.warnings.join("\n");
@@ -166,7 +180,7 @@ fn a_dangling_attachment_scope_is_warned() {
 
 #[test]
 fn default_export_emits_no_live_secret() {
-    let doc = build_export_document(&snapshot(&rows()), false);
+    let doc = export(&rows(), false);
     let pk = &find(&doc, "provider_keys")[0];
     assert_eq!(
         pk["api_key"],
@@ -175,7 +189,7 @@ fn default_export_emits_no_live_secret() {
     assert_eq!(doc.secret_placeholders.len(), 1);
     assert_eq!(doc.secret_placeholders[0].id, PK);
 
-    let revealed = build_export_document(&snapshot(&rows()), true);
+    let revealed = export(&rows(), true);
     assert_eq!(
         find(&revealed, "provider_keys")[0]["api_key"],
         json!("sk-live")
@@ -185,8 +199,8 @@ fn default_export_emits_no_live_secret() {
 
 #[test]
 fn credentials_beside_the_api_key_are_redacted() {
-    let doc = build_export_document(
-        &snapshot(&[
+    let doc = export(
+        &[
             (
                 "provider_keys",
                 PK,
@@ -204,7 +218,7 @@ fn credentials_beside_the_api_key_are_redacted() {
                 MODEL,
                 json!({"name": "corp", "hmac_secret": "s".repeat(40)}),
             ),
-        ]),
+        ],
         false,
     );
     let text = serde_json::to_string(&doc.collections).unwrap();
@@ -216,8 +230,8 @@ fn credentials_beside_the_api_key_are_redacted() {
 
 #[test]
 fn two_entries_sharing_a_name_warn_about_their_placeholder() {
-    let doc = build_export_document(
-        &snapshot(&[
+    let doc = export(
+        &[
             (
                 "provider_keys",
                 PK,
@@ -228,7 +242,7 @@ fn two_entries_sharing_a_name_warn_about_their_placeholder() {
                 MODEL,
                 json!({"display_name": "same", "api_key": "b"}),
             ),
-        ]),
+        ],
         false,
     );
     assert_eq!(doc.warnings.len(), 1, "{:?}", doc.warnings);
@@ -237,12 +251,12 @@ fn two_entries_sharing_a_name_warn_about_their_placeholder() {
 
 #[test]
 fn dollars_in_stored_strings_are_escaped() {
-    let doc = build_export_document(
-        &snapshot(&[(
+    let doc = export(
+        &[(
             "provider_keys",
             PK,
             json!({"display_name": "costs $5", "api_key": "x"}),
-        )]),
+        )],
         true,
     );
     assert_eq!(
@@ -253,11 +267,11 @@ fn dollars_in_stored_strings_are_escaped() {
 
 #[test]
 fn kinds_a_file_does_not_carry_are_reported() {
-    let doc = build_export_document(
-        &snapshot(&[
+    let doc = export(
+        &[
             ("teams", PK, json!({"name": "eng"})),
             ("users", MODEL, json!({"name": "ana"})),
-        ]),
+        ],
         false,
     );
     assert!(doc.collections.is_empty());
@@ -270,4 +284,32 @@ fn kinds_a_file_does_not_carry_are_reported() {
         warnings.contains("1 users document(s) not exported"),
         "{warnings}"
     );
+}
+
+#[test]
+fn documents_are_written_as_stored_not_re_serialized() {
+    // The typed model would add every default (`endpoint: null` among them,
+    // which the read schema refuses); the file carries what etcd carries.
+    let doc = export(
+        &[(
+            "guardrails",
+            POLICY,
+            json!({"name": "mod", "kind": "openai_moderation", "api_key": "sk-x"}),
+        )],
+        true,
+    );
+    assert_eq!(
+        find(&doc, "guardrails")[0],
+        json!({"id": POLICY, "name": "mod", "kind": "openai_moderation", "api_key": "sk-x"})
+    );
+}
+
+#[test]
+fn the_former_provider_key_secret_spelling_is_redacted_too() {
+    let doc = export(
+        &[("provider_keys", PK, json!({"display_name": "old", "secret": "sk-old-spelling"}))],
+        false,
+    );
+    let text = serde_json::to_string(&doc.collections).unwrap();
+    assert!(!text.contains("sk-old-spelling"), "{text}");
 }

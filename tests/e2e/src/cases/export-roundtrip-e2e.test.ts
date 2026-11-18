@@ -1,10 +1,13 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { parse as parseYaml } from "yaml";
 import {
+  droppedRows,
   EtcdClient,
   etcdEndpoint,
   ProxyClient,
@@ -179,6 +182,9 @@ describe("aisix export: etcd → export → file round-trip", () => {
       admin: true,
       exposeDebugHeaders: true,
     });
+    // Every exported document loads: a row the loader rejected would be
+    // dropped while the gateway boots anyway.
+    expect(await droppedRows(fileApp)).toEqual({ rejected: [], unknown_kinds: [] });
 
     // The file-mode gateway serves each resource under the control-plane id.
     const listIds = async (kind: string) => {
@@ -344,6 +350,22 @@ describe("aisix export: etcd → export → file round-trip", () => {
       }
       expect(yaml).toContain("${AISIXSECRET");
       expect(stderr).toContain("secret value(s) were replaced");
+
+      // The redacted file still loads whole once the placeholders are
+      // set: every secret-bearing kind's document survives the export.
+      const dir = await mkdtemp(join(tmpdir(), "aisix-export-noleak-"));
+      try {
+        const path = join(dir, "resources.yaml");
+        await writeFile(path, yaml, "utf8");
+        const env = {
+          ...process.env,
+          ...Object.fromEntries(placeholderVars(yaml).map((v) => [v, "placeholder-value"])),
+        };
+        const { stdout } = await execFileP(BIN_PATH, ["validate", "--resources", path], { env });
+        expect(stdout).toContain("OK:");
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
     } finally {
       await etcd.deletePrefix(prefix);
     }

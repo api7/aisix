@@ -46,6 +46,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 use yaml_rust2::{Yaml, YamlLoader};
 
+use aisix_core::config_status::{
+    hash_entries, ConfigStatus, IncomingRejection, LazyHash, LoadObservation,
+};
+
 use crate::key::{PrefixSet, WatchedPrefix};
 use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 
@@ -92,6 +96,8 @@ impl std::fmt::Display for ChannelError {
 pub struct FileErrors {
     pub file: String,
     pub errors: Vec<ChannelError>,
+    /// Digest of the bytes read, when the file could be read at all.
+    pub source_hash: Option<String>,
 }
 
 impl std::fmt::Display for FileErrors {
@@ -118,9 +124,14 @@ pub fn read_file(path: &Path, revision: i64) -> Result<Vec<RawEntry>, FileErrors
     let contents = std::fs::read_to_string(path).map_err(|e| FileErrors {
         file: label.clone(),
         errors: vec![file_error(format!("cannot read file: {e}"))],
+        source_hash: None,
     })?;
     read_str(&contents, &label, revision, &|name| {
         std::env::var(name).ok()
+    })
+    .map_err(|mut e| {
+        e.source_hash = Some(hash_entries([("", contents.as_bytes())]));
+        e
     })
 }
 
@@ -141,6 +152,7 @@ pub fn read_str(
     let fail = |errors: Vec<ChannelError>| FileErrors {
         file: file_label.to_string(),
         errors,
+        source_hash: None,
     };
     let docs = YamlLoader::load_from_str(contents)
         .map_err(|e| fail(vec![file_error(format!("YAML parse error: {e}"))]))?;
@@ -255,10 +267,18 @@ fn read_kind(
                 continue;
             }
         };
+        // Only the canonical spelling: references match ids as strings, so
+        // `ABC…` or `{abc…}` would name a different resource than `abc…`.
         let id = match doc.remove("id") {
-            Some(Value::String(id)) if uuid::Uuid::try_parse(&id).is_ok() => id,
+            Some(Value::String(id))
+                if uuid::Uuid::try_parse(&id).is_ok_and(|u| u.hyphenated().to_string() == id) =>
+            {
+                id
+            }
             Some(other) => {
-                error(format!("`id` must be a UUID string, found {other}"));
+                error(format!(
+                    "`id` must be a UUID string in lowercase hyphenated form, found {other}"
+                ));
                 continue;
             }
             None => {
@@ -284,10 +304,10 @@ fn read_kind(
 /// same [`crate::Supervisor`] etcd does.
 ///
 /// The file has no watch: a SIGHUP re-reads it and hands the supervisor a
-/// full resync. A read that fails ends the watch with an error, which the
-/// supervisor treats as a source outage — the configuration it serves
-/// stays, `/status/config` reports the failure, and it retries the read
-/// with its usual backoff until the file reads again.
+/// full resync. A reload that cannot be read as rows is not handed over at
+/// all: the configuration that is serving stays, the failure is recorded on
+/// the status handle given by [`Self::with_status`] (`out_of_sync`, with the
+/// problems as `rejected[]`), and the next SIGHUP tries again.
 ///
 /// Both of the supervisor's prefixes are read from the one file, so only
 /// the environment provider reads it; the provider for the global prefix
@@ -298,6 +318,7 @@ fn read_kind(
 pub struct FileConfigProvider {
     path: Option<PathBuf>,
     generation: Arc<AtomicI64>,
+    status: Option<ConfigStatus>,
 }
 
 impl FileConfigProvider {
@@ -305,7 +326,15 @@ impl FileConfigProvider {
         Self {
             path: Some(path.into()),
             generation: Arc::default(),
+            status: None,
         }
+    }
+
+    /// Where a failed SIGHUP reload is reported: the supervisor's own
+    /// status handle (see [`crate::Supervisor::with_config_status`]).
+    pub fn with_status(mut self, status: ConfigStatus) -> Self {
+        self.status = Some(status);
+        self
     }
 
     /// The provider for the global prefix: its rows come in with this
@@ -314,6 +343,7 @@ impl FileConfigProvider {
         Self {
             path: None,
             generation: Arc::clone(&self.generation),
+            status: None,
         }
     }
 
@@ -327,22 +357,82 @@ impl FileConfigProvider {
         read_file(path, revision).map(|entries| (entries, revision))
     }
 
-    async fn read_blocking(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
+    async fn read_blocking(&self) -> Result<(Vec<RawEntry>, i64), FileErrors> {
         let this = self.clone();
-        tokio::task::spawn_blocking(move || this.read())
+        let label = self
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let result = tokio::task::spawn_blocking(move || this.read())
             .await
-            .map_err(|e| ProviderError::Range(format!("resources file read task failed: {e}")))?
-            .map_err(|report| {
-                tracing::warn!("resources file could not be read:\n{report}");
-                ProviderError::Range(report.to_string())
+            .unwrap_or_else(|e| {
+                Err(FileErrors {
+                    file: label,
+                    errors: vec![file_error(format!("read task failed: {e}"))],
+                    source_hash: None,
+                })
+            });
+        if let Err(report) = &result {
+            tracing::warn!("resources file could not be read:\n{report}");
+        }
+        result
+    }
+
+    fn report_failure(&self, report: &FileErrors) {
+        let Some(status) = &self.status else { return };
+        let seen_at = chrono::Utc::now();
+        let rejected = report
+            .errors
+            .iter()
+            .map(|e| IncomingRejection {
+                identity: e.scope.clone(),
+                resource_kind: e
+                    .scope
+                    .split('[')
+                    .next()
+                    .filter(|k| !k.starts_with('('))
+                    .unwrap_or_default()
+                    .to_string(),
+                resource_id: String::new(),
+                last_error_kind: if e.message.starts_with("`id`")
+                    || e.message.starts_with("duplicate id")
+                {
+                    "bad_key"
+                } else {
+                    "non_json"
+                }
+                .to_string(),
+                last_error: e.message.clone(),
+                seen_at,
+                serving_stale_since: None,
             })
+            .collect();
+        status.record_load(LoadObservation {
+            source_hash: LazyHash::ready(
+                report
+                    .source_hash
+                    .clone()
+                    .unwrap_or_else(|| hash_entries(std::iter::empty())),
+            ),
+            observed_revision: None,
+            applied: None,
+            rejected,
+            partially_compatible: Vec::new(),
+            partially_compatible_rows_by_kind: Default::default(),
+            stale_served_rows_by_kind: Default::default(),
+            is_reload: true,
+            wholly_rejected: true,
+        });
     }
 }
 
 #[async_trait]
 impl ConfigProvider for FileConfigProvider {
     async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
-        self.read_blocking().await
+        self.read_blocking()
+            .await
+            .map_err(|report| ProviderError::File(report.to_string()))
     }
 
     async fn watch(
@@ -362,17 +452,21 @@ impl ConfigProvider for FileConfigProvider {
                 ProviderError::Watch(format!("cannot install the SIGHUP handler: {e}"))
             })?;
             let reader = self.clone();
-            let stream =
-                futures::stream::unfold((hup, reader), |(mut hup, reader)| async move {
+            let stream = futures::stream::unfold((hup, reader), |(mut hup, reader)| async move {
+                loop {
                     hup.recv().await?;
-                    let event = reader.read_blocking().await.map(|(entries, revision)| {
-                        WatchEvent::Resync {
-                            entries: Arc::new(entries),
-                            revision,
+                    match reader.read_blocking().await {
+                        Ok((entries, revision)) => {
+                            let event = WatchEvent::Resync {
+                                entries: Arc::new(entries),
+                                revision,
+                            };
+                            return Some((Ok(event), (hup, reader)));
                         }
-                    });
-                    Some((event, (hup, reader)))
-                });
+                        Err(report) => reader.report_failure(&report),
+                    }
+                }
+            });
             Ok(Box::new(Box::pin(stream)))
         }
         #[cfg(not(unix))]
