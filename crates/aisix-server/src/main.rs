@@ -84,7 +84,6 @@ mod telemetry;
 use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore, FileManagedStore};
 use aisix_cache::{Cache, MemoryCache};
 use aisix_core::models::Adapter;
-use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{
     AisixSnapshot, CacheBackend, Config, ConfigStatus, EtcdConfig, EtcdTlsConfig, RateLimitBackend,
     SourceKind,
@@ -299,21 +298,46 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
     outcome
 }
 
-/// `aisix validate --resources <file>`: run the identical file-source
-/// pipeline (read → interpolate → desugar → canonical schema validation
-/// → typed decode → cross-reference checks) that boot and SIGHUP reload
-/// use, without booting any listener, then check that every enabled
-/// guardrail row actually builds. Exit 0 on success; on failure the
-/// aggregated error report (every problem, with kind / entry / field
-/// context) goes to stderr and the process exits non-zero.
+/// `aisix validate --resources <file>`: read the file the way file mode
+/// does and run its rows through the loader the gateway uses for etcd and
+/// files alike, without booting any listener, then check that every
+/// enabled guardrail row actually builds. Every row the loader rejects is
+/// reported with its reason, and any rejection — or a file that cannot be
+/// read as rows at all — exits non-zero.
 fn run_validate(resources: &Path) -> anyhow::Result<()> {
-    let snapshot = match aisix_core::filesource::load_resources_file(resources, 1) {
-        Ok(snapshot) => snapshot,
+    let entries = match aisix_etcd::file_source::read_file(resources, 1) {
+        Ok(entries) => entries,
         Err(report) => {
             eprintln!("{report}");
             std::process::exit(1);
         }
     };
+    let (snapshot, stats) =
+        aisix_etcd::build_snapshot(&aisix_etcd::file_source::prefixes(), &entries);
+    for row in &stats.partial_rows {
+        eprintln!(
+            "resources file {}: warning: {}: fields this gateway does not define are ignored: {}",
+            resources.display(),
+            row.key,
+            row.fields.join(", "),
+        );
+    }
+    if !stats.rejections.is_empty() {
+        eprintln!(
+            "resources file {}: {} row(s) rejected:",
+            resources.display(),
+            stats.rejections.len(),
+        );
+        for rejection in &stats.rejections {
+            eprintln!(
+                "  - {} ({}): {}",
+                rejection.key,
+                rejection.kind.as_str(),
+                rejection.error
+            );
+        }
+        std::process::exit(1);
+    }
     // Loading only proves the file parses. A guardrail row whose config
     // does not build — an invalid regex, an unknown detector, a
     // `kind: custom` script with a syntax error — is dropped from the
@@ -478,102 +502,6 @@ fn gauge_series_is_live(
                         || model == UNRESOLVED
                         || snap.models.get_by_name(model).is_some()),
             )
-        }
-    }
-}
-
-/// SIGHUP → re-run the whole file-source pipeline against the same
-/// resources file. Success swaps the snapshot atomically (the same
-/// [`SnapshotHandle::store`] the etcd watch supervisor uses), stamping
-/// entries with the next generation as their revision; failure keeps
-/// serving the previous snapshot and logs the aggregated error report
-/// at WARN. There is deliberately no file watcher — reloads are
-/// explicit.
-async fn file_reload_loop(
-    path: PathBuf,
-    handle: SnapshotHandle<AisixSnapshot>,
-    config_status: ConfigStatus,
-    mut cancel: watch::Receiver<bool>,
-) {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut hup = match signal(SignalKind::hangup()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "cannot install SIGHUP handler; resources file reload disabled");
-                return;
-            }
-        };
-        // The boot load stamped revision 1; each successful reload
-        // bumps the generation so snapshot consumers observe a change.
-        let mut generation: i64 = 1;
-        loop {
-            tokio::select! {
-                _ = hup.recv() => {
-                    // File IO + the full parse/validate pipeline are
-                    // synchronous — run them off the async workers so a
-                    // large file can't stall in-flight requests.
-                    let load_path = path.clone();
-                    let next_generation = generation + 1;
-                    let reload_status = config_status.clone();
-                    let loaded = tokio::task::spawn_blocking(move || {
-                        aisix_core::filesource::load_resources_file_tracked(
-                            &load_path,
-                            next_generation,
-                            true,
-                            &reload_status,
-                        )
-                    })
-                    .await;
-                    let loaded = match loaded {
-                        Ok(result) => result,
-                        Err(join_err) => {
-                            tracing::warn!(
-                                file = %path.display(),
-                                error = %join_err,
-                                "resources file reload task failed — keeping the previous snapshot",
-                            );
-                            continue;
-                        }
-                    };
-                    match loaded {
-                        Ok(snapshot) => {
-                            generation += 1;
-                            let resources = snapshot.total_entries();
-                            handle.store(snapshot);
-                            tracing::info!(
-                                file = %path.display(),
-                                resources,
-                                generation,
-                                "resources file reloaded",
-                            );
-                        }
-                        Err(report) => {
-                            tracing::warn!(
-                                file = %path.display(),
-                                "resources file reload failed — keeping the previous snapshot:\n{report}",
-                            );
-                        }
-                    }
-                }
-                changed = cancel.changed() => {
-                    if changed.is_err() || *cancel.borrow() {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        // No SIGHUP on this platform: the boot-time load stays in
-        // effect until restart.
-        let _ = (path, handle);
-        loop {
-            if cancel.changed().await.is_err() || *cancel.borrow() {
-                break;
-            }
         }
     }
 }
@@ -824,26 +752,47 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     let metrics_slot: Arc<std::sync::OnceLock<Arc<Metrics>>> = Arc::new(std::sync::OnceLock::new());
     let (snapshot_handle, supervisor, watch_task, admin_client, config_status) =
         if let Some(path) = &file_source_path {
-            // FILE MODE: load once at boot, fail fast with the aggregated
-            // error report on any problem. SIGHUP re-runs the identical
-            // pipeline; a failed reload keeps the last-good snapshot.
-            let config_status = ConfigStatus::new(SourceKind::File);
-            let snapshot =
-                aisix_core::filesource::load_resources_file_tracked(path, 1, true, &config_status)
-                    .map_err(|report| anyhow::anyhow!("{report}"))?;
+            // FILE MODE: the file is a channel into the same supervisor
+            // etcd feeds — the same loader, last-known-good retention and
+            // `/status/config` report. A file that cannot be read as rows
+            // at all fails the boot here; SIGHUP re-reads it.
+            let provider = Arc::new(aisix_etcd::FileConfigProvider::new(path));
+            let entries = provider
+                .read()
+                .map_err(|report| anyhow::anyhow!("{report}"))?
+                .0;
             tracing::info!(
                 file = %path.display(),
-                resources = snapshot.total_entries(),
-                "resources loaded from file",
+                entries = entries.len(),
+                "resources file read",
             );
-            let handle = SnapshotHandle::new(snapshot);
-            let reload_task = tokio::spawn(file_reload_loop(
-                path.clone(),
-                handle.clone(),
-                config_status.clone(),
-                cancel_rx.clone(),
-            ));
-            (handle, None, reload_task, None, config_status)
+            let passive = Arc::new(provider.passive());
+            let observed = Arc::clone(&metrics_slot);
+            let supervisor = Arc::new(
+                Supervisor::with_sources(
+                    vec![
+                        (
+                            WatchedPrefix::environment(aisix_etcd::file_source::ENV_PREFIX),
+                            provider,
+                        ),
+                        (
+                            WatchedPrefix::global(aisix_etcd::file_source::GLOBAL_PREFIX),
+                            passive,
+                        ),
+                    ],
+                    SnapshotCache::disabled(),
+                )
+                .with_source_kind(SourceKind::File)
+                .with_apply_observer(Arc::new(move |trigger, events, elapsed| {
+                    if let Some(metrics) = observed.get() {
+                        metrics.record_config_apply(trigger, events, elapsed);
+                    }
+                })),
+            );
+            let config_status = supervisor.config_status();
+            let handle = supervisor.handle();
+            let watch_task = tokio::spawn(supervisor.run(cancel_rx.clone()));
+            (handle, None, watch_task, None, config_status)
         } else {
             // ETCD MODE (unchanged behavior).
             //
@@ -3962,15 +3911,17 @@ mod tests {
         let mut f = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
         f.write_all(
             br#"
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: pk
+  - id: 0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11
+    display_name: pk
     api_key: sk-test
 models:
-  - display_name: m1
+  - id: 6efd592d-a73b-573d-8e2c-e9e103692f92
+    display_name: m1
     provider: openai
     model_name: gpt-4o
-    provider_key: pk
+    provider_key_id: 0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11
 "#,
         )
         .unwrap();
@@ -3985,13 +3936,15 @@ models:
         let mut f = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
         f.write_all(
             br#"
-_format_version: "1"
+_format_version: "2"
 mcp_servers:
-  - name: erp
+  - id: 7c1d0a52-4b8e-4f3a-9a61-1f0e2d3c4b5a
+    name: erp
     type: openapi
     url: https://erp.test
     spec: {"paths": {"/a": {"get": {"operationId": "foo/list"}}, "/b": {"get": {"operationId": "foo.list"}}}}
-  - name: clean
+  - id: 8d2e1b63-5c9f-4a4b-8b72-2a1f3e4d5c6b
+    name: clean
     type: openapi
     url: https://clean.test
     spec: {"paths": {"/a": {"get": {"operationId": "one"}}, "/b": {"get": {"operationId": "two"}}}}
@@ -3999,7 +3952,9 @@ mcp_servers:
         )
         .unwrap();
         run_validate(f.path()).unwrap();
-        let snapshot = aisix_core::filesource::load_resources_file(f.path(), 1).unwrap();
+        let entries = aisix_etcd::file_source::read_file(f.path(), 1).unwrap();
+        let (snapshot, _) =
+            aisix_etcd::build_snapshot(&aisix_etcd::file_source::prefixes(), &entries);
         assert_eq!(
             openapi_tool_name_collisions(&snapshot.mcp_servers),
             vec![("erp".to_string(), vec!["foo_list".to_string()])]

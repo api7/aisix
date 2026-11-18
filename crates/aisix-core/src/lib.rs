@@ -19,7 +19,6 @@
 pub mod config;
 pub mod config_status;
 pub mod error;
-pub mod filesource;
 pub mod forwarded_headers;
 pub mod header_template;
 pub mod host;
@@ -41,9 +40,9 @@ pub use config::{
     UrlRewriteRule, CREDENTIAL_HEADERS,
 };
 pub use config_status::{
-    hash_bytes, hash_entries, AppliedSnapshot, ConfigMetricsView, ConfigRejectionSnapshot,
-    ConfigState, ConfigStatus, ConfigStatusView, IncomingRejection, LazyHash, LoadObservation,
-    RejectedResource, SourceKind, UnknownKindResource,
+    hash_entries, AppliedSnapshot, ConfigMetricsView, ConfigRejectionSnapshot, ConfigState,
+    ConfigStatus, ConfigStatusView, IncomingRejection, LazyHash, LoadObservation, RejectedResource,
+    SourceKind, UnknownKindResource,
 };
 pub use error::{
     AdminError, AdminErrorEnvelope, BootstrapError, ProxyError, ProxyErrorEnvelope, RateLimitScope,

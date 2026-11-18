@@ -217,7 +217,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "schema": {
             "type": "string"
           },
-          "description": "Model resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
+          "description": "Model resource ID, the ID segment of its etcd key, or the entry's `id` in a resources file.",
           "example": "c7f13a2e-5d6b-4b87-9f47-2c34de35f4aa"
         }
       ],
@@ -368,7 +368,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "schema": {
             "type": "string"
           },
-          "description": "Caller API key resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
+          "description": "Caller API key resource ID, the ID segment of its etcd key, or the entry's `id` in a resources file.",
           "example": "9f3b2a70-7a3d-4d83-96e1-0c6e5ad4f280"
         }
       ],
@@ -475,7 +475,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "schema": {
             "type": "string"
           },
-          "description": "Provider key resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
+          "description": "Provider key resource ID, the ID segment of its etcd key, or the entry's `id` in a resources file.",
           "example": "4f8f70e7-0c6e-4f74-92c5-cd70d94f3a21"
         }
       ],
@@ -582,7 +582,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "schema": {
             "type": "string"
           },
-          "description": "MCP server resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
+          "description": "MCP server resource ID, the ID segment of its etcd key, or the entry's `id` in a resources file.",
           "example": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12"
         }
       ],
@@ -689,7 +689,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "schema": {
             "type": "string"
           },
-          "description": "A2A agent resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
+          "description": "A2A agent resource ID, the ID segment of its etcd key, or the entry's `id` in a resources file.",
           "example": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12"
         }
       ],
@@ -796,7 +796,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "schema": {
             "type": "string"
           },
-          "description": "Passthrough route resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
+          "description": "Passthrough route resource ID, the ID segment of its etcd key, or the entry's `id` in a resources file.",
           "example": "1d95ac57-7f27-46a4-b5a3-55d3c3ad0a12"
         }
       ],
@@ -903,7 +903,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "schema": {
             "type": "string"
           },
-          "description": "Guardrail resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
+          "description": "Guardrail resource ID, the ID segment of its etcd key, or the entry's `id` in a resources file.",
           "example": "b0c04774-216f-4fb2-96f0-5f7f0a75b76a"
         }
       ],
@@ -1010,7 +1010,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "schema": {
             "type": "string"
           },
-          "description": "Cache policy resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
+          "description": "Cache policy resource ID, the ID segment of its etcd key, or the entry's `id` in a resources file.",
           "example": "6fdb4165-0970-47fb-9aa8-729f07889fd1"
         }
       ],
@@ -1117,7 +1117,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "schema": {
             "type": "string"
           },
-          "description": "Observability exporter resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
+          "description": "Observability exporter resource ID, the ID segment of its etcd key, or the entry's `id` in a resources file.",
           "example": "b2b0c782-d81d-4ac9-b9f7-98e3b0e5b261"
         }
       ],

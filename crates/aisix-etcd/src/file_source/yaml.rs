@@ -18,10 +18,10 @@ use yaml_rust2::Yaml;
 /// Environment lookup used by interpolation. Production passes
 /// `std::env::var(..).ok()`; tests inject a closed map so they never
 /// mutate process-global env state.
-pub(crate) type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 /// Interpolate `${VAR}` references in one string scalar.
-pub(crate) fn interpolate_str(input: &str, env: EnvLookup<'_>) -> Result<String, String> {
+fn interpolate_str(input: &str, env: EnvLookup<'_>) -> Result<String, String> {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(c) = chars.next() {

@@ -610,6 +610,13 @@ impl<P: ConfigProvider> Supervisor<P> {
         }
     }
 
+    /// Report load state as coming from `kind` — a resources file runs
+    /// through this same supervisor (see [`crate::file_source`]).
+    pub fn with_source_kind(mut self, kind: SourceKind) -> Self {
+        self.config_status = ConfigStatus::new(kind);
+        self
+    }
+
     /// Report the cost of every apply to `observer`.
     pub fn with_apply_observer(mut self, observer: Arc<ApplyObserver>) -> Self {
         self.apply_observer = Some(observer);

@@ -23,6 +23,7 @@
 pub mod backoff;
 pub mod client;
 pub mod etcd_provider;
+pub mod file_source;
 pub mod key;
 pub mod loader;
 pub mod provider;
@@ -37,6 +38,7 @@ pub use etcd_provider::{
     ConnectPolicy, EtcdConfigProvider, EtcdWatchStream, CONNECT_MAX_ATTEMPTS,
     CONNECT_RETRY_INTERVAL,
 };
+pub use file_source::FileConfigProvider;
 pub use key::{
     parse as parse_key, KeyError, PrefixScope, PrefixSet, ResourceKey, ScopedKey, WatchedPrefix,
 };

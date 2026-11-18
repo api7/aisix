@@ -1,17 +1,17 @@
 //! `aisix export` — emit a resources file from a running etcd store.
 //!
-//! The inverse of the file source (`aisix_core::filesource`): it reads
-//! every canonical resource document under the configured prefix, decodes
-//! it through the same typed models the gateway loads, and re-emits the
-//! set as a `resources.yaml` the file source can load back — the
-//! migration / backup path for a standalone deployment moving from
-//! Admin-API-plus-etcd to the declarative file.
+//! A resources file is the set of etcd documents written down
+//! (`aisix_etcd::file_source`), so the export reads every document under
+//! the configured prefix, decodes it through the loader the gateway uses,
+//! and writes each one as its etcd id plus the document the gateway
+//! serves — the migration / backup path for a standalone deployment
+//! moving from etcd to the declarative file.
 //!
 //! Pipeline:
 //!
 //! ```text
 //! etcd range read → decode (aisix_etcd::build_snapshot, the loader path)
-//!   → resugar references + strip ids + redact secrets (document)
+//!   → id + document, redact secrets (document)
 //!   → YAML emit (yaml_emit) → stdout / -o file
 //!   → secret-placeholder list + warnings → stderr
 //! ```
@@ -121,27 +121,8 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
     report_secrets(&document, args.reveal_secrets);
 
     // The file is written for inspection either way, but a scripted
-    // migration must not mistake an incomplete or non-loadable export for a
-    // finished one. Report every failure class before exiting, so an operator
-    // sees the full list in one run: a row the loader rejected is silently
-    // absent from the output (the file loads, yet the migration lost a
-    // resource), and a collision or dangling reference means the file cannot
-    // be loaded back as-is.
-    if !document.blocking.is_empty() {
-        eprintln!(
-            "\n{} issue(s) leave the exported file non-loadable — fix them in the source and \
-             re-export (or run `aisix validate` on the file):",
-            document.blocking.len()
-        );
-        for issue in &document.blocking {
-            eprintln!("  - {issue}");
-        }
-        anyhow::bail!(
-            "export completed with {} blocking issue(s); the resources file will not load as-is",
-            document.blocking.len()
-        );
-    }
-
+    // migration must not mistake an incomplete export for a finished one:
+    // a row the loader rejected is absent from the output.
     if !stats.rejections.is_empty() {
         anyhow::bail!(
             "export omitted {} rejected entr(ies); the resources file is incomplete. \
