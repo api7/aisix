@@ -61,6 +61,17 @@ export interface MockControlPlane {
   setEtcdPath(mode: "pass" | "reset" | "blackhole"): void;
   /** TCP connections the etcd endpoint has accepted into the blackhole so far. */
   etcdBlackholed(): number;
+  /**
+   * Hold the `n`th TCP connection the etcd endpoint accepts (1-based,
+   * counted from startup) unanswered until `releaseEtcdConnection()`,
+   * then serve it as usual.
+   */
+  holdEtcdConnection(n: number): void;
+  /** Whether the connection `holdEtcdConnection` named has arrived and is held. */
+  etcdConnectionHeld(): boolean;
+  releaseEtcdConnection(): void;
+  /** Every `/dp/heartbeat` body, in arrival order. */
+  heartbeatBodies: string[];
   close(): Promise<void>;
 }
 
@@ -181,6 +192,10 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
     telemetryHold: undefined,
     setEtcdPath: () => {},
     etcdBlackholed: () => 0,
+    holdEtcdConnection: () => {},
+    etcdConnectionHeld: () => false,
+    releaseEtcdConnection: () => {},
+    heartbeatBodies: [],
     close: async () => {},
   };
 
@@ -193,6 +208,7 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
       if (path.startsWith("/dp/store/v1/")) {
         serveStore(cp, req, Buffer.concat(chunks).toString("utf8"), res);
       } else if (req.method === "POST" && path === "/dp/heartbeat") {
+        cp.heartbeatBodies.push(Buffer.concat(chunks).toString("utf8"));
         res.writeHead(200, { "content-type": "application/json" });
         res.end("{}");
       } else if (req.method === "POST" && path === "/dp/telemetry") {
@@ -232,12 +248,18 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
   // its TLS handshake starts.
   let etcdPath: "pass" | "reset" | "blackhole" = "pass";
   let blackholed = 0;
+  let accepted = 0;
+  let holdNth = 0;
+  let heldSocket: Socket | undefined;
   const tcpSockets = new Set<Socket>();
   const etcdTcp: NetServer = createNetServer((socket) => {
     tcpSockets.add(socket);
     socket.on("close", () => tcpSockets.delete(socket));
     socket.on("error", () => socket.destroy());
-    if (etcdPath === "reset") {
+    accepted += 1;
+    if (accepted === holdNth) {
+      heldSocket = socket;
+    } else if (etcdPath === "reset") {
       socket.resetAndDestroy();
     } else if (etcdPath === "blackhole") {
       blackholed += 1;
@@ -253,6 +275,15 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
     if (mode === "reset") for (const s of tcpSockets) s.resetAndDestroy();
   };
   cp.etcdBlackholed = () => blackholed;
+  cp.holdEtcdConnection = (n) => {
+    holdNth = n;
+  };
+  cp.etcdConnectionHeld = () => heldSocket !== undefined;
+  cp.releaseEtcdConnection = () => {
+    const socket = heldSocket;
+    heldSocket = undefined;
+    if (socket && !socket.destroyed) etcdFront.emit("connection", socket);
+  };
 
   const port = (server: HttpsServer | NetServer) => (server.address() as { port: number }).port;
   cp.managed = {

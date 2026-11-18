@@ -303,9 +303,9 @@ impl EtcdConfigProvider {
     }
 }
 
-#[async_trait]
-impl ConfigProvider for EtcdConfigProvider {
-    async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
+impl EtcdConfigProvider {
+    /// The prefix's rows, now or as of `at`.
+    async fn read_prefix(&self, at: Option<i64>) -> Result<(Vec<RawEntry>, i64), ProviderError> {
         // The full read below stays unbounded by default (its cost scales
         // with the configuration), so it is only issued once a cheap
         // bounded read has shown the connection answers at all.
@@ -329,17 +329,22 @@ impl ConfigProvider for EtcdConfigProvider {
                 "range read",
                 self.client.call(self.request_timeout, move |client| {
                     let prefix = prefix.clone();
-                    async move {
-                        kv_client(&client)
-                            .get(prefix, Some(GetOptions::new().with_prefix()))
-                            .await
+                    let mut options = GetOptions::new().with_prefix();
+                    if let Some(revision) = at {
+                        options = options.with_revision(revision);
                     }
+                    async move { kv_client(&client).get(prefix, Some(options)).await }
                 }),
             )
             .await
-            .map_err(|e| provider_error(e, "range read", ProviderError::Range))?;
+            .map_err(|e| match e {
+                CallError::Call(err) if is_compaction(&err.to_string()) => ProviderError::Compacted,
+                e => provider_error(e, "range read", ProviderError::Range),
+            })?;
 
-        let revision = resp.header().map(|h| h.revision()).unwrap_or(0);
+        // A read at a revision is consistent as of that revision; the
+        // header carries the store's current one.
+        let revision = at.unwrap_or_else(|| resp.header().map(|h| h.revision()).unwrap_or(0));
 
         let entries = resp
             .kvs()
@@ -352,6 +357,17 @@ impl ConfigProvider for EtcdConfigProvider {
             .collect();
 
         Ok((entries, revision))
+    }
+}
+
+#[async_trait]
+impl ConfigProvider for EtcdConfigProvider {
+    async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
+        self.read_prefix(None).await
+    }
+
+    async fn load_all_at(&self, revision: i64) -> Result<(Vec<RawEntry>, i64), ProviderError> {
+        self.read_prefix(Some(revision)).await
     }
 
     async fn watch(

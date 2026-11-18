@@ -332,6 +332,12 @@ struct HeartbeatBody<'a> {
     /// against the revision returned by its own kine writes: a DP with
     /// `applied_revision >= write_revision` has seen that write.
     applied_revision: i64,
+    /// Always `true`: every configuration event at or below
+    /// `applied_revision`, in every prefix this gateway watches, has been
+    /// processed (applied or rejected). Gateways before this field could
+    /// report a revision below an event they had processed, so a control
+    /// plane must not treat their lag as exact.
+    applied_revision_complete: bool,
     /// The sha256 the DP computed over its applied (served) config set
     /// (#774). Omitted from the wire when the supervisor has not applied a
     /// snapshot yet, or the fetcher isn't wired (tests / managed-mode
@@ -519,6 +525,7 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
             version: &aisix_core::HEARTBEAT_VERSION,
             supported_guardrail_kinds: aisix_guardrails::supported_kinds(),
             applied_revision,
+            applied_revision_complete: true,
             config_hash,
             exporter_health,
             rejected_resources: rejections,
@@ -819,6 +826,7 @@ managed:
 
         // B.3 — the fetched applied revision.
         assert_eq!(body["applied_revision"], 42);
+        assert_eq!(body["applied_revision_complete"], true);
 
         // D.2 — both exporters, sorted by name, with the wire fields.
         let health = body["exporter_health"].as_array().unwrap();
