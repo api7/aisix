@@ -1707,6 +1707,11 @@ const UNKNOWN_FIELD_TOLERANCE: &[Probe] = &[
         pointer: "",
         document: || json!({"fail_mode": "closed", "closed_grace_seconds": 300}),
     },
+    Probe {
+        resource: "usage_accounting",
+        pointer: "",
+        document: || json!({"exclude_estimated_usage": true}),
+    },
 ];
 
 /// The two resources whose write contract closes NOTHING — not the root, not

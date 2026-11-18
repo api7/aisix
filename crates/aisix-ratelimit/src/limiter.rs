@@ -62,6 +62,46 @@ impl RateLimitStatus {
 pub struct BucketKey {
     pub key: String,
     pub window_type: RateLimitWindowType,
+    /// Carried over from the reservation (see
+    /// [`Reservation::excluding_estimated`]).
+    pub exclude_estimated: bool,
+}
+
+/// The token cost a finished call charges to TPM/TPD, and whether the
+/// gateway estimated it because the upstream reported no usage. Every
+/// commit site states both, so the environment's choice to keep estimated
+/// usage out of token limits is applied here, in one place, for every
+/// endpoint and both stores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenCharge {
+    pub tokens: u64,
+    pub estimated: bool,
+}
+
+impl TokenCharge {
+    /// Nothing to charge: the call produced no billable tokens.
+    pub const NONE: Self = Self {
+        tokens: 0,
+        estimated: false,
+    };
+
+    pub fn new(tokens: u64, estimated: bool) -> Self {
+        Self { tokens, estimated }
+    }
+
+    /// A cost the upstream reported itself.
+    pub fn reported(tokens: u64) -> Self {
+        Self::new(tokens, false)
+    }
+
+    /// What a layer that does or does not exclude estimated usage counts.
+    fn counted(self, exclude_estimated: bool) -> u64 {
+        if exclude_estimated && self.estimated {
+            0
+        } else {
+            self.tokens
+        }
+    }
 }
 
 /// Two-phase limiter over a shared or local [`RateStore`].
@@ -137,6 +177,7 @@ impl Limiter {
             has_concurrency_slot,
             refresh_task,
             lease_loss,
+            exclude_estimated: false,
             committed: false,
         })
     }
@@ -147,7 +188,8 @@ impl Limiter {
     /// concurrency slot is held by a [`StreamConcurrencyGuard`] and the
     /// tokens are accounted here when the terminal SSE usage frame lands
     /// (issue #108). No-op on zero tokens.
-    pub fn add_tokens_post_stream(&self, bucket: &BucketKey, tokens: u64) {
+    pub fn add_tokens_post_stream(&self, bucket: &BucketKey, charge: TokenCharge) {
+        let tokens = charge.counted(bucket.exclude_estimated);
         if tokens == 0 {
             return;
         }
@@ -253,6 +295,8 @@ pub struct Reservation {
     /// `watch::send` would drop a pre-body notification with no subscriber,
     /// while `send_replace` keeps the terminal state for the later hold.
     lease_loss: tokio::sync::watch::Sender<bool>,
+    /// Whether an estimated [`TokenCharge`] counts as zero here.
+    exclude_estimated: bool,
     committed: bool,
 }
 
@@ -272,10 +316,19 @@ impl Reservation {
         }
     }
 
+    /// Count an estimated [`TokenCharge`] as zero tokens at commit, as the
+    /// environment's `usage_accounting` asks. The request windows and the
+    /// concurrency slot are unaffected.
+    pub fn excluding_estimated(mut self, exclude: bool) -> Self {
+        self.exclude_estimated = exclude;
+        self
+    }
+
     /// Post-deduct phase. Records the actual token cost against TPM/TPD
     /// and releases the concurrency slot.
-    pub async fn commit_tokens(mut self, tokens: u64) {
+    pub async fn commit_tokens(mut self, charge: TokenCharge) {
         self.stop_refresh();
+        let tokens = charge.counted(self.exclude_estimated);
         self.store
             .commit(&self.key, tokens, &self.member, self.window_type)
             .await;
@@ -332,9 +385,9 @@ impl MultiReservation {
     }
 
     /// Commit the actual token cost to every layer.
-    pub async fn commit_tokens(self, tokens: u64) {
+    pub async fn commit_tokens(self, charge: TokenCharge) {
         for r in self.reservations {
-            r.commit_tokens(tokens).await;
+            r.commit_tokens(charge).await;
         }
     }
 
@@ -345,6 +398,7 @@ impl MultiReservation {
             .map(|r| BucketKey {
                 key: r.key.clone(),
                 window_type: r.window_type,
+                exclude_estimated: r.exclude_estimated,
             })
             .collect()
     }
@@ -579,6 +633,7 @@ mod tests {
         BucketKey {
             key: key.to_string(),
             window_type: RateLimitWindowType::Fixed,
+            exclude_estimated: false,
         }
     }
 
@@ -667,7 +722,7 @@ mod tests {
         // Overrun tpm: checked-but-not-incremented means the refusal
         // lands on the NEXT request after the commit.
         let r = limiter.pre_commit("k", &l).await.unwrap();
-        r.commit_tokens(1_000).await;
+        r.commit_tokens(TokenCharge::reported(1_000)).await;
 
         let detail = limiter.pre_commit("k", &l).await.unwrap_err().detail();
         assert_eq!(detail.dimension, "tpm");
@@ -764,7 +819,7 @@ mod tests {
         let l = limits(Some(10), Some(1_000), None);
 
         let r1 = limiter.pre_commit("k1", &l).await.unwrap();
-        r1.commit_tokens(600).await;
+        r1.commit_tokens(TokenCharge::reported(600)).await;
 
         // TPM now at 600. Next pre_commit with a strict TPM should still
         // succeed because 600 <= 1000.
@@ -778,7 +833,7 @@ mod tests {
         let l = limits(Some(10), Some(1_000), None);
 
         let r1 = limiter.pre_commit("k1", &l).await.unwrap();
-        r1.commit_tokens(1_500).await; // overshoot — allowed for a request already admitted
+        r1.commit_tokens(TokenCharge::reported(1_500)).await; // overshoot — allowed for a request already admitted
 
         // Next pre_commit sees tpm > 1000 and refuses.
         let err = limiter.pre_commit("k1", &l).await.unwrap_err();
@@ -800,7 +855,7 @@ mod tests {
         let l = limits(Some(10), Some(1_000), None);
 
         let r1 = limiter.pre_commit("k1", &l).await.unwrap();
-        r1.commit_tokens(1_000).await; // the whole minute's budget, exactly
+        r1.commit_tokens(TokenCharge::reported(1_000)).await; // the whole minute's budget, exactly
 
         let err = limiter.pre_commit("k1", &l).await.unwrap_err();
         match err {
@@ -815,7 +870,7 @@ mod tests {
         // One token short of the cap still admits — the check is the
         // budget being spent, not merely being close.
         let r2 = limiter.pre_commit("k2", &l).await.unwrap();
-        r2.commit_tokens(999).await;
+        r2.commit_tokens(TokenCharge::reported(999)).await;
         let _r3 = limiter.pre_commit("k2", &l).await.unwrap();
     }
 
@@ -858,7 +913,7 @@ mod tests {
         let l = limits(Some(60), Some(100_000), Some(10));
 
         let r = limiter.pre_commit("k1", &l).await.unwrap();
-        r.commit_tokens(500).await;
+        r.commit_tokens(TokenCharge::reported(500)).await;
 
         let status = limiter.peek("k1", &l).await.unwrap();
         assert_eq!(status.rpm_limit, Some(60));
@@ -891,7 +946,7 @@ mod tests {
 
         for _ in 0..100 {
             let r = limiter.pre_commit("k1", &l).await.unwrap();
-            r.commit_tokens(1_000).await;
+            r.commit_tokens(TokenCharge::reported(1_000)).await;
         }
     }
 
@@ -986,7 +1041,7 @@ mod tests {
             "TPM should be 0 right after pre_commit + drop",
         );
 
-        limiter.add_tokens_post_stream(&fixed_bucket("k1"), 750);
+        limiter.add_tokens_post_stream(&fixed_bucket("k1"), TokenCharge::reported(750));
         assert_eq!(
             limiter.peek("k1", &l).await.unwrap().tpm_used,
             750,
@@ -998,7 +1053,7 @@ mod tests {
     async fn add_tokens_post_stream_zero_is_a_noop() {
         let clock = TestClock::new(100);
         let limiter = Limiter::local_with_clock(clock);
-        limiter.add_tokens_post_stream(&fixed_bucket("never-seen"), 0);
+        limiter.add_tokens_post_stream(&fixed_bucket("never-seen"), TokenCharge::reported(0));
         assert!(
             limiter
                 .peek("never-seen", &RateLimit::default())
@@ -1017,13 +1072,50 @@ mod tests {
         {
             let _r = limiter.pre_commit("k1", &l).await.unwrap();
         }
-        limiter.add_tokens_post_stream(&fixed_bucket("k1"), 1_500);
+        limiter.add_tokens_post_stream(&fixed_bucket("k1"), TokenCharge::reported(1_500));
 
         let err = limiter.pre_commit("k1", &l).await.unwrap_err();
         assert!(
             matches!(err, RateLimitError::Tokens { .. }),
             "TPM cap should block the next request after streaming over-shoot; got {err:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn an_excluding_layer_counts_estimated_tokens_as_zero_on_both_commit_paths() {
+        let limiter = Limiter::local_with_clock(TestClock::new(100));
+        let l = limits(Some(100), Some(1_000), None);
+
+        let excluding = limiter
+            .pre_commit("excl", &l)
+            .await
+            .unwrap()
+            .excluding_estimated(true);
+        let buckets = MultiReservation::new(vec![excluding]).keys();
+        let excluding = limiter
+            .pre_commit("excl", &l)
+            .await
+            .unwrap()
+            .excluding_estimated(true);
+        excluding.commit_tokens(TokenCharge::new(400, true)).await;
+        limiter.add_tokens_post_stream(&buckets[0], TokenCharge::new(300, true));
+        assert_eq!(limiter.peek("excl", &l).await.unwrap().tpm_used, 0);
+
+        let excluding = limiter
+            .pre_commit("excl", &l)
+            .await
+            .unwrap()
+            .excluding_estimated(true);
+        excluding.commit_tokens(TokenCharge::new(400, false)).await;
+        limiter.add_tokens_post_stream(&buckets[0], TokenCharge::new(300, false));
+        assert_eq!(limiter.peek("excl", &l).await.unwrap().tpm_used, 700);
+
+        let counting = limiter.pre_commit("count", &l).await.unwrap();
+        let buckets = MultiReservation::new(vec![counting]).keys();
+        let counting = limiter.pre_commit("count", &l).await.unwrap();
+        counting.commit_tokens(TokenCharge::new(400, true)).await;
+        limiter.add_tokens_post_stream(&buckets[0], TokenCharge::new(300, true));
+        assert_eq!(limiter.peek("count", &l).await.unwrap().tpm_used, 700);
     }
 
     // --- MultiReservation tests ----------------------------------------
@@ -1038,7 +1130,7 @@ mod tests {
         let r2 = limiter.pre_commit("model:gpt-4o", &l).await.unwrap();
         let multi = MultiReservation::new(vec![r1, r2]);
 
-        multi.commit_tokens(500).await;
+        multi.commit_tokens(TokenCharge::reported(500)).await;
 
         let s1 = limiter.peek("api_key:k1", &l).await.unwrap();
         let s2 = limiter.peek("model:gpt-4o", &l).await.unwrap();
@@ -1174,7 +1266,7 @@ mod tests {
 
         // One commit finalises both layers: tokens land on each and the
         // absorbed layer's concurrency slot is released.
-        multi.commit_tokens(300).await;
+        multi.commit_tokens(TokenCharge::reported(300)).await;
         let s = limiter.peek("model:target", &l).await.unwrap();
         assert_eq!(s.tpm_used, 300);
         assert!(limiter.pre_commit("model:target", &l).await.is_ok());
@@ -1432,14 +1524,14 @@ mod tests {
         let l = sliding(limits(None, Some(1_000), None));
 
         let r = limiter.pre_commit("k", &l).await.unwrap();
-        r.commit_tokens(600).await; // sub-bucket HOUR0
+        r.commit_tokens(TokenCharge::reported(600)).await; // sub-bucket HOUR0
         clock.set(HOUR0 + 35);
         let held = MultiReservation::new(vec![limiter.pre_commit("k", &l).await.unwrap()]);
         let buckets = held.keys();
         drop(held.into_stream_hold());
         clock.set(HOUR0 + 45);
         // A streamed response lands where the stream completed: HOUR0+40.
-        limiter.add_tokens_post_stream(&buckets[0], 500);
+        limiter.add_tokens_post_stream(&buckets[0], TokenCharge::reported(500));
 
         clock.set(HOUR0 + 65);
         let err = limiter.pre_commit("k", &l).await.unwrap_err();
@@ -1460,7 +1552,7 @@ mod tests {
             .pre_commit("k", &lf)
             .await
             .unwrap()
-            .commit_tokens(1_100)
+            .commit_tokens(TokenCharge::reported(1_100))
             .await;
         assert!(fixed.pre_commit("k", &lf).await.is_err());
     }
@@ -1499,14 +1591,14 @@ mod tests {
             .pre_commit("k", &l)
             .await
             .unwrap()
-            .commit_tokens(100)
+            .commit_tokens(TokenCharge::reported(100))
             .await;
         clock.set(HOUR0 + 52);
         limiter
             .pre_commit("k", &l)
             .await
             .unwrap()
-            .commit_tokens(50)
+            .commit_tokens(TokenCharge::reported(50))
             .await;
         clock.set(HOUR0 + 61);
         let s = limiter.peek("k", &l).await.unwrap();

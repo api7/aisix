@@ -1642,8 +1642,10 @@ async fn anthropic_passthrough_dispatch(
                     usage.cache_creation_tokens,
                     usage.cache_read_tokens,
                 );
+                let charge =
+                    aisix_ratelimit::TokenCharge::new(streamed_tokens, usage.usage_estimated);
                 for key in &post_stream_keys {
-                    limiter_c.add_tokens_post_stream(key, streamed_tokens);
+                    limiter_c.add_tokens_post_stream(key, charge);
                 }
                 drop(stream_hold);
                 // least_busy: stream over — this target is no longer
@@ -2546,8 +2548,10 @@ async fn cross_provider_dispatch(
                     comp.cache_creation_tokens,
                     comp.cache_read_tokens,
                 );
+                let charge =
+                    aisix_ratelimit::TokenCharge::new(streamed_tokens, comp.usage_estimated);
                 for key in &post_stream_keys {
-                    limiter_for_stream.add_tokens_post_stream(key, streamed_tokens);
+                    limiter_for_stream.add_tokens_post_stream(key, charge);
                 }
                 drop(stream_hold);
                 // least_busy: stream over — this target is no longer
@@ -3576,12 +3580,15 @@ fn messages_committed_tokens(usage: &aisix_gateway::UsageStats) -> u64 {
 }
 
 /// [`messages_committed_tokens`] for an attempt's recorded metrics.
-fn messages_metrics_tokens(metrics: &AnthropicUsageMetrics) -> u64 {
-    total_tokens_with_cache(
-        metrics.prompt_tokens,
-        metrics.completion_tokens,
-        metrics.cache_creation_tokens,
-        metrics.cache_read_tokens,
+fn messages_metrics_tokens(metrics: &AnthropicUsageMetrics) -> aisix_ratelimit::TokenCharge {
+    aisix_ratelimit::TokenCharge::new(
+        total_tokens_with_cache(
+            metrics.prompt_tokens,
+            metrics.completion_tokens,
+            metrics.cache_creation_tokens,
+            metrics.cache_read_tokens,
+        ),
+        metrics.usage_estimated,
     )
 }
 

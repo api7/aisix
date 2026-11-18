@@ -2399,6 +2399,7 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
         users,
         budgets,
         budget_policy,
+        usage_accounting,
     } = src;
     for e in models.entries() {
         dst.models.insert_arc(e);
@@ -2463,6 +2464,9 @@ fn merge_snapshot(dst: &AisixSnapshot, src: &AisixSnapshot) {
     for e in budget_policy.entries() {
         dst.budget_policy.insert_arc(e);
     }
+    for e in usage_accounting.entries() {
+        dst.usage_accounting.insert_arc(e);
+    }
 }
 
 /// Remove `(kind, id)` from `snap`.
@@ -2494,6 +2498,7 @@ fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
         users,
         budgets,
         budget_policy,
+        usage_accounting,
     } = snap;
     match kind {
         "models" => {
@@ -2561,6 +2566,9 @@ fn remove_from_snapshot(snap: &AisixSnapshot, kind: &str, id: &str) {
         }
         "budget_policy" => {
             budget_policy.remove(id);
+        }
+        "usage_accounting" => {
+            usage_accounting.remove(id);
         }
         _ => {}
     }
@@ -2640,6 +2648,7 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         users,
         budgets,
         budget_policy,
+        usage_accounting,
     } = snap;
     match kind {
         "models" => models.get_by_id(id).is_some(),
@@ -2663,6 +2672,7 @@ fn snapshot_has(snap: &AisixSnapshot, kind: &str, id: &str) -> bool {
         "users" => users.get_by_id(id).is_some(),
         "budgets" => budgets.get_by_id(id).is_some(),
         "budget_policy" => budget_policy.get_by_id(id).is_some(),
+        "usage_accounting" => usage_accounting.get_by_id(id).is_some(),
         _ => false,
     }
 }
@@ -2705,6 +2715,7 @@ fn resource_counts(snap: &AisixSnapshot) -> BTreeMap<String, usize> {
         ("users", snap.users.len()),
         ("budgets", snap.budgets.len()),
         ("budget_policy", snap.budget_policy.len()),
+        ("usage_accounting", snap.usage_accounting.len()),
     ] {
         if n > 0 {
             counts.insert(kind.to_string(), n);

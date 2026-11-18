@@ -420,10 +420,11 @@ impl RateCommit {
     /// Charge `usage`'s token cost to every layer, as the handler's own
     /// `commit_tokens` would; the dropped reservations release their
     /// concurrency slots themselves.
-    fn commit(&self, usage: &aisix_gateway::chat::UsageStats) {
-        let tokens = (self.tokens)(usage);
+    fn commit(&self, usage: &CancelledUsage) {
+        let charge =
+            aisix_ratelimit::TokenCharge::new((self.tokens)(&usage.usage), usage.usage_estimated);
         for key in &self.keys {
-            self.limiter.add_tokens_post_stream(key, tokens);
+            self.limiter.add_tokens_post_stream(key, charge);
         }
     }
 }
@@ -450,7 +451,7 @@ pub(crate) async fn run_recorded_on_cancel<R: Send + 'static>(
     crate::attribution::publish_cancelled_usage(Box::new(move || {
         let usage = on_cancel(inline());
         if let Some(rate) = rate {
-            rate.commit(&usage.usage);
+            rate.commit(&usage);
         }
         usage
     }));

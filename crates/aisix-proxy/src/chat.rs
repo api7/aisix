@@ -2251,7 +2251,7 @@ async fn dispatch(
             move |comp: StreamCompletion| {
                 // Rate-limit accounting (TPM cap) for all layers.
                 for key in &post_stream_keys {
-                    limiter.add_tokens_post_stream(key, comp.total_tokens);
+                    limiter.add_tokens_post_stream(key, comp.token_charge());
                 }
                 // A stream can outlive several config generations, so the
                 // terminal emits read a FRESH snapshot rather than the one
@@ -2695,7 +2695,9 @@ async fn dispatch(
                 // (AISIX-Cloud#1571).
                 let entry_model = &virtual_entry.value;
                 crate::attribution::note_cache_hit_entry(entry_model, hit_layer.as_str());
-                reservation.commit_tokens(0).await;
+                reservation
+                    .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
+                    .await;
                 // #448: a cache hit is client-visible output just like a
                 // fresh upstream response, so it must run output guardrails
                 // before being returned — not bypass them.
@@ -3336,7 +3338,9 @@ async fn dispatch(
     if let Some(member) = won_member_reservation.take() {
         reservation.merge(member);
     }
-    reservation.commit_tokens(total).await;
+    reservation
+        .commit_tokens(aisix_ratelimit::TokenCharge::new(total, usage_estimated))
+        .await;
 
     let (output_verdict, hits) = resolved_chain
         .check_output_non_segment_observed(&upstream)
@@ -3746,11 +3750,16 @@ async fn dispatch_ensemble(
     // Failure exits bill every successful panel member even when the
     // upstream omitted usage. Share the same normalized accounting used by
     // UsageEvent emission so quota and telemetry cannot diverge.
-    let survivor_total = |panel: &[crate::ensemble::PanelOutcome]| -> u64 {
+    let survivor_charge = |panel: &[crate::ensemble::PanelOutcome]| {
         panel
             .iter()
-            .map(|member| u64::from(effective_panel_member_usage(member).usage.total_tokens))
-            .sum()
+            .fold(aisix_ratelimit::TokenCharge::NONE, |acc, member| {
+                let effective = effective_panel_member_usage(member);
+                aisix_ratelimit::TokenCharge::new(
+                    acc.tokens + u64::from(effective.usage.total_tokens),
+                    acc.estimated || effective.estimated,
+                )
+            })
     };
 
     let caller = crate::ensemble::ProxyModelCaller {
@@ -3846,7 +3855,7 @@ async fn dispatch_ensemble(
                         "ensemble panel did not reach the required number of responses",
                     )),
                 );
-                reservation.commit_tokens(survivor_total(&panel)).await;
+                reservation.commit_tokens(survivor_charge(&panel)).await;
                 return Err(failure);
             }
             // `run_ensemble_panel` never returns `Judge` (it stops before
@@ -3859,7 +3868,7 @@ async fn dispatch_ensemble(
             }) => {
                 let failure =
                     emit_panel_then_fail(&panel, &failed, Some(&judge), ProxyError::Bridge(source));
-                reservation.commit_tokens(survivor_total(&panel)).await;
+                reservation.commit_tokens(survivor_charge(&panel)).await;
                 return Err(failure);
             }
         };
@@ -3875,7 +3884,7 @@ async fn dispatch_ensemble(
             });
         // From here to the stream's completion the published
         // `PendingEnsemble` still speaks for the panel if the caller leaves.
-        let panel_total = survivor_total(&panel);
+        let panel_charge_tokens = survivor_charge(&panel);
 
         // The judge's prompt renders the caller's messages, so it is rebuilt
         // where it is needed (`build_judge_req` below) rather than held
@@ -3896,7 +3905,7 @@ async fn dispatch_ensemble(
                 Some(&judge_failure(&err, false, Instant::now())),
                 ProxyError::Bridge(err),
             );
-            reservation.commit_tokens(panel_total).await;
+            reservation.commit_tokens(panel_charge_tokens).await;
             return Err(failure);
         };
         let judge_model = &judge_entry.value;
@@ -3926,7 +3935,7 @@ async fn dispatch_ensemble(
                     Some(&judge_failure(&err, false, Instant::now())),
                     ProxyError::Bridge(err),
                 );
-                reservation.commit_tokens(panel_total).await;
+                reservation.commit_tokens(panel_charge_tokens).await;
                 return Err(failure);
             }
         };
@@ -3940,7 +3949,7 @@ async fn dispatch_ensemble(
                 Some(&judge_failure(&err, false, Instant::now())),
                 refused,
             );
-            reservation.commit_tokens(panel_total).await;
+            reservation.commit_tokens(panel_charge_tokens).await;
             return Err(failure);
         }
         let Some(judge_bridge) = crate::dispatch::resolve_bridge(&state.hub, &judge_pk.value)
@@ -3953,7 +3962,7 @@ async fn dispatch_ensemble(
                 Some(&judge_failure(&err, false, Instant::now())),
                 ProxyError::Bridge(err),
             );
-            reservation.commit_tokens(panel_total).await;
+            reservation.commit_tokens(panel_charge_tokens).await;
             return Err(failure);
         };
         let mut judge_ctx = crate::dispatch::bridge_ctx(
@@ -4004,7 +4013,7 @@ async fn dispatch_ensemble(
                     Some(&judge_failure(&err, true, Instant::now())),
                     ProxyError::Bridge(err),
                 );
-                reservation.commit_tokens(panel_total).await;
+                reservation.commit_tokens(panel_charge_tokens).await;
                 return Err(failure);
             }
         };
@@ -4029,7 +4038,7 @@ async fn dispatch_ensemble(
                     Some(&judge_failure(&be, false, judge_started)),
                     ProxyError::Bridge(be),
                 );
-                reservation.commit_tokens(panel_total).await;
+                reservation.commit_tokens(panel_charge_tokens).await;
                 return Err(failure);
             }
         };
@@ -4089,6 +4098,7 @@ async fn dispatch_ensemble(
                 .fold(aisix_gateway::chat::UsageStats::default(), |acc, p| {
                     acc.saturating_add(&p.effective_usage)
                 }),
+            panel_charge_tokens.estimated,
             &row_ctx,
         );
         let panel_rows: Vec<(u32, EnsembleSubcall)> = panel
@@ -4329,7 +4339,7 @@ async fn dispatch_ensemble(
                     /* blocked */ false,
                     input_bypass,
                 );
-                reservation.commit_tokens(survivor_total(&panel)).await;
+                reservation.commit_tokens(survivor_charge(&panel)).await;
                 return Err(DispatchFailure::new(
                     Some(model_id.to_string()),
                     None,
@@ -4356,8 +4366,14 @@ async fn dispatch_ensemble(
         .map(|u| u64::from(u.usage.total_tokens))
         .sum();
     let total_tokens = panel_total + u64::from(effective_judge.usage.total_tokens);
+    let usage_estimated = effective_judge.estimated || effective_panel.iter().any(|u| u.estimated);
     crate::attribution::note_ensemble_tokens_charged();
-    reservation.commit_tokens(total_tokens).await;
+    reservation
+        .commit_tokens(aisix_ratelimit::TokenCharge::new(
+            total_tokens,
+            usage_estimated,
+        ))
+        .await;
 
     // Emit one usage event per sub-call (each panel member + the judge),
     // all sharing `request_id`. `attempt_kind` is `"panel"` / `"judge"`;
@@ -5155,7 +5171,7 @@ fn created_ts() -> i64 {
 /// most recently seen `total_tokens` and, on stream end, hand it to
 /// `on_complete` so the caller can post-account it against TPM/TPD.
 ///
-/// Pre-fix the streaming path called `reservation.commit_tokens(0)`
+/// Pre-fix the streaming path called `reservation.commit_tokens(aisix_ratelimit::TokenCharge::NONE)`
 /// up front and never revisited the counter, leaving TPM caps silently
 /// bypassed for all streaming traffic and the cost/usage telemetry
 /// reporting `$0`. See issue #108.
@@ -5278,6 +5294,13 @@ struct StreamCompletion {
     /// The upstream error that ended the stream after its `200` went out,
     /// if one did. The terminal usage event reports it instead of a `200`.
     failure: Option<crate::attempt::StreamFailure>,
+}
+
+impl StreamCompletion {
+    /// What the stream charges to its TPM/TPD layers.
+    fn token_charge(&self) -> aisix_ratelimit::TokenCharge {
+        aisix_ratelimit::TokenCharge::new(self.total_tokens, self.usage_estimated)
+    }
 }
 
 impl crate::attempt::RecordsStreamRefusal for StreamCompletion {
@@ -5534,6 +5557,8 @@ struct EnsembleCharge {
     entry_keys: Vec<aisix_ratelimit::BucketKey>,
     /// The panel's (or, abandoned, every returned sub-call's) usage.
     usage: aisix_gateway::chat::UsageStats,
+    /// Whether any sub-call in `usage` was estimated.
+    usage_estimated: bool,
     bounded_model: String,
     metric_caller: crate::request_metrics::Owned,
     client: ClientContext,
@@ -5545,12 +5570,14 @@ impl EnsembleCharge {
         snapshot: &AisixSnapshot,
         entry_keys: Vec<aisix_ratelimit::BucketKey>,
         usage: aisix_gateway::chat::UsageStats,
+        usage_estimated: bool,
         rows: &EnsembleRowCtx,
     ) -> Self {
         Self {
             state: state.clone(),
             entry_keys,
             usage,
+            usage_estimated,
             bounded_model: crate::usage_attr::metric_model_label(snapshot, &rows.client_model)
                 .into_owned(),
             metric_caller: crate::request_metrics::Caller::from_api_key_id(
@@ -5571,13 +5598,18 @@ impl EnsembleCharge {
         // Rate-limit accounting: the panel tokens (already round-tripped)
         // plus the streamed judge's final total, against every layer.
         let panel_total = u64::from(self.usage.total_tokens);
+        let entry_charge = aisix_ratelimit::TokenCharge::new(
+            panel_total + comp.total_tokens,
+            self.usage_estimated || comp.usage_estimated,
+        );
         for key in &self.entry_keys {
-            limiter.add_tokens_post_stream(key, panel_total + comp.total_tokens);
+            limiter.add_tokens_post_stream(key, entry_charge);
         }
         // #620: the judge's own model bucket gets only the judge's
         // streamed tokens (each panel member was billed per-member).
+        let judge_charge = comp.token_charge();
         for key in judge_keys {
-            limiter.add_tokens_post_stream(key, comp.total_tokens);
+            limiter.add_tokens_post_stream(key, judge_charge);
         }
         let terminal_status = stream_terminal_status(comp);
         let aggregate_input = self.usage.prompt_tokens.saturating_add(comp.prompt_tokens);
@@ -5669,9 +5701,13 @@ impl EnsembleCharge {
     fn settle_abandoned(&self, tokens_owed: bool) {
         if tokens_owed {
             for key in &self.entry_keys {
-                self.state
-                    .limiter
-                    .add_tokens_post_stream(key, u64::from(self.usage.total_tokens));
+                self.state.limiter.add_tokens_post_stream(
+                    key,
+                    aisix_ratelimit::TokenCharge::new(
+                        u64::from(self.usage.total_tokens),
+                        self.usage_estimated,
+                    ),
+                );
             }
         }
         self.record_tokens(
@@ -5764,10 +5800,12 @@ pub(crate) fn emit_abandoned_ensemble(
     let charged = judge.is_some() || panel.iter().any(Result::is_ok);
     let mut index = first_index;
     let mut usage = aisix_gateway::chat::UsageStats::default();
+    let mut usage_estimated = false;
     for member in panel {
         match member {
             Ok(outcome) => {
                 usage = usage.saturating_add(&outcome.effective_usage);
+                usage_estimated |= outcome.usage_estimated;
                 EnsembleSubcall::of(snap, &outcome).emit(
                     state,
                     snap,
@@ -5784,6 +5822,7 @@ pub(crate) fn emit_abandoned_ensemble(
     }
     if let Some(judge) = judge {
         usage = usage.saturating_add(&judge.outcome.effective_usage);
+        usage_estimated |= judge.outcome.usage_estimated;
         let sub = EnsembleSubcall::of(snap, &judge.outcome);
         let extras = UsageExtras {
             provider_request_id: crate::usage_attr::sanitize_provider_response_id(
@@ -5801,7 +5840,14 @@ pub(crate) fn emit_abandoned_ensemble(
     if !charged {
         return index;
     }
-    let charge = EnsembleCharge::new(state, snap, pending.entry_keys, usage, &pending.ctx);
+    let charge = EnsembleCharge::new(
+        state,
+        snap,
+        pending.entry_keys,
+        usage,
+        usage_estimated,
+        &pending.ctx,
+    );
     if pending.stream {
         charge.settle_stream(&[], &StreamCompletion::default());
     } else {

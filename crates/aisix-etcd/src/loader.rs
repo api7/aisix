@@ -36,7 +36,8 @@ use aisix_core::models::{
 };
 use aisix_core::models::{
     validate_budget_lenient, validate_budget_policy_lenient, validate_pricing_lenient,
-    validate_team_lenient, validate_user_lenient, Budget, BudgetPolicy, Pricing, Team, User,
+    validate_team_lenient, validate_usage_accounting_lenient, validate_user_lenient, Budget,
+    BudgetPolicy, Pricing, Team, UsageAccounting, User,
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
@@ -549,6 +550,18 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
                     &mut stats,
                 ) {
                     snapshot.budget_policy.insert(entry);
+                }
+            }
+            "usage_accounting" => {
+                if let Some(entry) = validate_and_parse::<UsageAccounting>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_usage_accounting_lenient,
+                    &mut stats,
+                ) {
+                    snapshot.usage_accounting.insert(entry);
                 }
             }
             "pricing" => {
@@ -1802,6 +1815,31 @@ mod tests {
                 .closed_grace_seconds,
             120
         );
+    }
+
+    #[test]
+    fn usage_accounting_loads_by_its_key_id() {
+        let entries = vec![
+            raw(
+                "/aisix/usage_accounting/env-1",
+                br#"{"exclude_estimated_usage":true}"#,
+                1,
+            ),
+            // The field is required: a document without it is dropped.
+            raw("/aisix/usage_accounting/env-2", br#"{}"#, 2),
+        ];
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+        assert_eq!(stats.accepted, 1, "{:?}", stats.rejections);
+        assert_eq!(stats.unknown_kind, 0);
+        assert!(
+            snap.usage_accounting
+                .get_by_id("env-1")
+                .unwrap()
+                .value
+                .exclude_estimated_usage
+        );
+        assert!(snap.usage_accounting.get_by_id("env-2").is_none());
+        assert!(snap.excludes_estimated_usage());
     }
 
     #[test]

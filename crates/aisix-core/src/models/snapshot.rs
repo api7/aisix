@@ -21,6 +21,7 @@ use super::pricing::Pricing;
 use super::provider_key::ProviderKey;
 use super::rate_limit_policy::RateLimitPolicy;
 use super::team::Team;
+use super::usage_accounting::UsageAccounting;
 use super::user::User;
 use crate::resource::ResourceEntry;
 use crate::snapshot::ResourceTable;
@@ -106,6 +107,10 @@ pub struct AisixSnapshot {
     /// What budgeted traffic does while usage cannot reach the control
     /// plane: `/aisix/<env>/budget_policy/<env-id>` — a singleton row.
     pub budget_policy: ResourceTable<BudgetPolicy>,
+    /// How estimated usage counts: `/aisix/<env>/usage_accounting/<env-id>`
+    /// — a singleton row the control plane writes only while its switch is
+    /// on. Read through [`AisixSnapshot::excludes_estimated_usage`].
+    pub usage_accounting: ResourceTable<UsageAccounting>,
 }
 
 impl AisixSnapshot {
@@ -137,6 +142,16 @@ impl AisixSnapshot {
             + self.users.len()
             + self.budgets.len()
             + self.budget_policy.len()
+            + self.usage_accounting.len()
+    }
+
+    /// Whether estimated usage is kept out of token rate limits. Two rows
+    /// can only be a stale key; either one switching it on wins.
+    pub fn excludes_estimated_usage(&self) -> bool {
+        self.usage_accounting
+            .entries()
+            .iter()
+            .any(|e| e.value.exclude_estimated_usage)
     }
 }
 

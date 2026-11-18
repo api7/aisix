@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "How the environment counts usage the gateway estimated locally because the upstream reported none.\n\nAt most one document exists per environment, keyed by the environment id. Without it estimated usage counts like reported usage.",
+  "properties": {
+    "exclude_estimated_usage": {
+      "description": "When `true`, a request whose usage the gateway estimated (any token counter it counted locally, so its usage event carries `usage_estimated: true`) adds none of its tokens to any token rate limit window (`tpm`, `tpd`, and a policy's `max_tokens`). Request-count limits and concurrency still count it, and its usage event still reports the estimated tokens.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "exclude_estimated_usage"
+  ],
+  "title": "UsageAccounting",
+  "type": "object"
+}

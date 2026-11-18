@@ -408,6 +408,11 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             snapshot.budget_policy.len(),
             "budgeted traffic behaves as `sticky`",
         ),
+        (
+            "usage_accounting",
+            snapshot.usage_accounting.len(),
+            "estimated usage counts toward token rate limits",
+        ),
     ] {
         if count > 0 {
             diag.warnings.push(format!(

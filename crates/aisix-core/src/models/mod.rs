@@ -43,6 +43,7 @@ pub mod semantic;
 pub mod snapshot;
 pub mod tags;
 pub mod team;
+pub mod usage_accounting;
 pub mod user;
 
 pub use a2a_agent::{A2aAgent, A2aAuthType, A2aProtocolVersion};
@@ -113,7 +114,8 @@ pub use schema::{
     validate_oidc_provider, validate_oidc_provider_lenient, validate_passthrough_route,
     validate_passthrough_route_lenient, validate_pricing, validate_pricing_lenient,
     validate_provider_key, validate_provider_key_lenient, validate_rate_limit_policy,
-    validate_rate_limit_policy_lenient, validate_team, validate_team_lenient, validate_user,
+    validate_rate_limit_policy_lenient, validate_team, validate_team_lenient,
+    validate_usage_accounting, validate_usage_accounting_lenient, validate_user,
     validate_user_lenient, SchemaError,
 };
 pub use semantic::{
@@ -124,4 +126,5 @@ pub use semantic::{
 pub use snapshot::{AisixSnapshot, KeyOwnerNames};
 pub use tags::{effective_tags, is_valid_tag_key, tag_value_from_claim, Tags, TAG_KEY_PATTERN};
 pub use team::Team;
+pub use usage_accounting::UsageAccounting;
 pub use user::User;
