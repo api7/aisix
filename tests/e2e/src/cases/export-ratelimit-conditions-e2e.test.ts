@@ -93,7 +93,7 @@ describe("aisix export: a conditional rate-limit policy on model and api_key lea
       "--prefix",
       etcdApp.etcdPrefix,
       "--reveal-secrets",
-    ]);
+    ], { timeout: 30_000 });
     exported = stdout;
     exportStderr = stderr;
   });

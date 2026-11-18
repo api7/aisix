@@ -51,7 +51,10 @@ const ROUTER = "ecm-router";
 const BAD_ROUTER = "ecm-router-not-typesafe";
 const ROUTE_TARGET = "ecm-route-target";
 const ROUTE_DEFAULT = "ecm-route-default";
+const TARGET_UPSTREAM_MODEL = "gpt-route-target";
+const DEFAULT_UPSTREAM_MODEL = "gpt-route-default";
 const PROMPT = "fix my python script";
+const EXPORT_TIMEOUT_MS = 30_000;
 
 // The resources file's id derivation: UUIDv5 of "<kind>/<identity>" in the
 // file-resource namespace.
@@ -165,11 +168,14 @@ describe("aisix export: a classifier that names its direct model by id", () => {
       secret: "sk-chat-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
-    for (const name of [ROUTE_TARGET, ROUTE_DEFAULT]) {
+    for (const [name, upstreamModel] of [
+      [ROUTE_TARGET, TARGET_UPSTREAM_MODEL],
+      [ROUTE_DEFAULT, DEFAULT_UPSTREAM_MODEL],
+    ]) {
       await seed.createModel({
         display_name: name,
         provider: "openai",
-        model_name: "gpt-4o-mini",
+        model_name: upstreamModel,
         provider_key_id: chatKey.id,
       });
     }
@@ -222,7 +228,7 @@ describe("aisix export: a classifier that names its direct model by id", () => {
       "--prefix",
       etcdApp.etcdPrefix,
       "--reveal-secrets",
-    ]);
+    ], { timeout: EXPORT_TIMEOUT_MS });
     exported = stdout;
     fileApp = await spawnApp({
       resourcesFile: exported,
@@ -248,12 +254,26 @@ describe("aisix export: a classifier that names its direct model by id", () => {
     const call = decisions!.calls.at(-1)!;
     expect(call.headers.authorization).toBe(`Bearer ${DECISION_SECRET}`);
     expect(call.body.model).toBe(JEV_UPSTREAM_MODEL);
+    // The picked route's model served the chat, not the default.
+    const served = JSON.parse(upstream!.receivedRequests.at(-1)!.body) as { model?: string };
+    expect(served.model).toBe(TARGET_UPSTREAM_MODEL);
 
     await waitForSlsLog(
       sls!,
       LOGSTORE,
       (row) => row.get("request_id") === response.requestId && isChild(row),
       `the classifier child UsageEvent for ${response.requestId}`,
+      20_000,
+    );
+    // The SLS writer is a FIFO queue: once a later request's row is
+    // visible, every row of this request is too, so the count is exact.
+    const barrier = await chat(fileApp!, ROUTE_DEFAULT);
+    expect(barrier.status).toBe(200);
+    await waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (row) => row.get("request_id") === barrier.requestId,
+      `the barrier UsageEvent for ${barrier.requestId}`,
       20_000,
     );
     const children = slsLogsFor(sls!, LOGSTORE).filter(
@@ -274,10 +294,15 @@ describe("aisix export: a classifier that names its direct model by id", () => {
 
   test("a classifier model on a non-typesafe key fails the same way on both sources", async () => {
     const before = decisions!.calls.length;
+    const upstreamBefore = upstream!.receivedRequests.length;
     const fromEtcd = await chat(etcdApp!, BAD_ROUTER);
     const fromFile = await chat(fileApp!, BAD_ROUTER);
-    expect(fromEtcd.status).not.toBe(200);
+    // `on_failure: fail` — the router refuses instead of routing.
+    expect(fromEtcd.status).toBe(503);
     expect(fromFile.status).toBe(fromEtcd.status);
+    const code = (text: string) => (JSON.parse(text) as { error?: { code?: unknown } }).error?.code;
+    expect(code(fromFile.text)).toBe(code(fromEtcd.text));
     expect(decisions!.calls.length).toBe(before);
+    expect(upstream!.receivedRequests.length).toBe(upstreamBefore);
   });
 });
