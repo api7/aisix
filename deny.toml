@@ -1,0 +1,11 @@
+# cargo-deny configuration. Only the advisories check is run, by the
+# `cargo deny (advisories)` CI job, against the root workspace's Cargo.lock
+# (the bench/ workspaces keep their own lockfiles and are not checked).
+#
+# A vulnerability advisory fails the job. Unmaintained, unsound and notice
+# advisories are only reported: the job passes `-W unmaintained -W unsound
+# -W notice`, since cargo-deny has no per-kind level in this file.
+#
+# An entry in `ignore` needs a written `reason` and maintainer sign-off.
+[advisories]
+ignore = []
