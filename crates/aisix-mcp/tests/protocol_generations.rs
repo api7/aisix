@@ -121,21 +121,72 @@ fn initialize_body(protocol_version: &str) -> serde_json::Value {
 }
 
 /// `initialize` echoes a requested version exactly when it is one we
-/// support, for BOTH generations' Streamable HTTP clients.
+/// support and that still has an `initialize` handshake. `2026-07-28` has
+/// none (its clients use `server/discover`), so an `initialize` asking for it
+/// negotiates to `2025-11-25`, the newest revision that does.
 #[tokio::test]
 async fn initialize_echoes_supported_versions_exactly() {
     let addr = spawn_gateway().await;
     for version in aisix_mcp::SUPPORTED_PROTOCOL_VERSION_NAMES {
         let (status, headers, body) = post_raw(addr, &[], initialize_body(version)).await;
         assert_eq!(status, 200, "initialize {version}: {body}");
+        let expected = if *version == "2026-07-28" {
+            "2025-11-25"
+        } else {
+            version
+        };
         assert_eq!(
-            body["result"]["protocolVersion"], *version,
-            "supported version must be echoed exactly: {body}"
+            body["result"]["protocolVersion"], expected,
+            "initialize {version} must negotiate {expected}: {body}"
         );
         // Stateless serving on every generation: no session is minted.
         assert!(
             headers.get("mcp-session-id").is_none(),
             "no Mcp-Session-Id may be issued ({version})"
+        );
+    }
+}
+
+/// Only tools are advertised, yet the listing methods of the other
+/// capabilities answer empty rather than `method not found`, as they always
+/// have — some agents call them regardless of the advertised capabilities.
+#[tokio::test]
+async fn unadvertised_listing_methods_answer_empty() {
+    let addr = spawn_gateway().await;
+    let version = [("mcp-protocol-version", "2025-11-25")];
+    for (method, params, expected) in [
+        (
+            "resources/list",
+            serde_json::json!({}),
+            serde_json::json!({ "resources": [] }),
+        ),
+        (
+            "resources/templates/list",
+            serde_json::json!({}),
+            serde_json::json!({ "resourceTemplates": [] }),
+        ),
+        (
+            "prompts/list",
+            serde_json::json!({}),
+            serde_json::json!({ "prompts": [] }),
+        ),
+        (
+            "completion/complete",
+            serde_json::json!({
+                "ref": { "type": "ref/prompt", "name": "any" },
+                "argument": { "name": "a", "value": "b" },
+            }),
+            serde_json::json!({ "completion": { "values": [] } }),
+        ),
+    ] {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": method, "params": params,
+        });
+        let (status, _headers, body) = post_raw(addr, &version, request).await;
+        assert_eq!(status, 200, "{method}: {body}");
+        assert_eq!(
+            body["result"], expected,
+            "{method} must answer empty: {body}"
         );
     }
 }

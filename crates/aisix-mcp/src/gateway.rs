@@ -34,9 +34,10 @@ use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
 use rmcp::model::{
-    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
-    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
-    Tool,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, CompleteRequestParams,
+    CompleteResult, ContentBlock, ErrorData, ListPromptsResult, ListResourceTemplatesResult,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+    ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -1004,12 +1005,49 @@ impl ServerHandler for McpGateway {
         into_call_tool_result(result).map(CallToolResponse::from)
     }
 
+    // Only tools are advertised, but these four answer empty rather than
+    // `method not found`: agents that list resources and prompts whatever the
+    // capabilities say get the answer this endpoint has always given.
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(ListResourcesResult::default())
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        Ok(ListResourceTemplatesResult::default())
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        Ok(ListPromptsResult::default())
+    }
+
+    async fn complete(
+        &self,
+        _request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CompleteResult, ErrorData> {
+        Ok(CompleteResult::default())
+    }
+
     /// The protocol versions this endpoint implements, replacing the SDK
     /// default (`ProtocolVersion::KNOWN_VERSIONS`, which would advertise
     /// every version rmcp has ever heard of — including ones this endpoint
     /// does not serve). Consulted by rmcp for `initialize` negotiation (an
-    /// exact match is echoed; anything else falls back to
-    /// `get_info().protocol_version`) and advertised verbatim in
+    /// exact match of a version that still has an `initialize` handshake is
+    /// echoed — `2026-07-28` has none, so it negotiates to `2025-11-25`;
+    /// anything else falls back to `get_info().protocol_version`) and
+    /// advertised verbatim in
     /// `server/discover`.
     ///
     /// `2024-11-05` is deliberately absent: that generation's transport is
