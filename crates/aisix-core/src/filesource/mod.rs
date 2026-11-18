@@ -687,6 +687,9 @@ pub fn load_from_str(
             "passthrough_routes" => {
                 desugar::desugar_passthrough_route(&mut entry.doc, &identity_maps)
             }
+            "mcp_auth_settings" => {
+                desugar::desugar_mcp_auth_settings(&mut entry.doc, &identity_maps)
+            }
             _ => Ok(()),
         };
         if let Err(message) = sugar_result {

@@ -636,7 +636,7 @@ api_keys:
     allowed_models: []
 mcp_auth_settings:
   - anonymous:
-      api_key_id: k
+      api_key: k
       source_cidrs: ["10.0.0.0/8"]
       servers: ["github"]
 "#;
@@ -1185,6 +1185,74 @@ mcp_auth_settings:
     assert_eq!(
         entry.value.resource_url.as_deref(),
         Some("https://gw.example.com/mcp")
+    );
+}
+
+/// The anonymous principal is named by the api key's display name and
+/// resolves to the id the file derives for that key. The control-plane id
+/// spelling is refused, since no id a file carries can name a key.
+#[test]
+fn the_anonymous_principal_is_named_by_api_key_and_the_id_form_is_refused() {
+    let file = |principal: &str| {
+        format!(
+            r#"
+_format_version: "1"
+mcp_servers:
+  - name: docs
+    url: https://example.test/mcp
+api_keys:
+  - display_name: anon
+    key_env: CALLER_KEY
+    allowed_models: []
+mcp_auth_settings:
+  - anonymous:
+{principal}
+      source_cidrs: ["10.0.0.0/8"]
+      servers: ["docs"]
+"#
+        )
+    };
+    let env = env_of(&[("CALLER_KEY", "sk-caller")]);
+
+    let snapshot = load(&file("      api_key: anon"), &env).expect("loads");
+    let entry = snapshot.mcp_auth_settings.entries().pop().unwrap();
+    assert_eq!(
+        entry.value.anonymous.as_ref().unwrap().api_key_id,
+        derive_id("api_keys", "anon")
+    );
+
+    let errs = errors_of(load(&file("      api_key: ghost"), &env));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("`anonymous.api_key` references unknown api key \"ghost\"")
+            && errs[0].contains("anon"),
+        "{errs:?}"
+    );
+
+    // Even an id that happens to equal the derived one is refused: the
+    // rule is about the spelling, so an export can never fall back to it.
+    for id_form in [
+        "      api_key_id: 3761ebd7-6405-44c6-8777-28012af7693b".to_string(),
+        format!("      api_key_id: {}", derive_id("api_keys", "anon")),
+        format!(
+            "      api_key: anon\n      api_key_id: {}",
+            derive_id("api_keys", "anon")
+        ),
+    ] {
+        let errs = errors_of(load(&file(&id_form), &env));
+        assert_eq!(errs.len(), 1, "{id_form}: {errs:?}");
+        assert!(
+            errs[0].contains("does not accept `anonymous.api_key_id`")
+                && errs[0].contains("`anonymous.api_key`"),
+            "{id_form}: {errs:?}"
+        );
+    }
+
+    let errs = errors_of(load(&file(""), &env));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("`anonymous.api_key` is required"),
+        "{errs:?}"
     );
 }
 

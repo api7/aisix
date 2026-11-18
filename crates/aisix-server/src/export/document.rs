@@ -370,6 +370,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
 
     // mcp_auth_settings — singleton per environment with a fixed
     // identity; no secrets (the resource URL is public discovery data).
+    // `anonymous.api_key_id` resugars to the bound key's file name.
     push_kind(
         &mut collections,
         "mcp_auth_settings",
@@ -378,7 +379,10 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             |_| "mcp_auth_settings".to_string(),
             "mcp_auth_settings",
             &mut diag,
-            |doc, _, diag| resugar_anonymous_servers(doc, &mcp_server_names, diag),
+            |doc, _, diag| {
+                resugar_anonymous_servers(doc, &mcp_server_names, diag);
+                resugar_anonymous_principal(doc, &api_key_names, diag);
+            },
             |_, _| {},
         ),
     );
@@ -1086,6 +1090,38 @@ fn resugar_anonymous_servers(
         );
     }
     anon.insert("servers".into(), Value::Array(names));
+}
+
+/// `mcp_auth_settings.anonymous.api_key_id` (etcd id) → `anonymous.api_key`
+/// (name), which the loader resolves back to the key's derived id. The file
+/// refuses the raw id form, so a principal that is not among the exported
+/// keys is kept raw and blocking, as for a claim mapping.
+fn resugar_anonymous_principal(
+    doc: &mut Value,
+    api_key_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    let Some(Value::Object(anon)) = doc.get_mut("anonymous") else {
+        return;
+    };
+    let Some(id) = anon
+        .get("api_key_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    match api_key_names.get(&id) {
+        Some(name) => {
+            anon.remove("api_key_id");
+            anon.insert("api_key".into(), Value::String(name.clone()));
+        }
+        None => diag.blocking.push(format!(
+            "the anonymous MCP principal anonymous.api_key_id references api key id {id:?}, which \
+             is not among the exported api keys — kept as a raw id (dangling reference in the \
+             source data; the file will not load until it is resolved)"
+        )),
+    }
 }
 
 /// `claim_mapping.resolve.api_key_id` (etcd id) → `resolve.api_key`

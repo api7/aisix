@@ -390,7 +390,7 @@ describe("resources file: MCP server names and the anonymous ceiling", () => {
     "    allowed_models: []",
     "mcp_auth_settings:",
     "  - anonymous:",
-    "      api_key_id: k",
+    "      api_key: k",
     '      source_cidrs: ["10.0.0.0/8"]',
     '      servers: ["docs"]',
     "",
