@@ -4,11 +4,11 @@ import {
   EtcdClient,
   ProxyClient,
   SeedClient,
+  completeLines,
   etcdEndpoint,
   spawnApp,
   startMockControlPlane,
   waitConfigPropagation,
-  waitForLogLine,
   type MockControlPlane,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -25,16 +25,22 @@ import {
 
 const hash = (plaintext: string) => createHash("sha256").update(plaintext).digest("hex");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const RECOVERED = "etcd watch established after a failed cycle";
 
 const authenticates = async (app: SpawnedApp, key: string): Promise<boolean> => {
+  let status: number;
   try {
-    return (await new ProxyClient(app.proxyUrl, key).listModels()).status === 200;
+    status = (await new ProxyClient(app.proxyUrl, key).listModels()).status;
   } catch (e) {
     // The proxy listener binds once the first configuration applies.
     const err = e as { code?: string; cause?: { code?: string } };
     if ((err.code ?? err.cause?.code) === "ECONNREFUSED") return false;
     throw e;
   }
+  // 401 is a key that has not propagated yet; anything else is a failure.
+  if (status === 401) return false;
+  if (status !== 200) throw new Error(`GET /v1/models answered ${status}`);
+  return true;
 };
 
 for (const requestTimeoutMs of [undefined, 3000]) {
@@ -44,8 +50,11 @@ for (const requestTimeoutMs of [undefined, 3000]) {
     let cp: MockControlPlane | undefined;
     let app: SpawnedApp | undefined;
     let seed: SeedClient | undefined;
+    let envPrefix = "";
     let etcdReachable = false;
     const tag = randomUUID().slice(0, 8);
+    const key = (n: string) => `sk-rb-${tag}-${n}`;
+    const addKey = (n: string) => seed!.createApiKey({ key_hash: hash(key(n)), allowed_models: ["*"] });
 
     beforeAll(async () => {
       const etcd = new EtcdClient();
@@ -67,9 +76,14 @@ for (const requestTimeoutMs of [undefined, 3000]) {
           },
         },
       });
-      seed = new SeedClient(etcd, `${prefix}/${cp.envId}`);
-      await seed.createApiKey({ key_hash: hash(`sk-rb-${tag}-first`), allowed_models: ["*"] });
-      await waitConfigPropagation(() => authenticates(app!, `sk-rb-${tag}-first`));
+      envPrefix = `${prefix}/${cp.envId}`;
+      seed = new SeedClient(etcd, envPrefix);
+      await addKey("first");
+      await waitConfigPropagation(() => authenticates(app!, key("first")));
+      // Written after the first configuration is serving, so it can only
+      // arrive over the watch: the watch is established before the fault.
+      await addKey("warm");
+      await waitConfigPropagation(() => authenticates(app!, key("warm")));
     });
 
     afterAll(async () => {
@@ -79,6 +93,7 @@ for (const requestTimeoutMs of [undefined, 3000]) {
 
     test("a change written after the path recovers is applied", async (ctx) => {
       if (!etcdReachable || !app || !cp) return ctx.skip();
+      const checkpoint = completeLines(app).length;
 
       // Connections reset: the watch fails and reconnect attempts start.
       cp.setEtcdPath("reset");
@@ -93,15 +108,22 @@ for (const requestTimeoutMs of [undefined, 3000]) {
       await sleep(1000);
       cp.setEtcdPath("pass");
 
-      await seed!.createApiKey({ key_hash: hash(`sk-rb-${tag}-second`), allowed_models: ["*"] });
-      await waitConfigPropagation(() => authenticates(app!, `sk-rb-${tag}-second`), 90_000);
-      expect(await authenticates(app, `sk-rb-${tag}-second`)).toBe(true);
+      await addKey("second");
+      await waitConfigPropagation(() => authenticates(app!, key("second")), 90_000);
 
-      await waitForLogLine(
-        app,
-        (line) => line.includes("etcd watch established after a failed cycle"),
-        "the INFO line announcing the recovered watch",
+      // The recovered environment watch, from this outage.
+      await waitConfigPropagation(
+        async () =>
+          completeLines(app!)
+            .slice(checkpoint)
+            .some((line) => line.includes(RECOVERED) && line.includes(envPrefix)),
+        10_000,
       );
+
+      // And it delivers: a change written now arrives over the watch.
+      await addKey("third");
+      await waitConfigPropagation(() => authenticates(app!, key("third")));
+      expect(await authenticates(app, key("third"))).toBe(true);
     }, 180_000);
   });
 }

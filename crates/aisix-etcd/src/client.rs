@@ -12,7 +12,6 @@ use std::error::Error as StdError;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 /// Maximum size, in bytes, of a gRPC message decoded from etcd.
 ///
@@ -370,7 +369,11 @@ pub struct LazyEtcdClient {
     /// is what an explicit `dial_timeout_ms: 0` asks for; omitting the
     /// key gets `aisix_core::DEFAULT_ETCD_DIAL_TIMEOUT_MS` per endpoint.
     dial_timeout: Option<Duration>,
-    connected: Mutex<Option<Connected>>,
+    connected: std::sync::Mutex<Option<Connected>>,
+    /// Serializes dials, so concurrent first calls wait for one dial
+    /// rather than opening a connection each. Kept apart from `connected`
+    /// so retiring a connection never waits behind a dial.
+    dialing: tokio::sync::Mutex<()>,
     /// Handed to the next connection [`LazyEtcdClient::dial`] establishes.
     /// See [`Connected::generation`].
     next_generation: AtomicU64,
@@ -443,7 +446,8 @@ impl LazyEtcdClient {
                     .with_tcp_keepalive(TCP_KEEPALIVE),
             ),
             dial_timeout,
-            connected: Mutex::new(None),
+            connected: std::sync::Mutex::new(None),
+            dialing: tokio::sync::Mutex::new(()),
             next_generation: AtomicU64::new(0),
         }
     }
@@ -459,21 +463,29 @@ impl LazyEtcdClient {
     /// The connection, dialling if this is the first call to get there,
     /// and the generation it belongs to — what [`Self::invalidate`] needs
     /// to replace exactly this connection.
-    ///
-    /// The lock is held across the dial on purpose: concurrent first
-    /// calls wait for the one dial rather than opening a connection each.
     async fn connection(&self) -> Result<(Client, u64), ConnectError> {
-        let mut slot = self.connected.lock().await;
-        if let Some(connected) = slot.as_ref() {
-            return Ok((connected.client.clone(), connected.generation));
+        if let Some(found) = self.cached() {
+            return Ok(found);
+        }
+        let _dialing = self.dialing.lock().await;
+        if let Some(found) = self.cached() {
+            return Ok(found);
         }
         let client = self.dial().await?;
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        *slot = Some(Connected {
+        *self.connected.lock().unwrap() = Some(Connected {
             client: client.clone(),
             generation,
         });
         Ok((client, generation))
+    }
+
+    fn cached(&self) -> Option<(Client, u64)> {
+        self.connected
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| (c.client.clone(), c.generation))
     }
 
     /// Discard the connection `stale` names so the next call dials a new
@@ -481,8 +493,8 @@ impl LazyEtcdClient {
     ///
     /// A no-op once someone else has already replaced that generation —
     /// see [`Connected::generation`].
-    async fn invalidate(&self, stale: u64) {
-        let mut slot = self.connected.lock().await;
+    pub(crate) fn invalidate(&self, stale: u64) {
+        let mut slot = self.connected.lock().unwrap();
         if slot.as_ref().is_some_and(|c| c.generation == stale) {
             *slot = None;
         }
@@ -547,7 +559,7 @@ impl LazyEtcdClient {
                 Some(d) => match tokio::time::timeout(d, call).await {
                     Ok(outcome) => outcome,
                     Err(_) => {
-                        self.invalidate(generation).await;
+                        self.invalidate(generation);
                         return Err(CallError::CallTimeout(d));
                     }
                 },
@@ -564,7 +576,7 @@ impl LazyEtcdClient {
                         "etcd no longer accepts this connection's auth token — \
                          authenticating again and retrying",
                     );
-                    self.invalidate(generation).await;
+                    self.invalidate(generation);
                     reauthenticated = true;
                 }
                 // A transport failure, not an answer from etcd (an etcd
@@ -575,7 +587,7 @@ impl LazyEtcdClient {
                 // every later call on it forever. Only a new channel is
                 // certain to dial again.
                 _ if failed_on_transport(&err) => {
-                    self.invalidate(generation).await;
+                    self.invalidate(generation);
                     return Err(CallError::Call(err));
                 }
                 _ => return Err(CallError::Call(err)),
@@ -593,32 +605,22 @@ impl LazyEtcdClient {
         })
     }
 
-    /// A count-only read of `prefix` under [`Self::probe_bound`], run
-    /// before a call that is deliberately unbounded (the full
-    /// configuration read) so that a connection that cannot answer at all
-    /// is found, and replaced, in bounded time. Same key range as the full
-    /// read, so whatever authorizes that read authorizes this one.
-    pub async fn probe(&self, prefix: &[u8]) -> Result<(), CallError> {
+    /// A count-only read under [`Self::probe_bound`], run before a call
+    /// that is deliberately unbounded (the full configuration read) so
+    /// that a connection that cannot answer at all is found, and
+    /// replaced, in bounded time. `key` is read as a prefix when
+    /// `whole_prefix` is set — the caller picks a range its own reads are
+    /// already authorized for — and as one key otherwise.
+    pub async fn probe(&self, key: &[u8], whole_prefix: bool) -> Result<(), CallError> {
         self.call(self.probe_bound(), |client| {
-            let prefix = prefix.to_vec();
-            async move {
-                kv_client(&client)
-                    .get(
-                        prefix,
-                        Some(GetOptions::new().with_prefix().with_count_only()),
-                    )
-                    .await
-                    .map(|_| ())
+            let key = key.to_vec();
+            let mut options = GetOptions::new().with_count_only();
+            if whole_prefix {
+                options = options.with_prefix();
             }
+            async move { kv_client(&client).get(key, Some(options)).await.map(|_| ()) }
         })
         .await
-    }
-
-    /// [`Self::invalidate`] for a caller that cannot await — a stream's
-    /// `poll_next`.
-    pub fn invalidate_in_background(self: &std::sync::Arc<Self>, stale: u64) {
-        let client = std::sync::Arc::clone(self);
-        tokio::spawn(async move { client.invalidate(stale).await });
     }
 
     async fn dial(&self) -> Result<Client, ConnectError> {

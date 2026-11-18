@@ -285,18 +285,21 @@ impl EtcdConfigProvider {
         if self.request_timeout.is_some() {
             return Ok(());
         }
-        self.reporting("liveness probe", self.client.probe(self.prefix.as_bytes()))
-            .await
-            .map_err(|err| match err {
-                CallError::ConnectTimeout(d) | CallError::CallTimeout(d) => {
-                    ProviderError::Connect(format!(
-                        "etcd did not answer a liveness read within {} ms (a bound derived \
+        self.reporting(
+            "liveness probe",
+            self.client.probe(self.prefix.as_bytes(), true),
+        )
+        .await
+        .map_err(|err| match err {
+            CallError::ConnectTimeout(d) | CallError::CallTimeout(d) => {
+                ProviderError::Connect(format!(
+                    "etcd did not answer a liveness read within {} ms (a bound derived \
                          from etcd.dial_timeout_ms); dropping the connection to dial a new one",
-                        d.as_millis()
-                    ))
-                }
-                other => provider_error(other, "liveness read", ProviderError::Range),
-            })
+                    d.as_millis()
+                ))
+            }
+            other => provider_error(other, "liveness read", ProviderError::Range),
+        })
     }
 }
 
@@ -502,7 +505,7 @@ impl Stream for EtcdWatchStream {
                         ConnectError::Unreachable(_) | ConnectError::Unauthenticated(_) => {
                             if failed_on_transport(&err) {
                                 if let Some((client, generation)) = self.connection.take() {
-                                    client.invalidate_in_background(generation);
+                                    client.invalidate(generation);
                                 }
                             }
                             ProviderError::Watch(format_etcd_error(&err))

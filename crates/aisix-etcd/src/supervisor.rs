@@ -1870,6 +1870,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         });
 
         let mut streams = Vec::with_capacity(self.sources.len());
+        let mut opened = Vec::with_capacity(self.sources.len());
         for (source, from) in self.sources.iter().zip(&load.revisions) {
             // Each prefix resumes from its own read, never from the
             // maximum across prefixes. A prefix whose read was refused
@@ -1882,13 +1883,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             };
             match watch {
                 Ok(stream) => {
-                    if after_failure {
-                        tracing::info!(
-                            prefix = %source.prefix.prefix,
-                            start_revision = from + 1,
-                            "etcd watch established after a failed cycle",
-                        );
-                    }
+                    opened.push((&source.prefix.prefix, from + 1));
                     streams.push(stream);
                 }
                 Err(err) if source.tolerates(&err) => {
@@ -1899,6 +1894,15 @@ impl<P: ConfigProvider> Supervisor<P> {
                     source.log_refusal(&err);
                 }
                 Err(err) => return Err(SupervisorError::Provider(err)),
+            }
+        }
+        if after_failure {
+            for (prefix, start_revision) in opened {
+                tracing::info!(
+                    prefix = %prefix,
+                    start_revision,
+                    "etcd watch established after a failed cycle",
+                );
             }
         }
         *steady_since = Some(tokio::time::Instant::now());
