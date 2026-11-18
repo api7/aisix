@@ -1099,6 +1099,14 @@ fn classifier_model_ref_resolves_to_the_named_model() {
         "{errs:?}"
     );
 
+    let with_inline = file.replace("model_ref: jev", "model_ref: jev\n        provider_key: ts");
+    let errs = errors_of(load(&with_inline, &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("cannot be set together with `semantic.classifier.provider_key`"),
+        "{errs:?}"
+    );
+
     let raw_id = file.replace(
         "model_ref: jev",
         "model_id: 11111111-1111-1111-1111-111111111111",

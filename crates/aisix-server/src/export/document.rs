@@ -142,7 +142,15 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             &mut diag,
             |doc, identity, diag| {
                 resugar_provider_key(doc, identity, &provider_key_names, diag);
-                resugar_classifier_provider_key(doc, identity, &provider_key_names, diag);
+                // Before `resugar_model_refs`: it decides by the classifier's
+                // `model_id`, which that pass renames.
+                resugar_classifier_provider_key(
+                    doc,
+                    identity,
+                    &provider_key_names,
+                    &model_names,
+                    diag,
+                );
                 resugar_model_refs(doc, "models", "model", identity, &model_names, diag);
                 drop_pricing_key(doc, identity, diag);
             },
@@ -724,17 +732,24 @@ fn resugar_provider_key(
 /// `provider_key_id` + `model`: the control plane writes them beside it only
 /// for gateways that predate `model_id`. They are dropped rather than
 /// exported, so a key that pair names is neither demanded from the export
-/// nor shown in the file as if it were used.
+/// nor shown in the file as if it were used. When `model_id` names no
+/// exported model the export is blocked anyway, and the pair is kept: it is
+/// what the operator can fall back to by deleting the dangling `model_ref`.
 fn resugar_classifier_provider_key(
     doc: &mut Value,
     model: &str,
     provider_key_names: &BTreeMap<String, String>,
+    model_names: &BTreeMap<String, String>,
     diag: &mut Diagnostics,
 ) {
     let Some(Value::Object(classifier)) = doc.pointer_mut("/semantic/classifier") else {
         return;
     };
-    if classifier.contains_key("model_id") {
+    if classifier
+        .get("model_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| model_names.contains_key(id))
+    {
         classifier.remove("provider_key_id");
         classifier.remove("model");
         return;

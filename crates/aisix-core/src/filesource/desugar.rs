@@ -153,14 +153,29 @@ pub(crate) fn desugar_model(doc: &mut Value, maps: &IdentityMaps) -> Result<(), 
         .get_mut("semantic")
         .and_then(|s| s.get_mut("classifier"))
     {
+        let [reference] = &super::CLASSIFIER_MODEL_REF_ID_FIELDS;
+        let field = format!("`{}`", reference.hint);
+        // The decision calls then use the referenced model's key and
+        // `model_name`, so an inline pair beside it would never be read.
+        if classifier.contains_key(reference.name_field) {
+            if let Some(inline) = ["provider_key", "provider_key_id", "model"]
+                .into_iter()
+                .find(|f| classifier.contains_key(*f))
+            {
+                return Err(format!(
+                    "{field} cannot be set together with `semantic.classifier.{inline}` — the \
+                     classifier calls the referenced model with its own provider key and \
+                     model_name"
+                ));
+            }
+        }
         desugar_provider_key_ref(classifier, maps, "semantic.classifier.")?;
-        if let Some(name_value) = classifier.remove("model_ref") {
-            const FIELD: &str = "`semantic.classifier.model_ref`";
+        if let Some(name_value) = classifier.remove(reference.name_field) {
             let Some(name) = name_value.as_str() else {
-                return Err(format!("{FIELD} must be a string (a model display_name)"));
+                return Err(format!("{field} must be a string (a model display_name)"));
             };
-            let resolved = resolve_entity_name(maps, "models", "model", name, FIELD)?;
-            classifier.insert("model_id".into(), Value::String(resolved));
+            let resolved = resolve_entity_name(maps, "models", "model", name, &field)?;
+            classifier.insert(reference.field.into(), Value::String(resolved));
         }
     }
     Ok(())

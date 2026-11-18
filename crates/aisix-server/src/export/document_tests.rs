@@ -93,7 +93,8 @@ fn classifier_provider_key_ref_resugars_to_name() {
 /// model's name under `model_ref`, and drops the inline `provider_key_id` +
 /// `model` the control plane writes beside it for older gateways: the
 /// gateway never reads them while `model_id` is set. An id naming no
-/// exported model is blocking, like every other reference a model carries.
+/// exported model is blocking, like every other reference a model carries,
+/// and then the inline pair is kept as the fallback.
 #[test]
 fn classifier_model_id_resugars_to_model_ref_and_drops_the_inline_pair() {
     let snap = AisixSnapshot::new();
@@ -148,10 +149,10 @@ fn classifier_model_id_resugars_to_model_ref_and_drops_the_inline_pair() {
         .iter()
         .find(|m| m["display_name"] == json!("jev-router"))
         .unwrap();
-    assert_eq!(
-        exported["semantic"]["classifier"]["model_ref"],
-        json!("m-gone")
-    );
+    let classifier = &exported["semantic"]["classifier"];
+    assert_eq!(classifier["model_ref"], json!("m-gone"));
+    assert_eq!(classifier["model"], json!("jev-inline"));
+    assert_eq!(classifier["provider_key_id"], json!("pk-not-exported"));
     assert!(
         doc.blocking
             .iter()
