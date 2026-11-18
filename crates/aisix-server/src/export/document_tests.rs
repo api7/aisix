@@ -440,3 +440,29 @@ fn two_fields_of_one_entry_sharing_a_placeholder_are_reported() {
         doc.warnings[0]
     );
 }
+
+#[test]
+fn fields_the_gateway_ignores_are_left_out_of_the_stored_documents() {
+    let entries = vec![RawEntry {
+        key: format!("/aisix/provider_keys/{PK}"),
+        value: serde_json::to_vec(&json!({
+            "display_name": "pk",
+            "api_key": "x",
+            "access_token": "tok-left-over",
+            "request": {"timeout_hint": "tok-nested"}
+        }))
+        .unwrap(),
+        revision: 1,
+    }];
+    let prefixes = PrefixSet::new(vec![WatchedPrefix::environment("/aisix")]);
+    let (_, stats) = build_snapshot(&prefixes, &entries);
+    let (docs, notes) = stored_documents(&prefixes, &entries, &stats);
+    let doc = &docs[&("provider_keys".to_string(), PK.to_string())];
+    let text = serde_json::to_string(doc).unwrap();
+    assert!(
+        !text.contains("tok-left-over") && !text.contains("tok-nested"),
+        "{text}"
+    );
+    assert_eq!(doc["api_key"], json!("x"));
+    assert_eq!(notes.len(), 1, "{notes:?}");
+}

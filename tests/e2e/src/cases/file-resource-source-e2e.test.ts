@@ -581,6 +581,7 @@ guardrails:
     app.signal("SIGHUP");
     await waitConfigPropagation(async () => {
       const r = await proxy.listModels();
+      expect(r.status).toBe(200);
       return (r.body as { data: Array<{ id: string }> }).data.some((m) => m.id === "reload-d");
     });
     await writeFile(app.resourcesPath, "_format_version: \"2\"\nmodels: [\n", "utf8");

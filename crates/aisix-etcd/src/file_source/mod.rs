@@ -230,6 +230,10 @@ pub fn read_str(
     }
 
     if errors.is_empty() {
+        // Key order, as etcd returns a range: rows sharing a name then
+        // resolve the same way from a file as from etcd, and the same way
+        // at boot and on every reload.
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(entries)
     } else {
         Err(fail(errors))
@@ -349,7 +353,8 @@ pub struct FileConfigProvider {
 impl FileConfigProvider {
     /// Inside a Tokio runtime on unix this installs the SIGHUP receiver,
     /// and fails if it cannot; outside one, [`ConfigProvider::watch`]
-    /// installs it instead.
+    /// installs it instead. The runtime must have its I/O driver enabled
+    /// (the gateway's does), which signal handling needs.
     pub fn new(path: impl Into<PathBuf>) -> std::io::Result<Self> {
         #[cfg(unix)]
         let hup = match tokio::runtime::Handle::try_current() {
@@ -430,8 +435,10 @@ impl FileConfigProvider {
         let rejected = report
             .errors
             .iter()
-            .map(|e| IncomingRejection {
-                identity: e.scope.clone(),
+            .enumerate()
+            // Several problems can share a scope (`(file)`); each is its own row.
+            .map(|(i, e)| IncomingRejection {
+                identity: format!("{} #{i}", e.scope),
                 resource_kind: e
                     .scope
                     .split('[')

@@ -56,6 +56,89 @@ type Redact = fn(&mut Value, &mut RedactionCtx<'_>);
 /// The stored documents, keyed by `(kind, id)`.
 pub type RawDocs = BTreeMap<(String, String), serde_json::Map<String, Value>>;
 
+/// The stored documents of the rows the loader accepted, environment
+/// prefix only, with every field the loader ignored on them removed.
+///
+/// An ignored field is one this gateway does not define, so it configures
+/// nothing here — and nothing knows whether it holds a credential, so it is
+/// not written into a file redaction cannot vouch for. A row whose ignored
+/// fields were too many to be listed is left out; both are reported in the
+/// returned notes.
+pub fn stored_documents(
+    prefixes: &aisix_etcd::PrefixSet,
+    entries: &[aisix_etcd::RawEntry],
+    stats: &aisix_etcd::BuildStats,
+) -> (RawDocs, Vec<String>) {
+    let rejected: BTreeSet<&str> = stats.rejections.iter().map(|r| r.key.as_str()).collect();
+    let ignored: BTreeMap<&str, &[String]> = stats
+        .partial_rows
+        .iter()
+        .map(|r| (r.key.as_str(), r.fields.as_slice()))
+        .collect();
+    let mut notes = Vec::new();
+    let mut docs = RawDocs::new();
+    for entry in entries {
+        if rejected.contains(entry.key.as_str()) {
+            continue;
+        }
+        let Ok(key) = prefixes.resolve(&entry.key) else {
+            continue;
+        };
+        if key.scope != aisix_etcd::PrefixScope::Environment {
+            continue;
+        }
+        let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(&entry.value) else {
+            continue;
+        };
+        let mut doc = Value::Object(doc);
+        if let Some(fields) = ignored.get(entry.key.as_str()) {
+            if fields.iter().any(|f| f == "...truncated") {
+                notes.push(format!(
+                    "{} carries more fields this gateway does not define than can be listed; \
+                     it is left out of the export",
+                    entry.key
+                ));
+                continue;
+            }
+            for field in fields.iter() {
+                let path = field.strip_prefix("inapplicable:").unwrap_or(field);
+                remove_path(&mut doc, &path.split('.').collect::<Vec<_>>());
+            }
+            notes.push(format!(
+                "{}: fields this gateway does not define are left out: {}",
+                entry.key,
+                fields.join(", ")
+            ));
+        }
+        let Value::Object(doc) = doc else { continue };
+        docs.insert((key.kind.to_string(), key.id.to_string()), doc);
+    }
+    (docs, notes)
+}
+
+/// Remove the field at `path`, where a `[]` segment stands for every
+/// element of an array.
+fn remove_path(value: &mut Value, path: &[&str]) {
+    match path {
+        [] => {}
+        ["[]", rest @ ..] => {
+            for item in value.as_array_mut().into_iter().flatten() {
+                remove_path(item, rest);
+            }
+        }
+        [field] => {
+            if let Some(map) = value.as_object_mut() {
+                map.remove(*field);
+            }
+        }
+        [field, rest @ ..] => {
+            if let Some(child) = value.get_mut(*field) {
+                remove_path(child, rest);
+            }
+        }
+    }
+}
+
 /// Build the resources-file document from the stored documents and the
 /// snapshot the loader decoded from them (which decides what was accepted).
 pub fn build_export_document(

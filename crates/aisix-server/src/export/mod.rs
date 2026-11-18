@@ -92,22 +92,7 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
         WatchedPrefix::global(format!("{}/global/", args.prefix.trim_end_matches('/'))),
     ]);
     let (snapshot, stats) = build_snapshot(&prefixes, &entries);
-    let rejected: std::collections::HashSet<&str> =
-        stats.rejections.iter().map(|r| r.key.as_str()).collect();
-    let raw: document::RawDocs = entries
-        .iter()
-        .filter(|e| !rejected.contains(e.key.as_str()))
-        .filter_map(|e| {
-            let key = prefixes.resolve(&e.key).ok()?;
-            if key.scope != aisix_etcd::PrefixScope::Environment {
-                return None;
-            }
-            let serde_json::Value::Object(doc) = serde_json::from_slice(&e.value).ok()? else {
-                return None;
-            };
-            Some(((key.kind.to_string(), key.id.to_string()), doc))
-        })
-        .collect();
+    let (raw, dropped) = document::stored_documents(&prefixes, &entries, &stats);
 
     let document = build_export_document(&snapshot, &raw, args.reveal_secrets);
     let yaml = emit_yaml(&document).map_err(|e| anyhow::anyhow!(e))?;
@@ -133,6 +118,7 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
     }
 
     report_rejections(&stats);
+    report_warnings(&dropped);
     report_warnings(&document.warnings);
     report_secrets(&document, args.reveal_secrets);
 

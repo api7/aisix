@@ -126,7 +126,12 @@ describe("aisix export: etcd → export → file round-trip", () => {
     // etcd propagates asynchronously — gate on the last-seeded key
     // authenticating before the test reads etcd via export.
     const probe = new ProxyClient(etcdApp.proxyUrl, CALLER_PLAINTEXT);
-    await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
+    await waitConfigPropagation(async () => {
+      const { status } = await probe.listModels();
+      if (status === 401) return false;
+      if (status !== 200) throw new Error(`/v1/models answered ${status} while waiting`);
+      return true;
+    });
   });
 
   afterAll(async () => {
@@ -363,6 +368,7 @@ describe("aisix export: etcd → export → file round-trip", () => {
         expect(stderr, `secret leaked to stderr: ${field}`).not.toContain(value);
       }
       expect(yaml).toContain("${AISIXSECRET");
+      expect(yaml).not.toContain("$${AISIXSECRET");
       expect(stderr).toContain("secret value(s) were replaced");
 
       // The redacted file still loads whole once the placeholders are

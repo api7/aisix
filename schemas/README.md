@@ -73,8 +73,8 @@ The gateway's **read path — etcd, and a `resources_file`, which goes
 through the same loader — is deliberately more lenient** (#871): a
 stored document carrying fields outside these schemas still loads, with
 the unknown fields ignored and reported as partially compatible on
-`GET /status/config`, the heartbeat, and the
-`aisix_config_partially_compatible_resources` metric. This keeps an
+`GET /status/config` and the `aisix_config_partially_compatible_resources`
+metric (and, for a gateway connected to a control plane, the heartbeat). This keeps an
 older gateway serving documents written by a newer control plane. Types,
 required fields, ranges and closed enum value sets apply on the read path
 too, except for the write-only checks `resources-lenient/` relaxes (an

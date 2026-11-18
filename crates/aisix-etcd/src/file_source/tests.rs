@@ -43,11 +43,11 @@ global:
     assert_eq!(
         keys,
         [
-            format!("/aisix/provider_keys/{PK}"),
             format!("/aisix/global/pricing/{MODEL}"),
+            format!("/aisix/provider_keys/{PK}"),
         ]
     );
-    let value: Value = serde_json::from_slice(&entries[0].value).unwrap();
+    let value: Value = serde_json::from_slice(&entries[1].value).unwrap();
     assert_eq!(
         value,
         serde_json::json!({"display_name": "openai", "provider": "openai", "api_key": "sk-from-env"}),
@@ -385,11 +385,18 @@ async fn a_sighup_before_the_watch_starts_is_delivered_to_it() {
     let path = dir.path().join("resources.yaml");
     std::fs::write(&path, "_format_version: \"2\"\n").unwrap();
     let provider = FileConfigProvider::new(&path).unwrap();
+    // A second receiver proves the signal was delivered before the watch
+    // starts; a receiver the watch made only then would not see it.
+    let mut witness =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).unwrap();
     let status = std::process::Command::new("kill")
         .args(["-HUP", &std::process::id().to_string()])
         .status()
         .unwrap();
     assert!(status.success());
+    tokio::time::timeout(std::time::Duration::from_secs(5), witness.recv())
+        .await
+        .expect("the SIGHUP is delivered");
     let mut stream = provider.watch(0).await.unwrap();
     let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
         .await
@@ -397,4 +404,20 @@ async fn a_sighup_before_the_watch_starts_is_delivered_to_it() {
         .expect("the stream is open")
         .expect("the file reads");
     assert!(matches!(event, WatchEvent::Resync { .. }));
+}
+
+#[test]
+fn rows_come_back_in_key_order_whatever_the_file_order() {
+    let entries = read(&format!(
+        "_format_version: \"2\"\nmodels:\n  - id: {MODEL}\n  - id: {PK}\n"
+    ))
+    .unwrap();
+    let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
+    assert_eq!(
+        keys,
+        [
+            format!("/aisix/models/{PK}"),
+            format!("/aisix/models/{MODEL}")
+        ]
+    );
 }
