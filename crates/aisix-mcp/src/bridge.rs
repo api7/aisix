@@ -19,7 +19,9 @@ use aisix_core::{McpAuthType, McpServer};
 use async_trait::async_trait;
 use futures::future::{BoxFuture, FutureExt};
 use http::{HeaderName, HeaderValue};
-use rmcp::model::{CallToolRequestParams, CallToolResponse, ClientConfig, ProtocolVersion};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, ClientConfig, ErrorCode, ErrorData, ProtocolVersion,
+};
 use rmcp::service::{ClientInitializeError, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::{
     SseError, StreamableHttpClientTransportConfig, StreamableHttpError,
@@ -810,20 +812,14 @@ pub(crate) fn sanitize_error_message(message: &str) -> String {
 /// The reqwest transport surfaces a 401 in one of two stable shapes (rmcp is
 /// pinned exactly, so these cannot drift silently): a 401 carrying a
 /// `WWW-Authenticate` header becomes `StreamableHttpError::AuthRequired`, and
-/// any other non-success status becomes
-/// `UnexpectedServerResponse("HTTP <status>: …")`. Both arrive here inside
+/// one without becomes `UnexpectedServerResponse("HTTP 401 …")` — its body
+/// is never parsed as JSON-RPC, so a revoked token is always recognized
+/// here, whatever the upstream put in the body. Both arrive here inside
 /// `ClientInitializeError::TransportError` as the type-erased transport error;
 /// the downcast names rmcp's own reqwest (`rmcp_reqwest`, the 0.13 line — not
 /// the workspace 0.12) so the types match. Post-handshake operations don't
 /// need this: [`EphemeralBridge`] reconnects per operation, so every request
 /// replays the handshake and a rejected token always surfaces on this path.
-///
-/// Known gap (availability-only): a bare 401 whose body parses as a JSON-RPC
-/// error arrives as `ClientInitializeError::JsonRpcError` — not a transport
-/// error — and is not recognized here, so a revoked token is replayed until
-/// the cache's expiry skew retires it (at most ~59 minutes at the default
-/// lifetime). Spec-conforming servers answer 401 with `WWW-Authenticate`,
-/// which IS recognized.
 fn init_error_is_unauthorized(error: &ClientInitializeError) -> bool {
     let ClientInitializeError::TransportError { error, .. } = error else {
         return false;
@@ -869,13 +865,30 @@ fn service_failure(error: &rmcp::ServiceError) -> Option<ToolCallFailure> {
 fn init_failure(error: &ClientInitializeError) -> Option<ToolCallFailure> {
     match error {
         ClientInitializeError::TransportError { error, .. } => transport_failure(error),
-        ClientInitializeError::JsonRpcError(data) => Some(ToolCallFailure::JsonRpc(data.code.0)),
+        ClientInitializeError::JsonRpcError(data) => Some(discover_rejection_status(data).map_or(
+            ToolCallFailure::JsonRpc(data.code.0),
+            ToolCallFailure::UpstreamStatus,
+        )),
         ClientInitializeError::ConnectionClosed(_) => Some(ToolCallFailure::Transport),
         ClientInitializeError::ExpectedInitResponse(_)
         | ClientInitializeError::ExpectedInitResult(_)
         | ClientInitializeError::ConflictInitResponseId(_, _) => Some(ToolCallFailure::Undecodable),
         _ => None,
     }
+}
+
+/// The HTTP status of a 4xx answer to `server/discover`. rmcp hands such an
+/// answer to the lifecycle as a JSON-RPC `invalid_request` it synthesizes,
+/// `server/discover rejected with HTTP <status>: <body>`, rather than as a
+/// transport error, so the status is read back out of that text.
+fn discover_rejection_status(data: &ErrorData) -> Option<u16> {
+    if data.code != ErrorCode::INVALID_REQUEST {
+        return None;
+    }
+    http_status_of(
+        data.message
+            .strip_prefix("server/discover rejected with ")?,
+    )
 }
 
 /// What a failed send says about the upstream. The shapes left over are the
@@ -897,16 +910,13 @@ fn transport_failure(error: &rmcp::transport::DynamicTransportError) -> Option<T
         StreamableHttpError::HttpStatus(status) => {
             Some(ToolCallFailure::UpstreamStatus(status.status))
         }
-        StreamableHttpError::ReinitializationFailed(data) => {
-            Some(ToolCallFailure::JsonRpc(data.code.0))
-        }
         StreamableHttpError::Client(client) if client.is_timeout() => {
             Some(ToolCallFailure::Timeout)
         }
-        StreamableHttpError::ControlRequestTimeout
-        | StreamableHttpError::SessionRecoveryTimeout => Some(ToolCallFailure::Timeout),
-        // An over-cap JSON body and an over-cap SSE event (`SseError::Body`)
-        // read the same way: the upstream sent more than the gateway buffers.
+        StreamableHttpError::ControlRequestTimeout => Some(ToolCallFailure::Timeout),
+        // An over-cap JSON body reads as a transport failure, the class an
+        // over-cap SSE event lands in too: rmcp ends that stream (logging the
+        // cap itself) and the call sees a closed transport.
         StreamableHttpError::Client(_)
         | StreamableHttpError::Io(_)
         | StreamableHttpError::ResponseBodyTooLarge { .. }

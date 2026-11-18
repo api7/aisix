@@ -123,7 +123,7 @@ fn initialize_body(protocol_version: &str) -> serde_json::Value {
 /// `initialize` echoes a requested version exactly when it is one we
 /// support and that still has an `initialize` handshake. `2026-07-28` has
 /// none (its clients use `server/discover`), so an `initialize` asking for it
-/// negotiates to `2025-11-25`, the newest revision that does.
+/// gets the endpoint's pinned fallback, `2025-11-25`.
 #[tokio::test]
 async fn initialize_echoes_supported_versions_exactly() {
     let addr = spawn_gateway().await;

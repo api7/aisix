@@ -1045,9 +1045,8 @@ impl ServerHandler for McpGateway {
     /// every version rmcp has ever heard of — including ones this endpoint
     /// does not serve). Consulted by rmcp for `initialize` negotiation (an
     /// exact match of a version that still has an `initialize` handshake is
-    /// echoed — `2026-07-28` has none, so it negotiates to `2025-11-25`;
-    /// anything else falls back to `get_info().protocol_version`) and
-    /// advertised verbatim in
+    /// echoed; anything else, `2026-07-28` included since it has none, falls
+    /// back to `get_info().protocol_version`) and advertised verbatim in
     /// `server/discover`.
     ///
     /// `2024-11-05` is deliberately absent: that generation's transport is

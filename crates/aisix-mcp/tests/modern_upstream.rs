@@ -439,3 +439,32 @@ async fn stateful_legacy_upstream_receives_the_full_handshake_sequence() {
         "every bridge session must run the full legacy lifecycle"
     );
 }
+
+/// An upstream that answers `server/discover` with a plain HTTP 4xx (a wrong
+/// path, say) is reported by that status, as the same failure under the
+/// legacy handshake is — not as an in-band JSON-RPC error.
+#[tokio::test]
+async fn discover_rejected_with_http_404_reports_the_status() {
+    let app = axum::Router::new().route(
+        "/mcp",
+        axum::routing::post(|| async { (axum::http::StatusCode::NOT_FOUND, "no such endpoint") }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let upstream =
+        McpUpstream::new(format!("http://{addr}/mcp")).with_protocol(McpProtocol::V20260728);
+    let error = match RmcpBridge::connect(&upstream).await {
+        Ok(_) => panic!("a 404 must fail the connect"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.tool_call_failure(),
+        Some(aisix_mcp::ToolCallFailure::UpstreamStatus(404)),
+        "{error}"
+    );
+}
