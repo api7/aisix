@@ -5,7 +5,12 @@
 //!
 //! - `models[].provider_key` — a provider-key *name*, resolved to the
 //!   derived `provider_key_id`. Mutually exclusive with an explicit
-//!   `provider_key_id`.
+//!   `provider_key_id`. A semantic router's `classifier` takes the same
+//!   sugar for its inline key.
+//! - `models[].semantic.classifier.model_ref` — a model *name*, resolved
+//!   to the derived `model_id`. The classifier's canonical name-like
+//!   field, `model`, is the upstream decision model name, so the
+//!   reference cannot use it.
 //! - `api_keys[].display_name` — required file-side identity, stripped
 //!   before validation (the canonical `api_key` document has no name
 //!   field).
@@ -137,7 +142,8 @@ fn known_names(maps: &IdentityMaps, kind: &str) -> String {
 
 /// `models[].provider_key` (name) → `provider_key_id` (derived id), and
 /// the same sugar on a semantic router's `classifier`, which references its
-/// Provider Key exactly the way a model does.
+/// Provider Key exactly the way a model does; plus the classifier's
+/// `model_ref` (name) → `model_id` (derived id).
 pub(crate) fn desugar_model(doc: &mut Value, maps: &IdentityMaps) -> Result<(), String> {
     let Some(obj) = doc.as_object_mut() else {
         return Ok(()); // non-object entries error upstream
@@ -147,7 +153,30 @@ pub(crate) fn desugar_model(doc: &mut Value, maps: &IdentityMaps) -> Result<(), 
         .get_mut("semantic")
         .and_then(|s| s.get_mut("classifier"))
     {
+        let [reference] = &super::CLASSIFIER_MODEL_REF_ID_FIELDS;
+        let field = format!("`{}`", reference.hint);
+        // The decision calls then use the referenced model's key and
+        // `model_name`, so an inline pair beside it would never be read.
+        if classifier.contains_key(reference.name_field) {
+            if let Some(inline) = ["provider_key", "provider_key_id", "model"]
+                .into_iter()
+                .find(|f| classifier.contains_key(*f))
+            {
+                return Err(format!(
+                    "{field} cannot be set together with `semantic.classifier.{inline}` — the \
+                     classifier calls the referenced model with its own provider key and \
+                     model_name"
+                ));
+            }
+        }
         desugar_provider_key_ref(classifier, maps, "semantic.classifier.")?;
+        if let Some(name_value) = classifier.remove(reference.name_field) {
+            let Some(name) = name_value.as_str() else {
+                return Err(format!("{field} must be a string (a model display_name)"));
+            };
+            let resolved = resolve_entity_name(maps, "models", "model", name, &field)?;
+            classifier.insert(reference.field.into(), Value::String(resolved));
+        }
     }
     Ok(())
 }
