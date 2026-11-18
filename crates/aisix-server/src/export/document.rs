@@ -1094,8 +1094,9 @@ fn resugar_anonymous_servers(
 
 /// `mcp_auth_settings.anonymous.api_key_id` (etcd id) → `anonymous.api_key`
 /// (name), which the loader resolves back to the key's derived id. The file
-/// refuses the raw id form, so a principal that is not among the exported
-/// keys is kept raw and blocking, as for a claim mapping.
+/// accepts an `api_key_id` only when it is a derived id, so a principal that
+/// is not among the exported keys is kept raw and blocking, as for a claim
+/// mapping.
 fn resugar_anonymous_principal(
     doc: &mut Value,
     api_key_names: &BTreeMap<String, String>,

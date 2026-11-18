@@ -1029,6 +1029,29 @@ pub fn load_from_str(
         }
     }
 
+    // Same rule for the anonymous MCP principal: an `api_key_id` written
+    // directly (the derived id, as a hand-written file may) must land on a
+    // key defined here. A control-plane id would bind anonymous callers to
+    // no key and answer every one of them with a 401.
+    for (_, scope, settings) in &mcp_auth_settings {
+        let Some(anon) = settings.anonymous.as_ref() else {
+            continue;
+        };
+        if !api_key_ids
+            .values()
+            .any(|derived| derived == &anon.api_key_id)
+        {
+            errors.push(LoadError {
+                scope: scope.clone(),
+                message: format!(
+                    "anonymous.api_key_id {:?} does not match any api key defined in this file — \
+                     reference the key by name via `anonymous.api_key` instead",
+                    anon.api_key_id
+                ),
+            });
+        }
+    }
+
     // A JWKS/discovery URL must never carry a credential query: JWKS
     // material is public,
     // credentials there would only leak (e.g. through a snapshot export).

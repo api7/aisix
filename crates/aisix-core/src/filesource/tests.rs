@@ -1189,10 +1189,11 @@ mcp_auth_settings:
 }
 
 /// The anonymous principal is named by the api key's display name and
-/// resolves to the id the file derives for that key. The control-plane id
-/// spelling is refused, since no id a file carries can name a key.
+/// resolves to the id the file derives for that key. A directly written
+/// `api_key_id` loads only when it is that derived id: a control-plane id
+/// would bind anonymous callers to no key at all.
 #[test]
-fn the_anonymous_principal_is_named_by_api_key_and_the_id_form_is_refused() {
+fn the_anonymous_principal_is_named_by_api_key_or_by_its_derived_id() {
     let file = |principal: &str| {
         format!(
             r#"
@@ -1213,13 +1214,16 @@ mcp_auth_settings:
         )
     };
     let env = env_of(&[("CALLER_KEY", "sk-caller")]);
+    let derived = derive_id("api_keys", "anon");
 
-    let snapshot = load(&file("      api_key: anon"), &env).expect("loads");
-    let entry = snapshot.mcp_auth_settings.entries().pop().unwrap();
-    assert_eq!(
-        entry.value.anonymous.as_ref().unwrap().api_key_id,
-        derive_id("api_keys", "anon")
-    );
+    for loads in [
+        "      api_key: anon".to_string(),
+        format!("      api_key_id: {derived}"),
+    ] {
+        let snapshot = load(&file(&loads), &env).expect(&loads);
+        let entry = snapshot.mcp_auth_settings.entries().pop().unwrap();
+        assert_eq!(entry.value.anonymous.as_ref().unwrap().api_key_id, derived);
+    }
 
     let errs = errors_of(load(&file("      api_key: ghost"), &env));
     assert_eq!(errs.len(), 1, "{errs:?}");
@@ -1229,31 +1233,24 @@ mcp_auth_settings:
         "{errs:?}"
     );
 
-    // Even an id that happens to equal the derived one is refused: the
-    // rule is about the spelling, so an export can never fall back to it.
-    for id_form in [
-        "      api_key_id: 3761ebd7-6405-44c6-8777-28012af7693b".to_string(),
-        format!("      api_key_id: {}", derive_id("api_keys", "anon")),
-        format!(
-            "      api_key: anon\n      api_key_id: {}",
-            derive_id("api_keys", "anon")
-        ),
-    ] {
-        let errs = errors_of(load(&file(&id_form), &env));
-        assert_eq!(errs.len(), 1, "{id_form}: {errs:?}");
-        assert!(
-            errs[0].contains("does not accept `anonymous.api_key_id`")
-                && errs[0].contains("`anonymous.api_key`"),
-            "{id_form}: {errs:?}"
-        );
-    }
-
-    let errs = errors_of(load(&file(""), &env));
+    let errs = errors_of(load(
+        &file("      api_key_id: 3761ebd7-6405-44c6-8777-28012af7693b"),
+        &env,
+    ));
     assert_eq!(errs.len(), 1, "{errs:?}");
     assert!(
-        errs[0].contains("`anonymous.api_key` is required"),
+        errs[0].contains(
+            "anonymous.api_key_id \"3761ebd7-6405-44c6-8777-28012af7693b\" does not match"
+        ) && errs[0].contains("`anonymous.api_key`"),
         "{errs:?}"
     );
+
+    let errs = errors_of(load(
+        &file(&format!("      api_key: anon\n      api_key_id: {derived}")),
+        &env,
+    ));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].contains("mutually exclusive"), "{errs:?}");
 }
 
 #[test]

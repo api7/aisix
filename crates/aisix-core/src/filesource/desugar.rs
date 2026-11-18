@@ -14,7 +14,8 @@
 //!   lowercase hex — [`crate::models::ApiKey::hash_bearer`]) and then
 //!   dropped. Exactly one of `key_env` / `key_hash` must be present.
 //! - `mcp_auth_settings[].anonymous.api_key` — an api-key *name*,
-//!   resolved to the derived `api_key_id`; the id form is refused.
+//!   resolved to the derived `api_key_id`. Mutually exclusive with an
+//!   explicit `api_key_id`, which must equal a key's derived id.
 //! - `rate_limit_policies[].scope_ref` — for `scope: api_key` /
 //!   `scope: model`, a *name* resolved to the referenced entry's derived
 //!   id; other scopes pass through verbatim.
@@ -275,9 +276,7 @@ pub(crate) fn desugar_claim_mapping(doc: &mut Value, maps: &IdentityMaps) -> Res
 }
 
 /// `mcp_auth_settings[].anonymous.api_key` (name) → `anonymous.api_key_id`
-/// (derived id). The id form is refused: a file derives its key ids from
-/// display names, so a control-plane id written here would bind anonymous
-/// callers to no key at all and every one of them would get a 401.
+/// (derived id).
 pub(crate) fn desugar_mcp_auth_settings(
     doc: &mut Value,
     maps: &IdentityMaps,
@@ -285,25 +284,21 @@ pub(crate) fn desugar_mcp_auth_settings(
     let Some(anon) = doc.get_mut("anonymous").and_then(Value::as_object_mut) else {
         return Ok(()); // missing / mistyped anonymous: canonical validation reports it
     };
-    if anon.contains_key("api_key_id") {
-        return Err(
-            "the resources file does not accept `anonymous.api_key_id` — it names an api key \
-             by control-plane id, which a file cannot resolve; name the key with \
-             `anonymous.api_key` instead"
-                .into(),
-        );
-    }
-    let Some(name_value) = anon.remove("api_key") else {
-        return Err(
-            "`anonymous.api_key` is required (the display_name of the api key anonymous \
-             callers run as)"
-                .into(),
-        );
+    let Some(name_value) = anon.get("api_key") else {
+        return Ok(());
     };
     let Some(name) = name_value.as_str() else {
         return Err("`anonymous.api_key` must be a string (an api key display_name)".into());
     };
+    if anon.contains_key("api_key_id") {
+        return Err(
+            "`anonymous.api_key` (a name reference) and `anonymous.api_key_id` are mutually \
+             exclusive — set exactly one"
+                .into(),
+        );
+    }
     let resolved = resolve_entity_name(maps, "api_keys", "api key", name, "`anonymous.api_key`")?;
+    anon.remove("api_key");
     anon.insert("api_key_id".into(), Value::String(resolved));
     Ok(())
 }
