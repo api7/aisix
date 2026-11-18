@@ -18,10 +18,10 @@ use yaml_rust2::Yaml;
 /// Environment lookup used by interpolation. Production passes
 /// `std::env::var(..).ok()`; tests inject a closed map so they never
 /// mutate process-global env state.
-pub(crate) type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 /// Interpolate `${VAR}` references in one string scalar.
-pub(crate) fn interpolate_str(input: &str, env: EnvLookup<'_>) -> Result<String, String> {
+fn interpolate_str(input: &str, env: EnvLookup<'_>) -> Result<String, String> {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(c) = chars.next() {
@@ -48,10 +48,12 @@ pub(crate) fn interpolate_str(input: &str, env: EnvLookup<'_>) -> Result<String,
                     name.push(c2);
                 }
                 if !closed {
-                    return Err(format!(
-                        "unterminated `${{` in value {input:?} — close it with `}}` \
-                         or escape the dollar sign as `$$`"
-                    ));
+                    // The value is not quoted: it can be a credential.
+                    return Err(
+                        "unterminated `${` — close it with `}` or escape the dollar \
+                                sign as `$$`"
+                            .into(),
+                    );
                 }
                 if name.is_empty() {
                     return Err("empty variable name in `${}`".into());

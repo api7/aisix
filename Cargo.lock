@@ -133,8 +133,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "url",
- "uuid",
- "yaml-rust2",
 ]
 
 [[package]]
@@ -159,6 +157,8 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+ "yaml-rust2",
 ]
 
 [[package]]

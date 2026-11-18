@@ -23,6 +23,10 @@ base64.workspace = true
 chrono.workspace = true
 ring.workspace = true
 hex.workspace = true
+# The resources file: parsed by the same YAML crate the `config`
+# dependency pulls in, keyed by UUID ids.
+yaml-rust2.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

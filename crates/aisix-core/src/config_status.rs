@@ -3,15 +3,16 @@
 //! Answers one operator question — *did my configuration take effect, and
 //! if not, why?* — for both load paths the gateway supports:
 //!
-//! - the **etcd** watch source (managed mode), and
-//! - the standalone **file** source (`resources_file`).
+//! - the **etcd** watch source, and
+//! - the standalone **file** source (`resources_file`), which runs through
+//!   the same supervisor as rows read from the file.
 //!
 //! [`ConfigStatus`] is a cheap-to-clone shared handle the load paths update
 //! as they observe and apply snapshots. It is read by the non-admin
 //! metrics/status listener to serve `GET /status/config`, `GET /status/ready`,
 //! and the `aisix_config_*` Prometheus series.
 //!
-//! The etcd supervisor and file source supply loader observations. Runtime
+//! The supervisor supplies loader observations for both. Runtime
 //! builders may add rejections for rows that passed the lenient loader but
 //! could not materialise; those are retained independently so a subsequent
 //! loader observation cannot erase a still-broken runtime row.
@@ -26,27 +27,25 @@
 //! `source_hash` and `config_hash` are deterministic and reproducible by a
 //! caller that knows what it wrote:
 //!
-//! - **etcd**: `sha256` over the entries, each rendered as
-//!   `key '\0' canonical_json_value '\n'`, concatenated in ascending key
-//!   order. `canonical_json_value` recursively sorts object keys and drops
-//!   insignificant whitespace ([`canonical_json`]); a value that is not JSON
-//!   is hashed as its raw bytes. `source_hash` covers every entry the DP has
-//!   observed from etcd — full snapshots and live watch events alike,
-//!   including rejected writes. `config_hash` covers the bytes each key
-//!   actually *serves*: the observed bytes for accepted keys, the pinned
-//!   last-known-good bytes for keys serving stale (#871, see
-//!   `serving_stale_since` on `rejected[]`), and nothing for a rejected key
-//!   with no last good. When everything is accepted the two hashes are
-//!   equal; a rejection makes them diverge, with `rejected[]` (or, for a
-//!   `kind` segment this build does not know, `unknown_kinds[]`) as the
-//!   authoritative per-resource explanation. A row rejected later by a
-//!   runtime builder is removed from the reported count and derives a stable
-//!   effective hash from that loader hash plus the sorted rejected identities;
-//!   this keeps the source/applied hashes divergent without retaining a second
-//!   copy of every source document in the status handle.
-//! - **file**: `sha256` over the raw file bytes. On a clean load the applied
-//!   `config_hash` equals `source_hash` (the whole file is applied); on a
-//!   rejected reload the applied hash stays at the last-good file's hash.
+//! `sha256` over the entries, each rendered as
+//! `key '\0' canonical_json_value '\n'`, concatenated in ascending key
+//! order. `canonical_json_value` recursively sorts object keys and drops
+//! insignificant whitespace ([`canonical_json`]); a value that is not JSON
+//! is hashed as its raw bytes. `source_hash` covers every entry the DP has
+//! observed from etcd — full snapshots and live watch events alike,
+//! including rejected writes. `config_hash` covers the bytes each key
+//! actually *serves*: the observed bytes for accepted keys, the pinned
+//! last-known-good bytes for keys serving stale (#871, see
+//! `serving_stale_since` on `rejected[]`), and nothing for a rejected key
+//! with no last good. When everything is accepted the two hashes are
+//! equal; a rejection makes them diverge, with `rejected[]` (or, for a
+//! `kind` segment this build does not know, `unknown_kinds[]`) as the
+//! authoritative per-resource explanation. A row rejected later by a
+//! runtime builder is removed from the reported count and derives a stable
+//! effective hash from that loader hash plus the sorted rejected identities;
+//! this keeps the source/applied hashes divergent without retaining a second
+//! copy of every source document in the status handle. A resources file is
+//! hashed the same way, over the rows it is read as.
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use ring::digest::{Context, SHA256};
@@ -330,8 +329,7 @@ impl LazyHash {
         }
     }
 
-    /// A digest already in hand — the file source, where hashing is one
-    /// pass over bytes already read, and tests.
+    /// A digest already in hand (tests).
     pub fn ready(value: impl Into<String>) -> Self {
         let value = value.into();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -430,7 +428,7 @@ pub struct LoadObservation {
     pub observed_revision: Option<i64>,
     /// The applied snapshot, when this load produced/kept a served snapshot.
     /// `None` only when a reload was wholly rejected and the last-good
-    /// snapshot is retained (file reload failure) — the caller then sets
+    /// snapshot is retained — the caller then sets
     /// [`Self::wholly_rejected`].
     pub applied: Option<AppliedSnapshot>,
     /// Rejected entries observed in this snapshot.
@@ -452,7 +450,7 @@ pub struct LoadObservation {
     /// incremental etcd events do not).
     pub is_reload: bool,
     /// True when the latest observed snapshot was rejected as a whole and the
-    /// gateway kept serving a previous snapshot (file reload failure).
+    /// gateway kept serving a previous snapshot.
     pub wholly_rejected: bool,
 }
 
@@ -600,6 +598,7 @@ impl ConfigStatus {
         inner.observed_revision = obs.observed_revision;
         inner.latest_wholly_rejected = obs.wholly_rejected;
 
+        let applied_now = obs.applied.is_some();
         if let Some(applied) = obs.applied {
             if !was_applied {
                 // Open the boot-time proxy-listener gate. Sending under the
@@ -695,9 +694,13 @@ impl ConfigStatus {
         }
         inner.unknown_kind = merged_unknown;
         inner.unknown_kind_counts = unknown_kind_counts;
-        inner.partially_compatible = obs.partially_compatible;
-        inner.partially_compatible_rows_by_kind = obs.partially_compatible_rows_by_kind;
-        inner.stale_served_rows_by_kind = obs.stale_served_rows_by_kind;
+        // These describe the served snapshot, which a load that applied
+        // nothing (a wholly rejected reload) left as it was.
+        if applied_now {
+            inner.partially_compatible = obs.partially_compatible;
+            inner.partially_compatible_rows_by_kind = obs.partially_compatible_rows_by_kind;
+            inner.stale_served_rows_by_kind = obs.stale_served_rows_by_kind;
+        }
 
         if inner.ever_applied
             && (!was_applied || previous_effective_version != inner.effective_config_version())
@@ -1263,13 +1266,6 @@ where
     hex(hasher.finish().as_ref())
 }
 
-/// Hash raw file bytes: `sha256` hex.
-pub fn hash_bytes(bytes: &[u8]) -> String {
-    let mut hasher = Context::new(&SHA256);
-    hasher.update(bytes);
-    hex(hasher.finish().as_ref())
-}
-
 /// Serialize a JSON value with object keys sorted recursively and no
 /// insignificant whitespace, so two structurally-equal documents hash the
 /// same regardless of key order or spacing.
@@ -1370,6 +1366,27 @@ mod tests {
             is_reload: true,
             wholly_rejected: false,
         }
+    }
+
+    #[test]
+    fn a_wholly_rejected_load_keeps_the_served_snapshot_s_summaries() {
+        let cs = ConfigStatus::new(SourceKind::File);
+        cs.record_load(LoadObservation {
+            partially_compatible_rows_by_kind: [("models".to_string(), 1)].into(),
+            stale_served_rows_by_kind: [("models".to_string(), 2)].into(),
+            ..clean_load()
+        });
+        cs.record_load(LoadObservation {
+            applied: None,
+            wholly_rejected: true,
+            ..clean_load()
+        });
+        let inner = cs.inner.lock().unwrap();
+        assert_eq!(
+            inner.partially_compatible_rows_by_kind.get("models"),
+            Some(&1)
+        );
+        assert_eq!(inner.stale_served_rows_by_kind.get("models"), Some(&2));
     }
 
     // The boot path gates the proxy listener on this: a waiter that never
@@ -2317,7 +2334,7 @@ mod tests {
         for len in [0, 1, 55, 56, 63, 64, 65, 127, 128, 129, 4096, 65537] {
             let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
             let expected = hex(Sha256::digest(&bytes).as_slice());
-            assert_eq!(hash_bytes(&bytes), expected);
+            assert_eq!(hash_records([&bytes]), expected);
             for chunk in [1, 7, 64, 1024] {
                 assert_eq!(hash_records(bytes.chunks(chunk)), expected);
             }

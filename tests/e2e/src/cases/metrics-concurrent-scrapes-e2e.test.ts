@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  fileId,
   spawnApp,
   startOpenAiUpstream,
   type OpenAiUpstream,
@@ -14,19 +15,22 @@ const KEYS = Array.from({ length: 64 }, (_, i) => `sk-concurrent-metrics-${i}`);
 
 function resources(base: string): string {
   return `
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: metrics-upstream
+  - id: ${fileId("metrics-upstream")}
+    display_name: metrics-upstream
     provider: openai
     api_key: sk-mock
     api_base: ${base}/v1
 models:
-${[MODEL, ...ESCAPED_MODELS].map((model) => `  - display_name: ${JSON.stringify(model)}
+${[MODEL, ...ESCAPED_MODELS].map((model) => `  - id: ${fileId(`model/${model}`)}
+    display_name: ${JSON.stringify(model)}
     provider: openai
     model_name: mock-model
-    provider_key: metrics-upstream`).join("\n")}
+    provider_key_id: ${fileId("metrics-upstream")}`).join("\n")}
 api_keys:
-${KEYS.map((key, i) => `  - display_name: metrics-caller-${i}
+${KEYS.map((key, i) => `  - id: ${fileId(`caller/${i}`)}
+    display_name: metrics-caller-${i}
     key_hash: ${createHash("sha256").update(key).digest("hex")}
     allowed_models: ${JSON.stringify([MODEL, ...ESCAPED_MODELS])}`).join("\n")}
 `;

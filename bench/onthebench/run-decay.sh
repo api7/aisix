@@ -72,21 +72,24 @@ admin:
     - "aisix-admin-dummy"
 EOF
 cat > "$OUT/resources.yaml" <<EOF
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: mock-openai
+  - id: 57a1d346-fc3f-4673-852f-7f24a24b1bfb
+    display_name: mock-openai
     provider: openai
     adapter: openai
     api_base: "http://127.0.0.1:$MOCK_PORT/v1"
     api_key: "sk-mock"
 models:
-  - display_name: gpt-4o-mini
+  - id: cc417944-9d8f-4e68-88d8-eda672d6bf79
+    display_name: gpt-4o-mini
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: mock-openai
+    provider_key_id: 57a1d346-fc3f-4673-852f-7f24a24b1bfb
 api_keys:
-  - display_name: bench
-    key_env: BENCH_AISIX_KEY
+  - id: f606e507-2e3d-4d90-80e0-1e8dfa34471e
+    display_name: bench
+    key_hash: 7137e16f75a1d75b6fd65930672814806cdc1a0d6e0aa38611afc996a402258b
     allowed_models: ["*"]
 EOF
 
@@ -95,7 +98,7 @@ start_gateway() {
     # aisix reads AISIX_* environment variables as config overrides; nothing
     # from the harness environment may leak into the measured process.
     while read -r v; do unset "$v"; done < <(compgen -v | grep '^AISIX_' || true)
-    BENCH_AISIX_KEY=bench-token taskset -c "$GW_CORES" "$BIN" --config "$OUT/config.yaml" \
+    taskset -c "$GW_CORES" "$BIN" --config "$OUT/config.yaml" \
         > "$OUT/gateway.log" 2>&1 &
     GW_PID=$!
     # Readiness posts $BODY, so a gateway that cannot carry the large payload

@@ -1,9 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -26,7 +21,6 @@ import {
 // Driven against a real gateway + etcd + two real MCP upstreams (official
 // TypeScript SDK servers), through the public `/mcp` surface only.
 
-const execFileP = promisify(execFile);
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
@@ -458,84 +452,5 @@ describe("mcp server reference ids: grants follow the server id, not its name", 
     expect((await callTool(KEYS.cappedRename, "gamma-v2__echo")).status).toBe(
       429,
     );
-  }, 60_000);
-});
-
-// The id spelling is a control-plane projection: a resources file derives
-// its ids from its own entry names, so an id written there could never
-// resolve. `aisix validate` refuses each of them by name rather than
-// loading a file whose grants and limits silently point at nothing.
-describe("resources file: every MCP server reference id spelling is refused", () => {
-  const BIN_PATH =
-    process.env.AISIX_BIN ??
-    join(process.cwd(), "..", "..", "target", "debug", "aisix");
-
-  const PRELUDE = [
-    '_format_version: "1"',
-    "mcp_servers:",
-    "  - name: github",
-    "    url: https://example.test/mcp",
-    "api_keys:",
-    "  - display_name: k",
-    "    key_env: MCP_REF_IDS_CALLER_KEY",
-    "    allowed_models: []",
-  ].join("\n");
-
-  const ID = "11111111-1111-1111-1111-111111111111";
-  const ENV = { ...process.env, MCP_REF_IDS_CALLER_KEY: "sk-caller" };
-
-  const CASES = [
-    {
-      label: "per-server rate limits",
-      field: "mcp_rate_limits_by_id",
-      withId: `\n    mcp_rate_limits_by_id:\n      "${ID}":\n        rpm: 1\n`,
-      without: "",
-    },
-    {
-      label: "mcp_access allow",
-      field: "mcp_access.allow_ids",
-      withId: `\n    mcp_access:\n      allow: []\n      allow_ids:\n        - server_id: "${ID}"\n          tool: "*"\n`,
-      without: `\n    mcp_access:\n      allow: []\n`,
-    },
-    {
-      label: "mcp_access deny",
-      field: "mcp_access.deny_ids",
-      withId: `\n    mcp_access:\n      allow: ["*"]\n      deny_ids:\n        - server_id: "${ID}"\n          tool: drop\n`,
-      without: `\n    mcp_access:\n      allow: ["*"]\n`,
-    },
-  ];
-
-  test("each id field is rejected by name, and the same file without it validates", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "aisix-mcp-ref-ids-"));
-    try {
-      for (const { label, field, withId, without } of CASES) {
-        const bad = join(dir, `bad-${label.replace(/\W+/g, "-")}.yaml`);
-        await writeFile(bad, PRELUDE + withId, "utf8");
-        let failure: (Error & { code?: number; stderr?: string }) | undefined;
-        try {
-          await execFileP(BIN_PATH, ["validate", "--resources", bad], { env: ENV });
-        } catch (e) {
-          failure = e as Error & { code?: number; stderr?: string };
-        }
-        if (!failure) {
-          throw new Error(`${label}: expected \`aisix validate\` to fail`);
-        }
-        expect(failure.code, label).toBe(1);
-        expect(String(failure.stderr), label).toContain(
-          `does not accept \`${field}\``,
-        );
-
-        // The same file with the id field removed validates, so the
-        // refusal is that field and not anything else in the fixture.
-        const good = join(dir, `good-${label.replace(/\W+/g, "-")}.yaml`);
-        await writeFile(good, PRELUDE + without, "utf8");
-        const ok = await execFileP(BIN_PATH, ["validate", "--resources", good], {
-          env: ENV,
-        });
-        expect(ok.stdout, label).toContain("OK:");
-      }
-    } finally {
-      await rm(dir, { recursive: true, force: true });
-    }
   }, 60_000);
 });

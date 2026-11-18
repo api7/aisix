@@ -4,6 +4,8 @@ import { connect, type AddressInfo, type Socket } from "node:net";
 import { WebSocket as WsClient, WebSocketServer } from "ws";
 import { afterEach, describe, expect, test } from "vitest";
 import {
+  keyHash,
+  fileId,
   metricDelta,
   scrapeMetrics,
   spawnApp,
@@ -25,26 +27,28 @@ import {
 // closes.
 
 const CALLER_PLAINTEXT = "sk-drain-ws-upgrade";
-const CALLER_KEY_ENV = "DRAIN_WS_UPGRADE_CALLER_KEY";
 const MODEL = "drain-ws-upgrade";
 
 function resources(port: number): string {
   return `
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: drain-ws-upgrade-pk
+  - id: ${fileId(`provider_keys/drain-ws-upgrade-pk`)}
+    display_name: drain-ws-upgrade-pk
     provider: openai
     adapter: openai
     api_key: sk-mock
     api_base: http://127.0.0.1:${port}/v1
 models:
-  - display_name: ${MODEL}
+  - id: ${fileId(`models/${MODEL}`)}
+    display_name: ${MODEL}
     provider: openai
     model_name: gpt-realtime-mock
-    provider_key: drain-ws-upgrade-pk
+    provider_key_id: ${fileId(`provider_keys/drain-ws-upgrade-pk`)}
 api_keys:
-  - display_name: drain-ws-upgrade-caller
-    key_env: ${CALLER_KEY_ENV}
+  - id: ${fileId(`api_keys/drain-ws-upgrade-caller`)}
+    display_name: drain-ws-upgrade-caller
+    key_hash: ${keyHash(CALLER_PLAINTEXT)}
     allowed_models: ["${MODEL}"]
 `;
 }
@@ -142,7 +146,6 @@ describe("drain: a WebSocket upgrade", () => {
       // The drain phases are reported at INFO; the suite default is WARN.
       logLevel: "info",
       resourcesFile: resources((http.address() as AddressInfo).port),
-      extraEnv: { [CALLER_KEY_ENV]: CALLER_PLAINTEXT },
       extra: { shutdown: { min_drain_secs: minDrainSecs } },
     });
     cleanup.push(() => app.exit());

@@ -10,7 +10,7 @@
 //! the variable out of band.
 //!
 //! The placeholder name is derived deterministically from the entry's
-//! identity and the field so it is stable across exports and greppable.
+//! name and the field so it is stable across exports and greppable.
 //! It deliberately does **not** start with `AISIX_`: the gateway's
 //! config loader owns that prefix (`Environment::with_prefix("AISIX")`),
 //! so a secret variable there is read as a configuration override when
@@ -34,8 +34,10 @@ pub struct SecretPlaceholder {
     pub env_var: String,
     /// Resource kind the credential belongs to (`provider_keys`, …).
     pub kind: &'static str,
-    /// The entry's file identity (display_name / name).
+    /// The entry's name (display_name / name), or its id when it has none.
     pub identity: String,
+    /// The entry's id.
+    pub id: String,
     /// Human label for the redacted field (e.g. `api_key`, `header x-…`).
     pub field: String,
 }
@@ -50,8 +52,10 @@ pub struct RedactionCtx<'a> {
     pub kind_token: &'a str,
     /// Canonical kind name recorded on the placeholder (`provider_keys`).
     pub kind: &'static str,
-    /// The entry's file identity.
+    /// The entry's name, which the placeholder is derived from.
     pub identity: &'a str,
+    /// The entry's id.
+    pub id: &'a str,
     /// Emit the real values inline instead of placeholders.
     pub reveal: bool,
     /// Where recorded placeholders accumulate.
@@ -66,6 +70,7 @@ impl RedactionCtx<'_> {
             env_var: env_var.clone(),
             kind: self.kind,
             identity: self.identity.to_string(),
+            id: self.id.to_string(),
             field: field_label,
         });
         Value::String(format!("${{{env_var}}}"))
@@ -202,6 +207,7 @@ mod tests {
             kind_token: "PROVIDER_KEY",
             kind: "provider_keys",
             identity,
+            id: identity,
             reveal,
             out,
         }
@@ -286,6 +292,7 @@ mod tests {
             kind_token: "GUARDRAIL",
             kind: "guardrails",
             identity: "bedrock-guard",
+            id: "bedrock-guard",
             reveal: false,
             out: &mut out,
         };
@@ -350,6 +357,7 @@ mod tests {
             kind_token: "OBSERVABILITY_EXPORTER",
             kind: "observability_exporters",
             identity: "honeycomb",
+            id: "honeycomb",
             reveal: false,
             out: &mut out,
         };

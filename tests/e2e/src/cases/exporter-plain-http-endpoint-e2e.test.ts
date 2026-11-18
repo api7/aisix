@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  keyHash,
+  fileId,
   EtcdClient,
   ProxyClient,
   SeedClient,
@@ -23,7 +25,6 @@ import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 const HOST = "127.0.0.2";
 const CALLER = "sk-exporter-plain-http";
 const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
-const CALLER_ENV = "EXPORTER_PLAIN_HTTP_CALLER";
 const MODEL = "plain-http-endpoint-model";
 const CREDENTIAL_REF = "plain-http-s3";
 const BUCKET = "plain-http-bucket";
@@ -177,27 +178,30 @@ describe("exporter endpoints accept plain http on any host", () => {
   test("resources file: an OTLP exporter loads and delivers", async () => {
     fileApp = await spawnApp({
       resourcesFile: `
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: plain-http-file-pk
+  - id: ${fileId(`provider_keys/plain-http-file-pk`)}
+    display_name: plain-http-file-pk
     provider: openai
     api_key: sk-mock
     api_base: ${upstream!.baseUrl}/v1
 models:
-  - display_name: ${MODEL}
+  - id: ${fileId(`models/${MODEL}`)}
+    display_name: ${MODEL}
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: plain-http-file-pk
+    provider_key_id: ${fileId(`provider_keys/plain-http-file-pk`)}
 api_keys:
-  - display_name: plain-http-file-caller
-    key_env: ${CALLER_ENV}
+  - id: ${fileId(`api_keys/plain-http-file-caller`)}
+    display_name: plain-http-file-caller
+    key_hash: ${keyHash(CALLER)}
     allowed_models: ["${MODEL}"]
 observability_exporters:
-  - name: otlp-plain-http-file
+  - id: ${fileId(`observability_exporters/otlp-plain-http-file`)}
+    name: otlp-plain-http-file
     kind: otlp_http
     endpoint: ${fileOtlp!.url}
 `,
-      extraEnv: { [CALLER_ENV]: CALLER },
     });
 
     const requestId = await chat(fileApp);

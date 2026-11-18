@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  keyHash,
+  fileId,
   EtcdClient,
   SeedClient,
   spawnApp,
@@ -27,9 +29,6 @@ const ETCD_CALLER_KEY_HASH = createHash("sha256")
   .digest("hex");
 
 const FILE_CALLER_PLAINTEXT = "sk-admin-off-file-caller";
-// `key_env` sugar: the plaintext travels to the gateway via this env var
-// (never `AISIX_`-prefixed — the config loader claims that namespace).
-const FILE_CALLER_KEY_ENV = "ADMIN_OFF_FILE_CALLER_KEY";
 
 /**
  * With `admin.enabled = false` the admin port is never bound, so a
@@ -197,23 +196,25 @@ describe("admin disabled, file source: gateway serves a declarative resources.ya
     app = await spawnApp({
       admin: false,
       resourcesFile: `
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: admin-off-file-pk
+  - id: ${fileId(`provider_keys/admin-off-file-pk`)}
+    display_name: admin-off-file-pk
     provider: openai
     api_key: sk-mock
     api_base: ${upstream.baseUrl}/v1
 models:
-  - display_name: admin-off-file-model
+  - id: ${fileId(`models/admin-off-file-model`)}
+    display_name: admin-off-file-model
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: admin-off-file-pk
+    provider_key_id: ${fileId(`provider_keys/admin-off-file-pk`)}
 api_keys:
-  - display_name: admin-off-file-caller
-    key_env: ${FILE_CALLER_KEY_ENV}
+  - id: ${fileId(`api_keys/admin-off-file-caller`)}
+    display_name: admin-off-file-caller
+    key_hash: ${keyHash(FILE_CALLER_PLAINTEXT)}
     allowed_models: ["admin-off-file-model"]
 `,
-      extraEnv: { [FILE_CALLER_KEY_ENV]: FILE_CALLER_PLAINTEXT },
     });
   });
 

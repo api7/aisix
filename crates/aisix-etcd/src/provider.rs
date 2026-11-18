@@ -67,6 +67,10 @@ pub enum ProviderError {
     Watch(String),
     #[error("etcd revision was compacted — caller should resync")]
     Compacted,
+    /// The resources file could not be read as a set of rows (see
+    /// [`crate::file_source`]); the message is its whole report.
+    #[error("{0}")]
+    File(String),
 }
 
 /// Abstraction the supervisor depends on. Methods are async so the etcd

@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { connect, type AddressInfo, type Socket } from "node:net";
 import { afterEach, describe, expect, test } from "vitest";
-import { spawnApp, waitForLogLine, type SpawnedApp } from "../harness/index.js";
+import { keyHash, fileId, spawnApp, waitForLogLine, type SpawnedApp } from "../harness/index.js";
 
 // E2E: a request still being served when thread-per-core workers exit at
 // the end of a drain.
@@ -18,7 +18,6 @@ import { spawnApp, waitForLogLine, type SpawnedApp } from "../harness/index.js";
 // connections come from a pool that is not per-worker.
 
 const CALLER_PLAINTEXT = "sk-tpc-shared-pool-drain";
-const CALLER_KEY_ENV = "TPC_SHARED_POOL_CALLER_KEY";
 const MODEL = "tpc-shared-pool";
 const VENDOR_HOST = "tpc-shared-pool.invalid";
 
@@ -73,21 +72,24 @@ async function startMock(): Promise<Mock> {
 
 function resources(port: number): string {
   return `
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: tpc-shared-pool-pk
+  - id: ${fileId(`provider_keys/tpc-shared-pool-pk`)}
+    display_name: tpc-shared-pool-pk
     provider: openai
     api_key: sk-mock
     api_base: http://${VENDOR_HOST}:${port}/v1
     resolve_addresses: ["127.0.0.1"]
 models:
-  - display_name: ${MODEL}
+  - id: ${fileId(`models/${MODEL}`)}
+    display_name: ${MODEL}
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: tpc-shared-pool-pk
+    provider_key_id: ${fileId(`provider_keys/tpc-shared-pool-pk`)}
 api_keys:
-  - display_name: tpc-shared-pool-caller
-    key_env: ${CALLER_KEY_ENV}
+  - id: ${fileId(`api_keys/tpc-shared-pool-caller`)}
+    display_name: tpc-shared-pool-caller
+    key_hash: ${keyHash(CALLER_PLAINTEXT)}
     allowed_models: ["${MODEL}"]
 `;
 }
@@ -148,7 +150,7 @@ async function runOnce(iteration: number, cleanup: Array<() => Promise<void>>): 
     logLevel: "info",
     threadPerCore: true,
     resourcesFile: resources(mock.port),
-    extraEnv: { [CALLER_KEY_ENV]: CALLER_PLAINTEXT, AISIX_PROXY__WORKERS: String(WORKERS) },
+    extraEnv: { AISIX_PROXY__WORKERS: String(WORKERS) },
     extra: { shutdown: { min_drain_secs: 1 } },
   });
   cleanup.push(() => app.exit());

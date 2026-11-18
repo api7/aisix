@@ -610,6 +610,15 @@ impl<P: ConfigProvider> Supervisor<P> {
         }
     }
 
+    /// Report load state on `status` instead of a fresh etcd one — a
+    /// resources file runs through this same supervisor, and its provider
+    /// reports a reload it could not read on the same handle (see
+    /// [`crate::file_source`]).
+    pub fn with_config_status(mut self, status: ConfigStatus) -> Self {
+        self.config_status = status;
+        self
+    }
+
     /// Report the cost of every apply to `observer`.
     pub fn with_apply_observer(mut self, observer: Arc<ApplyObserver>) -> Self {
         self.apply_observer = Some(observer);

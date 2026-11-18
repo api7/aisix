@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  fileId,
   spawnApp,
   startOpenAiUpstream,
   type OpenAiUpstream,
@@ -27,19 +28,22 @@ const TTFT_SERIES = "aisix_request_ttft_seconds";
 
 function resources(upstreamBase: string): string {
   return `
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: buckets-pk
+  - id: ${fileId(`provider_keys/buckets-pk`)}
+    display_name: buckets-pk
     provider: openai
     api_key: sk-mock
     api_base: ${upstreamBase}/v1
 models:
-  - display_name: buckets-model
+  - id: ${fileId(`models/buckets-model`)}
+    display_name: buckets-model
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: buckets-pk
+    provider_key_id: ${fileId(`provider_keys/buckets-pk`)}
 api_keys:
-  - display_name: buckets-caller
+  - id: ${fileId(`api_keys/buckets-caller`)}
+    display_name: buckets-caller
     key_hash: ${CALLER_KEY_HASH}
     allowed_models: ["buckets-model"]
 `;

@@ -3,7 +3,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { parse as parseYaml } from "yaml";
 import {
+  droppedRows,
   awaitWindowHeadroom,
   EtcdClient,
   etcdEndpoint,
@@ -20,7 +22,7 @@ import {
 // an API key must survive `aisix export` into a resources file: the
 // file-mode gateway loads it and throttles exactly what the etcd-backed
 // gateway throttles. The control plane writes those leaves as resource
-// ids; a resources file names resources by their entry names.
+// ids, and the export carries them as written.
 
 const execFileP = promisify(execFile);
 const BIN_PATH =
@@ -39,6 +41,8 @@ describe("aisix export: a conditional rate-limit policy on model and api_key lea
   let upstream: OpenAiUpstream | undefined;
   let exported = "";
   let exportStderr = "";
+  let limitedModelId = "";
+  let limitedKeyId = "";
 
   const chat = (app: SpawnedApp, key: string, model: string) =>
     new ProxyClient(app.proxyUrl, key).chat({
@@ -68,7 +72,8 @@ describe("aisix export: a conditional rate-limit policy on model and api_key lea
       });
       models[name] = m.id;
     }
-    const limitedKeyId = randomUUID();
+    limitedModelId = models[LIMITED_MODEL]!;
+    limitedKeyId = randomUUID();
     await seed.update("rate_limit_policies", randomUUID(), {
       name: "erlc-policy",
       conditions: [
@@ -106,7 +111,15 @@ describe("aisix export: a conditional rate-limit policy on model and api_key lea
   });
 
   test("the exported file loads and throttles what the etcd gateway throttles", { timeout: 60_000 }, async () => {
+    const doc = parseYaml(exported) as {
+      rate_limit_policies: Array<{ conditions: Array<{ dimension: string; value: unknown }> }>;
+    };
+    expect(doc.rate_limit_policies[0]!.conditions).toEqual([
+      expect.objectContaining({ dimension: "model", value: [limitedModelId] }),
+      expect.objectContaining({ dimension: "api_key", value: limitedKeyId }),
+    ]);
     fileApp = await spawnApp({ resourcesFile: exported });
+    expect(await droppedRows(fileApp)).toEqual({ rejected: [], unknown_kinds: [] });
     for (const app of [etcdApp!, fileApp]) {
       // `rpm` counts in a wall-clock minute; keep the pair inside one.
       await awaitWindowHeadroom(10);

@@ -70,3 +70,4 @@ export {
   signInMcpClient,
   whoami,
 } from "./mcp-oauth-client.js";
+export { droppedRows, fileId, keyHash } from "./resources-file.js";

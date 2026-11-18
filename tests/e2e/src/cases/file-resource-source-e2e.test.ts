@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import OpenAI, { APIError } from "openai";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  fileId,
   EtcdClient,
   ProxyClient,
   SeedClient,
@@ -18,76 +19,87 @@ import {
 } from "../harness/index.js";
 
 // E2E: the standalone file-based resource source (`resources_file`).
-// A single-container gateway loads provider keys / models / caller keys
-// from one resources.yaml — no etcd, no Admin API writes — and must be
-// observably identical to an etcd-backed gateway serving the same
-// logical resources.
+// A single-container gateway loads its resources from one resources.yaml —
+// no etcd, no Admin API writes. Each entry is an etcd document written
+// down: its `id` plus the document etcd would store, references by id. It
+// must be observably identical to an etcd-backed gateway serving the same
+// documents, including what happens to a document that does not load.
 //
 // Reference: OpenAI Chat Completions API spec
 // (https://platform.openai.com/docs/api-reference/chat/create) for the
 // proxy surface the cases drive.
-//
-// NOTE on env names: the caller-key plaintext travels to the gateway via
-// an environment variable (`key_env` sugar). The variable name must NOT
-// start with `AISIX_` — the binary's config loader treats that prefix as
-// config overrides (same reason the harness strips them).
 
 const execFileP = promisify(execFile);
 
 const CALLER_PLAINTEXT = "sk-file-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
-const CALLER_KEY_ENV = "FILE_E2E_CALLER_KEY";
+
+const PK = fileId("file-pk");
+const ALLOWED = fileId("file-allowed");
+const FORBIDDEN = fileId("file-forbidden");
+const UNSCOPED = fileId("file-unscoped");
+const NO_SECRETS = fileId("file-no-secrets");
+const MODEL_SCOPED = fileId("file-model-scoped");
 
 function fileModeResources(upstreamBase: string): string {
   return `
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: file-pk
+  - id: ${PK}
+    display_name: file-pk
     provider: openai
     api_key: sk-mock
     api_base: ${upstreamBase}/v1
 models:
-  - display_name: file-allowed
+  - id: ${ALLOWED}
+    display_name: file-allowed
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: file-pk
-  - display_name: file-forbidden
+    provider_key_id: ${PK}
+  - id: ${FORBIDDEN}
+    display_name: file-forbidden
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: file-pk
+    provider_key_id: ${PK}
   # Reachable by the caller, and deliberately NOT the model the scoped
   # guardrail names — the negative half of the scope assertion.
-  - display_name: file-unscoped
+  - id: ${UNSCOPED}
+    display_name: file-unscoped
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: file-pk
+    provider_key_id: ${PK}
 api_keys:
-  - display_name: file-caller
-    key_env: ${CALLER_KEY_ENV}
-    allowed_models: ["file-allowed", "file-unscoped"]
+  - id: ${fileId("file-caller")}
+    key_hash: ${CALLER_KEY_HASH}
+    allowed_model_ids: ["${ALLOWED}", "${UNSCOPED}"]
 guardrails:
-  - name: file-no-secrets
+  - id: ${NO_SECRETS}
+    name: file-no-secrets
     kind: keyword
     patterns:
       - kind: literal
         value: file-mode-forbidden-phrase
-  - name: file-model-scoped
+  - id: ${MODEL_SCOPED}
+    name: file-model-scoped
     kind: keyword
     patterns:
       - kind: literal
         value: file-mode-model-scoped-phrase
-  - name: file-unattached
+  - id: ${fileId("file-unattached")}
+    name: file-unattached
     kind: keyword
     patterns:
       - kind: literal
         value: file-mode-unattached-phrase
 guardrail_attachments:
-  - guardrail_id: file-no-secrets
+  - id: ${fileId("attach-env")}
+    guardrail_id: ${NO_SECRETS}
     scope_type: env
     priority: 100
-  - guardrail_id: file-model-scoped
+  - id: ${fileId("attach-model")}
+    guardrail_id: ${MODEL_SCOPED}
     scope_type: model
-    scope_id: file-allowed
+    scope_id: ${ALLOWED}
     priority: 100
 `;
 }
@@ -104,7 +116,6 @@ describe("file resource source: smoke + read-only admin surface", () => {
     app = await spawnApp({
       admin: true,
       resourcesFile: fileModeResources(upstream.baseUrl),
-      extraEnv: { [CALLER_KEY_ENV]: CALLER_PLAINTEXT },
     });
   });
 
@@ -179,14 +190,17 @@ describe("file resource source: smoke + read-only admin surface", () => {
     if (!app) throw new Error("setup failed");
     const auth = { authorization: `Bearer ${app.adminKey}` };
 
-    // GET list works and reflects the file.
+    // GET list works and reflects the file, each resource under the id
+    // its entry carries.
     const listRes = await fetch(`${app.adminUrl}/admin/v1/models`, { headers: auth });
     expect(listRes.status).toBe(200);
-    const listed = (await listRes.json()) as Array<{ value: { display_name: string } }>;
-    expect(listed.map((e) => e.value.display_name).sort()).toEqual([
-      "file-allowed",
-      "file-forbidden",
-      "file-unscoped",
+    const listed = (await listRes.json()) as Array<{ id: string; value: { display_name: string } }>;
+    expect(
+      listed.map((e) => [e.id, e.value.display_name]).sort((a, z) => a[1].localeCompare(z[1])),
+    ).toEqual([
+      [ALLOWED, "file-allowed"],
+      [FORBIDDEN, "file-forbidden"],
+      [UNSCOPED, "file-unscoped"],
     ]);
 
     // The write endpoints were removed: the routes serve GET only, so
@@ -241,10 +255,9 @@ describe("file resource source: smoke + read-only admin surface", () => {
   test("file-defined guardrail fires on matching input", async () => {
     if (!app || !upstream) throw new Error("setup failed");
     // A guardrail fires because an attachment says so — the file declares
-    // an env-scoped one alongside it, and the loader resolves the
-    // `guardrail_id` reference from the name to the derived id. There is no
-    // implicit scope any more (AISIX-Cloud#1450), so this pins both halves:
-    // the reference resolves, and the resolved attachment reaches the index.
+    // an env-scoped one alongside it, naming the guardrail by its id. There
+    // is no implicit scope (AISIX-Cloud#1450), so this pins both halves:
+    // the reference resolves, and the attachment reaches the index.
     const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     const hitsBefore = upstream.receivedRequests.length;
     const blocked = await proxy.chat({
@@ -263,12 +276,10 @@ describe("file resource source: smoke + read-only admin surface", () => {
     expect(clean.status).toBe(200);
   });
 
-  test("a model-scoped attachment resolves its target by name", async () => {
+  test("a model-scoped attachment resolves its target by id", async () => {
     if (!app || !upstream) throw new Error("setup failed");
-    // `scope_id: file-allowed` names the model the way the models
-    // collection keys it; the loader rewrites both references to derived
-    // ids, and the request must resolve to the same id for the scope to
-    // match. Nothing else in the pipeline proves that mapping end to end.
+    // `scope_id` is the model entry's id, and the request must resolve to
+    // that same id for the scope to match.
     const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     const hitsBefore = upstream.receivedRequests.length;
     const blocked = await proxy.chat({
@@ -328,23 +339,26 @@ describe("file resource source: differential vs etcd mode", () => {
     fileApp = await spawnApp({
       admin: true,
       resourcesFile: `
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: diff-pk
+  - id: ${fileId("diff-pk")}
+    display_name: diff-pk
     provider: openai
     api_key: sk-mock
     api_base: ${upstream.baseUrl}/v1
 models:
-  - display_name: diff-allowed
+  - id: ${fileId("diff-allowed")}
+    display_name: diff-allowed
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: diff-pk
-  - display_name: diff-forbidden
+    provider_key_id: ${fileId("diff-pk")}
+  - id: ${fileId("diff-forbidden")}
+    display_name: diff-forbidden
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: diff-pk
+    provider_key_id: ${fileId("diff-pk")}
 api_keys:
-  - display_name: diff-caller
+  - id: ${fileId("diff-caller")}
     key_hash: ${CALLER_KEY_HASH}
     allowed_models: ["diff-allowed"]
 `,
@@ -458,25 +472,27 @@ describe("file resource source: SIGHUP reload", () => {
   function reloadFile(upstreamBase: string, models: string[]): string {
     const blocks = models
       .map(
-        (name) => `  - display_name: ${name}
+        (name) => `  - id: ${fileId(name)}
+    display_name: ${name}
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: reload-pk`,
+    provider_key_id: ${fileId("reload-pk")}`,
       )
       .join("\n");
     return `
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: reload-pk
+  - id: ${fileId("reload-pk")}
+    display_name: reload-pk
     provider: openai
     api_key: sk-mock
     api_base: ${upstreamBase}/v1
 models:
 ${blocks}
 api_keys:
-  - display_name: reload-caller
+  - id: ${fileId("reload-caller")}
     key_hash: ${CALLER_KEY_HASH}
-    allowed_models: ["*"]
+    allow_all_models: true
 `;
   }
 
@@ -493,7 +509,17 @@ api_keys:
     await upstream?.close();
   });
 
-  test("valid edit applies on SIGHUP; invalid edit keeps last-good", async () => {
+  const statusConfig = async () => {
+    const res = await fetch(`${app!.metricsUrl}/status/config`);
+    expect(res.status).toBe(200);
+    return (await res.json()) as {
+      state: string;
+      applied: { apply_seq: number };
+      rejected: Array<{ resource_kind: string; resource_id: string; last_error_kind: string }>;
+    };
+  };
+
+  test("a SIGHUP applies an edit row by row, the way etcd applies writes", async () => {
     if (!app || !upstream || !app.resourcesPath) throw new Error("setup failed");
     const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     const modelIds = async () => {
@@ -521,60 +547,87 @@ api_keys:
     });
     expect(await modelIds()).toEqual(["reload-a", "reload-b"]);
 
-    // Invalid edit: reload-c appears alongside a broken entry. The
-    // whole reload must be rejected — nothing from the bad file applies
-    // (no partial pickup of reload-c), and the last-good snapshot keeps
-    // serving.
-    const broken = `${reloadFile(upstream.baseUrl, ["reload-a", "reload-b", "reload-c"])}
+    // An edit carrying one document that does not load: like a bad etcd
+    // write, that row is rejected and reported while every other row of the
+    // edit applies — reload-c is picked up beside it.
+    const brokenId = fileId("broken-entry");
+    const withBrokenRow = `${reloadFile(upstream.baseUrl, ["reload-a", "reload-b", "reload-c"])}
 guardrails:
-  - name: broken-entry
+  - id: ${brokenId}
+    name: broken-entry
     kind: no-such-guardrail-kind
 `;
-    const failuresBefore = (app.output().match(/reload failed/g) ?? []).length;
-    await writeFile(app.resourcesPath, broken, "utf8");
+    await writeFile(app.resourcesPath, withBrokenRow, "utf8");
     app.signal("SIGHUP");
-    // Deterministic wait: the gateway logs the aggregated reload
-    // failure; poll the captured output instead of sleeping.
-    await waitConfigPropagation(async () => {
-      return (app!.output().match(/reload failed/g) ?? []).length > failuresBefore;
-    });
+    await waitConfigPropagation(async () => (await statusConfig()).rejected.length > 0);
+    expect(await modelIds()).toEqual(["reload-a", "reload-b", "reload-c"]);
+    const status = await statusConfig();
+    expect(status.state).toBe("degraded");
+    expect(status.rejected).toEqual([
+      expect.objectContaining({
+        resource_kind: "guardrails",
+        resource_id: brokenId,
+        last_error_kind: "schema_failed",
+      }),
+    ]);
+  });
 
-    // Old models still serve; the new one from the rejected file is
-    // absent.
-    expect(await modelIds()).toEqual(["reload-a", "reload-b"]);
+  test("a file that cannot be read keeps the configuration that is serving", async () => {
+    if (!app || !upstream || !app.resourcesPath) throw new Error("setup failed");
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    // Apply a model this test owns first, so "still serving" below can only
+    // mean the configuration applied right before the failed reload.
+    await writeFile(app.resourcesPath, reloadFile(upstream.baseUrl, ["reload-a", "reload-d"]), "utf8");
+    app.signal("SIGHUP");
+    await waitConfigPropagation(async () => {
+      const r = await proxy.listModels();
+      expect(r.status).toBe(200);
+      return (r.body as { data: Array<{ id: string }> }).data.some((m) => m.id === "reload-d");
+    });
+    await writeFile(app.resourcesPath, "_format_version: \"2\"\nmodels: [\n", "utf8");
+    app.signal("SIGHUP");
+    // Handled once the status surface reports the file rejected as a whole.
+    await waitConfigPropagation(async () => (await statusConfig()).state === "out_of_sync");
     const stillServing = await proxy.chat({
-      model: "reload-a",
+      model: "reload-d",
       messages: [{ role: "user", content: "still-alive" }],
     });
     expect(stillServing.status).toBe(200);
-    const notPickedUp = await proxy.chat({
-      model: "reload-c",
-      messages: [{ role: "user", content: "must not exist" }],
-    });
-    expect(notPickedUp.status).toBe(404);
+
+    // Fixed and signalled again, the file applies — and a SIGHUP replaces
+    // the whole configuration, so a model the file no longer has is gone.
+    // Gated on the apply this reload publishes, not on what is asserted.
+    const seqBefore = (await statusConfig()).applied.apply_seq;
+    await writeFile(app.resourcesPath, reloadFile(upstream.baseUrl, ["reload-a"]), "utf8");
+    app.signal("SIGHUP");
+    await waitConfigPropagation(async () => (await statusConfig()).applied.apply_seq > seqBefore);
+    const res = await proxy.listModels();
+    expect((res.body as { data: Array<{ id: string }> }).data.map((m) => m.id)).toEqual([
+      "reload-a",
+    ]);
+    const status = await statusConfig();
+    expect(status.state).toBe("synced");
+    expect(status.rejected).toEqual([]);
   });
 });
 
-describe("file resource source: fail-fast boot", () => {
-  test("malformed file exits non-zero with the aggregated named errors on stderr", async () => {
+describe("file resource source: boot", () => {
+  test("a file that cannot be read as rows exits non-zero with every problem named", async () => {
     let caught: unknown;
     try {
       await spawnApp({
         admin: true,
         resourcesFile: `
-_format_version: "1"
+_format_version: "2"
 models:
-  - display_name: broken
-    provider: openai
-    provider_key: ghost-pk
+  - display_name: no-id
 api_keys:
-  - display_name: dup
+  - id: not-a-uuid
     key_hash: aa
-    allowed_models: ["nope"]
-  - display_name: dup
+  - id: ${fileId("dup")}
     key_hash: bb
-    allowed_models: []
-not_a_collection: []
+  - id: ${fileId("dup")}
+    key_hash: cc
 `,
       });
     } catch (e) {
@@ -584,12 +637,58 @@ not_a_collection: []
     const msg = (caught as Error).message;
     // Non-zero exit, not a readiness timeout.
     expect(msg).toContain("exited early with code=1");
-    // The aggregated report names every problem with its context.
-    expect(msg).toMatch(/4 error\(s\)/);
-    expect(msg).toContain("unknown top-level key `not_a_collection`");
-    expect(msg).toContain('duplicate api_keys entry');
-    expect(msg).toContain('unknown provider key "ghost-pk"');
-    expect(msg).toContain('unknown model "nope"');
+    expect(msg).toMatch(/3 error\(s\)/);
+    expect(msg).toContain("models[0]: `id` is required");
+    expect(msg).toContain('api_keys[0]: `id` must be a UUID string in lowercase hyphenated form');
+    expect(msg).toContain(`api_keys[2]: duplicate id "${fileId("dup")}"`);
+  }, 30_000);
+
+  test("a row the loader rejects does not stop the gateway", async () => {
+    const upstream = await startOpenAiUpstream();
+    try {
+      const app = await spawnApp({
+        resourcesFile: `
+_format_version: "2"
+provider_keys:
+  - id: ${fileId("boot-pk")}
+    display_name: boot-pk
+    provider: openai
+    api_key: sk-mock
+    api_base: ${upstream.baseUrl}/v1
+models:
+  - id: ${fileId("boot-model")}
+    display_name: boot-model
+    provider: openai
+    model_name: gpt-4o-mini
+    provider_key_id: ${fileId("boot-pk")}
+  - id: ${fileId("boot-broken")}
+    display_name: 42
+api_keys:
+  - id: ${fileId("boot-caller")}
+    key_hash: ${CALLER_KEY_HASH}
+    allow_all_models: true
+`,
+      });
+      try {
+        const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+        const r = await proxy.chat({
+          model: "boot-model",
+          messages: [{ role: "user", content: "hello" }],
+        });
+        expect(r.status).toBe(200);
+        const res = await fetch(`${app.metricsUrl}/status/config`);
+        const status = (await res.json()) as {
+          rejected: Array<{ resource_kind: string; resource_id: string }>;
+        };
+        expect(status.rejected).toEqual([
+          expect.objectContaining({ resource_kind: "models", resource_id: fileId("boot-broken") }),
+        ]);
+      } finally {
+        await app.exit();
+      }
+    } finally {
+      await upstream.close();
+    }
   }, 30_000);
 });
 
@@ -597,40 +696,50 @@ describe("file resource source: validate subcommand", () => {
   const BIN_PATH =
     process.env.AISIX_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "aisix");
 
-  test("valid file exits 0; invalid file exits 1 with the aggregated report on stderr", async () => {
+  test("valid file exits 0; a rejected row or a malformed file exits 1", async () => {
     const dir = await mkdtemp(join(tmpdir(), "aisix-validate-e2e-"));
     try {
+      const lines = [
+        '_format_version: "2"',
+        "provider_keys:",
+        `  - id: ${fileId("pk")}`,
+        "    display_name: pk",
+        "    api_key: sk-x",
+        "models:",
+        `  - id: ${fileId("m1")}`,
+        "    display_name: m1",
+        "    provider: openai",
+        "    model_name: gpt-4o",
+        `    provider_key_id: ${fileId("pk")}`,
+        "",
+      ];
       const good = join(dir, "good.yaml");
-      await writeFile(
-        good,
-        [
-          '_format_version: "1"',
-          "provider_keys:",
-          "  - display_name: pk",
-          "    api_key: sk-x",
-          "models:",
-          "  - display_name: m1",
-          "    provider: openai",
-          "    model_name: gpt-4o",
-          "    provider_key: pk",
-          "",
-        ].join("\n"),
-        "utf8",
-      );
+      await writeFile(good, lines.join("\n"), "utf8");
       const ok = await execFileP(BIN_PATH, ["validate", "--resources", good]);
       expect(ok.stdout).toContain("OK:");
 
-      const bad = join(dir, "bad.yaml");
-      await writeFile(bad, "models: []\n", "utf8");
-      let failure: (Error & { code?: number; stderr?: string }) | undefined;
-      try {
-        await execFileP(BIN_PATH, ["validate", "--resources", bad]);
-      } catch (e) {
-        failure = e as Error & { code?: number; stderr?: string };
-      }
-      if (!failure) throw new Error("expected `aisix validate` to exit non-zero");
-      expect(failure.code).toBe(1);
-      expect(String(failure.stderr)).toContain("missing mandatory _format_version");
+      const failure = async (contents: string) => {
+        const path = join(dir, "bad.yaml");
+        await writeFile(path, contents, "utf8");
+        try {
+          await execFileP(BIN_PATH, ["validate", "--resources", path]);
+        } catch (e) {
+          return e as Error & { code?: number; stderr?: string };
+        }
+        throw new Error("expected `aisix validate` to exit non-zero");
+      };
+
+      const rejected = await failure(
+        [...lines, `  - id: ${fileId("m2")}`, "    display_name: 42", ""].join("\n"),
+      );
+      expect(rejected.code).toBe(1);
+      expect(String(rejected.stderr)).toContain(
+        `/aisix/models/${fileId("m2")} (schema_failed)`,
+      );
+
+      const malformed = await failure("models: []\n");
+      expect(malformed.code).toBe(1);
+      expect(String(malformed.stderr)).toContain("missing mandatory _format_version");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

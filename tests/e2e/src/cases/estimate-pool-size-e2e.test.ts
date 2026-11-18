@@ -3,7 +3,7 @@ import type { AddressInfo } from "node:net";
 import { availableParallelism } from "node:os";
 import { readdir, readFile } from "node:fs/promises";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { spawnApp, type SpawnedApp } from "../harness/index.js";
+import { keyHash, fileId, spawnApp, type SpawnedApp } from "../harness/index.js";
 
 // E2E: `proxy.workers` sizes the gateway's token-estimate pool. Each pool
 // thread holds its own tokenizer copies, so the worker count is what lets an
@@ -13,7 +13,6 @@ import { spawnApp, type SpawnedApp } from "../harness/index.js";
 // an upper bound on what the gateway can see, so the two counts differ.
 
 const CALLER_PLAINTEXT = "sk-estimate-pool-size";
-const CALLER_KEY_ENV = "ESTIMATE_POOL_SIZE_CALLER_KEY";
 const MODEL = "estimate-pool-size";
 const WORKERS = availableParallelism() + 1;
 
@@ -57,23 +56,26 @@ beforeAll(async () => {
   const port = (upstream.address() as AddressInfo).port;
   app = await spawnApp({
     resourcesFile: `
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: estimate-pool-size-pk
+  - id: ${fileId(`provider_keys/estimate-pool-size-pk`)}
+    display_name: estimate-pool-size-pk
     provider: openai
     api_key: sk-mock
     api_base: http://127.0.0.1:${port}/v1
 models:
-  - display_name: ${MODEL}
+  - id: ${fileId(`models/${MODEL}`)}
+    display_name: ${MODEL}
     provider: openai
     model_name: gpt-4o
-    provider_key: estimate-pool-size-pk
+    provider_key_id: ${fileId(`provider_keys/estimate-pool-size-pk`)}
 api_keys:
-  - display_name: estimate-pool-size-caller
-    key_env: ${CALLER_KEY_ENV}
+  - id: ${fileId(`api_keys/estimate-pool-size-caller`)}
+    display_name: estimate-pool-size-caller
+    key_hash: ${keyHash(CALLER_PLAINTEXT)}
     allowed_models: ["${MODEL}"]
 `,
-    extraEnv: { [CALLER_KEY_ENV]: CALLER_PLAINTEXT, AISIX_PROXY__WORKERS: String(WORKERS) },
+    extraEnv: { AISIX_PROXY__WORKERS: String(WORKERS) },
   });
 });
 
