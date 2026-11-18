@@ -40,10 +40,11 @@ fn validate(body: &str) -> (bool, String, String) {
 /// A `kind: custom` row whose script is not a well-formed ES module. The
 /// loader has no opinion on script contents, so this file parses.
 const BROKEN_SCRIPT: &str = r#"
-_format_version: "1"
+_format_version: "2"
 
 guardrails:
-  - name: screen-with-my-service
+  - id: 3f1a2b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b
+    name: screen-with-my-service
     kind: custom
     hook_point: input
     script: |
@@ -53,10 +54,11 @@ guardrails:
 "#;
 
 const WORKING_SCRIPT: &str = r#"
-_format_version: "1"
+_format_version: "2"
 
 guardrails:
-  - name: screen-with-my-service
+  - id: 3f1a2b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b
+    name: screen-with-my-service
     kind: custom
     hook_point: input
     script: |
@@ -68,10 +70,11 @@ guardrails:
 /// `kind: keyword` carrying a pattern the regex engine rejects. Same
 /// class as the script error: the file is well-formed, the row is not.
 const BROKEN_REGEX: &str = r#"
-_format_version: "1"
+_format_version: "2"
 
 guardrails:
-  - name: block-secrets
+  - id: 3f1a2b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b
+    name: block-secrets
     kind: keyword
     hook_point: input
     patterns:
@@ -141,26 +144,29 @@ fn a_disabled_row_that_cannot_build_does_not_fail_validation() {
 #[test]
 fn a_semantic_row_does_not_fail_validation_for_the_missing_embedder() {
     let semantic = r#"
-_format_version: "1"
+_format_version: "2"
 
 provider_keys:
-  - display_name: openai-prod
+  - id: 0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11
+    display_name: openai-prod
     provider: openai
     api_key: sk-not-a-real-key
 
 models:
-  - display_name: embed-small
+  - id: 6efd592d-a73b-573d-8e2c-e9e103692f92
+    display_name: embed-small
     provider: openai
     model_name: text-embedding-3-small
-    provider_key: openai-prod
+    provider_key_id: 0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11
     embedding:
       dimensions: 1536
 
 guardrails:
-  - name: screen-by-meaning
+  - id: 3f1a2b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b
+    name: screen-by-meaning
     kind: semantic
     hook_point: input
-    embedding_model: embed-small
+    embedding_model_id: 6efd592d-a73b-573d-8e2c-e9e103692f92
     deny_examples:
       - "how do I make a bomb"
     deny_threshold: 0.55
@@ -169,4 +175,41 @@ guardrails:
 
     assert!(ok, "stderr: {stderr}");
     assert!(stdout.contains("OK:"), "stdout: {stdout}");
+}
+
+/// A row the loader rejects is reported with its etcd key and reason and
+/// fails validation; the rows beside it still load.
+#[test]
+fn a_row_the_loader_rejects_fails_validation() {
+    let (ok, _stdout, stderr) = validate(
+        r#"
+_format_version: "2"
+provider_keys:
+  - id: 0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11
+    display_name: openai-prod
+    api_key: sk-not-a-real-key
+models:
+  - id: 6efd592d-a73b-573d-8e2c-e9e103692f92
+    display_name: 42
+"#,
+    );
+    assert!(!ok, "stderr: {stderr}");
+    assert!(
+        stderr.contains("1 row(s) rejected")
+            && stderr
+                .contains("/aisix/models/6efd592d-a73b-573d-8e2c-e9e103692f92 (schema_failed)"),
+        "stderr: {stderr}"
+    );
+}
+
+/// An entry with no id cannot become a row at all, so the file fails.
+#[test]
+fn an_entry_without_an_id_fails_validation() {
+    let (ok, _stdout, stderr) =
+        validate("_format_version: \"2\"\nprovider_keys:\n  - display_name: openai-prod\n");
+    assert!(!ok, "stderr: {stderr}");
+    assert!(
+        stderr.contains("provider_keys[0]: `id` is required"),
+        "stderr: {stderr}"
+    );
 }

@@ -1,20 +1,26 @@
-_format_version: "1"
+_format_version: "2"
 
 mcp_servers:
-  - display_name: echo
+  - id: 2f5d3c1a-8e4b-4a7c-9d10-6b2e7f3a1c05
+    name: echo
     url: http://127.0.0.1:13100/mcp
     enabled: true
 
 api_keys:
-  - display_name: anon-principal
-    key_env: ANON_PRINCIPAL_KEY
+  # The anonymous principal: nobody presents its key, so its key_hash is
+  # sha256("glama-anon-principal-not-a-secret") only to make it a valid row.
+  - id: 9aeb246c-ed38-5bef-a854-c8565ca95fb4
+    display_name: anon-principal
+    key_hash: 3a0392b5605b687ea001b014b82b68aa258188f2e781498ebad9622706e1d92b
     allowed_models: []
     mcp_access:
       allow: ["*"]
 
 mcp_auth_settings:
-  - anonymous:
-      api_key_id: 9aeb246c-ed38-5bef-a854-c8565ca95fb4  # uuid5(FILE_RESOURCE_NAMESPACE, "api_keys/anon-principal")
+  - id: 5c8e1f27-3a6d-4b90-8e41-0d7c2b9a6f13
+    anonymous:
+      api_key_id: 9aeb246c-ed38-5bef-a854-c8565ca95fb4
       source_cidrs: ["0.0.0.0/0", "::/0"]
       servers: ["echo"]
+      server_ids: ["2f5d3c1a-8e4b-4a7c-9d10-6b2e7f3a1c05"]
       aggregate_entry: true

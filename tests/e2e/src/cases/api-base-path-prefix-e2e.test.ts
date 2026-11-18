@@ -2,6 +2,8 @@ import { WebSocket } from "undici";
 import { WebSocketServer, type WebSocket as WsSocket } from "ws";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  keyHash,
+  fileId,
   spawnApp,
   startOpenAiUpstream,
   type OpenAiUpstream,
@@ -27,7 +29,6 @@ import {
 // gateway failing after a correct dispatch.
 
 const CALLER_PLAINTEXT = "sk-apibase-e2e-caller";
-const CALLER_KEY_ENV = "APIBASE_E2E_CALLER_KEY";
 
 /** `/v2` — the reported Qianfan shape; also stands in for every other
  *  vendor whose OpenAI-compatible root is not `/v1`. */
@@ -37,57 +38,68 @@ function resources(
   videosBase: string,
 ): string {
   return `
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: pk-v2-root
+  - id: ${fileId(`provider_keys/pk-v2-root`)}
+    display_name: pk-v2-root
     provider: openai
     adapter: openai
     api_key: sk-mock
     api_base: ${upstreamBase}/v2
-  - display_name: pk-bare-host
+  - id: ${fileId(`provider_keys/pk-bare-host`)}
+    display_name: pk-bare-host
     provider: openai
     adapter: openai
     api_key: sk-mock
     api_base: ${upstreamBase}
-  - display_name: pk-anthropic-mounted
+  - id: ${fileId(`provider_keys/pk-anthropic-mounted`)}
+    display_name: pk-anthropic-mounted
     provider: anthropic
     adapter: anthropic
     api_key: sk-mock
     api_base: ${upstreamBase}/anthropic
-  - display_name: pk-realtime-v2-root
+  - id: ${fileId(`provider_keys/pk-realtime-v2-root`)}
+    display_name: pk-realtime-v2-root
     provider: openai
     adapter: openai
     api_key: sk-upstream-realtime
     api_base: ${realtimeBase}/v2
-  - display_name: pk-videos-v2-root
+  - id: ${fileId(`provider_keys/pk-videos-v2-root`)}
+    display_name: pk-videos-v2-root
     provider: openai
     adapter: openai
     api_key: sk-mock
     api_base: ${videosBase}/v2
 models:
-  - display_name: m-v2-root
+  - id: ${fileId(`models/m-v2-root`)}
+    display_name: m-v2-root
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: pk-v2-root
-  - display_name: m-bare-host
+    provider_key_id: ${fileId(`provider_keys/pk-v2-root`)}
+  - id: ${fileId(`models/m-bare-host`)}
+    display_name: m-bare-host
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: pk-bare-host
-  - display_name: m-anthropic-mounted
+    provider_key_id: ${fileId(`provider_keys/pk-bare-host`)}
+  - id: ${fileId(`models/m-anthropic-mounted`)}
+    display_name: m-anthropic-mounted
     provider: anthropic
     model_name: claude-3-5-sonnet
-    provider_key: pk-anthropic-mounted
-  - display_name: m-realtime-v2-root
+    provider_key_id: ${fileId(`provider_keys/pk-anthropic-mounted`)}
+  - id: ${fileId(`models/m-realtime-v2-root`)}
+    display_name: m-realtime-v2-root
     provider: openai
     model_name: gpt-realtime-mock
-    provider_key: pk-realtime-v2-root
-  - display_name: m-videos-v2-root
+    provider_key_id: ${fileId(`provider_keys/pk-realtime-v2-root`)}
+  - id: ${fileId(`models/m-videos-v2-root`)}
+    display_name: m-videos-v2-root
     provider: openai
     model_name: sora-2
-    provider_key: pk-videos-v2-root
+    provider_key_id: ${fileId(`provider_keys/pk-videos-v2-root`)}
 api_keys:
-  - display_name: apibase-caller
-    key_env: ${CALLER_KEY_ENV}
+  - id: ${fileId(`api_keys/apibase-caller`)}
+    display_name: apibase-caller
+    key_hash: ${keyHash(CALLER_PLAINTEXT)}
     allowed_models:
       [
         "m-v2-root",
@@ -178,7 +190,6 @@ describe("api_base path prefix is preserved on every endpoint", () => {
         realtime.baseUrl,
         videosUpstream.baseUrl,
       ),
-      extraEnv: { [CALLER_KEY_ENV]: CALLER_PLAINTEXT },
     });
   });
 

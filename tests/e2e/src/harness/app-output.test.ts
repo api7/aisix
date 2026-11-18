@@ -30,7 +30,7 @@ test("startup assertions retain an error between long logs and a backtrace", asy
     writeFileSync(2, "backtrace frame\\n".repeat(300));
     process.exit(1);
   `);
-  await expect(spawnApp({ resourcesFile: '_format_version: "1"\n' })).rejects.toThrow(/unsupported variable.*request_id/);
+  await expect(spawnApp({ resourcesFile: '_format_version: "2"\n' })).rejects.toThrow(/unsupported variable.*request_id/);
 });
 
 test("startup failure includes output drained after the child exits", async () => {
@@ -41,7 +41,7 @@ test("startup failure includes output drained after the child exits", async () =
     }).unref();
     process.exit(1);
   `);
-  await expect(spawnApp({ resourcesFile: '_format_version: "1"\n' })).rejects.toThrow("final startup diagnostic");
+  await expect(spawnApp({ resourcesFile: '_format_version: "2"\n' })).rejects.toThrow("final startup diagnostic");
 });
 
 test("a real gateway startup error survives surrounding output", async () => {
@@ -58,7 +58,7 @@ test("a real gateway startup error survives surrounding output", async () => {
     writeFileSync(2, "shutdown diagnostic\\n".repeat(300));
     process.exit(result.status ?? 2);
   `);
-  await expect(spawnApp({ resourcesFile: '_format_version: "1"\n', extraEnv: {
+  await expect(spawnApp({ resourcesFile: '_format_version: "2"\n', extraEnv: {
     AISIX_OBSERVABILITY__METRICS__LABELS: JSON.stringify({ aisix_request_ttft_seconds: ["request_id"] }),
   } })).rejects.toThrow(/unsupported variable.*request_id/);
 });

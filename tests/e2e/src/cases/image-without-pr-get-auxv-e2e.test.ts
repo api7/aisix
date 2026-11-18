@@ -108,7 +108,7 @@ describe.skipIf(!hasDocker || process.platform !== "linux")("image default start
       ].join("\n"),
     );
     const resources = join(dir, "resources.yaml");
-    await writeFile(resources, '_format_version: "1"\n');
+    await writeFile(resources, '_format_version: "2"\n');
 
     await docker(
       "run",

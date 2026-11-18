@@ -407,7 +407,7 @@ jobs:
           docker pull "$IMAGE"
           test "$(docker inspect --format '{{.Config.User}}' "$IMAGE")" = "10001"
           mkdir -p /tmp/uid-smoke
-          printf '_format_version: "1"\n' > /tmp/uid-smoke/resources.yaml
+          printf '_format_version: "2"\n' > /tmp/uid-smoke/resources.yaml
           cat > /tmp/uid-smoke/config.yaml <<'EOF'
           resources_file: /etc/aisix/resources.yaml
           proxy:

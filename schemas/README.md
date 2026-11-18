@@ -37,13 +37,13 @@ while the etcd prefix groups a collection of instances.
 
 ## Strictness: these files describe the write contract
 
-The published schemas carry the **write contract** for self-managed
-declarative writes: `aisix validate --resources` checks a file offline,
-and the `resources_file` source enforces the same shape at boot and
-SIGHUP. A payload that fails them — including unknown fields, where a
-resource closes them — is rejected on those paths. They are generated
-from the same producers the in-repo strict validators compile, so the
-published files and the gateway's own validators cannot drift.
+The published schemas carry the **write contract**: what a writer of
+resource documents — the control plane, or anyone writing etcd or a
+resources file by hand — should produce. They are generated from the same
+producers the in-repo strict validators compile, so the published files
+and the gateway's own validators cannot drift. The gateway itself reads
+every document, from etcd and from a `resources_file` alike, against the
+lenient schemas in `resources-lenient/`.
 
 Four top-level resources intentionally **omit**
 `additionalProperties: false` even on the write contract (the list is
@@ -69,14 +69,17 @@ etcd, and a **raw direct etcd put gets no synchronous validation** —
 the document is only checked on read, by the lenient loader below.
 Validate documents before putting them.
 
-The gateway's **etcd read path is deliberately more lenient** (#871): a
+The gateway's **read path — etcd, and a `resources_file`, which goes
+through the same loader — is deliberately more lenient** (#871): a
 stored document carrying fields outside these schemas still loads, with
 the unknown fields ignored and reported as partially compatible on
-`GET /status/config`, the heartbeat, and the
-`aisix_config_partially_compatible_resources` metric. This keeps an
-older gateway serving documents written by a newer control plane. Every
-other constraint in these files — types, required fields, ranges, closed
-enum value sets — applies on both paths.
+`GET /status/config` and the `aisix_config_partially_compatible_resources`
+metric (and, for a gateway connected to a control plane, the heartbeat). This keeps an
+older gateway serving documents written by a newer control plane. Types,
+required fields, ranges and closed enum value sets apply on the read path
+too, except for the write-only checks `resources-lenient/` relaxes (an
+empty `effort_mapping` value, for one) — diff the two sets for the exact
+difference. `aisix validate --resources` checks the read contract.
 
 That read contract is published too, as `resources-lenient/` — see below.
 

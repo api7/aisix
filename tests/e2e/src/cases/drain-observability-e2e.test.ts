@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  keyHash,
+  fileId,
   spawnApp,
   startOpenAiUpstream,
   type OpenAiUpstream,
@@ -19,7 +21,6 @@ import {
 // minted here, so nothing upstream of the gateway knows it.
 
 const CALLER_PLAINTEXT = "sk-drain-obs-caller";
-const CALLER_KEY_ENV = "DRAIN_OBS_CALLER_KEY";
 
 /** Short, so the in-flight wait is reached while the requests still run. */
 const DRAIN_WINDOW_SECS = 2;
@@ -32,20 +33,23 @@ const SLOW_UPSTREAM_MS = 14_000;
 
 function resources(upstreamBase: string): string {
   return `
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: drain-obs-pk
+  - id: ${fileId(`provider_keys/drain-obs-pk`)}
+    display_name: drain-obs-pk
     provider: openai
     api_key: sk-mock
     api_base: ${upstreamBase}/v1
 models:
-  - display_name: drain-obs
+  - id: ${fileId(`models/drain-obs`)}
+    display_name: drain-obs
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: drain-obs-pk
+    provider_key_id: ${fileId(`provider_keys/drain-obs-pk`)}
 api_keys:
-  - display_name: drain-obs-caller
-    key_env: ${CALLER_KEY_ENV}
+  - id: ${fileId(`api_keys/drain-obs-caller`)}
+    display_name: drain-obs-caller
+    key_hash: ${keyHash(CALLER_PLAINTEXT)}
     allowed_models: ["drain-obs"]
 `;
 }
@@ -101,7 +105,6 @@ describe("access log carries the downstream connection identity", () => {
       // The fields under test are reported at INFO; the suite default is WARN.
       logLevel: "info",
       resourcesFile: resources(upstream.baseUrl),
-      extraEnv: { [CALLER_KEY_ENV]: CALLER_PLAINTEXT },
     });
   });
 
@@ -201,7 +204,6 @@ describe("the drain reports what is still arriving and what is still open", () =
     app = await spawnApp({
       logLevel: "info",
       resourcesFile: resources(upstream.baseUrl),
-      extraEnv: { [CALLER_KEY_ENV]: CALLER_PLAINTEXT },
       extra: { shutdown: { min_drain_secs: DRAIN_WINDOW_SECS } },
     });
   });

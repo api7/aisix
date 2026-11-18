@@ -4,8 +4,8 @@
 //! `YamlLoader` the file source parses with — so the output is guaranteed
 //! to re-parse to an equivalent tree. In particular the emitter quotes
 //! scalars that would otherwise change type (the mandatory
-//! `_format_version: "1"` re-parses as the string `"1"`, not the integer
-//! `1`), and quotes the `${VAR}` secret placeholders as needed.
+//! `_format_version: "2"` re-parses as the string `"2"`, not the integer
+//! `2`), and quotes the `${VAR}` secret placeholders as needed.
 //!
 //! The top-level mapping is built directly so the header sits first and
 //! collections follow in the file's fixed kind order; per-entry field
@@ -17,8 +17,7 @@ use yaml_rust2::{Yaml, YamlEmitter};
 
 use super::document::ExportDocument;
 
-/// The mandatory format-version header value, emitted as a quoted string.
-const FORMAT_VERSION: &str = "1";
+use aisix_etcd::file_source::FORMAT_VERSION;
 
 /// Serialize the document to a resources-file YAML string.
 pub fn emit_yaml(document: &ExportDocument) -> Result<String, String> {
@@ -79,7 +78,6 @@ mod tests {
             collections,
             secret_placeholders: Vec::new(),
             warnings: Vec::new(),
-            blocking: Vec::new(),
         }
     }
 
@@ -88,11 +86,11 @@ mod tests {
         let yaml = emit_yaml(&doc_with(vec![])).unwrap();
         let docs = YamlLoader::load_from_str(&yaml).unwrap();
         assert_eq!(docs.len(), 1, "must be a single document");
-        // The loader keys off `Yaml::String("1")`; an unquoted `1` would
+        // The loader keys off `Yaml::String("2")`; an unquoted `2` would
         // parse as an integer and be rejected.
         assert_eq!(
             docs[0]["_format_version"],
-            Yaml::String("1".into()),
+            Yaml::String("2".into()),
             "emitted:\n{yaml}"
         );
     }
@@ -124,7 +122,7 @@ mod tests {
             vec![json!({
                 "name": "cap",
                 "scope": "model",
-                "scope_ref": "gpt-4o",
+                "scope_ref": "6efd592d-a73b-573d-8e2c-e9e103692f92",
                 "window": "minute",
                 "max_requests": 300,
                 "enabled": true
@@ -135,7 +133,10 @@ mod tests {
         let p = &docs[0]["rate_limit_policies"][0];
         // Integer stays an integer; string stays a string; bool a bool.
         assert_eq!(p["max_requests"], Yaml::Integer(300));
-        assert_eq!(p["scope_ref"], Yaml::String("gpt-4o".into()));
+        assert_eq!(
+            p["scope_ref"],
+            Yaml::String("6efd592d-a73b-573d-8e2c-e9e103692f92".into())
+        );
         assert_eq!(p["enabled"], Yaml::Boolean(true));
     }
 
@@ -148,7 +149,7 @@ mod tests {
             ),
             (
                 "models",
-                vec![json!({"display_name": "m", "provider_key": "pk"})],
+                vec![json!({"display_name": "m", "provider_key_id": "pk"})],
             ),
         ]))
         .unwrap();

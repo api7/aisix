@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  fileId,
   ProxyClient,
   spawnApp,
   startOpenAiUpstream,
@@ -28,21 +29,24 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 function smokeResources(upstreamBase: string): string {
   return `
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: smoke-openai
+  - id: ${fileId(`provider_keys/smoke-openai`)}
+    display_name: smoke-openai
     provider: openai
     api_key: sk-mock
     # The OpenAI bridge appends \`/chat/completions\`, so the api_base
     # already needs the \`/v1\` segment to land on \`/v1/chat/completions\`.
     api_base: ${upstreamBase}/v1
 models:
-  - display_name: smoke-gpt
+  - id: ${fileId(`models/smoke-gpt`)}
+    display_name: smoke-gpt
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: smoke-openai
+    provider_key_id: ${fileId(`provider_keys/smoke-openai`)}
 api_keys:
-  - display_name: smoke-caller
+  - id: ${fileId(`api_keys/smoke-caller`)}
+    display_name: smoke-caller
     key_hash: ${CALLER_KEY_HASH}
     allowed_models: ["smoke-gpt"]
 `;
