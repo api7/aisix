@@ -636,7 +636,7 @@ api_keys:
     allowed_models: []
 mcp_auth_settings:
   - anonymous:
-      api_key_id: k
+      api_key: k
       source_cidrs: ["10.0.0.0/8"]
       servers: ["github"]
 "#;
@@ -1248,6 +1248,163 @@ mcp_auth_settings:
         entry.value.resource_url.as_deref(),
         Some("https://gw.example.com/mcp")
     );
+}
+
+/// The anonymous principal is named by the api key's display name and
+/// resolves to the id the file derives for that key. A directly written
+/// `api_key_id` loads only when it is that derived id: a control-plane id
+/// would bind anonymous callers to no key at all.
+#[test]
+fn the_anonymous_principal_is_named_by_api_key_or_by_its_derived_id() {
+    let file = |principal: &str| {
+        format!(
+            r#"
+_format_version: "1"
+mcp_servers:
+  - name: docs
+    url: https://example.test/mcp
+api_keys:
+  - display_name: anon
+    key_env: CALLER_KEY
+    allowed_models: []
+mcp_auth_settings:
+  - anonymous:
+{principal}
+      source_cidrs: ["10.0.0.0/8"]
+      servers: ["docs"]
+"#
+        )
+    };
+    let env = env_of(&[("CALLER_KEY", "sk-caller")]);
+    let derived = derive_id("api_keys", "anon");
+
+    for loads in [
+        "      api_key: anon".to_string(),
+        format!("      api_key_id: {derived}"),
+    ] {
+        let snapshot = load(&file(&loads), &env).expect(&loads);
+        let entry = snapshot.mcp_auth_settings.entries().pop().unwrap();
+        assert_eq!(entry.value.anonymous.as_ref().unwrap().api_key_id, derived);
+    }
+
+    let errs = errors_of(load(&file("      api_key: ghost"), &env));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("`anonymous.api_key` references unknown api key \"ghost\"")
+            && errs[0].contains("anon"),
+        "{errs:?}"
+    );
+
+    let errs = errors_of(load(
+        &file("      api_key_id: 3761ebd7-6405-44c6-8777-28012af7693b"),
+        &env,
+    ));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains(
+            "anonymous.api_key_id \"3761ebd7-6405-44c6-8777-28012af7693b\" does not match"
+        ) && errs[0].contains("`anonymous.api_key`"),
+        "{errs:?}"
+    );
+
+    let errs = errors_of(load(
+        &file(&format!("      api_key: anon\n      api_key_id: {derived}")),
+        &env,
+    ));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].contains("mutually exclusive"), "{errs:?}");
+}
+
+/// A passthrough route names its anonymous principal and its injected
+/// provider key by display name, or by the derived id the file gives that
+/// entry. Any other id would load and then fail every request on the route.
+#[test]
+fn passthrough_route_key_ids_must_be_derived_ids() {
+    let file = |anonymous: &str, provider: &str| {
+        format!(
+            r#"
+_format_version: "1"
+provider_keys:
+  - display_name: up
+    provider: openai
+    api_key: sk-upstream
+api_keys:
+  - display_name: anon
+    key_env: CALLER_KEY
+    allowed_models: []
+passthrough_routes:
+  - name: open
+    path_prefix: /passthrough/open
+    target_url: https://upstream.test
+    auth_mode: anonymous
+{anonymous}
+    source_cidrs: ["10.0.0.0/8"]
+    credential_mode: inject
+{provider}
+"#
+        )
+    };
+    let env = env_of(&[("CALLER_KEY", "sk-caller")]);
+    let anon_id = derive_id("api_keys", "anon");
+    let pk_id = derive_id("provider_keys", "up");
+
+    for (anonymous, provider) in [
+        (
+            "    anonymous_key: anon".to_string(),
+            "    provider_key: up".to_string(),
+        ),
+        (
+            format!("    anonymous_key_id: {anon_id}"),
+            format!("    provider_key_id: {pk_id}"),
+        ),
+    ] {
+        let snapshot = load(&file(&anonymous, &provider), &env).expect(&anonymous);
+        let entry = snapshot.passthrough_routes.entries().pop().unwrap();
+        let route = &entry.value;
+        assert_eq!(route.anonymous_key_id.as_deref(), Some(anon_id.as_str()));
+        assert_eq!(route.provider_key_id.as_deref(), Some(pk_id.as_str()));
+    }
+
+    let stray = "3761ebd7-6405-44c6-8777-28012af7693b";
+    let errs = errors_of(load(
+        &file(
+            &format!("    anonymous_key_id: {stray}"),
+            "    provider_key: up",
+        ),
+        &env,
+    ));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains(&format!(
+            "anonymous_key_id \"{stray}\" does not match any api key"
+        )) && errs[0].contains("`anonymous_key`"),
+        "{errs:?}"
+    );
+
+    let errs = errors_of(load(
+        &file(
+            "    anonymous_key: anon",
+            &format!("    provider_key_id: {stray}"),
+        ),
+        &env,
+    ));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains(&format!(
+            "provider_key_id \"{stray}\" does not match any provider key"
+        )) && errs[0].contains("`provider_key`"),
+        "{errs:?}"
+    );
+
+    let errs = errors_of(load(
+        &file(
+            &format!("    anonymous_key: anon\n    anonymous_key_id: {anon_id}"),
+            "    provider_key: up",
+        ),
+        &env,
+    ));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].contains("mutually exclusive"), "{errs:?}");
 }
 
 #[test]

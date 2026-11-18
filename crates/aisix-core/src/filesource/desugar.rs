@@ -18,6 +18,9 @@
 //!   value is the plaintext caller key; hashed to `key_hash` (SHA-256,
 //!   lowercase hex — [`crate::models::ApiKey::hash_bearer`]) and then
 //!   dropped. Exactly one of `key_env` / `key_hash` must be present.
+//! - `mcp_auth_settings[].anonymous.api_key` — an api-key *name*,
+//!   resolved to the derived `api_key_id`. Mutually exclusive with an
+//!   explicit `api_key_id`, which must equal a key's derived id.
 //! - `rate_limit_policies[].scope_ref` — for `scope: api_key` /
 //!   `scope: model`, a *name* resolved to the referenced entry's derived
 //!   id; other scopes pass through verbatim.
@@ -270,34 +273,43 @@ pub(crate) fn desugar_passthrough_route(
 /// `claim_mappings[].resolve.api_key` (name) → `resolve.api_key_id`
 /// (derived id).
 pub(crate) fn desugar_claim_mapping(doc: &mut Value, maps: &IdentityMaps) -> Result<(), String> {
-    let Some(resolve) = doc.get_mut("resolve").and_then(Value::as_object_mut) else {
-        return Ok(()); // missing / mistyped resolve: canonical validation reports it
+    desugar_api_key_ref(doc, "resolve", maps)
+}
+
+/// `mcp_auth_settings[].anonymous.api_key` (name) → `anonymous.api_key_id`
+/// (derived id).
+pub(crate) fn desugar_mcp_auth_settings(
+    doc: &mut Value,
+    maps: &IdentityMaps,
+) -> Result<(), String> {
+    desugar_api_key_ref(doc, "anonymous", maps)
+}
+
+/// `<parent>.api_key` (an api key display name) → `<parent>.api_key_id`.
+/// A directly written `api_key_id` passes through; the loader checks that
+/// it is a derived id after validation.
+fn desugar_api_key_ref(doc: &mut Value, parent: &str, maps: &IdentityMaps) -> Result<(), String> {
+    let Some(obj) = doc.get_mut(parent).and_then(Value::as_object_mut) else {
+        return Ok(()); // missing / mistyped parent: canonical validation reports it
     };
-    let Some(name_value) = resolve.get("api_key") else {
+    let Some(name_value) = obj.get("api_key") else {
         return Ok(());
     };
     let Some(name) = name_value.as_str() else {
-        return Err("`resolve.api_key` must be a string (an api key display_name)".into());
+        return Err(format!(
+            "`{parent}.api_key` must be a string (an api key display_name)"
+        ));
     };
-    if resolve.contains_key("api_key_id") {
-        return Err(
-            "`resolve.api_key` (a name reference) and `resolve.api_key_id` are mutually \
+    if obj.contains_key("api_key_id") {
+        return Err(format!(
+            "`{parent}.api_key` (a name reference) and `{parent}.api_key_id` are mutually \
              exclusive — set exactly one"
-                .into(),
-        );
+        ));
     }
-    let resolved = maps
-        .get("api_keys")
-        .and_then(|m| m.get(name))
-        .cloned()
-        .ok_or_else(|| {
-            format!(
-                "`resolve.api_key` references unknown api key {name:?} ({})",
-                known_names(maps, "api_keys")
-            )
-        })?;
-    resolve.remove("api_key");
-    resolve.insert("api_key_id".into(), Value::String(resolved));
+    let field = format!("`{parent}.api_key`");
+    let resolved = resolve_entity_name(maps, "api_keys", "api key", name, &field)?;
+    obj.remove("api_key");
+    obj.insert("api_key_id".into(), Value::String(resolved));
     Ok(())
 }
 

@@ -1478,29 +1478,98 @@ fn a_star_named_server_on_the_deny_side_blocks_the_export() {
     assert_eq!(keys[0]["mcp_access"]["deny"], json!([]));
 }
 
-/// The anonymous ceiling with `server_ids` set: one anonymous block,
-/// registered servers as named.
-fn anonymous_settings(anonymous: Value) -> ResourceEntry<aisix_core::models::McpAuthSettings> {
-    ResourceEntry::new(
+/// One anonymous block, plus the `k-uuid-1` api key it binds unless the
+/// test names another principal.
+fn insert_anonymous_settings(snap: &AisixSnapshot, anonymous: Value) {
+    snap.apikeys.insert(ResourceEntry::new(
+        "k-uuid-1",
+        serde_json::from_value(json!({
+            "key_hash": "ab".repeat(32),
+            "allowed_models": [],
+            "mcp_access": {"allow": ["docs__*"]}
+        }))
+        .unwrap(),
+        1,
+    ));
+    snap.mcp_auth_settings.insert(ResourceEntry::new(
         "env-uuid-1",
         serde_json::from_value(json!({ "anonymous": anonymous })).unwrap(),
         1,
-    )
+    ));
+}
+
+#[test]
+fn the_anonymous_principal_resugars_to_the_key_name_and_reloads() {
+    let snap = AisixSnapshot::new();
+    register_mcp_servers(&snap, &[("s-uuid-1", "docs")]);
+    insert_anonymous_settings(
+        &snap,
+        json!({
+            "api_key_id": "k-uuid-1",
+            "source_cidrs": ["10.0.0.0/8"],
+            "servers": ["docs"]
+        }),
+    );
+
+    let doc = build_export_document(&snap, false);
+    let anonymous = &find(&doc, "mcp_auth_settings")[0]["anonymous"];
+    assert!(anonymous.get("api_key_id").is_none(), "{anonymous}");
+    let name = synthetic_api_key_name(&"ab".repeat(32));
+    assert_eq!(anonymous["api_key"], json!(name));
+    assert!(doc.blocking.is_empty(), "{:?}", doc.blocking);
+
+    let yaml = crate::export::yaml_emit::emit_yaml(&doc).expect("emit");
+    let loaded = aisix_core::filesource::load_from_str(&yaml, "exported.yaml", 1, &|_| None)
+        .expect("the exported file must re-load through the file source");
+    let settings = loaded.mcp_auth_settings.entries().pop().unwrap();
+    assert_eq!(
+        settings.value.anonymous.as_ref().unwrap().api_key_id,
+        aisix_core::filesource::derive_id("api_keys", &name)
+    );
+}
+
+#[test]
+fn a_dangling_anonymous_principal_is_kept_and_blocking() {
+    let snap = AisixSnapshot::new();
+    register_mcp_servers(&snap, &[("s-uuid-1", "docs")]);
+    insert_anonymous_settings(
+        &snap,
+        json!({
+            "api_key_id": "k-gone",
+            "source_cidrs": ["10.0.0.0/8"],
+            "servers": ["docs"]
+        }),
+    );
+
+    let doc = build_export_document(&snap, false);
+    let anonymous = &find(&doc, "mcp_auth_settings")[0]["anonymous"];
+    assert_eq!(anonymous["api_key_id"], json!("k-gone"));
+    assert!(anonymous.get("api_key").is_none(), "{anonymous}");
+    assert!(
+        doc.blocking
+            .iter()
+            .any(|b| b.contains("anonymous.api_key_id") && b.contains("k-gone")),
+        "{:?}",
+        doc.blocking
+    );
 }
 
 #[test]
 fn anonymous_ceiling_server_ids_resugar_to_names() {
     let snap = AisixSnapshot::new();
     register_mcp_servers(&snap, &[("s-uuid-1", "docs"), ("s-uuid-2", "kb")]);
-    snap.mcp_auth_settings.insert(anonymous_settings(json!({
-        "api_key_id": "k-uuid-1",
-        "source_cidrs": ["10.0.0.0/8"],
-        // Deliberately stale: the id form is authoritative at runtime, so
-        // the exported file must carry what the gateway enforces, not what
-        // the shadowed name field still says.
-        "servers": ["stale-name"],
-        "server_ids": ["s-uuid-2"]
-    })));
+    insert_anonymous_settings(
+        &snap,
+        json!({
+            "api_key_id": "k-uuid-1",
+            "source_cidrs": ["10.0.0.0/8"],
+            // Deliberately stale: the id form is authoritative at runtime, so
+            // the exported file must carry what the gateway enforces, not what
+            // the shadowed name field still says.
+            "servers": ["stale-name"],
+            "server_ids": ["s-uuid-2"]
+        }),
+    );
 
     let doc = build_export_document(&snap, false);
     let settings = find(&doc, "mcp_auth_settings");
@@ -1514,12 +1583,15 @@ fn anonymous_ceiling_server_ids_resugar_to_names() {
 fn an_unresolvable_id_in_the_anonymous_ceiling_is_dropped_and_warned() {
     let snap = AisixSnapshot::new();
     register_mcp_servers(&snap, &[("s-uuid-1", "docs")]);
-    snap.mcp_auth_settings.insert(anonymous_settings(json!({
-        "api_key_id": "k-uuid-1",
-        "source_cidrs": ["10.0.0.0/8"],
-        "servers": ["docs"],
-        "server_ids": ["s-gone", "s-uuid-1"]
-    })));
+    insert_anonymous_settings(
+        &snap,
+        json!({
+            "api_key_id": "k-uuid-1",
+            "source_cidrs": ["10.0.0.0/8"],
+            "servers": ["docs"],
+            "server_ids": ["s-gone", "s-uuid-1"]
+        }),
+    );
 
     let doc = build_export_document(&snap, false);
     let settings = find(&doc, "mcp_auth_settings");
@@ -1541,12 +1613,15 @@ fn an_anonymous_ceiling_admitting_no_server_blocks_the_export() {
     // gateway is refusing. The export says so rather than picking.
     let snap = AisixSnapshot::new();
     register_mcp_servers(&snap, &[("s-uuid-1", "docs")]);
-    snap.mcp_auth_settings.insert(anonymous_settings(json!({
-        "api_key_id": "k-uuid-1",
-        "source_cidrs": ["10.0.0.0/8"],
-        "servers": ["docs"],
-        "server_ids": []
-    })));
+    insert_anonymous_settings(
+        &snap,
+        json!({
+            "api_key_id": "k-uuid-1",
+            "source_cidrs": ["10.0.0.0/8"],
+            "servers": ["docs"],
+            "server_ids": []
+        }),
+    );
 
     let doc = build_export_document(&snap, false);
     assert!(
@@ -1567,12 +1642,15 @@ fn a_star_named_server_in_the_anonymous_ceiling_blocks_the_export() {
     // sides fail the opposite way for the same character.)
     let snap = AisixSnapshot::new();
     register_mcp_servers(&snap, &[("s-star", "gh*"), ("s-ghost", "ghost")]);
-    snap.mcp_auth_settings.insert(anonymous_settings(json!({
-        "api_key_id": "k-uuid-1",
-        "source_cidrs": ["10.0.0.0/8"],
-        "servers": ["gh*"],
-        "server_ids": ["s-star"]
-    })));
+    insert_anonymous_settings(
+        &snap,
+        json!({
+            "api_key_id": "k-uuid-1",
+            "source_cidrs": ["10.0.0.0/8"],
+            "servers": ["gh*"],
+            "server_ids": ["s-star"]
+        }),
+    );
 
     let doc = build_export_document(&snap, false);
     assert!(
@@ -1586,11 +1664,14 @@ fn a_star_named_server_in_the_anonymous_ceiling_blocks_the_export() {
 fn an_anonymous_ceiling_without_server_ids_is_left_alone() {
     let snap = AisixSnapshot::new();
     register_mcp_servers(&snap, &[("s-uuid-1", "docs")]);
-    snap.mcp_auth_settings.insert(anonymous_settings(json!({
-        "api_key_id": "k-uuid-1",
-        "source_cidrs": ["10.0.0.0/8"],
-        "servers": ["docs"]
-    })));
+    insert_anonymous_settings(
+        &snap,
+        json!({
+            "api_key_id": "k-uuid-1",
+            "source_cidrs": ["10.0.0.0/8"],
+            "servers": ["docs"]
+        }),
+    );
 
     let doc = build_export_document(&snap, false);
     let settings = find(&doc, "mcp_auth_settings");
@@ -1628,12 +1709,15 @@ fn a_ceiling_of_only_star_named_servers_blocks_once_with_the_right_advice() {
     // wrong fix here; the star diagnostic already names the real one.
     let snap = AisixSnapshot::new();
     register_mcp_servers(&snap, &[("s-star", "gh*")]);
-    snap.mcp_auth_settings.insert(anonymous_settings(json!({
-        "api_key_id": "k-uuid-1",
-        "source_cidrs": ["10.0.0.0/8"],
-        "servers": ["gh*"],
-        "server_ids": ["s-star"]
-    })));
+    insert_anonymous_settings(
+        &snap,
+        json!({
+            "api_key_id": "k-uuid-1",
+            "source_cidrs": ["10.0.0.0/8"],
+            "servers": ["gh*"],
+            "server_ids": ["s-star"]
+        }),
+    );
 
     let doc = build_export_document(&snap, false);
     assert!(

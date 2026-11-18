@@ -380,6 +380,7 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
 
     // mcp_auth_settings — singleton per environment with a fixed
     // identity; no secrets (the resource URL is public discovery data).
+    // `anonymous.api_key_id` resugars to the bound key's file name.
     push_kind(
         &mut collections,
         "mcp_auth_settings",
@@ -388,7 +389,10 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             |_| "mcp_auth_settings".to_string(),
             "mcp_auth_settings",
             &mut diag,
-            |doc, _, diag| resugar_anonymous_servers(doc, &mcp_server_names, diag),
+            |doc, _, diag| {
+                resugar_anonymous_servers(doc, &mcp_server_names, diag);
+                resugar_anonymous_principal(doc, &api_key_names, diag);
+            },
             |_, _| {},
         ),
     );
@@ -1119,6 +1123,22 @@ fn resugar_anonymous_servers(
     anon.insert("servers".into(), Value::Array(names));
 }
 
+/// `mcp_auth_settings.anonymous.api_key_id` (etcd id) → `anonymous.api_key`
+/// (name). Same contract as [`resugar_claim_resolve`].
+fn resugar_anonymous_principal(
+    doc: &mut Value,
+    api_key_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    resugar_api_key_ref(
+        doc,
+        "anonymous",
+        "the anonymous MCP principal",
+        api_key_names,
+        diag,
+    );
+}
+
 /// `claim_mapping.resolve.api_key_id` (etcd id) → `resolve.api_key`
 /// (name), the file's sugar form, which the loader resolves back to the
 /// key's derived id. Emitting the raw etcd UUID would resolve to nothing
@@ -1129,10 +1149,29 @@ fn resugar_claim_resolve(
     api_key_names: &BTreeMap<String, String>,
     diag: &mut Diagnostics,
 ) {
-    let Some(resolve) = doc.get_mut("resolve").and_then(Value::as_object_mut) else {
+    resugar_api_key_ref(
+        doc,
+        "resolve",
+        &format!("claim_mapping {mapping:?}"),
+        api_key_names,
+        diag,
+    );
+}
+
+/// `<parent>.api_key_id` (etcd id) → `<parent>.api_key` (name). The file
+/// accepts an `api_key_id` only when it is a derived id, so an id naming no
+/// exported key is kept raw and blocking.
+fn resugar_api_key_ref(
+    doc: &mut Value,
+    parent: &str,
+    owner: &str,
+    api_key_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    let Some(obj) = doc.get_mut(parent).and_then(Value::as_object_mut) else {
         return;
     };
-    let Some(id) = resolve
+    let Some(id) = obj
         .get("api_key_id")
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -1141,13 +1180,13 @@ fn resugar_claim_resolve(
     };
     match api_key_names.get(&id) {
         Some(name) => {
-            resolve.remove("api_key_id");
-            resolve.insert("api_key".into(), Value::String(name.clone()));
+            obj.remove("api_key_id");
+            obj.insert("api_key".into(), Value::String(name.clone()));
         }
         None => diag.blocking.push(format!(
-            "claim_mapping {mapping:?} resolve.api_key_id references api key id {id:?}, which is \
-             not among the exported api keys — kept as a raw id (dangling reference in the source \
-             data; the file will not load until it is resolved)"
+            "{owner} {parent}.api_key_id references api key id {id:?}, which is not among the \
+             exported api keys — kept as a raw id (dangling reference in the source data; the \
+             file will not load until it is resolved)"
         )),
     }
 }

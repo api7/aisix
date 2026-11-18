@@ -375,6 +375,31 @@ pub fn for_each_model_ref_node(kind: &str, doc: &mut Value, f: ModelRefVisitor<'
     }
 }
 
+/// An id written directly in a resources file must be the derived id of an
+/// entry the file defines: in file mode every id is derived from a name, so
+/// any other value is guaranteed dangling. `ids` is that collection's
+/// identity map (name → derived id); `name_field` is the name-reference
+/// sugar the error points at instead.
+fn check_derived_id_ref(
+    errors: &mut Vec<LoadError>,
+    scope: &str,
+    ids: &BTreeMap<String, String>,
+    id: &str,
+    field: &str,
+    noun: &str,
+    name_field: &str,
+) {
+    if !ids.values().any(|derived| derived == id) {
+        errors.push(LoadError {
+            scope: scope.to_string(),
+            message: format!(
+                "{field} {id:?} does not match any {noun} defined in this file — \
+                 reference the {noun} by name via `{name_field}` instead"
+            ),
+        });
+    }
+}
+
 /// The first id-form model reference `doc` carries.
 fn model_ref_id_field(kind: &str, doc: &mut Value) -> Option<&'static ModelRefIdField> {
     let mut found = None;
@@ -699,6 +724,9 @@ pub fn load_from_str(
             "passthrough_routes" => {
                 desugar::desugar_passthrough_route(&mut entry.doc, &identity_maps)
             }
+            "mcp_auth_settings" => {
+                desugar::desugar_mcp_auth_settings(&mut entry.doc, &identity_maps)
+            }
             _ => Ok(()),
         };
         if let Err(message) = sugar_result {
@@ -1019,22 +1047,60 @@ pub fn load_from_str(
                 ),
             });
         }
-        // The `resolve.api_key` name sugar resolves (or errors) in
-        // desugar; a canonical `resolve.api_key_id` written directly must
-        // equally land on a key defined in this file, or the mapping
-        // would silently resolve nothing at runtime.
-        if !api_key_ids
-            .values()
-            .any(|derived| derived == &mapping.resolve.api_key_id)
-        {
-            errors.push(LoadError {
-                scope: scope.clone(),
-                message: format!(
-                    "resolve.api_key_id {:?} does not match any api key defined in this file — \
-                     reference the key by name via `resolve.api_key` instead",
-                    mapping.resolve.api_key_id
-                ),
-            });
+        // Otherwise the mapping would silently resolve nothing at runtime.
+        check_derived_id_ref(
+            &mut errors,
+            scope,
+            api_key_ids,
+            &mapping.resolve.api_key_id,
+            "resolve.api_key_id",
+            "api key",
+            "resolve.api_key",
+        );
+    }
+
+    // A control-plane id here would bind anonymous MCP callers to no key
+    // and answer every one of them with a 401.
+    for (_, scope, settings) in &mcp_auth_settings {
+        if let Some(anon) = settings.anonymous.as_ref() {
+            check_derived_id_ref(
+                &mut errors,
+                scope,
+                api_key_ids,
+                &anon.api_key_id,
+                "anonymous.api_key_id",
+                "api key",
+                "anonymous.api_key",
+            );
+        }
+    }
+
+    // A passthrough route's ids otherwise surface only per request: an
+    // unknown `anonymous_key_id` answers every call with "anonymous key is
+    // not configured", an unknown `provider_key_id` fails every inject.
+    let provider_key_ids = identity_maps.get("provider_keys").unwrap_or(&empty);
+    for (_, scope, route) in &passthrough_routes {
+        if let Some(id) = route.anonymous_key_id.as_deref() {
+            check_derived_id_ref(
+                &mut errors,
+                scope,
+                api_key_ids,
+                id,
+                "anonymous_key_id",
+                "api key",
+                "anonymous_key",
+            );
+        }
+        if let Some(id) = route.provider_key_id.as_deref() {
+            check_derived_id_ref(
+                &mut errors,
+                scope,
+                provider_key_ids,
+                id,
+                "provider_key_id",
+                "provider key",
+                "provider_key",
+            );
         }
     }
 
@@ -1077,27 +1143,17 @@ pub fn load_from_str(
         }
     }
 
-    // An explicit `provider_key_id` must also resolve: in file mode every
-    // provider-key id is derived from its name, so any other value is
-    // guaranteed dangling and would only surface per-request.
-    let pk_ids: std::collections::BTreeSet<&str> = identity_maps
-        .get("provider_keys")
-        .unwrap_or(&empty)
-        .values()
-        .map(String::as_str)
-        .collect();
     for (_, scope, model) in &models {
         if let Some(pk_id) = model.provider_key_id.as_deref() {
-            if !pk_ids.contains(pk_id) {
-                errors.push(LoadError {
-                    scope: scope.clone(),
-                    message: format!(
-                        "provider_key_id {pk_id:?} does not match any provider key \
-                         defined in this file — reference it by name with \
-                         `provider_key` instead"
-                    ),
-                });
-            }
+            check_derived_id_ref(
+                &mut errors,
+                scope,
+                provider_key_ids,
+                pk_id,
+                "provider_key_id",
+                "provider key",
+                "provider_key",
+            );
         }
         let classifier = model.semantic.as_ref().and_then(|s| s.classifier.as_ref());
         // The inline key is read only when the classifier names no model.
@@ -1106,16 +1162,15 @@ pub fn load_from_str(
             .map(|c| c.provider_key_id.as_str())
             .filter(|id| !id.is_empty())
         {
-            if !pk_ids.contains(pk_id) {
-                errors.push(LoadError {
-                    scope: scope.clone(),
-                    message: format!(
-                        "semantic classifier provider_key_id {pk_id:?} does not match any \
-                         provider key defined in this file — reference it by name with \
-                         `provider_key` instead"
-                    ),
-                });
-            }
+            check_derived_id_ref(
+                &mut errors,
+                scope,
+                provider_key_ids,
+                pk_id,
+                "semantic classifier provider_key_id",
+                "provider key",
+                "semantic.classifier.provider_key",
+            );
         }
     }
 
