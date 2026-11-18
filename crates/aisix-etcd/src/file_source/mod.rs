@@ -198,6 +198,14 @@ pub fn read_str(
             if at.is_empty() && (kind == "_format_version" || kind == GLOBAL_SECTION) {
                 continue;
             }
+            // One key segment: `global/pricing` at the top level would land
+            // on the keys of the `global` section's `pricing`.
+            if kind.is_empty() || kind.contains('/') {
+                errors.push(file_error(format!(
+                    "`{at}{kind}` is not a resource collection name (one segment, no `/`)"
+                )));
+                continue;
+            }
             read_kind(
                 kind,
                 items,
@@ -275,10 +283,10 @@ fn read_kind(
             {
                 id
             }
-            Some(other) => {
-                error(format!(
-                    "`id` must be a UUID string in lowercase hyphenated form, found {other}"
-                ));
+            // The value is not echoed: after interpolation it can be anything,
+            // a credential included.
+            Some(_) => {
+                error("`id` must be a UUID string in lowercase hyphenated form".into());
                 continue;
             }
             None => {

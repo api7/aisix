@@ -307,9 +307,49 @@ fn documents_are_written_as_stored_not_re_serialized() {
 #[test]
 fn the_former_provider_key_secret_spelling_is_redacted_too() {
     let doc = export(
-        &[("provider_keys", PK, json!({"display_name": "old", "secret": "sk-old-spelling"}))],
+        &[(
+            "provider_keys",
+            PK,
+            json!({"display_name": "old", "secret": "sk-old-spelling"}),
+        )],
         false,
     );
     let text = serde_json::to_string(&doc.collections).unwrap();
     assert!(!text.contains("sk-old-spelling"), "{text}");
+}
+
+#[test]
+fn a_custom_guardrail_s_script_secrets_are_redacted() {
+    let doc = export(
+        &[(
+            "guardrails",
+            POLICY,
+            json!({
+                "name": "screen",
+                "kind": "custom",
+                "script": "export async function checkInput() { return { action: \"none\" }; }",
+                "secrets": {"SCREENING_TOKEN": "tok-live-secret"}
+            }),
+        )],
+        false,
+    );
+    let gr = &find(&doc, "guardrails")[0];
+    assert!(!gr.to_string().contains("tok-live-secret"), "{gr}");
+    assert!(gr["secrets"]["SCREENING_TOKEN"]
+        .as_str()
+        .unwrap()
+        .starts_with("${AISIXSECRET_"));
+}
+
+#[test]
+fn a_model_priced_by_a_pricing_document_is_reported() {
+    let mut rows = rows();
+    rows[1].2["pricing_key"] = json!("openai/gpt-4o");
+    let doc = export(&rows, false);
+    assert_eq!(doc.warnings.len(), 1, "{:?}", doc.warnings);
+    assert!(
+        doc.warnings[0].contains("carries no price"),
+        "{}",
+        doc.warnings[0]
+    );
 }

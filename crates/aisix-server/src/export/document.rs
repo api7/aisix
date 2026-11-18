@@ -117,7 +117,11 @@ pub fn build_export_document(
         "guardrails",
         "GUARDRAIL",
         |g| g.name.clone(),
-        |doc, ctx| { redact_by_key(doc, GUARDRAIL_SECRET_KEYS, ctx) }
+        |doc, ctx| {
+            redact_by_key(doc, GUARDRAIL_SECRET_KEYS, ctx);
+            // A `kind: custom` script's credentials, keyed by the names it reads.
+            redact_string_map(doc, "secrets", "secret", ctx);
+        }
     );
     export!(
         guardrail_attachments,
@@ -206,6 +210,25 @@ pub fn build_export_document(
     );
 
     let mut warnings = dangling_references(snapshot);
+
+    // Pricing documents are not exported, so a model priced by one changes
+    // price on a gateway loading this file.
+    for entry in snapshot.models.entries() {
+        let model = &entry.value;
+        let Some(key) = model.pricing_key.as_deref() else {
+            continue;
+        };
+        let effect = if model.cost.is_some() {
+            "falls back to its inline `cost`, a different price whenever the two disagree"
+        } else {
+            "carries no price and ranks last under `least_cost`; set `cost` if the price matters"
+        };
+        warnings.push(format!(
+            "model {:?} ({}) is priced by the pricing document {key:?}, which is not exported \
+             — on a gateway loading this file it {effect}",
+            model.display_name, entry.id
+        ));
+    }
 
     // Pricing, teams, users, budgets and usage accounting are not exported: a gateway loading
     // this file runs without them, and says so here.

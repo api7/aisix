@@ -117,24 +117,21 @@ provider_keys:
   - id: "{{0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11}}"
 "#
     ));
-    let not_canonical = |i: usize, found: &str| {
-        format!(
-            "provider_keys[{i}]: `id` must be a UUID string in lowercase hyphenated form, \
-             found {found}"
-        )
+    let not_canonical = |i: usize| {
+        format!("provider_keys[{i}]: `id` must be a UUID string in lowercase hyphenated form")
     };
     assert_eq!(
         errors,
         [
             "provider_keys[0]: `id` is required (the resource's UUID)".to_string(),
-            not_canonical(1, "\"openai-prod\""),
-            not_canonical(2, "42"),
+            not_canonical(1),
+            not_canonical(2),
             format!(
                 "provider_keys[4]: duplicate id \"{PK}\" — every entry of `provider_keys` needs \
                  its own id"
             ),
-            not_canonical(5, "\"0B6F3C1E-2F0A-4C5E-9D55-7D1A8B0C2E11\""),
-            not_canonical(6, "\"{0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11}\""),
+            not_canonical(5),
+            not_canonical(6),
         ]
     );
 }
@@ -309,4 +306,18 @@ async fn a_reload_that_cannot_be_read_is_reported_out_of_sync() {
         .provider_keys
         .get_by_id(PK)
         .is_some());
+}
+
+#[test]
+fn a_collection_name_is_one_key_segment_and_an_id_is_never_echoed() {
+    let errors = messages(
+        "_format_version: \"2\"\nglobal/pricing: []\nmodels:\n  - id: ${OPENAI_API_KEY}\n",
+    );
+    assert_eq!(
+        errors,
+        [
+            "(file): `global/pricing` is not a resource collection name (one segment, no `/`)",
+            "models[0]: `id` must be a UUID string in lowercase hyphenated form",
+        ]
+    );
 }

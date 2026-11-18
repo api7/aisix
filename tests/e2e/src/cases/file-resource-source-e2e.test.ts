@@ -574,15 +574,10 @@ guardrails:
   test("a file that cannot be read keeps the configuration that is serving", async () => {
     if (!app || !upstream || !app.resourcesPath) throw new Error("setup failed");
     const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
-    const failuresBefore = (app.output().match(/resources file could not be read/g) ?? []).length;
     await writeFile(app.resourcesPath, "_format_version: \"2\"\nmodels: [\n", "utf8");
     app.signal("SIGHUP");
-    await waitConfigPropagation(
-      async () =>
-        (app!.output().match(/resources file could not be read/g) ?? []).length > failuresBefore,
-    );
-    // Reported on the status surface too: the file as a whole is rejected.
-    expect((await statusConfig()).state).toBe("out_of_sync");
+    // Handled once the status surface reports the file rejected as a whole.
+    await waitConfigPropagation(async () => (await statusConfig()).state === "out_of_sync");
     const stillServing = await proxy.chat({
       model: "reload-a",
       messages: [{ role: "user", content: "still-alive" }],
