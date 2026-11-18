@@ -15,7 +15,7 @@ use std::sync::Arc;
 use aisix_mcp::{EphemeralBridge, McpBridge, McpUpstream, OAuthClientConfig, RmcpBridge};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -67,8 +67,8 @@ impl ServerHandler for EchoServer {
         Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
     }
 
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
     }

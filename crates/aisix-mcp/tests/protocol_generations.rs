@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use aisix_mcp::{streamable_http_service, McpBridge, McpError, McpGateway, McpTool, McpToolResult};
-use rmcp::model::{CallToolRequestParams, ClientInfo, ProtocolVersion};
+use rmcp::model::{CallToolRequestParams, ClientConfig, ProtocolVersion};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{ClientLifecycleMode, ClientServiceExt, ServiceExt};
 
@@ -394,7 +394,7 @@ async fn legacy_results_keep_their_wire_shape() {
 #[tokio::test]
 async fn modern_rmcp_client_lifecycle_works_end_to_end() {
     let addr = spawn_gateway().await;
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve_with_lifecycle(
             StreamableHttpClientTransport::from_uri(format!("http://{addr}/mcp")),
             ClientLifecycleMode::Discover {
@@ -457,8 +457,8 @@ impl rmcp::ServerHandler for UpstreamEcho {
         )
     }
 
-    fn get_info(&self) -> rmcp::model::ServerInfo {
-        let mut info = rmcp::model::ServerInfo::default();
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        let mut info = rmcp::model::ServerConfig::default();
         info.capabilities = rmcp::model::ServerCapabilities::builder()
             .enable_tools()
             .build();
@@ -512,7 +512,7 @@ async fn modern_client_through_real_bridge_and_upstream() {
         axum::serve(gw_listener, app).await.expect("serve gateway");
     });
 
-    let client = ClientInfo::default()
+    let client = ClientConfig::default()
         .serve_with_lifecycle(
             StreamableHttpClientTransport::from_uri(format!("http://{gw_addr}/mcp")),
             ClientLifecycleMode::Discover {
