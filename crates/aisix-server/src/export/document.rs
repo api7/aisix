@@ -316,7 +316,8 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
     );
 
     // rate_limit_policies — identity: name; resugar scope_ref for
-    // api_key / model scopes to the referenced entry's name.
+    // api_key / model scopes, and the api_key / model condition leaves, to
+    // the referenced entry's name.
     push_kind(
         &mut collections,
         "rate_limit_policies",
@@ -326,7 +327,8 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             "rate_limit_policies",
             &mut diag,
             |doc, identity, diag| {
-                resugar_scope_ref(doc, identity, &model_names, &api_key_names, diag)
+                resugar_scope_ref(doc, identity, &model_names, &api_key_names, diag);
+                resugar_condition_refs(doc, identity, &model_names, &api_key_names, diag);
             },
             |_, _| {},
         ),
@@ -1234,6 +1236,67 @@ fn resugar_scope_ref(
              among the exported {label}s — kept as a raw id (dangling reference in the source \
              data; the file will not load until it is resolved)"
         )),
+    }
+}
+
+/// A conditional policy's `conditions` leaves on the `api_key` / `model`
+/// dimensions (canonical ids) → the referenced entries' names, which is
+/// how the file source reads them, recursively through group nodes. Every
+/// other dimension passes through verbatim.
+///
+/// An id naming no exported entry is kept and blocking, as for
+/// `scope_ref`: the loader rejects a leaf value it cannot resolve.
+fn resugar_condition_refs(
+    doc: &mut Value,
+    policy: &str,
+    model_names: &BTreeMap<String, String>,
+    api_key_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    fn walk(
+        nodes: &mut Value,
+        policy: &str,
+        model_names: &BTreeMap<String, String>,
+        api_key_names: &BTreeMap<String, String>,
+        diag: &mut Diagnostics,
+    ) {
+        let Some(items) = nodes.as_array_mut() else {
+            return;
+        };
+        for node in items {
+            let Some(obj) = node.as_object_mut() else {
+                continue;
+            };
+            if let Some(children) = obj.get_mut("children") {
+                walk(children, policy, model_names, api_key_names, diag);
+                continue;
+            }
+            let (lookup, label) = match obj.get("dimension").and_then(Value::as_str) {
+                Some("model") => (model_names, "model"),
+                Some("api_key") => (api_key_names, "api key"),
+                _ => continue,
+            };
+            let mut rename = |value: &mut Value| {
+                let Value::String(id) = value else { return };
+                match lookup.get(id.as_str()) {
+                    Some(name) => *id = name.clone(),
+                    None => diag.blocking.push(format!(
+                        "rate_limit_policy {policy:?} has a `conditions` {label} value {id:?}, \
+                         which is not among the exported {label}s — kept as a raw id (dangling \
+                         reference in the source data; the file will not load until it is \
+                         resolved)"
+                    )),
+                }
+            };
+            match obj.get_mut("value") {
+                Some(Value::Array(values)) => values.iter_mut().for_each(&mut rename),
+                Some(value) => rename(value),
+                None => {}
+            }
+        }
+    }
+    if let Some(conditions) = doc.get_mut("conditions") {
+        walk(conditions, policy, model_names, api_key_names, diag);
     }
 }
 

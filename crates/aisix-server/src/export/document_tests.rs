@@ -251,6 +251,59 @@ fn scope_ref_resolves_for_model_and_api_key_scopes() {
     assert_eq!(by_name("cap-team")["scope_ref"], json!("team-uuid-9"));
 }
 
+/// Condition leaves on the `model` / `api_key` dimensions carry ids and
+/// export as names, through group nodes; other dimensions are untouched,
+/// and an id naming no exported entry is kept and blocking.
+#[test]
+fn condition_leaf_refs_resolve_for_model_and_api_key_dimensions() {
+    let snap = AisixSnapshot::new();
+    let key_hash = "bb".repeat(32);
+    snap.provider_keys
+        .insert(ResourceEntry::new("pk", provider_key("pk", "sk"), 1));
+    snap.models.insert(ResourceEntry::new(
+        "m-uuid-1",
+        model_value(json!({"display_name": "gpt-4o", "provider": "openai", "model_name": "x", "provider_key_id": "pk"})),
+        1,
+    ));
+    snap.apikeys.insert(ResourceEntry::new(
+        "k-uuid-1",
+        serde_json::from_value(json!({"key_hash": key_hash, "allowed_models": ["*"]})).unwrap(),
+        1,
+    ));
+    snap.rate_limit_policies.insert(ResourceEntry::new(
+        "rlp-cond",
+        serde_json::from_value(json!({
+            "name": "cond",
+            "conditions": [
+                {"dimension": "model", "operator": "in", "value": ["m-uuid-1", "m-gone"]},
+                {"logic": "or", "children": [
+                    {"dimension": "api_key", "operator": "==", "value": "k-uuid-1"},
+                    {"dimension": "team", "operator": "==", "value": "team-uuid-9"}
+                ]}
+            ],
+            "group_by": ["model"],
+            "limits": {"rpm": 1}
+        }))
+        .unwrap(),
+        1,
+    ));
+
+    let doc = build_export_document(&snap, false);
+    let conditions = &find(&doc, "rate_limit_policies")[0]["conditions"];
+    assert_eq!(conditions[0]["value"], json!(["gpt-4o", "m-gone"]));
+    assert_eq!(
+        conditions[1]["children"][0]["value"],
+        json!(synthetic_api_key_name(&key_hash))
+    );
+    assert_eq!(conditions[1]["children"][1]["value"], json!("team-uuid-9"));
+    assert_eq!(doc.blocking.len(), 1, "{:?}", doc.blocking);
+    assert!(
+        doc.blocking[0].contains("\"cond\"") && doc.blocking[0].contains("m-gone"),
+        "{:?}",
+        doc.blocking
+    );
+}
+
 #[test]
 fn duplicate_identity_within_a_kind_warns() {
     let snap = AisixSnapshot::new();
