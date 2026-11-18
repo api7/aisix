@@ -142,7 +142,15 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             &mut diag,
             |doc, identity, diag| {
                 resugar_provider_key(doc, identity, &provider_key_names, diag);
-                resugar_classifier_provider_key(doc, identity, &provider_key_names, diag);
+                // Before `resugar_model_refs`: it decides by the classifier's
+                // `model_id`, which that pass renames.
+                resugar_classifier_provider_key(
+                    doc,
+                    identity,
+                    &provider_key_names,
+                    &model_names,
+                    diag,
+                );
                 resugar_model_refs(doc, "models", "model", identity, &model_names, diag);
                 drop_pricing_key(doc, identity, diag);
             },
@@ -308,7 +316,8 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
     );
 
     // rate_limit_policies — identity: name; resugar scope_ref for
-    // api_key / model scopes to the referenced entry's name.
+    // api_key / model scopes, and the api_key / model condition leaves, to
+    // the referenced entry's name.
     push_kind(
         &mut collections,
         "rate_limit_policies",
@@ -318,7 +327,8 @@ pub fn build_export_document(snapshot: &AisixSnapshot, reveal_secrets: bool) -> 
             "rate_limit_policies",
             &mut diag,
             |doc, identity, diag| {
-                resugar_scope_ref(doc, identity, &model_names, &api_key_names, diag)
+                resugar_scope_ref(doc, identity, &model_names, &api_key_names, diag);
+                resugar_condition_refs(doc, identity, &model_names, &api_key_names, diag);
             },
             |_, _| {},
         ),
@@ -723,15 +733,37 @@ fn resugar_provider_key(
 
 /// `semantic.classifier.provider_key_id` → `provider_key: <name>`, the
 /// same file sugar a model's own key reference gets.
+///
+/// A classifier that names its model by `model_id` (resugared to
+/// `model_ref` by [`resugar_model_refs`]) never reads the inline
+/// `provider_key_id` + `model`: the control plane writes them beside it only
+/// for gateways that predate `model_id`. They are dropped rather than
+/// exported, so a key that pair names is neither demanded from the export
+/// nor shown in the file as if it were used. When `model_id` names no
+/// exported model the export is blocked anyway, and the pair is kept as a
+/// fallback: deleting the dangling `model_ref` restores a loadable
+/// classifier only when the pair's key resolved to an exported provider
+/// key too; otherwise the pair's `provider_key_id` stays a raw id (blocking
+/// on its own) and has to be replaced with an exported `provider_key`.
 fn resugar_classifier_provider_key(
     doc: &mut Value,
     model: &str,
     provider_key_names: &BTreeMap<String, String>,
+    model_names: &BTreeMap<String, String>,
     diag: &mut Diagnostics,
 ) {
     let Some(Value::Object(classifier)) = doc.pointer_mut("/semantic/classifier") else {
         return;
     };
+    if classifier
+        .get("model_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| model_names.contains_key(id))
+    {
+        classifier.remove("provider_key_id");
+        classifier.remove("model");
+        return;
+    }
     let Some(id) = classifier
         .get("provider_key_id")
         .and_then(Value::as_str)
@@ -830,10 +862,10 @@ fn resugar_allowed_models(
 /// The id form is a control-plane projection: it names a model by the id
 /// the control plane assigned it, and a file's ids are derived from its
 /// entry names, so the export resolves each id to the identity the models
-/// collection is keyed by and emits the name the document already has a
-/// field for. The fields and the places they can appear come from
-/// `aisix_core::filesource`, the same pair of tables the file source
-/// refuses them by, so the two cannot drift.
+/// collection is keyed by and emits it under the name-form field the
+/// resources file reads for that reference. The fields and the places they
+/// can appear come from `aisix_core::filesource`, the same tables the file
+/// source refuses them by, so the two cannot drift.
 ///
 /// An id naming no exported model is emitted as the name form carrying the
 /// raw id, which is exactly how the gateway already treats it — the id
@@ -851,10 +883,9 @@ fn resugar_model_refs(
     model_names: &BTreeMap<String, String>,
     diag: &mut Diagnostics,
 ) {
-    let fields = aisix_core::filesource::model_ref_id_fields(kind);
     let mut blocking: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
-    aisix_core::filesource::for_each_model_ref_node(kind, doc, &mut |node| {
+    aisix_core::filesource::for_each_model_ref_node(kind, doc, &mut |node, fields| {
         for reference in fields {
             let (id_field, name_field) = (reference.field, reference.name_field);
             // Only a STRING id is rewritten here. `api_keys` carries an
@@ -1213,6 +1244,67 @@ fn resugar_scope_ref(
              among the exported {label}s — kept as a raw id (dangling reference in the source \
              data; the file will not load until it is resolved)"
         )),
+    }
+}
+
+/// A conditional policy's `conditions` leaves on the `api_key` / `model`
+/// dimensions (canonical ids) → the referenced entries' names, which is
+/// how the file source reads them, recursively through group nodes. Every
+/// other dimension passes through verbatim.
+///
+/// An id naming no exported entry is kept and blocking, as for
+/// `scope_ref`: the loader rejects a leaf value it cannot resolve.
+fn resugar_condition_refs(
+    doc: &mut Value,
+    policy: &str,
+    model_names: &BTreeMap<String, String>,
+    api_key_names: &BTreeMap<String, String>,
+    diag: &mut Diagnostics,
+) {
+    fn walk(
+        nodes: &mut Value,
+        policy: &str,
+        model_names: &BTreeMap<String, String>,
+        api_key_names: &BTreeMap<String, String>,
+        diag: &mut Diagnostics,
+    ) {
+        let Some(items) = nodes.as_array_mut() else {
+            return;
+        };
+        for node in items {
+            let Some(obj) = node.as_object_mut() else {
+                continue;
+            };
+            if let Some(children) = obj.get_mut("children") {
+                walk(children, policy, model_names, api_key_names, diag);
+                continue;
+            }
+            let (lookup, label) = match obj.get("dimension").and_then(Value::as_str) {
+                Some("model") => (model_names, "model"),
+                Some("api_key") => (api_key_names, "api key"),
+                _ => continue,
+            };
+            let mut rename = |value: &mut Value| {
+                let Value::String(id) = value else { return };
+                match lookup.get(id.as_str()) {
+                    Some(name) => *id = name.clone(),
+                    None => diag.blocking.push(format!(
+                        "rate_limit_policy {policy:?} has a `conditions` {label} value {id:?}, \
+                         which is not among the exported {label}s — kept as a raw id (dangling \
+                         reference in the source data; the file will not load until it is \
+                         resolved)"
+                    )),
+                }
+            };
+            match obj.get_mut("value") {
+                Some(Value::Array(values)) => values.iter_mut().for_each(&mut rename),
+                Some(value) => rename(value),
+                None => {}
+            }
+        }
+    }
+    if let Some(conditions) = doc.get_mut("conditions") {
+        walk(conditions, policy, model_names, api_key_names, diag);
     }
 }
 

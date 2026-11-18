@@ -1243,6 +1243,42 @@ fn every_refused_model_reference_id_is_a_declared_field() {
     }
 }
 
+/// The classifier's id-form reference is declared on the classifier, and
+/// its name form is file sugar the canonical classifier does NOT declare:
+/// the file source resolves it before validation, so a canonical field of
+/// that name would be shadowed by the sugar and the strict schema could
+/// never see it.
+#[test]
+fn the_classifier_model_reference_is_declared_and_its_name_form_is_sugar() {
+    fn classifier_properties(node: &Value) -> Option<&serde_json::Map<String, Value>> {
+        match node {
+            Value::Object(map) => map
+                .get("properties")
+                .and_then(Value::as_object)
+                .filter(|p| p.contains_key("min_confidence"))
+                .or_else(|| map.values().find_map(classifier_properties)),
+            Value::Array(items) => items.iter().find_map(classifier_properties),
+            _ => None,
+        }
+    }
+
+    let schema = resource_root_schema("model", true);
+    let properties = classifier_properties(&schema).expect("the model schema has a classifier");
+    for reference in &aisix_core::filesource::CLASSIFIER_MODEL_REF_ID_FIELDS {
+        assert!(
+            properties.contains_key(reference.field),
+            "the classifier does not declare `{}`",
+            reference.field
+        );
+        assert!(
+            !properties.contains_key(reference.name_field),
+            "the classifier declares `{}`, which the file source consumes as sugar",
+            reference.name_field
+        );
+        assert!(reference.hint.ends_with(reference.name_field));
+    }
+}
+
 /// The same check for the OTHER reference with an id spelling: every
 /// field the resources file refuses as an id-form MCP server reference,
 /// and every name field it points the operator at, is one this build's

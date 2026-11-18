@@ -212,6 +212,19 @@ pub fn model_ref_id_fields(kind: &str) -> &'static [ModelRefIdField] {
     }
 }
 
+/// The id-form model reference on a semantic router's `classifier`.
+///
+/// Kept apart from [`model_ref_id_fields`] because the classifier has no
+/// canonical name form to rewrite it to: its `model` is the upstream
+/// decision model name, read only when `model_id` is absent. The name
+/// form is file sugar instead, `model_ref`, which the file source
+/// resolves to the derived id (`desugar_model`) before validation.
+pub const CLASSIFIER_MODEL_REF_ID_FIELDS: [ModelRefIdField; 1] = [ModelRefIdField {
+    field: "model_id",
+    name_field: "model_ref",
+    hint: "semantic.classifier.model_ref",
+}];
+
 /// One id-form MCP server reference a document can carry: where it sits,
 /// the field, and the name-form field that replaces it.
 ///
@@ -293,40 +306,43 @@ fn mcp_ref_id_field(kind: &str, doc: &Value) -> Option<&'static McpRefIdField> {
     })
 }
 
-/// Call `f` on every object in `doc` that may carry one of
-/// [`model_ref_id_fields`]'s fields, for a document of `kind`.
+/// What [`for_each_model_ref_node`] calls on each object: the object, and
+/// the id-form model references it can carry.
+pub type ModelRefVisitor<'a> =
+    &'a mut dyn FnMut(&mut serde_json::Map<String, Value>, &'static [ModelRefIdField]);
+
+/// Call `f` on every object in `doc` that may carry an id-form model
+/// reference, for a document of `kind`, with the references that object
+/// can carry: [`model_ref_id_fields`] everywhere except a semantic
+/// router's `classifier`, which gets [`CLASSIFIER_MODEL_REF_ID_FIELDS`].
 ///
 /// Addressed by path rather than by walking the whole document for the
 /// field names: `secrets` and `headers` on a guardrail are operator-keyed
 /// maps, so a blind walk would treat a secret named `model_id` as a model
 /// reference and rewrite it. Extend this when a new nesting site gains a
 /// model reference.
-pub fn for_each_model_ref_node(
-    kind: &str,
-    doc: &mut Value,
-    f: &mut dyn FnMut(&mut serde_json::Map<String, Value>),
-) {
+pub fn for_each_model_ref_node(kind: &str, doc: &mut Value, f: ModelRefVisitor<'_>) {
+    let fields = model_ref_id_fields(kind);
     let Some(root) = doc.as_object_mut() else {
         return;
     };
-    let objects_in =
-        |node: &mut Value, key: &str, f: &mut dyn FnMut(&mut serde_json::Map<String, Value>)| {
-            if let Some(Value::Array(items)) = node.get_mut(key) {
-                for item in items {
-                    if let Some(obj) = item.as_object_mut() {
-                        f(obj);
-                    }
+    let objects_in = |node: &mut Value, key: &str, f: ModelRefVisitor<'_>| {
+        if let Some(Value::Array(items)) = node.get_mut(key) {
+            for item in items {
+                if let Some(obj) = item.as_object_mut() {
+                    f(obj, fields);
                 }
             }
-        };
+        }
+    };
     match kind {
         // The key's grant list is a root field; a guardrail's kind config
         // is `#[serde(flatten)]`ed onto the root, so its embedder is too.
-        "api_keys" | "guardrails" => f(root),
+        "api_keys" | "guardrails" => f(root, fields),
         "cache_policies" => {
-            f(root);
+            f(root, fields);
             if let Some(Value::Object(semantic)) = root.get_mut("semantic") {
-                f(semantic);
+                f(semantic, fields);
             }
         }
         "models" => {
@@ -336,22 +352,22 @@ pub fn for_each_model_ref_node(
             if let Some(ensemble) = root.get_mut("ensemble") {
                 objects_in(ensemble, "panel", f);
                 if let Some(Value::Object(judge)) = ensemble.get_mut("judge") {
-                    f(judge);
+                    f(judge, fields);
                 }
             }
             if let Some(semantic) = root.get_mut("semantic") {
                 objects_in(semantic, "routes", f);
                 if let Some(Value::Object(on_failure)) = semantic.get_mut("on_embedding_failure") {
-                    f(on_failure);
+                    f(on_failure, fields);
                 }
-                if let Some(Value::Object(on_failure)) = semantic
-                    .get_mut("classifier")
-                    .and_then(|c| c.get_mut("on_failure"))
-                {
-                    f(on_failure);
+                if let Some(Value::Object(classifier)) = semantic.get_mut("classifier") {
+                    if let Some(Value::Object(on_failure)) = classifier.get_mut("on_failure") {
+                        f(on_failure, fields);
+                    }
+                    f(classifier, &CLASSIFIER_MODEL_REF_ID_FIELDS);
                 }
                 if let Some(semantic) = semantic.as_object_mut() {
-                    f(semantic);
+                    f(semantic, fields);
                 }
             }
         }
@@ -361,12 +377,8 @@ pub fn for_each_model_ref_node(
 
 /// The first id-form model reference `doc` carries.
 fn model_ref_id_field(kind: &str, doc: &mut Value) -> Option<&'static ModelRefIdField> {
-    let fields = model_ref_id_fields(kind);
-    if fields.is_empty() {
-        return None;
-    }
     let mut found = None;
-    for_each_model_ref_node(kind, doc, &mut |node| {
+    for_each_model_ref_node(kind, doc, &mut |node, fields| {
         if found.is_none() {
             found = fields.iter().find(|f| node.contains_key(f.field));
         }
