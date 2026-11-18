@@ -147,6 +147,12 @@ const responsesBuffered: Call = (app, key) =>
   post(app, key, "/v1/responses", { model: "est-responses-buffered", input: PROMPT });
 const completions: Call = (app, key) => post(app, key, "/v1/completions", { model: "est-completions", prompt: PROMPT });
 const embeddings: Call = (app, key) => post(app, key, "/v1/embeddings", { model: "est-embeddings", input: PROMPT });
+const policyChatStream: Call = (app, key) =>
+  post(app, key, "/v1/chat/completions", {
+    model: "est-chat-policy",
+    stream: true,
+    messages: [{ role: "user", content: PROMPT }],
+  });
 const reportedChatStream: Call = (app, key) =>
   post(app, key, "/v1/chat/completions", {
     model: "reported-chat",
@@ -221,11 +227,29 @@ describe.each(BACKENDS)("estimated usage and token rate limits ($name counters)"
     await model("est-completions", completionsUp);
     await model("est-embeddings", embeddingsUp);
     await model("reported-chat", reportedUp);
+    // A policy is this model's only token cap: its key carries no inline limit.
+    const policyModel = await seed.createModel({
+      display_name: "est-chat-policy",
+      provider: "openai",
+      model_name: "relay-2028",
+      provider_key_id: (
+        await seed.createProviderKey({
+          display_name: "est-chat-policy-pk",
+          secret: "sk-mock",
+          api_base: `${chatUp.baseUrl}/v1`,
+        })
+      ).id,
+    });
+    await seed.createRateLimitPolicy({
+      name: `est-policy-${gateway}`,
+      conditions: [{ dimension: "model", operator: "in", value: [policyModel.id] }],
+      limits: { tpm: TPM },
+    });
     for (const label of labels) {
       await seed.createApiKey({
         key_hash: hash(keyFor(gateway, label)),
         allowed_models: ["*"],
-        rate_limit: { tpm: TPM },
+        ...(label === "policy" ? {} : { rate_limit: { tpm: TPM } }),
       });
     }
     for (const label of labels) {
@@ -237,32 +261,25 @@ describe.each(BACKENDS)("estimated usage and token rate limits ($name counters)"
   beforeAll(async () => {
     ready = (await new EtcdClient().ping()) && (name === "memory" || (await redisPing(REDIS_URL)));
     if (!ready) return;
-    upstreams.push(
-      await startOpenAiUpstream({ streamEvents: CHAT_STREAM_NO_USAGE }),
-      await startOpenAiUpstream({ nonStreamBody: CHAT_BODY_NO_USAGE }),
-      await startOpenAiUpstream({ streamEvents: RESPONSES_STREAM_NO_USAGE }),
-      await startOpenAiUpstream({ streamEvents: CHAT_STREAM_WITH_USAGE }),
-      await startOpenAiUpstream({ nonStreamBody: RESPONSES_BODY_NO_USAGE }),
-      await startOpenAiUpstream({ nonStreamBody: COMPLETIONS_BODY_NO_USAGE }),
-      await startOpenAiUpstream({ nonStreamBody: EMBEDDINGS_BODY_NO_USAGE }),
-    );
+    // Registered one by one, so teardown closes whichever started before a
+    // later one failed.
+    for (const opts of [
+      { streamEvents: CHAT_STREAM_NO_USAGE },
+      { nonStreamBody: CHAT_BODY_NO_USAGE },
+      { streamEvents: RESPONSES_STREAM_NO_USAGE },
+      { streamEvents: CHAT_STREAM_WITH_USAGE },
+      { nonStreamBody: RESPONSES_BODY_NO_USAGE },
+      { nonStreamBody: COMPLETIONS_BODY_NO_USAGE },
+      { nonStreamBody: EMBEDDINGS_BODY_NO_USAGE },
+    ]) {
+      upstreams.push(await startOpenAiUpstream(opts));
+    }
     const extra = ratelimit ? { ratelimit } : undefined;
     apps.on = await spawnApp(extra ? { extra } : {});
     apps.off = await spawnApp(extra ? { extra } : {});
-    await seedGateway(apps.on, "on", [
-      "chat-stream",
-      "chat-buffered",
-      "messages",
-      "messages-buffered",
-      "responses",
-      "responses-buffered",
-      "completions",
-      "embeddings",
-      "ensemble-buffered",
-      "ensemble-stream",
-      "reported",
-    ]);
-    await seedGateway(apps.off, "off", ["chat-stream"]);
+    const estimatedLabels = estimatedCalls.map(([label]) => label);
+    await seedGateway(apps.on, "on", [...estimatedLabels, "reported"]);
+    await seedGateway(apps.off, "off", estimatedLabels);
   });
 
   afterAll(async () => {
@@ -282,6 +299,7 @@ describe.each(BACKENDS)("estimated usage and token rate limits ($name counters)"
     ["embeddings", embeddings],
     ["ensemble-buffered", ensembleBuffered],
     ["ensemble-stream", ensembleStream],
+    ["policy", policyChatStream],
   ];
   for (const [label, call] of estimatedCalls) {
     test(`excluded: estimated ${label} traffic is never throttled by TPM`, async (ctx) => {
@@ -308,11 +326,15 @@ describe.each(BACKENDS)("estimated usage and token rate limits ($name counters)"
     expect(got.slice(1)).toContain(429);
   });
 
-  test("not excluded: the same estimated traffic is throttled by TPM", async (ctx) => {
-    if (!ready || !apps.off) return ctx.skip();
-    await awaitWindowHeadroom(20);
-    const got = await statuses(3, () => chatStream(apps.off!, keyFor("off", "chat-stream")));
-    expect(got[0]).toBe(200);
-    expect(got.slice(1)).toContain(429);
-  });
+  // The control for every excluded case: the same traffic on the same limit
+  // is throttled once estimated usage counts, so each endpoint does charge.
+  for (const [label, call] of estimatedCalls) {
+    test(`not excluded: the same estimated ${label} traffic is throttled by TPM`, async (ctx) => {
+      if (!ready || !apps.off) return ctx.skip();
+      await awaitWindowHeadroom(20);
+      const got = await statuses(3, () => call(apps.off!, keyFor("off", label)));
+      expect(got[0]).toBe(200);
+      expect(got.slice(1)).toContain(429);
+    });
+  }
 });
