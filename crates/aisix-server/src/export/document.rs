@@ -338,6 +338,39 @@ pub fn build_export_document(
 
     let mut warnings = dangling_references(snapshot);
 
+    // The catalog is read from `<prefix>/global/`, so an export of an
+    // environment prefix (`<base>/<env_id>`) does not reach the catalog the
+    // gateway reads from `<base>/global/`.
+    let exported_keys: BTreeSet<String> = snapshot
+        .pricing
+        .entries()
+        .into_iter()
+        .chain(snapshot.global_pricing.entries())
+        .map(|e| e.value.key.clone())
+        .collect();
+    for entry in snapshot.models.entries() {
+        let model = &entry.value;
+        let Some(key) = model.pricing_key.as_deref() else {
+            continue;
+        };
+        if exported_keys.contains(key) {
+            continue;
+        }
+        let has_cost = raw
+            .get(&("models".to_string(), entry.id.clone()))
+            .is_some_and(|doc| doc.contains_key("cost"));
+        let effect = if has_cost {
+            "falls back to its inline `cost`"
+        } else {
+            "carries no price and ranks last under `least_cost`"
+        };
+        warnings.push(format!(
+            "model {:?} ({}) is priced by {key:?}, which no exported pricing document carries \
+             — on a gateway loading this file it {effect}",
+            model.display_name, entry.id
+        ));
+    }
+
     if !snapshot.budgets.is_empty() {
         warnings.push(format!(
             "{} budgets document(s) not exported — a budget's `exhausted` state is written at \

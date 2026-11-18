@@ -496,6 +496,33 @@ fn a_custom_guardrail_s_script_secrets_are_redacted() {
 }
 
 #[test]
+fn a_model_priced_by_a_key_no_exported_pricing_document_carries_is_reported() {
+    let mut rows = rows();
+    rows[1].2["pricing_key"] = json!("openai/gpt-4o");
+    let doc = export(&rows, false);
+    assert_eq!(doc.warnings.len(), 1, "{:?}", doc.warnings);
+    assert!(
+        doc.warnings[0].contains("carries no price"),
+        "{}",
+        doc.warnings[0]
+    );
+    rows[1].2["cost"] = json!({"input_per_1k": 1, "output_per_1k": 2});
+    let with_cost = export(&rows, false);
+    assert!(
+        with_cost.warnings[0].contains("falls back to its inline `cost`"),
+        "{}",
+        with_cost.warnings[0]
+    );
+    rows.push((
+        "pricing",
+        PRICE,
+        json!({"key": "openai/gpt-4o", "input_per_1k": 5, "output_per_1k": 15}),
+    ));
+    let priced = export(&rows, false);
+    assert!(priced.warnings.is_empty(), "{:?}", priced.warnings);
+}
+
+#[test]
 fn two_fields_of_one_entry_sharing_a_placeholder_are_reported() {
     let doc = export(
         &[(

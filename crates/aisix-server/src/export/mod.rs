@@ -78,10 +78,12 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("etcd range read under {:?} failed: {e}", args.prefix))?;
 
     // Decode through the identical loader path the gateway uses, so the
-    // exported set is exactly what the running gateway would serve. The
-    // gateway reads the shared catalog from `<prefix>/global/`, which the
-    // range read under `<prefix>` also returns; declaring it resolves those
-    // keys as the global prices they are rather than as a kind `global`.
+    // exported set is exactly what the running gateway would serve. With
+    // `--prefix` the bare base (no `env_id`), the range read also returns the
+    // shared catalog under `<base>/global/`; declaring it resolves those keys
+    // as the global prices they are rather than as a kind `global`. An
+    // environment prefix (`<base>/<env_id>`) does not reach the catalog, which
+    // the per-model pricing warning then reports.
     let prefixes = PrefixSet::new(vec![
         WatchedPrefix::environment(&args.prefix),
         WatchedPrefix::global(format!("{}/global/", args.prefix.trim_end_matches('/'))),
@@ -123,8 +125,14 @@ pub async fn run(args: ExportArgs) -> anyhow::Result<()> {
     let invalid_ids: Vec<String> = document
         .collections
         .iter()
-        .chain(&document.global_collections)
-        .flat_map(|(kind, entries)| entries.iter().map(move |e| (kind, e)))
+        .map(|(kind, entries)| (kind.to_string(), entries))
+        .chain(
+            document
+                .global_collections
+                .iter()
+                .map(|(kind, entries)| (format!("global.{kind}"), entries)),
+        )
+        .flat_map(|(kind, entries)| entries.iter().map(move |e| (kind.clone(), e)))
         .filter_map(|(kind, entry)| {
             let id = entry
                 .get("id")
