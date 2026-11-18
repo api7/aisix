@@ -5,7 +5,12 @@
 //!
 //! - `models[].provider_key` — a provider-key *name*, resolved to the
 //!   derived `provider_key_id`. Mutually exclusive with an explicit
-//!   `provider_key_id`.
+//!   `provider_key_id`. A semantic router's `classifier` takes the same
+//!   sugar for its inline key.
+//! - `models[].semantic.classifier.model_ref` — a model *name*, resolved
+//!   to the derived `model_id`. The classifier's canonical name-like
+//!   field, `model`, is the upstream decision model name, so the
+//!   reference cannot use it.
 //! - `api_keys[].display_name` — required file-side identity, stripped
 //!   before validation (the canonical `api_key` document has no name
 //!   field).
@@ -137,7 +142,8 @@ fn known_names(maps: &IdentityMaps, kind: &str) -> String {
 
 /// `models[].provider_key` (name) → `provider_key_id` (derived id), and
 /// the same sugar on a semantic router's `classifier`, which references its
-/// Provider Key exactly the way a model does.
+/// Provider Key exactly the way a model does; plus the classifier's
+/// `model_ref` (name) → `model_id` (derived id).
 pub(crate) fn desugar_model(doc: &mut Value, maps: &IdentityMaps) -> Result<(), String> {
     let Some(obj) = doc.as_object_mut() else {
         return Ok(()); // non-object entries error upstream
@@ -148,6 +154,14 @@ pub(crate) fn desugar_model(doc: &mut Value, maps: &IdentityMaps) -> Result<(), 
         .and_then(|s| s.get_mut("classifier"))
     {
         desugar_provider_key_ref(classifier, maps, "semantic.classifier.")?;
+        if let Some(name_value) = classifier.remove("model_ref") {
+            const FIELD: &str = "`semantic.classifier.model_ref`";
+            let Some(name) = name_value.as_str() else {
+                return Err(format!("{FIELD} must be a string (a model display_name)"));
+            };
+            let resolved = resolve_entity_name(maps, "models", "model", name, FIELD)?;
+            classifier.insert("model_id".into(), Value::String(resolved));
+        }
     }
     Ok(())
 }

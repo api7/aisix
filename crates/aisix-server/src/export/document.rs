@@ -718,6 +718,13 @@ fn resugar_provider_key(
 
 /// `semantic.classifier.provider_key_id` → `provider_key: <name>`, the
 /// same file sugar a model's own key reference gets.
+///
+/// A classifier that names its model by `model_id` (resugared to
+/// `model_ref` by [`resugar_model_refs`]) never reads the inline
+/// `provider_key_id` + `model`: the control plane writes them beside it only
+/// for gateways that predate `model_id`. They are dropped rather than
+/// exported, so a key that pair names is neither demanded from the export
+/// nor shown in the file as if it were used.
 fn resugar_classifier_provider_key(
     doc: &mut Value,
     model: &str,
@@ -727,6 +734,11 @@ fn resugar_classifier_provider_key(
     let Some(Value::Object(classifier)) = doc.pointer_mut("/semantic/classifier") else {
         return;
     };
+    if classifier.contains_key("model_id") {
+        classifier.remove("provider_key_id");
+        classifier.remove("model");
+        return;
+    }
     let Some(id) = classifier
         .get("provider_key_id")
         .and_then(Value::as_str)
@@ -825,10 +837,10 @@ fn resugar_allowed_models(
 /// The id form is a control-plane projection: it names a model by the id
 /// the control plane assigned it, and a file's ids are derived from its
 /// entry names, so the export resolves each id to the identity the models
-/// collection is keyed by and emits the name the document already has a
-/// field for. The fields and the places they can appear come from
-/// `aisix_core::filesource`, the same pair of tables the file source
-/// refuses them by, so the two cannot drift.
+/// collection is keyed by and emits it under the name-form field the
+/// resources file reads for that reference. The fields and the places they
+/// can appear come from `aisix_core::filesource`, the same tables the file
+/// source refuses them by, so the two cannot drift.
 ///
 /// An id naming no exported model is emitted as the name form carrying the
 /// raw id, which is exactly how the gateway already treats it — the id
@@ -846,10 +858,9 @@ fn resugar_model_refs(
     model_names: &BTreeMap<String, String>,
     diag: &mut Diagnostics,
 ) {
-    let fields = aisix_core::filesource::model_ref_id_fields(kind);
     let mut blocking: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
-    aisix_core::filesource::for_each_model_ref_node(kind, doc, &mut |node| {
+    aisix_core::filesource::for_each_model_ref_node(kind, doc, &mut |node, fields| {
         for reference in fields {
             let (id_field, name_field) = (reference.field, reference.name_field);
             // Only a STRING id is rewritten here. `api_keys` carries an

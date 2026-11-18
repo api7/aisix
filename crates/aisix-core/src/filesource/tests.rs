@@ -1062,6 +1062,56 @@ fn cross_ref_checks_a_classifier_router_without_an_embedding_model() {
     );
 }
 
+/// A classifier names its direct model with `model_ref`, which loads as
+/// the derived `model_id` the request path resolves — the reference an
+/// exported control-plane classifier carries. A name that is not defined is
+/// a load error like any model reference, and the id spelling is refused
+/// because no control-plane id resolves among a file's derived ids.
+#[test]
+fn classifier_model_ref_resolves_to_the_named_model() {
+    let file = CLASSIFIER_FILE
+        .replace("provider_key_id: PK_ID", "model_ref: jev")
+        .replace("target: ghost-failure", "target: real");
+    let snapshot = load(&file, &env_of(&[])).expect("classifier model_ref loads");
+    let router = snapshot.models.get_by_name("sem").expect("router loaded");
+    let classifier = router
+        .value
+        .semantic
+        .as_ref()
+        .unwrap()
+        .classifier
+        .as_ref()
+        .unwrap();
+    let jev = snapshot
+        .models
+        .get_by_name("jev")
+        .expect("classifier model loaded");
+    assert_eq!(classifier.model_id.as_deref(), Some(jev.id.as_str()));
+
+    let errs = errors_of(load(
+        &file.replace("model_ref: jev", "model_ref: ghost"),
+        &env_of(&[]),
+    ));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("semantic.classifier.model_ref")
+            && errs[0].contains("unknown model \"ghost\""),
+        "{errs:?}"
+    );
+
+    let raw_id = file.replace(
+        "model_ref: jev",
+        "model_id: 11111111-1111-1111-1111-111111111111",
+    );
+    let errs = errors_of(load(&raw_id, &env_of(&[])));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains("does not accept `model_id`")
+            && errs[0].contains("semantic.classifier.model_ref"),
+        "{errs:?}"
+    );
+}
+
 const CLASSIFIER_FILE: &str = r#"
 _format_version: "1"
 provider_keys:
@@ -1075,6 +1125,10 @@ models:
     provider: openai
     model_name: x
     provider_key: pk
+  - display_name: jev
+    provider: typesafe
+    model_name: jev-1
+    provider_key: ts
   - display_name: sem
     semantic:
       classifier:
