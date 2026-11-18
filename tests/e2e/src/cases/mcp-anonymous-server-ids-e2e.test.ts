@@ -1,9 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -28,7 +23,6 @@ import {
 // settings row and waits for the new configuration to be observable, so
 // they run in order.
 
-const execFileP = promisify(execFile);
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
@@ -345,86 +339,5 @@ describe("mcp anonymous access: the allowlist may name servers by id", () => {
     expect(await initialize("/mcp/docs", undefined)).toBe(401);
     expect(await served("/mcp", undefined, "docs__echo")).toBe(false);
     expect(await served("/mcp/kb", undefined, "echo")).toBe(true);
-  }, 60_000);
-});
-
-// Two write-path refusals the gateway binary enforces on its own, with no
-// etcd involved: the resources file cannot name an MCP server by the id a
-// control plane assigned it, and a registered server's name may not carry
-// a `*`.
-describe("resources file: MCP server names and the anonymous ceiling", () => {
-  const BIN_PATH =
-    process.env.AISIX_BIN ??
-    join(process.cwd(), "..", "..", "target", "debug", "aisix");
-
-  const run = async (
-    contents: string,
-  ): Promise<{ ok: boolean; out: string }> => {
-    const dir = await mkdtemp(join(tmpdir(), "aisix-anon-ids-"));
-    try {
-      const path = join(dir, "resources.yaml");
-      await writeFile(path, contents, "utf8");
-      try {
-        const ok = await execFileP(BIN_PATH, ["validate", "--resources", path], {
-          env: { ...process.env, ANON_CALLER_KEY: "sk-caller" },
-        });
-        return { ok: true, out: ok.stdout };
-      } catch (e) {
-        const err = e as Error & { code?: number; stderr?: string };
-        expect(err.code).toBe(1);
-        return { ok: false, out: String(err.stderr) };
-      }
-    } finally {
-      await rm(dir, { recursive: true, force: true });
-    }
-  };
-
-  const PRELUDE = [
-    '_format_version: "1"',
-    "mcp_servers:",
-    "  - name: docs",
-    "    url: https://example.test/mcp",
-    "api_keys:",
-    "  - display_name: k",
-    "    key_env: ANON_CALLER_KEY",
-    "    allowed_models: []",
-    "mcp_auth_settings:",
-    "  - anonymous:",
-    "      api_key: k",
-    '      source_cidrs: ["10.0.0.0/8"]',
-    '      servers: ["docs"]',
-    "",
-  ].join("\n");
-
-  test("`anonymous.server_ids` is refused, and the same file without it loads", async () => {
-    const bad = await run(
-      `${PRELUDE}      server_ids: ["11111111-1111-1111-1111-111111111111"]\n`,
-    );
-    expect(bad.ok).toBe(false);
-    expect(bad.out).toContain("does not accept `anonymous.server_ids`");
-    expect(bad.out).toContain("servers");
-
-    const good = await run(PRELUDE);
-    expect(good.ok).toBe(true);
-    expect(good.out).toContain("OK:");
-  }, 60_000);
-
-  test("an MCP server name containing `*` is refused", async () => {
-    // The name is pasted into the `<server>__*` glob patterns every
-    // name-form grant, deny and anonymous ceiling is written as, so `gh*`
-    // would reach `ghost`'s tools as well as its own.
-    const bad = await run(
-      ['_format_version: "1"', "mcp_servers:", '  - name: "gh*"', "    url: https://example.test/mcp", ""].join("\n"),
-    );
-    expect(bad.ok).toBe(false);
-    expect(bad.out).toContain("/name");
-
-    // The same file with the `*` removed loads, so the refusal is that
-    // character and not anything else in the fixture.
-    const good = await run(
-      ['_format_version: "1"', "mcp_servers:", "  - name: gh", "    url: https://example.test/mcp", ""].join("\n"),
-    );
-    expect(good.ok).toBe(true);
-    expect(good.out).toContain("OK:");
   }, 60_000);
 });

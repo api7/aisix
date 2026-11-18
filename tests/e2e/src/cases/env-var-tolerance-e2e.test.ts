@@ -33,7 +33,7 @@ const SERVICE_LINKS: Record<string, string> = {
 
 // The file source keeps this spec off etcd: its subject is the boot
 // itself, and nothing here needs a resource.
-const RESOURCES = '_format_version: "1"\n';
+const RESOURCES = '_format_version: "2"\n';
 
 describe("unrecognised AISIX_* environment variables", () => {
   let app: SpawnedApp | undefined;

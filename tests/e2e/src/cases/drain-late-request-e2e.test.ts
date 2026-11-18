@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect as tlsConnect } from "node:tls";
 import { afterEach, describe, expect, test } from "vitest";
-import { spawnApp, waitForLogLine, type SpawnedApp } from "../harness/index.js";
+import { keyHash, fileId, spawnApp, waitForLogLine, type SpawnedApp } from "../harness/index.js";
 
 // E2E: a connection accepted during the drain whose request only arrives
 // after the drain has ended.
@@ -22,7 +22,6 @@ import { spawnApp, waitForLogLine, type SpawnedApp } from "../harness/index.js";
 // but not a byte of the request has been read when the drain ends.
 
 const CALLER_PLAINTEXT = "sk-drain-late-request";
-const CALLER_KEY_ENV = "DRAIN_LATE_REQUEST_CALLER_KEY";
 const MODEL = "drain-late-request";
 
 /** Enough connections that a per-connection coin flip cannot pass by luck. */
@@ -63,20 +62,23 @@ async function startMock(): Promise<Mock> {
 
 function resources(port: number): string {
   return `
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: drain-late-request-pk
+  - id: ${fileId(`provider_keys/drain-late-request-pk`)}
+    display_name: drain-late-request-pk
     provider: openai
     api_key: sk-mock
     api_base: http://127.0.0.1:${port}/v1
 models:
-  - display_name: ${MODEL}
+  - id: ${fileId(`models/${MODEL}`)}
+    display_name: ${MODEL}
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: drain-late-request-pk
+    provider_key_id: ${fileId(`provider_keys/drain-late-request-pk`)}
 api_keys:
-  - display_name: drain-late-request-caller
-    key_env: ${CALLER_KEY_ENV}
+  - id: ${fileId(`api_keys/drain-late-request-caller`)}
+    display_name: drain-late-request-caller
+    key_hash: ${keyHash(CALLER_PLAINTEXT)}
     allowed_models: ["${MODEL}"]
 `;
 }
@@ -152,7 +154,6 @@ describe("drain: a request that arrives after the drain ended", () => {
       // "drain complete" is reported at INFO; the suite default is WARN.
       logLevel: "info",
       resourcesFile: resources(mock.port),
-      extraEnv: { [CALLER_KEY_ENV]: CALLER_PLAINTEXT },
       extra: { shutdown: { min_drain_secs: 1 } },
       proxyListeners,
     });

@@ -72,34 +72,38 @@ observability:
 ```
 
 ```yaml
-# resources.yaml
-_format_version: "1"
+# resources.yaml — every entry is an id plus the resource's document
+_format_version: "2"
 
 provider_keys:
-  - display_name: openai-main
+  - id: 0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11
+    display_name: openai-main
     provider: openai
     api_key: ${OPENAI_API_KEY}        # interpolated from the environment
 
 models:
-  - display_name: my-model
+  - id: 6efd592d-a73b-573d-8e2c-e9e103692f92
+    display_name: my-model
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: openai-main
+    provider_key_id: 0b6f3c1e-2f0a-4c5e-9d55-7d1a8b0c2e11
 
 api_keys:
-  - display_name: local-dev
-    key_env: CALLER_API_KEY           # hashed at load; the plaintext is never stored
-    allowed_models: ["my-model"]
+  - id: 4a1c9e2b-7d3f-4b6a-8c5e-1f2a3b4c5d6e
+    display_name: local-dev
+    key_hash: ${CALLER_API_KEY_SHA256}  # sha256 hex of the caller key; the plaintext is never stored
+    allowed_model_ids: ["6efd592d-a73b-573d-8e2c-e9e103692f92"]
 ```
 
 ```bash
 export OPENAI_API_KEY="YOUR_PROVIDER_KEY"
 export CALLER_API_KEY="YOUR_CALLER_KEY"
+export CALLER_API_KEY_SHA256="$(printf %s "$CALLER_API_KEY" | sha256sum | cut -d' ' -f1)"
 
 docker run -d --name aisix \
   -v "$(pwd)/config.yaml:/etc/aisix/config.yaml:ro" \
   -v "$(pwd)/resources.yaml:/etc/aisix/resources.yaml:ro" \
-  -e OPENAI_API_KEY -e CALLER_API_KEY \
+  -e OPENAI_API_KEY -e CALLER_API_KEY_SHA256 \
   -p 3000:3000 -p 127.0.0.1:9090:9090 \
   ghcr.io/api7/aisix:latest        # proxy → :3000, metrics + status → :9090
 #                                  ^ the metrics/status listener is unauthenticated;
@@ -116,8 +120,10 @@ curl http://localhost:3000/v1/chat/completions \
 ```
 
 Edit `resources.yaml` and send `SIGHUP` (`docker kill -s HUP aisix`) to apply changes with
-no restart — an invalid file is rejected whole and the last good configuration keeps
-serving. Check a file before booting with `aisix validate --resources resources.yaml`.
+no restart. The file is loaded exactly as etcd is: a resource that does not load is dropped
+and reported on `/status/config` while the rest serve, and a file that cannot be read at all
+keeps the last configuration serving. Check a file before booting with
+`aisix validate --resources resources.yaml`.
 
 Full walkthrough: the
 [Gateway Quickstart](https://docs.api7.ai/ai-gateway/getting-started/gateway-quickstart) ·
@@ -192,9 +198,9 @@ Covered by 183 end-to-end scenario files (496 cases) that run against real gatew
   telemetry.
 - **Declarative configuration** — one `resources.yaml` carries all ten resource collections
   (provider keys, models, caller keys, guardrails, MCP servers, A2A agents, cache policies,
-  observability exporters, rate-limit policies, OIDC providers), validated against the same
-  JSON Schemas the gateway uses at runtime. `aisix validate` checks a file offline; `SIGHUP`
-  reloads it atomically.
+  observability exporters, rate-limit policies, OIDC providers) as the same documents the
+  gateway reads from etcd, loaded by the same code. `aisix validate` checks a file offline;
+  `SIGHUP` reloads it.
 - **Operational endpoints** — `/livez` and `/readyz` on the proxy listener; `/status/config`,
   `/status/ready`, `/status/models`, and Prometheus `/metrics` on a dedicated metrics
   listener (`:9090`). The admin listener (`:3001`) additionally serves a **read-only**
@@ -279,8 +285,8 @@ wires the crates together.
 
 ```text
 crates/
-├── aisix-core           Config, snapshot, resource model, resources.yaml source, errors
-├── aisix-etcd           Config provider + watch supervisor
+├── aisix-core           Config, snapshot, resource model, errors
+├── aisix-etcd           Config providers (etcd, resources.yaml) + watch supervisor
 ├── aisix-gateway        Hub & bridge, SSE parser, provider trait
 ├── aisix-proxy          /v1/*, /mcp, /a2a handlers, routing, middleware
 ├── aisix-admin          Read-only resource surface + playground + OpenAPI

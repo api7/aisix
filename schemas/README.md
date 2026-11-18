@@ -37,13 +37,13 @@ while the etcd prefix groups a collection of instances.
 
 ## Strictness: these files describe the write contract
 
-The published schemas carry the **write contract** for self-managed
-declarative writes: `aisix validate --resources` checks a file offline,
-and the `resources_file` source enforces the same shape at boot and
-SIGHUP. A payload that fails them — including unknown fields, where a
-resource closes them — is rejected on those paths. They are generated
-from the same producers the in-repo strict validators compile, so the
-published files and the gateway's own validators cannot drift.
+The published schemas carry the **write contract**: what a writer of
+resource documents — the control plane, or anyone writing etcd or a
+resources file by hand — should produce. They are generated from the same
+producers the in-repo strict validators compile, so the published files
+and the gateway's own validators cannot drift. The gateway itself reads
+every document, from etcd and from a `resources_file` alike, against the
+lenient schemas in `resources-lenient/`.
 
 Four top-level resources intentionally **omit**
 `additionalProperties: false` even on the write contract (the list is

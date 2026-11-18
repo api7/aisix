@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { parse as parseYaml } from "yaml";
 import {
   EtcdClient,
   etcdEndpoint,
@@ -18,8 +19,8 @@ import {
 // Anonymous MCP access must survive `aisix export` into a resources file:
 // the file-mode gateway serves an uncredentialed caller as the same bound
 // API key the etcd-backed gateway does. The control plane writes that key
-// as `anonymous.api_key_id`, a resource id; a resources file derives its
-// ids from entry names, so the export has to name the key instead.
+// as `anonymous.api_key_id`, a resource id, and the export carries the
+// settings row and the key under the ids the control plane gave them.
 
 const execFileP = promisify(execFile);
 const BIN_PATH =
@@ -35,6 +36,7 @@ describe("aisix export: anonymous MCP access bound to an api key", () => {
   let docs: McpUpstream | undefined;
   let exported = "";
   let exportStderr = "";
+  let principalId = "";
 
   const post = async (app: SpawnedApp, path: string, body: unknown) => {
     const res = await fetch(`${app.proxyUrl}${path}`, {
@@ -93,6 +95,7 @@ describe("aisix export: anonymous MCP access bound to an api key", () => {
       allowed_models: [],
       mcp_access: { allow: ["docs__*"] },
     });
+    principalId = principal.id;
     // Both allowlist spellings, the way the control plane projects them.
     await seed.update("mcp_auth_settings", randomUUID(), {
       anonymous: {
@@ -125,6 +128,12 @@ describe("aisix export: anonymous MCP access bound to an api key", () => {
 
   test("the exported file serves anonymous callers as the etcd gateway does", async () => {
     expect(exportStderr).not.toContain("anonymous");
+    const doc = parseYaml(exported) as {
+      api_keys: Array<{ id: string }>;
+      mcp_auth_settings: Array<{ anonymous: { api_key_id: string } }>;
+    };
+    expect(doc.mcp_auth_settings[0]!.anonymous.api_key_id).toBe(principalId);
+    expect(doc.api_keys.map((k) => k.id)).toContain(principalId);
     fileApp = await spawnApp({ resourcesFile: exported });
     for (const [label, app] of [["etcd", etcdApp!], ["file", fileApp]] as const) {
       const listed = await anonymousTools(app, "/mcp/docs");

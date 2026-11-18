@@ -58,9 +58,9 @@ mapfile -t SHAPES < <("$TRAINER" --list-shapes)
 
 # ---- gateway training config -------------------------------------------------
 # Modeled on the committed bench topology (bench/onthebench/run-baseline.sh):
-# standalone resources_file mode, no etcd, one mock upstream, one api key from
-# env. Default observability posture stays ON (the metrics recording path must
-# train hot); only the prometheus listener address moves off :9090 so a
+# standalone resources_file mode, no etcd, one mock upstream, one api key
+# (`pgo-token`). Default observability posture stays ON (the metrics recording
+# path must train hot); only the prometheus listener address moves off :9090 so a
 # training run can never collide with a gateway already running on the host.
 cat > "$PGO_DIR/config.yaml" <<EOF
 resources_file: "$PGO_DIR/resources.yaml"
@@ -74,49 +74,58 @@ observability:
       addr: "127.0.0.1:$METRICS_PORT"
 EOF
 cat > "$PGO_DIR/resources.yaml" <<EOF
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: pgo-openai
+  - id: 1d4c9a46-dd2b-4dea-8acf-76f5a35cc725
+    display_name: pgo-openai
     provider: openai
     adapter: openai
     api_base: "http://127.0.0.1:$MOCK_PORT/v1"
     api_key: "sk-pgo-mock"
-  - display_name: pgo-anthropic
+  - id: 4bd09d38-b683-4938-8d11-dc6c6bb4ae7b
+    display_name: pgo-anthropic
     provider: anthropic
     api_base: "http://127.0.0.1:$MOCK_PORT"
     api_key: "sk-pgo-mock"
 models:
-  - display_name: gpt-4o-mini
+  - id: cc417944-9d8f-4e68-88d8-eda672d6bf79
+    display_name: gpt-4o-mini
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: pgo-openai
-  - display_name: gpt-4o-mini-b
+    provider_key_id: 1d4c9a46-dd2b-4dea-8acf-76f5a35cc725
+  - id: 4032998c-3981-454c-8ddc-c92de240471d
+    display_name: gpt-4o-mini-b
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: pgo-openai
-  - display_name: gpt-4o-mini-rl
+    provider_key_id: 1d4c9a46-dd2b-4dea-8acf-76f5a35cc725
+  - id: c05e0821-afb1-44cd-8cd2-f43f5a395ba1
+    display_name: gpt-4o-mini-rl
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: pgo-openai
+    provider_key_id: 1d4c9a46-dd2b-4dea-8acf-76f5a35cc725
     rate_limit:
       rpm: 1000000
       tpm: 1000000000
-  - display_name: gpt-router
+  - id: b14cc869-ada5-452e-877d-15c54b7e75ac
+    display_name: gpt-router
     routing:
       targets:
-        - model: gpt-4o-mini
-        - model: gpt-4o-mini-b
-  - display_name: claude-pgo
+        - model_id: cc417944-9d8f-4e68-88d8-eda672d6bf79
+        - model_id: 4032998c-3981-454c-8ddc-c92de240471d
+  - id: 0333c9ee-ad2d-4158-8c34-3454eb598c6a
+    display_name: claude-pgo
     provider: anthropic
     model_name: claude-pgo
-    provider_key: pgo-anthropic
-  - display_name: text-embedding-mock
+    provider_key_id: 4bd09d38-b683-4938-8d11-dc6c6bb4ae7b
+  - id: 2e5485b6-4997-4aa4-8b4e-47455dc791b4
+    display_name: text-embedding-mock
     provider: openai
     model_name: text-embedding-mock
-    provider_key: pgo-openai
+    provider_key_id: 1d4c9a46-dd2b-4dea-8acf-76f5a35cc725
 api_keys:
-  - display_name: pgo-trainer
-    key_env: PGO_TRAIN_KEY
+  - id: 362a91d1-3822-4eda-84ca-f980d920a1d2
+    display_name: pgo-trainer
+    key_hash: 501e03eb0d5b03f9854eb195efd83a7593ab4753ae757c8874113aa7bae6c0a6
     allowed_models: ["*"]
 EOF
 
@@ -127,7 +136,6 @@ while read -r v; do unset "$v"; done < <(compgen -v | grep '^AISIX_' || true)
 # ---- one gateway lifetime per shape -------------------------------------------
 for shape in "${SHAPES[@]}"; do
     echo "== shape: $shape ==" >&2
-    PGO_TRAIN_KEY=pgo-token \
     LLVM_PROFILE_FILE="$PGO_DIR/aisix-$shape-%p.profraw" \
         "$BIN" --config "$PGO_DIR/config.yaml" > "$PGO_DIR/gateway-$shape.log" 2>&1 &
     GW_PID=$!

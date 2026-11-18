@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { parse as parseYaml } from "yaml";
 import {
   EtcdClient,
   etcdEndpoint,
@@ -22,8 +23,10 @@ import {
 // written straight to etcd, as the control plane does in managed mode).
 // `aisix export` reads that etcd store and emits a resources.yaml; a
 // second, file-mode gateway loads the exported file and must be
-// observably identical to the etcd-backed one — same /v1/models listing,
-// same chat completion, same allowed_models 403. The exported file also
+// observably identical to the etcd-backed one — every resource under the
+// id the control plane gave it, the same /v1/models listing, the same chat
+// completion, the same allowed_models 403, and a cache policy scoped to
+// the caller key by that key's id still applying. The exported file also
 // must carry no live credential at default settings; the provider
 // secret is replaced with a ${VAR} placeholder the file-mode gateway
 // interpolates from its environment.
@@ -53,6 +56,7 @@ describe("aisix export: etcd → export → file round-trip", () => {
   let fileApp: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let etcdReachable = false;
+  const ids: Record<string, string> = {};
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -76,21 +80,35 @@ describe("aisix export: etcd → export → file round-trip", () => {
       api_key: PROVIDER_SECRET,
       api_base: `${upstream.baseUrl}/v1`,
     });
-    await seed.createModel({
+    const allowed = await seed.createModel({
       display_name: "rt-allowed",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await seed.createModel({
+    const forbidden = await seed.createModel({
       display_name: "rt-forbidden",
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
-    await seed.createApiKey({
+    const key = await seed.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: ["rt-allowed"],
+      allowed_model_ids: [allowed.id],
+    });
+    // Scoped to the caller key by its id: the reference a file could not
+    // carry while its ids were derived from entry names.
+    const policy = await seed.createCachePolicy({
+      name: "rt-per-key-cache",
+      enabled: true,
+      applies_to: `api_key:${key.id}`,
+    });
+    Object.assign(ids, {
+      pk: pk.id,
+      allowed: allowed.id,
+      forbidden: forbidden.id,
+      key: key.id,
+      policy: policy.id,
     });
 
     // etcd propagates asynchronously — gate on the allowed model serving
@@ -140,10 +158,39 @@ describe("aisix export: etcd → export → file round-trip", () => {
       expect(stderr).toContain(v);
     }
 
+    // Every entry is written under its etcd id, references as stored.
+    const doc = parseYaml(yaml) as Record<string, Array<Record<string, unknown>>>;
+    const idsOf = (kind: string) => doc[kind]!.map((e) => e.id).sort();
+    expect(idsOf("provider_keys")).toEqual([ids.pk]);
+    expect(idsOf("models")).toEqual([ids.allowed, ids.forbidden].sort());
+    expect(idsOf("api_keys")).toEqual([ids.key]);
+    expect(doc.api_keys![0]!.allowed_model_ids).toEqual([ids.allowed]);
+    expect(doc.cache_policies![0]).toMatchObject({
+      id: ids.policy,
+      applies_to: `api_key:${ids.key}`,
+    });
+
     // 3) Load the exported file into a file-mode gateway, supplying the
     // real secret through the placeholder variables the export emitted.
     const extraEnv = Object.fromEntries(vars.map((v) => [v, PROVIDER_SECRET]));
-    fileApp = await spawnApp({ resourcesFile: yaml, extraEnv });
+    fileApp = await spawnApp({
+      resourcesFile: yaml,
+      extraEnv,
+      admin: true,
+      exposeDebugHeaders: true,
+    });
+
+    // The file-mode gateway serves each resource under the control-plane id.
+    const listIds = async (kind: string) => {
+      const res = await fetch(`${fileApp!.adminUrl}/admin/v1/${kind}`, {
+        headers: { authorization: `Bearer ${fileApp!.adminKey}` },
+      });
+      expect(res.status).toBe(200);
+      return ((await res.json()) as Array<{ id: string }>).map((e) => e.id).sort();
+    };
+    expect(await listIds("models")).toEqual([ids.allowed, ids.forbidden].sort());
+    expect(await listIds("api_keys")).toEqual([ids.key]);
+    expect(await listIds("cache_policies")).toEqual([ids.policy]);
 
     const fileProxy = new ProxyClient(fileApp.proxyUrl, CALLER_PLAINTEXT);
     const etcdProxy = new ProxyClient(etcdApp.proxyUrl, CALLER_PLAINTEXT);
@@ -199,6 +246,30 @@ describe("aisix export: etcd → export → file round-trip", () => {
       return { type: e.type, code: e.code };
     };
     expect(envelope(fileBlocked.body)).toEqual(envelope(etcdBlocked.body));
+
+    // 4d) The cache policy scoped by the caller key's id applies on the
+    // file side: the repeat is served from cache and never reaches the
+    // upstream.
+    const prompt = `cache-${randomUUID()}`;
+    const cachedChat = () =>
+      fetch(`${fileApp!.proxyUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ model: "rt-allowed", messages: [{ role: "user", content: prompt }] }),
+      });
+    const first = await cachedChat();
+    expect(first.status).toBe(200);
+    expect(first.headers.get("x-aisix-cache")).toBe("miss");
+    await first.text();
+    const hitsBefore = upstream.receivedRequests.length;
+    const second = await cachedChat();
+    expect(second.status).toBe(200);
+    expect(second.headers.get("x-aisix-cache")).toBe("hit");
+    await second.text();
+    expect(upstream.receivedRequests.length).toBe(hitsBefore);
   });
 
   test("default export redacts a live secret on every secret-bearing kind", async (ctx) => {

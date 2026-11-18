@@ -1,10 +1,5 @@
-import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
@@ -18,7 +13,6 @@ import {
 } from "../harness/index.js";
 import { pickFreePort } from "../harness/ports.js";
 
-const execFileP = promisify(execFile);
 
 // E2E: every place a document points at a Model may name it by resource
 // id (`<field>_id`) instead of by display name. The id decides when
@@ -798,128 +792,4 @@ describe("model references by resource id", () => {
     expect((await chat("mr-cache-renamed-v2", prompt)).cache).toBe("miss");
     expect((await chat("mr-cache-renamed-v2", prompt)).cache).toBe("hit");
   });
-});
-
-// The id spelling is a control-plane projection: a resources file derives
-// its ids from its own entry names, so an id written there could never
-// resolve. `aisix validate` refuses each of them by name rather than
-// loading a file whose references silently point at nothing.
-describe("resources file: every model-reference id spelling is refused", () => {
-  const BIN_PATH =
-    process.env.AISIX_BIN ??
-    join(process.cwd(), "..", "..", "target", "debug", "aisix");
-
-  const PRELUDE = [
-    '_format_version: "1"',
-    "provider_keys:",
-    "  - display_name: pk",
-    "    api_key: sk-x",
-    "models:",
-    "  - display_name: m",
-    "    provider: openai",
-    "    model_name: gpt-4o",
-    "    provider_key: pk",
-    "  - display_name: e",
-    "    provider: openai",
-    "    model_name: embed",
-    "    provider_key: pk",
-    "    embedding:",
-    "      dimensions: 4",
-  ].join("\n");
-
-  const ID = "11111111-1111-1111-1111-111111111111";
-
-  const CASES: { label: string; field: string; withId: string; without: string }[] =
-    [
-      {
-        label: "routing target",
-        field: "model_id",
-        withId: `\n  - display_name: g\n    routing:\n      targets:\n        - model: m\n          model_id: ${ID}\n`,
-        without: `\n  - display_name: g\n    routing:\n      targets:\n        - model: m\n`,
-      },
-      {
-        label: "ensemble panel member",
-        field: "model_id",
-        withId: `\n  - display_name: p\n    ensemble:\n      panel:\n        - model: m\n          model_id: ${ID}\n      judge:\n        model: m\n`,
-        without: `\n  - display_name: p\n    ensemble:\n      panel:\n        - model: m\n      judge:\n        model: m\n`,
-      },
-      {
-        label: "ensemble judge",
-        field: "model_id",
-        withId: `\n  - display_name: j\n    ensemble:\n      panel:\n        - model: m\n      judge:\n        model: m\n        model_id: ${ID}\n`,
-        without: `\n  - display_name: j\n    ensemble:\n      panel:\n        - model: m\n      judge:\n        model: m\n`,
-      },
-      {
-        label: "semantic embedding model",
-        field: "embedding_model_id",
-        withId: `\n  - display_name: s\n    semantic:\n      embedding_model: e\n      embedding_model_id: ${ID}\n      routes:\n        - name: r\n          target: m\n          examples: ["hi"]\n      default: m\n      match:\n        threshold: 0.5\n`,
-        without: `\n  - display_name: s\n    semantic:\n      embedding_model: e\n      routes:\n        - name: r\n          target: m\n          examples: ["hi"]\n      default: m\n      match:\n        threshold: 0.5\n`,
-      },
-      {
-        label: "semantic default",
-        field: "default_id",
-        withId: `\n  - display_name: s\n    semantic:\n      embedding_model: e\n      routes:\n        - name: r\n          target: m\n          examples: ["hi"]\n      default: m\n      default_id: ${ID}\n      match:\n        threshold: 0.5\n`,
-        without: `\n  - display_name: s\n    semantic:\n      embedding_model: e\n      routes:\n        - name: r\n          target: m\n          examples: ["hi"]\n      default: m\n      match:\n        threshold: 0.5\n`,
-      },
-      {
-        label: "semantic route target",
-        field: "target_id",
-        withId: `\n  - display_name: s\n    semantic:\n      embedding_model: e\n      routes:\n        - name: r\n          target: m\n          target_id: ${ID}\n          examples: ["hi"]\n      default: m\n      match:\n        threshold: 0.5\n`,
-        without: `\n  - display_name: s\n    semantic:\n      embedding_model: e\n      routes:\n        - name: r\n          target: m\n          examples: ["hi"]\n      default: m\n      match:\n        threshold: 0.5\n`,
-      },
-      {
-        label: "semantic on_embedding_failure target",
-        field: "target_id",
-        withId: `\n  - display_name: s\n    semantic:\n      embedding_model: e\n      routes:\n        - name: r\n          target: m\n          examples: ["hi"]\n      default: m\n      match:\n        threshold: 0.5\n      on_embedding_failure:\n        target: m\n        target_id: ${ID}\n`,
-        without: `\n  - display_name: s\n    semantic:\n      embedding_model: e\n      routes:\n        - name: r\n          target: m\n          examples: ["hi"]\n      default: m\n      match:\n        threshold: 0.5\n      on_embedding_failure:\n        target: m\n`,
-      },
-      {
-        label: "cache policy model scope",
-        field: "applies_to_model_id",
-        withId: `\ncache_policies:\n  - name: c\n    applies_to: all\n    applies_to_model_id: ${ID}\n`,
-        without: `\ncache_policies:\n  - name: c\n    applies_to: all\n`,
-      },
-      {
-        label: "cache policy similarity embedder",
-        field: "embedding_model_id",
-        withId: `\ncache_policies:\n  - name: c\n    semantic:\n      embedding_model: e\n      embedding_model_id: ${ID}\n      threshold: 0.9\n`,
-        without: `\ncache_policies:\n  - name: c\n    semantic:\n      embedding_model: e\n      threshold: 0.9\n`,
-      },
-      {
-        label: "semantic guardrail embedder",
-        field: "embedding_model_id",
-        withId: `\nguardrails:\n  - name: g\n    kind: semantic\n    embedding_model: e\n    embedding_model_id: ${ID}\n    deny_examples: ["x"]\n    deny_threshold: 0.8\n`,
-        without: `\nguardrails:\n  - name: g\n    kind: semantic\n    embedding_model: e\n    deny_examples: ["x"]\n    deny_threshold: 0.8\n`,
-      },
-    ];
-
-  test("each id field is rejected by name, and the same file without it validates", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "aisix-model-ref-ids-"));
-    try {
-      for (const { label, field, withId, without } of CASES) {
-        const bad = join(dir, `bad-${label.replace(/\W+/g, "-")}.yaml`);
-        await writeFile(bad, PRELUDE + withId, "utf8");
-        let failure: (Error & { code?: number; stderr?: string }) | undefined;
-        try {
-          await execFileP(BIN_PATH, ["validate", "--resources", bad]);
-        } catch (e) {
-          failure = e as Error & { code?: number; stderr?: string };
-        }
-        if (!failure) throw new Error(`${label}: expected \`aisix validate\` to fail`);
-        expect(failure.code, label).toBe(1);
-        expect(String(failure.stderr), label).toContain(
-          `does not accept \`${field}\``,
-        );
-
-        // The same file with the id field removed validates, so the
-        // refusal is that field and not anything else in the fixture.
-        const good = join(dir, `good-${label.replace(/\W+/g, "-")}.yaml`);
-        await writeFile(good, PRELUDE + without, "utf8");
-        const ok = await execFileP(BIN_PATH, ["validate", "--resources", good]);
-        expect(ok.stdout, label).toContain("OK:");
-      }
-    } finally {
-      await rm(dir, { recursive: true, force: true });
-    }
-  }, 60_000);
 });

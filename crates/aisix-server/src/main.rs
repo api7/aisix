@@ -1358,9 +1358,9 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 readyz_watch_status.snapshot().last_apply_age
             }))
         }
-        // File mode: the snapshot is applied synchronously at boot /
-        // SIGHUP and there is no watch stream to go stale — report the
-        // config as always freshly applied.
+        // File mode: the file changes only when it is re-read on SIGHUP,
+        // so there is no watch stream to go stale — report the config as
+        // always freshly applied.
         None => proxy_state.with_config_apply_age(Arc::new(|| Some(std::time::Duration::ZERO))),
     };
     register_memory_probes(&metrics, &proxy_state);
@@ -2615,10 +2615,10 @@ const FIRST_CONFIG_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 /// read is still in flight, and every request is rejected as an unknown API
 /// key.
 ///
-/// The paths that already hold a configuration pay nothing: file mode loads
-/// synchronously and boot-fatally before this point, and an etcd boot seeded
-/// from the on-disk snapshot cache has applied that snapshot before the watch
-/// task is spawned. A cold etcd boot is the only one that waits, and it waits
+/// File mode has read its file boot-fatally before this point and waits only
+/// for the supervisor's first apply of it; an etcd boot seeded from the
+/// on-disk snapshot cache has applied that snapshot before the watch task is
+/// spawned. A cold etcd boot is the only one that waits on its source, and it waits
 /// indefinitely — the watch supervisor owns the retry loop and its backoff,
 /// and `/status/ready` on the metrics listener answers 503 throughout.
 ///

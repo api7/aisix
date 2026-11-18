@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
+  fileId,
   EtcdClient,
   ProxyClient,
   SeedClient,
@@ -207,17 +208,19 @@ describe("status/models: standalone file source", () => {
     app = await spawnApp({
       admin: true,
       resourcesFile: `
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: file-status-models-pk
+  - id: ${fileId(`provider_keys/file-status-models-pk`)}
+    display_name: file-status-models-pk
     provider: openai
     api_key: sk-mock
     api_base: http://127.0.0.1:9/v1
 models:
-  - display_name: file-status-models-direct
+  - id: ${fileId(`models/file-status-models-direct`)}
+    display_name: file-status-models-direct
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: file-status-models-pk
+    provider_key_id: ${fileId(`provider_keys/file-status-models-pk`)}
 `,
     });
   });

@@ -23,11 +23,10 @@ import { pickFreePort } from "../harness/ports.js";
 
 // A semantic router whose JEV classifier names its direct model by
 // `model_id` — the shape the control plane projects — must keep working
-// after `aisix export` moves it into a resources file. A file derives its
-// ids from entry names, so the control-plane id cannot resolve there; the
-// export has to carry the reference by name, and the file-mode gateway has
-// to call that model and attribute the decision call to it, exactly as the
-// etcd-backed gateway does.
+// after `aisix export` moves it into a resources file: the export carries
+// the reference and the model under the control-plane id, and the
+// file-mode gateway has to call that model and attribute the decision call
+// to it, exactly as the etcd-backed gateway does.
 //
 // A real aisix DP + etcd, `aisix export`, then a second gateway in file
 // mode; System One and chat upstreams are local endpoints, and the usage
@@ -55,18 +54,6 @@ const TARGET_UPSTREAM_MODEL = "gpt-route-target";
 const DEFAULT_UPSTREAM_MODEL = "gpt-route-default";
 const PROMPT = "fix my python script";
 const EXPORT_TIMEOUT_MS = 30_000;
-
-// The resources file's id derivation: UUIDv5 of "<kind>/<identity>" in the
-// file-resource namespace.
-const FILE_RESOURCE_NAMESPACE = "63e50ab2-677a-54d3-8d1e-c0cb29ceae94";
-function fileResourceId(kind: string, identity: string): string {
-  const ns = Buffer.from(FILE_RESOURCE_NAMESPACE.replaceAll("-", ""), "hex");
-  const hash = createHash("sha1").update(ns).update(`${kind}/${identity}`).digest();
-  hash[6] = (hash[6]! & 0x0f) | 0x50;
-  hash[8] = (hash[8]! & 0x3f) | 0x80;
-  const hex = hash.subarray(0, 16).toString("hex");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
 
 interface DecisionCall {
   headers: IncomingHttpHeaders;
@@ -119,6 +106,7 @@ describe("aisix export: a classifier that names its direct model by id", () => {
   let decisions: Awaited<ReturnType<typeof startDecisionMock>> | undefined;
   let upstream: OpenAiUpstream | undefined;
   let exported = "";
+  let jevId = "";
 
   const slsEnv = {
     [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
@@ -192,6 +180,7 @@ describe("aisix export: a classifier that names its direct model by id", () => {
       model_name: JEV_UPSTREAM_MODEL,
       provider_key_id: jevKey.id,
     });
+    jevId = jev.id;
     // A direct model the classifier must refuse: its key is not typesafe.
     const notTypesafe = await seed.createModel({
       display_name: NOT_TYPESAFE_MODEL,
@@ -282,14 +271,10 @@ describe("aisix export: a classifier that names its direct model by id", () => {
     expect(children).toHaveLength(1);
     const child = children[0]!;
     expect(child.get("internal_call_purpose")).toBe("semantic_route_decision");
-    expect(child.get("model_id")).toBe(fileResourceId("models", JEV_MODEL));
+    expect(child.get("model_id")).toBe(jevId);
     expect(child.get("requested_model")).toBe(JEV_MODEL);
     expect(child.get("prompt_tokens")).toBe("300");
     expect(child.get("completion_tokens")).toBe("20");
-
-    // The inline pair the control plane writes for older gateways is not
-    // read beside `model_id`, so it is not exported either.
-    expect(exported).not.toContain("jev-inline-must-not-be-sent");
   });
 
   test("a classifier model on a non-typesafe key fails the same way on both sources", async () => {

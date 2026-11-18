@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { stringify as yamlStringify } from "yaml";
 import {
+  fileId,
   EtcdClient,
   ProxyClient,
   SeedClient,
@@ -479,19 +480,22 @@ describe("status/config: standalone file source", () => {
     upstream = await startOpenAiUpstream();
     app = await spawnApp({
       resourcesFile: `
-_format_version: "1"
+_format_version: "2"
 provider_keys:
-  - display_name: file-status-pk
+  - id: ${fileId(`provider_keys/file-status-pk`)}
+    display_name: file-status-pk
     provider: openai
     api_key: sk-mock
     api_base: ${upstream.baseUrl}/v1
 models:
-  - display_name: file-status-model
+  - id: ${fileId(`models/file-status-model`)}
+    display_name: file-status-model
     provider: openai
     model_name: gpt-4o-mini
-    provider_key: file-status-pk
+    provider_key_id: ${fileId(`provider_keys/file-status-pk`)}
 api_keys:
-  - display_name: file-status-caller
+  - id: ${fileId(`api_keys/file-status-caller`)}
+    display_name: file-status-caller
     key_hash: ${CALLER_KEY_HASH}
     allowed_models: ["file-status-model"]
 `,
