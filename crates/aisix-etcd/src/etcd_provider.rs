@@ -307,7 +307,10 @@ impl EtcdConfigProvider {
 /// server one index lookup, and it lies inside every range that
 /// authorizes reading the prefix.
 pub fn probe_key(prefix: &str) -> String {
-    format!("{}/aisix-liveness-probe", prefix.trim_end_matches('/'))
+    format!(
+        "{}/aisix-liveness-probe",
+        prefix.strip_suffix('/').unwrap_or(prefix)
+    )
 }
 
 impl EtcdConfigProvider {

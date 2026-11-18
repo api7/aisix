@@ -2200,7 +2200,9 @@ struct PrefixLoad {
 impl PrefixLoad {
     /// The revision the snapshot as a whole reflects, and what the
     /// heartbeat reports as `applied_revision`: the one revision every
-    /// prefix was read at (see [`Supervisor::load_all_prefixes`]).
+    /// prefix that answered was read at (see
+    /// [`Supervisor::load_all_prefixes`]). Rows retained from a refused
+    /// prefix are not covered by it.
     ///
     /// A prefix whose read was refused reports no revision and does not
     /// lower the answer: it contributed no rows this cycle, so nothing in

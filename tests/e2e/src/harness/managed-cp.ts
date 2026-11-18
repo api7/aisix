@@ -275,6 +275,9 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
     if (socket.remotePort !== undefined) connectionByPort.set(socket.remotePort, accepted);
     if (accepted === holdNth) {
       heldSocket = socket;
+      socket.on("close", () => {
+        if (heldSocket === socket) heldSocket = undefined;
+      });
     } else if (etcdPath === "reset") {
       socket.resetAndDestroy();
     } else if (etcdPath === "blackhole") {
@@ -294,7 +297,7 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
   cp.holdEtcdConnection = (n) => {
     holdNth = n;
   };
-  cp.etcdConnectionHeld = () => heldSocket !== undefined;
+  cp.etcdConnectionHeld = () => heldSocket !== undefined && !heldSocket.destroyed;
   cp.stallEtcdConnection = (n) => {
     const pair = served.get(n);
     if (!pair) throw new Error(`etcd connection ${n} is not being served`);

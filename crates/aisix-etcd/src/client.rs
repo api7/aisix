@@ -1044,6 +1044,10 @@ mod reauth_tests {
             .await
             .expect_err("the first connection never answers");
         assert!(matches!(err, CallError::CallTimeout(_)), "{err:?}");
+        assert!(
+            client.cached().is_none(),
+            "the timed-out connection must be retired"
+        );
 
         let err = read_on(&client, Some(Duration::from_secs(5)))
             .await
@@ -1064,6 +1068,10 @@ mod reauth_tests {
         let client = LazyEtcdClient::new(vec![endpoint], None, None);
         for _ in 0..2 {
             read_on(&client, None).await.expect_err("Unavailable");
+            assert!(
+                client.cached().is_some(),
+                "an answer from etcd keeps the connection"
+            );
         }
         assert_eq!(connections.load(Ordering::Relaxed), 1);
     }
@@ -1107,6 +1115,10 @@ mod reauth_tests {
             panic!("{first:?}");
         };
         assert!(failed_on_transport(err), "{err:?}");
+        assert!(
+            client.cached().is_none(),
+            "the broken connection must be retired"
+        );
         read_on(&client, Some(Duration::from_secs(5)))
             .await
             .expect_err("Unavailable");

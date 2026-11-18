@@ -50,7 +50,12 @@ describe("heartbeat applied_revisions", () => {
   const putCatalog = async (): Promise<number> => {
     const key = `${globalPrefix}pricing/${randomUUID()}`;
     await etcd!.put(key, JSON.stringify({ key: `vendor/${randomUUID()}`, input_per_1k: 1, output_per_1k: 1 }));
-    return (await etcd!.modRevision(key))!;
+    return revisionOf(key);
+  };
+  const revisionOf = async (key: string): Promise<number> => {
+    const revision = await etcd!.modRevision(key);
+    if (!Number.isSafeInteger(revision) || revision! <= 0) throw new Error(`no revision for ${key}: ${revision}`);
+    return revision!;
   };
 
   beforeAll(async () => {
@@ -72,6 +77,8 @@ describe("heartbeat applied_revisions", () => {
     await waitConfigPropagation(async () => cp!.etcdConnectionHeld(), 30_000);
     catalogRevision = await putCatalog();
     cp.releaseEtcdConnection();
+    // The first live read has completed once both prefixes are reported.
+    await waitConfigPropagation(async () => Object.keys(latest()?.applied_revisions ?? {}).length === 2, 30_000);
   });
 
   afterAll(async () => {
@@ -89,7 +96,7 @@ describe("heartbeat applied_revisions", () => {
     if (!etcdReachable || !app || !cp) return ctx.skip();
     const key = `${envPrefix}models/rejected-${randomUUID()}`;
     await etcd!.put(key, "{not json");
-    const revision = (await etcd!.modRevision(key))!;
+    const revision = await revisionOf(key);
     await waitConfigPropagation(reaches(envPrefix, revision), 30_000);
   }, 60_000);
 
