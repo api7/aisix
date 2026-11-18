@@ -28,11 +28,8 @@ use aisix_core::models::{
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, Model};
-use aisix_gateway::{EmbeddingRequest, EmbeddingUsageSource, EmbeddingVector};
-use aisix_obs::{
-    GatewayEmbeddingCall, GatewayEmbeddingOutcome, GatewayEmbeddingPurpose,
-    GatewayEmbeddingUsageSource, SemanticAccessLog, SemanticFallback,
-};
+use aisix_gateway::{EmbeddingRequest, EmbeddingVector};
+use aisix_obs::{InternalCallPurpose, SemanticAccessLog, SemanticFallback};
 
 use crate::error::ProxyError;
 use crate::routing::{AttemptModel, RoutingRequest};
@@ -318,7 +315,16 @@ pub(crate) async fn resolve(
     }
 
     let pick = match &semantic.classifier {
-        Some(classifier) => match classify(snapshot, &semantic.routes, classifier, prompt).await {
+        Some(classifier) => match classify(
+            snapshot,
+            &semantic.routes,
+            classifier,
+            prompt,
+            request_id,
+            routing.client,
+        )
+        .await
+        {
             Ok((picked, confidence)) => {
                 let confident = confidence >= classifier.min_confidence;
                 Ok(Pick {
@@ -787,7 +793,7 @@ async fn decide_by_embedding(
         &embed_entry,
         embed_deadline,
         request_id,
-        GatewayEmbeddingPurpose::SemanticRoute,
+        InternalCallPurpose::SemanticRouteEmbedding,
         &to_embed,
     )
     .await
@@ -952,14 +958,120 @@ struct ClassifierAnswer {
 /// log, and the caller applies `classifier.on_failure`.
 ///
 /// Detached, like the embedding sub-call: it is a call the GATEWAY decided
-/// to make, not one the caller addressed, and it is not metered as one.
+/// to make, not one the caller addressed, so it is recorded as the
+/// request's child usage event rather than as its target.
 async fn classify(
     snapshot: &AisixSnapshot,
     routes: &[SemanticRoute],
     classifier: &SemanticClassifier,
     prompt: &str,
+    request_id: &str,
+    client: Option<&crate::client_ip::ClientContext>,
 ) -> Result<(usize, f64), (DecisionFailure, String)> {
-    crate::attribution::detached(classify_inner(snapshot, routes, classifier, prompt)).await
+    crate::attribution::detached(classify_inner(
+        snapshot, routes, classifier, prompt, request_id, client,
+    ))
+    .await
+}
+
+/// What a classifier call goes out on: a direct model when the classifier
+/// names one by `model_id`, else the inline Provider Key and model name.
+struct ClassifierTarget {
+    pk: Arc<ResourceEntry<aisix_core::ProviderKey>>,
+    model: Option<Arc<ResourceEntry<Model>>>,
+    upstream_model: String,
+}
+
+fn classifier_target(
+    snapshot: &AisixSnapshot,
+    classifier: &SemanticClassifier,
+) -> Result<ClassifierTarget, String> {
+    let (pk, model) = match classifier.model_id.as_deref() {
+        Some(id) => {
+            let entry = snapshot
+                .models
+                .get_by_id(id)
+                .ok_or_else(|| format!("classifier model_id {id:?} matches no model"))?;
+            let m = &entry.value;
+            if m.is_routing() || m.is_semantic() || m.is_ensemble() || m.is_embedding() {
+                return Err(format!(
+                    "classifier model {:?} is not a direct model",
+                    m.display_name
+                ));
+            }
+            let pk =
+                crate::dispatch::resolve_provider_key(snapshot, m).map_err(|e| e.to_string())?;
+            (pk, Some(entry))
+        }
+        None => {
+            let pk = snapshot
+                .provider_keys
+                .get_by_id(&classifier.provider_key_id)
+                .ok_or_else(|| {
+                    format!(
+                        "classifier provider_key_id {:?} matches no provider key",
+                        classifier.provider_key_id
+                    )
+                })?;
+            (pk, None)
+        }
+    };
+    if pk.value.provider != TYPESAFE_PROVIDER {
+        return Err(format!(
+            "classifier provider key {:?} has provider {:?}, not {TYPESAFE_PROVIDER:?}",
+            pk.value.display_name, pk.value.provider
+        ));
+    }
+    let upstream_model = match &model {
+        Some(entry) => {
+            crate::dispatch::require_api_key(&pk.value, &entry.value).map_err(|e| e.to_string())?;
+            crate::dispatch::require_upstream_model(&entry.value)
+                .map_err(|e| e.to_string())?
+                .to_string()
+        }
+        None => classifier.model.clone(),
+    };
+    Ok(ClassifierTarget {
+        pk,
+        model,
+        upstream_model,
+    })
+}
+
+/// The classifier request's headers. A classifier that names a direct
+/// model sends what a `POST /v1/systemone` to that model sends: the request
+/// id and the Provider Key's configured request headers.
+fn classifier_headers(
+    target: &ClassifierTarget,
+    request_id: &str,
+    client: Option<&crate::client_ip::ClientContext>,
+) -> Result<reqwest::header::HeaderMap, String> {
+    use reqwest::header::{HeaderName, HeaderValue};
+    let pk = &target.pk.value;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", pk.api_key))
+            .map_err(|_| "classifier api key contains invalid header chars".to_owned())?,
+    );
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let Some(model) = &target.model else {
+        return Ok(headers);
+    };
+    if let Ok(id) = HeaderValue::from_str(request_id) {
+        headers.insert(HeaderName::from_static("x-aisix-request-id"), id);
+    }
+    let ctx = match client {
+        Some(client) => {
+            crate::dispatch::upstream_header_ctx(pk, &target.pk.id, &model.value, &model.id, client)
+        }
+        None => aisix_gateway::UpstreamHeaderContext::from_overrides(pk.request.as_ref()),
+    };
+    aisix_gateway::apply_request_headers(&mut headers, &ctx);
+    Ok(headers)
 }
 
 async fn classify_inner(
@@ -967,39 +1079,16 @@ async fn classify_inner(
     routes: &[SemanticRoute],
     classifier: &SemanticClassifier,
     prompt: &str,
+    request_id: &str,
+    client: Option<&crate::client_ip::ClientContext>,
 ) -> Result<(usize, f64), (DecisionFailure, String)> {
     use DecisionFailure::{ClassifierInvalidResponse, ClassifierUnavailable, ClassifierUpstream};
-    let pk = snapshot
-        .provider_keys
-        .get_by_id(&classifier.provider_key_id)
-        .ok_or_else(|| {
-            (
-                ClassifierUnavailable,
-                format!(
-                    "classifier provider_key_id {:?} matches no provider key",
-                    classifier.provider_key_id
-                ),
-            )
-        })?;
-    if pk.value.provider != TYPESAFE_PROVIDER {
-        return Err((
-            ClassifierUnavailable,
-            format!(
-                "classifier provider key {:?} has provider {:?}, not {TYPESAFE_PROVIDER:?}",
-                pk.value.display_name, pk.value.provider
-            ),
-        ));
-    }
-    let base = pk
-        .value
-        .api_base
-        .as_deref()
-        .filter(|b| !b.is_empty())
-        .unwrap_or(TYPESAFE_DEFAULT_API_BASE)
-        .trim_end_matches('/');
+    let target =
+        classifier_target(snapshot, classifier).map_err(|msg| (ClassifierUnavailable, msg))?;
+    let pk = &target.pk.value;
     let body = serde_json::to_vec(&ClassifierRequest {
         state: prompt,
-        model: &classifier.model,
+        model: &target.upstream_model,
         questions: ClassifierQuestions(routes),
     })
     .map_err(|e| {
@@ -1008,26 +1097,75 @@ async fn classify_inner(
             format!("encoding the classifier request: {e}"),
         )
     })?;
-    let resp = crate::http_client::client_for(pk.value.upstream_connection().as_ref())
-        .post(format!("{base}/v1/systemone"))
-        .bearer_auth(&pk.value.api_key)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
+    let body = match &target.model {
+        Some(_) => crate::decisions::apply_body_overrides(pk, bytes::Bytes::from(body))
+            .map_err(|e| (ClassifierUnavailable, e.to_string()))?,
+        None => bytes::Bytes::from(body),
+    };
+    let headers = classifier_headers(&target, request_id, client)
+        .map_err(|msg| (ClassifierUnavailable, msg))?;
+
+    let mut child = crate::attribution::begin_internal_call(internal_call(
+        InternalCallPurpose::SemanticRouteDecision,
+        crate::operation::SYSTEMONE.operation,
+        target.model.as_deref(),
+        &target.pk.id,
+    ));
+    let sent = crate::http_client::client_for(pk.upstream_connection().as_ref())
+        .post(crate::decisions::typesafe_systemone_url(pk))
+        .headers(headers)
         .timeout(classifier.timeout())
         .body(body)
         .send()
-        .await
-        .map_err(|e| DecisionFailure::of_classifier_transport(&e))?;
-    let status = resp.status();
+        .await;
+    let read = match sent {
+        Ok(resp) => {
+            let status = resp.status();
+            resp.bytes().await.map(|bytes| (status, bytes))
+        }
+        Err(e) => Err(e),
+    };
+    let mut call = child.settle();
+    let (status, bytes) = match read {
+        Ok(read) => read,
+        Err(e) => {
+            let (failure, message) = DecisionFailure::of_classifier_transport(&e);
+            let (code, class) = if e.is_timeout() {
+                (504, "timeout")
+            } else {
+                (502, "transport")
+            };
+            call.status_code = code;
+            call.error_class = class.to_owned();
+            call.error_message = crate::attempt::sanitize_error_message(&message);
+            child.record(call);
+            return Err((failure, message));
+        }
+    };
+    call.status_code = status.as_u16();
     if !status.is_success() {
-        return Err((
-            ClassifierUpstream,
-            format!("classifier returned HTTP {}", status.as_u16()),
-        ));
+        let message = format!("classifier returned HTTP {}", status.as_u16());
+        call.error_class = "upstream_status".to_owned();
+        call.error_message = message.clone();
+        child.record(call);
+        return Err((ClassifierUpstream, message));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| DecisionFailure::of_classifier_transport(&e))?;
+    // What the call cost is read the way a direct `/v1/systemone` call
+    // reads it, whatever the answer turns out to say.
+    let parsed = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+    if let Some(doc) = &parsed {
+        let usage = crate::decisions_convert::systemone_usage(doc).unwrap_or_default();
+        call.prompt_tokens = usage.input;
+        call.completion_tokens = usage.output;
+        call.provider_request_id = crate::usage_attr::provider_response_id(doc);
+        call.provider_model_version = crate::chat::sanitize_tag(
+            doc.get("model")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        );
+    }
+    child.record(call);
     // Neither error below repeats what the classifier answered: its
     // response can quote the prompt it was sent (`state`), and these
     // errors end up on the router's warn line.
@@ -1084,12 +1222,17 @@ fn candidate_for_target(snapshot: &AisixSnapshot, alias: &str) -> Result<Candida
 struct Eligible {
     attempts: Vec<AttemptModel>,
     group: Option<Arc<ResourceEntry<Model>>>,
+    /// Id of the picked target: the direct model, or the model group.
+    target_id: String,
     /// Whether the fallback displaced the primary.
     fell_back: bool,
 }
 
 impl Eligible {
+    /// The dispatch, with its target recorded as the request's
+    /// `route_target_model_id`.
     fn into_dispatch(self, route: Option<String>) -> SemanticDispatch {
+        crate::attribution::note_route_target(&self.target_id);
         SemanticDispatch {
             attempts: self.attempts,
             route,
@@ -1267,12 +1410,14 @@ fn select_eligible(
             "semantic route target unavailable; serving default",
         );
     }
+    let (target_id, group) = match candidate {
+        Candidate::Group(group) => (group.id.clone(), Some(group)),
+        Candidate::Direct(entry) => (entry.id.clone(), None),
+    };
     Ok(Eligible {
         attempts,
-        group: match candidate {
-            Candidate::Group(group) => Some(group),
-            Candidate::Direct(_) => None,
-        },
+        group,
+        target_id,
         fell_back,
     })
 }
@@ -1315,7 +1460,7 @@ pub(crate) async fn embed_texts(
     embed_entry: &ResourceEntry<Model>,
     timeout: Option<std::time::Duration>,
     request_id: &str,
-    purpose: GatewayEmbeddingPurpose,
+    purpose: InternalCallPurpose,
     texts: &[String],
 ) -> Result<Vec<Vec<f32>>, EmbedTextsError> {
     // Detached: this is a dispatch the GATEWAY decided to make — for a
@@ -1343,7 +1488,7 @@ async fn embed_texts_inner(
     embed_entry: &ResourceEntry<Model>,
     timeout: Option<std::time::Duration>,
     request_id: &str,
-    purpose: GatewayEmbeddingPurpose,
+    purpose: InternalCallPurpose,
     texts: &[String],
 ) -> Result<Vec<Vec<f32>>, EmbedTextsError> {
     let model = &embed_entry.value;
@@ -1352,7 +1497,6 @@ async fn embed_texts_inner(
     let bridge = crate::dispatch::resolve_bridge(hub, &pk_entry.value)
         .ok_or(ProxyError::ProviderUnavailable)?;
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
-    let audit_model_id = crate::attribution::capped_gateway_embedding_model_id(&embed_entry.id);
     let dimensions = model.embedding.as_ref().map(|e| e.dimensions);
 
     let req = EmbeddingRequest {
@@ -1381,42 +1525,36 @@ async fn embed_texts_inner(
         }
     };
 
-    // Keep this guard alive across the bridge await. If the downstream client
-    // cancels this parent request while the bridge is pending, its Drop writes
-    // a failed child audit directly to the shared parent ledger before the
-    // cancel emitter takes that ledger into the terminal 499 event.
-    let mut audit_call = crate::attribution::begin_gateway_embedding_call(purpose, &audit_model_id);
+    // Keep this guard alive across the bridge await: if the downstream client
+    // cancels the parent request while the bridge is pending, its Drop
+    // records the child as cancelled before the cancel emitter takes the
+    // ledger into the terminal 499 event.
+    let mut child = crate::attribution::begin_internal_call(internal_call(
+        purpose,
+        crate::operation::EMBEDDINGS.operation,
+        Some(embed_entry),
+        &pk_entry.id,
+    ));
     let response = bridge.embed(&req, &ctx).await;
-    let latency_ms = audit_call.settle();
+    let mut call = child.settle();
     let resp = match response {
         Ok(resp) => {
-            crate::attribution::note_gateway_embedding_call(GatewayEmbeddingCall {
-                count: 1,
-                purpose,
-                embedding_model_id: audit_model_id.clone(),
-                prompt_tokens: resp.usage.prompt_tokens,
-                total_tokens: resp.usage.total_tokens,
-                usage_source: match resp.usage.source {
-                    EmbeddingUsageSource::Reported => GatewayEmbeddingUsageSource::Reported,
-                    EmbeddingUsageSource::Unavailable => GatewayEmbeddingUsageSource::Unavailable,
-                },
-                latency_ms,
-                outcome: GatewayEmbeddingOutcome::Succeeded,
-            });
+            call.status_code = 200;
+            call.prompt_tokens = resp.usage.prompt_tokens;
+            call.total_tokens = resp.usage.upstream_total_tokens;
+            call.provider_model_version = crate::chat::sanitize_tag(resp.model.clone());
+            child.record(call);
             resp
         }
         Err(err) => {
-            crate::attribution::note_gateway_embedding_call(GatewayEmbeddingCall {
-                count: 1,
-                purpose,
-                embedding_model_id: audit_model_id,
-                prompt_tokens: 0,
-                total_tokens: 0,
-                usage_source: GatewayEmbeddingUsageSource::Unavailable,
-                latency_ms,
-                outcome: GatewayEmbeddingOutcome::Failed,
-            });
-            return Err(ProxyError::Bridge(err).into());
+            let err = EmbedTextsError::from(ProxyError::Bridge(err));
+            if let EmbedTextsError::Dispatch(proxy_err) = &err {
+                call.status_code = proxy_err.status().as_u16();
+                call.error_class = crate::attempt::error_class(proxy_err).to_string();
+            }
+            call.error_message = crate::attempt::sanitize_error_message(&embed_failure_text(&err));
+            child.record(call);
+            return Err(err);
         }
     };
     let mut data = resp.data;
@@ -1454,6 +1592,28 @@ async fn embed_texts_inner(
         )));
     }
     Ok(out)
+}
+
+/// One internal call as known before it goes out: what it is for, and the
+/// model it calls — `None` for an inline classifier, which names no model
+/// resource.
+fn internal_call(
+    purpose: InternalCallPurpose,
+    operation: &'static str,
+    model: Option<&ResourceEntry<Model>>,
+    provider_key_id: &str,
+) -> crate::attribution::InternalCall {
+    let (model_id, model_name) = model
+        .map(|m| (m.id.clone(), m.value.display_name.clone()))
+        .unwrap_or_default();
+    crate::attribution::InternalCall {
+        purpose: Some(purpose),
+        operation,
+        model_id,
+        model_name,
+        provider_key_id: provider_key_id.to_string(),
+        ..Default::default()
+    }
 }
 
 /// What a failed [`embed_texts`] call may say on a log line.
@@ -1627,7 +1787,7 @@ mod tests {
                 &embed_entry,
                 None,
                 "req-embed",
-                GatewayEmbeddingPurpose::SemanticRoute,
+                InternalCallPurpose::SemanticRouteEmbedding,
                 &["scan me".to_string()],
             )
             .await

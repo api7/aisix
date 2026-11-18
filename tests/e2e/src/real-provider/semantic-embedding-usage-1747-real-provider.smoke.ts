@@ -19,8 +19,9 @@ import {
 // the protected real-provider-e2e environment has released its secret.
 //
 // The upstream embedding and chat calls are real OpenAI API requests. The
-// local SLS receiver only observes the gateway's exported parent UsageEvent;
-// it never stands in for either upstream provider.
+// local SLS receiver only observes the gateway's exported usage events — the
+// request's own and the child event of each gateway embedding
+// (AISIX-Cloud#2075); it never stands in for either upstream provider.
 
 const OPENAI_API_KEY = process.env.AISIX_E2E_OPENAI_API_KEY;
 const OPENAI_EMBEDDING_MODEL =
@@ -56,21 +57,25 @@ const CACHE_MODEL = "semantic-embedding-real-provider-1747-cache";
 const CACHE_PROMPT = "semantic embedding telemetry cache exact hit";
 const BARRIER_PROMPT = "semantic embedding telemetry export barrier";
 
-interface GatewayEmbeddingCall {
-  count: number;
-  purpose: "semantic_route" | "semantic_cache" | "guardrail";
-  embedding_model_id: string;
-  prompt_tokens: number;
-  total_tokens: number;
-  usage_source: "reported" | "unavailable";
-  latency_ms: number;
-  outcome: "succeeded" | "failed";
-}
+type Row = Map<string, string>;
 
-function embeddingCalls(row: Map<string, string>): GatewayEmbeddingCall[] {
-  const raw = row.get("gateway_embedding_calls");
-  expect(raw, `usage row carried no embedding audit: ${[...row.keys()].join(",")}`).toBeDefined();
-  return JSON.parse(raw!) as GatewayEmbeddingCall[];
+const isChild = (row: Row) => row.has("internal_call_purpose");
+
+/** A gateway embedding's child usage event, checked against what a real provider reports. */
+function expectEmbeddingChild(child: Row, parent: Row, purpose: string, modelID: string): void {
+  expect(child.get("internal_call_purpose")).toBe(purpose);
+  expect(child.get("request_id")).toBe(parent.get("request_id"));
+  expect(child.get("api_key_id")).toBe(parent.get("api_key_id"));
+  expect(child.get("is_final_attempt")).toBe("false");
+  expect(child.get("operation")).toBe("embeddings");
+  expect(child.get("model_id")).toBe(modelID);
+  expect(child.get("requested_model_id")).toBe(modelID);
+  expect(child.get("status_code")).toBe("200");
+  // OpenAI's embeddings response reports usage. Requiring it catches a real
+  // upstream wire or parser regression rather than accepting a locally
+  // manufactured child record.
+  expect(Number(child.get("prompt_tokens"))).toBeGreaterThan(0);
+  expect(Number(child.get("upstream_latency_ms"))).toBeGreaterThan(0);
 }
 
 describe("semantic embedding usage with a real OpenAI provider (#1747)", () => {
@@ -110,12 +115,19 @@ describe("semantic embedding usage with a real OpenAI provider (#1747)", () => {
     };
   }
 
+  /** The child usage events of `requestId`; read after [`usageRow`]. */
+  function childrenOf(requestId: string): Row[] {
+    return slsLogsFor(sls!, LOGSTORE).filter(
+      (candidate) => candidate.get("request_id") === requestId && isChild(candidate),
+    );
+  }
+
   async function usageRow(requestId: string): Promise<Map<string, string>> {
     expect(requestId, "the gateway stamps the real-provider parent request id").not.toBe("");
     const row = await waitForSlsLog(
       sls!,
       LOGSTORE,
-      (candidate) => candidate.get("request_id") === requestId,
+      (candidate) => candidate.get("request_id") === requestId && !isChild(candidate),
       `the real-provider parent UsageEvent for ${requestId}`,
       30_000,
     );
@@ -256,25 +268,13 @@ describe("semantic embedding usage with a real OpenAI provider (#1747)", () => {
 
       const row = await usageRow(response.requestId);
       const rows = slsLogsFor(sls!, LOGSTORE).filter(
-        (candidate) => candidate.get("request_id") === response.requestId,
+        (candidate) => candidate.get("request_id") === response.requestId && !isChild(candidate),
       );
       expect(rows).toHaveLength(1);
-      expect(row.has("gateway_embedding_calls_dropped")).toBe(false);
-
-      const calls = embeddingCalls(row);
-      expect(calls).toHaveLength(1);
-      const call = calls[0]!;
-      expect(call.count).toBe(1);
-      expect(call.purpose).toBe("semantic_route");
-      expect(call.embedding_model_id).toBe(embeddingModelID);
-      expect(call.outcome).toBe("succeeded");
-      // OpenAI's embeddings response reports usage. Requiring it here catches
-      // a real upstream wire or parser regression rather than accepting a
-      // locally manufactured child record.
-      expect(call.usage_source).toBe("reported");
-      expect(call.prompt_tokens).toBeGreaterThan(0);
-      expect(call.total_tokens).toBeGreaterThanOrEqual(call.prompt_tokens);
-      expect(call.latency_ms).toBeGreaterThan(0);
+      const children = childrenOf(response.requestId);
+      expect(children).toHaveLength(1);
+      expectEmbeddingChild(children[0]!, row, "semantic_route_embedding", embeddingModelID);
+      expect(row.get("route_target_model_id")).toBe(targetModelID);
 
       // The caller received the target's chat response. Its parent event
       // remains priced and attributed as that target, never as the internal
@@ -300,20 +300,13 @@ describe("semantic embedding usage with a real OpenAI provider (#1747)", () => {
       expect(response.servedBy).toBe(GUARDRAIL_MODEL);
 
       const row = await usageRow(response.requestId);
-      const calls = embeddingCalls(row);
-      // One cached prototype batch plus the screened candidate are separate
-      // real OpenAI embeddings. Their token counts need not be hard-coded:
-      // OpenAI tokenization may legitimately change between model revisions.
-      expect(calls).toHaveLength(2);
-      for (const call of calls) {
-        expect(call.count).toBe(1);
-        expect(call.purpose).toBe("guardrail");
-        expect(call.embedding_model_id).toBe(embeddingModelID);
-        expect(call.outcome).toBe("succeeded");
-        expect(call.usage_source).toBe("reported");
-        expect(call.prompt_tokens).toBeGreaterThan(0);
-        expect(call.total_tokens).toBeGreaterThanOrEqual(call.prompt_tokens);
-        expect(call.latency_ms).toBeGreaterThan(0);
+      // One prototype batch plus the screened candidate are separate real
+      // OpenAI embeddings. Their token counts need not be hard-coded: OpenAI
+      // tokenization may legitimately change between model revisions.
+      const children = childrenOf(response.requestId);
+      expect(children).toHaveLength(2);
+      for (const child of children) {
+        expectEmbeddingChild(child, row, "guardrail_embedding", embeddingModelID);
       }
       expect(row.has("cost_usd")).toBe(false);
       expect(row.get("model_id")).toBe(guardrailModelID);
@@ -332,17 +325,9 @@ describe("semantic embedding usage with a real OpenAI provider (#1747)", () => {
       expect(miss.cache).toBe("miss");
 
       const missRow = await usageRow(miss.requestId);
-      const missCalls = embeddingCalls(missRow);
-      expect(missCalls).toHaveLength(1);
-      const call = missCalls[0]!;
-      expect(call.count).toBe(1);
-      expect(call.purpose).toBe("semantic_cache");
-      expect(call.embedding_model_id).toBe(embeddingModelID);
-      expect(call.outcome).toBe("succeeded");
-      expect(call.usage_source).toBe("reported");
-      expect(call.prompt_tokens).toBeGreaterThan(0);
-      expect(call.total_tokens).toBeGreaterThanOrEqual(call.prompt_tokens);
-      expect(call.latency_ms).toBeGreaterThan(0);
+      const missChildren = childrenOf(miss.requestId);
+      expect(missChildren).toHaveLength(1);
+      expectEmbeddingChild(missChildren[0]!, missRow, "semantic_cache_embedding", embeddingModelID);
       expect(missRow.has("cost_usd")).toBe(false);
       expect(missRow.get("model_id")).toBe(cacheModelID);
       expect(missRow.get("attempt_model")).toBeUndefined();
@@ -352,8 +337,9 @@ describe("semantic embedding usage with a real OpenAI provider (#1747)", () => {
       expect(hit.status).toBe(200);
       expect(hit.cache).toBe("hit");
       expect(hit.cacheLayer).toBe("exact");
-      const hitRow = await usageRow(hit.requestId);
-      expect(hitRow.get("gateway_embedding_calls")).toBeUndefined();
+      await usageRow(hit.requestId);
+      // An exact hit is answered before any embedding is made.
+      expect(childrenOf(hit.requestId)).toHaveLength(0);
     },
     90_000,
   );

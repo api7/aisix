@@ -475,6 +475,13 @@ just absent or off, which reads like a quiet upstream:
   that carries an assistant turn has to be added there; a buffered answer
   attaches its parts at its own `CapturedContent` site with
   `aisix_obs::OutputCollector::from_body` over the JSON the caller receives.
+- **A model call the gateway makes on a request's behalf** (semantic routing,
+  the semantic cache, guardrail embeddings) runs inside `attribution::detached`
+  and records itself with `attribution::begin_internal_call`, held across the
+  upstream await. That record is its only usage event — `emit_usage` emits it
+  as a child beside the terminal row — so a new internal call that skips it is
+  unbilled. A call outside a request scope (the realtime session) has no
+  parent to attach to and records nothing.
 
 ## Every upstream credential a request spends passes the provider-key budget
 

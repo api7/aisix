@@ -216,13 +216,25 @@ fn default_classifier_timeout_ms() -> u64 {
 pub struct SemanticClassifier {
     /// Decision model family. `jev` is the only supported value.
     pub r#type: ClassifierType,
+    /// Resource id of a direct Model whose Provider Key's `provider` is
+    /// `typesafe`. When set, the decision calls go to that model exactly as
+    /// a `POST /v1/systemone` request addressed to it does: its
+    /// `model_name`, and its Provider Key's API key, `api_base`, request
+    /// body overrides and request headers. `provider_key_id` and `model`
+    /// are then not read. An id resolving to no such model is a classifier
+    /// that cannot be called, and the router applies `on_failure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
+    pub model_id: Option<String>,
     /// Resource id of the Provider Key that authenticates the decision
-    /// calls. The key's `provider` must be `typesafe`; its API key is sent
-    /// as the bearer token, and its `api_base`, when set, replaces the
-    /// default endpoint `https://api.typesafe.ai`.
+    /// calls, read only when `model_id` is absent. Required when there is
+    /// no `model_id`. The key's `provider` must be `typesafe`; its API key
+    /// is sent as the bearer token, and its `api_base`, when set, replaces
+    /// the default endpoint `https://api.typesafe.ai`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     #[schemars(length(min = 1))]
     pub provider_key_id: String,
-    /// Decision model to call.
+    /// Decision model to call, read only when `model_id` is absent.
     #[serde(default = "default_classifier_model")]
     #[schemars(length(min = 1))]
     pub model: String,

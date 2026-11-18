@@ -457,45 +457,22 @@ mod tests {
         assert!(bare.get("guardrail_scores").is_none());
     }
 
-    /// AISIX-Cloud#1747: a gateway-initiated embedding remains child work
-    /// of the caller's request, but its token/count/latency audit must ride
-    /// the same metadata-only exporter wire as the parent event. This keeps
-    /// the record visible without folding a different model's usage into the
-    /// parent's billable token fields.
+    /// A child event's purpose and a semantic request's route target ride
+    /// the flattened exporter wire beside the scalar fields.
     #[test]
-    fn gateway_embedding_calls_ride_the_flattened_exporter_wire() {
+    fn internal_call_fields_ride_the_flattened_exporter_wire() {
         let rec = SinkRecord::metadata_only(UsageEvent {
-            gateway_embedding_calls: vec![crate::usage::GatewayEmbeddingCall {
-                count: 1,
-                purpose: crate::usage::GatewayEmbeddingPurpose::SemanticCache,
-                embedding_model_id: "embedding-model-id".into(),
-                prompt_tokens: 12,
-                total_tokens: 15,
-                usage_source: crate::usage::GatewayEmbeddingUsageSource::Reported,
-                latency_ms: 34,
-                outcome: crate::usage::GatewayEmbeddingOutcome::Succeeded,
-            }],
-            gateway_embedding_calls_dropped: 2,
+            internal_call_purpose: Some(crate::usage::InternalCallPurpose::SemanticCacheEmbedding),
+            route_target_model_id: "target-model-id".into(),
             ..UsageEvent::default()
         });
         let json = serde_json::to_value(&rec).unwrap();
-        let calls = json["gateway_embedding_calls"]
-            .as_array()
-            .expect("flattened onto the record, not nested under `usage`");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0]["count"], 1);
-        assert_eq!(calls[0]["purpose"], "semantic_cache");
-        assert_eq!(calls[0]["embedding_model_id"], "embedding-model-id");
-        assert_eq!(calls[0]["prompt_tokens"], 12);
-        assert_eq!(calls[0]["total_tokens"], 15);
-        assert_eq!(calls[0]["usage_source"], "reported");
-        assert_eq!(calls[0]["latency_ms"], 34);
-        assert_eq!(calls[0]["outcome"], "succeeded");
-        assert_eq!(json["gateway_embedding_calls_dropped"], 2);
+        assert_eq!(json["internal_call_purpose"], "semantic_cache_embedding");
+        assert_eq!(json["route_target_model_id"], "target-model-id");
 
         let bare = serde_json::to_value(SinkRecord::metadata_only(UsageEvent::default())).unwrap();
-        assert!(bare.get("gateway_embedding_calls").is_none());
-        assert!(bare.get("gateway_embedding_calls_dropped").is_none());
+        assert!(bare.get("internal_call_purpose").is_none());
+        assert!(bare.get("route_target_model_id").is_none());
     }
 
     #[test]

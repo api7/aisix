@@ -732,6 +732,7 @@ async fn dispatch(
             source_ip: &client.source_ip,
             context_origin: affinity.origin(),
             budget: Some(&budget_gate),
+            client: Some(client),
         },
         crate::semantic::SessionRequest {
             metadata: body.get("metadata"),

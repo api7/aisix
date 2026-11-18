@@ -707,7 +707,7 @@ async fn dispatch(
 /// Apply the Provider Key's `request.*` body overrides, as every other
 /// directly-built upstream request does. A no-op without overrides, so the
 /// verbatim body is only re-serialised when an operator asked for a change.
-fn apply_body_overrides(
+pub(crate) fn apply_body_overrides(
     pk: &aisix_core::ProviderKey,
     outbound: Bytes,
 ) -> Result<Bytes, ProxyError> {
@@ -733,6 +733,21 @@ fn apply_body_overrides(
 /// Endpoint a `typesafe` Provider Key reaches when it sets no `api_base`.
 const TYPESAFE_DEFAULT_API_BASE: &str = crate::semantic::TYPESAFE_DEFAULT_API_BASE;
 
+/// The System One endpoint a `typesafe` Provider Key reaches. Shared with
+/// the semantic router's classifier, so a classifier call and a direct
+/// `POST /v1/systemone` on the same key go to the same URL.
+pub(crate) fn typesafe_systemone_url(pk: &aisix_core::ProviderKey) -> String {
+    let base = pk
+        .api_base
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .unwrap_or(TYPESAFE_DEFAULT_API_BASE)
+        .trim_end_matches('/');
+    let base = base.strip_suffix("/systemone").unwrap_or(base);
+    format!("{}/v1/systemone", base.strip_suffix("/v1").unwrap_or(base))
+}
+
 fn upstream_url(upstream: Upstream, pk: &aisix_core::ProviderKey) -> Result<String, ProxyError> {
     let configured = pk
         .api_base
@@ -740,12 +755,7 @@ fn upstream_url(upstream: Upstream, pk: &aisix_core::ProviderKey) -> Result<Stri
         .map(str::trim)
         .filter(|b| !b.is_empty());
     Ok(match upstream {
-        Upstream::TypeSafe => {
-            let base = configured.unwrap_or(TYPESAFE_DEFAULT_API_BASE);
-            let base = base.trim_end_matches('/');
-            let base = base.strip_suffix("/systemone").unwrap_or(base);
-            format!("{}/v1/systemone", base.strip_suffix("/v1").unwrap_or(base))
-        }
+        Upstream::TypeSafe => typesafe_systemone_url(pk),
         Upstream::Foundry => {
             let base = configured.ok_or_else(|| {
                 ProxyError::InvalidRequest(format!(

@@ -936,7 +936,7 @@ async fn cache_semantic_embed(
         &sem.embed_entry,
         embed_deadline,
         request_id,
-        aisix_obs::GatewayEmbeddingPurpose::SemanticCache,
+        aisix_obs::InternalCallPurpose::SemanticCacheEmbedding,
         &texts,
     )
     .await
@@ -1662,6 +1662,7 @@ async fn dispatch(
             source_ip: &client.source_ip,
             context_origin: None,
             budget: Some(&budget_gate),
+            client: Some(client),
         },
         crate::semantic::SessionRequest {
             metadata: req.extra.get("metadata"),

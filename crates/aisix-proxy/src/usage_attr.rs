@@ -1137,6 +1137,11 @@ pub(crate) fn emit_usage(
     event.operation = surface.operation.to_string();
     event.is_final_attempt = terminal;
     stamp_requested_model_id(&mut event);
+    if event.route_target_model_id.is_empty() {
+        if let Some(id) = crate::attribution::route_target_model_id(&event.requested_model) {
+            event.route_target_model_id = id;
+        }
+    }
     // Upstream-supplied text bound for line-oriented stores: the same
     // control-character strip and cap as the provider's response id.
     event.service_tier = event
@@ -1220,15 +1225,6 @@ pub(crate) fn emit_usage(
     if terminal && event.guardrail_blocked {
         state.metrics.record_guardrail_blocked_request();
     }
-    // Gateway-initiated semantic embeddings are child work of this request,
-    // never attempts for the model the caller addressed. Attach their bounded
-    // ledger only to the one terminal parent event: a retry can emit
-    // non-terminal attempt rows, and a stream's terminal emitter may run much
-    // later, but neither may duplicate or replace the parent's
-    // token/cost/model fields.
-    if terminal {
-        attach_gateway_embedding_audit(&mut event);
-    }
     stamp_latency_breakdown(&mut event, terminal);
     // A Responses result carries no finish reason of its own; it is derived
     // from what the caller received, native or bridged alike.
@@ -1257,6 +1253,9 @@ pub(crate) fn emit_usage(
         .try_emit(surface.handler, event.clone(), labels);
     let exporters = live_exporters(state, snap);
     if exporters.is_empty() {
+        if terminal {
+            emit_internal_calls(state, snap, surface, &event);
+        }
         return;
     }
     // A streamed response's parts were read off the frames the caller got;
@@ -1320,6 +1319,12 @@ pub(crate) fn emit_usage(
         facts.as_ref(),
         exporters.iter().map(|e| &e.value),
     );
+    // The gateway's own model calls for this request go out after its one
+    // terminal event, once every attempt and the stream have settled, and
+    // inherit that event's caller identity.
+    if terminal {
+        emit_internal_calls(state, snap, surface, &event);
+    }
 }
 
 /// `gateway_overhead_ms` on the event that carries `downstream_latency_ms`,
@@ -1359,13 +1364,115 @@ pub(crate) fn stamp_client_disconnect(status: u16, class: &mut String, message: 
     }
 }
 
-/// Move the bounded gateway-embedding child audit to the terminal parent
-/// event. Kept beside the emission chokepoint so no request family can attach
-/// an unbounded or duplicated child trail on an intermediate attempt.
-fn attach_gateway_embedding_audit(event: &mut UsageEvent) {
-    let audit = crate::attribution::take_gateway_embedding_audit();
-    event.gateway_embedding_calls = audit.calls;
-    event.gateway_embedding_calls_dropped = audit.dropped;
+/// Emit the child usage events of the internal calls this request made
+/// ([`crate::attribution::InternalCall`]), each carrying `parent`'s request
+/// id, trace id and caller identity.
+///
+/// They leave through the sink and the exporters directly, not through
+/// [`emit_usage`]: a child is not an attempt of the request, so it must not
+/// touch what that chokepoint keeps per request — the terminal flag, the
+/// attempt index, the access-log line, the cancel interlock, the latency
+/// breakdown or the captured content of a failure row.
+fn emit_internal_calls(
+    state: &ProxyState,
+    snap: &AisixSnapshot,
+    surface: Surface,
+    parent: &UsageEvent,
+) {
+    let calls = crate::attribution::take_internal_calls();
+    if calls.is_empty() {
+        return;
+    }
+    let exporters = live_exporters(state, snap);
+    for mut call in calls {
+        let provider_key_id = std::mem::take(&mut call.provider_key_id);
+        let pk = ResolvedPk::resolve(snap, &provider_key_id);
+        let mut event = internal_call_event(call, parent);
+        apply_pk_telemetry(&mut event, &pk);
+        let model = usage_event_model_label(snap, &event.requested_model);
+        state.usage_sink.try_emit(
+            surface.handler,
+            event.clone(),
+            usage_event_labels(&model, &pk),
+        );
+        if exporters.is_empty() {
+            continue;
+        }
+        let facts = exporters
+            .iter()
+            .any(|e| {
+                e.value.enabled && matches!(e.value.kind, aisix_core::ExporterKind::OtlpHttp(_))
+            })
+            .then(|| {
+                std::sync::Arc::new(aisix_obs::SpanFacts {
+                    upstream: crate::span_facts::upstream_facts(
+                        snap,
+                        &event,
+                        pk.labels().id(),
+                        false,
+                    ),
+                    ..Default::default()
+                })
+            });
+        state.otlp_fan_out.fan_out(
+            &event,
+            None,
+            None,
+            facts.as_ref(),
+            exporters.iter().map(|e| &e.value),
+        );
+    }
+}
+
+/// The child event of `call`: the call's own model, tokens and outcome,
+/// and what it shares with `parent`, the request it was made for — its id,
+/// trace and caller.
+fn internal_call_event(
+    mut call: crate::attribution::InternalCall,
+    parent: &UsageEvent,
+) -> UsageEvent {
+    // Stamped by `UsageEvent::occurred_at_now` when the call settled.
+    let completed_at = std::mem::take(&mut call.completed_at);
+    let mut event = UsageEvent {
+        // NO-GUARDRAIL-CHAIN: the gateway's own call; the guardrails that
+        // governed the request are reported on the request's own events.
+        // NO-CALLER-IDENTITY: copied from `parent`, whose emitter stamped it
+        // with `apply_caller_identity`, so the child cannot disagree with it.
+        internal_call_purpose: call.purpose,
+        operation: call.operation.to_string(),
+        request_id: parent.request_id.clone(),
+        trace_id: parent.trace_id.clone(),
+        requested_model_id: call.model_id.clone(),
+        model_id: call.model_id,
+        requested_model: call.model_name,
+        prompt_tokens: call.prompt_tokens,
+        completion_tokens: call.completion_tokens,
+        total_tokens: call.total_tokens,
+        upstream_latency_ms: call.latency_ms,
+        status_code: call.status_code,
+        error_class: call.error_class,
+        error_message: call.error_message,
+        provider_request_id: call.provider_request_id,
+        provider_model_version: call.provider_model_version,
+        api_key_id: parent.api_key_id.clone(),
+        api_key_name: parent.api_key_name.clone(),
+        user_id: parent.user_id.clone(),
+        user_name: parent.user_name.clone(),
+        team_id: parent.team_id.clone(),
+        tags: parent.tags.clone(),
+        auth_type: parent.auth_type.clone(),
+        jwt_subject: parent.jwt_subject.clone(),
+        jwt_provider: parent.jwt_provider.clone(),
+        jwt_claim_mapping: parent.jwt_claim_mapping.clone(),
+        client_identity: parent.client_identity.clone(),
+        client_source_ip: parent.client_source_ip.clone(),
+        client_user_agent: parent.client_user_agent.clone(),
+        request_headers: parent.request_headers.clone(),
+        inbound_protocol: parent.inbound_protocol.clone(),
+        ..Default::default()
+    };
+    event.occurred_at = completed_at;
+    event
 }
 
 #[cfg(test)]
@@ -1432,6 +1539,114 @@ mod tests {
         assert_eq!(emit(200, "", ""), "");
     }
 
+    /// The internal calls a request recorded go out once, beside its one
+    /// terminal event, as children that inherit the caller and are never
+    /// the terminal row; the parent carries the route target and the
+    /// children do not.
+    #[tokio::test]
+    async fn internal_calls_go_out_once_as_children_of_the_terminal_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let state = crate::ProxyState::new(
+            aisix_core::snapshot::SnapshotHandle::new(AisixSnapshot::new()),
+            std::sync::Arc::new(aisix_gateway::Hub::new()),
+            &aisix_core::ProxyConfig {
+                addr: "127.0.0.1:0".into(),
+                request_body_limit_bytes: 1_048_576,
+                real_ip: Default::default(),
+                request_id: Default::default(),
+                url_rewrites: Vec::new(),
+                expose_debug_headers: false,
+                tls: None,
+                listeners: Vec::new(),
+                thread_per_core: None,
+                workers: None,
+            },
+        )
+        .without_cache()
+        .with_usage_sink(aisix_obs::UsageSink::new(tx));
+        let snap = state.snapshot.load();
+        let cell = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
+        crate::attribution::scope(cell, async {
+            crate::attribution::note_requested_model("router", "m-router");
+            crate::attribution::note_route_target("m-target");
+            let mut guard =
+                crate::attribution::begin_internal_call(crate::attribution::InternalCall {
+                    purpose: Some(aisix_obs::InternalCallPurpose::SemanticRouteEmbedding),
+                    operation: "embeddings",
+                    model_id: "m-embed".into(),
+                    model_name: "embed".into(),
+                    provider_key_id: "pk-embed".into(),
+                    ..Default::default()
+                });
+            let mut call = guard.settle();
+            call.status_code = 200;
+            call.prompt_tokens = 7;
+            guard.record(call);
+
+            let parent = |attempt_index| UsageEvent {
+                request_id: "req-1".into(),
+                requested_model: "router".into(),
+                model_id: "m-target".into(),
+                api_key_id: "ak-1".into(),
+                team_id: "team-1".into(),
+                status_code: 200,
+                attempt_index,
+                ..Default::default()
+            };
+            let emit = |event, terminal| {
+                emit_usage(
+                    &state,
+                    &snap,
+                    crate::operation::CHAT,
+                    event,
+                    usage_event_labels("router", &ResolvedPk::unresolved()),
+                    None,
+                    None,
+                    terminal,
+                    false,
+                )
+            };
+            emit(parent(0), false);
+            let attempt = rx.try_recv().expect("the attempt row");
+            assert!(attempt.internal_call_purpose.is_none());
+            assert!(
+                rx.try_recv().is_err(),
+                "a non-terminal row flushes no child"
+            );
+
+            emit(parent(1), true);
+            // The request's own row first, then its children.
+            let terminal = rx.try_recv().expect("the terminal row");
+            let child = rx.try_recv().expect("the child row");
+            assert!(rx.try_recv().is_err());
+            assert_eq!(
+                child.internal_call_purpose,
+                Some(aisix_obs::InternalCallPurpose::SemanticRouteEmbedding)
+            );
+            assert!(!child.is_final_attempt);
+            assert_eq!(child.request_id, "req-1");
+            assert_eq!(child.api_key_id, "ak-1");
+            assert_eq!(child.team_id, "team-1");
+            assert_eq!(child.model_id, "m-embed");
+            assert_eq!(child.requested_model, "embed");
+            assert_eq!(child.requested_model_id, "m-embed");
+            assert_eq!(child.operation, "embeddings");
+            assert_eq!(child.prompt_tokens, 7);
+            assert_eq!(child.route_target_model_id, "");
+            assert!(!child.occurred_at.is_empty());
+
+            assert!(terminal.is_final_attempt);
+            assert_eq!(terminal.route_target_model_id, "m-target");
+            assert_eq!(attempt.route_target_model_id, "m-target");
+
+            emit(parent(2), true);
+            let duplicate = rx.try_recv().expect("the duplicate terminal row");
+            assert!(duplicate.internal_call_purpose.is_none());
+            assert!(rx.try_recv().is_err(), "a child is emitted once");
+        })
+        .await;
+    }
+
     #[test]
     fn summed_upstream_total_stands_only_while_every_counting_report_carried_one() {
         let with = |n: u64| serde_json::json!({ "input_tokens": 1, "total_tokens": n });
@@ -1449,66 +1664,6 @@ mod tests {
         gap.add(&without, true);
         gap.add(&with(6), true);
         assert_eq!(gap.recorded(), 0);
-    }
-
-    #[tokio::test]
-    async fn terminal_event_receives_the_bounded_gateway_embedding_audit_once() {
-        let parent = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
-        crate::attribution::scope(parent, async {
-            for index in 0..=crate::attribution::MAX_GATEWAY_EMBEDDING_CALLS {
-                crate::attribution::note_gateway_embedding_call(aisix_obs::GatewayEmbeddingCall {
-                    count: 1,
-                    purpose: aisix_obs::GatewayEmbeddingPurpose::SemanticCache,
-                    embedding_model_id: format!("embed-{index}"),
-                    prompt_tokens: index as u32,
-                    total_tokens: index as u32,
-                    usage_source: aisix_obs::GatewayEmbeddingUsageSource::Reported,
-                    latency_ms: index as u32,
-                    outcome: aisix_obs::GatewayEmbeddingOutcome::Succeeded,
-                });
-            }
-
-            let mut terminal = UsageEvent::default();
-            attach_gateway_embedding_audit(&mut terminal);
-            assert_eq!(
-                terminal.gateway_embedding_calls.len(),
-                crate::attribution::MAX_GATEWAY_EMBEDDING_CALLS,
-            );
-            assert_eq!(
-                terminal.gateway_embedding_calls[0].embedding_model_id,
-                "embed-0"
-            );
-            assert_eq!(terminal.gateway_embedding_calls_dropped, 1);
-
-            let mut duplicate_terminal = UsageEvent::default();
-            attach_gateway_embedding_audit(&mut duplicate_terminal);
-            assert!(duplicate_terminal.gateway_embedding_calls.is_empty());
-            assert_eq!(duplicate_terminal.gateway_embedding_calls_dropped, 0);
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn terminal_usage_event_replaces_an_unsafe_embedding_model_id_with_unknown() {
-        let parent = std::sync::Arc::new(crate::attribution::RequestAttribution::default());
-        crate::attribution::scope(parent, async {
-            crate::attribution::note_gateway_embedding_call(aisix_obs::GatewayEmbeddingCall {
-                count: 1,
-                purpose: aisix_obs::GatewayEmbeddingPurpose::SemanticRoute,
-                embedding_model_id: "界".repeat(100),
-                prompt_tokens: 1,
-                total_tokens: 1,
-                usage_source: aisix_obs::GatewayEmbeddingUsageSource::Reported,
-                latency_ms: 1,
-                outcome: aisix_obs::GatewayEmbeddingOutcome::Succeeded,
-            });
-
-            let mut terminal = UsageEvent::default();
-            attach_gateway_embedding_audit(&mut terminal);
-            let model_id = &terminal.gateway_embedding_calls[0].embedding_model_id;
-            assert_eq!(model_id, "unknown");
-        })
-        .await;
     }
 
     #[test]

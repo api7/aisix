@@ -1083,6 +1083,14 @@ pub fn apply_model_ref_alternatives(schema: &mut Value) {
     {
         split_semantic_modes(node);
     }
+    // Not a name-or-id pair of one model, but the same shape of rule: the
+    // inline Provider Key is required only when no direct model is named.
+    if let Some(node) = schema
+        .pointer_mut("/definitions/SemanticClassifier")
+        .and_then(Value::as_object_mut)
+    {
+        require_name_or_id(node, "provider_key_id", "model_id");
+    }
 }
 
 /// State what each of a semantic router's two decision modes requires and
@@ -3218,6 +3226,40 @@ mod tests {
             route[field] = value;
             assert_rejected_on_both(&jev_router(json!({}), route), field);
         }
+    }
+
+    /// A classifier names its decision model either as a direct model by
+    /// id, or inline as a Provider Key plus model name; the inline key is
+    /// required only without the id, on both sets, and a row naming
+    /// neither — or only a `null` id — is refused by both.
+    #[test]
+    fn model_semantic_classifier_needs_a_model_id_or_an_inline_key() {
+        for classifier in [
+            json!({"type": "jev", "model_id": "m-jev"}),
+            json!({"type": "jev", "model_id": "m-jev", "provider_key_id": "pk-ts", "model": "jev-1"}),
+            json!({"type": "jev", "provider_key_id": "pk-ts"}),
+        ] {
+            let mut v = jev_router(json!({}), jev_route());
+            v["semantic"]["classifier"] = classifier.clone();
+            validate_model(&v).unwrap_or_else(|e| panic!("strict refused {classifier}: {e:?}"));
+            validate_model_lenient(&v)
+                .unwrap_or_else(|e| panic!("lenient refused {classifier}: {e:?}"));
+        }
+        for classifier in [
+            json!({"type": "jev"}),
+            json!({"type": "jev", "model_id": null}),
+            json!({"type": "jev", "model_id": ""}),
+        ] {
+            let mut v = jev_router(json!({}), jev_route());
+            v["semantic"]["classifier"] = classifier.clone();
+            assert_rejected_on_both(&v, &classifier.to_string());
+        }
+        let mut v = jev_router(json!({}), jev_route());
+        v["semantic"]["classifier"] = json!({"type": "jev", "model_id": "m-jev"});
+        let m: Model = serde_json::from_value(v).unwrap();
+        let c = m.semantic.unwrap().classifier.unwrap();
+        assert_eq!(c.model_id.as_deref(), Some("m-jev"));
+        assert_eq!(c.provider_key_id, "");
     }
 
     #[test]

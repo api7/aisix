@@ -78,6 +78,9 @@ pub(crate) struct Resolved {
     /// Id of the entry `requested_model` resolved to — for a routing group,
     /// semantic router or ensemble the group's own id, never a target's.
     pub requested_model_id: String,
+    /// For a semantic router, the id of the target it selected — a direct
+    /// model or a model group. See [`note_route_target`].
+    pub route_target_model_id: String,
     /// Vendor id of the last target the request selected.
     pub provider: String,
     /// That target's upstream model id.
@@ -637,119 +640,102 @@ struct BodyCounters {
     capturing_output: AtomicBool,
 }
 
-/// The maximum child embedding bridge invocations retained per parent event.
-///
-/// The parent event keeps this ordered prefix and a saturating dropped count,
-/// rather than allowing an attacker-controlled semantic configuration to make
-/// telemetry allocation unbounded.
-pub(crate) const MAX_GATEWAY_EMBEDDING_CALLS: usize = 64;
-
-/// Maximum byte length for a gateway-initiated embedding resource ID retained
-/// in the audit event. This field crosses the usage sink boundary, so validate
-/// it before it reaches the parent ledger rather than relying on individual
-/// exporters to do so.
-pub(crate) const MAX_GATEWAY_EMBEDDING_MODEL_ID_BYTES: usize = 128;
-
-/// Return a bounded ASCII-safe gateway embedding resource ID, or `unknown`.
-///
-/// Resource IDs originate in etcd and reach OTLP/exporters through the child
-/// embedding audit. Keep only the fixed `[A-Za-z0-9_-]` vocabulary; do not
-/// truncate an invalid value because a retained prefix could still expose it.
-pub(crate) fn capped_gateway_embedding_model_id(value: &str) -> String {
-    if !value.is_empty()
-        && value.len() <= MAX_GATEWAY_EMBEDDING_MODEL_ID_BYTES
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    {
-        value.to_owned()
-    } else {
-        "unknown".to_owned()
-    }
+/// One model call the gateway made on a request's behalf, recorded as a
+/// child usage event and emitted beside the request's terminal event
+/// ([`crate::usage_attr::emit_usage`]), which supplies the request id and
+/// the caller's identity.
+#[derive(Default)]
+pub(crate) struct InternalCall {
+    pub(crate) purpose: Option<aisix_obs::InternalCallPurpose>,
+    /// `UsageEvent::operation` of the call: `embeddings` or `systemone`.
+    pub(crate) operation: &'static str,
+    /// The Model the call went to, empty for an inline classifier.
+    pub(crate) model_id: String,
+    pub(crate) model_name: String,
+    /// The Provider Key the call went out on.
+    pub(crate) provider_key_id: String,
+    pub(crate) completed_at: String,
+    pub(crate) status_code: u16,
+    pub(crate) error_class: String,
+    pub(crate) error_message: String,
+    pub(crate) latency_ms: u32,
+    pub(crate) prompt_tokens: u32,
+    pub(crate) completion_tokens: u32,
+    /// The upstream's own total, `0` when it reported none.
+    pub(crate) total_tokens: u32,
+    pub(crate) provider_request_id: String,
+    pub(crate) provider_model_version: String,
 }
 
-/// The child embedding calls a request caused while it was being served.
+/// The internal calls a request caused while it was being served.
 ///
 /// This sits outside [`Cell`]: [`detached`] must isolate target attribution,
-/// but semantic routing, the semantic cache, and semantic guardrails still
-/// need to append their gateway-initiated calls to the real parent's terminal
-/// usage event. A detached child therefore receives a fresh `Cell` and shares
-/// only this ledger with its parent.
+/// but semantic routing, the semantic cache, and semantic guardrails make
+/// their calls inside a detached scope and still belong to the real parent.
+/// A detached child therefore receives a fresh `Cell` and shares only this
+/// ledger with its parent.
 #[derive(Default)]
-struct GatewayEmbeddingLedger {
-    state: Mutex<GatewayEmbeddingLedgerState>,
+struct InternalCallLedger {
+    calls: Mutex<Vec<InternalCall>>,
 }
 
-#[derive(Default)]
-struct GatewayEmbeddingLedgerState {
-    calls: Vec<aisix_obs::GatewayEmbeddingCall>,
-    dropped: u32,
-}
-
-/// The bounded child-work audit transferred to a terminal parent event.
-#[derive(Default)]
-pub(crate) struct GatewayEmbeddingAudit {
-    pub(crate) calls: Vec<aisix_obs::GatewayEmbeddingCall>,
-    pub(crate) dropped: u32,
-}
-
-impl GatewayEmbeddingLedger {
-    fn record(&self, mut call: aisix_obs::GatewayEmbeddingCall) {
-        call.embedding_model_id = capped_gateway_embedding_model_id(&call.embedding_model_id);
-        let mut ledger = self
-            .state
+impl InternalCallLedger {
+    fn record(&self, call: InternalCall) {
+        self.calls
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if ledger.calls.len() < MAX_GATEWAY_EMBEDDING_CALLS {
-            ledger.calls.push(call);
-            return;
-        }
-        ledger.dropped = ledger.dropped.saturating_add(1);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(call);
     }
 }
 
-/// Records an in-flight gateway-owned embedding call if its future is
-/// cancelled before the bridge returns.
+/// Records an in-flight internal call as a cancelled child if its future is
+/// dropped before the call returns.
 ///
 /// The guard owns the ledger rather than consulting [`CURRENT`] from
 /// [`Drop`]. A handler cancellation drops the detached child scope before the
 /// parent cancel guard emits its terminal event, but task-local state is not a
 /// safe dependency for that cleanup path. The shared ledger is still alive at
-/// that point, so the terminal 499 event retains the failed child call.
-#[must_use = "an in-flight embedding call must stay guarded until it settles"]
-pub(crate) struct GatewayEmbeddingCallGuard {
-    ledger: Option<Arc<GatewayEmbeddingLedger>>,
-    purpose: aisix_obs::GatewayEmbeddingPurpose,
-    embedding_model_id: String,
+/// that point, so the terminal 499 event still carries the child.
+#[must_use = "an in-flight internal call must stay guarded until it settles"]
+pub(crate) struct InternalCallGuard {
+    ledger: Option<Arc<InternalCallLedger>>,
+    /// The child as far as it is known before the call returns.
+    pending: Option<InternalCall>,
     started: Instant,
-    recorded: bool,
 }
 
-impl GatewayEmbeddingCallGuard {
-    /// Disarm the cancellation fallback and return this bridge invocation's
-    /// elapsed time for the ordinary success/error record.
-    pub(crate) fn settle(&mut self) -> u32 {
-        self.recorded = true;
-        crate::attempt::measured_ms(self.started.elapsed())
+impl InternalCallGuard {
+    /// The child as built before the call, timed, for the settled outcome
+    /// to fill in. Disarms the cancellation record.
+    pub(crate) fn settle(&mut self) -> InternalCall {
+        let mut call = self.pending.take().expect("an internal call settles once");
+        call.completed_at = aisix_obs::UsageEvent::occurred_at_now();
+        call.latency_ms = crate::attempt::measured_ms(self.started.elapsed());
+        call
+    }
+
+    /// Record the settled child on the request it was made for.
+    pub(crate) fn record(&self, call: InternalCall) {
+        if let Some(ledger) = &self.ledger {
+            ledger.record(call);
+        }
     }
 }
 
-impl Drop for GatewayEmbeddingCallGuard {
+impl Drop for InternalCallGuard {
     fn drop(&mut self) {
-        if !self.recorded {
-            if let Some(ledger) = &self.ledger {
-                ledger.record(aisix_obs::GatewayEmbeddingCall {
-                    count: 1,
-                    purpose: self.purpose,
-                    embedding_model_id: self.embedding_model_id.clone(),
-                    prompt_tokens: 0,
-                    total_tokens: 0,
-                    usage_source: aisix_obs::GatewayEmbeddingUsageSource::Unavailable,
-                    latency_ms: crate::attempt::measured_ms(self.started.elapsed()),
-                    outcome: aisix_obs::GatewayEmbeddingOutcome::Failed,
-                });
-            }
-        }
+        let (Some(ledger), Some(mut call)) = (&self.ledger, self.pending.take()) else {
+            return;
+        };
+        call.completed_at = aisix_obs::UsageEvent::occurred_at_now();
+        call.latency_ms = crate::attempt::measured_ms(self.started.elapsed());
+        call.status_code = crate::CLIENT_CLOSED_REQUEST;
+        crate::usage_attr::stamp_client_disconnect(
+            call.status_code,
+            &mut call.error_class,
+            &mut call.error_message,
+        );
+        ledger.record(call);
     }
 }
 
@@ -760,7 +746,7 @@ impl Drop for GatewayEmbeddingCallGuard {
 pub(crate) struct RequestAttribution {
     cell: Mutex<Cell>,
     bodies: BodyCounters,
-    gateway_embedding_ledger: Arc<GatewayEmbeddingLedger>,
+    internal_calls: Arc<InternalCallLedger>,
     /// The upstream response headers this request's exporters asked for.
     /// See [`aisix_gateway::response_tap`].
     response_tap: Arc<aisix_gateway::ResponseHeaderTap>,
@@ -768,13 +754,12 @@ pub(crate) struct RequestAttribution {
 
 impl RequestAttribution {
     /// A sub-call scope that cannot change the parent request's target
-    /// attribution but can still account for gateway-initiated embeddings on
-    /// the parent's eventual terminal usage event.
+    /// attribution but still records its internal calls on the parent.
     fn detached_child(&self) -> Self {
         Self {
             cell: Mutex::new(Cell::default()),
             bodies: BodyCounters::default(),
-            gateway_embedding_ledger: Arc::clone(&self.gateway_embedding_ledger),
+            internal_calls: Arc::clone(&self.internal_calls),
             response_tap: Arc::default(),
         }
     }
@@ -795,23 +780,17 @@ impl RequestAttribution {
         }
     }
 
-    fn note_gateway_embedding_call(&self, call: aisix_obs::GatewayEmbeddingCall) {
-        self.gateway_embedding_ledger.record(call);
-    }
-
-    /// Move the bounded child-call prefix and its dropped count into the one
-    /// terminal parent event. Taking rather than cloning makes a duplicate
-    /// terminal emitter unable to report the same bridge call twice.
-    fn take_gateway_embedding_audit(&self) -> GatewayEmbeddingAudit {
-        let mut ledger = self
-            .gateway_embedding_ledger
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        GatewayEmbeddingAudit {
-            calls: std::mem::take(&mut ledger.calls),
-            dropped: std::mem::take(&mut ledger.dropped),
-        }
+    /// Move the recorded internal calls out for the one terminal parent
+    /// event. Taking rather than cloning makes a duplicate terminal emitter
+    /// unable to emit the same call twice.
+    fn take_internal_calls(&self) -> Vec<InternalCall> {
+        std::mem::take(
+            &mut *self
+                .internal_calls
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
     }
 
     /// Mark this cell as installed by the telemetry middleware, which will
@@ -1146,44 +1125,52 @@ pub(crate) fn current() -> Option<Resolved> {
     CURRENT.try_with(|a| a.get()).ok()
 }
 
-/// Record one actual gateway-initiated embedding bridge call. This is safe
-/// inside [`detached`]: that scope keeps a throwaway target cell but shares
-/// the parent's [`GatewayEmbeddingLedger`]. Calls outside an HTTP request are
-/// deliberately dropped, just like every other attribution write.
-pub(crate) fn note_gateway_embedding_call(call: aisix_obs::GatewayEmbeddingCall) {
-    let _ = CURRENT.try_with(|a| a.note_gateway_embedding_call(call));
-}
-
-/// Start accounting for one gateway-initiated embedding bridge call.
-///
-/// Call this immediately before `bridge.embed(...).await`, then call
-/// [`GatewayEmbeddingCallGuard::settle`] before emitting the ordinary
-/// success/error record. If the enclosing request future is dropped while
-/// awaiting the bridge, [`Drop`] records a bounded failed call against the
-/// parent ledger before cancellation emits the parent event.
-pub(crate) fn begin_gateway_embedding_call(
-    purpose: aisix_obs::GatewayEmbeddingPurpose,
-    embedding_model_id: &str,
-) -> GatewayEmbeddingCallGuard {
-    GatewayEmbeddingCallGuard {
+/// Start one internal call: `call` is its child as known before the call
+/// goes out. Call this immediately before awaiting the upstream, keep
+/// the guard alive across the await, then [`InternalCallGuard::settle`] and
+/// [`InternalCallGuard::record`] it. If the enclosing request future is
+/// dropped while awaiting, [`Drop`] records the child as cancelled before
+/// the cancel emitter takes the ledger. Outside a request scope nothing is
+/// recorded.
+pub(crate) fn begin_internal_call(call: InternalCall) -> InternalCallGuard {
+    InternalCallGuard {
         ledger: CURRENT
-            .try_with(|attribution| Arc::clone(&attribution.gateway_embedding_ledger))
+            .try_with(|attribution| Arc::clone(&attribution.internal_calls))
             .ok(),
-        purpose,
-        embedding_model_id: capped_gateway_embedding_model_id(embedding_model_id),
+        pending: Some(call),
         started: Instant::now(),
-        recorded: false,
     }
 }
 
-/// Move this request's bounded gateway-initiated embedding audit into its
-/// terminal usage event. Outside a request scope this is empty; cancellation
-/// installs the original cell with [`sync_scope`] before it emits, so it
-/// follows the same path as ordinary and streaming terminal emitters.
-pub(crate) fn take_gateway_embedding_audit() -> GatewayEmbeddingAudit {
+/// Move this request's internal calls out, for its terminal usage event to
+/// emit. Empty outside a request scope; cancellation installs the original
+/// cell with [`sync_scope`] before it emits, so it follows the same path as
+/// ordinary and streaming terminal emitters.
+pub(crate) fn take_internal_calls() -> Vec<InternalCall> {
     CURRENT
-        .try_with(|a| a.take_gateway_embedding_audit())
+        .try_with(|a| a.take_internal_calls())
         .unwrap_or_default()
+}
+
+/// Note the id of the model a semantic router selected for this request,
+/// for every parent event of it to carry as `route_target_model_id`.
+pub(crate) fn note_route_target(model_id: &str) {
+    with(|r| r.route_target_model_id = model_id.to_string());
+}
+
+/// The id [`note_route_target`] recorded, when `requested` is the name the
+/// request resolved — so only the request's own events carry it, never a
+/// child naming the model the gateway called.
+pub(crate) fn route_target_model_id(requested: &str) -> Option<String> {
+    CURRENT
+        .try_with(|a| {
+            let cell = a.lock();
+            (!cell.resolved.route_target_model_id.is_empty()
+                && cell.resolved.requested_model == requested)
+                .then(|| cell.resolved.route_target_model_id.clone())
+        })
+        .ok()
+        .flatten()
 }
 
 /// The dispatched-target half of an access-log line (AISIX-Cloud#1571).
@@ -1816,16 +1803,12 @@ mod tests {
         .unwrap()
     }
 
-    fn embedding_call(index: usize) -> aisix_obs::GatewayEmbeddingCall {
-        aisix_obs::GatewayEmbeddingCall {
-            count: 1,
-            purpose: aisix_obs::GatewayEmbeddingPurpose::SemanticRoute,
-            embedding_model_id: format!("embed-{index}"),
-            prompt_tokens: index as u32,
-            total_tokens: index as u32,
-            usage_source: aisix_obs::GatewayEmbeddingUsageSource::Reported,
-            latency_ms: index as u32,
-            outcome: aisix_obs::GatewayEmbeddingOutcome::Succeeded,
+    fn internal_call(model_id: &str) -> InternalCall {
+        InternalCall {
+            purpose: Some(aisix_obs::InternalCallPurpose::GuardrailEmbedding),
+            model_id: model_id.to_string(),
+            provider_key_id: "pk-embed".into(),
+            ..Default::default()
         }
     }
 
@@ -1908,27 +1891,20 @@ mod tests {
         assert!(current().is_none());
     }
 
-    /// A gateway-owned embedding must retain the caller's actual target while
+    /// A gateway-owned call must retain the caller's actual target while
     /// still reaching that caller's one terminal usage event. This is the
-    /// reason the detached cell shares only the child-call ledger, not its
+    /// reason the detached cell shares only the internal-call ledger, not its
     /// resolved target state.
     #[tokio::test]
-    async fn detached_embedding_call_reaches_the_parent_ledger_once() {
+    async fn detached_internal_call_reaches_the_parent_ledger_once() {
         let parent = Arc::new(RequestAttribution::default());
         scope(parent.clone(), async {
             note_target(&model("anthropic", "claude-sonnet"), "pk-chat");
             detached(async {
                 note_target(&model("openai", "text-embedding-3-small"), "pk-embed");
-                note_gateway_embedding_call(aisix_obs::GatewayEmbeddingCall {
-                    count: 1,
-                    purpose: aisix_obs::GatewayEmbeddingPurpose::Guardrail,
-                    embedding_model_id: "embed-model-id".into(),
-                    prompt_tokens: 4,
-                    total_tokens: 4,
-                    usage_source: aisix_obs::GatewayEmbeddingUsageSource::Reported,
-                    latency_ms: 9,
-                    outcome: aisix_obs::GatewayEmbeddingOutcome::Succeeded,
-                });
+                let mut guard = begin_internal_call(internal_call("embed-model-id"));
+                let call = guard.settle();
+                guard.record(call);
             })
             .await;
 
@@ -1936,123 +1912,52 @@ mod tests {
             assert_eq!(target.upstream_model, "claude-sonnet");
             assert_eq!(target.provider_key_id, "pk-chat");
 
-            let audit = take_gateway_embedding_audit();
-            assert_eq!(audit.calls.len(), 1);
-            assert_eq!(audit.dropped, 0);
-            assert_eq!(
-                audit.calls[0].purpose,
-                aisix_obs::GatewayEmbeddingPurpose::Guardrail
-            );
-            assert!(take_gateway_embedding_audit().calls.is_empty());
+            let calls = take_internal_calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].model_id, "embed-model-id");
+            assert_eq!(calls[0].status_code, 0, "a settled call is not a cancel");
+            assert!(take_internal_calls().is_empty());
         })
         .await;
     }
 
-    /// The guard is created immediately before `bridge.embed(...).await`.
-    /// Poll this child through that point, then drop it as a cancelled handler
-    /// would; the parent terminal emitter must still see the in-flight call.
+    /// The guard is created immediately before the upstream await. Poll this
+    /// child through that point, then drop it as a cancelled handler would;
+    /// the parent terminal emitter must still see the in-flight call, as a
+    /// cancelled one.
     #[tokio::test]
-    async fn cancelled_child_embedding_bridge_call_reaches_the_parent_ledger() {
+    async fn cancelled_internal_call_reaches_the_parent_ledger() {
         let parent = Arc::new(RequestAttribution::default());
         scope(parent, async {
-            let mut bridge_await = Box::pin(detached(async {
-                let _call = begin_gateway_embedding_call(
-                    aisix_obs::GatewayEmbeddingPurpose::SemanticRoute,
-                    "cancel-leak-情",
-                );
+            let mut upstream_await = Box::pin(detached(async {
+                let _call = begin_internal_call(internal_call("embed-model-id"));
                 std::future::pending::<()>().await;
             }));
             std::future::poll_fn(|cx| {
-                assert!(std::future::Future::poll(bridge_await.as_mut(), cx).is_pending());
+                assert!(std::future::Future::poll(upstream_await.as_mut(), cx).is_pending());
                 std::task::Poll::Ready(())
             })
             .await;
-            drop(bridge_await);
+            drop(upstream_await);
 
-            let audit = take_gateway_embedding_audit();
-            assert_eq!(audit.calls.len(), 1);
-            assert_eq!(audit.dropped, 0);
-            let call = &audit.calls[0];
-            assert_eq!(
-                call.purpose,
-                aisix_obs::GatewayEmbeddingPurpose::SemanticRoute
-            );
-            assert_eq!(call.embedding_model_id, "unknown");
-            assert_eq!(
-                call.usage_source,
-                aisix_obs::GatewayEmbeddingUsageSource::Unavailable
-            );
-            assert_eq!(call.outcome, aisix_obs::GatewayEmbeddingOutcome::Failed);
+            let calls = take_internal_calls();
+            assert_eq!(calls.len(), 1);
+            let call = &calls[0];
+            assert_eq!(call.model_id, "embed-model-id");
+            assert_eq!(call.status_code, crate::CLIENT_CLOSED_REQUEST);
+            assert_eq!(call.error_class, crate::CLIENT_DISCONNECTED_KIND);
             assert_eq!(call.prompt_tokens, 0);
-            assert_eq!(call.total_tokens, 0);
         })
         .await;
     }
 
+    /// Outside a request there is no parent to attach a child to.
     #[test]
-    fn child_embedding_model_ids_allow_only_bounded_ascii_safe_resource_ids() {
-        assert_eq!(
-            capped_gateway_embedding_model_id("embed_model-01"),
-            "embed_model-01"
-        );
-        assert_eq!(
-            capped_gateway_embedding_model_id("embed@customer"),
-            "unknown"
-        );
-        assert_eq!(
-            capped_gateway_embedding_model_id("embed\u{1b}[31m"),
-            "unknown"
-        );
-        assert_eq!(
-            capped_gateway_embedding_model_id(
-                &"a".repeat(MAX_GATEWAY_EMBEDDING_MODEL_ID_BYTES + 1)
-            ),
-            "unknown"
-        );
-    }
-
-    #[tokio::test]
-    async fn child_embedding_ledger_keeps_the_ordered_prefix_and_reports_all_drops() {
-        let parent = Arc::new(RequestAttribution::default());
-        scope(parent, async {
-            let total = MAX_GATEWAY_EMBEDDING_CALLS + 257;
-            for index in 0..total {
-                note_gateway_embedding_call(embedding_call(index));
-            }
-
-            let audit = take_gateway_embedding_audit();
-            assert_eq!(audit.calls.len(), MAX_GATEWAY_EMBEDDING_CALLS);
-            assert_eq!(audit.calls[0].embedding_model_id, "embed-0");
-            assert_eq!(
-                audit.calls[MAX_GATEWAY_EMBEDDING_CALLS - 1].embedding_model_id,
-                format!("embed-{}", MAX_GATEWAY_EMBEDDING_CALLS - 1),
-            );
-            assert_eq!(audit.dropped, 257);
-
-            let second_take = take_gateway_embedding_audit();
-            assert!(second_take.calls.is_empty());
-            assert_eq!(second_take.dropped, 0);
-        })
-        .await;
-    }
-
-    #[test]
-    fn child_embedding_ledger_drop_counter_saturates() {
-        let attribution = RequestAttribution::default();
-        for index in 0..MAX_GATEWAY_EMBEDDING_CALLS {
-            attribution.note_gateway_embedding_call(embedding_call(index));
-        }
-        attribution
-            .gateway_embedding_ledger
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .dropped = u32::MAX;
-
-        attribution.note_gateway_embedding_call(embedding_call(MAX_GATEWAY_EMBEDDING_CALLS));
-        let audit = attribution.take_gateway_embedding_audit();
-        assert_eq!(audit.calls.len(), MAX_GATEWAY_EMBEDDING_CALLS);
-        assert_eq!(audit.dropped, u32::MAX);
+    fn an_internal_call_outside_a_request_records_nothing() {
+        let mut guard = begin_internal_call(internal_call("embed-model-id"));
+        let call = guard.settle();
+        guard.record(call);
+        assert!(take_internal_calls().is_empty());
     }
 
     #[tokio::test]
