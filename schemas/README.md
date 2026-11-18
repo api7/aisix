@@ -106,7 +106,7 @@ That is the tolerance the split exists for: an optional field a newer
 control plane adds inside a nested config object is ignored and reported,
 instead of taking the whole row down.
 
-For **nine** resources the read contract relaxes a requirement as well,
+For **eleven** resources the read contract relaxes a requirement as well,
 so a consumer that models the lenient set as "the strict set with
 `additionalProperties` stripped" is wrong about them:
 
@@ -120,6 +120,7 @@ so a consumer that models the lenient set as "the strict set with
 | `oidc_provider` | `tag_claims` is any object of strings, or `null` read as none: the key pattern, the non-empty path and the 32-entry cap are write-path limits, for the reason given under `team` — a row lost to one would stop the provider authenticating its callers |
 | `team`, `user` | `tags` is any object of strings, or `null` read as no tags: the key pattern, the 1–128-character value length and the 32-entry cap are write-path limits, so a stored row stays loadable if a later release relaxes them — for an `api_key` a row lost to one would stop the key authenticating |
 | `budget` | the per-scope shape is not checked — `tag` only and always for scope `tag`, `scope_ref` for every other scope, `exhausted_members` only for `team_member`: a row missing its target matches no request, which is no worse than not loading it |
+| `usage_accounting` | `exclude_estimated_usage` is not required: a stored row without it loads with the switch off, which is the behaviour without the row |
 | `model` | the per-kind `not`/`anyOf` lists that forbid a knob a kind never resolves are shorter — a stored row keeps loading and `Model::strip_kind_inapplicable` drops the dead knob; and an `effort_mapping` target value may be empty, which the write path refuses |
 
 Three of those are worth spelling out. A half-written `McpToolRef` entry
@@ -142,7 +143,7 @@ required on **both** sets. A scriptless `custom` row screens nothing
 either way, so rejecting it is what makes it visible in
 `GET /status/config`'s `rejected[]`.
 
-These come from the nine producers that take a `strict` flag in
+These come from the eleven producers that take a `strict` flag in
 `crates/aisix-core/src/models/schema.rs` and are deliberate.
 
 One consequence is registered rather than fixed: the gateway's own Admin

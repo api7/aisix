@@ -1825,11 +1825,12 @@ mod tests {
                 br#"{"exclude_estimated_usage":true}"#,
                 1,
             ),
-            // The field is required: a document without it is dropped.
+            // Required on write only: a stored document without the field
+            // loads with the switch off.
             raw("/aisix/usage_accounting/env-2", br#"{}"#, 2),
         ];
         let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
-        assert_eq!(stats.accepted, 1, "{:?}", stats.rejections);
+        assert_eq!(stats.accepted, 2, "{:?}", stats.rejections);
         assert_eq!(stats.unknown_kind, 0);
         assert!(
             snap.usage_accounting
@@ -1838,7 +1839,14 @@ mod tests {
                 .value
                 .exclude_estimated_usage
         );
-        assert!(snap.usage_accounting.get_by_id("env-2").is_none());
+        assert!(
+            !snap
+                .usage_accounting
+                .get_by_id("env-2")
+                .unwrap()
+                .value
+                .exclude_estimated_usage
+        );
         assert!(snap.excludes_estimated_usage());
     }
 

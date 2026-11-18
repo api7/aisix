@@ -2066,14 +2066,7 @@ async fn responses_to_target(
                 // #688: apply the terminal token cost to TPM/TPD and release the
                 // concurrency hold now the stream has ended (sync analog of the
                 // reservation's async `commit_tokens`, which this closure can't await).
-                let streamed_tokens = total_tokens_with_cache(
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    usage.cache_creation_tokens,
-                    usage.cache_read_tokens,
-                );
-                let charge =
-                    aisix_ratelimit::TokenCharge::new(streamed_tokens, usage.usage_estimated);
+                let charge = response_usage_charge(&usage);
                 for key in &post_stream_keys {
                     limiter_c.add_tokens_post_stream(key, charge);
                 }

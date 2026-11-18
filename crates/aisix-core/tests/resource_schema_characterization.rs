@@ -1057,6 +1057,7 @@ fn published_strict_schemas_are_what_the_write_path_compiles() {
 ///   BOTH sets.
 const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
     ("budget", &["/allOf"]),
+    ("usage_accounting", &["/required"]),
     (
         "api_key",
         &[

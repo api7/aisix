@@ -21,6 +21,7 @@ pub struct UsageAccounting {
     ///
     /// A stream the caller closes before the usage frame arrives is excluded
     /// too, so turn this on only where every caller is trusted.
+    #[serde(default)]
     pub exclude_estimated_usage: bool,
 
     /// Set by the loader from the key's id segment. Not part of the wire
@@ -51,12 +52,15 @@ mod tests {
     use crate::models::{validate_usage_accounting, validate_usage_accounting_lenient};
 
     #[test]
-    fn exclude_estimated_usage_is_a_required_boolean() {
+    fn exclude_estimated_usage_is_required_on_write_only() {
         assert!(validate_usage_accounting(&json!({"exclude_estimated_usage": true})).is_ok());
         assert!(validate_usage_accounting(&json!({"exclude_estimated_usage": false})).is_ok());
         assert!(validate_usage_accounting(&json!({})).is_err());
         assert!(validate_usage_accounting(&json!({"exclude_estimated_usage": "yes"})).is_err());
-        assert!(validate_usage_accounting_lenient(&json!({})).is_err());
+        assert!(validate_usage_accounting_lenient(&json!({})).is_ok());
+        assert!(
+            validate_usage_accounting_lenient(&json!({"exclude_estimated_usage": "yes"})).is_err()
+        );
     }
 
     #[test]

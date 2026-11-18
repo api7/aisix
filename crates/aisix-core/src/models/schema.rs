@@ -154,7 +154,7 @@ pub fn resource_root_schema(resource: &str, strict: bool) -> Value {
         "user" => user_root_schema(strict),
         "budget" => budget_root_schema(strict),
         "budget_policy" => budget_policy_root_schema(),
-        "usage_accounting" => usage_accounting_root_schema(),
+        "usage_accounting" => usage_accounting_root_schema(strict),
         other => panic!("unknown resource {other:?}"),
     };
     if strict {
@@ -2381,8 +2381,12 @@ pub fn budget_policy_root_schema() -> Value {
 
 /// Canonical JSON Schema for the `usage_accounting` resource, derived from
 /// the [`UsageAccounting`](crate::models::UsageAccounting) struct.
-pub fn usage_accounting_root_schema() -> Value {
-    struct_root_schema::<crate::models::UsageAccounting>(false)
+pub fn usage_accounting_root_schema(strict: bool) -> Value {
+    let mut schema = struct_root_schema::<crate::models::UsageAccounting>(false);
+    if strict {
+        require_property(&mut schema, "exclude_estimated_usage");
+    }
+    schema
 }
 
 /// Canonical JSON Schema for the `team` resource, derived from the
