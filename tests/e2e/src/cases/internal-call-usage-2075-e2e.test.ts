@@ -15,6 +15,7 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 import { pickFreePort } from "../harness/ports.js";
 
 // AISIX-Cloud#2075: the model calls the gateway makes on a request's behalf
@@ -53,6 +54,7 @@ const ROUTE_DEFAULT = "icu-2075-route-default";
 const STREAM_ROUTER_MODEL = "icu-2075-router-stream";
 const STREAM_ROUTE_TARGET = "icu-2075-route-target-stream";
 const GUARDRAIL_MODEL = "icu-2075-guardrail-chat";
+const CUSTOM_TIMEOUT_MODEL = "icu-2075-custom-timeout-chat";
 const CACHE_MODEL = "icu-2075-cache-chat";
 const UNAVAILABLE_USAGE_EMBED_MODEL = "icu-2075-embed-usage-unavailable";
 const UNAVAILABLE_USAGE_ROUTER_MODEL = "icu-2075-router-usage-unavailable";
@@ -245,6 +247,7 @@ const isChild = (row: Row) => row.has("internal_call_purpose");
 describe("internal model calls as child usage events (#2075)", () => {
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
+  let otlp: MockOtlp | undefined;
   let embed: EmbeddingMock | undefined;
   let decisions: Awaited<ReturnType<typeof startDecisionMock>> | undefined;
   let upstream: OpenAiUpstream | undefined;
@@ -353,6 +356,7 @@ describe("internal model calls as child usage events (#2075)", () => {
     expect(await etcd.ping(), "internal call usage e2e requires etcd").toBe(true);
 
     sls = await startMockSls();
+    otlp = await startMockOtlp();
     embed = await startEmbeddingMock();
     decisions = await startDecisionMock();
     upstream = await startOpenAiUpstream({
@@ -392,6 +396,12 @@ describe("internal model calls as child usage events (#2075)", () => {
         content_mode,
       });
     }
+    await seed.createObservabilityExporter({
+      name: "internal-call-usage-otlp",
+      enabled: true,
+      kind: "otlp_http",
+      endpoint: otlp.url,
+    });
 
     const embeddingKey = await seed.createProviderKey({
       display_name: "icu-2075-embed-pk",
@@ -424,7 +434,14 @@ describe("internal model calls as child usage events (#2075)", () => {
       secret: "sk-stream-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
-    for (const name of [ROUTE_TARGET, ROUTE_GROUP_MEMBER, ROUTE_DEFAULT, GUARDRAIL_MODEL, CACHE_MODEL]) {
+    for (const name of [
+      ROUTE_TARGET,
+      ROUTE_GROUP_MEMBER,
+      ROUTE_DEFAULT,
+      GUARDRAIL_MODEL,
+      CUSTOM_TIMEOUT_MODEL,
+      CACHE_MODEL,
+    ]) {
       const model = await seed.createModel({
         display_name: name,
         provider: "openai",
@@ -554,6 +571,25 @@ describe("internal model calls as child usage events (#2075)", () => {
       priority: 100,
     });
 
+    // A custom script whose embedding outlives the script's own time
+    // budget: the gateway stops waiting, the client does not leave.
+    const customTimeout = await seed.createGuardrail(
+      {
+        enabled: true,
+        name: "icu-2075-custom-timeout",
+        hook_point: "input",
+        kind: "custom",
+        fail_open: true,
+        timeout_ms: 500,
+        script: `export async function checkInput(ctx) {
+  await aisix.embed("${CANCELLED_EMBED_MODEL}", [ctx.text]);
+  return { action: "none" };
+}`,
+      },
+      { attach: false },
+    );
+    await seed.attachGuardrailToModel(customTimeout.id, ids[CUSTOM_TIMEOUT_MODEL]!);
+
     await seed.createCachePolicy({
       name: "icu-2075-cache",
       backend: "memory",
@@ -576,6 +612,7 @@ describe("internal model calls as child usage events (#2075)", () => {
     await embed?.close();
     await decisions?.close();
     await sls?.close();
+    await otlp?.close();
   });
 
   test("a semantic route's embedding is a child; the parent names the selected target", async () => {
@@ -636,7 +673,7 @@ describe("internal model calls as child usage events (#2075)", () => {
     expect(parent.get("route_target_model_id")).toBe(ids[STREAM_ROUTE_TARGET]);
   });
 
-  test("an embedding answer without usage is a zero-token child", async () => {
+  test("an embedding answer without usage is counted locally and flagged estimated", async () => {
     const response = await chat(UNAVAILABLE_USAGE_ROUTER_MODEL, ROUTE_PROMPT);
     expect(response.status).toBe(200);
     const { parent, children } = split(await rowsOf(response.requestId));
@@ -645,8 +682,69 @@ describe("internal model calls as child usage events (#2075)", () => {
     expectChildOf(child, parent);
     expect(child.get("model_id")).toBe(ids[UNAVAILABLE_USAGE_EMBED_MODEL]);
     expect(child.get("status_code")).toBe("200");
-    expect(child.get("prompt_tokens") ?? "0").toBe("0");
+    expect(Number(child.get("prompt_tokens") ?? "0")).toBeGreaterThan(0);
+    expect(child.get("usage_estimated")).toBe("true");
     expectParentUsage(parent);
+  });
+
+  test("an embedding answer with usage is not flagged estimated", async () => {
+    const response = await chat(ROUTER_MODEL, ROUTE_PROMPT);
+    const { children } = split(await rowsOf(response.requestId));
+    expect(children).toHaveLength(1);
+    expect(children[0]!.has("usage_estimated")).toBe(false);
+  });
+
+  test("a child's OTLP span is in the request's trace, under its SERVER span", async () => {
+    const response = await chat(ROUTER_MODEL, ROUTE_PROMPT);
+    expect(response.status).toBe(200);
+    const childSpan = () =>
+      otlp!.spans.find(
+        (span) =>
+          span.attributes["aisix.request_id"] === response.requestId &&
+          span.attributes["aisix.internal_call_purpose"] === "semantic_route_embedding",
+      );
+    const parentSpan = () =>
+      otlp!.spans.find(
+        (span) =>
+          span.attributes["aisix.request_id"] === response.requestId &&
+          span.attributes["aisix.internal_call_purpose"] === undefined,
+      );
+    for (let i = 0; i < 100 && !(childSpan() && parentSpan()); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const child = childSpan();
+    const parent = parentSpan();
+    expect(child, "the child's span").toBeDefined();
+    expect(parent, "a span of the request itself").toBeDefined();
+    expect(child!.kind).toBe(3);
+    expect(child!.traceId).toBe(parent!.traceId);
+    const server = otlp!.spans.find((span) => span.spanId === child!.parentSpanId);
+    expect(server, "the child's parent span was exported").toBeDefined();
+    expect(server!.kind).toBe(2);
+    expect(server!.traceId).toBe(parent!.traceId);
+    expect(BigInt(child!.startTimeUnixNano)).toBeGreaterThanOrEqual(
+      BigInt(server!.startTimeUnixNano),
+    );
+    expect(BigInt(child!.endTimeUnixNano)).toBeLessThanOrEqual(BigInt(server!.endTimeUnixNano));
+  });
+
+  test("an embedding the gateway stopped waiting for is a timeout child, not a client disconnect", async () => {
+    const { embed } = runtime();
+    const slowBefore = embed.callCountFor(CANCELLED_UPSTREAM_MODEL);
+    const response = await chat(CUSTOM_TIMEOUT_MODEL, "custom-timeout candidate");
+    // The script's budget elapsed; the row fails open and the request is served.
+    expect(response.status).toBe(200);
+    expect(embed.callCountFor(CANCELLED_UPSTREAM_MODEL)).toBe(slowBefore + 1);
+    const { parent, children } = split(await rowsOf(response.requestId));
+    expect(parent.get("status_code")).toBe("200");
+    expect(children).toHaveLength(1);
+    const child = children[0]!;
+    expectChildOf(child, parent);
+    expect(child.get("internal_call_purpose")).toBe("guardrail_embedding");
+    expect(child.get("model_id")).toBe(ids[CANCELLED_EMBED_MODEL]);
+    expect(child.get("status_code")).toBe("504");
+    expect(child.get("error_class")).toBe("timeout");
+    expect(Number(child.get("upstream_latency_ms"))).toBeGreaterThan(0);
   });
 
   test("a failed embedding is a failed child that carries no captured content", async () => {

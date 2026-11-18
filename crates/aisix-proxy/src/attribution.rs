@@ -663,6 +663,14 @@ pub(crate) struct InternalCall {
     pub(crate) completion_tokens: u32,
     /// The upstream's own total, `0` when it reported none.
     pub(crate) total_tokens: u32,
+    /// The token counts were estimated locally: the upstream reported none.
+    pub(crate) usage_estimated: bool,
+    /// When the call returned (or was abandoned), for its trace span.
+    pub(crate) settled_at: Option<Instant>,
+    /// The call's future was dropped before it returned. Whether the
+    /// caller left or the gateway stopped waiting is told apart by the
+    /// request's own outcome, when the child is emitted.
+    pub(crate) abandoned: bool,
     pub(crate) provider_request_id: String,
     pub(crate) provider_model_version: String,
 }
@@ -688,7 +696,7 @@ impl InternalCallLedger {
     }
 }
 
-/// Records an in-flight internal call as a cancelled child if its future is
+/// Records an in-flight internal call as an abandoned child if its future is
 /// dropped before the call returns.
 ///
 /// The guard owns the ledger rather than consulting [`CURRENT`] from
@@ -702,15 +710,28 @@ pub(crate) struct InternalCallGuard {
     /// The child as far as it is known before the call returns.
     pending: Option<InternalCall>,
     started: Instant,
+    /// When the upstream answered, if work remains before the child
+    /// settles (a local token estimate); the call's own time ends here.
+    returned: Option<Instant>,
 }
 
 impl InternalCallGuard {
+    /// The upstream has answered: the call's latency and span end here,
+    /// even if counting its tokens still takes a while. The guard stays
+    /// armed until [`Self::settle`].
+    pub(crate) fn mark_returned(&mut self) {
+        self.returned = Some(Instant::now());
+    }
+
     /// The child as built before the call, timed, for the settled outcome
     /// to fill in. Disarms the cancellation record.
     pub(crate) fn settle(&mut self) -> InternalCall {
         let mut call = self.pending.take().expect("an internal call settles once");
+        let returned = self.returned.unwrap_or_else(Instant::now);
         call.completed_at = aisix_obs::UsageEvent::occurred_at_now();
-        call.latency_ms = crate::attempt::measured_ms(self.started.elapsed());
+        call.settled_at = Some(returned);
+        call.latency_ms =
+            crate::attempt::measured_ms(returned.saturating_duration_since(self.started));
         call
     }
 
@@ -728,13 +749,9 @@ impl Drop for InternalCallGuard {
             return;
         };
         call.completed_at = aisix_obs::UsageEvent::occurred_at_now();
+        call.settled_at = Some(Instant::now());
         call.latency_ms = crate::attempt::measured_ms(self.started.elapsed());
-        call.status_code = crate::CLIENT_CLOSED_REQUEST;
-        crate::usage_attr::stamp_client_disconnect(
-            call.status_code,
-            &mut call.error_class,
-            &mut call.error_message,
-        );
+        call.abandoned = true;
         ledger.record(call);
     }
 }
@@ -1139,6 +1156,7 @@ pub(crate) fn begin_internal_call(call: InternalCall) -> InternalCallGuard {
             .ok(),
         pending: Some(call),
         started: Instant::now(),
+        returned: None,
     }
 }
 
@@ -1944,8 +1962,8 @@ mod tests {
             assert_eq!(calls.len(), 1);
             let call = &calls[0];
             assert_eq!(call.model_id, "embed-model-id");
-            assert_eq!(call.status_code, crate::CLIENT_CLOSED_REQUEST);
-            assert_eq!(call.error_class, crate::CLIENT_DISCONNECTED_KIND);
+            assert!(call.abandoned);
+            assert!(call.settled_at.is_some());
             assert_eq!(call.prompt_tokens, 0);
         })
         .await;

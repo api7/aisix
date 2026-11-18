@@ -1254,7 +1254,7 @@ pub(crate) fn emit_usage(
     let exporters = live_exporters(state, snap);
     if exporters.is_empty() {
         if terminal {
-            emit_internal_calls(state, snap, surface, &event);
+            emit_internal_calls(state, snap, surface, &event, trace);
         }
         return;
     }
@@ -1323,7 +1323,7 @@ pub(crate) fn emit_usage(
     // terminal event, once every attempt and the stream have settled, and
     // inherit that event's caller identity.
     if terminal {
-        emit_internal_calls(state, snap, surface, &event);
+        emit_internal_calls(state, snap, surface, &event, trace);
     }
 }
 
@@ -1378,6 +1378,7 @@ fn emit_internal_calls(
     snap: &AisixSnapshot,
     surface: Surface,
     parent: &UsageEvent,
+    trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
 ) {
     let calls = crate::attribution::take_internal_calls();
     if calls.is_empty() {
@@ -1386,6 +1387,13 @@ fn emit_internal_calls(
     let exporters = live_exporters(state, snap);
     for mut call in calls {
         let provider_key_id = std::mem::take(&mut call.provider_key_id);
+        // Each child is a span of the request's own trace, under its SERVER span.
+        let emission = trace.map(|bundle| {
+            bundle.internal_call_emission(
+                call.settled_at.unwrap_or_else(std::time::Instant::now),
+                call.latency_ms,
+            )
+        });
         let pk = ResolvedPk::resolve(snap, &provider_key_id);
         let mut event = internal_call_event(call, parent);
         apply_pk_telemetry(&mut event, &pk);
@@ -1417,7 +1425,7 @@ fn emit_internal_calls(
         state.otlp_fan_out.fan_out(
             &event,
             None,
-            None,
+            emission.as_ref(),
             facts.as_ref(),
             exporters.iter().map(|e| &e.value),
         );
@@ -1433,6 +1441,24 @@ fn internal_call_event(
 ) -> UsageEvent {
     // Stamped by `UsageEvent::occurred_at_now` when the call settled.
     let completed_at = std::mem::take(&mut call.completed_at);
+    if call.abandoned {
+        // The call's future was dropped before it returned. If the caller
+        // left, the request ends 499 and so does the call; otherwise the
+        // gateway stopped waiting for it (a custom guardrail's time budget).
+        if parent.status_code == crate::CLIENT_CLOSED_REQUEST {
+            call.status_code = crate::CLIENT_CLOSED_REQUEST;
+            stamp_client_disconnect(
+                call.status_code,
+                &mut call.error_class,
+                &mut call.error_message,
+            );
+        } else {
+            call.status_code = 504;
+            call.error_class = "timeout".to_owned();
+            call.error_message =
+                "the gateway stopped waiting for this call before it returned".to_owned();
+        }
+    }
     let mut event = UsageEvent {
         // NO-GUARDRAIL-CHAIN: the gateway's own call; the guardrails that
         // governed the request are reported on the request's own events.
@@ -1448,6 +1474,7 @@ fn internal_call_event(
         prompt_tokens: call.prompt_tokens,
         completion_tokens: call.completion_tokens,
         total_tokens: call.total_tokens,
+        usage_estimated: call.usage_estimated,
         upstream_latency_ms: call.latency_ms,
         status_code: call.status_code,
         error_class: call.error_class,

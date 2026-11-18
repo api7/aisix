@@ -1538,11 +1538,28 @@ async fn embed_texts_inner(
         &pk_entry.id,
     ));
     let response = bridge.embed(&req, &ctx).await;
+    child.mark_returned();
+    // Counted the way `/v1/embeddings` counts the same answer: the
+    // upstream's prompt count, else its total, else a local estimate.
+    let counted = match &response {
+        Ok(resp) => Some(
+            match crate::embeddings::reported_prompt_tokens(&resp.usage) {
+                Some(reported) => (reported, false),
+                None => {
+                    let estimated = estimate_embedding_tokens(model, texts).await;
+                    (estimated, estimated > 0)
+                }
+            },
+        ),
+        Err(_) => None,
+    };
     let mut call = child.settle();
     let resp = match response {
         Ok(resp) => {
+            let (prompt_tokens, usage_estimated) = counted.unwrap_or_default();
             call.status_code = 200;
-            call.prompt_tokens = resp.usage.prompt_tokens;
+            call.prompt_tokens = prompt_tokens;
+            call.usage_estimated = usage_estimated;
             call.total_tokens = resp.usage.upstream_total_tokens;
             call.provider_model_version = crate::chat::sanitize_tag(resp.model.clone());
             child.record(call);
@@ -1594,6 +1611,20 @@ async fn embed_texts_inner(
         )));
     }
     Ok(out)
+}
+
+/// The local token estimate of an embedding batch the upstream reported no
+/// usage for, counted off the request worker unless the input is small.
+async fn estimate_embedding_tokens(model: &Model, texts: &[String]) -> u32 {
+    let upstream_model = model.upstream_model().unwrap_or("unknown").to_owned();
+    let texts = texts.to_vec();
+    let bytes = texts
+        .iter()
+        .fold(0usize, |n, s| n.saturating_add(s.len()).saturating_add(3));
+    crate::estimate_pool::run(bytes, move || {
+        crate::token_estimate::count_texts(&upstream_model, texts.iter().map(String::as_str))
+    })
+    .await
 }
 
 /// One internal call as known before it goes out: what it is for, and the

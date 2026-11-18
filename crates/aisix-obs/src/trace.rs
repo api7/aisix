@@ -205,8 +205,14 @@ impl TraceClock {
 
     /// Nanoseconds since the Unix epoch, now.
     pub fn now_unix_nanos(&self) -> u64 {
+        self.unix_nanos_at(Instant::now())
+    }
+
+    /// Nanoseconds since the Unix epoch at `at`, on the same monotonic base.
+    pub fn unix_nanos_at(&self, at: Instant) -> u64 {
+        let offset = at.saturating_duration_since(self.base);
         self.base_unix_nanos
-            .saturating_add(self.base.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+            .saturating_add(offset.as_nanos().min(u64::MAX as u128) as u64)
     }
 }
 
@@ -529,6 +535,35 @@ impl RequestTraceBundle {
             remote_flags: self.remote.as_ref().map(|r| r.flags),
             tracestate: self.remote.as_ref().and_then(|r| r.tracestate.clone()),
             spans,
+        }
+    }
+}
+
+impl RequestTraceBundle {
+    /// The span of one model call the gateway made on this request's
+    /// behalf (a child usage event): a CLIENT span in the request's trace,
+    /// parented under its SERVER span, ending when the call settled and
+    /// clamped inside the request. Its id is minted once per snapshot, so
+    /// delivery retries and every exporter agree on it.
+    pub fn internal_call_emission(&self, settled: Instant, latency_ms: u32) -> TraceEmission {
+        let end = self
+            .clock
+            .unix_nanos_at(settled)
+            .max(self.server_start_unix_nano);
+        let latency_nanos = u64::from(latency_ms).saturating_mul(1_000_000);
+        TraceEmission {
+            trace_id: self.trace_id,
+            remote_flags: self.remote.as_ref().map(|r| r.flags),
+            tracestate: None,
+            spans: vec![SpanEmit {
+                role: SpanRole::Attempt,
+                span_id: SpanId::random(),
+                parent_span_id: Some(self.server_span_id),
+                start_unix_nano: end
+                    .saturating_sub(latency_nanos)
+                    .max(self.server_start_unix_nano),
+                end_unix_nano: end,
+            }],
         }
     }
 }
@@ -930,5 +965,30 @@ mod tests {
             !second.spans.iter().any(|s| s.role == SpanRole::Server),
             "duplicate SERVER span"
         );
+    }
+
+    /// A gateway-internal call's span joins the request's trace under its
+    /// SERVER span, bracketed by the request.
+    #[test]
+    fn an_internal_call_span_is_a_child_of_the_request_s_server_span() {
+        let bundle = RequestTraceBundle::new(None);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let settled = Instant::now();
+        let child = bundle.internal_call_emission(settled, 3);
+        let terminal = bundle.emission(true, 0, 0, false);
+        let server = terminal
+            .spans
+            .iter()
+            .find(|s| s.role == SpanRole::Server)
+            .unwrap();
+        assert_eq!(child.trace_id, terminal.trace_id);
+        assert_eq!(child.spans.len(), 1);
+        let span = child.spans[0];
+        assert_eq!(span.role, SpanRole::Attempt);
+        assert_eq!(span.parent_span_id, Some(server.span_id));
+        assert_ne!(span.span_id, server.span_id);
+        assert_eq!(span.end_unix_nano - span.start_unix_nano, 3_000_000);
+        assert!(span.start_unix_nano >= server.start_unix_nano);
+        assert!(span.end_unix_nano <= server.end_unix_nano);
     }
 }
