@@ -70,6 +70,13 @@ export interface MockControlPlane {
   /** Whether the connection `holdEtcdConnection` named has arrived and is held. */
   etcdConnectionHeld(): boolean;
   releaseEtcdConnection(): void;
+  /**
+   * Stop delivering etcd's replies on the `n`th accepted connection (same
+   * numbering) while the gateway's requests still reach etcd, until
+   * `resumeEtcdConnection(n)` delivers everything withheld.
+   */
+  stallEtcdConnection(n: number): void;
+  resumeEtcdConnection(n: number): void;
   /** Every `/dp/heartbeat` body, in arrival order. */
   heartbeatBodies: string[];
   close(): Promise<void>;
@@ -194,6 +201,8 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
     etcdBlackholed: () => 0,
     holdEtcdConnection: () => {},
     etcdConnectionHeld: () => false,
+    stallEtcdConnection: () => {},
+    resumeEtcdConnection: () => {},
     releaseEtcdConnection: () => {},
     heartbeatBodies: [],
     close: async () => {},
@@ -232,8 +241,14 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
   // gRPC over TLS in front of the plain etcd every spec shares.
   const target = new URL(etcdEndpoint());
   const sockets = new Set<Socket>();
+  // Accepted connection number by the gateway's source port, and the
+  // etcd-side socket and gateway-side socket of each served one.
+  const connectionByPort = new Map<number, number>();
+  const served = new Map<number, { client: Socket; upstream: Socket }>();
   const etcdFront: TlsServer = createTlsServer({ ...tlsMaterial, ALPNProtocols: ["h2"] }, (client) => {
     const upstream = connect(Number(target.port), target.hostname);
+    const n = connectionByPort.get(client.remotePort ?? -1);
+    if (n !== undefined) served.set(n, { client, upstream });
     for (const s of [client, upstream]) {
       sockets.add(s);
       s.on("close", () => sockets.delete(s));
@@ -257,6 +272,7 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
     socket.on("close", () => tcpSockets.delete(socket));
     socket.on("error", () => socket.destroy());
     accepted += 1;
+    if (socket.remotePort !== undefined) connectionByPort.set(socket.remotePort, accepted);
     if (accepted === holdNth) {
       heldSocket = socket;
     } else if (etcdPath === "reset") {
@@ -279,6 +295,16 @@ export async function startMockControlPlane(): Promise<MockControlPlane> {
     holdNth = n;
   };
   cp.etcdConnectionHeld = () => heldSocket !== undefined;
+  cp.stallEtcdConnection = (n) => {
+    const pair = served.get(n);
+    if (!pair) throw new Error(`etcd connection ${n} is not being served`);
+    pair.upstream.unpipe(pair.client);
+    pair.upstream.pause();
+  };
+  cp.resumeEtcdConnection = (n) => {
+    const pair = served.get(n);
+    if (pair) pair.upstream.pipe(pair.client);
+  };
   cp.releaseEtcdConnection = () => {
     const socket = heldSocket;
     heldSocket = undefined;

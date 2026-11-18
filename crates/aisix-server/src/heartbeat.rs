@@ -54,6 +54,10 @@ pub type RejectionFetcher = Arc<dyn Fn() -> Vec<ConfigRejectionSnapshot> + Send 
 /// "propagating…" until the DP catches up (#519 B.3). `0` = the
 /// supervisor has not completed its first load yet.
 pub type AppliedRevisionFetcher = Arc<dyn Fn() -> i64 + Send + Sync>;
+/// Per watched prefix, the revision the gateway has processed every event
+/// under it to. Empty before the first live read.
+pub type AppliedRevisionsFetcher =
+    Arc<dyn Fn() -> std::collections::BTreeMap<String, i64> + Send + Sync>;
 
 /// Per-tick source of the observability exporters' delivery counters,
 /// keyed by exporter name (`OtlpHttpFanOut::exporter_stats`). Reported
@@ -144,6 +148,8 @@ pub struct HeartbeatConfig {
     /// `None` (tests / no supervisor) reports `applied_revision: 0`,
     /// the same value as "not yet loaded". See #519 B.3.
     pub applied_revision_fetcher: Option<AppliedRevisionFetcher>,
+    /// Optional source of `applied_revisions`; `None` omits the field.
+    pub applied_revisions_fetcher: Option<AppliedRevisionsFetcher>,
     /// Optional source of per-exporter delivery counters. `None`
     /// reports an empty `exporter_health` array. See #519 D.2.
     pub exporter_health_fetcher: Option<ExporterHealthFetcher>,
@@ -174,6 +180,10 @@ impl std::fmt::Debug for HeartbeatConfig {
             .field(
                 "applied_revision_fetcher",
                 &self.applied_revision_fetcher.as_ref().map(|_| "<fn>"),
+            )
+            .field(
+                "applied_revisions_fetcher",
+                &self.applied_revisions_fetcher.as_ref().map(|_| "<fn>"),
             )
             .field(
                 "exporter_health_fetcher",
@@ -212,6 +222,7 @@ impl HeartbeatConfig {
             mtls,
             rejection_fetcher: None,
             applied_revision_fetcher: None,
+            applied_revisions_fetcher: None,
             exporter_health_fetcher: None,
             config_hash_fetcher: None,
             partial_compat_fetcher: None,
@@ -228,6 +239,12 @@ impl HeartbeatConfig {
     /// Wire the supervisor's applied-revision source (#519 B.3).
     pub fn with_applied_revision_fetcher(mut self, fetcher: AppliedRevisionFetcher) -> Self {
         self.applied_revision_fetcher = Some(fetcher);
+        self
+    }
+
+    /// Wire the per-prefix applied-revision source.
+    pub fn with_applied_revisions_fetcher(mut self, fetcher: AppliedRevisionsFetcher) -> Self {
+        self.applied_revisions_fetcher = Some(fetcher);
         self
     }
 
@@ -332,12 +349,15 @@ struct HeartbeatBody<'a> {
     /// against the revision returned by its own kine writes: a DP with
     /// `applied_revision >= write_revision` has seen that write.
     applied_revision: i64,
-    /// `true` whenever a revision is reported: every configuration event at or below
-    /// `applied_revision`, in every prefix this gateway watches, has been
-    /// processed (applied or rejected). Gateways before this field could
-    /// report a revision below an event they had processed, so a control
-    /// plane must not treat their lag as exact.
-    applied_revision_complete: bool,
+    /// Keyed by each watched prefix exactly as the gateway watches it:
+    /// every configuration event under that prefix at or below the value
+    /// has been processed (applied or rejected). Per prefix because the
+    /// prefixes are watched on separate streams with no order between
+    /// them, so no single revision can say the same across all of them.
+    /// Omitted until the first live read (a snapshot restored from the
+    /// disk cache does not know it).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    applied_revisions: std::collections::BTreeMap<String, i64>,
     /// The sha256 the DP computed over its applied (served) config set
     /// (#774). Omitted from the wire when the supervisor has not applied a
     /// snapshot yet, or the fetcher isn't wired (tests / managed-mode
@@ -475,6 +495,11 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
         .as_ref()
         .map(|fetcher| fetcher())
         .unwrap_or(0);
+    let applied_revisions = cfg
+        .applied_revisions_fetcher
+        .as_ref()
+        .map(|fetcher| fetcher())
+        .unwrap_or_default();
     // Off the runtime's own threads: the configuration status computes
     // this digest when something reports it rather than on every apply,
     // so the first heartbeat after an apply walks the whole
@@ -525,7 +550,7 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
             version: &aisix_core::HEARTBEAT_VERSION,
             supported_guardrail_kinds: aisix_guardrails::supported_kinds(),
             applied_revision,
-            applied_revision_complete: cfg.applied_revision_fetcher.is_some(),
+            applied_revisions,
             config_hash,
             exporter_health,
             rejected_resources: rejections,
@@ -790,6 +815,9 @@ managed:
         let mtls = write_test_bundle(dir.path());
         let cfg = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls)
             .with_applied_revision_fetcher(Arc::new(|| 42))
+            .with_applied_revisions_fetcher(Arc::new(|| {
+                std::collections::BTreeMap::from([("/aisix/e/".to_string(), 41)])
+            }))
             .with_exporter_health_fetcher(Arc::new(|| {
                 let mut m = std::collections::HashMap::new();
                 m.insert(
@@ -826,7 +854,7 @@ managed:
 
         // B.3 — the fetched applied revision.
         assert_eq!(body["applied_revision"], 42);
-        assert_eq!(body["applied_revision_complete"], true);
+        assert_eq!(body["applied_revisions"]["/aisix/e/"], 41);
 
         // D.2 — both exporters, sorted by name, with the wire fields.
         let health = body["exporter_health"].as_array().unwrap();
@@ -964,6 +992,7 @@ managed:
         let received = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
         assert_eq!(body["applied_revision"], 0);
+        assert!(body.get("applied_revisions").is_none(), "{body}");
         assert_eq!(body["exporter_health"], serde_json::json!([]));
         assert!(body["supported_guardrail_kinds"]
             .as_array()

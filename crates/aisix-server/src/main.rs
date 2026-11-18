@@ -1289,7 +1289,9 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             config_status_for_rejections.rejection_snapshots()
         }));
         let watch_status = supervisor.watch_status();
+        let prefix_status = watch_status.clone();
         h = h.with_applied_revision_fetcher(Arc::new(move || watch_status.snapshot().revision));
+        h = h.with_applied_revisions_fetcher(Arc::new(move || prefix_status.prefix_revisions()));
         let config_status_for_heartbeat = supervisor.config_status();
         h = h.with_config_hash_fetcher(Arc::new(move || {
             config_status_for_heartbeat.applied_config_hash()
