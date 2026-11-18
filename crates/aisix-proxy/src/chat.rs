@@ -2222,11 +2222,10 @@ async fn dispatch(
         // assembled inside the stream into `comp.response_text`. Both gated on
         // `content_cap` (None on the common content-free path).
         let captured_prompt_for_telem = content_cap.map(|_| captured_request_json(req));
-        // #790: the bridge injects `stream_options.include_usage` on the
-        // upstream leg whenever the client didn't set stream_options — the
-        // terminal usage-only chunk that produces is for the gateway's own
-        // telemetry. It reaches the client only when the client itself
-        // asked for usage.
+        // #790: the bridge sets `stream_options.include_usage` on every
+        // streaming upstream leg, whatever the client sent — the usage that
+        // produces is for the gateway's own accounting. It reaches the
+        // client only when the client itself asked for usage.
         let client_requested_usage = req.include_usage();
         // Token-estimation fallback context (AISIX-Cloud#1074): the
         // request is cloned here because the stream owns it until an
