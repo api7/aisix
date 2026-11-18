@@ -672,11 +672,12 @@ impl RmcpBridge {
             }
             let transport =
                 StreamableHttpClientTransport::with_client(shared_http_client(), config);
-            // Lifecycle follows the configured protocol revision. The
-            // handler is `ClientConfig::default()` on BOTH paths — identical
-            // handshake bytes to the previous unit handler (whose default
-            // `get_info()` returns exactly `ClientConfig::default()`), plus
-            // the per-request metadata the Discover lifecycle needs.
+            // Lifecycle follows the configured protocol revision; the same
+            // handler serves both paths. Its version is pinned, not the
+            // SDK default: that is the newest revision rmcp knows, which has
+            // no `initialize` handshake, so the legacy path would ask every
+            // upstream for it. The Discover path takes its version from
+            // `preferred_versions` instead.
             let lifecycle = match upstream.protocol {
                 McpProtocol::LegacyHandshake => ClientLifecycleMode::Initialize,
                 // Discover, NOT Auto: a server that answers `server/discover`
@@ -688,6 +689,7 @@ impl RmcpBridge {
                 },
             };
             ClientConfig::default()
+                .with_protocol_version(ProtocolVersion::V_2025_11_25)
                 .serve_with_lifecycle(transport, lifecycle)
                 .await
                 .map_err(|e| {
