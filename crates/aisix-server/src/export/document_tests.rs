@@ -369,5 +369,9 @@ fn two_fields_of_one_entry_sharing_a_placeholder_are_reported() {
         false,
     );
     assert_eq!(doc.warnings.len(), 1, "{:?}", doc.warnings);
-    assert!(doc.warnings[0].contains("same environment variable"), "{}", doc.warnings[0]);
+    assert!(
+        doc.warnings[0].contains("same environment variable"),
+        "{}",
+        doc.warnings[0]
+    );
 }
