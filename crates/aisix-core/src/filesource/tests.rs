@@ -1315,6 +1315,98 @@ mcp_auth_settings:
     assert!(errs[0].contains("mutually exclusive"), "{errs:?}");
 }
 
+/// A passthrough route names its anonymous principal and its injected
+/// provider key by display name, or by the derived id the file gives that
+/// entry. Any other id would load and then fail every request on the route.
+#[test]
+fn passthrough_route_key_ids_must_be_derived_ids() {
+    let file = |anonymous: &str, provider: &str| {
+        format!(
+            r#"
+_format_version: "1"
+provider_keys:
+  - display_name: up
+    provider: openai
+    api_key: sk-upstream
+api_keys:
+  - display_name: anon
+    key_env: CALLER_KEY
+    allowed_models: []
+passthrough_routes:
+  - name: open
+    path_prefix: /passthrough/open
+    target_url: https://upstream.test
+    auth_mode: anonymous
+{anonymous}
+    source_cidrs: ["10.0.0.0/8"]
+    credential_mode: inject
+{provider}
+"#
+        )
+    };
+    let env = env_of(&[("CALLER_KEY", "sk-caller")]);
+    let anon_id = derive_id("api_keys", "anon");
+    let pk_id = derive_id("provider_keys", "up");
+
+    for (anonymous, provider) in [
+        (
+            "    anonymous_key: anon".to_string(),
+            "    provider_key: up".to_string(),
+        ),
+        (
+            format!("    anonymous_key_id: {anon_id}"),
+            format!("    provider_key_id: {pk_id}"),
+        ),
+    ] {
+        let snapshot = load(&file(&anonymous, &provider), &env).expect(&anonymous);
+        let entry = snapshot.passthrough_routes.entries().pop().unwrap();
+        let route = &entry.value;
+        assert_eq!(route.anonymous_key_id.as_deref(), Some(anon_id.as_str()));
+        assert_eq!(route.provider_key_id.as_deref(), Some(pk_id.as_str()));
+    }
+
+    let stray = "3761ebd7-6405-44c6-8777-28012af7693b";
+    let errs = errors_of(load(
+        &file(
+            &format!("    anonymous_key_id: {stray}"),
+            "    provider_key: up",
+        ),
+        &env,
+    ));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains(&format!(
+            "anonymous_key_id \"{stray}\" does not match any api key"
+        )) && errs[0].contains("`anonymous_key`"),
+        "{errs:?}"
+    );
+
+    let errs = errors_of(load(
+        &file(
+            "    anonymous_key: anon",
+            &format!("    provider_key_id: {stray}"),
+        ),
+        &env,
+    ));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].contains(&format!(
+            "provider_key_id \"{stray}\" does not match any provider key"
+        )) && errs[0].contains("`provider_key`"),
+        "{errs:?}"
+    );
+
+    let errs = errors_of(load(
+        &file(
+            &format!("    anonymous_key: anon\n    anonymous_key_id: {anon_id}"),
+            "    provider_key: up",
+        ),
+        &env,
+    ));
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(errs[0].contains("mutually exclusive"), "{errs:?}");
+}
+
 #[test]
 fn mcp_auth_settings_resource_url_with_credentials_is_a_load_error() {
     // The resource URL is served verbatim on the unauthenticated PRM
