@@ -226,6 +226,20 @@ fn credentials_beside_the_api_key_are_redacted() {
         assert!(!text.contains(secret), "{secret} leaked: {text}");
     }
     assert!(text.contains("\"safe_prompt\":true"), "{text}");
+    // Replaced by a placeholder at each field, not dropped.
+    let placeholder = |v: &Value| v.as_str().is_some_and(|s| s.starts_with("${AISIXSECRET_"));
+    let pk = &find(&doc, "provider_keys")[0];
+    assert!(placeholder(&pk["api_key"]), "{pk}");
+    assert!(
+        placeholder(&pk["request"]["default_headers"]["x-secondary"]),
+        "{pk}"
+    );
+    assert!(
+        placeholder(&pk["request"]["default_body_fields"]["token"]),
+        "{pk}"
+    );
+    let oidc = &find(&doc, "oidc_providers")[0];
+    assert!(placeholder(&oidc["hmac_secret"]), "{oidc}");
 }
 
 #[test]
@@ -314,8 +328,52 @@ fn the_former_provider_key_secret_spelling_is_redacted_too() {
         )],
         false,
     );
-    let text = serde_json::to_string(&doc.collections).unwrap();
-    assert!(!text.contains("sk-old-spelling"), "{text}");
+    let pk = &find(&doc, "provider_keys")[0];
+    assert_eq!(
+        pk["secret"],
+        json!("${AISIXSECRET_PROVIDER_KEY_OLD_SECRET}"),
+        "{pk}"
+    );
+}
+
+#[test]
+fn the_id_comes_from_the_key_not_from_a_stored_id_field() {
+    let doc = export(
+        &[(
+            "provider_keys",
+            PK,
+            json!({"display_name": "pk", "api_key": "x", "id": GONE}),
+        )],
+        true,
+    );
+    assert_eq!(find(&doc, "provider_keys")[0]["id"], json!(PK));
+}
+
+#[test]
+fn a_custom_guardrail_secret_named_like_a_credential_gets_one_placeholder() {
+    let doc = export(
+        &[(
+            "guardrails",
+            POLICY,
+            json!({
+                "name": "screen",
+                "kind": "custom",
+                "script": "export async function checkInput() { return { action: \"none\" }; }",
+                "secrets": {"api_key": "tok-live"}
+            }),
+        )],
+        false,
+    );
+    assert_eq!(
+        doc.secret_placeholders.len(),
+        1,
+        "{:?}",
+        doc.secret_placeholders
+    );
+    assert_eq!(
+        find(&doc, "guardrails")[0]["secrets"]["api_key"],
+        json!(format!("${{{}}}", doc.secret_placeholders[0].env_var))
+    );
 }
 
 #[test]

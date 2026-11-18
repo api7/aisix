@@ -327,14 +327,28 @@ pub struct FileConfigProvider {
     path: Option<PathBuf>,
     generation: Arc<AtomicI64>,
     status: Option<ConfigStatus>,
+    /// The SIGHUP receiver, installed when the provider is built so a
+    /// signal sent after the first apply (readiness) but before the watch
+    /// starts is queued for it rather than taking the default action,
+    /// which ends the process.
+    #[cfg(unix)]
+    hup: Arc<std::sync::Mutex<Option<tokio::signal::unix::Signal>>>,
 }
 
 impl FileConfigProvider {
+    /// Inside a Tokio runtime on unix this installs the SIGHUP receiver;
+    /// outside one, [`ConfigProvider::watch`] installs it instead.
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: Some(path.into()),
             generation: Arc::default(),
             status: None,
+            #[cfg(unix)]
+            hup: Arc::new(std::sync::Mutex::new(
+                tokio::runtime::Handle::try_current().ok().and_then(|_| {
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok()
+                }),
+            )),
         }
     }
 
@@ -352,6 +366,8 @@ impl FileConfigProvider {
             path: None,
             generation: Arc::clone(&self.generation),
             status: None,
+            #[cfg(unix)]
+            hup: Arc::default(),
         }
     }
 
@@ -456,9 +472,13 @@ impl ConfigProvider for FileConfigProvider {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
-            let hup = signal(SignalKind::hangup()).map_err(|e| {
-                ProviderError::Watch(format!("cannot install the SIGHUP handler: {e}"))
-            })?;
+            let installed = self.hup.lock().unwrap_or_else(|p| p.into_inner()).take();
+            let hup = match installed {
+                Some(hup) => hup,
+                None => signal(SignalKind::hangup()).map_err(|e| {
+                    ProviderError::Watch(format!("cannot install the SIGHUP handler: {e}"))
+                })?,
+            };
             let reader = self.clone();
             let stream = futures::stream::unfold((hup, reader), |(mut hup, reader)| async move {
                 loop {

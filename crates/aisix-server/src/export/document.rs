@@ -118,9 +118,15 @@ pub fn build_export_document(
         "GUARDRAIL",
         |g| g.name.clone(),
         |doc, ctx| {
+            // A `kind: custom` script's credentials, keyed by the names it
+            // reads, are redacted as a map — kept out of the by-name pass,
+            // which would give a `secrets.api_key` a second placeholder.
+            let secrets = doc.as_object_mut().and_then(|d| d.remove("secrets"));
             redact_by_key(doc, GUARDRAIL_SECRET_KEYS, ctx);
-            // A `kind: custom` script's credentials, keyed by the names it reads.
-            redact_string_map(doc, "secrets", "secret", ctx);
+            if let (Some(secrets), Some(d)) = (secrets, doc.as_object_mut()) {
+                d.insert("secrets".into(), secrets);
+                redact_string_map(doc, "secrets", "secret", ctx);
+            }
         }
     );
     export!(
@@ -349,9 +355,15 @@ where
         let Some(stored) = raw.get(&(kind.to_string(), entry.id.clone())) else {
             continue;
         };
+        // `id` from the key, never from a stray `id` field in the document.
         let mut doc = serde_json::Map::new();
         doc.insert("id".into(), Value::String(entry.id.clone()));
-        doc.extend(stored.iter().map(|(k, v)| (k.clone(), v.clone())));
+        doc.extend(
+            stored
+                .iter()
+                .filter(|(k, _)| k.as_str() != "id")
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
         let mut doc = Value::Object(doc);
         escape_dollars(&mut doc);
         let label = name(&entry.value);

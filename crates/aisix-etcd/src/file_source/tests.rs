@@ -321,3 +321,39 @@ fn a_collection_name_is_one_key_segment_and_an_id_is_never_echoed() {
         ]
     );
 }
+
+#[tokio::test]
+async fn a_file_gone_after_the_first_apply_leaves_that_apply_serving() {
+    use crate::{SnapshotCache, Supervisor};
+    use aisix_core::config_status::{ConfigState, SourceKind};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resources.yaml");
+    std::fs::write(
+        &path,
+        format!("_format_version: \"2\"\nprovider_keys:\n  - id: {PK}\n    display_name: pk\n    api_key: x\n"),
+    )
+    .unwrap();
+    let status = aisix_core::ConfigStatus::new(SourceKind::File);
+    let provider = Arc::new(FileConfigProvider::new(&path).with_status(status.clone()));
+    let supervisor = Supervisor::with_sources(
+        vec![(WatchedPrefix::environment(ENV_PREFIX), provider)],
+        SnapshotCache::disabled(),
+    )
+    .with_config_status(status.clone());
+    supervisor.load_once().await.unwrap();
+
+    std::fs::remove_file(&path).unwrap();
+    assert!(supervisor.load_once().await.is_err());
+    assert!(
+        status.is_ready(),
+        "the first apply opened readiness and nothing closes it"
+    );
+    assert!(supervisor
+        .handle()
+        .load()
+        .provider_keys
+        .get_by_id(PK)
+        .is_some());
+    assert_ne!(status.view().state, ConfigState::NeverLoaded);
+}

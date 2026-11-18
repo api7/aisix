@@ -598,6 +598,7 @@ impl ConfigStatus {
         inner.observed_revision = obs.observed_revision;
         inner.latest_wholly_rejected = obs.wholly_rejected;
 
+        let applied_now = obs.applied.is_some();
         if let Some(applied) = obs.applied {
             if !was_applied {
                 // Open the boot-time proxy-listener gate. Sending under the
@@ -693,9 +694,13 @@ impl ConfigStatus {
         }
         inner.unknown_kind = merged_unknown;
         inner.unknown_kind_counts = unknown_kind_counts;
-        inner.partially_compatible = obs.partially_compatible;
-        inner.partially_compatible_rows_by_kind = obs.partially_compatible_rows_by_kind;
-        inner.stale_served_rows_by_kind = obs.stale_served_rows_by_kind;
+        // These describe the served snapshot, which a load that applied
+        // nothing (a wholly rejected reload) left as it was.
+        if applied_now {
+            inner.partially_compatible = obs.partially_compatible;
+            inner.partially_compatible_rows_by_kind = obs.partially_compatible_rows_by_kind;
+            inner.stale_served_rows_by_kind = obs.stale_served_rows_by_kind;
+        }
 
         if inner.ever_applied
             && (!was_applied || previous_effective_version != inner.effective_config_version())
@@ -1361,6 +1366,27 @@ mod tests {
             is_reload: true,
             wholly_rejected: false,
         }
+    }
+
+    #[test]
+    fn a_wholly_rejected_load_keeps_the_served_snapshot_s_summaries() {
+        let cs = ConfigStatus::new(SourceKind::File);
+        cs.record_load(LoadObservation {
+            partially_compatible_rows_by_kind: [("models".to_string(), 1)].into(),
+            stale_served_rows_by_kind: [("models".to_string(), 2)].into(),
+            ..clean_load()
+        });
+        cs.record_load(LoadObservation {
+            applied: None,
+            wholly_rejected: true,
+            ..clean_load()
+        });
+        let inner = cs.inner.lock().unwrap();
+        assert_eq!(
+            inner.partially_compatible_rows_by_kind.get("models"),
+            Some(&1)
+        );
+        assert_eq!(inner.stale_served_rows_by_kind.get("models"), Some(&2));
     }
 
     // The boot path gates the proxy listener on this: a waiter that never

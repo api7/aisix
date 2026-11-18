@@ -514,6 +514,7 @@ api_keys:
     expect(res.status).toBe(200);
     return (await res.json()) as {
       state: string;
+      applied: { apply_seq: number };
       rejected: Array<{ resource_kind: string; resource_id: string; last_error_kind: string }>;
     };
   };
@@ -594,13 +595,11 @@ guardrails:
 
     // Fixed and signalled again, the file applies — and a SIGHUP replaces
     // the whole configuration, so a model the file no longer has is gone.
+    // Gated on the apply this reload publishes, not on what is asserted.
+    const seqBefore = (await statusConfig()).applied.apply_seq;
     await writeFile(app.resourcesPath, reloadFile(upstream.baseUrl, ["reload-a"]), "utf8");
     app.signal("SIGHUP");
-    await waitConfigPropagation(async () => {
-      const r = await proxy.listModels();
-      const ids = (r.body as { data: Array<{ id: string }> }).data.map((m) => m.id);
-      return r.status === 200 && ids.length === 1;
-    });
+    await waitConfigPropagation(async () => (await statusConfig()).applied.apply_seq > seqBefore);
     const res = await proxy.listModels();
     expect((res.body as { data: Array<{ id: string }> }).data.map((m) => m.id)).toEqual([
       "reload-a",
