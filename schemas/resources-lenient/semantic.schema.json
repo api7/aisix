@@ -229,6 +229,32 @@
       "description": "What the router does when the embedding call errors or times out. Use `\"default\"` to route to the router's default model, `\"fail\"` to reject the request with `503`, or `{ \"target\": \"<alias>\" }` to route to a specific fallback direct model or model group."
     },
     "SemanticClassifier": {
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "properties": {
+                "provider_key_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "provider_key_id"
+              ]
+            },
+            {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_id"
+              ]
+            }
+          ]
+        }
+      ],
       "description": "Route selection by a hosted decision model. For each request the newest user text (reminder blocks removed) is sent to the model together with every route's `name` and `description`, and the model picks one route. A request goes to the picked route's target, or to the router's `default` when the model's confidence in its pick is below `min_confidence`. To catch requests that fit none of the routes, configure a route for them.",
       "properties": {
         "min_confidence": {
@@ -241,9 +267,17 @@
         },
         "model": {
           "default": "jev-latest",
-          "description": "Decision model to call.",
+          "description": "Decision model to call, read only when `model_id` is absent.",
           "minLength": 1,
           "type": "string"
+        },
+        "model_id": {
+          "description": "Resource id of a direct Model whose Provider Key's `provider` is `typesafe`. When set, the decision calls go to that model exactly as a `POST /v1/systemone` request addressed to it does: its `model_name`, and its Provider Key's API key, `api_base`, request body overrides and request headers. `provider_key_id` and `model` are then not read. An id resolving to no such model is a classifier that cannot be called, and the router applies `on_failure`.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "on_failure": {
           "allOf": [
@@ -254,7 +288,7 @@
           "description": "Behavior when the decision call fails, times out, or returns an answer that names no route. Same values as `on_embedding_failure`."
         },
         "provider_key_id": {
-          "description": "Resource id of the Provider Key that authenticates the decision calls. The key's `provider` must be `typesafe`; its API key is sent as the bearer token, and its `api_base`, when set, replaces the default endpoint `https://api.typesafe.ai`.",
+          "description": "Resource id of the Provider Key that authenticates the decision calls, read only when `model_id` is absent. Required when there is no `model_id`. The key's `provider` must be `typesafe`; its API key is sent as the bearer token, and its `api_base`, when set, replaces the default endpoint `https://api.typesafe.ai`.",
           "minLength": 1,
           "type": "string"
         },
@@ -275,7 +309,6 @@
         }
       },
       "required": [
-        "provider_key_id",
         "type"
       ],
       "type": "object"

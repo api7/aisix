@@ -1088,7 +1088,12 @@ pub fn load_from_str(
             }
         }
         let classifier = model.semantic.as_ref().and_then(|s| s.classifier.as_ref());
-        if let Some(pk_id) = classifier.map(|c| c.provider_key_id.as_str()) {
+        // The inline key is read only when the classifier names no model.
+        if let Some(pk_id) = classifier
+            .filter(|c| c.model_id.is_none())
+            .map(|c| c.provider_key_id.as_str())
+            .filter(|id| !id.is_empty())
+        {
             if !pk_ids.contains(pk_id) {
                 errors.push(LoadError {
                     scope: scope.clone(),

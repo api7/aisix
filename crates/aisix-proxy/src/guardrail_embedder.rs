@@ -130,7 +130,7 @@ impl GuardrailEmbedder for ProxyGuardrailEmbedder {
             &entry,
             Some(timeout),
             "guardrail-semantic",
-            aisix_obs::GatewayEmbeddingPurpose::Guardrail,
+            aisix_obs::InternalCallPurpose::GuardrailEmbedding,
             &misses,
         )
         .await

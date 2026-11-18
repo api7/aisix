@@ -883,7 +883,7 @@ fn emit_access_log(
 /// The prompt count an embeddings `usage` block reports: `prompt_tokens`, or
 /// `total_tokens` from a provider that reports only that (embeddings are
 /// input-only). `None` when it reports neither.
-fn reported_prompt_tokens(usage: &aisix_gateway::EmbeddingUsage) -> Option<u32> {
+pub(crate) fn reported_prompt_tokens(usage: &aisix_gateway::EmbeddingUsage) -> Option<u32> {
     [usage.prompt_tokens, usage.total_tokens]
         .into_iter()
         .find(|&n| n > 0)
