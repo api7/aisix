@@ -18,6 +18,11 @@ pub struct UsageAccounting {
     /// limit window (`tpm`, `tpd`, and a policy's `max_tokens`).
     /// Request-count limits and concurrency still count it, and its usage
     /// event still reports the estimated tokens.
+    ///
+    /// Estimates the caller causes are excluded too: a streamed chat request
+    /// that sends its own `stream_options` (the gateway then does not ask the
+    /// upstream for usage), and a stream the caller closes before the usage
+    /// frame arrives. Turn this on only where every caller is trusted.
     pub exclude_estimated_usage: bool,
 
     /// Set by the loader from the key's id segment. Not part of the wire
