@@ -198,8 +198,8 @@ async fn the_passive_provider_reports_the_generation_of_the_last_read() {
     std::fs::write(&path, "_format_version: \"2\"\n").unwrap();
     let provider = FileConfigProvider::new(&path).unwrap();
     let passive = provider.passive();
-    assert_eq!(provider.load_all().await.unwrap().1, 1);
-    assert_eq!(provider.load_all().await.unwrap().1, 2);
+    assert_eq!(provider.read().unwrap().1, 1);
+    assert_eq!(provider.read().unwrap().1, 2);
     assert_eq!(passive.load_all().await.unwrap(), (Vec::new(), 2));
 }
 
@@ -228,6 +228,7 @@ async fn a_file_runs_through_the_supervisor_like_etcd() {
             .unwrap()
             .with_status(status.clone()),
     );
+    let provider_reader = Arc::clone(&provider);
     let passive = Arc::new(provider.passive());
     let supervisor = Supervisor::with_sources(
         vec![
@@ -253,8 +254,10 @@ async fn a_file_runs_through_the_supervisor_like_etcd() {
 
     // A row that stops loading keeps serving its last known good value
     // and is reported, as it would be from etcd.
+    // A reload, as the SIGHUP watch hands it over.
     write("[not, a, string]");
-    supervisor.load_once().await.unwrap();
+    let (entries, revision) = provider_reader.read().unwrap();
+    supervisor.apply_resync_at(&entries, Some(revision));
     let snap = supervisor.handle().load();
     assert_eq!(
         snap.models.get_by_id(MODEL).unwrap().value.display_name,
@@ -331,7 +334,7 @@ fn a_collection_name_is_one_key_segment_and_an_id_is_never_echoed() {
 }
 
 #[tokio::test]
-async fn a_file_gone_after_the_first_apply_leaves_that_apply_serving() {
+async fn a_load_after_the_first_read_does_not_read_the_file_again() {
     use crate::{SnapshotCache, Supervisor};
     use aisix_core::config_status::{ConfigState, SourceKind};
 
@@ -355,19 +358,18 @@ async fn a_file_gone_after_the_first_apply_leaves_that_apply_serving() {
     .with_config_status(status.clone());
     supervisor.load_once().await.unwrap();
 
+    // The supervisor's next cycle loads again; it gets the rows already
+    // read, not whatever the file is now — gone, here.
     std::fs::remove_file(&path).unwrap();
-    assert!(supervisor.load_once().await.is_err());
-    assert!(
-        status.is_ready(),
-        "the first apply opened readiness and nothing closes it"
-    );
+    supervisor.load_once().await.unwrap();
+    assert!(status.is_ready());
     assert!(supervisor
         .handle()
         .load()
         .provider_keys
         .get_by_id(PK)
         .is_some());
-    assert_ne!(status.view().state, ConfigState::NeverLoaded);
+    assert_eq!(status.view().state, ConfigState::Synced);
 }
 
 /// A SIGHUP that arrives after the provider exists but before its watch

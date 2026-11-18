@@ -308,6 +308,9 @@ fn read_kind(
     }
 }
 
+/// One read of the file: its rows and the generation they were read at.
+type Read = (Vec<RawEntry>, i64);
+
 /// A [`ConfigProvider`] over a resources file, so the file runs through the
 /// same [`crate::Supervisor`] etcd does.
 ///
@@ -316,6 +319,12 @@ fn read_kind(
 /// all: the configuration that is serving stays, the failure is recorded on
 /// the status handle given by [`Self::with_status`] (`out_of_sync`, with the
 /// problems as `rejected[]`), and the next SIGHUP tries again.
+///
+/// The file is read only at boot and on SIGHUP. A `load_all` after the
+/// first successful read — the supervisor's own first cycle right after
+/// the boot apply, or a cycle it restarts — hands back the rows last read
+/// rather than reading again, so nothing a file is changed to applies
+/// without a SIGHUP, and that cycle cannot fail on a file being edited.
 ///
 /// Both of the supervisor's prefixes are read from the one file, so only
 /// the environment provider reads it; the provider for the global prefix
@@ -326,6 +335,8 @@ fn read_kind(
 pub struct FileConfigProvider {
     path: Option<PathBuf>,
     generation: Arc<AtomicI64>,
+    /// The rows of the last successful read, and their generation.
+    last_read: Arc<std::sync::Mutex<Option<Read>>>,
     status: Option<ConfigStatus>,
     /// The SIGHUP receiver, installed when the provider is built so a
     /// signal sent after the first apply (readiness) but before the watch
@@ -350,6 +361,7 @@ impl FileConfigProvider {
         Ok(Self {
             path: Some(path.into()),
             generation: Arc::default(),
+            last_read: Arc::default(),
             status: None,
             #[cfg(unix)]
             hup: Arc::new(std::sync::Mutex::new(hup)),
@@ -369,6 +381,7 @@ impl FileConfigProvider {
         Self {
             path: None,
             generation: Arc::clone(&self.generation),
+            last_read: Arc::default(),
             status: None,
             #[cfg(unix)]
             hup: Arc::default(),
@@ -401,8 +414,12 @@ impl FileConfigProvider {
                     source_hash: None,
                 })
             });
-        if let Err(report) = &result {
-            tracing::warn!("resources file could not be read:\n{report}");
+        match &result {
+            Ok(read) if self.path.is_some() => {
+                *self.last_read.lock().unwrap_or_else(|p| p.into_inner()) = Some(read.clone());
+            }
+            Ok(_) => {}
+            Err(report) => tracing::warn!("resources file could not be read:\n{report}"),
         }
         result
     }
@@ -458,6 +475,14 @@ impl FileConfigProvider {
 #[async_trait]
 impl ConfigProvider for FileConfigProvider {
     async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
+        if let Some(last) = self
+            .last_read
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            return Ok(last);
+        }
         self.read_blocking()
             .await
             .map_err(|report| ProviderError::File(report.to_string()))
