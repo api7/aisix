@@ -12,6 +12,7 @@ import {
 } from "../harness/index.js";
 import {
   decodedTextFor,
+  slsLogsFor,
   startMockSls,
   waitForSlsLog,
   type MockSls,
@@ -393,10 +394,12 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     return slsFlaggedCount(requestedModel) > 0;
   }
 
+  /** Records for exactly `requestedModel` that carry `usage_estimated`. */
   function slsFlaggedCount(requestedModel: string): number {
-    const text = decodedTextFor(sls!, META_LOGSTORE);
-    const re = new RegExp(`${requestedModel}[\\s\\S]{0,600}?usage_estimated`, "g");
-    return text.match(re)?.length ?? 0;
+    return slsLogsFor(sls!, META_LOGSTORE).filter(
+      (log) =>
+        log.get("requested_model") === requestedModel && log.get("usage_estimated") === "true",
+    ).length;
   }
 
   async function waitSlsFlagged(requestedModel: string): Promise<void> {
