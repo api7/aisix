@@ -332,7 +332,9 @@ type Read = (Vec<RawEntry>, i64);
 ///
 /// Both of the supervisor's prefixes are read from the one file, so only
 /// the environment provider reads it; the provider for the global prefix
-/// is [`Self::passive`] and contributes nothing of its own. Every resync
+/// is [`Self::passive`], which hands back the global rows of that read.
+/// They have to come from it: the supervisor takes each key from the
+/// read of the prefix that owns it. Every resync
 /// carries the whole file, both prefixes included, because a resync
 /// replaces everything the supervisor holds.
 #[derive(Clone)]
@@ -380,13 +382,13 @@ impl FileConfigProvider {
         self
     }
 
-    /// The provider for the global prefix: its rows come in with this
-    /// provider's reads, and it reports the generation they were read at.
+    /// The provider for the global prefix: its rows are the global rows of
+    /// this provider's last read, at the generation they were read at.
     pub fn passive(&self) -> Self {
         Self {
             path: None,
             generation: Arc::clone(&self.generation),
-            last_read: Arc::default(),
+            last_read: Arc::clone(&self.last_read),
             status: None,
             #[cfg(unix)]
             hup: Arc::default(),
@@ -488,6 +490,14 @@ impl ConfigProvider for FileConfigProvider {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
         {
+            if self.path.is_none() {
+                let (entries, revision) = last;
+                let global = entries
+                    .into_iter()
+                    .filter(|e| e.key.starts_with(GLOBAL_PREFIX))
+                    .collect();
+                return Ok((global, revision));
+            }
             return Ok(last);
         }
         self.read_blocking()

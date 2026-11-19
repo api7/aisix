@@ -1965,8 +1965,31 @@ impl<P: ConfigProvider> Supervisor<P> {
         // prefix, so what the skipped copies replay is already in it.
         // Resolved against the prefixes watched THIS cycle: with the
         // catalog's watch refused, the base stream is the only one
-        // carrying those keys and keeps applying them.
+        // carrying those keys and keeps applying them — except what the
+        // catalog's own read already covers, which the base replays from
+        // its older read revision and would briefly roll back.
         let owners = PrefixSet::new(watching);
+        let read_owners = PrefixSet::new(
+            self.sources
+                .iter()
+                .zip(&load.revisions)
+                .filter(|(_, rev)| rev.is_some())
+                .map(|(source, _)| source.prefix.clone())
+                .collect(),
+        );
+        let read_revision = |prefix: &str| {
+            self.sources
+                .iter()
+                .zip(&load.revisions)
+                .find(|(source, _)| source.prefix.prefix == prefix)
+                .and_then(|(_, rev)| *rev)
+        };
+        let covered_by_read = |prefix: &str, key: &str, revision: i64| {
+            read_owners.owner(key).is_some_and(|owner| {
+                owner.prefix != prefix
+                    && read_revision(&owner.prefix).is_some_and(|read| revision <= read)
+            })
+        };
         *steady_since = Some(tokio::time::Instant::now());
         // Each stream is tagged so its END is delivered as an item
         // rather than absorbed by `select_all`. See [`Watched`].
@@ -2093,8 +2116,10 @@ impl<P: ConfigProvider> Supervisor<P> {
                     let staged: Vec<PendingEvent<'_>> = batch
                         .iter()
                         .filter_map(|(prefix, event)| {
-                            let (key, pending) = match event {
-                                WatchEvent::Put(raw) => (&raw.key, PendingEvent::Put(raw)),
+                            let (key, revision, pending) = match event {
+                                WatchEvent::Put(raw) => {
+                                    (&raw.key, raw.revision, PendingEvent::Put(raw))
+                                }
                                 // Advance the applied-revision floor to the
                                 // delete's mod_revision even when the key
                                 // wasn't present — "processed everything up
@@ -2104,6 +2129,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                                 // put arrives.
                                 WatchEvent::Delete { key, revision } => (
                                     key,
+                                    *revision,
                                     PendingEvent::Delete {
                                         key,
                                         revision: Some(*revision),
@@ -2116,7 +2142,8 @@ impl<P: ConfigProvider> Supervisor<P> {
                                     unreachable!("a resync is never added to a coalesced batch")
                                 }
                             };
-                            owners.owns(prefix, key).then_some(pending)
+                            (owners.owns(prefix, key) && !covered_by_read(prefix, key, revision))
+                                .then_some(pending)
                         })
                         .collect();
                     if !staged.is_empty() {
@@ -4201,7 +4228,9 @@ mod tests {
             let sup = sup.clone();
             async move {
                 let _cancel_tx = cancel_tx;
-                let _ = sup.cycle(&cancel_rx, &mut None, false).await;
+                sup.cycle(&cancel_rx, &mut None, false)
+                    .await
+                    .expect("the watch cycle failed");
             }
         });
         (sup, watcher)
@@ -4567,6 +4596,41 @@ mod tests {
             drop(base_tx);
             watcher.await.unwrap();
         }
+    }
+
+    /// With the catalog's read served and only its watch refused, the base
+    /// stream carries the catalog's keys but replays them from its own,
+    /// older read. What the catalog's read already holds must not be
+    /// rolled back by that replay.
+    #[tokio::test(start_paused = true)]
+    async fn a_base_replay_below_the_catalog_read_does_not_roll_it_back() {
+        const KEY: &str = "/aisix/global/pricing/p-1";
+        let (base, base_tx) = LiveProvider::new(5);
+        let catalog = LiveProvider::refusing(Refuse::Watch, vec![entry(KEY, &price(0.002), 8)], 9);
+        let (sup, watcher) = nested_cycle(base, catalog);
+        until("initial load", processed(&sup, "/aisix", 5)).await;
+        assert_eq!(catalog_price(&sup, "p-1"), Some((8, 0.002)));
+
+        for (rev, input) in [(7, 0.001), (8, 0.002)] {
+            base_tx
+                .unbounded_send(Ok(WatchEvent::Put(entry(KEY, &price(input), rev))))
+                .unwrap();
+            until("base replay", processed(&sup, "/aisix", rev)).await;
+            assert_eq!(
+                catalog_price(&sup, "p-1"),
+                Some((8, 0.002)),
+                "the replay at {rev} rolled the catalog's read back",
+            );
+        }
+
+        base_tx
+            .unbounded_send(Ok(WatchEvent::Put(entry(KEY, &price(0.003), 10))))
+            .unwrap();
+        until("base stream at 10", processed(&sup, "/aisix", 10)).await;
+        assert_eq!(catalog_price(&sup, "p-1"), Some((10, 0.003)));
+
+        drop(base_tx);
+        watcher.await.unwrap();
     }
 
     /// Shutdown must not throw away what the window already took off the
