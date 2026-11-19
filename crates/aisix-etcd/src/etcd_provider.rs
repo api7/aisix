@@ -917,8 +917,9 @@ mod tests {
         // intermediary resetting the stream; 8 ResourceExhausted is
         // throttling. 11 OutOfRange is a revision the server has not
         // caught up to, or has compacted. 5, 6, 12 and 15 say nothing
-        // about the credentials either. All of them heal, or at least
-        // cannot be fixed by an operator editing a config.
+        // about the credentials either. None of them is a verdict on the
+        // credentials, so none ends the boot: the gateway starts and keeps
+        // retrying, and the warn line carries what etcd answered.
         let retried: &[(u16, &'static str)] = &[
             (1, "no answer"),
             (2, "no answer"),
