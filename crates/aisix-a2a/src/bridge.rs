@@ -705,7 +705,7 @@ mod tests {
 
     fn agent(auth_type: &str) -> A2aAgent {
         serde_json::from_str(&format!(
-            r#"{{"display_name":"a","url":"https://x/a2a","auth_type":"{auth_type}","secret":"s"}}"#
+            r#"{{"name":"a","url":"https://x/a2a","auth_type":"{auth_type}","secret":"s"}}"#
         ))
         .unwrap()
     }

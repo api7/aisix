@@ -87,7 +87,7 @@ const startEnv = async (
 
   const anthropicPk = await seed.createProviderKey({
     display_name: "textless-anthropic",
-    secret: "sk-ant-mock",
+    api_key: "sk-ant-mock",
     // The Anthropic bridge appends to the BARE host — no /v1 suffix here.
     api_base: llm.baseUrl,
     provider: "anthropic",
@@ -95,7 +95,7 @@ const startEnv = async (
   });
   const openaiPk = await seed.createProviderKey({
     display_name: "textless-openai",
-    secret: "sk-mock",
+    api_key: "sk-mock",
     api_base: `${llm.baseUrl}/v1`,
   });
   await seed.createModel({
@@ -111,7 +111,7 @@ const startEnv = async (
     provider_key_id: openaiPk.id,
   });
   await seed.update("mcp_servers", randomUUID(), {
-    display_name: "textless",
+    name: "textless",
     url: mcp.url,
     enabled: true,
   });

@@ -79,7 +79,7 @@ async function seedInto(app: SpawnedApp, etcd: EtcdClient, apiBase: string): Pro
   const pk = (
     await seed.createProviderKey({
       display_name: "pool-idle-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${apiBase}/v1`,
     })
   ).id;

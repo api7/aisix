@@ -167,7 +167,7 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
       display_name: "apis-declared",
       provider: "openai",
       adapter: "openai",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
       apis: {},
     });
@@ -184,7 +184,7 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
       display_name: "apis-legacy",
       provider: "openai",
       adapter: "openai",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -200,7 +200,7 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
       display_name: "apis-dual",
       provider: "deepseek",
       adapter: "openai",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
       apis: { messages: { base: `${upstream.baseUrl}/anthropic` } },
     });
@@ -219,7 +219,7 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
       display_name: "apis-anthropic",
       provider: "byo",
       adapter: "anthropic",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
       apis: { messages: { base: `${upstream.baseUrl}/anthropic` } },
     });
@@ -238,7 +238,7 @@ describe("provider_keys[].apis — native surfaces and their entry points", () =
       display_name: "apis-responses",
       provider: "deepseek",
       adapter: "openai",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
       // A version-bearing root, the shape an OpenAI-compatible endpoint
       // is configured with: the endpoint path is appended to it as-is.

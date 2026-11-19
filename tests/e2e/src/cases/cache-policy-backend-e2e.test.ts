@@ -78,7 +78,7 @@ async function seedApp(
   const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
   const pk = await seed.createProviderKey({
     display_name: `${modelAlias}-pk`,
-    secret: "sk-mock",
+    api_key: "sk-mock",
     api_base: `${upstreamBase}/v1`,
   });
   for (const alias of [modelAlias, canaryAlias]) {

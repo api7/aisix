@@ -125,25 +125,25 @@ describe("applied_guardrails on every guardrail-governed surface", () => {
 
     const openaiPk = await seed.createProviderKey({
       display_name: "gas-openai-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const anthropicPk = await seed.createProviderKey({
       display_name: "gas-anthropic-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: upstream.baseUrl,
       provider: "anthropic",
       adapter: "anthropic",
     });
     const alibabaPk = await seed.createProviderKey({
       display_name: "gas-alibaba-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: upstream.baseUrl,
       provider: "alibaba",
     });
     const realtimePk = await seed.createProviderKey({
       display_name: "gas-realtime-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `http://127.0.0.1:${realtime.port}/v1`,
     });
     const model = (

@@ -96,7 +96,7 @@ describe("provider_key rotation: zero in-flight disruption (#196 L3 / #271)", ()
 
     const pk = await seed.createProviderKey({
       display_name: "pkrot-pk",
-      secret: "sk-mock-v1",
+      api_key: "sk-mock-v1",
       api_base: `${upstream.baseUrl}/v1`,
     });
     pkId = pk.id;
@@ -164,7 +164,7 @@ describe("provider_key rotation: zero in-flight disruption (#196 L3 / #271)", ()
             provider: "openai",
             adapter: "openai",
             display_name: "pkrot-pk",
-            secret: "sk-mock-v2-rotated",
+            api_key: "sk-mock-v2-rotated",
             api_base: `${upstream!.baseUrl}/v1`,
           });
         }

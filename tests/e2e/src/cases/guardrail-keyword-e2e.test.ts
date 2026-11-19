@@ -46,7 +46,7 @@ describe("guardrail e2e: keyword block returns 422 and skips upstream", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "gr-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

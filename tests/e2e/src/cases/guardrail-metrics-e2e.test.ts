@@ -185,7 +185,7 @@ describe("guardrail latency metrics e2e: per-execution histogram", () => {
     ] as const) {
       const pk = await seed.createProviderKey({
         display_name: `${model}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({
@@ -199,7 +199,7 @@ describe("guardrail latency metrics e2e: per-execution histogram", () => {
       display_name: `${MODEL_PROTOCOL_MATRIX}-pk`,
       provider: "deepseek",
       adapter: "openai",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${cleanUpstream.baseUrl}/v1`,
     });
     await seed.createModel({

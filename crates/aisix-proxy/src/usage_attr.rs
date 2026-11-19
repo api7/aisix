@@ -1790,7 +1790,7 @@ mod tests {
 
     fn snap_with_pk(display_name: &str, tags: &str) -> AisixSnapshot {
         let json = format!(
-            r#"{{"display_name":{},"secret":"sk-up","api_base":"http://up","provider":"openai","adapter":"openai"{}}}"#,
+            r#"{{"display_name":{},"api_key":"sk-up","api_base":"http://up","provider":"openai","adapter":"openai"{}}}"#,
             serde_json::to_string(display_name).unwrap(),
             tags,
         );
@@ -1837,7 +1837,7 @@ mod tests {
 
         // A key whose vendor has no specialized bridge takes its
         // adapter's wire value.
-        let json = r#"{"display_name":"byo-anthropic","secret":"sk","provider":"byo","adapter":"anthropic"}"#;
+        let json = r#"{"display_name":"byo-anthropic","api_key":"sk","provider":"byo","adapter":"anthropic"}"#;
         let byo: ProviderKey = serde_json::from_str(json).unwrap();
         let snap = AisixSnapshot::new();
         snap.provider_keys.insert(ResourceEntry::new(PK_ID, byo, 1));

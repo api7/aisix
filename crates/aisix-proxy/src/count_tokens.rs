@@ -1280,7 +1280,7 @@ mod tests {
 
     fn anthropic_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"anthropic-up","secret":"sk-ant-test","api_base":"{api_base}","provider":"anthropic","adapter":"anthropic"}}"#
+            r#"{{"display_name":"anthropic-up","api_key":"sk-ant-test","api_base":"{api_base}","provider":"anthropic","adapter":"anthropic"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
@@ -1777,7 +1777,7 @@ mod tests {
     #[tokio::test]
     async fn non_anthropic_provider_returns_400() {
         let snap = AisixSnapshot::new();
-        let pk_json = r#"{"display_name":"openai-up","secret":"sk-openai","api_base":"https://api.openai.com","provider":"openai","adapter":"openai"}"#;
+        let pk_json = r#"{"display_name":"openai-up","api_key":"sk-openai","api_base":"https://api.openai.com","provider":"openai","adapter":"openai"}"#;
         let pk: aisix_core::ProviderKey = serde_json::from_str(pk_json).unwrap();
         snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
         snap.models.insert(openai_model("gpt-model"));
@@ -1902,7 +1902,7 @@ mod tests {
 
         let snap = AisixSnapshot::new();
         let pk_json = format!(
-            r#"{{"display_name":"byo-anthropic","secret":"sk-byo","api_base":"{}","provider":"byo","adapter":"anthropic"}}"#,
+            r#"{{"display_name":"byo-anthropic","api_key":"sk-byo","api_base":"{}","provider":"byo","adapter":"anthropic"}}"#,
             upstream.uri()
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
@@ -1945,7 +1945,7 @@ mod tests {
     ) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = serde_json::json!({
             "display_name": "anthropic-up",
-            "secret": "sk-ant-test",
+            "api_key": "sk-ant-test",
             "api_base": api_base,
             "provider": "anthropic",
             "adapter": "anthropic",

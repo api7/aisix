@@ -156,7 +156,7 @@ describe("outbound TLS trust (#860)", () => {
     });
     const pk = await seed.createProviderKey({
       display_name: `private-ca-pk-${app.etcdPrefix}`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: upstream!.baseUrl,
     });
     await seed.createModel({
@@ -311,7 +311,7 @@ describe("outbound TLS trust (#860)", () => {
       try {
         const pk = await seed.createProviderKey({
           display_name: `plain-pk-${app.etcdPrefix}`,
-          secret: "sk-mock",
+          api_key: "sk-mock",
           api_base: ready.baseUrl,
         });
         await seed.createModel({

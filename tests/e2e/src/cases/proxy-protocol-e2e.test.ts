@@ -208,7 +208,7 @@ describe("PROXY protocol e2e (AISIX-Cloud#1915): the header's source is the clie
     });
     const pk = await s.createProviderKey({
       display_name: "pp-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream!.baseUrl}/v1`,
     });
     await s.createModel({

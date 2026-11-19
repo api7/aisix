@@ -88,7 +88,7 @@ describe("legacy /v1/completions e2e: text-in / text-out passthrough", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "completions-legacy-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

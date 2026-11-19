@@ -139,7 +139,7 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
 
     const pk = await seed.createProviderKey({
       display_name: "uma-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -151,7 +151,7 @@ describe("usage member attribution e2e: a usage row names the org member (#1389)
 
     const throttledPk = await seed.createProviderKey({
       display_name: "uma-throttled-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${throttled.baseUrl}/v1`,
     });
     await seed.createModel({

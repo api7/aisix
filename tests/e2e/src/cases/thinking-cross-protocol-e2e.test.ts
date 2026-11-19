@@ -235,7 +235,7 @@ describe("thinking ↔ reasoning_content across protocols (AISIX-Cloud#1784)", (
     for (const key of ["oaiText", "oaiTool", "oaiStream"] as const) {
       const pk = await seed.createProviderKey({
         display_name: `${MODELS[key]}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstreams[key]!.baseUrl}/v1`,
       });
       await seed.createModel({
@@ -250,7 +250,7 @@ describe("thinking ↔ reasoning_content across protocols (AISIX-Cloud#1784)", (
         display_name: `${MODELS[key]}-pk`,
         provider: "anthropic",
         adapter: "anthropic",
-        secret: "sk-anth-mock",
+        api_key: "sk-anth-mock",
         api_base: upstreams[key]!.baseUrl,
       });
       await seed.createModel({
@@ -531,7 +531,7 @@ describe("unsigned thinking blocks and Anthropic's own API (AISIX-Cloud#1784)", 
         display_name: `${M[key]}-pk`,
         provider: "anthropic",
         adapter: "anthropic",
-        secret: "sk-anth-mock",
+        api_key: "sk-anth-mock",
         api_base: ups[key]!.baseUrl,
       });
       await seed.createModel({
@@ -548,7 +548,7 @@ describe("unsigned thinking blocks and Anthropic's own API (AISIX-Cloud#1784)", 
         display_name: `${M[key]}-pk`,
         provider: "deepseek",
         adapter: "openai",
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${ups[key]!.baseUrl}/v1`,
         apis: { messages: { base: `${ups[key]!.baseUrl}/anthropic` } },
       });

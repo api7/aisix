@@ -86,7 +86,7 @@ describe("config forward-compat: unknown fields from a newer control plane", () 
 
     const pk = await seed.createProviderKey({
       display_name: "fc-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     pkId = pk.id;
@@ -291,7 +291,7 @@ describe("config forward-compat: a resource kind from a newer control plane", ()
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "fk-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: "http://127.0.0.1:1/v1",
     });
     await seed.createModel({

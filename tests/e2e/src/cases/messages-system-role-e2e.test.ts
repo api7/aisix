@@ -54,7 +54,7 @@ describe("anthropic /v1/messages with system role in messages[] (#597)", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "issue597-pk",
-      secret: "sk-deepseek-mock",
+      api_key: "sk-deepseek-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     // Mirrors the customer setup from #597: Claude CLI talking to a

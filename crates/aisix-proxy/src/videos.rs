@@ -2782,7 +2782,7 @@ mod tests {
     fn new_snap(api_base: &str, provider: &str, model_extra: &str) -> AisixSnapshot {
         let snap = AisixSnapshot::new();
         let pk_json = format!(
-            r#"{{"display_name":"ali-up","secret":"sk-up","api_base":"{api_base}","provider":"{provider}"}}"#
+            r#"{{"display_name":"ali-up","api_key":"sk-up","api_base":"{api_base}","provider":"{provider}"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
         snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
@@ -3383,7 +3383,7 @@ mod tests {
 
         let snap = AisixSnapshot::new();
         let pk_json = format!(
-            r#"{{"display_name":"ali-up","secret":"sk-up","api_base":"{}","provider":"alibaba"}}"#,
+            r#"{{"display_name":"ali-up","api_key":"sk-up","api_base":"{}","provider":"alibaba"}}"#,
             upstream.uri()
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
@@ -3461,7 +3461,7 @@ mod tests {
 
         let snap = AisixSnapshot::new();
         let pk_json = format!(
-            r#"{{"display_name":"ali-up","secret":"sk-up","api_base":"{}","provider":"alibaba"}}"#,
+            r#"{{"display_name":"ali-up","api_key":"sk-up","api_base":"{}","provider":"alibaba"}}"#,
             upstream.uri()
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();

@@ -153,18 +153,18 @@ describe("model references by resource id", () => {
 
     const chatPk = await seed.createProviderKey({
       display_name: "mr-chat-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${chatUp.baseUrl}/v1`,
     });
     chatPkId = chatPk.id;
     const embedPk = await seed.createProviderKey({
       display_name: "mr-embed-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${embedMock.baseUrl}/v1`,
     });
     const failPk = await seed.createProviderKey({
       display_name: "mr-embed-fail-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${failingEmbedMock.baseUrl}/v1`,
     });
 
@@ -726,7 +726,7 @@ describe("model references by resource id", () => {
       model_name: "embed-mr-embed-renamed",
       provider_key_id: (await seed.createProviderKey({
         display_name: `mr-embed-pk-${randomUUID()}`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${embedMock!.baseUrl}/v1`,
       })).id,
       embedding: { dimensions: 4, normalize: true },

@@ -4942,7 +4942,7 @@ mod tests {
     fn sample_pk_with_secret(secret_json: &str) -> Arc<ProviderKey> {
         Arc::new(
             serde_json::from_str(&format!(
-                r#"{{"display_name": "vertex-prod", "secret": {}}}"#,
+                r#"{{"display_name": "vertex-prod", "api_key": {}}}"#,
                 serde_json::to_string(secret_json).unwrap()
             ))
             .unwrap(),
@@ -4955,7 +4955,7 @@ mod tests {
     fn sample_pk_with_secret_and_api_base(secret_json: &str, api_base: &str) -> Arc<ProviderKey> {
         Arc::new(
             serde_json::from_str(&format!(
-                r#"{{"display_name": "vertex-prod", "secret": {}, "api_base": {}}}"#,
+                r#"{{"display_name": "vertex-prod", "api_key": {}, "api_base": {}}}"#,
                 serde_json::to_string(secret_json).unwrap(),
                 serde_json::to_string(api_base).unwrap(),
             ))
@@ -7138,7 +7138,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         Arc::new(
             serde_json::from_value(serde_json::json!({
                 "display_name": "vertex-prod",
-                "secret": valid_secret_json(),
+                "api_key": valid_secret_json(),
                 "request": request,
             }))
             .expect("provider_key with request overrides deserializes"),
@@ -7411,7 +7411,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         Arc::new(
             serde_json::from_value(serde_json::json!({
                 "display_name": "vertex-prod",
-                "secret": valid_secret_json(),
+                "api_key": valid_secret_json(),
                 "response": response,
             }))
             .expect("provider_key with response overrides deserializes"),

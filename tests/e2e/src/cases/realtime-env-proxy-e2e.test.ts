@@ -230,7 +230,7 @@ describe("realtime upstream WebSocket follows the proxy environment", () => {
     if (tlsUpstream) {
       const pk = await seed.createProviderKey({
         display_name: "rt-proxy-tls-pk",
-        secret: "sk-upstream-realtime",
+        api_key: "sk-upstream-realtime",
         api_base: `https://${PROXIED_HOST}:${tlsUpstream.port}/v1`,
       });
       await seed.createModel({
@@ -242,7 +242,7 @@ describe("realtime upstream WebSocket follows the proxy environment", () => {
     }
     const directPk = await seed.createProviderKey({
       display_name: "rt-proxy-direct-pk",
-      secret: "sk-upstream-realtime",
+      api_key: "sk-upstream-realtime",
       api_base: `http://127.0.0.1:${plainUpstream.port}/v1`,
     });
     await seed.createModel({
@@ -327,7 +327,7 @@ describe("realtime upstream WebSocket through an https:// proxy, and a SOCKS one
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const tlsPk = await seed.createProviderKey({
       display_name: "rt-https-proxy-pk",
-      secret: "sk-upstream-realtime",
+      api_key: "sk-upstream-realtime",
       api_base: `https://${PROXIED_HOST}:${tlsUpstream.port}/v1`,
     });
     await seed.createModel({
@@ -339,7 +339,7 @@ describe("realtime upstream WebSocket through an https:// proxy, and a SOCKS one
     // `localhost` is outside NO_PROXY, so this one is the SOCKS proxy's.
     const socksPk = await seed.createProviderKey({
       display_name: "rt-socks-pk",
-      secret: "sk-upstream-realtime",
+      api_key: "sk-upstream-realtime",
       api_base: `http://localhost:${plainUpstream.port}/v1`,
     });
     await seed.createModel({

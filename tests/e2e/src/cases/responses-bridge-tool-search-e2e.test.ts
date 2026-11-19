@@ -195,7 +195,7 @@ describe("/v1/responses bridge: Codex's client-executed tool search", () => {
       upstreams[model] = upstream;
       const pk = await seed.createProviderKey({
         display_name: `${model}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
         apis: {},
       });

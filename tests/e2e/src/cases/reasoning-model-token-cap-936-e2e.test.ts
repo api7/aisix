@@ -186,15 +186,15 @@ describe("reasoning models receive max_completion_tokens (AISIX-Cloud#936)", () 
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
     const keys: Record<Key, string> = {
-      openai: (await seed.createProviderKey({ display_name: "k936-openai", secret: "sk-mock", api_base: `${plain.baseUrl}/v1` })).id,
+      openai: (await seed.createProviderKey({ display_name: "k936-openai", api_key: "sk-mock", api_base: `${plain.baseUrl}/v1` })).id,
       "openai-stream": (
-        await seed.createProviderKey({ display_name: "k936-openai-stream", secret: "sk-mock", api_base: `${sse.baseUrl}/v1` })
+        await seed.createProviderKey({ display_name: "k936-openai-stream", api_key: "sk-mock", api_base: `${sse.baseUrl}/v1` })
       ).id,
       // No native Responses surface, so /v1/responses is bridged to Chat Completions.
       "openai-bridged-responses": (
         await seed.createProviderKey({
           display_name: "k936-openai-bridged",
-          secret: "sk-mock",
+          api_key: "sk-mock",
           api_base: `${plain.baseUrl}/v1`,
           apis: {},
         })
@@ -202,7 +202,7 @@ describe("reasoning models receive max_completion_tokens (AISIX-Cloud#936)", () 
       "openai-operator-rename": (
         await seed.createProviderKey({
           display_name: "k936-openai-rename",
-          secret: "sk-mock",
+          api_key: "sk-mock",
           api_base: `${plain.baseUrl}/v1`,
           request: { param_renames: { max_completion_tokens: "max_tokens" } },
         })
@@ -210,7 +210,7 @@ describe("reasoning models receive max_completion_tokens (AISIX-Cloud#936)", () 
       "openai-default-cap": (
         await seed.createProviderKey({
           display_name: "k936-openai-default-cap",
-          secret: "sk-mock",
+          api_key: "sk-mock",
           api_base: `${plain.baseUrl}/v1`,
           request: { default_body_fields: { max_tokens: 64 } },
         })
@@ -218,7 +218,7 @@ describe("reasoning models receive max_completion_tokens (AISIX-Cloud#936)", () 
       "azure-default-cap": (
         await seed.createProviderKey({
           display_name: "k936-azure-default-cap",
-          secret: "azure-mock",
+          api_key: "azure-mock",
           api_base: plain.baseUrl,
           provider: "azure",
           adapter: "azure-openai",
@@ -228,7 +228,7 @@ describe("reasoning models receive max_completion_tokens (AISIX-Cloud#936)", () 
       openrouter: (
         await seed.createProviderKey({
           display_name: "k936-openrouter",
-          secret: "sk-or-mock",
+          api_key: "sk-or-mock",
           api_base: `${plain.baseUrl}/v1`,
           provider: "openrouter",
         })
@@ -236,7 +236,7 @@ describe("reasoning models receive max_completion_tokens (AISIX-Cloud#936)", () 
       azure: (
         await seed.createProviderKey({
           display_name: "k936-azure",
-          secret: "azure-mock",
+          api_key: "azure-mock",
           api_base: plain.baseUrl,
           provider: "azure",
           adapter: "azure-openai",

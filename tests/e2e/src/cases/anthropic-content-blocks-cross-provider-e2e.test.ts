@@ -75,7 +75,7 @@ describe("anthropic content blocks → OpenAI upstream (#722)", () => {
     upstreams.push(upstream);
     const pk = await seed!.createProviderKey({
       display_name: `${name}-pk`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed!.createModel({

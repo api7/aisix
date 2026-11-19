@@ -258,21 +258,21 @@ describe("UsageEvent: prompt-cache writes split by cache lifetime", () => {
       display_name: "ttl-anthropic-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: up.baseUrl,
     });
     const bedrockPk = await seed.createProviderKey({
       display_name: "ttl-bedrock-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({ access_key_id: "AKIA-cache-ttl", secret_access_key: "sk-cache-ttl", region: "us-west-2" }),
+      api_key: JSON.stringify({ access_key_id: "AKIA-cache-ttl", secret_access_key: "sk-cache-ttl", region: "us-west-2" }),
       api_base: up.baseUrl,
     });
     const vertexPk = await seed.createProviderKey({
       display_name: "ttl-vertex-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({ access_token: "ya29.cache-ttl", project: "proj-e2e", region: "us-east5" }),
+      api_key: JSON.stringify({ access_token: "ya29.cache-ttl", project: "proj-e2e", region: "us-east5" }),
       api_base: up.baseUrl,
     });
     for (const [display_name, pk, provider, model_name] of [

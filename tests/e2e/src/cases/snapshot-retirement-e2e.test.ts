@@ -38,7 +38,7 @@ test("configuration replacement preserves held requests and accepts cancellation
     const modelId = randomUUID();
     await etcd.put(`${prefix}/provider_keys/${provider}`, JSON.stringify({
       provider: "openai", adapter: "openai", display_name: "held-provider",
-      secret: "sk-mock", api_base: `http://127.0.0.1:${address.port}/v1`,
+      api_key: "sk-mock", api_base: `http://127.0.0.1:${address.port}/v1`,
     }));
     const putModel = (revision: number) => etcd.put(`${prefix}/models/${modelId}`, JSON.stringify({
       display_name: `held-model-${revision}`, provider: "openai",

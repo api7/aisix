@@ -74,7 +74,7 @@ describe("etcd bootstrap: a configuration set larger than one gRPC message", () 
 
     const pk = await seed.createProviderKey({
       display_name: "large-config-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

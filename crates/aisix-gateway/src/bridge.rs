@@ -1407,7 +1407,7 @@ mod tests {
                 .unwrap(),
             ),
             std::sync::Arc::new(
-                serde_json::from_str::<ProviderKey>(r#"{"display_name":"pk","secret":"s"}"#).unwrap(),
+                serde_json::from_str::<ProviderKey>(r#"{"display_name":"pk","api_key":"s"}"#).unwrap(),
             ),
         );
         let embed_req = EmbeddingRequest {
@@ -1821,7 +1821,7 @@ mod tests {
     }
 
     fn sample_provider_key() -> ProviderKey {
-        serde_json::from_str(r#"{"display_name":"openai-prod","secret":"sk-x"}"#).unwrap()
+        serde_json::from_str(r#"{"display_name":"openai-prod","api_key":"sk-x"}"#).unwrap()
     }
 
     #[test]

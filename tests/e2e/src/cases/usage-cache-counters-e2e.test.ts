@@ -119,7 +119,7 @@ describe("usage cache-counter passthrough on /v1/chat/completions (#542)", () =>
     // "openai"`) — the same bridge whose usage parser this PR fixes.
     const oaiPk = await seed.createProviderKey({
       display_name: "cache-oai-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${openaiUpstream.baseUrl}/v1`,
       provider: "openai",
       adapter: "openai",
@@ -133,7 +133,7 @@ describe("usage cache-counter passthrough on /v1/chat/completions (#542)", () =>
 
     const dsPk = await seed.createProviderKey({
       display_name: "cache-ds-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${deepseekUpstream.baseUrl}/v1`,
       provider: "deepseek",
       adapter: "openai",
@@ -236,7 +236,7 @@ describe("usage cache-counter passthrough on /v1/chat/completions (#542)", () =>
       const plainSeed = new SeedClient(new EtcdClient(), plainApp.etcdPrefix);
       const pk = await plainSeed.createProviderKey({
         display_name: "cache-plain-pk",
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${plainUpstream.baseUrl}/v1`,
         provider: "openai",
         adapter: "openai",
@@ -322,7 +322,7 @@ describe("usage cache-counter passthrough on /v1/chat/completions (#542)", () =>
       const streamSeed = new SeedClient(new EtcdClient(), streamApp.etcdPrefix);
       const pk = await streamSeed.createProviderKey({
         display_name: "cache-ds-stream-pk",
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${streamUpstream.baseUrl}/v1`,
         provider: "deepseek",
         adapter: "openai",

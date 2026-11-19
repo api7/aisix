@@ -223,7 +223,7 @@ mod tests {
         );
         let pk = std::sync::Arc::new(
             serde_json::from_str::<aisix_core::ProviderKey>(
-                r#"{"display_name":"pk","secret":"k"}"#,
+                r#"{"display_name":"pk","api_key":"k"}"#,
             )
             .unwrap(),
         );
@@ -247,7 +247,7 @@ mod tests {
             None => String::new(),
         };
         let json = format!(
-            r#"{{"display_name":"pk","secret":"k","provider":"{provider}"{adapter_field}}}"#
+            r#"{{"display_name":"pk","api_key":"k","provider":"{provider}"{adapter_field}}}"#
         );
         serde_json::from_str::<aisix_core::ProviderKey>(&json).unwrap()
     }

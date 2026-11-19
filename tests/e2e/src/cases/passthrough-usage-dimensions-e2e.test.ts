@@ -371,7 +371,7 @@ describe("passthrough-route usage event: token dimensions and the caller's wait"
 
     const pk = await seed.createProviderKey({
       display_name: "ptr-dims-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: "http://unused-on-routes",
     });
     for (const [name, prefix, upstream] of [

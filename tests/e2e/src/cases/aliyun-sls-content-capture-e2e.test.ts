@@ -56,7 +56,7 @@ async function seedRouting(
 ) {
   const pk = await seed.createProviderKey({
     display_name: "content-capture-pk",
-    secret: PROVIDER_SECRET,
+    api_key: PROVIDER_SECRET,
     api_base: `${upstream.baseUrl}/v1`,
   });
   await seed.createModel({
@@ -67,7 +67,7 @@ async function seedRouting(
   });
   const streamPk = await seed.createProviderKey({
     display_name: "content-capture-stream-pk",
-    secret: PROVIDER_SECRET,
+    api_key: PROVIDER_SECRET,
     api_base: `${streamUpstream.baseUrl}/v1`,
   });
   await seed.createModel({
@@ -78,7 +78,7 @@ async function seedRouting(
   });
   const msgPk = await seed.createProviderKey({
     display_name: "content-capture-messages-pk",
-    secret: PROVIDER_SECRET,
+    api_key: PROVIDER_SECRET,
     api_base: `${messagesUpstream.baseUrl}/v1`,
   });
   await seed.createModel({

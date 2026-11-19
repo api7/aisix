@@ -71,7 +71,7 @@ describe("non-UTF-8 prompt rejected on every multipart surface (#1016)", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "non-utf8-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

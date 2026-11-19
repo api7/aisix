@@ -31,7 +31,7 @@ describe("vertex provider key with a mistyped secret field", () => {
       display_name: "vertex-secret-shape-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({ project: "p", region: "us-central1", service_account_json: JSON.stringify(SA_KEY) }),
+      api_key: JSON.stringify({ project: "p", region: "us-central1", service_account_json: JSON.stringify(SA_KEY) }),
       api_base: "http://127.0.0.1:9",
     });
     await seed.createModel({

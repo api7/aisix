@@ -157,7 +157,7 @@ describe("TTFT metrics split the wait by side", () => {
       upstreams.push(up);
       const pk = await seed.createProviderKey({
         display_name: `${c.model}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: c.provider === "anthropic" ? up.baseUrl : `${up.baseUrl}/v1`,
         provider: c.provider,
       });

@@ -88,7 +88,7 @@ describe("config last-known-good: rejected updates keep serving across resync an
     const seed = new SeedClient(etcd, etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "lkg-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const model = await seed.createModel({

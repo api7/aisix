@@ -64,7 +64,7 @@ describe("guardrail disabled-bypass e2e: enabled:false → no block", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "gr-disabled-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

@@ -74,7 +74,7 @@ describe("input guardrails read replayed reasoning content parts", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "reasoning-parts-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

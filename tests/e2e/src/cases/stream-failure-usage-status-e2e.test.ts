@@ -288,7 +288,7 @@ describe("usage status of a stream that fails after its 200 headers", () => {
         // The Anthropic adapter appends `/v1/messages` to the bare host.
         const pk = await seed.createProviderKey({
           display_name: `${model}-pk`,
-          secret: "sk-ant-mock",
+          api_key: "sk-ant-mock",
           api_base: upstream.baseUrl,
           provider: "anthropic",
           adapter: "anthropic",
@@ -303,7 +303,7 @@ describe("usage status of a stream that fails after its 200 headers", () => {
       }
       const pk = await seed.createProviderKey({
         display_name: `${model}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
         ...(kind === "responses-bridge" ? { apis: {} } : {}),
       });
@@ -332,7 +332,7 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     upstreams.push(routeUpstream);
     const routePk = await seed.createProviderKey({
       display_name: "sf-route-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${routeUpstream.baseUrl}/v1`,
     });
     await seed.createPassthroughRoute({
@@ -346,7 +346,7 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     upstreams.push(errorRouteUpstream);
     const errorRoutePk = await seed.createProviderKey({
       display_name: "sf-route-in-band-pk",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: errorRouteUpstream.baseUrl,
     });
     await seed.createPassthroughRoute({
@@ -360,7 +360,7 @@ describe("usage status of a stream that fails after its 200 headers", () => {
     upstreams.push(nestedRouteUpstream);
     const nestedRoutePk = await seed.createProviderKey({
       display_name: "sf-route-nested-error-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: nestedRouteUpstream.baseUrl,
     });
     await seed.createPassthroughRoute({

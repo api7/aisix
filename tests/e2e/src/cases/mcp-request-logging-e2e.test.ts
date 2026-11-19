@@ -125,7 +125,7 @@ describe("mcp request logging e2e: JSON-RPC method, tool counts, ACL warning", (
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "alpha",
+      name: "alpha",
       url: alpha.url,
       enabled: true,
     });

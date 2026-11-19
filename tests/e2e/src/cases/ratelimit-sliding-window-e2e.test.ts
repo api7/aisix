@@ -132,7 +132,7 @@ describe("rate limit e2e: sliding window", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "sw-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -143,7 +143,7 @@ describe("rate limit e2e: sliding window", () => {
     });
     const streamPk = await seed.createProviderKey({
       display_name: "sw-stream-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
     await seed.createModel({

@@ -146,7 +146,7 @@ describe("response ids", () => {
       display_name: "id-vertex-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({ access_token: "ya29.response-id-e2e", project: "proj-e2e", region: "us-central1" }),
+      api_key: JSON.stringify({ access_token: "ya29.response-id-e2e", project: "proj-e2e", region: "us-central1" }),
       api_base: base,
     });
     for (const name of Object.keys(GEMINI_MODELS)) {
@@ -156,7 +156,7 @@ describe("response ids", () => {
       display_name: "id-bedrock-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({ access_key_id: "AKIA-response-id", secret_access_key: "sk-response-id", region: "us-east-1" }),
+      api_key: JSON.stringify({ access_key_id: "AKIA-response-id", secret_access_key: "sk-response-id", region: "us-east-1" }),
       api_base: base,
     });
     await seed.createModel({
@@ -167,7 +167,7 @@ describe("response ids", () => {
     });
     const openai = await seed.createProviderKey({
       display_name: "id-openai-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${base}/v1`,
     });
     await seed.createModel({

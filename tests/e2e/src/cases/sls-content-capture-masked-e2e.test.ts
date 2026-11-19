@@ -139,7 +139,7 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
       });
       const chatPk = await seed.createProviderKey({
         display_name: "masked-chat-pk",
-        secret: PROVIDER_SECRET,
+        api_key: PROVIDER_SECRET,
         api_base: `${chatUpstream.baseUrl}/v1`,
       });
       await seed.createModel({
@@ -150,7 +150,7 @@ describe("sls content capture e2e: streaming capture is post-mask (#932 × AISIX
       });
       const bridgePk = await seed.createProviderKey({
         display_name: "masked-bridge-pk",
-        secret: PROVIDER_SECRET,
+        api_key: PROVIDER_SECRET,
         api_base: `${bridgeUpstream.baseUrl}/v1`,
         provider: "deepseek",
         adapter: "openai",

@@ -177,28 +177,28 @@ describe("Claude bridges handle each field by the target's contract", () => {
       display_name: "pcb-anthropic-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
     const openaiPk = await seed.createProviderKey({
       display_name: "pcb-openai-pk",
       provider: "openai",
       adapter: "openai",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const vertexPk = await seed.createProviderKey({
       display_name: "pcb-vertex-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({ access_token: "ya29.pcb", project: "proj-e2e", region: "us-east5" }),
+      api_key: JSON.stringify({ access_token: "ya29.pcb", project: "proj-e2e", region: "us-east5" }),
       api_base: upstream.baseUrl,
     });
     const bedrockPk = await seed.createProviderKey({
       display_name: "pcb-bedrock-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({ access_key_id: "AKIA-pcb", secret_access_key: "sk-pcb", region: "us-west-2" }),
+      api_key: JSON.stringify({ access_key_id: "AKIA-pcb", secret_access_key: "sk-pcb", region: "us-west-2" }),
       api_base: upstream.baseUrl,
     });
     for (const [display_name, provider, model_name, pk] of [

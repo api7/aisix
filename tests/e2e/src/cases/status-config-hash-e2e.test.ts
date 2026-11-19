@@ -61,7 +61,7 @@ test("configuration digests match the written rows through updates, rejection, d
       provider: "openai",
       adapter: "openai",
       display_name: "hash-provider",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     }));
     for (let i = 0; i < 256; i++) rows.set(modelKey(i), model(i));

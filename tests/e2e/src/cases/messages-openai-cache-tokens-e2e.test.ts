@@ -262,7 +262,7 @@ describe("/v1/messages keeps an OpenAI upstream's prompt-cache hit (AISIX-Cloud#
     ] as const) {
       const pk = await seed.createProviderKey({
         display_name: `${model}-pk`,
-        secret: "sk-mock-minimax",
+        api_key: "sk-mock-minimax",
         api_base: `${upstream.baseUrl}/v1`,
         provider: "openai",
         adapter: "openai",

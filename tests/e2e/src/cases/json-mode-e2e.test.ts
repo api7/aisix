@@ -96,7 +96,7 @@ describe("json mode e2e: response_format passthrough on /v1/chat/completions", (
 
     const pk = await seed.createProviderKey({
       display_name: "jsonmode-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

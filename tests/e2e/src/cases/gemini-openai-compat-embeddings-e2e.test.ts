@@ -63,7 +63,7 @@ describe("Gemini OpenAI-compatible /v1/embeddings", () => {
     const pk = await seed.createProviderKey({
       display_name: "gemini-compat-embed-pk",
       provider: "google",
-      secret: "gemini-mock-key",
+      api_key: "gemini-mock-key",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({

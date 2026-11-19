@@ -166,7 +166,7 @@ describe("realtime model echo e2e: session frames name what the caller asked for
 
     const pk = await seed.createProviderKey({
       display_name: "realtime-echo-pk",
-      secret: "sk-upstream-realtime",
+      api_key: "sk-upstream-realtime",
       api_base: `http://127.0.0.1:${upstream.port}/v1`,
     });
     await seed.createModel({

@@ -203,7 +203,7 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     const seedModel = async (display: string, upstream: OpenAiUpstream, provider = "openai") => {
       const pk = await seed!.createProviderKey({
         display_name: `${display}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed!.createModel({

@@ -238,7 +238,7 @@ describe("sls content capture e2e (AISIX-Cloud#947): /v1/responses + /v1/complet
       const seedModel = async (name: string, provider: string, upstream: OpenAiUpstream) => {
         const pk = await seed.createProviderKey({
           display_name: `${name}-pk`,
-          secret: PROVIDER_SECRET,
+          api_key: PROVIDER_SECRET,
           api_base: `${upstream.baseUrl}/v1`,
           provider,
           adapter: "openai",

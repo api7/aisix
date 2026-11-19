@@ -36,7 +36,7 @@ describe("configured upstream URL with userinfo is used as configured", () => {
       display_name: "azure-userinfo-pk",
       provider: "azure-openai",
       adapter: "azure-openai",
-      secret: "az-key",
+      api_key: "az-key",
       api_base: upstream.baseUrl.replace("http://", "http://proxy-user:proxy-pw@"),
     });
     await seed.createModel({

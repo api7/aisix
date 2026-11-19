@@ -119,7 +119,7 @@ describe("/v1/responses lite-mode tools on a key with a native Responses surface
       upstreams[name] = upstream;
       return seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
         provider: spec.provider,
         adapter: spec.adapter,

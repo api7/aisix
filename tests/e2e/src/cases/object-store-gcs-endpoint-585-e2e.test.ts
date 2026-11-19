@@ -137,7 +137,7 @@ describe("object_store exporter for gcs honours endpoint (#585)", () => {
       });
       const pk = await seed.createProviderKey({
         display_name: "objstore-gcs-endpoint-pk",
-        secret: "sk-mock-objstore-gcs",
+        api_key: "sk-mock-objstore-gcs",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({
@@ -207,7 +207,7 @@ describe("object_store exporter for gcs honours endpoint (#585)", () => {
       });
       const pk = await seed.createProviderKey({
         display_name: "objstore-gcs-rejecting-pk",
-        secret: "sk-mock-objstore-gcs",
+        api_key: "sk-mock-objstore-gcs",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({

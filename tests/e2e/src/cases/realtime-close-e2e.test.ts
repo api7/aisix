@@ -112,7 +112,7 @@ describe("/v1/realtime close handshake", () => {
     });
     const pk = await seed.createProviderKey({
       display_name: "rt-close-pk",
-      secret: "sk-upstream-realtime",
+      api_key: "sk-upstream-realtime",
       api_base: `http://127.0.0.1:${upstream.port}/v1`,
     });
     await seed.createModel({

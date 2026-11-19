@@ -115,7 +115,7 @@ describe("streamed chat tool-call arguments are held under a window row's own bu
     });
     const pk = await seed.createProviderKey({
       display_name: "wnd-chat-tool-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
 

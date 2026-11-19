@@ -63,7 +63,7 @@ describe("cache TTL eviction e2e: entry expires after ttl_seconds", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "cache-ttl-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

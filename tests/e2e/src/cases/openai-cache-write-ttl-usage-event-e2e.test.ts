@@ -125,7 +125,7 @@ describe("OpenAI cache-write retention split on the usage event", () => {
     });
     const pk = await seed.createProviderKey({
       display_name: "cache-write-ttl-openai", provider: "openai", adapter: "openai",
-      secret: "test", api_base: `http://127.0.0.1:${port}/v1`,
+      api_key: "test", api_base: `http://127.0.0.1:${port}/v1`,
     });
     for (const c of cases) {
       await seed.createModel({ display_name: c.model, model_name: c.model, provider: "openai", provider_key_id: pk.id });

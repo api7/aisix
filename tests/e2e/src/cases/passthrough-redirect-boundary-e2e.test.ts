@@ -64,7 +64,7 @@ describe("passthrough redirect boundary e2e", () => {
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const providerKey = await seed.createProviderKey({
       display_name: "passthrough-redirect-boundary-pk",
-      secret: PROVIDER_SECRET,
+      api_key: PROVIDER_SECRET,
       api_base: sameOriginUpstream.baseUrl,
     });
     await seed.createPassthroughRoute({

@@ -82,12 +82,12 @@ describe("cooldown contract (H1) — 401 cools down despite being non-retryable"
 
     const failPk = await seed.createProviderKey({
       display_name: "h1-401-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${authFailUpstream.baseUrl}/v1`,
     });
     const stablePk = await seed.createProviderKey({
       display_name: "h1-stable-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${stableUpstream.baseUrl}/v1`,
     });
 
@@ -238,12 +238,12 @@ describe("cooldown contract (M1) — 429 cools down even when retry_on_429=false
 
     const rateLimitedPk = await seed.createProviderKey({
       display_name: "m1-429-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${rateLimitedUpstream.baseUrl}/v1`,
     });
     const stablePk = await seed.createProviderKey({
       display_name: "m1-stable-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${stableUpstream.baseUrl}/v1`,
     });
 
@@ -396,12 +396,12 @@ describe("cooldown contract (H2) — Retry-After header from upstream drives TTL
 
     const upstreamPk = await seed.createProviderKey({
       display_name: "h2-upstream-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const stablePk = await seed.createProviderKey({
       display_name: "h2-stable-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${stableUpstream.baseUrl}/v1`,
     });
 
@@ -539,12 +539,12 @@ describe("filter contract (H3) — all candidates unhealthy returns 503", () => 
 
     const aPk = await seed.createProviderKey({
       display_name: "h3-down-a-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${downAUpstream.baseUrl}/v1`,
     });
     const bPk = await seed.createProviderKey({
       display_name: "h3-down-b-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${downBUpstream.baseUrl}/v1`,
     });
 
@@ -671,7 +671,7 @@ describe("filter contract (H3 escape hatch) — try_anyway sends to known-bad", 
 
     const pk = await seed.createProviderKey({
       display_name: "h3-escape-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${downUpstream.baseUrl}/v1`,
     });
 
@@ -801,12 +801,12 @@ describe("cooldown observability — a cooldown transition emits aisix_deploymen
 
     const failPk = await seed.createProviderKey({
       display_name: "cd-metrics-fail-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${failUpstream.baseUrl}/v1`,
     });
     const stablePk = await seed.createProviderKey({
       display_name: "cd-metrics-stable-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${stableUpstream.baseUrl}/v1`,
     });
 
@@ -999,12 +999,12 @@ describe("cooldown observability — the state gauge follows a target back into 
 
     const flakyPk = await seed.createProviderKey({
       display_name: "cd-recover-flaky-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${flakyUpstream.baseUrl}/v1`,
     });
     const stablePk = await seed.createProviderKey({
       display_name: "cd-recover-stable-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${stableUpstream.baseUrl}/v1`,
     });
 

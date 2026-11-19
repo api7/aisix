@@ -992,7 +992,7 @@ mod tests {
     fn snapshot_with(provider_key_id: &str) -> AisixSnapshot {
         let snap = AisixSnapshot::new();
         let pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"openai-prod","secret":"sk-x","api_base":"https://proxy.example.com/v1","provider":"openai","adapter":"openai"}"#,
+            r#"{"display_name":"openai-prod","api_key":"sk-x","api_base":"https://proxy.example.com/v1","provider":"openai","adapter":"openai"}"#,
         )
         .unwrap();
         snap.provider_keys
@@ -1038,7 +1038,7 @@ mod tests {
     fn without_apis_the_vendor_inference_is_unchanged() {
         let snap = snapshot_with_pk_json(
             "pk-1",
-            r#"{"display_name":"o","secret":"k","api_base":"https://up/v1","provider":"openai","adapter":"openai"}"#,
+            r#"{"display_name":"o","api_key":"k","api_base":"https://up/v1","provider":"openai","adapter":"openai"}"#,
         );
         let m = model_on("openai", "pk-1");
         assert!(serves_natively(&snap, &m, ApiSurface::Responses));
@@ -1046,7 +1046,7 @@ mod tests {
 
         let snap = snapshot_with_pk_json(
             "pk-2",
-            r#"{"display_name":"a","secret":"k","api_base":"https://up","provider":"byo","adapter":"anthropic"}"#,
+            r#"{"display_name":"a","api_key":"k","api_base":"https://up","provider":"byo","adapter":"anthropic"}"#,
         );
         let m = model_on("byo", "pk-2");
         assert!(serves_natively(&snap, &m, ApiSurface::Messages));
@@ -1071,7 +1071,7 @@ mod tests {
             let snap = snapshot_with_pk_json(
                 "pk-1",
                 &format!(
-                    r#"{{"display_name":"k","secret":"k","api_base":"https://up/v1","provider":"{provider}","adapter":"openai","apis":{{"responses":{{}}}}}}"#
+                    r#"{{"display_name":"k","api_key":"k","api_base":"https://up/v1","provider":"{provider}","adapter":"openai","apis":{{"responses":{{}}}}}}"#
                 ),
             );
             let m = model_on(provider, "pk-1");
@@ -1092,7 +1092,7 @@ mod tests {
     fn apis_without_responses_stops_the_verbatim_passthrough() {
         let snap = snapshot_with_pk_json(
             "pk-1",
-            r#"{"display_name":"o","secret":"k","api_base":"https://vllm.internal/v1","provider":"openai","adapter":"openai","apis":{}}"#,
+            r#"{"display_name":"o","api_key":"k","api_base":"https://vllm.internal/v1","provider":"openai","adapter":"openai","apis":{}}"#,
         );
         let m = model_on("openai", "pk-1");
         assert!(
@@ -1108,7 +1108,7 @@ mod tests {
     fn apis_listing_responses_keeps_the_verbatim_passthrough() {
         let snap = snapshot_with_pk_json(
             "pk-1",
-            r#"{"display_name":"o","secret":"k","api_base":"https://vllm.internal/v1","provider":"byo","adapter":"openai","apis":{"responses":{}}}"#,
+            r#"{"display_name":"o","api_key":"k","api_base":"https://vllm.internal/v1","provider":"byo","adapter":"openai","apis":{"responses":{}}}"#,
         );
         let m = model_on("byo", "pk-1");
         assert!(serves_natively(&snap, &m, ApiSurface::Responses));
@@ -1123,7 +1123,7 @@ mod tests {
     fn apis_adds_a_native_anthropic_route_to_an_openai_key() {
         let snap = snapshot_with_pk_json(
             "pk-1",
-            r#"{"display_name":"ds","secret":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","adapter":"openai",
+            r#"{"display_name":"ds","api_key":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","adapter":"openai",
                 "apis":{"messages":{"base":"https://api.deepseek.com/anthropic"}}}"#,
         );
         let m = model_on("deepseek", "pk-1");
@@ -1139,7 +1139,7 @@ mod tests {
     fn an_anthropic_adapter_keeps_its_own_surface_when_apis_lists_others() {
         let snap = snapshot_with_pk_json(
             "pk-1",
-            r#"{"display_name":"a","secret":"k","api_base":"https://up","provider":"byo","adapter":"anthropic","apis":{"responses":{}}}"#,
+            r#"{"display_name":"a","api_key":"k","api_base":"https://up","provider":"byo","adapter":"anthropic","apis":{"responses":{}}}"#,
         );
         let m = model_on("byo", "pk-1");
         assert!(serves_natively(&snap, &m, ApiSurface::Messages));
@@ -1152,7 +1152,7 @@ mod tests {
         // The catalog vendor, even pointed at a proxied endpoint.
         let snap = snapshot_with_pk_json(
             "pk-1",
-            r#"{"display_name":"a","secret":"k","api_base":"https://anthropic.corp-proxy/","provider":"anthropic","adapter":"anthropic"}"#,
+            r#"{"display_name":"a","api_key":"k","api_base":"https://anthropic.corp-proxy/","provider":"anthropic","adapter":"anthropic"}"#,
         );
         let m = model_on("anthropic", "pk-1");
         assert!(is_first_party_anthropic(&snap, &m));
@@ -1160,7 +1160,7 @@ mod tests {
         // byo + anthropic adapter: speaks the protocol, is not Anthropic.
         let snap = snapshot_with_pk_json(
             "pk-1",
-            r#"{"display_name":"a","secret":"k","api_base":"https://up","provider":"byo","adapter":"anthropic"}"#,
+            r#"{"display_name":"a","api_key":"k","api_base":"https://up","provider":"byo","adapter":"anthropic"}"#,
         );
         let m = model_on("byo", "pk-1");
         assert!(speaks_anthropic(&snap, &m));
@@ -1169,7 +1169,7 @@ mod tests {
         // A vendor declaring `apis.messages`: same answer.
         let snap = snapshot_with_pk_json(
             "pk-1",
-            r#"{"display_name":"ds","secret":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","adapter":"openai",
+            r#"{"display_name":"ds","api_key":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","adapter":"openai",
                 "apis":{"messages":{"base":"https://api.deepseek.com/anthropic"}}}"#,
         );
         let m = model_on("deepseek", "pk-1");
@@ -1179,7 +1179,7 @@ mod tests {
         // An OpenAI-compatible upstream reached through the bridge.
         let snap = snapshot_with_pk_json(
             "pk-1",
-            r#"{"display_name":"o","secret":"k","api_base":"https://up/v1","provider":"openai","adapter":"openai"}"#,
+            r#"{"display_name":"o","api_key":"k","api_base":"https://up/v1","provider":"openai","adapter":"openai"}"#,
         );
         let m = model_on("openai", "pk-1");
         assert!(!is_first_party_anthropic(&snap, &m));
@@ -1189,7 +1189,7 @@ mod tests {
         // route, so it is not first-party either.
         let snap = snapshot_with_pk_json(
             "pk-1",
-            r#"{"display_name":"b","secret":"{}","api_base":"https://up","provider":"anthropic","adapter":"bedrock"}"#,
+            r#"{"display_name":"b","api_key":"{}","api_base":"https://up","provider":"anthropic","adapter":"bedrock"}"#,
         );
         let m = model_on("anthropic", "pk-1");
         assert!(!is_first_party_anthropic(&snap, &m));
@@ -1204,7 +1204,7 @@ mod tests {
             let snap = snapshot_with_pk_json(
                 "pk-1",
                 &format!(
-                    r#"{{"display_name":"p","secret":"{{}}","api_base":"https://up","provider":"byo","adapter":"{adapter}","apis":{{"responses":{{}},"messages":{{}}}}}}"#
+                    r#"{{"display_name":"p","api_key":"{{}}","api_base":"https://up","provider":"byo","adapter":"{adapter}","apis":{{"responses":{{}},"messages":{{}}}}}}"#
                 ),
             );
             let m = model_on("byo", "pk-1");
@@ -1235,7 +1235,7 @@ mod tests {
             let snap = snapshot_with_pk_json(
                 "pk-1",
                 &format!(
-                    r#"{{"display_name":"p","secret":"{{}}","api_base":"https://up","provider":"{vendor}","adapter":"{adapter}"}}"#
+                    r#"{{"display_name":"p","api_key":"{{}}","api_base":"https://up","provider":"{vendor}","adapter":"{adapter}"}}"#
                 ),
             );
             let m = model_on(vendor, "pk-1");
@@ -1253,7 +1253,7 @@ mod tests {
     #[test]
     fn an_empty_surface_base_falls_back_to_api_base() {
         let pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"ds","secret":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","apis":{"messages":{"base":"   "}}}"#,
+            r#"{"display_name":"ds","api_key":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","apis":{"messages":{"base":"   "}}}"#,
         )
         .unwrap();
         assert_eq!(
@@ -1268,7 +1268,7 @@ mod tests {
     #[test]
     fn surface_base_overrides_api_base_only_for_the_declared_surface() {
         let pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"ds","secret":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","adapter":"openai",
+            r#"{"display_name":"ds","api_key":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","adapter":"openai",
                 "apis":{"messages":{"base":"https://api.deepseek.com/anthropic/v1/messages"}}}"#,
         )
         .unwrap();
@@ -1297,11 +1297,11 @@ mod tests {
     #[test]
     fn surface_fingerprint_changes_when_the_entry_changes() {
         let base: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"ds","secret":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","apis":{"messages":{"base":"https://a.example/anthropic"}}}"#,
+            r#"{"display_name":"ds","api_key":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","apis":{"messages":{"base":"https://a.example/anthropic"}}}"#,
         )
         .unwrap();
         let edited: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"ds","secret":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","apis":{"messages":{"base":"https://b.example/anthropic"}}}"#,
+            r#"{"display_name":"ds","api_key":"k","api_base":"https://api.deepseek.com/v1","provider":"deepseek","apis":{"messages":{"base":"https://b.example/anthropic"}}}"#,
         )
         .unwrap();
         assert_ne!(
@@ -1389,7 +1389,8 @@ mod tests {
         // No provider (legacy row) — must NOT get the openai default:
         // sending an unknown vendor's credential to api.openai.com is
         // worse than the 400.
-        let pk: ProviderKey = serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
+        let pk: ProviderKey =
+            serde_json::from_str(r#"{"display_name":"x","api_key":"k"}"#).unwrap();
         let err = resolve_base_url(&pk).unwrap_err();
         match err {
             ProxyError::InvalidRequest(msg) => {
@@ -1409,7 +1410,7 @@ mod tests {
     #[test]
     fn resolve_base_url_openai_vendor_falls_back_to_default_base() {
         let pk: ProviderKey =
-            serde_json::from_str(r#"{"display_name":"x","secret":"k","provider":"openai"}"#)
+            serde_json::from_str(r#"{"display_name":"x","api_key":"k","provider":"openai"}"#)
                 .unwrap();
         assert_eq!(
             resolve_base_url(&pk).unwrap(),
@@ -1424,7 +1425,7 @@ mod tests {
     #[test]
     fn resolve_base_url_legacy_empty_vendor_openai_adapter_falls_back() {
         let pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"x","secret":"k","provider":"","adapter":"openai"}"#,
+            r#"{"display_name":"x","api_key":"k","provider":"","adapter":"openai"}"#,
         )
         .unwrap();
         assert_eq!(
@@ -1444,7 +1445,7 @@ mod tests {
             .filter(|a| *a != aisix_core::Adapter::Openai)
         {
             let pk: ProviderKey = serde_json::from_str(&format!(
-                r#"{{"display_name":"x","secret":"k","provider":"","adapter":"{}"}}"#,
+                r#"{{"display_name":"x","api_key":"k","provider":"","adapter":"{}"}}"#,
                 adapter.wire_protocol()
             ))
             .unwrap();
@@ -1461,11 +1462,11 @@ mod tests {
     #[test]
     fn cached_url_rebuilds_when_adapter_changes_without_api_base() {
         let openai_pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"legacy","secret":"k","provider":"","adapter":"openai"}"#,
+            r#"{"display_name":"legacy","api_key":"k","provider":"","adapter":"openai"}"#,
         )
         .unwrap();
         let anthropic_pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"legacy","secret":"k2","provider":"","adapter":"anthropic"}"#,
+            r#"{"display_name":"legacy","api_key":"k2","provider":"","adapter":"anthropic"}"#,
         )
         .unwrap();
         let resource_id = "test-1019-fingerprint-adapter";
@@ -1489,10 +1490,10 @@ mod tests {
     #[test]
     fn resolve_base_url_for_messages_falls_back_to_anthropic_default() {
         for doc in [
-            r#"{"display_name":"x","secret":"k","provider":"anthropic","adapter":"anthropic"}"#,
-            r#"{"display_name":"x","secret":"k","provider":" Anthropic "}"#,
-            r#"{"display_name":"x","secret":"k","provider":"","adapter":"anthropic","api_base":" "}"#,
-            r#"{"display_name":"x","secret":"k","provider":"anthropic","apis":{"messages":{}}}"#,
+            r#"{"display_name":"x","api_key":"k","provider":"anthropic","adapter":"anthropic"}"#,
+            r#"{"display_name":"x","api_key":"k","provider":" Anthropic "}"#,
+            r#"{"display_name":"x","api_key":"k","provider":"","adapter":"anthropic","api_base":" "}"#,
+            r#"{"display_name":"x","api_key":"k","provider":"anthropic","apis":{"messages":{}}}"#,
         ] {
             let pk: ProviderKey = serde_json::from_str(doc).unwrap();
             assert_eq!(
@@ -1513,9 +1514,9 @@ mod tests {
     #[test]
     fn resolve_base_url_for_messages_keeps_non_anthropic_keys() {
         for doc in [
-            r#"{"display_name":"x","secret":"k","provider":"deepseek","adapter":"anthropic"}"#,
-            r#"{"display_name":"x","secret":"k","provider":"","adapter":"bedrock"}"#,
-            r#"{"display_name":"x","secret":"k","provider":""}"#,
+            r#"{"display_name":"x","api_key":"k","provider":"deepseek","adapter":"anthropic"}"#,
+            r#"{"display_name":"x","api_key":"k","provider":"","adapter":"bedrock"}"#,
+            r#"{"display_name":"x","api_key":"k","provider":""}"#,
         ] {
             let pk: ProviderKey = serde_json::from_str(doc).unwrap();
             assert!(
@@ -1524,7 +1525,7 @@ mod tests {
             );
         }
         let pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"x","secret":"k","provider":"anthropic","api_base":"https://proxy.example.com/"}"#,
+            r#"{"display_name":"x","api_key":"k","provider":"anthropic","api_base":"https://proxy.example.com/"}"#,
         )
         .unwrap();
         assert_eq!(
@@ -1539,7 +1540,7 @@ mod tests {
     #[test]
     fn resolve_base_url_openai_fallback_tolerates_case_and_blank_base() {
         let pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"x","secret":"k","provider":" OpenAI ","api_base":"   "}"#,
+            r#"{"display_name":"x","api_key":"k","provider":" OpenAI ","api_base":"   "}"#,
         )
         .unwrap();
         assert_eq!(
@@ -1589,11 +1590,11 @@ mod tests {
     #[test]
     fn cached_url_rebuilds_when_provider_changes_without_api_base() {
         let openai_pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"repurpose","secret":"k","provider":"openai"}"#,
+            r#"{"display_name":"repurpose","api_key":"k","provider":"openai"}"#,
         )
         .unwrap();
         let deepseek_pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"repurpose","secret":"k2","provider":"deepseek","adapter":"openai"}"#,
+            r#"{"display_name":"repurpose","api_key":"k2","provider":"deepseek","adapter":"openai"}"#,
         )
         .unwrap();
         let resource_id = "test-1017-fingerprint-repurpose";
@@ -1634,7 +1635,7 @@ mod tests {
     #[test]
     fn resolve_base_url_openai_compatible_vendor_still_errors() {
         let pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"x","secret":"k","provider":"deepseek","adapter":"openai"}"#,
+            r#"{"display_name":"x","api_key":"k","provider":"deepseek","adapter":"openai"}"#,
         )
         .unwrap();
         assert!(matches!(
@@ -1644,7 +1645,7 @@ mod tests {
     }
 
     fn pk_with_base(api_base: &str) -> ProviderKey {
-        let cfg = format!(r#"{{"display_name":"x","secret":"k","api_base":"{api_base}"}}"#);
+        let cfg = format!(r#"{{"display_name":"x","api_key":"k","api_base":"{api_base}"}}"#);
         serde_json::from_str(&cfg).unwrap()
     }
 
@@ -2018,7 +2019,7 @@ mod tests {
                 None => String::new(),
             };
             let cfg = format!(
-                r#"{{"display_name":"x","secret":"k","provider":"{provider}"{adapter_json}}}"#
+                r#"{{"display_name":"x","api_key":"k","provider":"{provider}"{adapter_json}}}"#
             );
             serde_json::from_str(&cfg).unwrap()
         }

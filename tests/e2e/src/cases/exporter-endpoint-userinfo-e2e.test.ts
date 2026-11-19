@@ -131,7 +131,7 @@ describe("exporter endpoint URLs may carry userinfo", () => {
     });
     const pk = await seed.createProviderKey({
       display_name: "endpoint-userinfo-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

@@ -213,7 +213,7 @@ describe("chat response_format → Gemini and Bedrock", () => {
       display_name: "structured-vertex-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_token: "ya29.structured-e2e",
         project: "proj-e2e",
         region: "us-central1",
@@ -240,7 +240,7 @@ describe("chat response_format → Gemini and Bedrock", () => {
       display_name: "structured-bedrock-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-structured-e2e",
         secret_access_key: "sk-structured-e2e",
         region: "us-west-2",
@@ -264,7 +264,7 @@ describe("chat response_format → Gemini and Bedrock", () => {
       display_name: "structured-slow-bedrock-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-structured-slow",
         secret_access_key: "sk-structured-slow",
         region: "us-west-2",

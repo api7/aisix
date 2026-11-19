@@ -156,7 +156,7 @@ describe("custom script guardrail e2e: operator script screens against its own s
 
     const pk = await seed.createProviderKey({
       display_name: "custom-script-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

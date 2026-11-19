@@ -71,7 +71,7 @@ describe("anthropic upstream e2e: OpenAI in, Anthropic out, OpenAI back to calle
       display_name: "an-e2e-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({
@@ -250,7 +250,7 @@ describe("anthropic upstream e2e: tool_use-only response surfaces content:null (
       display_name: "an-e2e-toolnull-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({
@@ -353,7 +353,7 @@ describe("anthropic upstream e2e: cache tokens fold into total_tokens (#906)", (
       display_name: "an-e2e-cachetotal-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({
@@ -468,7 +468,7 @@ describe("anthropic upstream e2e: client cache_control markers survive translati
       display_name: "an-e2e-cachectl-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({
@@ -676,7 +676,7 @@ describe("anthropic upstream e2e: auto_prompt_caching injects breakpoints (AISIX
       display_name: "an-e2e-inject-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({

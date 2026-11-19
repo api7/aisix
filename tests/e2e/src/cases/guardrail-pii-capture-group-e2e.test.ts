@@ -77,7 +77,7 @@ describe("pii capture-group + replacement e2e", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "pii-capture-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

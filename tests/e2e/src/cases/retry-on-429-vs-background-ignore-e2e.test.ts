@@ -72,12 +72,12 @@ describe("retry_on_429 vs background ignore e2e", () => {
 
     const primaryPk = await seed.createProviderKey({
       display_name: "retry-429-primary-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${rateLimitedUpstream.baseUrl}/v1`,
     });
     const fallbackPk = await seed.createProviderKey({
       display_name: "retry-429-fallback-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${fallbackUpstream.baseUrl}/v1`,
     });
 

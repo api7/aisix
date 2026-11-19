@@ -113,7 +113,7 @@ describe("vision messages edges e2e: multi-image, detail param, mixed-source", (
 
     const pk = await seed.createProviderKey({
       display_name: "vision-edges-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

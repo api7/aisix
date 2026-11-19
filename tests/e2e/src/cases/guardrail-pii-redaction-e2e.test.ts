@@ -88,7 +88,7 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "pii-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -104,7 +104,7 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
 
     const streamPk = await seed.createProviderKey({
       display_name: "pii-stream-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -309,7 +309,7 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
     const monSeed = new SeedClient(new EtcdClient(), monApp.etcdPrefix);
     const monPk = await monSeed.createProviderKey({
       display_name: "pii-mon-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${monUpstream.baseUrl}/v1`,
     });
     await monSeed.createModel({
@@ -398,7 +398,7 @@ describe("pii guardrail e2e: mask + block on request and response", () => {
 
     const anthPk = await seed.createProviderKey({
       display_name: "pii-anth-pk",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: `http://127.0.0.1:${anthPort}`,
       provider: "anthropic",
       adapter: "anthropic",

@@ -129,7 +129,7 @@ describe("cross-provider matrix: OpenAI-compat upstreams", () => {
 
       const pk = await seed.createProviderKey({
         display_name: `${tc.displayPrefix}-pk-non-stream`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
         // Post-#302 Phase A: cp-api writes `provider` + `adapter` on
         // every PK row. Without these the snapshot's
@@ -231,7 +231,7 @@ describe("cross-provider matrix: OpenAI-compat upstreams", () => {
 
       const pk = await seed.createProviderKey({
         display_name: `${tc.displayPrefix}-pk-stream`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
         // Same post-Phase-A admission-contract requirement as the
         // non-streaming fixture above — see that comment.

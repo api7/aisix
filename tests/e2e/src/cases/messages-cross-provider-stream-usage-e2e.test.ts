@@ -126,12 +126,12 @@ describe("anthropic→openai streaming usage (#790)", () => {
 
     const pkUsage = await seed.createProviderKey({
       display_name: "issue790-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${upstreamUsage.baseUrl}/v1`,
     });
     const pkNoUsage = await seed.createProviderKey({
       display_name: "issue790-pk-nousage",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${upstreamNoUsage.baseUrl}/v1`,
     });
     // Mirrors the customer config from #790: alias gpt-5.5 → upstream

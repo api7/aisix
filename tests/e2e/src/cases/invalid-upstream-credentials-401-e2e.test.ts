@@ -51,7 +51,7 @@ describe("invalid upstream credentials maps to 401 e2e", () => {
     // credential problem.
     const pk = await seed.createProviderKey({
       display_name: "invalid-cred-pk",
-      secret: "sk-live\n-injected",
+      api_key: "sk-live\n-injected",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

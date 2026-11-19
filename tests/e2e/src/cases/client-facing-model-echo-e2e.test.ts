@@ -88,7 +88,7 @@ describe("client-facing model echo e2e: the response names what the caller asked
   ): Promise<void> {
     const pk = await seed!.createProviderKey({
       display_name: `pk-${alias}`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
       provider: opts.provider ?? "openai",
       adapter: opts.adapter ?? "openai",
@@ -454,7 +454,7 @@ describe("client-facing model echo e2e: the response names what the caller asked
 
     const pk = await seed.createProviderKey({
       display_name: "pk-echo-videos",
-      secret: "sk-mock-dashscope",
+      api_key: "sk-mock-dashscope",
       api_base: upstream.baseUrl,
       provider: "alibaba",
     });
@@ -626,7 +626,7 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
 
     const pk = await seed.createProviderKey({
       display_name: "pk-echo-guarded",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -690,7 +690,7 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
 
     const pk = await seed.createProviderKey({
       display_name: "pk-echo-tail",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: upstream.baseUrl,
       provider: "anthropic",
       adapter: "anthropic",
@@ -763,7 +763,7 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
 
     const pk = await seed.createProviderKey({
       display_name: "pk-echo-cut-tail",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -823,7 +823,7 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
 
     const pk = await seed.createProviderKey({
       display_name: "pk-echo-mask-tail",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -882,7 +882,7 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
 
     const pk = await seed.createProviderKey({
       display_name: "pk-echo-mask-tail-anthropic",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: upstream.baseUrl,
       provider: "anthropic",
       adapter: "anthropic",
@@ -962,7 +962,7 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
 
     const pk = await seed.createProviderKey({
       display_name: "pk-echo-raw-frame",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -1030,7 +1030,7 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
 
     const pk = await seed.createProviderKey({
       display_name: "pk-echo-multiline",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -1089,7 +1089,7 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
 
     const pk = await seed.createProviderKey({
       display_name: "pk-echo-raw-frame-anthropic",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: upstream.baseUrl,
       provider: "anthropic",
       adapter: "anthropic",
@@ -1160,7 +1160,7 @@ describe("client-facing model echo e2e: a buffering output guardrail keeps the a
 
     const pk = await seed.createProviderKey({
       display_name: "pk-echo-multiline-anthropic",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: upstream.baseUrl,
       provider: "anthropic",
       adapter: "anthropic",

@@ -85,17 +85,17 @@ describe("runtime mixed filtering e2e", () => {
 
     const unhealthyPk = await seed.createProviderKey({
       display_name: "mixed-unhealthy-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${unhealthyUpstream.baseUrl}/v1`,
     });
     const cooldownPk = await seed.createProviderKey({
       display_name: "mixed-cooldown-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${cooldownUpstream.baseUrl}/v1`,
     });
     const healthyPk = await seed.createProviderKey({
       display_name: "mixed-healthy-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${healthyUpstream.baseUrl}/v1`,
     });
 

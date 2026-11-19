@@ -88,7 +88,7 @@ describe("Cohere Provider Key upstream URLs", () => {
       upstreams.set(form, upstream);
       const pk = await seed.createProviderKey({
         display_name: `cohere-${form}`,
-        secret: "cohere-mock-key",
+        api_key: "cohere-mock-key",
         provider: "cohere",
         adapter: "openai",
         api_base: apiBase(form, upstream.baseUrl),

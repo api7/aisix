@@ -70,7 +70,7 @@ describe("exporter pipelines run on the control runtime (#901)", () => {
       }
       const pk = await seed.createProviderKey({
         display_name: "exporter-runtime-pk",
-        secret: "sk-mock-exporter-runtime",
+        api_key: "sk-mock-exporter-runtime",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({

@@ -107,7 +107,7 @@ describe("streaming tool-route structured output keeps the reasoning", () => {
       display_name: "tool-think-anthropic-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: anthropic.baseUrl,
     });
     await seed.createModel({
@@ -120,7 +120,7 @@ describe("streaming tool-route structured output keeps the reasoning", () => {
       display_name: "tool-think-bedrock-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-tool-think",
         secret_access_key: "sk-tool-think",
         region: "us-west-2",
@@ -137,7 +137,7 @@ describe("streaming tool-route structured output keeps the reasoning", () => {
       display_name: "tool-think-vertex-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_token: "ya29.tool-think",
         project: "proj-e2e",
         region: "us-east5",

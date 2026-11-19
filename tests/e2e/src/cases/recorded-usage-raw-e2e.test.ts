@@ -285,7 +285,7 @@ describe("the usage record carries upstream usage as reported", () => {
         display_name: `${model}-pk`,
         provider: "google",
         adapter: "vertex",
-        secret: JSON.stringify({
+        api_key: JSON.stringify({
           access_token: "ya29.recorded-usage-e2e",
           project: "proj-e2e",
           region: "us-central1",
@@ -305,7 +305,7 @@ describe("the usage record carries upstream usage as reported", () => {
     ] as const) {
       const pk = await seed.createProviderKey({
         display_name: `${model}-pk`,
-        secret: "sk-openai-mock",
+        api_key: "sk-openai-mock",
         api_base: `${upstream.baseUrl}/v1`,
         provider: "openai",
         adapter: "openai",
@@ -514,7 +514,7 @@ describe("legacy completions record reasoning and total like chat does", () => {
     });
     const pk = await seed.createProviderKey({
       display_name: `${MODEL}-pk`,
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${upstream.baseUrl}/v1`,
       provider: "openai",
       adapter: "openai",

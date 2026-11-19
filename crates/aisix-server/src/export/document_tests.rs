@@ -415,24 +415,6 @@ fn documents_are_written_as_stored_not_re_serialized() {
 }
 
 #[test]
-fn the_former_provider_key_secret_spelling_is_redacted_too() {
-    let doc = export(
-        &[(
-            "provider_keys",
-            PK,
-            json!({"display_name": "old", "secret": "sk-old-spelling"}),
-        )],
-        false,
-    );
-    let pk = &find(&doc, "provider_keys")[0];
-    assert_eq!(
-        pk["secret"],
-        json!("${AISIXSECRET_PROVIDER_KEY_OLD_SECRET}"),
-        "{pk}"
-    );
-}
-
-#[test]
 fn the_id_comes_from_the_key_not_from_a_stored_id_field() {
     let doc = export(
         &[(

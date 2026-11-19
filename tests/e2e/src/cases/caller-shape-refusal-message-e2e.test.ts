@@ -83,7 +83,7 @@ describe("a refused request shape is described as a request error", () => {
       display_name: "refusal-vertex-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_token: "ya29.caller-shape-refusal",
         project: "proj-e2e",
         region: "us-central1",
@@ -100,7 +100,7 @@ describe("a refused request shape is described as a request error", () => {
       display_name: "refusal-bedrock-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-refusal",
         secret_access_key: "sk-refusal",
         region: "us-east-1",
@@ -123,7 +123,7 @@ describe("a refused request shape is described as a request error", () => {
       display_name: "refusal-anthropic-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-refusal",
+      api_key: "sk-ant-refusal",
       api_base: baseUrl,
     });
     await seed.createModel({

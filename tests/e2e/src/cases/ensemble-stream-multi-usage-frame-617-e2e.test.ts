@@ -122,7 +122,7 @@ describe("streaming ensemble folds the panel usage once with a multi-usage-frame
     ] as const) {
       const pk = await seed.createProviderKey({
         display_name: `${display}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({

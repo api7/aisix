@@ -201,7 +201,7 @@ describe("an upstream's failure reads the same on every route that sends its own
     const model = async (name: string, provider: string, base: string) => {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         provider,
         ...(provider === "openai" ? {} : { adapter: "openai" }),
         api_base: base,
@@ -232,7 +232,7 @@ describe("an upstream's failure reads the same on every route that sends its own
     for (const status of [400, 503]) {
       const pk = await seed.createProviderKey({
         display_name: `realtime-cooldown-${status}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         provider: "openai",
         api_base: `${await fixedUpstream(status, openAiEnvelope(status))}/v1`,
       });
@@ -251,7 +251,7 @@ describe("an upstream's failure reads the same on every route that sends its own
     {
       const pk = await seed.createProviderKey({
         display_name: "video-cooldown-retry-after-pk",
-        secret: "sk-mock",
+        api_key: "sk-mock",
         provider: "openai",
         api_base: `${await fixedUpstream(429, openAiEnvelope(429), { "retry-after": "180" })}/v1`,
       });
@@ -380,7 +380,7 @@ describe("an upstream's failure reads the same on every route that sends its own
     ] as const) {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         provider: "azure-openai",
         adapter: "azure-openai",
         api_base: await fixedUpstream(status, body, {}, contentType),

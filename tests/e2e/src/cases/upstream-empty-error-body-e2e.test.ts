@@ -79,7 +79,7 @@ describe("upstream error with no message → caller sees the upstream status (#9
     closers.push(() => upstream.close());
     const pk = await seed!.createProviderKey({
       display_name: `${name}-pk`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed!.createModel({

@@ -405,7 +405,7 @@ describe("internal model calls as child usage events (#2075)", () => {
 
     const embeddingKey = await seed.createProviderKey({
       display_name: "icu-2075-embed-pk",
-      secret: "sk-embedding-mock",
+      api_key: "sk-embedding-mock",
       api_base: `${embed.baseUrl}/v1`,
     });
     for (const [name, upstreamModel] of [
@@ -426,12 +426,12 @@ describe("internal model calls as child usage events (#2075)", () => {
 
     const chatKey = await seed.createProviderKey({
       display_name: "icu-2075-chat-pk",
-      secret: "sk-chat-mock",
+      api_key: "sk-chat-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const streamKey = await seed.createProviderKey({
       display_name: "icu-2075-stream-pk",
-      secret: "sk-stream-mock",
+      api_key: "sk-stream-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
     for (const name of [
@@ -501,7 +501,7 @@ describe("internal model calls as child usage events (#2075)", () => {
     // which the decision call must honour as a direct `/v1/systemone` does.
     const jevKey = await seed.createProviderKey({
       display_name: "icu-2075-jev-pk",
-      secret: DECISION_SECRET,
+      api_key: DECISION_SECRET,
       provider: "typesafe",
       adapter: undefined,
       api_base: `${decisions.baseUrl}/v1`,
@@ -520,14 +520,14 @@ describe("internal model calls as child usage events (#2075)", () => {
     // An inline classifier's own key; its api_base ends in `/v1` too.
     const inlineKey = await seed.createProviderKey({
       display_name: "icu-2075-jev-inline-pk",
-      secret: INLINE_DECISION_SECRET,
+      api_key: INLINE_DECISION_SECRET,
       provider: "typesafe",
       adapter: undefined,
       api_base: `${decisions.baseUrl}/v1/`,
     });
     const notTypesafe = await seed.createProviderKey({
       display_name: "icu-2075-not-typesafe-pk",
-      secret: "sk-not-typesafe",
+      api_key: "sk-not-typesafe",
       api_base: decisions.baseUrl,
     });
     const jevRouter = async (name: string, classifier: Record<string, unknown>) => {

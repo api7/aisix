@@ -103,7 +103,7 @@ describe("usage estimation (AISIX-Cloud#1816): images and opaque payloads are no
     const seedModel = async (display: string, upstream: OpenAiUpstream, provider: string) => {
       const pk = await seed.createProviderKey({
         display_name: `${display}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({

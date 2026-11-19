@@ -536,7 +536,7 @@ async fn loader_picks_up_every_direct_write() {
                 "display_name": "loader-pk",
                 "provider": "openai",
                 "adapter": "openai",
-                "secret": "sk-loader"
+                "api_key": "sk-loader"
             }),
         ),
         (

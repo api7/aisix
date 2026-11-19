@@ -47,7 +47,7 @@ describe("invalid upstream config maps to 400 e2e", () => {
       display_name: "invalid-config-pk",
       provider: "openrouter",
       adapter: "openai",
-      secret: "sk-mock",
+      api_key: "sk-mock",
     });
     await seed.createModel({
       display_name: "invalid-config-model",

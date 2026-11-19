@@ -209,7 +209,7 @@ describe("Bedrock clients honour the proxy environment", () => {
         display_name: `envproxy-${name}`,
         provider: "bedrock",
         adapter: "bedrock",
-        secret: JSON.stringify(secret),
+        api_key: JSON.stringify(secret),
         api_base: apiBase,
       });
       await seed.createModel({

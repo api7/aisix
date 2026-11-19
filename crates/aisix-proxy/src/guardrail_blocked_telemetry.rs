@@ -104,7 +104,7 @@ fn snapshot() -> AisixSnapshot {
     ] {
         let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
             "display_name": name,
-            "secret": "sk-unused",
+            "api_key": "sk-unused",
             "api_base": base,
             "provider": provider,
             "adapter": adapter,

@@ -74,7 +74,7 @@ describe("graceful shutdown drains in-flight requests", () => {
     const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "drain-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `http://127.0.0.1:${upstreamPort}/v1`,
     });
     await seed.createModel({

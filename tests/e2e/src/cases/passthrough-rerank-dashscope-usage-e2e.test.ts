@@ -202,7 +202,7 @@ describe("passthrough route meters rerank and DashScope native bodies", () => {
     });
     const pk = await seed.createProviderKey({
       display_name: "ptr-rerank-ds-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: "http://unused-on-routes",
     });
     for (const c of CASES) {

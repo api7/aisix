@@ -75,7 +75,7 @@ describe("token usage e2e: upstream usage block reaches client byte-for-byte", (
 
     const pk = await seed.createProviderKey({
       display_name: "tu-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

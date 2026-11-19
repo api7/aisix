@@ -142,7 +142,7 @@ describe("aliyun guardrails classify body Code 588 / 581", () => {
     });
     const pk = await seed.createProviderKey({
       display_name: "aliyun-body-code-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
 

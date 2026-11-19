@@ -59,7 +59,7 @@ describe("model kind dead knobs e2e", () => {
     upstreams.push(upstream);
     const pk = await seed.createProviderKey({
       display_name: "dk-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

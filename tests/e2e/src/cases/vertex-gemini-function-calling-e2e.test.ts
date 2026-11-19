@@ -204,7 +204,7 @@ describe("function calling on Vertex's native Gemini wire", () => {
       display_name: "vertex-fc-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_token: "ya29.function-calling-e2e",
         project: "proj-e2e",
         region: "us-central1",
@@ -713,7 +713,7 @@ describe("a Gemini tool call id continuing on another provider", () => {
       display_name: "vertex-portable-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({ access_token: "ya29.portable", project: "p", region: "us-central1" }),
+      api_key: JSON.stringify({ access_token: "ya29.portable", project: "p", region: "us-central1" }),
       api_base: vertex.baseUrl,
     });
     await seed.createModel({
@@ -745,7 +745,7 @@ describe("a Gemini tool call id continuing on another provider", () => {
     await seed.attachGuardrailToModel(guardrail.id as string, guarded.id as string);
     const openaiPk = await seed.createProviderKey({
       display_name: "portable-openai-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${openai.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -756,7 +756,7 @@ describe("a Gemini tool call id continuing on another provider", () => {
     });
     const responsesPk = await seed.createProviderKey({
       display_name: "portable-responses-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${other.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -769,7 +769,7 @@ describe("a Gemini tool call id continuing on another provider", () => {
       display_name: "portable-anthropic-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: other.baseUrl,
     });
     await seed.createModel({
@@ -782,7 +782,7 @@ describe("a Gemini tool call id continuing on another provider", () => {
       display_name: "portable-bedrock-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-portable",
         secret_access_key: "sk-portable",
         region: "us-west-2",

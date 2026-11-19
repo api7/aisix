@@ -2444,7 +2444,7 @@ mod tests {
         }
         let apikey: ApiKey = serde_json::from_value(key).expect("valid apikey");
         let agent: A2aAgent = serde_json::from_value(serde_json::json!({
-            "display_name": "invoice",
+            "name": "invoice",
             "url": agent_url,
             "enabled": enabled,
         }))

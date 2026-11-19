@@ -102,7 +102,7 @@ describe("streaming usage accumulation e2e: stream final usage == non-stream usa
     // bodies in the assertion below.
     const pkNon = await seed.createProviderKey({
       display_name: "stream-usage-non-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${nonStreamUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -113,7 +113,7 @@ describe("streaming usage accumulation e2e: stream final usage == non-stream usa
     });
     const pkStream = await seed.createProviderKey({
       display_name: "stream-usage-stream-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
     await seed.createModel({

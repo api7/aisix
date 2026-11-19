@@ -36,7 +36,7 @@ describe("passthrough route ACL (allowed_routes)", () => {
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "ptr-acl-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: "http://unused-on-routes",
     });
     await seed.createPassthroughRoute({

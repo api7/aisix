@@ -189,13 +189,13 @@ describe("guardrails never scan a tool-call id", () => {
 
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
-    const openaiPk = await seed.createProviderKey({ display_name: "ids-openai-pk", secret: "sk-mock", api_base: `${base}/v1` });
+    const openaiPk = await seed.createProviderKey({ display_name: "ids-openai-pk", api_key: "sk-mock", api_base: `${base}/v1` });
     await seed.createModel({ display_name: "ids-gpt", provider: "openai", model_name: "gpt-4o", provider_key_id: openaiPk.id });
     const anthropicPk = await seed.createProviderKey({
       display_name: "ids-anthropic-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: base,
     });
     await seed.createModel({

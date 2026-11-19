@@ -4876,7 +4876,7 @@ mod tests {
     async fn apply_put_propagates_every_resource_kind() {
         const VALID_PROVIDER_KEY: &[u8] = br#"{
             "display_name": "watch-pk",
-            "secret": "sk-watch"
+            "api_key": "sk-watch"
         }"#;
         const VALID_GUARDRAIL: &[u8] = br#"{
             "name": "watch-block",
@@ -5000,7 +5000,7 @@ mod tests {
             vec![
                 entry(
                     "/aisix/provider_keys/pk-1",
-                    br#"{"display_name":"x","secret":"y"}"#,
+                    br#"{"display_name":"x","api_key":"y"}"#,
                     1,
                 ),
                 // #826: a watch delete for a guardrail attachment must

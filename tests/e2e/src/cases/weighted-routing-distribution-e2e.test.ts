@@ -92,12 +92,12 @@ describe("weighted round-robin distribution e2e: 70/30 split is exact over one W
     // attributable per side.
     const pkA = await seed.createProviderKey({
       display_name: "wr-a-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstreamA.baseUrl}/v1`,
     });
     const pkB = await seed.createProviderKey({
       display_name: "wr-b-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstreamB.baseUrl}/v1`,
     });
     await seed.createModel({

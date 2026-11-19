@@ -89,7 +89,7 @@ describe("guardrail monitor-hit telemetry: would_block/would_mask on usage event
 
     const pk = await seed.createProviderKey({
       display_name: "monitor-telemetry-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

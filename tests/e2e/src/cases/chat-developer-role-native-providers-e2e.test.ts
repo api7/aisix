@@ -104,7 +104,7 @@ describe("chat developer role → native provider instruction slots", () => {
       display_name: "dev-anthropic-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: anthropic.baseUrl,
     });
     await seed.createModel({
@@ -118,7 +118,7 @@ describe("chat developer role → native provider instruction slots", () => {
       display_name: "dev-vertex-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_token: "ya29.developer-e2e",
         project: "proj-e2e",
         region: "us-central1",
@@ -136,7 +136,7 @@ describe("chat developer role → native provider instruction slots", () => {
       display_name: "dev-bedrock-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-developer-e2e",
         secret_access_key: "sk-developer-e2e",
         region: "us-west-2",

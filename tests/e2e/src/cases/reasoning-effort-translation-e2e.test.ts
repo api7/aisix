@@ -66,7 +66,7 @@ describe("Anthropic Messages → OpenAI upstream: effort tier reaches the upstre
 
     const pk = await seed.createProviderKey({
       display_name: "effort-xprov-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -250,7 +250,7 @@ describe("OpenAI Chat → Anthropic upstream: reasoning_effort becomes output_co
       display_name: "effort-anth-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({

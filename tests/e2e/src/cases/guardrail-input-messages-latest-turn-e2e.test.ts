@@ -99,7 +99,7 @@ describe("guardrail input_messages: latest_turn (AISIX-Cloud#1558)", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "lt-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
 

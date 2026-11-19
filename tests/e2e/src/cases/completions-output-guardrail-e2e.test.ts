@@ -64,7 +64,7 @@ describe("completions output guardrail (#911 [23])", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "cmpl-out-gr-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

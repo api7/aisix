@@ -97,7 +97,7 @@ describe("vision messages e2e: image_url content array forwarded byte-for-byte",
 
     const pk = await seed.createProviderKey({
       display_name: "vision-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

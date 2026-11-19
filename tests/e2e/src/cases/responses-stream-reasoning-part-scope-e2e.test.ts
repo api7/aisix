@@ -99,7 +99,7 @@ describe("native /v1/responses stream leaves a reasoning_text content part out o
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "resp-reasoning-part-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const masked = await seed.createModel({
@@ -116,7 +116,7 @@ describe("native /v1/responses stream leaves a reasoning_text content part out o
     });
     const controlPk = await seed.createProviderKey({
       display_name: "resp-reasoning-control-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${control.baseUrl}/v1`,
     });
     const blockedControl = await seed.createModel({

@@ -117,7 +117,7 @@ describe("custom guardrail e2e: a broken script is distinguishable from an enfor
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "cvd-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
 

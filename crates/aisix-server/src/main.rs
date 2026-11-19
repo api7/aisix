@@ -4294,7 +4294,7 @@ managed:
                     None => String::new(),
                 };
                 let pk: aisix_core::ProviderKey = serde_json::from_str(&format!(
-                    r#"{{"display_name":"pk","secret":"k","provider":"{vendor}"{adapter_field}}}"#
+                    r#"{{"display_name":"pk","api_key":"k","provider":"{vendor}"{adapter_field}}}"#
                 ))
                 .unwrap();
                 let dispatched = hub
@@ -4319,7 +4319,7 @@ managed:
     #[test]
     fn upstream_protocol_is_unknown_without_a_resolvable_bridge() {
         let pk: aisix_core::ProviderKey = serde_json::from_str(
-            r#"{"display_name":"pk","secret":"k","provider":"some-long-tail-vendor"}"#,
+            r#"{"display_name":"pk","api_key":"k","provider":"some-long-tail-vendor"}"#,
         )
         .unwrap();
         assert_eq!(
@@ -4338,7 +4338,7 @@ managed:
     fn upstream_protocol_reads_the_specialized_tier_before_the_adapter() {
         for (vendor, want) in [("openai", "openai"), ("anthropic", "anthropic")] {
             let pk: aisix_core::ProviderKey = serde_json::from_str(&format!(
-                r#"{{"display_name":"pk","secret":"k","provider":"{vendor}"}}"#
+                r#"{{"display_name":"pk","api_key":"k","provider":"{vendor}"}}"#
             ))
             .unwrap();
             assert!(pk.adapter.is_none());
@@ -4395,7 +4395,7 @@ managed:
         // registrations above (e.g. xai). It must resolve via the
         // family bridge.
         let pk: aisix_core::ProviderKey = serde_json::from_str(
-            r#"{"display_name":"xai-pk","secret":"sk-test","provider":"xai","adapter":"openai","api_base":"https://api.x.ai/v1"}"#,
+            r#"{"display_name":"xai-pk","api_key":"sk-test","provider":"xai","adapter":"openai","api_base":"https://api.x.ai/v1"}"#,
         )
         .unwrap();
         let bridge = hub.dispatch_two_tier(&pk).unwrap_or_else(|| {
@@ -4430,7 +4430,7 @@ managed:
             "`some-anthropic-compat` must not be specialized; the test must exercise the family tier"
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(
-            r#"{"display_name":"anth-compat-pk","secret":"sk-test","provider":"some-anthropic-compat","adapter":"anthropic","api_base":"https://example.com"}"#,
+            r#"{"display_name":"anth-compat-pk","api_key":"sk-test","provider":"some-anthropic-compat","adapter":"anthropic","api_base":"https://example.com"}"#,
         )
         .unwrap();
         let bridge = hub

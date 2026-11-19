@@ -96,7 +96,7 @@ describe("upstream responses without `model` (#533)", () => {
     const pk = await seed!.createProviderKey({
       display_name: `${name}-pk`,
       provider: "deepseek",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed!.createModel({
