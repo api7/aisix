@@ -95,7 +95,9 @@ pub(crate) fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
 pub enum ConnectError {
     /// No server answered: TCP refused, DNS failure, TLS handshake
     /// failure, an expired `etcd.dial_timeout_ms`, or an etcd that is up
-    /// but cannot serve (no leader, shutting down). Retryable.
+    /// but cannot serve (no leader, shutting down) — or etcd answered
+    /// with anything that is not a verdict on the credentials (see
+    /// [`classify`]). Retryable.
     #[error("etcd did not answer: {0}")]
     Unreachable(String),
     /// etcd answered and refused — a wrong user or password, a user
@@ -128,15 +130,37 @@ pub enum ConnectError {
 /// (<https://grpc.io/docs/guides/status-codes/>). Compared numerically so
 /// this crate does not have to depend on — and keep in step with — the
 /// exact `tonic` release `etcd-client` builds against.
-const GRPC_CANCELLED: i32 = 1;
-const GRPC_UNKNOWN: i32 = 2;
-const GRPC_DEADLINE_EXCEEDED: i32 = 4;
-const GRPC_RESOURCE_EXHAUSTED: i32 = 8;
-const GRPC_ABORTED: i32 = 10;
-const GRPC_INTERNAL: i32 = 13;
-const GRPC_UNAVAILABLE: i32 = 14;
 const GRPC_INVALID_ARGUMENT: i32 = 3;
+const GRPC_PERMISSION_DENIED: i32 = 7;
+const GRPC_FAILED_PRECONDITION: i32 = 9;
+const GRPC_UNIMPLEMENTED: i32 = 12;
 const GRPC_UNAUTHENTICATED: i32 = 16;
+
+/// etcd's answers that are a verdict on the configured credentials but
+/// share a status code with answers that are not: `InvalidArgument` also
+/// carries malformed-request answers, `FailedPrecondition` also carries
+/// `not leader`, `not capable` and the learner refusals, which a cluster
+/// electing or catching up sends and then stops sending, and
+/// `Unimplemented` is any service or method the server lacks. Matched
+/// by message for the same reason as [`STALE_TOKEN_MESSAGES`].
+const CREDENTIAL_REFUSAL_MESSAGES: [(i32, &str); 3] = [
+    // In full: `etcdserver: authentication failed, invalid user ID or
+    // password`.
+    (GRPC_INVALID_ARGUMENT, "etcdserver: authentication failed"),
+    (
+        GRPC_FAILED_PRECONDITION,
+        "etcdserver: authentication is not enabled",
+    ),
+    // Credentials sent to a server with no Auth service at all — kine,
+    // and the control plane's DPM, which embeds it.
+    (GRPC_UNIMPLEMENTED, "unknown service etcdserverpb.Auth"),
+];
+
+fn is_credential_refusal(code: i32, message: &str) -> bool {
+    CREDENTIAL_REFUSAL_MESSAGES
+        .iter()
+        .any(|(c, m)| *c == code && message.contains(m))
+}
 
 /// etcd's own error strings for the two answers that mean "the token you
 /// sent is stale" but arrive as `InvalidArgument`, sharing a status code
@@ -190,12 +214,23 @@ impl ConnectError {
 
 /// Sort one `etcd-client` failure into [`ConnectError`].
 ///
-/// The split is structural, on the gRPC status code — never on the text
-/// of a message. Verified against etcd 3.5 and etcd-client 0.14: a
-/// refused TCP connect, a DNS failure and a failed TLS handshake all
-/// arrive as `GRpcStatus` with code `Unavailable` (tonic manufactures
-/// the status locally; the message is "tcp connect error" / "dns error"
-/// / "tls handshake eof"), while a wrong password arrives as
+/// [`ConnectError::Rejected`] is reserved for etcd's verdicts on the
+/// credentials and their permissions; every other answer is retried. A
+/// status outside that set — `OutOfRange` for a revision the server has
+/// not caught up to or has compacted, `NotFound`, `Unimplemented`,
+/// `DataLoss`, a code this list has never heard of — says nothing an
+/// operator can fix, and treating it as a refusal would either end the
+/// boot or, on the shared catalog, stop watching it until the cycle next
+/// restarts.
+///
+/// The split is on the gRPC status code, and on the message only where
+/// etcd puts a refusal and a passing condition under one code (see
+/// [`CREDENTIAL_REFUSAL_MESSAGES`] and [`STALE_TOKEN_MESSAGES`]).
+/// Verified against etcd 3.5 and etcd-client 0.14: a refused TCP
+/// connect, a DNS failure and a failed TLS handshake all arrive as
+/// `GRpcStatus` with code `Unavailable` (tonic manufactures the status
+/// locally; the message is "tcp connect error" / "dns error" / "tls
+/// handshake eof"), while a wrong password arrives as
 /// `InvalidArgument` carrying etcd's own "authentication failed, invalid
 /// user ID or password".
 ///
@@ -214,33 +249,14 @@ impl ConnectError {
 /// `PermissionDenied`; neither can reach the retry path however many
 /// times it is presented.
 ///
-/// `InvalidArgument` is not only that, though, which is why two of its
-/// members are named by message below. See [`STALE_TOKEN_MESSAGES`].
+/// `InvalidArgument` is not only that, though, which is why its members
+/// are named by message below.
 pub(crate) fn classify(err: &EtcdError) -> ConnectError {
     let detail = format_etcd_error(err);
     match err {
         // The call never reached a server.
         EtcdError::TransportError(_) | EtcdError::IoError(_) => ConnectError::Unreachable(detail),
         EtcdError::GRpcStatus(status) => match status.code() as i32 {
-            // `Unavailable` is both what tonic synthesises for every
-            // failure to reach a server and what etcd itself answers
-            // while it has no leader or is stopping. `DeadlineExceeded`
-            // is a call that ran out of time. `Unknown` and `Internal`
-            // are what a connection broken mid-call surfaces as.
-            // `Cancelled` and `Aborted` are what a peer or an
-            // intermediary resetting the stream produces — an ingress in
-            // front of etcd restarting looks like this — and
-            // `ResourceExhausted` is an etcd throttling a fleet of
-            // gateways that all restarted at once. None of them is an
-            // answer about the credentials, and all of them heal on
-            // their own.
-            GRPC_UNAVAILABLE
-            | GRPC_DEADLINE_EXCEEDED
-            | GRPC_UNKNOWN
-            | GRPC_INTERNAL
-            | GRPC_CANCELLED
-            | GRPC_ABORTED
-            | GRPC_RESOURCE_EXHAUSTED => ConnectError::Unreachable(detail),
             // etcd knows the call arrived with a token it no longer
             // holds — the TTL elapsed, or its token store was cleared.
             // The configured credentials are not what it is complaining
@@ -252,13 +268,30 @@ pub(crate) fn classify(err: &EtcdError) -> ConnectError {
             GRPC_INVALID_ARGUMENT if is_stale_token(status.message()) => {
                 ConnectError::Unauthenticated(detail)
             }
-            // Everything else is etcd having evaluated the request and
-            // said no: the rest of `InvalidArgument` — a wrong user or
-            // password — `PermissionDenied` for a user without the
-            // rights, `FailedPrecondition` for credentials sent to a
-            // cluster that has authentication disabled.
-            _ => ConnectError::Rejected(detail),
+            // etcd's verdicts on the credentials: a user without the
+            // rights, a wrong user or password, credentials sent to a
+            // cluster that has authentication disabled or to a server
+            // with no Auth service.
+            GRPC_PERMISSION_DENIED => ConnectError::Rejected(detail),
+            code if is_credential_refusal(code, status.message()) => ConnectError::Rejected(detail),
+            // Everything else heals without anyone editing a config.
+            // `Unavailable` is both what tonic synthesises for every
+            // failure to reach a server and what etcd itself answers
+            // while it has no leader or is stopping. `DeadlineExceeded`
+            // is a call that ran out of time. `Unknown` and `Internal`
+            // are what a connection broken mid-call surfaces as.
+            // `Cancelled` and `Aborted` are what a peer or an
+            // intermediary resetting the stream produces — an ingress in
+            // front of etcd restarting looks like this — and
+            // `ResourceExhausted` is an etcd throttling a fleet of
+            // gateways that all restarted at once. `OutOfRange` is a
+            // revision the server has not caught up to yet, or has
+            // compacted.
+            _ => ConnectError::Unreachable(detail),
         },
+        // The stream closed before etcd confirmed the watch: a
+        // connection problem, not an answer.
+        EtcdError::WatchError(_) => ConnectError::Unreachable(detail),
         // Unparseable endpoints, an empty endpoint list, a bad header
         // value: configuration, not reachability.
         _ => ConnectError::Rejected(detail),
@@ -724,6 +757,14 @@ mod tests {
         // empty endpoint list dialable — so it is fatal, not a wait.
         let err = EtcdError::InvalidArgs("empty endpoints".to_string());
         assert!(matches!(classify(&err), ConnectError::Rejected(_)));
+    }
+
+    #[test]
+    fn a_watch_closed_before_its_create_answer_is_retried() {
+        // etcd-client's own error for a watch stream that ended before the
+        // server confirmed the create: the connection went, nobody refused.
+        let err = EtcdError::WatchError("failed to create watch".to_string());
+        assert!(matches!(classify(&err), ConnectError::Unreachable(_)));
     }
 
     #[tokio::test]
