@@ -1089,22 +1089,26 @@ impl<P: ConfigProvider> Supervisor<P> {
         // not — `accepted` and the per-field partially-compatible row
         // counts are sums, and those numbers are reported.
         let mut all: BTreeMap<String, RawEntry> = BTreeMap::new();
-        // Per source: a refused prefix has none, and no watch this cycle.
+        // Per source, and not just the maximum: each prefix's watch has
+        // to start from the revision ITS OWN range read was consistent
+        // as of. The reads run in sequence, so a later prefix reports a
+        // higher revision, and starting an earlier prefix's watch there
+        // would skip every write to it in between — absent from that
+        // read and never delivered to that watch. A refused prefix has
+        // none, and no watch this cycle.
+        //
+        // Each read is unpinned. Pinning a later prefix to an earlier
+        // read's revision asks the server for a revision it may not
+        // know yet: kine answers an empty range from a per-process
+        // revision cache that lags writes made by another process, and
+        // refuses a revision above it as a future one.
         let mut revisions: Vec<Option<i64>> = Vec::with_capacity(self.sources.len());
         // Retention (below) runs in a second pass so it can see the WHOLE
         // read, not just the prefixes that came before the refusal.
         let mut read_ok: Vec<&str> = Vec::new();
         let mut refused: Vec<&PrefixSource<P>> = Vec::new();
-        // Every prefix after the first is read at the first one's
-        // revision, so the union is one snapshot: everything at or below
-        // that revision in every prefix, and nothing above it.
-        let mut snapshot_at: Option<i64> = None;
         for source in &self.sources {
-            let read = match snapshot_at {
-                None => source.provider.load_all().await,
-                Some(at) => source.provider.load_all_at(at).await,
-            };
-            match read {
+            match source.provider.load_all().await {
                 Ok((entries, rev)) => {
                     source.clear_refusal();
                     read_ok.push(&source.prefix.prefix);
@@ -1122,8 +1126,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                             }
                         }
                     }
-                    let at = *snapshot_at.get_or_insert(rev);
-                    revisions.push(Some(at));
+                    revisions.push(Some(rev));
                 }
                 Err(err) if source.tolerates(&err) => {
                     // Read as refused: the prefix contributes no revision,
@@ -1894,12 +1897,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         let load = tokio::select! {
             biased;
             _ = wait_for_cancel(cancel.clone()) => return Err(SupervisorError::Cancelled),
-            load = self.load_all_prefixes() => match load {
-                Ok(load) => load,
-                // Including a first read's revision compacted before a later
-                // prefix could be read at it: the next cycle reads afresh.
-                Err(err) => return Err(SupervisorError::Provider(err)),
-            },
+            load = self.load_all_prefixes() => load.map_err(SupervisorError::Provider)?,
         };
         let revision = load.applied_revision();
 
@@ -1921,9 +1919,9 @@ impl<P: ConfigProvider> Supervisor<P> {
         let mut streams = Vec::with_capacity(self.sources.len());
         let mut opened = Vec::with_capacity(self.sources.len());
         for (source, from) in self.sources.iter().zip(&load.revisions) {
-            // Every prefix resumes from the one revision the read was
-            // taken at. A prefix whose read was refused has no revision to
-            // resume from and no stream this cycle.
+            // Each prefix resumes from its own read, never from the
+            // maximum across prefixes. A prefix whose read was refused
+            // has no revision to resume from and no stream this cycle.
             let Some(from) = *from else { continue };
             let watch = tokio::select! {
                 biased;
@@ -2199,10 +2197,16 @@ struct PrefixLoad {
 
 impl PrefixLoad {
     /// The revision the snapshot as a whole reflects, and what the
-    /// heartbeat reports as `applied_revision`: the one revision every
-    /// prefix that answered was read at (see
-    /// [`Supervisor::load_all_prefixes`]). Rows retained from a refused
-    /// prefix are not covered by it.
+    /// heartbeat reports as `applied_revision`.
+    ///
+    /// The LOWEST any prefix reported, not the highest. kine revisions are
+    /// cluster-global, but the range reads run in sequence: a write landing
+    /// between the first prefix's read and the last one's is below the last
+    /// read's header revision and absent from the union all the same. So
+    /// the union is consistent as of the EARLIEST point any part of it was
+    /// read at, and claiming the highest would tell the control plane the
+    /// gateway had applied a write it has not seen — the one thing
+    /// `applied_revision` exists to answer.
     ///
     /// A prefix whose read was refused reports no revision and does not
     /// lower the answer: it contributed no rows this cycle, so nothing in
@@ -3192,8 +3196,6 @@ mod tests {
         refuse: bool,
         /// The `start_revision` this provider's watch was opened with.
         watched_from: Mutex<Option<i64>>,
-        /// The revision a `load_all_at` asked this provider to read at.
-        read_at: Mutex<Option<i64>>,
         /// Hand back a stream that never ends and never yields, the way
         /// a healthy watch on a prefix nobody is writing behaves.
         never_ends: bool,
@@ -3210,7 +3212,6 @@ mod tests {
                 revision,
                 refuse: false,
                 watched_from: Mutex::new(None),
-                read_at: Mutex::new(None),
                 never_ends: false,
                 script: Mutex::new(std::collections::VecDeque::new()),
             })
@@ -3225,7 +3226,6 @@ mod tests {
                 revision,
                 refuse: false,
                 watched_from: Mutex::new(None),
-                read_at: Mutex::new(None),
                 never_ends: true,
                 script: Mutex::new(std::collections::VecDeque::new()),
             })
@@ -3237,7 +3237,6 @@ mod tests {
                 revision: 0,
                 refuse: true,
                 watched_from: Mutex::new(None),
-                read_at: Mutex::new(None),
                 never_ends: false,
                 script: Mutex::new(std::collections::VecDeque::new()),
             })
@@ -3252,7 +3251,6 @@ mod tests {
                 revision: 0,
                 refuse: true,
                 watched_from: Mutex::new(None),
-                read_at: Mutex::new(None),
                 never_ends: false,
                 script: Mutex::new(steps.into()),
             })
@@ -3275,17 +3273,6 @@ mod tests {
                 return Err(refusal());
             }
             Ok((self.entries.clone(), self.revision))
-        }
-
-        /// The rows a read at `revision` sees: none written after it.
-        async fn load_all_at(&self, revision: i64) -> Result<(Vec<RawEntry>, i64), ProviderError> {
-            *self.read_at.lock().unwrap() = Some(revision);
-            let (entries, _) = self.load_all().await?;
-            let entries = entries
-                .into_iter()
-                .filter(|e| e.revision <= revision)
-                .collect();
-            Ok((entries, revision))
         }
 
         async fn watch(
@@ -3382,14 +3369,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_prefix_is_read_at_the_first_reads_revision() {
-        // The reads run in sequence. Reading the catalog at "now" would
-        // take in a row written after the environment was read while a
-        // write to the environment in that interval is missing, so the
-        // union would be consistent as of no single revision. Read at the
-        // first revision, it is exactly the store as of that revision, and
-        // that is what the heartbeat reports — in both orders, since
-        // taking either prefix's own header passes one of them by accident.
+    async fn applied_revision_is_the_minimum_across_prefixes() {
+        // The prefixes are read in sequence, so the union is consistent
+        // only as far as the EARLIEST read: a write that landed between
+        // the two reads is missing from the union while sitting below the
+        // later read's header revision. Reporting the higher one would
+        // claim a write the gateway has not applied. Both orders, because
+        // taking the LAST prefix's revision (or the FIRST, or the
+        // environment's) passes one of them by accident.
+        //
+        // Every entry is written at revision 1 so the header revisions
+        // are the only thing that can produce the expected value: the
+        // resync raises the floor to the highest entry revision first,
+        // and entries at 5 / 7 / 42 / 99 would supply the answer by
+        // themselves.
         let global_ahead = scoped_supervisor(
             ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 7),
             ScopedProvider::serving(vec![entry("/aisix/global/pricing/g", VALID_PRICE, 1)], 42),
@@ -3397,15 +3390,12 @@ mod tests {
         global_ahead.load_once().await.unwrap();
         assert_eq!(global_ahead.watch_status().snapshot().revision, 7);
 
-        let global =
-            ScopedProvider::serving(vec![entry("/aisix/global/pricing/g", VALID_PRICE, 1)], 5);
         let env_ahead = scoped_supervisor(
             ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 99),
-            Arc::clone(&global),
+            ScopedProvider::serving(vec![entry("/aisix/global/pricing/g", VALID_PRICE, 1)], 5),
         );
         env_ahead.load_once().await.unwrap();
-        assert_eq!(*global.read_at.lock().unwrap(), Some(99));
-        assert_eq!(env_ahead.watch_status().snapshot().revision, 99);
+        assert_eq!(env_ahead.watch_status().snapshot().revision, 5);
     }
 
     #[tokio::test]
@@ -3415,8 +3405,9 @@ mod tests {
         // earlier prefix was read — while a write to the earlier prefix in
         // that same interval is missing from the union entirely. Letting
         // the entry-max stand would keep claiming a revision the gateway
-        // has not seen. Reading every prefix at the first read's revision
-        // keeps such a row out of the read altogether; its watch delivers it.
+        // has not seen, which is exactly what taking the minimum header is
+        // for. Distinct from the case above: here the overstatement comes
+        // from an ENTRY, not from a header.
         let sup = scoped_supervisor(
             ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 90)], 100),
             ScopedProvider::serving(
@@ -3428,8 +3419,8 @@ mod tests {
         assert_eq!(
             sup.watch_status().snapshot().revision,
             100,
-            "the read is consistent as of its one revision, whatever a later \
-             prefix holds above it"
+            "the union is consistent as of the earliest read, whatever revision \
+             a later prefix's rows carry"
         );
     }
 
@@ -3600,10 +3591,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_watch_resumes_from_the_reads_single_revision() {
-        // The catalog row written at 20, after the environment was read at
-        // 7, is not in this read: the catalog's watch, starting at 8,
-        // delivers it, so nothing is skipped and nothing is claimed early.
+    async fn each_prefix_is_read_unpinned_and_resumes_from_its_own_read() {
+        // A later prefix is read at "now", never at an earlier prefix's
+        // revision: a server can refuse a revision it has not caught up
+        // to yet as a future one (kine does, for an empty range). So each
+        // prefix's watch starts after its OWN read, and the revision it
+        // reports is its own. Resuming the earlier prefix from the later
+        // read would skip every write to it in between; resuming the
+        // later one from the earlier read would replay rows it already
+        // holds and report less than it has.
         let env =
             ScopedProvider::serving(vec![entry("/aisix/env-1/models/m-1", VALID_MODEL, 1)], 7);
         let global = ScopedProvider::serving(
@@ -3620,10 +3616,17 @@ mod tests {
             .await
             .expect("cycle completes");
 
-        assert_eq!(*global.read_at.lock().unwrap(), Some(7));
         assert_eq!(*env.watched_from.lock().unwrap(), Some(8));
-        assert_eq!(*global.watched_from.lock().unwrap(), Some(8));
-        assert_eq!(sup.handle().load().global_pricing.len(), 1);
+        assert_eq!(*global.watched_from.lock().unwrap(), Some(43));
+        assert_eq!(
+            sup.handle().load().global_pricing.len(),
+            2,
+            "the catalog's own read takes in the row written after the environment was read",
+        );
+        let revisions = sup.watch_status().prefix_revisions();
+        assert_eq!(revisions.get("/aisix/env-1/"), Some(&7));
+        assert_eq!(revisions.get("/aisix/global/"), Some(&42));
+        // The union as a whole is still only as fresh as its earliest read.
         assert_eq!(sup.watch_status().snapshot().revision, 7);
     }
 

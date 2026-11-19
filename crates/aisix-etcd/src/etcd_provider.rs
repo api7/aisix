@@ -313,9 +313,9 @@ pub fn probe_key(prefix: &str) -> String {
     )
 }
 
-impl EtcdConfigProvider {
-    /// The prefix's rows, now or as of `at`.
-    async fn read_prefix(&self, at: Option<i64>) -> Result<(Vec<RawEntry>, i64), ProviderError> {
+#[async_trait]
+impl ConfigProvider for EtcdConfigProvider {
+    async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
         // The full read below stays unbounded by default (its cost scales
         // with the configuration), so it is only issued once a cheap
         // bounded read has shown the connection answers at all.
@@ -339,24 +339,17 @@ impl EtcdConfigProvider {
                 "range read",
                 self.client.call(self.request_timeout, move |client| {
                     let prefix = prefix.clone();
-                    let mut options = GetOptions::new().with_prefix();
-                    if let Some(revision) = at {
-                        options = options.with_revision(revision);
+                    async move {
+                        kv_client(&client)
+                            .get(prefix, Some(GetOptions::new().with_prefix()))
+                            .await
                     }
-                    async move { kv_client(&client).get(prefix, Some(options)).await }
                 }),
             )
             .await
-            .map_err(|e| match e {
-                CallError::Call(err) if err.to_string().contains("has been compacted") => {
-                    ProviderError::Compacted
-                }
-                e => provider_error(e, "range read", ProviderError::Range),
-            })?;
+            .map_err(|e| provider_error(e, "range read", ProviderError::Range))?;
 
-        // A read at a revision is consistent as of that revision; the
-        // header carries the store's current one.
-        let revision = at.unwrap_or_else(|| resp.header().map(|h| h.revision()).unwrap_or(0));
+        let revision = resp.header().map(|h| h.revision()).unwrap_or(0);
 
         let entries = resp
             .kvs()
@@ -369,17 +362,6 @@ impl EtcdConfigProvider {
             .collect();
 
         Ok((entries, revision))
-    }
-}
-
-#[async_trait]
-impl ConfigProvider for EtcdConfigProvider {
-    async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
-        self.read_prefix(None).await
-    }
-
-    async fn load_all_at(&self, revision: i64) -> Result<(Vec<RawEntry>, i64), ProviderError> {
-        self.read_prefix(Some(revision)).await
     }
 
     async fn watch(
@@ -923,9 +905,9 @@ mod tests {
     async fn each_status_code_lands_on_one_side_deliberately() {
         // The whole fix rests on telling "no answer" from "answered and
         // refused", so the split is pinned per wire code against a server
-        // that really sends them. The retryable set is an allowlist:
-        // anything outside it ends the boot, which is what keeps a wrong
-        // password from being waited out forever.
+        // that really sends them. The fatal set is etcd's verdicts on the
+        // credentials and nothing else: an answer that is not one ends no
+        // boot and is retried.
         //
         // 2 Unknown, 4 DeadlineExceeded, 13 Internal and 14 Unavailable
         // are what a call that never got a usable answer arrives as —
@@ -933,17 +915,44 @@ mod tests {
         // failure and a failed TLS handshake, and etcd answers it while
         // it has no leader. 1 Cancelled and 10 Aborted are a peer or an
         // intermediary resetting the stream; 8 ResourceExhausted is
-        // throttling. All of them heal without anyone editing a config.
-        for code in [1u16, 2, 4, 8, 10, 13, 14] {
-            let endpoint = spawn_grpc_status_server(code, "no answer").await;
+        // throttling. 11 OutOfRange is a revision the server has not
+        // caught up to, or has compacted. 5, 6, 12 and 15 say nothing
+        // about the credentials either. All of them heal, or at least
+        // cannot be fixed by an operator editing a config.
+        let retried: &[(u16, &'static str)] = &[
+            (1, "no answer"),
+            (2, "no answer"),
+            (4, "no answer"),
+            (5, "no answer"),
+            (6, "no answer"),
+            (8, "no answer"),
+            (10, "no answer"),
+            (
+                11,
+                "etcdserver: mvcc: required revision is a future revision",
+            ),
+            (11, "etcdserver: mvcc: required revision has been compacted"),
+            (12, "no answer"),
+            (13, "no answer"),
+            (14, "no answer"),
+            (15, "no answer"),
+            // The `InvalidArgument` and `FailedPrecondition` answers
+            // that are not about the credentials.
+            (3, "etcdserver: request is too large"),
+            (9, "etcdserver: not leader"),
+            (9, "etcdserver: not capable"),
+            (9, "etcdserver: rpc not supported for learner"),
+        ];
+        for &(code, message) in retried {
+            let endpoint = spawn_grpc_status_server(code, message).await;
             let provider =
                 EtcdConfigProvider::connect(&[endpoint], "/aisix", credentials(), None, None)
                     .await
-                    .unwrap_or_else(|e| panic!("code {code} must be waited out, got {e:?}"));
-            assert!(matches!(
-                provider.load_all().await,
-                Err(ProviderError::Connect(_))
-            ));
+                    .unwrap_or_else(|e| panic!("{code} {message:?} must be waited out, got {e:?}"));
+            assert!(
+                matches!(provider.load_all().await, Err(ProviderError::Connect(_))),
+                "{code} {message:?}",
+            );
         }
         // 16 Unauthenticated is the third class: etcd answered, and what
         // it refused is the token rather than the credentials — it
@@ -964,24 +973,55 @@ mod tests {
                 Err(ProviderError::Connect(_))
             ));
         }
-        // 3 InvalidArgument *with etcd's wrong-password message* — the
-        // code alone is not enough, see `STALE_TOKEN_MESSAGES` — plus
-        // 7 PermissionDenied and 9 FailedPrecondition (credentials sent
-        // to a cluster with authentication disabled).
-        for code in [3u16, 7, 9] {
-            let endpoint = spawn_grpc_status_server(
-                code,
+        // 3 InvalidArgument with etcd's wrong-password message, 7
+        // PermissionDenied for a user without the rights, and 9
+        // FailedPrecondition with the message for credentials sent to a
+        // cluster with authentication disabled.
+        let refused: &[(u16, &'static str)] = &[
+            (
+                3,
                 "etcdserver: authentication failed, invalid user ID or password",
-            )
-            .await;
+            ),
+            (7, "etcdserver: permission denied"),
+            (9, "etcdserver: authentication is not enabled"),
+        ];
+        for &(code, message) in refused {
+            let endpoint = spawn_grpc_status_server(code, message).await;
             let err = EtcdConfigProvider::connect(&[endpoint], "/aisix", credentials(), None, None)
                 .await
                 .expect_err("a refusal must end the boot");
             assert!(
                 matches!(err, ProviderError::Rejected(_)),
-                "code {code} must be fatal, got {err:?}",
+                "{code} {message:?} must be fatal, got {err:?}",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_future_revision_answer_on_a_read_or_a_watch_is_retried_not_refused() {
+        // kine answers a range over an empty prefix from a per-process
+        // revision cache that can lag writes another process made, and
+        // refuses a revision above it with `OutOfRange` "future
+        // revision". On the shared catalog a refusal is tolerated — no
+        // watch until the cycle restarts — so this answer must reach the
+        // supervisor as an ordinary call failure, which fails the cycle
+        // into backoff. No credentials, so the dial does no I/O and the
+        // status is the read's (or the watch create's) own.
+        let endpoint = spawn_grpc_status_server(
+            11,
+            "etcdserver: mvcc: required revision is a future revision",
+        )
+        .await;
+        let provider = EtcdConfigProvider::connect(&[endpoint], "/aisix/global/", None, None, None)
+            .await
+            .unwrap();
+        let err = provider.load_all().await.unwrap_err();
+        assert!(matches!(err, ProviderError::Range(_)), "{err:?}");
+        let err = match provider.watch(43).await {
+            Ok(_) => panic!("the server refuses every call"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ProviderError::Watch(_)), "{err:?}");
     }
 
     #[test]
