@@ -115,6 +115,24 @@ const MESSAGES_STREAM_EVENTS_NO_USAGE = [
   JSON.stringify({ type: "message_stop" }),
 ];
 
+// The same Anthropic stream, but `message_start` reports the input and a
+// prompt-cache read while no output count ever arrives.
+const MESSAGES_STREAM_EVENTS_INPUT_ONLY = MESSAGES_STREAM_EVENTS_NO_USAGE.map((e, i) =>
+  i === 0
+    ? JSON.stringify({
+        type: "message_start",
+        message: {
+          id: "msg_est_2",
+          role: "assistant",
+          content: [],
+          model: "relay-claude",
+          stop_reason: null,
+          usage: { input_tokens: 5, cache_read_input_tokens: 7 },
+        },
+      })
+    : e,
+);
+
 // /v1/responses SSE that aborts before any terminal `response.completed`
 // event — no usage ever arrives; the deltas are the only output signal.
 const RESPONSES_STREAM_EVENTS_NO_USAGE = [
@@ -148,6 +166,7 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
   let chatNonStreamUpstream: OpenAiUpstream | undefined;
   let chatAbortUpstream: OpenAiUpstream | undefined;
   let messagesUpstream: OpenAiUpstream | undefined;
+  let messagesInputOnlyUpstream: OpenAiUpstream | undefined;
   let responsesUpstream: OpenAiUpstream | undefined;
   let completionsUpstream: OpenAiUpstream | undefined;
   let embeddingsUpstream: OpenAiUpstream | undefined;
@@ -177,6 +196,9 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     });
     messagesUpstream = await startOpenAiUpstream({
       streamEvents: MESSAGES_STREAM_EVENTS_NO_USAGE,
+    });
+    messagesInputOnlyUpstream = await startOpenAiUpstream({
+      streamEvents: MESSAGES_STREAM_EVENTS_INPUT_ONLY,
     });
     responsesUpstream = await startOpenAiUpstream({
       streamEvents: RESPONSES_STREAM_EVENTS_NO_USAGE,
@@ -230,21 +252,49 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     await seedModel("est-chat-stream", chatStreamUpstream);
     await seedModel("est-chat-stream-usage", chatStreamUpstream);
     await seedModel("est-chat-stream-partial", chatPartialUpstream);
+    // Behind a mask-capable output guardrail the whole response, usage
+    // frame included, is held until the end-of-stream scan releases it.
+    const heldPk = await seed.createProviderKey({
+      display_name: "est-chat-stream-held-pk",
+      secret: "sk-mock",
+      api_base: `${chatStreamUpstream.baseUrl}/v1`,
+    });
+    const heldModel = await seed.createModel({
+      display_name: "est-chat-stream-held",
+      provider: "openai",
+      model_name: "relay-compat-x",
+      provider_key_id: heldPk.id,
+    });
+    const heldGuardrail = await seed.createGuardrail(
+      {
+        name: "est-chat-stream-held-mask",
+        enabled: true,
+        hook_point: "output",
+        kind: "pii",
+        detectors: [{ type: "email", action: "mask" }],
+      },
+      { attach: false },
+    );
+    await seed.attachGuardrailToModel(heldGuardrail.id, heldModel.id);
     // An Anthropic provider key, so the chat request is bridged to the
     // Anthropic wire and rendered back as chat chunks.
-    const anthropicPk = await seed.createProviderKey({
-      display_name: "est-chat-stream-anthropic-pk",
-      provider: "anthropic",
-      adapter: "anthropic",
-      secret: "sk-mock",
-      api_base: messagesUpstream.baseUrl,
-    });
-    await seed.createModel({
-      display_name: "est-chat-stream-anthropic",
-      provider: "anthropic",
-      model_name: "relay-compat-x",
-      provider_key_id: anthropicPk.id,
-    });
+    const seedAnthropicModel = async (display: string, upstream: OpenAiUpstream) => {
+      const pk = await seed!.createProviderKey({
+        display_name: `${display}-pk`,
+        provider: "anthropic",
+        adapter: "anthropic",
+        secret: "sk-mock",
+        api_base: upstream.baseUrl,
+      });
+      await seed!.createModel({
+        display_name: display,
+        provider: "anthropic",
+        model_name: "relay-compat-x",
+        provider_key_id: pk.id,
+      });
+    };
+    await seedAnthropicModel("est-chat-stream-anthropic", messagesUpstream);
+    await seedAnthropicModel("est-chat-stream-anthropic-cache", messagesInputOnlyUpstream);
     await seedModel("est-chat-nonstream", chatNonStreamUpstream);
     await seedModel("est-chat-abort", chatAbortUpstream);
     await seedModel("est-msgs-stream", messagesUpstream, "anthropic");
@@ -258,7 +308,9 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
         "est-chat-stream",
         "est-chat-stream-usage",
         "est-chat-stream-partial",
+        "est-chat-stream-held",
         "est-chat-stream-anthropic",
+        "est-chat-stream-anthropic-cache",
         "est-chat-nonstream",
         "est-chat-abort",
         "est-msgs-stream",
@@ -278,6 +330,7 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     await chatNonStreamUpstream?.close();
     await chatAbortUpstream?.close();
     await messagesUpstream?.close();
+    await messagesInputOnlyUpstream?.close();
     await responsesUpstream?.close();
     await completionsUpstream?.close();
     await embeddingsUpstream?.close();
@@ -337,9 +390,13 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
    * present only when true), so a bounded forward window inside the
    * decoded protobuf text identifies the pair within one record. */
   function slsFlagged(requestedModel: string): boolean {
+    return slsFlaggedCount(requestedModel) > 0;
+  }
+
+  function slsFlaggedCount(requestedModel: string): number {
     const text = decodedTextFor(sls!, META_LOGSTORE);
-    const re = new RegExp(`${requestedModel}[\\s\\S]{0,600}?usage_estimated`);
-    return re.test(text);
+    const re = new RegExp(`${requestedModel}[\\s\\S]{0,600}?usage_estimated`, "g");
+    return text.match(re)?.length ?? 0;
   }
 
   async function waitSlsFlagged(requestedModel: string): Promise<void> {
@@ -437,6 +494,8 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     await waitCallerKey();
     await streamWithUsage(model);
     await waitTokenMetrics(model);
+    await waitSlsFlagged(model);
+    const flaggedBefore = slsFlaggedCount(model);
     const inputBefore = await tokenMetric("aisix_llm_input_tokens_total", model);
     const outputBefore = await tokenMetric("aisix_llm_output_tokens_total", model);
     const seen = await streamWithUsage(model);
@@ -446,10 +505,18 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     while (Date.now() < deadline) {
       input = await tokenMetric("aisix_llm_input_tokens_total", model);
       output = await tokenMetric("aisix_llm_output_tokens_total", model);
-      if (input > inputBefore) break;
+      if (input > inputBefore && output > outputBefore) break;
       await new Promise((r) => setTimeout(r, 100));
     }
-    return { seen, recorded: { input: input - inputBefore, output: output - outputBefore } };
+    // The asserted call's own record is flagged, not just the warm-up's.
+    while (Date.now() < deadline && slsFlaggedCount(model) <= flaggedBefore) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    const flagged = slsFlaggedCount(model) > flaggedBefore;
+    return {
+      seen,
+      recorded: { input: input - inputBefore, output: output - outputBefore, flagged },
+    };
   }
 
   test("chat SSE with include_usage, upstream sends no usage: the final usage frame carries the estimate the record does", async (ctx) => {
@@ -469,8 +536,8 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     expect(recorded).toEqual({
       input: EXPECTED_PROMPT_TOKENS,
       output: EXPECTED_COMPLETION_TOKENS,
+      flagged: true,
     });
-    await waitSlsFlagged("est-chat-stream-usage");
   }, 60_000);
 
   test("chat SSE with include_usage, upstream counts only the prompt: its prompt is kept and the completion estimated", async (ctx) => {
@@ -488,8 +555,29 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     expect(recorded).toEqual({
       input: PARTIAL_PROMPT_TOKENS,
       output: EXPECTED_COMPLETION_TOKENS,
+      flagged: true,
     });
-    await waitSlsFlagged("est-chat-stream-partial");
+  }, 60_000);
+
+  test("chat SSE with include_usage behind a held-back output guardrail: the released usage frame carries the estimate", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const { seen, recorded } = await streamedUsageAndRecord("est-chat-stream-held");
+    expect(seen.content).toBe("Hello world");
+    expect(seen.usages).toHaveLength(1);
+    expect(seen.lastIsUsage).toBe(true);
+    expect(seen.usages[0]).toMatchObject({
+      prompt_tokens: EXPECTED_PROMPT_TOKENS,
+      completion_tokens: EXPECTED_COMPLETION_TOKENS,
+      total_tokens: EXPECTED_PROMPT_TOKENS + EXPECTED_COMPLETION_TOKENS,
+    });
+    expect(recorded).toEqual({
+      input: EXPECTED_PROMPT_TOKENS,
+      output: EXPECTED_COMPLETION_TOKENS,
+      flagged: true,
+    });
   }, 60_000);
 
   test("chat SSE with include_usage bridged to an Anthropic upstream that sends no usage: the estimate reaches the client", async (ctx) => {
@@ -509,8 +597,26 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     expect(recorded).toEqual({
       input: EXPECTED_PROMPT_TOKENS,
       output: EXPECTED_COMPLETION_TOKENS,
+      flagged: true,
     });
-    await waitSlsFlagged("est-chat-stream-anthropic");
+  }, 60_000);
+
+  test("chat SSE with include_usage bridged to an Anthropic upstream that counts input and a cache read but no output: the frame keeps both", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+    const { seen, recorded } = await streamedUsageAndRecord("est-chat-stream-anthropic-cache");
+    expect(seen.usages).toHaveLength(1);
+    // OpenAI shape: the cache read is part of the prompt and named as cached.
+    expect(seen.usages[0]).toMatchObject({
+      prompt_tokens: 5 + 7,
+      completion_tokens: EXPECTED_COMPLETION_TOKENS,
+      total_tokens: 5 + 7 + EXPECTED_COMPLETION_TOKENS,
+      prompt_tokens_details: { cached_tokens: 7 },
+    });
+    expect(recorded.output).toBe(EXPECTED_COMPLETION_TOKENS);
+    expect(recorded.flagged).toBe(true);
   }, 60_000);
 
   test("chat non-streaming 200 without usage: the client usage block carries the same estimate the record does", async (ctx) => {

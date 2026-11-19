@@ -2246,7 +2246,7 @@ async fn dispatch(
             content_cap,
             client_requested_usage,
             // Single upstream: nothing pre-incurred, so no usage to fold in.
-            aisix_gateway::chat::UsageStats::default(),
+            None,
             Some(estimator),
             move |comp: StreamCompletion| {
                 // Rate-limit accounting (TPM cap) for all layers.
@@ -4134,7 +4134,7 @@ async fn dispatch_ensemble(
             req.model.clone(),
             content_cap,
             client_requested_usage,
-            panel_usage_sum,
+            Some(panel_usage_sum),
             Some(judge_estimator),
             move |comp: StreamCompletion| {
                 // Fresh snapshot at stream end, shared by every emit in this
@@ -5946,8 +5946,8 @@ impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
 
     /// The estimate for the client's `include_usage` frame, which is about
     /// to be released: counted ahead and left for [`Self::complete`], so the
-    /// frame and the usage record carry one number. `None` when the upstream
-    /// reported both counters.
+    /// frame and the usage record carry one number. `None` when nothing was
+    /// estimated.
     async fn usage_frame_estimate(&mut self) -> Option<crate::token_estimate::Filled> {
         let delivered = self.delivered.load(Ordering::Relaxed).max(1);
         let (_, c) = self.slot.as_ref()?;
@@ -6115,9 +6115,9 @@ fn build_sse_stream<F>(
     // Usage already incurred before this stream begins — the buffered panel
     // members of an ensemble (#614). Folded into the client-facing terminal
     // usage chunk so the caller sees the full panel+judge aggregate; the
-    // `on_complete` (`comp`) counts stay stream-only. Zero for single-upstream
-    // callers, where the fold is a no-op.
-    base_usage: aisix_gateway::chat::UsageStats,
+    // `on_complete` (`comp`) counts stay stream-only. `None` for
+    // single-upstream callers, which fold nothing in.
+    base_usage: Option<aisix_gateway::chat::UsageStats>,
     // Token-estimation fallback context (AISIX-Cloud#1074); see
     // `CompleteOnDrop::estimator`.
     estimator: Option<crate::token_estimate::Estimator>,
@@ -6232,7 +6232,6 @@ where
         let mut first_chunk_seen = false;
         let mut stream_usage: Option<aisix_gateway::chat::UsageStats> = None;
         let mut last_usage: Option<aisix_gateway::chat::UsageStats> = None;
-        let fold_base = base_usage != aisix_gateway::chat::UsageStats::default();
         let mut last_chunk_id = String::new();
         let mut stream_id = crate::render::StreamId::default();
         let mut last_chunk_model = String::new();
@@ -6723,14 +6722,18 @@ where
         // Stamped like the last chunk.
         let final_usage = if !client_requested_usage {
             None
-        } else if fold_base {
-            stream_usage.map(|u| u.saturating_add(&base_usage))
+        } else if let Some(base_usage) = base_usage.as_ref() {
+            stream_usage.map(|u| u.saturating_add(base_usage))
         } else if errored {
             last_usage
         } else {
             match guard.usage_frame_estimate().await {
                 Some(filled) => {
-                    let mut usage = last_usage.unwrap_or_default();
+                    // Built on the merged reports the record is counted
+                    // from, so a counter reported only for accounting (an
+                    // Anthropic `message_start`'s input and cache counts)
+                    // reaches the client as the record bills it.
+                    let mut usage = stream_usage.unwrap_or_default();
                     apply_estimated_usage(
                         &mut usage,
                         filled.prompt_tokens,
