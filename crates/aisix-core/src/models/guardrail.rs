@@ -1741,9 +1741,9 @@ mod tests {
         // The typo guard used to be `deny_unknown_fields` on the config
         // structs, which sat in the TYPE — so it also applied to the etcd
         // loader, which deserialises the same types, and killed the whole
-        // row. It now lives in the strict schema: `aisix validate` and the
-        // file source still refuse the typo, while a stored document keeps
-        // loading with the field ignored.
+        // row. It now lives in the strict schema, the published write
+        // contract, while a stored document keeps loading with the field
+        // ignored.
         let v = json!({
             "name": "g",
             "kind": "keyword",

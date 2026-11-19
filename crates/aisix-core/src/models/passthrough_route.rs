@@ -77,10 +77,10 @@ pub struct PassthroughRoute {
     /// Header carrying the gateway credential (API key or JWT) when
     /// `auth_mode` is `header_key`, e.g. `x-aisix-api-key`. Lets
     /// `Authorization` carry the caller's own upstream credential. The
-    /// header is stripped before forwarding. Lowercase-only so the
-    /// forbidden credential-slot list in the coupling is exhaustive
-    /// (matching is case-insensitive on the wire regardless). Required
-    /// for `header_key`; ignored otherwise.
+    /// header is stripped before forwarding. Lowercase-only (matching is
+    /// case-insensitive on the wire regardless); `authorization`,
+    /// `proxy-authorization`, `cookie`, `set-cookie` and `x-api-key` are
+    /// refused. Required for `header_key`; ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9a-z-]+$"), length(min = 1))]
     pub auth_header_name: Option<String>,
@@ -116,10 +116,14 @@ pub struct PassthroughRoute {
     /// Optional header carrying the end-user identity injected by the
     /// upstream network device (e.g. `x-aisix-user`). Its value is recorded
     /// on the usage event for per-employee audit attribution and stripped
-    /// before forwarding. Lowercase-only so the forbidden credential-slot
-    /// list in the coupling is exhaustive; credential-bearing names
-    /// (`authorization`, `cookie`, …) are rejected outright — their value
-    /// on the usage event would be credential retention, not identity.
+    /// before forwarding. Lowercase-only. Only `authorization`,
+    /// `proxy-authorization`, `cookie`, `set-cookie` and `x-api-key` are
+    /// refused; any other header's value is recorded as `client_identity`,
+    /// including credential-bearing ones such as `api-key`,
+    /// `x-goog-api-key`, `x-amz-security-token`, `x-amz-date`,
+    /// `x-amz-content-sha256`, `x-aisix-api-key`, or this route's own
+    /// `auth_header_name`. Never point it at a header that carries a
+    /// credential: its value would be retained on every usage event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9a-z-]+$"), length(min = 1))]
     pub identity_header: Option<String>,
@@ -268,17 +272,24 @@ impl PassthroughRoute {
     }
 }
 
-/// Cross-field coupling for the flat `PassthroughRoute` schema, injected as
-/// an `allOf` by [`crate::models::schema::passthrough_route_root_schema`]
-/// (same pattern as [`super::mcp_server::mcp_server_credential_coupling`]).
-/// Every rule here is enforced on both the strict declarative path and the
-/// lenient etcd path so a route is never half-configured at dispatch time.
 /// Header names a route's `identity_header` / `auth_header_name` may never
 /// take: the value of any of these IS a credential, and the identity slot
 /// records its value onto the usage event (credential retention) while the
 /// auth slot would repurpose a credential channel the modes already own.
-/// The fields' schemars pattern forces lowercase, so this lowercase list is
-/// exhaustive on every configuration path.
+/// The fields' schemars pattern forces lowercase, so a lowercase list is
+/// enough to match every spelling.
+///
+/// This is NOT every credential slot. `api-key`, `x-goog-api-key` and the
+/// SigV4 trio (`x-amz-security-token`, `x-amz-date`,
+/// `x-amz-content-sha256`) from [`crate::CREDENTIAL_SLOT_HEADERS`] pass this
+/// schema in either field, and so do the gateway's own
+/// [`crate::forwarded_headers::GATEWAY_CREDENTIAL_HEADER`] and an
+/// `identity_header` equal to the route's `auth_header_name`. A route naming
+/// any of them as its `identity_header` records that header's value as
+/// `client_identity`. Adding them here would reject stored routes on load,
+/// since this list is part of the lenient schema older control planes'
+/// documents are read with, and the gateway has no write path of its own to
+/// refuse them on.
 const FORBIDDEN_HEADER_SLOTS: [&str; 5] = [
     "authorization",
     "proxy-authorization",
@@ -287,6 +298,13 @@ const FORBIDDEN_HEADER_SLOTS: [&str; 5] = [
     "x-api-key",
 ];
 
+/// Cross-field coupling for the flat `PassthroughRoute` schema, injected as
+/// an `allOf` by [`crate::models::schema::passthrough_route_root_schema`]
+/// (same pattern as [`super::mcp_server::mcp_server_credential_coupling`]).
+/// Every rule here is in both the published strict schema and the lenient
+/// one the loader runs, so a route is never half-configured at dispatch time.
+/// The loader is the only validation the gateway runs on a route: etcd, the
+/// resources file and `aisix validate` all go through it.
 pub fn passthrough_route_coupling() -> Value {
     json!([
         // At least one match dimension.
