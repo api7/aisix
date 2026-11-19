@@ -153,37 +153,31 @@ impl PrefixSet {
     pub fn owner(&self, key: &str) -> Option<&WatchedPrefix> {
         self.prefixes.iter().find(|watched| {
             key.strip_prefix(watched.prefix.trim_end_matches('/'))
-                .is_some_and(|rest| rest.starts_with('/'))
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
         })
     }
 
-    /// Split `key` into scope, kind and id. Reports the mismatch against
-    /// the first (longest) prefix, which is the one an operator is most
-    /// likely to have meant.
+    /// Split `key` into scope, kind and id against its [`Self::owner`].
+    /// A key under no prefix reports the mismatch against the first
+    /// (longest) prefix, which is the one an operator is most likely to
+    /// have meant.
     pub fn resolve<'a>(&self, key: &'a str) -> Result<ScopedKey<'a>, KeyError> {
-        let mut first_err = None;
-        for watched in &self.prefixes {
-            match parse(&watched.prefix, key) {
-                Ok(parsed) => {
-                    return Ok(ScopedKey {
-                        scope: watched.scope,
-                        kind: parsed.kind,
-                        id: parsed.id,
-                    })
-                }
-                // A key under this prefix with a malformed suffix is a bad
-                // key, not a reason to try the next prefix: no other
-                // prefix contains it either.
-                Err(err @ (KeyError::MissingSuffix(_) | KeyError::EmptySegment(_))) => {
-                    return Err(err)
-                }
-                Err(err) => first_err.get_or_insert(err),
-            };
-        }
-        Err(first_err.unwrap_or_else(|| KeyError::PrefixMismatch {
-            key: key.to_string(),
-            prefix: String::new(),
-        }))
+        let Some(watched) = self.owner(key) else {
+            return Err(KeyError::PrefixMismatch {
+                key: key.to_string(),
+                prefix: self
+                    .prefixes
+                    .first()
+                    .map(|p| p.prefix.clone())
+                    .unwrap_or_default(),
+            });
+        };
+        let parsed = parse(&watched.prefix, key)?;
+        Ok(ScopedKey {
+            scope: watched.scope,
+            kind: parsed.kind,
+            id: parsed.id,
+        })
     }
 }
 

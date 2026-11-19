@@ -1081,14 +1081,18 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// only as far as the EARLIEST of them — see
     /// [`PrefixLoad::applied_revision`].
     async fn load_all_prefixes(&self) -> Result<PrefixLoad, ProviderError> {
-        // Deduplicated by key, because the prefixes can nest: when the
-        // gateway has no `env_id` the environment prefix is the bare base
-        // and `<base>/global/` sits inside it, so both range reads return
-        // the catalog's rows. The snapshot and the observed-state map are
-        // both keyed and would absorb the repeat, but the BuildStats are
-        // not — `accepted` and the per-field partially-compatible row
-        // counts are sums, and those numbers are reported.
+        // Each key is taken from the read of the prefix that owns it, the
+        // longest one whose read succeeded, because the prefixes can nest:
+        // with no `env_id` the environment prefix is the bare base and
+        // `<base>/global/` sits inside it, so both reads return the
+        // catalog's rows. The base is read first, so its copy is the older
+        // one, and a catalog row deleted between the two reads is in it
+        // alone — keeping it would serve the deleted row, since the watch
+        // loop leaves that delete to the catalog stream, which starts after
+        // it. Taking one copy also keeps the BuildStats sums (`accepted`,
+        // the partially-compatible row counts) from counting a row twice.
         let mut all: BTreeMap<String, RawEntry> = BTreeMap::new();
+        let mut reads: Vec<(&PrefixSource<P>, Vec<RawEntry>)> = Vec::new();
         // Per source, and not just the maximum: each prefix's watch has
         // to start from the revision ITS OWN range read was consistent
         // as of. The reads run in sequence, so a later prefix reports a
@@ -1112,20 +1116,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                 Ok((entries, rev)) => {
                     source.clear_refusal();
                     read_ok.push(&source.prefix.prefix);
-                    for entry in entries {
-                        match all.entry(entry.key.clone()) {
-                            std::collections::btree_map::Entry::Occupied(mut slot) => {
-                                // Two reads of one key are two points in
-                                // time; keep the later write.
-                                if entry.revision > slot.get().revision {
-                                    slot.insert(entry);
-                                }
-                            }
-                            std::collections::btree_map::Entry::Vacant(slot) => {
-                                slot.insert(entry);
-                            }
-                        }
-                    }
+                    reads.push((source, entries));
                     revisions.push(Some(rev));
                 }
                 Err(err) if source.tolerates(&err) => {
@@ -1138,6 +1129,18 @@ impl<P: ConfigProvider> Supervisor<P> {
                     revisions.push(None);
                 }
                 Err(err) => return Err(err),
+            }
+        }
+
+        let owners = PrefixSet::new(reads.iter().map(|(s, _)| s.prefix.clone()).collect());
+        for (source, entries) in reads {
+            for entry in entries {
+                if owners
+                    .owner(&entry.key)
+                    .is_none_or(|owner| owner.prefix == source.prefix.prefix)
+                {
+                    all.insert(entry.key.clone(), entry);
+                }
             }
         }
 
@@ -1961,9 +1964,11 @@ impl<P: ConfigProvider> Supervisor<P> {
         // a newer write — an older price comes back, a deleted one
         // reappears. Only the stream of the longest watched prefix
         // containing the key applies it, so each key follows one stream's
-        // revision order. Resolved against the prefixes watched THIS
-        // cycle: with the catalog's watch refused, the base stream is the
-        // only one carrying those keys and keeps applying them.
+        // revision order; the read above took the same key from the same
+        // prefix, so what the skipped copies replay is already in it.
+        // Resolved against the prefixes watched THIS cycle: with the
+        // catalog's watch refused, the base stream is the only one
+        // carrying those keys and keeps applying them.
         let owners = PrefixSet::new(watching);
         *steady_since = Some(tokio::time::Instant::now());
         // Each stream is tagged so its END is delivered as an item
@@ -2094,7 +2099,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                             let key = match event {
                                 WatchEvent::Put(raw) => &raw.key,
                                 WatchEvent::Delete { key, .. } => key,
-                                WatchEvent::Resync { .. } => return true,
+                                WatchEvent::Resync { .. } => {
+                                    unreachable!("a resync is never added to a coalesced batch")
+                                }
                             };
                             owners
                                 .owner(key)
@@ -4118,9 +4125,16 @@ mod tests {
         entries: Vec<RawEntry>,
         revision: i64,
         rx: Mutex<Option<futures::channel::mpsc::UnboundedReceiver<WatchItem>>>,
-        /// Refuse the read the way a control plane withholding the
-        /// catalog does, so the prefix gets no watch this cycle.
-        refuse: bool,
+        /// Refuse the read or the watch the way a control plane
+        /// withholding the catalog does.
+        refuse: Refuse,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Refuse {
+        Nothing,
+        Read,
+        Watch,
     }
 
     type WatchItem = Result<WatchEvent, ProviderError>;
@@ -4138,26 +4152,102 @@ mod tests {
                     entries: Vec::new(),
                     revision,
                     rx: Mutex::new(Some(rx)),
-                    refuse: false,
+                    refuse: Refuse::Nothing,
                 }),
                 tx,
             )
         }
 
-        fn refusing() -> Arc<Self> {
+        /// Serves `entries` from a read consistent as of `revision`.
+        fn holding(
+            entries: Vec<RawEntry>,
+            revision: i64,
+        ) -> (
+            Arc<Self>,
+            futures::channel::mpsc::UnboundedSender<WatchItem>,
+        ) {
+            let (tx, rx) = futures::channel::mpsc::unbounded();
+            (
+                Arc::new(Self {
+                    entries,
+                    revision,
+                    rx: Mutex::new(Some(rx)),
+                    refuse: Refuse::Nothing,
+                }),
+                tx,
+            )
+        }
+
+        fn refusing(refuse: Refuse, entries: Vec<RawEntry>, revision: i64) -> Arc<Self> {
             Arc::new(Self {
-                entries: Vec::new(),
-                revision: 0,
+                entries,
+                revision,
                 rx: Mutex::new(None),
-                refuse: true,
+                refuse,
             })
         }
+    }
+
+    /// Wait for `done`, bounded: virtual time auto-advances, so an
+    /// unbounded wait would hang instead of failing.
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "never happened: {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Runs one watch cycle over the bare base and the catalog nested in it
+    /// — the shape a gateway with no `env_id` has.
+    fn nested_cycle(
+        base: Arc<LiveProvider>,
+        catalog: Arc<LiveProvider>,
+    ) -> (Arc<Supervisor<LiveProvider>>, tokio::task::JoinHandle<()>) {
+        let sup = Arc::new(Supervisor::with_sources(
+            vec![
+                (WatchedPrefix::environment("/aisix"), base),
+                (WatchedPrefix::global("/aisix/global/"), catalog),
+            ],
+            SnapshotCache::disabled(),
+        ));
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let watcher = tokio::spawn({
+            let sup = sup.clone();
+            async move {
+                let _cancel_tx = cancel_tx;
+                let _ = sup.cycle(&cancel_rx, &mut None, false).await;
+            }
+        });
+        (sup, watcher)
+    }
+
+    fn processed(sup: &Arc<Supervisor<LiveProvider>>, prefix: &str, rev: i64) -> impl Fn() -> bool {
+        let sup = sup.clone();
+        let prefix = prefix.to_string();
+        move || sup.watch_status().prefix_revisions().get(&prefix).copied() >= Some(rev)
+    }
+
+    fn catalog_price(sup: &Supervisor<LiveProvider>, id: &str) -> Option<(i64, f64)> {
+        sup.handle()
+            .load()
+            .global_pricing
+            .get_by_id(id)
+            .map(|e| (e.revision, e.value.input_per_1k))
+    }
+
+    fn price(input: f64) -> Vec<u8> {
+        format!(r#"{{"key":"openai/gpt-4o","input_per_1k":{input},"output_per_1k":0.015}}"#)
+            .into_bytes()
     }
 
     #[async_trait]
     impl ConfigProvider for LiveProvider {
         async fn load_all(&self) -> Result<(Vec<RawEntry>, i64), ProviderError> {
-            if self.refuse {
+            if self.refuse == Refuse::Read {
                 return Err(ProviderError::Rejected("permission denied".into()));
             }
             Ok((self.entries.clone(), self.revision))
@@ -4170,6 +4260,9 @@ mod tests {
             Box<dyn futures::Stream<Item = Result<WatchEvent, ProviderError>> + Send + Unpin>,
             ProviderError,
         > {
+            if self.refuse == Refuse::Watch {
+                return Err(ProviderError::Rejected("permission denied".into()));
+            }
             Ok(Box::new(
                 self.rx.lock().unwrap().take().expect("watched twice"),
             ))
@@ -4340,90 +4433,59 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_catalog_event_late_on_the_base_stream_does_not_undo_a_newer_one() {
         const KEY: &str = "/aisix/global/pricing/p-1";
-        let price = |input: f64| {
-            format!(r#"{{"key":"openai/gpt-4o","input_per_1k":{input},"output_per_1k":0.015}}"#)
-                .into_bytes()
-        };
-
-        let (base, base_tx) = LiveProvider::new(9);
-        let (global, global_tx) = LiveProvider::new(9);
-        let sup = Arc::new(Supervisor::with_sources(
-            vec![
-                (WatchedPrefix::environment("/aisix"), base),
-                (WatchedPrefix::global("/aisix/global/"), global),
-            ],
-            SnapshotCache::disabled(),
-        ));
-        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let watcher = tokio::spawn({
-            let sup = sup.clone();
-            async move {
-                let _ = sup.cycle(&cancel_rx, &mut None, false).await;
-            }
-        });
-
-        // Bounded: virtual time auto-advances, so an unbounded wait would
-        // hang instead of failing.
-        async fn until(what: &str, done: impl Fn() -> bool) {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            while !done() {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "never happened: {what}"
-                );
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        }
-        let processed = |prefix: &str, rev: i64| {
-            let sup = sup.clone();
-            let prefix = prefix.to_string();
-            move || sup.watch_status().prefix_revisions().get(&prefix).copied() >= Some(rev)
-        };
-        let catalog_price = || {
-            sup.handle()
-                .load()
-                .global_pricing
-                .get_by_id("p-1")
-                .map(|e| (e.revision, e.value.input_per_1k))
-        };
-
-        until("initial load", processed("/aisix/global/", 9)).await;
+        // The base is read first, so its read is the older one.
+        let (base, base_tx) = LiveProvider::new(7);
+        let (catalog, catalog_tx) = LiveProvider::new(9);
+        let (sup, watcher) = nested_cycle(base, catalog);
+        until("initial load", processed(&sup, "/aisix/global/", 9)).await;
 
         // The catalog stream runs ahead: two writes to the same price.
         for (rev, input) in [(10, 0.001), (11, 0.002)] {
-            global_tx
+            catalog_tx
                 .unbounded_send(Ok(WatchEvent::Put(entry(KEY, &price(input), rev))))
                 .unwrap();
         }
-        until("catalog stream at 11", processed("/aisix/global/", 11)).await;
-        assert_eq!(catalog_price(), Some((11, 0.002)));
+        until(
+            "catalog stream at 11",
+            processed(&sup, "/aisix/global/", 11),
+        )
+        .await;
+        assert_eq!(catalog_price(&sup, "p-1"), Some((11, 0.002)));
 
         // The base stream's copy of the OLDER write arrives afterwards.
         base_tx
             .unbounded_send(Ok(WatchEvent::Put(entry(KEY, &price(0.001), 10))))
             .unwrap();
-        until("base stream at 10", processed("/aisix", 10)).await;
+        until("base stream at 10", processed(&sup, "/aisix", 10)).await;
         assert_eq!(
-            catalog_price(),
+            catalog_price(&sup, "p-1"),
             Some((11, 0.002)),
             "a late copy on the base stream regressed the price",
         );
 
         // The catalog deletes the price; the base stream's copy of the put
         // before it arrives after the delete.
-        global_tx
+        catalog_tx
             .unbounded_send(Ok(WatchEvent::Delete {
                 key: KEY.into(),
                 revision: 12,
             }))
             .unwrap();
-        until("catalog stream at 12", processed("/aisix/global/", 12)).await;
-        assert_eq!(catalog_price(), None);
+        until(
+            "catalog stream at 12",
+            processed(&sup, "/aisix/global/", 12),
+        )
+        .await;
+        assert_eq!(catalog_price(&sup, "p-1"), None);
         base_tx
             .unbounded_send(Ok(WatchEvent::Put(entry(KEY, &price(0.002), 11))))
             .unwrap();
-        until("base stream at 11", processed("/aisix", 11)).await;
-        assert_eq!(catalog_price(), None, "a deleted price came back");
+        until("base stream at 11", processed(&sup, "/aisix", 11)).await;
+        assert_eq!(
+            catalog_price(&sup, "p-1"),
+            None,
+            "a deleted price came back"
+        );
 
         // The base stream still applies the keys it owns, and a skipped
         // copy still counts as processed for it.
@@ -4440,63 +4502,94 @@ mod tests {
                 13,
             ))))
             .unwrap();
-        until("base stream at 13", processed("/aisix", 13)).await;
+        until("base stream at 13", processed(&sup, "/aisix", 13)).await;
         assert_eq!(sup.handle().load().models.len(), 1);
-        assert_eq!(catalog_price(), None);
+        assert_eq!(catalog_price(&sup, "p-1"), None);
 
         drop(base_tx);
-        drop(global_tx);
+        drop(catalog_tx);
+        watcher.await.unwrap();
+    }
+
+    /// The prefixes are read in sequence, base first, so a catalog row
+    /// deleted between the two reads is still in the base's read. The
+    /// catalog's read is the one that answers for its keys: the delete is
+    /// already behind the catalog stream's start, and the base stream's
+    /// replay of it is left to that stream, so serving the base's copy
+    /// would keep a deleted price for the whole cycle.
+    #[tokio::test(start_paused = true)]
+    async fn a_catalog_delete_between_the_two_reads_is_not_served() {
+        const KEY: &str = "/aisix/global/pricing/p-1";
+        let (base, base_tx) = LiveProvider::holding(
+            vec![
+                entry("/aisix/models/m-1", VALID_MODEL, 3),
+                entry(KEY, &price(0.001), 12),
+            ],
+            15,
+        );
+        // Deleted at 17, read at 20.
+        let (catalog, catalog_tx) = LiveProvider::holding(Vec::new(), 20);
+        let (sup, watcher) = nested_cycle(base, catalog);
+        until("initial load", processed(&sup, "/aisix/global/", 20)).await;
+        assert_eq!(
+            catalog_price(&sup, "p-1"),
+            None,
+            "the deleted price was loaded"
+        );
+        assert_eq!(sup.handle().load().models.len(), 1);
+
+        // The base stream replays the delete from its own read on.
+        base_tx
+            .unbounded_send(Ok(WatchEvent::Delete {
+                key: KEY.into(),
+                revision: 17,
+            }))
+            .unwrap();
+        until("base stream at 17", processed(&sup, "/aisix", 17)).await;
+        assert_eq!(catalog_price(&sup, "p-1"), None);
+
+        drop(base_tx);
+        drop(catalog_tx);
         watcher.await.unwrap();
     }
 
     /// The base stream's copy of a catalog event is skipped only while the
-    /// catalog has a watch of its own. With that watch refused the base
-    /// stream is the only one carrying the catalog's keys.
+    /// catalog has a watch of its own. With its read or its watch refused,
+    /// the base stream is the only one carrying the catalog's keys.
     #[tokio::test(start_paused = true)]
     async fn with_the_catalog_refused_the_base_stream_still_applies_its_keys() {
-        let (base, base_tx) = LiveProvider::new(9);
-        let sup = Arc::new(Supervisor::with_sources(
-            vec![
-                (WatchedPrefix::environment("/aisix"), base),
-                (
-                    WatchedPrefix::global("/aisix/global/"),
-                    LiveProvider::refusing(),
-                ),
-            ],
-            SnapshotCache::disabled(),
-        ));
-        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let watcher = tokio::spawn({
-            let sup = sup.clone();
-            async move {
-                let _ = sup.cycle(&cancel_rx, &mut None, false).await;
-            }
-        });
-
-        base_tx
-            .unbounded_send(Ok(WatchEvent::Put(entry(
-                "/aisix/global/pricing/p-1",
-                VALID_PRICE,
-                10,
-            ))))
-            .unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while sup.watch_status().prefix_revisions().get("/aisix").copied() < Some(10) {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the put was never processed"
+        for refuse in [Refuse::Read, Refuse::Watch] {
+            let (base, base_tx) = LiveProvider::new(9);
+            let catalog = LiveProvider::refusing(
+                refuse,
+                vec![entry("/aisix/global/pricing/p-1", &price(0.001), 5)],
+                9,
             );
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        assert!(sup
-            .handle()
-            .load()
-            .global_pricing
-            .get_by_id("p-1")
-            .is_some());
+            let (sup, watcher) = nested_cycle(base, catalog);
+            until("initial load", processed(&sup, "/aisix", 9)).await;
 
-        drop(base_tx);
-        watcher.await.unwrap();
+            base_tx
+                .unbounded_send(Ok(WatchEvent::Put(entry(
+                    "/aisix/global/pricing/p-1",
+                    &price(0.002),
+                    10,
+                ))))
+                .unwrap();
+            until("base stream at 10", processed(&sup, "/aisix", 10)).await;
+            assert_eq!(
+                catalog_price(&sup, "p-1"),
+                Some((10, 0.002)),
+                "refused {}",
+                if refuse == Refuse::Read {
+                    "read"
+                } else {
+                    "watch"
+                },
+            );
+
+            drop(base_tx);
+            watcher.await.unwrap();
+        }
     }
 
     /// Shutdown must not throw away what the window already took off the
