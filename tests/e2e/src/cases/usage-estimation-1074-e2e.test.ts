@@ -256,7 +256,7 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     // frame included, is held until the end-of-stream scan releases it.
     const heldPk = await seed.createProviderKey({
       display_name: "est-chat-stream-held-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${chatStreamUpstream.baseUrl}/v1`,
     });
     const heldModel = await seed.createModel({
@@ -283,7 +283,7 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
         display_name: `${display}-pk`,
         provider: "anthropic",
         adapter: "anthropic",
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: upstream.baseUrl,
       });
       await seed!.createModel({
