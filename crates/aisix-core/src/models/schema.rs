@@ -1,29 +1,22 @@
-//! JSON Schema Draft 2020-12 validators for every entity written via the
-//! Admin API (spec §2, §3).
-//!
-//! The flow on write is:
-//! ```text
-//! 1. parse bytes as serde_json::Value
-//! 2. validator.validate(&value)       → emits detailed field path on failure
-//! 3. serde deserialise into the typed struct (cheap after schema passes)
-//! 4. duplicate-name check vs snapshot
-//! 5. etcd txn commit
-//! ```
+//! JSON Schema Draft 2020-12 validators for every resource kind (spec §2, §3).
 //!
 //! Two validator sets exist since issue #871 (strict write / lenient read):
 //!
 //! - **Strict** ([`SCHEMAS`], the plain `validate_*` functions): unknown
-//!   fields are rejected (where a resource closes them). Used by the
-//!   in-repo declarative writers — `aisix validate` and the file
-//!   source — so typos keep failing loud, and published as the
-//!   resource schema files in `schemas/resources/` — the write
-//!   contract. (The control plane validates against its own API
-//!   schema; raw direct etcd puts are only checked on read.)
+//!   fields are rejected (where a resource closes them). Published as the
+//!   resource schema files in `schemas/resources/` — the write contract for
+//!   whoever writes documents — and used by this crate's tests. The gateway
+//!   itself writes no resource (the Admin API is read-only) and runs no
+//!   strict validation at load time; the control plane validates against
+//!   its own API schema.
 //! - **Lenient** ([`LENIENT_SCHEMAS`], the `validate_*_lenient` functions):
 //!   unknown fields pass; every other constraint (types, required, ranges,
-//!   closed enums) still applies. Used only by the etcd snapshot loader so a
-//!   document written by a newer control plane loads with its extra fields
-//!   ignored — and reported — instead of whole-row rejected.
+//!   closed enums) still applies. Used by the snapshot loader, which every
+//!   configuration source goes through — etcd, the resources file and
+//!   `aisix validate` — so a document written by a newer control plane loads
+//!   with its extra fields ignored — and reported — instead of whole-row
+//!   rejected. A constraint added to a lenient schema therefore rejects
+//!   documents already stored, not just new writes.
 //!
 //! Both sets build from the same per-resource producers; strictness is a
 //! mechanical pair of passes over the produced value — [`close_unknown_fields`]
@@ -42,8 +35,9 @@
 //! `serde_ignored`, so the loader takes their paths from
 //! [`unknown_field_paths`], which reads them off the strict schema.
 //!
-//! The watch path reuses step 2 on incoming events — malformed payloads are
-//! skipped with a warning and do not take down the gateway.
+//! The watch path runs the lenient validator on incoming events too —
+//! malformed payloads are skipped with a warning and do not take down the
+//! gateway.
 
 use crate::models::model::Model;
 use jsonschema::Validator;
@@ -1684,8 +1678,8 @@ pub fn claim_mapping_root_schema() -> Value {
 /// `credential_mode` closed sets come from their enums; every
 /// cross-field invariant (match dimensions, target shape, per-mode required
 /// companions) is injected as an `allOf` (see
-/// [`super::passthrough_route::passthrough_route_coupling`]) so the strict
-/// write path and the lenient etcd read path enforce the same coupling. The
+/// [`super::passthrough_route::passthrough_route_coupling`]) so the
+/// published write contract and the lenient loader enforce the same coupling. The
 /// label is accepted under both `name` and its `display_name` alias.
 pub fn passthrough_route_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::PassthroughRoute>(true);

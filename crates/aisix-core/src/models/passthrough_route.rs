@@ -271,14 +271,25 @@ impl PassthroughRoute {
 /// Cross-field coupling for the flat `PassthroughRoute` schema, injected as
 /// an `allOf` by [`crate::models::schema::passthrough_route_root_schema`]
 /// (same pattern as [`super::mcp_server::mcp_server_credential_coupling`]).
-/// Every rule here is enforced on both the strict declarative path and the
-/// lenient etcd path so a route is never half-configured at dispatch time.
+/// Every rule here is in both the published strict schema and the lenient
+/// one the loader runs, so a route is never half-configured at dispatch time.
+/// The loader is the only validation the gateway runs on a route: etcd, the
+/// resources file and `aisix validate` all go through it.
 /// Header names a route's `identity_header` / `auth_header_name` may never
 /// take: the value of any of these IS a credential, and the identity slot
 /// records its value onto the usage event (credential retention) while the
 /// auth slot would repurpose a credential channel the modes already own.
-/// The fields' schemars pattern forces lowercase, so this lowercase list is
-/// exhaustive on every configuration path.
+/// The fields' schemars pattern forces lowercase, so a lowercase list is
+/// enough to match every spelling.
+///
+/// This is NOT every credential slot: `api-key`, `x-goog-api-key` and the
+/// SigV4 trio (`x-amz-security-token`, `x-amz-date`,
+/// `x-amz-content-sha256`) from [`crate::CREDENTIAL_SLOT_HEADERS`] pass this
+/// schema in either field, and a route naming one as its `identity_header`
+/// records that header's value as `client_identity`. Adding them here would
+/// reject stored routes on load, since this list is part of the lenient
+/// schema older control planes' documents are read with, and the gateway has
+/// no write path of its own to refuse them on.
 const FORBIDDEN_HEADER_SLOTS: [&str; 5] = [
     "authorization",
     "proxy-authorization",

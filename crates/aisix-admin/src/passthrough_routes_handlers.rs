@@ -1,7 +1,8 @@
 //! Read handlers for `/admin/v1/passthrough_routes`: list and get-by-id,
 //! same shape as [`crate::mcp_servers_handlers`]. Cross-field coupling
 //! (match dimensions, target shape, per-mode required companions) lives in
-//! the canonical schema, enforced on every declarative write path.
+//! the canonical schema, enforced by the loader every configuration source
+//! goes through.
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::PassthroughRoute;
