@@ -157,6 +157,12 @@ impl PrefixSet {
         })
     }
 
+    /// Whether `prefix` is the one `key` is attributed to. A key under no
+    /// prefix in the set belongs to whichever one delivered it.
+    pub fn owns(&self, prefix: &str, key: &str) -> bool {
+        self.owner(key).is_none_or(|owner| owner.prefix == prefix)
+    }
+
     /// Split `key` into scope, kind and id against its [`Self::owner`].
     /// A key under no prefix reports the mismatch against the first
     /// (longest) prefix, which is the one an operator is most likely to

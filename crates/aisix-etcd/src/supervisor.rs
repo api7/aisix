@@ -1135,10 +1135,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         let owners = PrefixSet::new(reads.iter().map(|(s, _)| s.prefix.clone()).collect());
         for (source, entries) in reads {
             for entry in entries {
-                if owners
-                    .owner(&entry.key)
-                    .is_none_or(|owner| owner.prefix == source.prefix.prefix)
-                {
+                if owners.owns(&source.prefix.prefix, &entry.key) {
                     all.insert(entry.key.clone(), entry);
                 }
             }
@@ -2095,37 +2092,31 @@ impl<P: ConfigProvider> Supervisor<P> {
                     }
                     let staged: Vec<PendingEvent<'_>> = batch
                         .iter()
-                        .filter(|(prefix, event)| {
-                            let key = match event {
-                                WatchEvent::Put(raw) => &raw.key,
-                                WatchEvent::Delete { key, .. } => key,
+                        .filter_map(|(prefix, event)| {
+                            let (key, pending) = match event {
+                                WatchEvent::Put(raw) => (&raw.key, PendingEvent::Put(raw)),
+                                // Advance the applied-revision floor to the
+                                // delete's mod_revision even when the key
+                                // wasn't present — "processed everything up
+                                // to rev X" must cover deletes, otherwise the
+                                // heartbeat-reported applied_revision (#519
+                                // B.3) stalls after a CP delete until the next
+                                // put arrives.
+                                WatchEvent::Delete { key, revision } => (
+                                    key,
+                                    PendingEvent::Delete {
+                                        key,
+                                        revision: Some(*revision),
+                                    },
+                                ),
+                                // Unreachable by the arm above and the drain's
+                                // own filter, both of which are exhaustive over
+                                // `WatchEvent`.
                                 WatchEvent::Resync { .. } => {
                                     unreachable!("a resync is never added to a coalesced batch")
                                 }
                             };
-                            owners
-                                .owner(key)
-                                .is_none_or(|owner| owner.prefix == *prefix)
-                        })
-                        .map(|(_, event)| match event {
-                            WatchEvent::Put(raw) => PendingEvent::Put(raw),
-                            // Advance the applied-revision floor to the
-                            // delete's mod_revision even when the key
-                            // wasn't present — "processed everything up
-                            // to rev X" must cover deletes, otherwise the
-                            // heartbeat-reported applied_revision (#519
-                            // B.3) stalls after a CP delete until the next
-                            // put arrives.
-                            WatchEvent::Delete { key, revision } => PendingEvent::Delete {
-                                key,
-                                revision: Some(*revision),
-                            },
-                            // Unreachable by the arm above and the drain's
-                            // own filter, both of which are exhaustive over
-                            // `WatchEvent`.
-                            WatchEvent::Resync { .. } => {
-                                unreachable!("a resync is never added to a coalesced batch")
-                            }
+                            owners.owns(prefix, key).then_some(pending)
                         })
                         .collect();
                     if !staged.is_empty() {
@@ -4130,7 +4121,7 @@ mod tests {
         refuse: Refuse,
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Refuse {
         Nothing,
         Read,
@@ -4146,16 +4137,7 @@ mod tests {
             Arc<Self>,
             futures::channel::mpsc::UnboundedSender<WatchItem>,
         ) {
-            let (tx, rx) = futures::channel::mpsc::unbounded();
-            (
-                Arc::new(Self {
-                    entries: Vec::new(),
-                    revision,
-                    rx: Mutex::new(Some(rx)),
-                    refuse: Refuse::Nothing,
-                }),
-                tx,
-            )
+            Self::holding(Vec::new(), revision)
         }
 
         /// Serves `entries` from a read consistent as of `revision`.
@@ -4579,12 +4561,7 @@ mod tests {
             assert_eq!(
                 catalog_price(&sup, "p-1"),
                 Some((10, 0.002)),
-                "refused {}",
-                if refuse == Refuse::Read {
-                    "read"
-                } else {
-                    "watch"
-                },
+                "refused {refuse:?}",
             );
 
             drop(base_tx);

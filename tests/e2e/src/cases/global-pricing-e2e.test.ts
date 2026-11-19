@@ -305,6 +305,58 @@ describe("global pricing e2e: pricing documents drive least_cost", () => {
     expect(await seed.raw("models", modelA.id)).toBe(before);
   });
 
+  test("deleting the global price takes the model back to its inline cost", async (ctx) => {
+    if (!etcdReachable || !app || !seed || !global) {
+      ctx.skip();
+      return;
+    }
+
+    // This gateway runs with no `env_id`, so the catalog prefix sits inside
+    // its environment prefix and both watches see the delete.
+    const globalRows = async (): Promise<number> => {
+      const res = await fetch(`${app!.metricsUrl}/status/config`);
+      if (!res.ok) return -1;
+      const body = (await res.json()) as {
+        applied?: { resource_counts?: Record<string, number> };
+      };
+      return body.applied?.resource_counts?.global_pricing ?? 0;
+    };
+
+    const a = await startOpenAiUpstream({ nonStreamBody: okBody("del-a-served") });
+    const b = await startOpenAiUpstream({ nonStreamBody: okBody("del-b-served") });
+    upstreams.push(a, b);
+
+    const rowsBefore = await globalRows();
+    const priceA = await global.createPricing({
+      key: "vendor/del-a",
+      input_per_1k: 0.1,
+      output_per_1k: 0.1,
+    });
+    await global.createPricing({ key: "vendor/del-b", input_per_1k: 1, output_per_1k: 1 });
+    await waitConfigPropagation(async () => (await globalRows()) === rowsBefore + 2);
+
+    await seed.createModel({
+      display_name: "del-virtual",
+      routing: {
+        strategy: "least_cost",
+        targets: [{ model: "del-a" }, { model: "del-b" }],
+      },
+    });
+    // Its inline cost makes A the expensive one once the catalog no longer
+    // prices it.
+    await createOpenAiModel("del-a", a, {
+      pricing_key: "vendor/del-a",
+      cost: { input_per_1k: 50, output_per_1k: 50 },
+    });
+    await createOpenAiModel("del-b", b, { pricing_key: "vendor/del-b" });
+    await waitForModels("del-a", "del-b");
+    expect(await ask("del-virtual", "a is cheaper")).toBe("del-a-served");
+
+    await global.delete("pricing", priceA.id);
+    await waitConfigPropagation(async () => (await globalRows()) === rowsBefore + 1);
+    expect(await ask("del-virtual", "b now")).toBe("del-b-served");
+  });
+
   test("the global prefix carries prices only — another kind there is never served", async (ctx) => {
     if (!etcdReachable || !app || !seed || !global) {
       ctx.skip();
