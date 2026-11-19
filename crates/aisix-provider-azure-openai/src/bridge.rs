@@ -276,14 +276,12 @@ impl AzureUpstreamRef {
     /// Resolve from the deployment name + an optional pre-parsed
     /// `api_base`.
     ///
-    /// Both `deployment` and the resolved `resource` are validated to
-    /// match a strict `[A-Za-z0-9_-]+` shape: Azure resource names
-    /// and deployment names are constrained to that set per the
-    /// portal, and a URL-injection vector via `?`, `#`, `/`, or
-    /// whitespace would let an operator-supplied default redirect
-    /// the dispatch to an attacker-pinned API version.
+    /// `deployment` must match `[A-Za-z0-9._-]+` and not be dots only, and
+    /// the resolved `resource` must match `[A-Za-z0-9_-]+`: a `?`, `#`, `/`,
+    /// whitespace, or a `.`/`..` path segment would let a configured value
+    /// redirect the dispatch or override the pinned API version.
     pub fn resolve(deployment: &str, api_base: Option<&str>) -> Result<Self, BridgeError> {
-        validate_url_token("deployment name", deployment)?;
+        validate_deployment_name(deployment)?;
         let (resource, upstream_override) = Self::resolve_api_base(api_base)?;
         Ok(Self {
             resource,
@@ -403,10 +401,9 @@ impl AzureUpstreamRef {
     }
 }
 
-/// Reject URL-control characters in operator/customer-supplied tokens
-/// that end up in the Azure URL path. Azure resource names and
-/// deployment names are documented as `[A-Za-z0-9_-]+`, so anything
-/// outside that set is either a misconfig or a URL-injection attempt
+/// Reject URL-control characters in a resource name, which becomes the
+/// DNS label of `https://<resource>.openai.azure.com`. Anything outside
+/// `[A-Za-z0-9_-]+` is either a misconfig or a URL-injection attempt
 /// (e.g. `?api-version=evil` to override the bridge's version pin).
 fn validate_url_token(name: &str, value: &str) -> Result<(), BridgeError> {
     if value.is_empty() {
@@ -421,6 +418,36 @@ fn validate_url_token(name: &str, value: &str) -> Result<(), BridgeError> {
         return Err(BridgeError::InvalidUpstreamConfig(format!(
             "azure {name} {value:?} contains URL-control characters — \
              must match [A-Za-z0-9_-]+ (no spaces, slashes, dots, query params, or hash)"
+        )));
+    }
+    Ok(())
+}
+
+/// A deployment name is one path segment of
+/// `/openai/deployments/<deployment>/…`. Azure accepts dots in it
+/// (`gpt-4.1`, `gpt-5.6-sol`), so `.` is allowed alongside
+/// `[A-Za-z0-9_-]`; a name made only of dots is refused because it would
+/// resolve as a `.`/`..` segment and rewrite the path.
+fn validate_deployment_name(value: &str) -> Result<(), BridgeError> {
+    if value.is_empty() {
+        return Err(BridgeError::InvalidUpstreamConfig(
+            "azure deployment name is empty (expected an identifier matching [A-Za-z0-9._-]+)"
+                .into(),
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(BridgeError::InvalidUpstreamConfig(format!(
+            "azure deployment name {value:?} contains URL-control characters — \
+             must match [A-Za-z0-9._-]+ (no spaces, slashes, query params, or hash)"
+        )));
+    }
+    if value.bytes().all(|b| b == b'.') {
+        return Err(BridgeError::InvalidUpstreamConfig(format!(
+            "azure deployment name {value:?} is made only of dots — \
+             it would resolve as a relative path segment"
         )));
     }
     Ok(())
@@ -1298,6 +1325,42 @@ mod tests {
                 assert!(msg.contains("URL-control characters"), "got {msg}");
             }
             other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_accepts_dotted_deployment() {
+        for dep in ["gpt-4.1", "gpt-5.6-sol", "a.b_c-d"] {
+            let r = AzureUpstreamRef::resolve(dep, Some("acme")).unwrap();
+            assert_eq!(r.deployment, dep);
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_dots_only_deployment() {
+        for dep in [".", "..", "..."] {
+            let err = AzureUpstreamRef::resolve(dep, Some("acme")).unwrap_err();
+            assert!(
+                matches!(&err, BridgeError::InvalidUpstreamConfig(m) if m.contains("only of dots")),
+                "{dep:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_dotted_resource_name() {
+        let err = AzureUpstreamRef::resolve("dep", Some("acme.east")).unwrap_err();
+        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
+    }
+
+    #[test]
+    fn resolve_rejects_deployment_with_percent_or_space() {
+        for dep in ["foo%2Fbar", "foo bar", "foo\tbar"] {
+            let err = AzureUpstreamRef::resolve(dep, Some("acme")).unwrap_err();
+            assert!(
+                matches!(err, BridgeError::InvalidUpstreamConfig(_)),
+                "{dep:?}"
+            );
         }
     }
 
