@@ -204,6 +204,34 @@ async fn the_passive_provider_reports_the_generation_of_the_last_read() {
 }
 
 #[tokio::test]
+async fn the_global_section_loads_through_the_supervisor() {
+    use crate::{SnapshotCache, Supervisor};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resources.yaml");
+    std::fs::write(
+        &path,
+        "_format_version: \"2\"\nglobal:\n  pricing:\n    - id: 9a3c3f0e-6b8f-4c55-9d2a-4f1e2b7c8d90\n      \
+         key: openai/gpt-4o\n      input_per_1k: 0.005\n      output_per_1k: 0.015\n",
+    )
+    .unwrap();
+    let provider = Arc::new(FileConfigProvider::new(&path).unwrap());
+    let passive = Arc::new(provider.passive());
+    let supervisor = Supervisor::with_sources(
+        vec![
+            (WatchedPrefix::environment(ENV_PREFIX), provider),
+            (WatchedPrefix::global(GLOBAL_PREFIX), passive),
+        ],
+        SnapshotCache::disabled(),
+    );
+
+    supervisor.load_once().await.unwrap();
+    let snap = supervisor.handle().load();
+    assert_eq!(snap.global_pricing.len(), 1);
+    assert_eq!(snap.pricing.len(), 0);
+}
+
+#[tokio::test]
 async fn a_file_runs_through_the_supervisor_like_etcd() {
     use crate::{SnapshotCache, Supervisor};
     use aisix_core::config_status::{ConfigState, SourceKind};
