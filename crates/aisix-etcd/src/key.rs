@@ -148,6 +148,15 @@ impl PrefixSet {
         self.prefixes.is_empty()
     }
 
+    /// The prefix `key` is attributed to: the longest one containing it,
+    /// at a `/` boundary.
+    pub fn owner(&self, key: &str) -> Option<&WatchedPrefix> {
+        self.prefixes.iter().find(|watched| {
+            key.strip_prefix(watched.prefix.trim_end_matches('/'))
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+    }
+
     /// Split `key` into scope, kind and id. Reports the mismatch against
     /// the first (longest) prefix, which is the one an operator is most
     /// likely to have meant.
