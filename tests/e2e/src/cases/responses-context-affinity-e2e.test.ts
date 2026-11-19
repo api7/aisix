@@ -1,4 +1,5 @@
-// /v1/responses context affinity through routing model groups.
+// /v1/responses context affinity through routing model groups and direct
+// models.
 //
 // A follow-up turn carries context only the upstream account that produced
 // it can use: a reasoning item's `encrypted_content`, and a stored
@@ -9,13 +10,15 @@
 // the same model, so the only thing that can make a follow-up fail is which
 // account it lands on.
 //
-// The gateway tags what a group's target produced
-// (`aisix_enc_v1:<b64url("<target id>;<provider key id>")>;<original>` and
-// `resp_<b64url("aisix:v1;<target id>;<original>")>`) and must route a
-// follow-up back to an account that can read it — or strip what no
-// available account can read — while never letting a tag reach an upstream.
+// The gateway tags the ciphertext any model produced
+// (`aisix_enc_v1:<b64url("<target id>;<provider key id>")>;<original>`) and
+// the response id a group's target produced
+// (`resp_<b64url("aisix:v1;<target id>;<original>")>`), and must route a
+// follow-up back to an account that can read it — or strip what the account
+// it lands on cannot read — while never letting a tag reach an upstream.
 // Ciphertext follows the provider key that served it, so a model moved to
-// another key in place, or deleted, must not change who can read it.
+// another key in place, or deleted, or a conversation moved between a group
+// and a direct model, must not change who can read it.
 import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -204,7 +207,7 @@ function parseSse(text: string): any[] {
     .map((d) => JSON.parse(d));
 }
 
-describe("/v1/responses context affinity through model groups", () => {
+describe("/v1/responses context affinity", () => {
   let app: SpawnedApp | undefined;
   let seed: SeedClient | undefined;
   let upstream: AccountsUpstream | undefined;
@@ -276,7 +279,7 @@ describe("/v1/responses context affinity through model groups", () => {
           ...extra,
         })
       ).id;
-    for (const account of ["acct-f", "acct-g", "acct-h", "acct-i", "acct-j", "acct-k", "acct-l", "acct-m", "acct-n", "acct-p", "acct-q", "acct-r"]) {
+    for (const account of ["acct-f", "acct-g", "acct-h", "acct-i", "acct-j", "acct-k", "acct-l", "acct-m", "acct-n", "acct-p", "acct-q", "acct-r", "acct-s", "acct-t", "acct-u", "acct-v", "acct-w"]) {
       pks[account] = await pk(account);
     }
     const pkA = await pk("acct-a");
@@ -320,6 +323,13 @@ describe("/v1/responses context affinity through model groups", () => {
     await model("rp-o", pks["acct-q"]);
     await model("rp-new", pks["acct-r"]);
     await group("rp-grp", "failover", ["rp-o"]);
+    // Direct models.
+    await model("dr-o", pks["acct-s"]);
+    await model("dm-o", pks["acct-t"]);
+    await model("gd-o", pks["acct-v"]);
+    await group("gd-grp", "failover", ["gd-o"]);
+    await model("gd-peer", pks["acct-v"]);
+    await model("gd-other", pks["acct-w"]);
 
     // Caller key last: once it authenticates, every resource above is in
     // the snapshot.
@@ -533,7 +543,7 @@ describe("/v1/responses context affinity through model groups", () => {
     }
   });
 
-  test("a direct model receives untagged context and never a tag", async (ctx) => {
+  test("a group target's context reaches it untagged when addressed directly, and its direct response tags ciphertext only", async (ctx) => {
     if (!app || !upstream) return ctx.skip();
     let first;
     do {
@@ -551,9 +561,12 @@ describe("/v1/responses context affinity through model groups", () => {
     expect(served.account).toBe("acct-b");
     expect(served.body.previous_response_id).toBe(decodeResponseId(first.json.id)!.original);
     expect(served.body.input[0].encrypted_content).toMatch(/^enc:acct-b:\d+$/);
-    // A direct model's own output is not tagged.
+    // A direct model's response id is not tagged; its ciphertext is.
     expect(decodeResponseId(r.json.id)).toBeUndefined();
-    expect(r.json.output[0].encrypted_content).toMatch(/^enc:acct-b:\d+$/);
+    const enc = decodeEncrypted(r.json.output[0].encrypted_content);
+    expect(enc?.target).toBe(ids["aff-b"]);
+    expect(enc?.key).toBe(docs["aff-b"].provider_key_id);
+    expect(enc?.original).toMatch(/^enc:acct-b:\d+$/);
   });
 
   test("a forged or undecodable tag is dropped, not forwarded and not an error", async (ctx) => {
@@ -718,5 +731,71 @@ describe("/v1/responses context affinity through model groups", () => {
     const served = upstream.received.at(-1)!;
     expect(served.account).toBe("acct-r");
     expect(sentReasoning(served)).toEqual({ type: "reasoning", summary: [{ type: "summary_text", text: expect.stringMatching(/^thought \d+$/) }] });
+  });
+
+  test("a direct model's response tags its ciphertext with the model and provider key, streamed or not", async (ctx) => {
+    if (!app || !upstream) return ctx.skip();
+    const r = await respond({ model: "dr-o", input: [userTurn("direct tag")] });
+    expect(r.status, r.text).toBe(200);
+    expect(upstream.received.at(-1)!.account).toBe("acct-s");
+    expect(decodeResponseId(r.json.id)).toBeUndefined();
+    expect(r.json.id).toMatch(/^resp_acct-s_\d+$/);
+    const enc = decodeEncrypted(r.json.output.find((i: any) => i.type === "reasoning").encrypted_content);
+    expect(enc).toEqual({ target: ids["dr-o"], key: pks["acct-s"], original: expect.stringMatching(/^enc:acct-s:\d+$/) });
+
+    const s = await respond({ model: "dr-o", input: [userTurn("direct tag")], stream: true });
+    expect(s.status).toBe(200);
+    const events = parseSse(s.text);
+    const done = events.find((e) => e.type === "response.output_item.done" && e.item.type === "reasoning");
+    expect(decodeEncrypted(done.item.encrypted_content)).toEqual({ target: ids["dr-o"], key: pks["acct-s"], original: expect.stringMatching(/^enc:acct-s:\d+$/) });
+    const completed = events.find((e) => e.type === "response.completed");
+    expect(decodeResponseId(completed.response.id)).toBeUndefined();
+    const final = completed.response.output.find((i: any) => i.type === "reasoning");
+    expect(decodeEncrypted(final.encrypted_content)?.key).toBe(pks["acct-s"]);
+  });
+
+  test("a direct model on an unchanged provider key reads its own ciphertext back verbatim", async (ctx) => {
+    if (!app || !upstream) return ctx.skip();
+    const { history, account } = await firstTurn("dr-o", "direct keep");
+    expect(account).toBe("acct-s");
+    const r = await respond({ model: "dr-o", store: false, input: history });
+    expect(r.status, r.text).toBe(200);
+    const served = upstream.received.at(-1)!;
+    expect(served.account).toBe("acct-s");
+    expect(sentReasoning(served).encrypted_content).toBe(decodeEncrypted(history[1].encrypted_content)!.original);
+  });
+
+  test("a direct model moved to another provider key in place gets its old ciphertext stripped", async (ctx) => {
+    if (!app || !upstream) return ctx.skip();
+    const { history, account } = await firstTurn("dm-o", "direct move");
+    expect(account).toBe("acct-t");
+
+    await seed!.update("models", ids["dm-o"], { ...docs["dm-o"], provider_key_id: pks["acct-u"] });
+    await untilServedBy("dm-o", "acct-u");
+
+    const r = await respond({ model: "dm-o", store: false, input: history });
+    expect(r.status, r.text).toBe(200);
+    const served = upstream.received.at(-1)!;
+    expect(served.account).toBe("acct-u");
+    expect(sentReasoning(served)).toEqual({ type: "reasoning", summary: [{ type: "summary_text", text: expect.stringMatching(/^thought \d+$/) }] });
+  });
+
+  test("a group target's ciphertext sent to a direct model is stripped on another key and forwarded on the same key", async (ctx) => {
+    if (!app || !upstream) return ctx.skip();
+    const { history, account } = await firstTurn("gd-grp", "group to direct");
+    expect(account).toBe("acct-v");
+
+    const other = await respond({ model: "gd-other", store: false, input: history });
+    expect(other.status, other.text).toBe(200);
+    const strippedAt = upstream.received.at(-1)!;
+    expect(strippedAt.account).toBe("acct-w");
+    expect(sentReasoning(strippedAt)).toEqual({ type: "reasoning", summary: [{ type: "summary_text", text: expect.stringMatching(/^thought \d+$/) }] });
+
+    const peer = await respond({ model: "gd-peer", store: false, input: history });
+    expect(peer.status, peer.text).toBe(200);
+    const forwardedAt = upstream.received.at(-1)!;
+    expect(forwardedAt.account).toBe("acct-v");
+    expect(forwardedAt.body.model).toBe("gpt-gd-peer");
+    expect(sentReasoning(forwardedAt).encrypted_content).toMatch(/^enc:acct-v:\d+$/);
   });
 });

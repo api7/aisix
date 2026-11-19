@@ -1,4 +1,4 @@
-//! Context affinity for `/v1/responses` served through a routing model group.
+//! Context affinity for `/v1/responses`.
 //!
 //! A follow-up turn can carry context only the upstream that produced it can
 //! read: a reasoning item's `encrypted_content` (stateless clients echo it
@@ -6,14 +6,17 @@
 //! to another deployment or account, the first is rejected with
 //! `invalid_encrypted_content` and the second is not found.
 //!
-//! So the gateway tags what a group's target produced, in the values the
-//! client echoes back unchanged:
+//! So the gateway tags what a model produced, in the values the client
+//! echoes back unchanged:
 //!
 //! - `encrypted_content` → `aisix_enc_v1:<base64url("<target id>;<provider key id>")>;<original>`,
-//!   the key id empty when the target has none. Ciphertext is bound to the
-//!   account that issued it, so the key that served it is what decides who
-//!   can read it — not the model, whose key can be changed in place.
-//! - response `id` → `resp_` + base64url(`aisix:v1;<target id>;<original>`)
+//!   the key id empty when the target has none — on every response, a direct
+//!   model's included. Ciphertext is bound to the account that issued it, so
+//!   the key that served it is what decides who can read it — not the model,
+//!   whose key can be changed in place, and not the model the client
+//!   addresses, which can be a group one turn and a direct model the next.
+//! - response `id` → `resp_` + base64url(`aisix:v1;<target id>;<original>`),
+//!   for a group's target only: a direct model has nothing to pin.
 //!
 //! Gateways before the key was recorded read the first ciphertext segment as
 //! a bare model id. Keeping the prefix and the segment boundary makes them
@@ -24,10 +27,11 @@
 //! lose the pin — so it keeps recording the model only.
 //!
 //! On every request the tags are removed before anything else reads the
-//! body, so a tagged value never reaches an upstream; for a group, the
-//! decoded origin pins the attempt order ([`crate::routing`]) and every
-//! attempt whose target cannot read an item's ciphertext gets the item
-//! without it ([`ContextAffinity::body_for_target`]).
+//! body, so a tagged value never reaches an upstream; every attempt whose
+//! target — a group's or a direct model — cannot read an item's ciphertext
+//! gets the item without it ([`ContextAffinity::body_for_target`]), and for
+//! a group the decoded origin also pins the attempt order
+//! ([`crate::routing`]).
 //!
 //! Two targets can read each other's context when they share a provider key
 //! (same credentials, same endpoint) — that is the [`Boundary`].
@@ -262,7 +266,7 @@ impl ContextAffinity {
             .or_else(|| self.encrypted.last().map(|(_, o)| o))
     }
 
-    /// The body one routing-group attempt sends: `None` when every tagged
+    /// The body one attempt sends: `None` when every tagged
     /// ciphertext is readable by `target`, else a copy without the items
     /// it cannot read.
     pub(crate) fn body_for_target(
@@ -297,13 +301,19 @@ impl ContextAffinity {
         Some(body)
     }
 
-    /// How a response to this request is tagged. `target` is the routing
-    /// target that served it and its provider key, `None` outside a routing
-    /// group.
-    pub(crate) fn response_mark(&self, target: Option<(&str, Option<&str>)>) -> ResponseMark {
+    /// How a response to this request is tagged: its ciphertext with the
+    /// model that served it and that model's provider key, and — only when
+    /// it is a routing group's target (`routed`) — its response id.
+    pub(crate) fn response_mark(
+        &self,
+        target_id: &str,
+        target_provider_key_id: Option<&str>,
+        routed: bool,
+    ) -> ResponseMark {
         ResponseMark {
-            target_id: target.map(|(id, _)| id.to_string()),
-            target_provider_key_id: target.and_then(|(_, key)| key.map(str::to_string)),
+            target_id: Some(target_id.to_string()),
+            target_provider_key_id: target_provider_key_id.map(str::to_string),
+            tags_response_id: routed,
             previous_echo: self.previous_echo.clone(),
         }
     }
@@ -334,6 +344,7 @@ fn strip_ciphertext(mut item: Value) -> Option<Value> {
 pub(crate) struct ResponseMark {
     target_id: Option<String>,
     target_provider_key_id: Option<String>,
+    tags_response_id: bool,
     previous_echo: Option<(String, String)>,
 }
 
@@ -357,17 +368,20 @@ impl ResponseMark {
 
     /// A response id the gateway minted itself (the bridged path).
     pub(crate) fn response_id(&self, id: String) -> String {
-        match &self.target_id {
+        match self.response_id_target() {
             Some(target) => mark_response_id(target, &id),
             None => id,
         }
     }
 
+    fn response_id_target(&self) -> Option<&str> {
+        self.target_id.as_deref().filter(|_| self.tags_response_id)
+    }
+
     fn rewrite(&self, slot: Slot, value: &str) -> Option<String> {
         match slot {
             Slot::ResponseId => self
-                .target_id
-                .as_deref()
+                .response_id_target()
                 .filter(|_| !value.is_empty())
                 .map(|t| mark_response_id(t, value)),
             Slot::EncryptedContent => self
@@ -611,6 +625,7 @@ mod tests {
         let mark = ResponseMark {
             target_id: Some("m-1".into()),
             target_provider_key_id: Some("pk-1".into()),
+            tags_response_id: true,
             previous_echo: Some(("resp_prev".into(), "resp_SENT".into())),
         };
         let frame = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_up\",\"previous_response_id\":\"resp_prev\",\"output\":[{\"type\":\"reasoning\",\"encrypted_content\":\"CT\"}]}}\n\n";

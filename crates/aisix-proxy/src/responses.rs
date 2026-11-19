@@ -752,8 +752,8 @@ async fn dispatch(
     let fallback_statuses: &[u16] = plan.fallback_statuses(&model_entry.value);
     // Also arms the per-target quota pass the request gate deferred a
     // routing/semantic parent's model-property policies to, and the
-    // context-affinity tagging: a semantic router can serve successive
-    // turns from different targets, exactly like a group.
+    // context-affinity response-id pin: a semantic router can serve
+    // successive turns from different targets, exactly like a group.
     let is_routing_request = crate::dispatch_plan::is_routing_request(&model_entry.value);
     let mut routing = RoutingTelemetry::for_request(&model_entry.value.display_name)
         .with_trace(client.trace.clone());
@@ -784,19 +784,16 @@ async fn dispatch(
         // Deadlines resolved target → group → deployment default, next to
         // the retry budget so the two knobs stay in lockstep.
         let timeouts = plan.timeouts(&target.model, &model_entry.value, state.default_timeouts);
-        // A group target that cannot read some tagged ciphertext gets the
-        // request without it, rather than a certain 400. Built once per
-        // target: every same-target retry sends the same body.
-        let stripped_body = is_routing_request
-            .then(|| {
-                affinity.body_for_target(
-                    snapshot,
-                    body,
-                    &target.id,
-                    target.model.provider_key_id.as_deref(),
-                )
-            })
-            .flatten();
+        // A target — a group's or a direct model — that cannot read some
+        // tagged ciphertext gets the request without it, rather than a
+        // certain 400. Built once per target: every same-target retry sends
+        // the same body.
+        let stripped_body = affinity.body_for_target(
+            snapshot,
+            body,
+            &target.id,
+            target.model.provider_key_id.as_deref(),
+        );
         for attempt_idx in 0..=budget.attempts {
             // Upstream `Retry-After` when the last failure carried one, else
             // exponential backoff + jitter, before re-hitting the SAME target
@@ -869,8 +866,9 @@ async fn dispatch(
             };
             let attempt_body = stripped_body.as_ref().unwrap_or(body);
             let mark = affinity.response_mark(
-                is_routing_request
-                    .then_some((target.id.as_str(), target.model.provider_key_id.as_deref())),
+                &target.id,
+                target.model.provider_key_id.as_deref(),
+                is_routing_request,
             );
             let result = if crate::dispatch::responses_served_natively(
                 snapshot,
