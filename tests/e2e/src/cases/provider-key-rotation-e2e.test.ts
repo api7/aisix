@@ -28,7 +28,7 @@ import {
 // IMPORTANT scope note (from the #523 audit): "zero in-flight
 // disruption" is largely an ARCHITECTURAL guarantee here, NOT a property
 // this test could falsify. The DP holds one shared upstream client and
-// reads `pk.secret` / `pk.api_base` per-request from an atomic ArcSwap
+// reads `pk.api_key` / `pk.api_base` per-request from an atomic ArcSwap
 // snapshot; an in-flight request keeps its own snapshot Arc to
 // completion and a watch-applied update CAS-swaps a fresh snapshot —
 // there is no per-provider_key client or pool to tear down. So this is a
@@ -201,7 +201,7 @@ describe("provider_key rotation: zero in-flight disruption (#196 L3 / #271)", ()
     // a rotation that silently did nothing would leave the original secret).
     const rawAfter = await etcd.get(`${app.etcdPrefix}/provider_keys/${pkId}`);
     expect(rawAfter, "provider_key missing from etcd after rotation").toBeDefined();
-    const pkAfter = JSON.parse(rawAfter!) as { secret?: string };
-    expect(pkAfter.secret).toBe("sk-mock-v2-rotated");
+    const pkAfter = JSON.parse(rawAfter!) as { api_key?: string };
+    expect(pkAfter.api_key).toBe("sk-mock-v2-rotated");
   }, 90_000);
 });
