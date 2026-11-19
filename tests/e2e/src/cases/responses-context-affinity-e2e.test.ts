@@ -20,7 +20,8 @@
 // key that served it, and by the origin's current key: a key rotated on the
 // same account, a deleted origin, or a conversation moved between a group
 // and a direct model must not cost it its context. A model moved to another
-// account's key is left to the upstream's 400.
+// account's key is left to the upstream's 400 (a group falls through it only
+// when its `fallback_on_statuses` lists 400).
 import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";

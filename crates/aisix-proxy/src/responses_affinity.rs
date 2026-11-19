@@ -18,9 +18,9 @@
 //!   origin model itself always reads it, even after its key changed — a
 //!   key rotated to a new key on the same account must not cost an ongoing
 //!   conversation its context, so a model moved to another account's key is
-//!   left to the upstream's rejection (a group falls back on it like any
-//!   other 400). The client-addressed model plays no part: it can be a group
-//!   one turn and a direct model the next.
+//!   left to the upstream's 400, which a group falls through only when its
+//!   `fallback_on_statuses` lists 400. The client-addressed model plays no
+//!   part: it can be a group one turn and a direct model the next.
 //! - response `id` → `resp_` + base64url(`aisix:v1;<target id>;<original>`),
 //!   for a group's target only: a direct model has nothing to pin.
 //!
