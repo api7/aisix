@@ -123,7 +123,7 @@ describe("timeout fallback e2e (#554)", () => {
       (
         await seed!.createProviderKey({
           display_name: name,
-          secret: "sk-mock",
+          api_key: "sk-mock",
           api_base: `${u.baseUrl}/v1`,
         })
       ).id;

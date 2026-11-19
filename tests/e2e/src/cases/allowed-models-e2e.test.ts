@@ -47,7 +47,7 @@ describe("allowed_models e2e: 403 on disallowed model, upstream untouched", () =
     // forbidden call leaks through, it will register here.
     const pk = await seed.createProviderKey({
       display_name: "am-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

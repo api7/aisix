@@ -239,7 +239,7 @@ describe("aliyun AI guardrail e2e: MultiModalGuard suggestion drives the verdict
 
     const benignPk = await seed.createProviderKey({
       display_name: "aig-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${benignUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -251,7 +251,7 @@ describe("aliyun AI guardrail e2e: MultiModalGuard suggestion drives the verdict
 
     const riskyOutPk = await seed.createProviderKey({
       display_name: "aig-out-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${riskyOutputUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -263,7 +263,7 @@ describe("aliyun AI guardrail e2e: MultiModalGuard suggestion drives the verdict
 
     const maskOutPk = await seed.createProviderKey({
       display_name: "aig-mask-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${maskOutputUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -275,7 +275,7 @@ describe("aliyun AI guardrail e2e: MultiModalGuard suggestion drives the verdict
 
     const streamPk = await seed.createProviderKey({
       display_name: "aig-stream-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -547,7 +547,7 @@ describe("aliyun AI guardrail e2e: basic service level uses non-Pro codes", () =
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "aig-basic-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

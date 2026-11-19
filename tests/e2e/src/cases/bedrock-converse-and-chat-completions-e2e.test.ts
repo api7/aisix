@@ -184,7 +184,7 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
       display_name: "bedrock-cc-e2e-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-cc-e2e",
         secret_access_key: "sk-cc-e2e",
         region: "us-east-1",
@@ -219,7 +219,7 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
       display_name: "bedrock-cc-e2e-azure",
       provider: "azure-openai",
       adapter: "azure-openai",
-      secret: "az-key",
+      api_key: "az-key",
       api_base: base,
     });
     await seed.createModel({
@@ -230,7 +230,7 @@ describe("Amazon Bedrock: Converse, Chat Completions and errors", () => {
     });
     const openai = await seed.createProviderKey({
       display_name: "bedrock-cc-e2e-openai",
-      secret: "sk-openai",
+      api_key: "sk-openai",
       api_base: `${base}/oai`,
     });
     await seed.createModel({

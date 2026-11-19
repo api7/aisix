@@ -18,7 +18,6 @@ use crate::resource::Resource;
 pub struct PassthroughRoute {
     /// Operator-facing label, unique within the gateway. Referenced by API
     /// keys' `allowed_routes` globs and used for usage attribution.
-    #[serde(alias = "display_name")]
     #[schemars(length(min = 1))]
     pub name: String,
 
@@ -540,15 +539,6 @@ mod tests {
         assert_eq!(r.credential_mode, PassthroughCredentialMode::Inject);
         assert!(r.enabled);
         assert!(!r.preserve_host);
-    }
-
-    #[test]
-    fn display_name_alias_accepted() {
-        let r: PassthroughRoute = serde_json::from_str(
-            r#"{"display_name":"x","path_prefix":"/x","target_url":"https://u","provider_key_id":"pk"}"#,
-        )
-        .unwrap();
-        assert_eq!(r.name, "x");
     }
 
     #[test]

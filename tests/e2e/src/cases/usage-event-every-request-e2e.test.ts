@@ -93,7 +93,7 @@ describe("a usage event for every request", () => {
     // itself, with no upstream call.
     const videoPk = await seed.createProviderKey({
       display_name: "every-request-video",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       provider: "minimax",
       api_base: "http://127.0.0.1:9",
     });
@@ -106,7 +106,7 @@ describe("a usage event for every request", () => {
 
     const coherePk = await seed.createProviderKey({
       display_name: "every-request-cohere",
-      secret: "cohere-mock-key",
+      api_key: "cohere-mock-key",
       provider: "cohere",
       adapter: "openai",
       api_base: cohere.baseUrl,
@@ -122,7 +122,7 @@ describe("a usage event for every request", () => {
     // gateway answers those itself, without an upstream call.
     const anthropicPk = await seed.createProviderKey({
       display_name: "every-request-anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       provider: "anthropic",
       api_base: "http://127.0.0.1:9",
     });
@@ -136,7 +136,7 @@ describe("a usage event for every request", () => {
     // A guardrail on the MCP server makes the gateway read the tool result
     // back before relaying it.
     const mcpServerId = randomUUID();
-    await seed.update("mcp_servers", mcpServerId, { display_name: "big", url: mcp.url, enabled: true });
+    await seed.update("mcp_servers", mcpServerId, { name: "big", url: mcp.url, enabled: true });
     const monitor = await seed.createGuardrail(
       {
         name: "every-request-mcp-monitor",

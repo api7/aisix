@@ -170,7 +170,7 @@ async function seedFixtures(
 ): Promise<{ policyId: string; policyBody: Record<string, unknown> }> {
   const embedPk = await seed.createProviderKey({
     display_name: "semredis-embed-pk",
-    secret: "sk-mock",
+    api_key: "sk-mock",
     api_base: `${embedBase}/v1`,
   });
   await seed.createModel({
@@ -182,7 +182,7 @@ async function seedFixtures(
   });
   const chatPk = await seed.createProviderKey({
     display_name: "semredis-chat-pk",
-    secret: "sk-mock",
+    api_key: "sk-mock",
     api_base: `${upstreamBase}/v1`,
   });
   await seed.createModel({

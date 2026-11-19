@@ -323,7 +323,7 @@ describe("prompt caching for Claude on Amazon Bedrock and Vertex AI", () => {
       display_name: "pc-bedrock-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-prompt-cache",
         secret_access_key: "sk-prompt-cache",
         region: "us-west-2",
@@ -334,7 +334,7 @@ describe("prompt caching for Claude on Amazon Bedrock and Vertex AI", () => {
       display_name: "pc-vertex-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_token: "ya29.prompt-cache",
         project: "proj-e2e",
         region: "us-east5",
@@ -345,14 +345,14 @@ describe("prompt caching for Claude on Amazon Bedrock and Vertex AI", () => {
       display_name: "pc-openai-pk",
       provider: "openai",
       adapter: "openai",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const anthropicPk = await seed.createProviderKey({
       display_name: "pc-anthropic-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
     const auto = { enabled: true, ttl: "1h" };

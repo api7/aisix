@@ -154,12 +154,12 @@ describe("cost-attribution tags e2e", () => {
 
     const okPk = await seed.createProviderKey({
       display_name: "cat-ok-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${ok.baseUrl}/v1`,
     });
     const downPk = await seed.createProviderKey({
       display_name: "cat-down-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${down.baseUrl}/v1`,
     });
     await seed.createModel({

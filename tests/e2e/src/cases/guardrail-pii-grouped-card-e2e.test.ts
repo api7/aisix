@@ -59,7 +59,7 @@ describe("bank_card recognises grouped numbers and values touching CJK text", ()
     streams.push(stream);
     const pk = await seed.createProviderKey({
       display_name: `${model}-pk`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${stream.baseUrl}/v1`,
     });
     const created = await seed.createModel({
@@ -110,12 +110,12 @@ describe("bank_card recognises grouped numbers and values touching CJK text", ()
 
     const pk = await seed.createProviderKey({
       display_name: "card-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const leakyPk = await seed.createProviderKey({
       display_name: "card-leaky-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${leaky.baseUrl}/v1`,
     });
     const modelIds: Record<string, string> = {};

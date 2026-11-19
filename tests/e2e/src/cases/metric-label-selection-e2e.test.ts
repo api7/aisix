@@ -64,7 +64,7 @@ describe("metric label configuration is applied to real request observations", (
         const pk = await seed.createProviderKey({
           display_name: name, provider: context.provider,
           adapter: context.wire === "anthropic" ? "anthropic" : "openai",
-          secret: "test", api_base: `${upstream.baseUrl}/v1`,
+          api_key: "test", api_base: `${upstream.baseUrl}/v1`,
         });
         const model = `labels-${index}-${suffix}`;
         await seed.createModel({

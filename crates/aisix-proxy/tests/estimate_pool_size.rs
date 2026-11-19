@@ -63,7 +63,7 @@ async fn pool_has_one_thread_per_configured_worker() {
 
     let snapshot = AisixSnapshot::new();
     let pk: ProviderKey = serde_json::from_value(json!({
-        "display_name": "upstream", "secret": "test-upstream-credential",
+        "display_name": "upstream", "api_key": "test-upstream-credential",
         "api_base": upstream.uri(), "provider": "openai", "adapter": "openai"
     }))
     .unwrap();

@@ -216,7 +216,7 @@ describe("semantic guardrail similarity scores on usage events", () => {
     ): Promise<string> => {
       const pk = await seed.createProviderKey({
         display_name: `${displayName}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: apiBase,
       });
       const model = await seed.createModel({

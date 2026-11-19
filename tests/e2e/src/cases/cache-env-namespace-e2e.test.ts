@@ -111,7 +111,7 @@ async function seed(etcdRoot: string, upstreamBase: string) {
   const seed = new SeedClient(new EtcdClient(), etcdRoot);
   const pk = await seed.createProviderKey({
     display_name: `${MODEL}-pk`,
-    secret: "sk-mock",
+    api_key: "sk-mock",
     api_base: `${upstreamBase}/v1`,
   });
   await seed.createModel({

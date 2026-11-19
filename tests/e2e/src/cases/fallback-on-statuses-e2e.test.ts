@@ -72,7 +72,7 @@ describe("fallback_on_statuses e2e: opt-in 4xx failover (#1012)", () => {
 
     const overloadedPk = await seed.createProviderKey({
       display_name: "fos-overloaded-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${overloaded.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -84,7 +84,7 @@ describe("fallback_on_statuses e2e: opt-in 4xx failover (#1012)", () => {
     });
     const badPk = await seed.createProviderKey({
       display_name: "fos-bad-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${badRequest.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -96,7 +96,7 @@ describe("fallback_on_statuses e2e: opt-in 4xx failover (#1012)", () => {
     });
     const healthyPk = await seed.createProviderKey({
       display_name: "fos-healthy-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${healthy.baseUrl}/v1`,
     });
     await seed.createModel({

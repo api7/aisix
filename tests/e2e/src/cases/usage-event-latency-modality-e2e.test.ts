@@ -147,7 +147,7 @@ describe("usage events carry the key name, the latency breakdown and modality co
     for (const [name, upstream] of Object.entries(upstreams)) {
       const pk = await seed.createProviderKey({
         display_name: `lm-${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({

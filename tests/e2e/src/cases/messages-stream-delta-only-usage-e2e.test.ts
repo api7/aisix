@@ -78,7 +78,7 @@ describe("anthropic /v1/messages stream with usage only on message_delta (#952)"
 
     const pk = await seed.createProviderKey({
       display_name: "anth-952-delta-pk",
-      secret: "sk-anth-mock",
+      api_key: "sk-anth-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({

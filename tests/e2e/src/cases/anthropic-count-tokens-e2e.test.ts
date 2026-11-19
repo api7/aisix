@@ -67,7 +67,7 @@ describe("anthropic count_tokens e2e: /v1/messages/count_tokens through the DP (
     // Anthropic bridge appends the path to the bare host (no `/v1`).
     const pk = await seed.createProviderKey({
       display_name: "ct-e2e-pk",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({

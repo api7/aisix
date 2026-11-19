@@ -74,7 +74,7 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
 
     const fastPk = await seed.createProviderKey({
       display_name: PK_NAME,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${fast.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -85,7 +85,7 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
     });
     const embedPk = await seed.createProviderKey({
       display_name: EMBED_PK_NAME,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${embeddings.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -98,7 +98,7 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
     // OpenAI upstream, so it reuses the chat-shaped mock.
     const msgPk = await seed.createProviderKey({
       display_name: MSG_PK_NAME,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${fast.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -109,7 +109,7 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
     });
     const respPk = await seed.createProviderKey({
       display_name: RESP_PK_NAME,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${responses.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -120,7 +120,7 @@ describe("usage-event and cancel attribution #1317 e2e", () => {
     });
     const slowPk = await seed.createProviderKey({
       display_name: SLOW_PK_NAME,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${slow.baseUrl}/v1`,
     });
     await seed.createModel({

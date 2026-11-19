@@ -51,7 +51,7 @@ describe("guardrail block log lines name the guardrail", () => {
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "block-log-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const model = await seed.createModel({

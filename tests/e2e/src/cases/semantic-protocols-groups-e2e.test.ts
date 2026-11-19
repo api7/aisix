@@ -185,7 +185,7 @@ describe("semantic routing on every protocol, with model-group targets", () => {
 
     const embedPk = await seed.createProviderKey({
       display_name: "sp-embed-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${embed.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -209,7 +209,7 @@ describe("semantic routing on every protocol, with model-group targets", () => {
         display_name: `${name}-pk`,
         provider: "deepseek",
         adapter: "openai",
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${mock.baseUrl}/v1`,
       });
       await seed!.createModel({
@@ -241,7 +241,7 @@ describe("semantic routing on every protocol, with model-group targets", () => {
       anthropicMocks[name] = mock;
       const pk = await seed!.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-ant-mock",
+        api_key: "sk-ant-mock",
         api_base: mock.baseUrl,
       });
       await seed!.createModel({

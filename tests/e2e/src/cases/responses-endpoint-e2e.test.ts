@@ -107,7 +107,7 @@ describe("responses endpoint e2e: /v1/responses dispatch + provider mismatch", (
 
     const pk = await seed.createProviderKey({
       display_name: "resp-openai-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -252,7 +252,7 @@ describe("responses endpoint e2e: /v1/responses dispatch + provider mismatch", (
       display_name: "resp-deepseek-pk",
       provider: "deepseek",
       adapter: "openai",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

@@ -47,7 +47,7 @@ describe("streaming /v1/messages tool_use output guardrail (#448)", () => {
     seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "msgtool-gr-pk",
-      secret: "sk-anth-mock",
+      api_key: "sk-anth-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({

@@ -250,7 +250,7 @@ describe("/v1/responses bridge: what an agent client needs from a non-OpenAI mod
       upstreams[model] = upstream;
       const pk = await seed.createProviderKey({
         display_name: `${model}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
         apis: {},
       });

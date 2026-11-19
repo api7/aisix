@@ -62,7 +62,7 @@ describe("openai SDK compat: drive gateway through real client", () => {
     // expected upstream rather than leaking across.
     const pkSync = await seed.createProviderKey({
       display_name: "sdk-compat-sync-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${nonStreamUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -74,7 +74,7 @@ describe("openai SDK compat: drive gateway through real client", () => {
 
     const pkStream = await seed.createProviderKey({
       display_name: "sdk-compat-stream-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -88,7 +88,7 @@ describe("openai SDK compat: drive gateway through real client", () => {
     // Completions contract has no `developer` role.
     const pkCompat = await seed.createProviderKey({
       display_name: "sdk-compat-deepseek-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${compatUpstream.baseUrl}/v1`,
       provider: "deepseek",
       adapter: "openai",

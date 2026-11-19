@@ -292,7 +292,7 @@ async fn duplicate_upstream_name_keeps_first() {
 #[test]
 fn upstream_from_mcp_server_maps_auth_and_timeout() {
     let server: McpServer = serde_json::from_value(serde_json::json!({
-        "display_name": "gh",
+        "name": "gh",
         "url": "https://api.example.com/mcp",
         "auth_type": "bearer",
         "secret": "tok",
@@ -306,7 +306,7 @@ fn upstream_from_mcp_server_maps_auth_and_timeout() {
 
     // `none` auth and absent timeout fall back to defaults.
     let plain: McpServer = serde_json::from_value(serde_json::json!({
-        "display_name": "x", "url": "https://x/mcp"
+        "name": "x", "url": "https://x/mcp"
     }))
     .unwrap();
     assert!(matches!(
@@ -322,7 +322,7 @@ fn upstream_from_mcp_server_maps_auth_and_timeout() {
 #[test]
 fn upstream_from_mcp_server_maps_protocol_version() {
     let modern: McpServer = serde_json::from_value(serde_json::json!({
-        "display_name": "m",
+        "name": "m",
         "url": "https://api.example.com/mcp",
         "protocol_version": "2026-07-28"
     }))
@@ -333,7 +333,7 @@ fn upstream_from_mcp_server_maps_protocol_version() {
     );
 
     let dflt: McpServer = serde_json::from_value(serde_json::json!({
-        "display_name": "d", "url": "https://api.example.com/mcp"
+        "name": "d", "url": "https://api.example.com/mcp"
     }))
     .unwrap();
     assert_eq!(
@@ -344,7 +344,7 @@ fn upstream_from_mcp_server_maps_protocol_version() {
     // An unknown revision is a hard deserialization error, not a silent
     // fallback to some default lifecycle.
     let unknown = serde_json::from_value::<McpServer>(serde_json::json!({
-        "display_name": "u",
+        "name": "u",
         "url": "https://api.example.com/mcp",
         "protocol_version": "2099-01-01"
     }));
@@ -354,7 +354,7 @@ fn upstream_from_mcp_server_maps_protocol_version() {
 #[test]
 fn upstream_from_mcp_server_maps_api_key_and_oauth2() {
     let api_key: McpServer = serde_json::from_value(serde_json::json!({
-        "display_name": "gh",
+        "name": "gh",
         "url": "https://api.example.com/mcp",
         "auth_type": "api_key",
         "secret": "k-1"
@@ -366,7 +366,7 @@ fn upstream_from_mcp_server_maps_api_key_and_oauth2() {
     ));
 
     let oauth: McpServer = serde_json::from_value(serde_json::json!({
-        "display_name": "gh2",
+        "name": "gh2",
         "url": "https://api.example.com/mcp",
         "auth_type": "oauth2",
         "secret": "cs",
@@ -388,7 +388,7 @@ fn upstream_from_mcp_server_maps_api_key_and_oauth2() {
     // Missing oauth2 fields map to empty strings — the mapping never errors;
     // the token fetch fails cleanly at connect time instead.
     let incomplete: McpServer = serde_json::from_value(serde_json::json!({
-        "display_name": "gh3",
+        "name": "gh3",
         "url": "https://api.example.com/mcp",
         "auth_type": "oauth2"
     }))
@@ -407,7 +407,7 @@ fn upstream_from_mcp_server_maps_api_key_and_oauth2() {
 /// Build a snapshot resource entry for an upstream at `addr`.
 fn mcp_entry(id: &str, name: &str, addr: &SocketAddr, enabled: bool) -> ResourceEntry<McpServer> {
     let server: McpServer = serde_json::from_value(serde_json::json!({
-        "display_name": name,
+        "name": name,
         "url": format!("http://{addr}/mcp"),
         "enabled": enabled
     }))
@@ -466,7 +466,7 @@ async fn from_snapshot_degrades_misconfigured_oauth2_upstream_gracefully() {
     // (the flat schema stays permissive on credential coupling), but its
     // token fetch can never succeed.
     let broken: McpServer = serde_json::from_value(serde_json::json!({
-        "display_name": "broken",
+        "name": "broken",
         "url": format!("http://{alpha}/mcp"),
         "auth_type": "oauth2",
         "client_id": "cid",

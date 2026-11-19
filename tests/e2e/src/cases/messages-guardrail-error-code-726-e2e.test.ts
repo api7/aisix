@@ -100,7 +100,7 @@ describe("Anthropic-surface guardrail refusals carry error.code (AISIX-Cloud#726
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "g726-pk",
-      secret: "sk-anth-mock",
+      api_key: "sk-anth-mock",
       api_base: upstream.baseUrl,
     });
     for (const [model, guardrail] of Object.entries(CASES)) {

@@ -176,7 +176,7 @@ describe("Bedrock: streamed reasoning matches the non-streamed reply", () => {
       display_name: "bedrock-stream-reasoning-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-stream-reasoning",
         secret_access_key: "sk-stream-reasoning",
         region: "us-west-2",

@@ -154,7 +154,7 @@ describe("aisix export: a classifier that names its direct model by id", () => {
     });
     const chatKey = await seed.createProviderKey({
       display_name: "ecm-chat-pk",
-      secret: "sk-chat-mock",
+      api_key: "sk-chat-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     for (const [name, upstreamModel] of [
@@ -170,7 +170,7 @@ describe("aisix export: a classifier that names its direct model by id", () => {
     }
     const jevKey = await seed.createProviderKey({
       display_name: "ecm-jev-pk",
-      secret: DECISION_SECRET,
+      api_key: DECISION_SECRET,
       provider: "typesafe",
       adapter: undefined,
       api_base: decisions.baseUrl,

@@ -143,7 +143,7 @@ describe("videos e2e: unified submit/poll/content surface", () => {
 
     const happyPk = await seed.createProviderKey({
       display_name: "videos-e2e-ali-pk",
-      secret: "sk-mock-dashscope",
+      api_key: "sk-mock-dashscope",
       api_base: happyUpstream.baseUrl,
       provider: "alibaba",
     });
@@ -156,7 +156,7 @@ describe("videos e2e: unified submit/poll/content surface", () => {
 
     const rlPk = await seed.createProviderKey({
       display_name: "videos-e2e-rl-pk",
-      secret: "sk-mock-dashscope",
+      api_key: "sk-mock-dashscope",
       api_base: rlUpstream.baseUrl,
       provider: "alibaba",
     });
@@ -170,7 +170,7 @@ describe("videos e2e: unified submit/poll/content surface", () => {
 
     const probePk = await seed.createProviderKey({
       display_name: "videos-e2e-probe-pk",
-      secret: "sk-mock-dashscope",
+      api_key: "sk-mock-dashscope",
       api_base: probeUpstream.baseUrl,
       provider: "alibaba",
     });

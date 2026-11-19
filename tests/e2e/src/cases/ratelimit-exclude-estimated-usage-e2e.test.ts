@@ -205,7 +205,7 @@ describe.each(BACKENDS)("estimated usage and token rate limits ($name counters)"
     const model = async (display_name: string, upstream: OpenAiUpstream) => {
       const pk = await seed.createProviderKey({
         display_name: `${display_name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({ display_name, provider: "openai", model_name: "relay-2028", provider_key_id: pk.id });
@@ -235,7 +235,7 @@ describe.each(BACKENDS)("estimated usage and token rate limits ($name counters)"
       provider_key_id: (
         await seed.createProviderKey({
           display_name: "est-chat-policy-pk",
-          secret: "sk-mock",
+          api_key: "sk-mock",
           api_base: `${chatUp.baseUrl}/v1`,
         })
       ).id,

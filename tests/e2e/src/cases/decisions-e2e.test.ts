@@ -316,47 +316,47 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
     await direct("dec-typesafe", "jev-latest", {
       provider: "typesafe",
       adapter: undefined,
-      secret: "ts-secret",
+      api_key: "ts-secret",
       api_base: typesafe.baseUrl,
     });
     await direct("dec-openai", "gpt-6-luna", {
       provider: "openai",
-      secret: "sk-openai",
+      api_key: "sk-openai",
       api_base: `${openai.baseUrl}/v1`,
     });
     await direct("dec-foundry", "jev-foundry-deployment", {
       provider: "azure",
       adapter: "azure-openai",
-      secret: "foundry-resource-key",
+      api_key: "foundry-resource-key",
       api_base: `${foundry.baseUrl}/api/projects/proj-1`,
     });
     await direct("dec-openrouter", "typesafe/jev-1.13", {
       provider: "openrouter",
-      secret: "sk-or",
+      api_key: "sk-or",
       api_base: `${openrouter.baseUrl}/api/v1`,
     });
     await direct("dec-failing", "jev-latest", {
       provider: "typesafe",
       adapter: undefined,
-      secret: "ts-secret",
+      api_key: "ts-secret",
       api_base: failing.baseUrl,
     });
     await direct("dec-rejecting", "jev-latest", {
       provider: "typesafe",
       adapter: undefined,
-      secret: "ts-secret",
+      api_key: "ts-secret",
       api_base: rejecting.baseUrl,
     });
     await direct("dec-anthropic", "claude-haiku-4-5", {
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant",
+      api_key: "sk-ant",
       api_base: anthropic.baseUrl,
     });
     const typesafeAt = (upstream: OpenAiUpstream) => ({
       provider: "typesafe",
       adapter: undefined,
-      secret: "ts-secret",
+      api_key: "ts-secret",
       api_base: upstream.baseUrl,
     });
     await direct("dec-no-confidence", "jev-latest", typesafeAt(noConfidence));
@@ -367,18 +367,18 @@ describe("decision endpoints e2e: /v1/systemone + /v1/decisions", () => {
     });
     await direct("dec-openai-no-usage", "gpt-6-luna", {
       provider: "openai",
-      secret: "sk-openai",
+      api_key: "sk-openai",
       api_base: `${openaiNoUsage.baseUrl}/v1`,
     });
     await direct("dec-openai-no-confidence", "gpt-6-luna", {
       provider: "openai",
-      secret: "sk-openai",
+      api_key: "sk-openai",
       api_base: `${openaiNoConfidence.baseUrl}/v1`,
     });
     await direct(
       "dec-embedding",
       "text-embedding-3-small",
-      { provider: "openai", secret: "sk-openai", api_base: `${openai.baseUrl}/v1` },
+      { provider: "openai", api_key: "sk-openai", api_base: `${openai.baseUrl}/v1` },
       { embedding: { dimensions: 4, normalize: true } },
     );
     await seed.createModel({

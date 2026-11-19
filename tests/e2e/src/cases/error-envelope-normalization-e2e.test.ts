@@ -185,7 +185,7 @@ describe("error envelope normalization e2e: provider-native 4xx → OpenAI-shape
 
       const pk = await seed.createProviderKey({
         display_name: `${tc.displayName}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}${tc.apiBaseSuffix}`,
         // Post-#302 Phase A: `Hub::dispatch_two_tier` needs the PK
         // to carry both `provider` (vendor identity, open string)

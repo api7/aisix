@@ -109,24 +109,24 @@ describe.each(["full", "metadata_only"] as const)(
         detectors: [{ type: "email", action: "mask" }],
       });
       await seed.update("mcp_servers", randomUUID(), {
-        display_name: "faulty",
+        name: "faulty",
         url: faulty.url,
         enabled: true,
       });
       await seed.update("mcp_servers", randomUUID(), {
-        display_name: "slow",
+        name: "slow",
         url: faulty.url,
         enabled: true,
         timeout_ms: 500,
       });
       const closedPort = await unusedPort();
       await seed.update("mcp_servers", randomUUID(), {
-        display_name: "gone",
+        name: "gone",
         url: `http://127.0.0.1:${closedPort}/mcp`,
         enabled: true,
       });
       await seed.update("mcp_servers", randomUUID(), {
-        display_name: "signedout",
+        name: "signedout",
         url: faulty.url,
         enabled: true,
         auth_type: "oauth2",

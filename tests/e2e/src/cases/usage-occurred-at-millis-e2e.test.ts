@@ -74,7 +74,7 @@ describe("usage occurred_at has millisecond precision (AISIX-Cloud#1368)", () =>
     });
     const pk = await seed.createProviderKey({
       display_name: "oam-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

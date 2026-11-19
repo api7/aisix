@@ -74,7 +74,7 @@ describe("wildcard alias identity e2e", () => {
     upstreams.push(upstream);
     const pk = await seed.createProviderKey({
       display_name: "wid-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -105,7 +105,7 @@ describe("wildcard alias identity e2e", () => {
     upstreams.push(sse);
     const pk2 = await seed.createProviderKey({
       display_name: "wid2-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${sse.baseUrl}/v1`,
     });
     await seed.createModel({

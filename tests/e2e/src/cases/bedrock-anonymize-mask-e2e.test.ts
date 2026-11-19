@@ -216,7 +216,7 @@ describe("bedrock guardrail ANONYMIZE write-back (#932 follow-up)", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "bmask-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -232,7 +232,7 @@ describe("bedrock guardrail ANONYMIZE write-back (#932 follow-up)", () => {
 
     const streamPk = await seed.createProviderKey({
       display_name: "bmask-stream-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
     await seed.createModel({

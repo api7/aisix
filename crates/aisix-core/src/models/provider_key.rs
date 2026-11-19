@@ -38,11 +38,6 @@ pub struct ProviderKey {
     /// Upstream provider's API key. The gateway receives plaintext so it
     /// can authenticate to the upstream provider. Protect the configuration
     /// store and transport accordingly.
-    // `secret` is the field's former name; stored documents and callers
-    // that still use it keep deserializing (schema-side acceptance lives
-    // in `schema::provider_key_root_schema`). Re-serialization always
-    // emits `api_key`.
-    #[serde(alias = "secret")]
     #[schemars(length(min = 1))]
     pub api_key: String,
 
@@ -661,7 +656,7 @@ mod tests {
     #[test]
     fn deserialises_minimal_provider_key() {
         let p: ProviderKey =
-            serde_json::from_str(r#"{"display_name":"openai-prod","secret":"sk-prod-xxxx"}"#)
+            serde_json::from_str(r#"{"display_name":"openai-prod","api_key":"sk-prod-xxxx"}"#)
                 .unwrap();
         assert_eq!(p.display_name, "openai-prod");
         assert_eq!(p.api_key, "sk-prod-xxxx");
@@ -671,7 +666,7 @@ mod tests {
     #[test]
     fn deserialises_with_api_base() {
         let p: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"openai-proxy","secret":"sk-x","api_base":"https://proxy.example.com/v1"}"#,
+            r#"{"display_name":"openai-proxy","api_key":"sk-x","api_base":"https://proxy.example.com/v1"}"#,
         )
         .unwrap();
         assert_eq!(p.api_base.as_deref(), Some("https://proxy.example.com/v1"));
@@ -684,7 +679,7 @@ mod tests {
         // strict schema validator (validate_provider_key in
         // models/schema.rs).
         let p: ProviderKey =
-            serde_json::from_str(r#"{"display_name":"x","secret":"k","extra":1}"#).unwrap();
+            serde_json::from_str(r#"{"display_name":"x","api_key":"k","extra":1}"#).unwrap();
         assert_eq!(p.display_name, "x");
     }
 
@@ -825,8 +820,6 @@ mod tests {
         assert!(err.to_string().contains("invalid IP address"), "{err}");
     }
 
-    // ---- `secret` → `api_key` rename ----
-
     #[test]
     fn accepts_canonical_api_key_spelling() {
         let p: ProviderKey =
@@ -836,46 +829,18 @@ mod tests {
     }
 
     #[test]
-    fn legacy_secret_spelling_still_deserialises() {
-        // Stored documents written before the rename spell the field
-        // `secret`; the serde alias must keep loading them. (Most other
-        // fixtures in this module double as coverage for this, but pin
-        // it explicitly so the intent survives fixture migrations.)
-        let p: ProviderKey =
-            serde_json::from_str(r#"{"display_name":"openai-prod","secret":"sk-legacy"}"#).unwrap();
-        assert_eq!(p.api_key, "sk-legacy");
-    }
-
-    #[test]
-    fn serialises_credential_under_api_key_only() {
-        // Emission contract: re-serialization (admin GET responses,
-        // admin-written documents) uses the canonical name, never the
-        // former spelling.
-        let p: ProviderKey =
-            serde_json::from_str(r#"{"display_name":"x","secret":"sk-x"}"#).unwrap();
-        let s = serde_json::to_string(&p).unwrap();
-        assert!(s.contains(r#""api_key":"sk-x""#), "got: {s}");
-        assert!(!s.contains(r#""secret""#), "got: {s}");
-    }
-
-    #[test]
-    fn rejects_document_carrying_both_spellings() {
-        // serde maps the alias onto the same field, so a document that
-        // carries both spellings is a duplicate-field error — the
-        // ambiguity is rejected instead of one value silently winning.
-        let r: Result<ProviderKey, _> =
-            serde_json::from_str(r#"{"display_name":"x","api_key":"sk-new","secret":"sk-old"}"#);
-        let err = r.expect_err("both spellings in one document must be rejected");
-        assert!(
-            err.to_string().contains("duplicate field"),
-            "expected a duplicate-field error, got: {err}"
-        );
+    fn the_retired_secret_spelling_no_longer_deserialises() {
+        let err = serde_json::from_str::<ProviderKey>(
+            r#"{"display_name":"openai-prod","secret":"sk-legacy"}"#,
+        )
+        .expect_err("`secret` is no longer read as `api_key`");
+        assert!(err.to_string().contains("missing field `api_key`"), "{err}");
     }
 
     #[test]
     fn resource_trait_routes_through_display_name() {
         let mut p: ProviderKey =
-            serde_json::from_str(r#"{"display_name":"openai-prod","secret":"sk-x"}"#).unwrap();
+            serde_json::from_str(r#"{"display_name":"openai-prod","api_key":"sk-x"}"#).unwrap();
         p.runtime_id = "uuid-pk-1".into();
         assert_eq!(<ProviderKey as Resource>::kind(), "provider_keys");
         assert_eq!(p.id(), "uuid-pk-1");
@@ -891,7 +856,7 @@ mod tests {
         // `adapter`, no `telemetry_tags`) must still deserialize, and
         // the new fields must land at their zero values.
         let p: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"openai-prod","secret":"sk-x","api_base":"https://api.openai.com/v1"}"#,
+            r#"{"display_name":"openai-prod","api_key":"sk-x","api_base":"https://api.openai.com/v1"}"#,
         )
         .unwrap();
         assert_eq!(p.provider, "");
@@ -904,7 +869,7 @@ mod tests {
         let p: ProviderKey = serde_json::from_str(
             r#"{
                 "display_name": "deepseek-prod",
-                "secret": "sk-x",
+                "api_key": "sk-x",
                 "api_base": "https://api.deepseek.com/v1",
                 "provider": "deepseek",
                 "adapter": "openai",
@@ -936,7 +901,7 @@ mod tests {
         let p: ProviderKey = serde_json::from_str(
             r#"{
                 "display_name": "internal-llm",
-                "secret": "sk-x",
+                "api_key": "sk-x",
                 "telemetry_tags": {
                     "kind": "byo",
                     "branded_provider": null,
@@ -960,7 +925,7 @@ mod tests {
         let p: ProviderKey = serde_json::from_str(
             r#"{
                 "display_name": "x",
-                "secret": "k",
+                "api_key": "k",
                 "telemetry_tags": { "unknown_tag": "v", "featured": true }
             }"#,
         )
@@ -973,7 +938,7 @@ mod tests {
         // `adapter` is the closed `Adapter` enum — unknown shape
         // strings must fail loudly rather than silently fall through.
         let r: Result<ProviderKey, _> = serde_json::from_str(
-            r#"{"display_name":"x","secret":"k","adapter":"not-a-real-adapter"}"#,
+            r#"{"display_name":"x","api_key":"k","adapter":"not-a-real-adapter"}"#,
         );
         assert!(r.is_err());
     }
@@ -1052,7 +1017,7 @@ mod tests {
         // the Phase A2.5 PR must still deserialize, and `request` /
         // `response` must land at `None`.
         let p: ProviderKey =
-            serde_json::from_str(r#"{"display_name":"openai-prod","secret":"sk-x"}"#).unwrap();
+            serde_json::from_str(r#"{"display_name":"openai-prod","api_key":"sk-x"}"#).unwrap();
         assert!(p.request.is_none());
         assert!(p.response.is_none());
     }
@@ -1062,7 +1027,7 @@ mod tests {
         // `{"request": {}}` must succeed and yield an all-default
         // RequestOverrides — empty maps, no constraints.
         let p: ProviderKey =
-            serde_json::from_str(r#"{"display_name":"x","secret":"k","request":{}}"#).unwrap();
+            serde_json::from_str(r#"{"display_name":"x","api_key":"k","request":{}}"#).unwrap();
         let req = p.request.expect("request was Some");
         assert!(req.param_renames.is_empty());
         assert!(req.param_constraints.is_none());
@@ -1076,7 +1041,7 @@ mod tests {
         let p: ProviderKey = serde_json::from_str(
             r#"{
                 "display_name": "deepseek-prod",
-                "secret": "sk-x",
+                "api_key": "sk-x",
                 "request": {
                     "param_renames":      { "max_completion_tokens": "max_tokens" },
                     "param_constraints":  { "temperature_max": 1.0 },
@@ -1110,7 +1075,7 @@ mod tests {
         let p: ProviderKey = serde_json::from_str(
             r#"{
                 "display_name": "x",
-                "secret": "k",
+                "api_key": "k",
                 "request": { "param_rename": {}, "default_headers": { "X-Foo": "bar" } }
             }"#,
         )
@@ -1122,7 +1087,7 @@ mod tests {
     #[test]
     fn response_overrides_empty_object_deserialises_to_defaults() {
         let p: ProviderKey =
-            serde_json::from_str(r#"{"display_name":"x","secret":"k","response":{}}"#).unwrap();
+            serde_json::from_str(r#"{"display_name":"x","api_key":"k","response":{}}"#).unwrap();
         let resp = p.response.expect("response was Some");
         assert!(resp.stream_done_marker.is_none());
         assert!(!resp.content_list_to_string);
@@ -1136,7 +1101,7 @@ mod tests {
         let p: ProviderKey = serde_json::from_str(
             r#"{
                 "display_name": "deepseek-prod",
-                "secret": "sk-x",
+                "api_key": "sk-x",
                 "response": {
                     "stream_done_marker":     "required",
                     "content_list_to_string": false,
@@ -1164,7 +1129,7 @@ mod tests {
         let p: ProviderKey = serde_json::from_str(
             r#"{
                 "display_name": "x",
-                "secret": "k",
+                "api_key": "k",
                 "response": { "reasoning_fields": "delta.foo", "error_envelope": "openai" }
             }"#,
         )
@@ -1227,14 +1192,14 @@ mod tests {
     // ---- Issue #411 strip_headers deserialize/normalize ----
 
     fn pk_with_strip(strip_json: &str) -> ProviderKey {
-        let json = format!(r#"{{"display_name":"x","secret":"sk","strip_headers":{strip_json}}}"#);
+        let json = format!(r#"{{"display_name":"x","api_key":"sk","strip_headers":{strip_json}}}"#);
         serde_json::from_str(&json).unwrap()
     }
 
     #[test]
     fn strip_headers_default_applies_when_field_absent() {
         let pk: ProviderKey =
-            serde_json::from_str(r#"{"display_name":"x","secret":"sk"}"#).unwrap();
+            serde_json::from_str(r#"{"display_name":"x","api_key":"sk"}"#).unwrap();
         assert_eq!(pk.strip_headers, default_strip_headers());
     }
 

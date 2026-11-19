@@ -139,7 +139,7 @@ describe("mcp mask write-back e2e: /mcp", () => {
   ): Promise<void> => {
     const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "eda",
+      name: "eda",
       url: upstream!.url,
       enabled: true,
     });

@@ -61,8 +61,6 @@ describe("auth baseline e2e: missing/malformed/unknown bearer all fail closed", 
     // must NOT degrade to "any-key-works".
     const pk = await seed.createProviderKey({
       display_name: "auth-baseline-pk",
-      // Canonical credential spelling; most other cases still seed the
-      // former `secret` spelling, keeping both accepted long-term.
       api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });

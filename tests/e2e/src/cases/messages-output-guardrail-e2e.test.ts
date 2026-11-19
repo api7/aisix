@@ -35,7 +35,7 @@ describe("/v1/messages output guardrail (#448)", () => {
     seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "msgout-gr-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     // OpenAI-provider model → /v1/messages takes the cross-provider path

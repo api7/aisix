@@ -86,7 +86,7 @@ describe("Gemini OpenAI-compatible streamed parallel tool calls", () => {
     const pk = await seed.createProviderKey({
       display_name: "gemini-compat-parallel-tools-pk",
       provider: "google",
-      secret: "gemini-mock-key",
+      api_key: "gemini-mock-key",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({

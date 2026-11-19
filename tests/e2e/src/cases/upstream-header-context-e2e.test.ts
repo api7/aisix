@@ -115,7 +115,7 @@ describe("upstream header context e2e: ${...} variables + client-header allowlis
 
     const openaiPk = await seed.createProviderKey({
       display_name: "hdrctx-openai-pk",
-      secret: PROVIDER_SECRET,
+      api_key: PROVIDER_SECRET,
       api_base: `${upstream.baseUrl}/v1`,
       request,
     });
@@ -132,7 +132,7 @@ describe("upstream header context e2e: ${...} variables + client-header allowlis
       display_name: "hdrctx-anthropic-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: PROVIDER_SECRET,
+      api_key: PROVIDER_SECRET,
       api_base: anthropicUpstream.baseUrl,
       request,
     });

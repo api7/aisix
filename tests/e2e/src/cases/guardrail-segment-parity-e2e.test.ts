@@ -198,7 +198,7 @@ describe("guardrail segment parity e2e: /mcp", () => {
     for (const [server, body] of guarded) {
       const serverId = randomUUID();
       await seed.update("mcp_servers", serverId, {
-        display_name: server,
+        name: server,
         url: upstream.url,
         enabled: true,
       });
@@ -432,7 +432,7 @@ describe("guardrail segment parity e2e: chat and responses", () => {
     for (const [name, upstream, guardrail] of models) {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       const model = await seed.createModel({
@@ -637,7 +637,7 @@ describe("guardrail segment parity e2e: streaming /v1/messages", () => {
       const name = `seg-msg-${mode}`;
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-anth-mock",
+        api_key: "sk-anth-mock",
         api_base: upstream.baseUrl,
       });
       const model = await seed.createModel({

@@ -142,7 +142,7 @@ describe("anthropic cache tokens count toward TPM (AISIX-Cloud#995)", () => {
         display_name: `${name}-pk`,
         provider: "anthropic",
         adapter: "anthropic",
-        secret: "sk-ant-mock",
+        api_key: "sk-ant-mock",
         api_base: upstream.baseUrl,
       });
       await seed!.createModel({

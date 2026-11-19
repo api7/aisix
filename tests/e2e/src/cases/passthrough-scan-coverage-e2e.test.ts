@@ -399,7 +399,7 @@ describe("passthrough guardrail scan coverage", () => {
     });
     const pk = await seed.createProviderKey({
       display_name: "pt-scan-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: upstreams.input.baseUrl,
     });
     for (const [name, upstream] of Object.entries(upstreams)) {
@@ -1360,7 +1360,7 @@ describe("passthrough encoded successful output fail-open", () => {
     });
     const providerKey = await seed.createProviderKey({
       display_name: "pt-encoded-fail-open-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: bufferedUpstream.baseUrl,
     });
     await seed.createPassthroughRoute({
@@ -1470,7 +1470,7 @@ describe("passthrough supplemental selector fail-closed", () => {
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const providerKey = await seed.createProviderKey({
       display_name: "pt-scan-supplemental-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createPassthroughRoute({
@@ -1587,7 +1587,7 @@ describe("passthrough unevaluable-output fail-open", () => {
     });
     const providerKey = await seed.createProviderKey({
       display_name: "pt-scan-fail-open-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createPassthroughRoute({
@@ -1801,7 +1801,7 @@ describe("passthrough Raw stream held fail-open continuity", () => {
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const providerKey = await seed.createProviderKey({
       display_name: "pt-scan-held-fail-open-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createPassthroughRoute({

@@ -113,12 +113,12 @@ describe("the audio endpoints relay their response as it arrives (#998)", () => 
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const transcribePk = await seed.createProviderKey({
       display_name: "issue998-transcribe-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${transcribeUpstream.baseUrl}/v1`,
     });
     const speechPk = await seed.createProviderKey({
       display_name: "issue998-speech-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${speechUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -135,7 +135,7 @@ describe("the audio endpoints relay their response as it arrives (#998)", () => 
     });
     const wholeSpeechPk = await seed.createProviderKey({
       display_name: "issue998-whole-speech-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${wholeSpeechUpstream.baseUrl}/v1`,
     });
     await seed.createModel({

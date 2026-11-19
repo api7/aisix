@@ -65,7 +65,7 @@ describe("rate limit e2e: day window (#771)", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "day-window-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

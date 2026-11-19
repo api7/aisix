@@ -232,7 +232,7 @@ describe("OpenAI tools round-trip (#220 + #202)", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "openai-tools-rt-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({

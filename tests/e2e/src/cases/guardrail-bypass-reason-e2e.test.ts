@@ -151,7 +151,7 @@ describe("guardrail bypass reason across the handler family", () => {
     ): Promise<void> => {
       const pk = await seed.createProviderKey({
         display_name: `${display}-pk`,
-        secret: "sk-mock-upstream",
+        api_key: "sk-mock-upstream",
         api_base: up.baseUrl,
         provider,
         adapter: provider,

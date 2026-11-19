@@ -82,7 +82,7 @@ describe("exporter delivery errors carry no configured credential", () => {
     });
     const pk = await seed.createProviderKey({
       display_name: "redaction-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

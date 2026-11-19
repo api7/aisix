@@ -72,7 +72,7 @@ describe("provider_key api_base re-point reaches the new host", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "repoint-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${hostA.baseUrl}/v1`,
     });
     pkId = pk.id;
@@ -132,7 +132,7 @@ describe("provider_key api_base re-point reaches the new host", () => {
       provider: "openai",
       adapter: "openai",
       display_name: "repoint-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${hostB!.baseUrl}/v1`,
     });
 

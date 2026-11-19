@@ -96,7 +96,7 @@ describe("aisix_llm_tokens_by_client_total token_type=total is cache-inclusive (
       display_name: `${MODEL}-pk`,
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({

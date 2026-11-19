@@ -160,7 +160,7 @@ describe("audio duration cost basis (#1138)", () => {
 
     const jsonPK = await seed.createProviderKey({
       display_name: "issue1138-duration-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${jsonUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -171,7 +171,7 @@ describe("audio duration cost basis (#1138)", () => {
     });
     const textPK = await seed.createProviderKey({
       display_name: "issue1138-text-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${textUpstream.baseUrl}/v1`,
     });
     await seed.createModel({

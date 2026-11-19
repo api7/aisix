@@ -104,7 +104,7 @@ describe("bedrock header precedence e2e", () => {
       display_name: "bedrock-hdr-prec-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-hdr-prec-e2e",
         secret_access_key: "sk-hdr-prec-e2e",
         region: "us-west-2",

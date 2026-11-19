@@ -184,7 +184,7 @@ describe("Claude streaming tool calls reach OpenAI-protocol clients", () => {
         display_name: `${MODELS[key]}-pk`,
         provider: "anthropic",
         adapter: "anthropic",
-        secret: "sk-anth-mock",
+        api_key: "sk-anth-mock",
         api_base: upstreams[key]!.baseUrl,
       });
       await seed.createModel({
@@ -198,7 +198,7 @@ describe("Claude streaming tool calls reach OpenAI-protocol clients", () => {
       display_name: `${MODELS.vertex}-pk`,
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({ access_token: "ya29.stream-tools", project: "p", region: "us-east5" }),
+      api_key: JSON.stringify({ access_token: "ya29.stream-tools", project: "p", region: "us-east5" }),
       api_base: upstreams.vertex!.baseUrl,
     });
     await seed.createModel({

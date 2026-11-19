@@ -172,7 +172,7 @@ describe("exporters record the request and upstream response headers they list",
     const model = async (name: string, mock: OpenAiUpstream) => {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${mock.baseUrl}/v1`,
       });
       await seed.createModel({
@@ -201,7 +201,7 @@ describe("exporters record the request and upstream response headers they list",
       auth_header_name: "x-gw-key",
     });
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "urh",
+      name: "urh",
       url: mcp.url,
       enabled: true,
     });

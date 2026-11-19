@@ -69,14 +69,14 @@ describe("audio request timeout (#911 [22])", () => {
     const slowPk = (
       await seed.createProviderKey({
         display_name: "audio-slow-pk",
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${slow.baseUrl}/v1`,
       })
     ).id;
     const fastPk = (
       await seed.createProviderKey({
         display_name: "audio-gate-pk",
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${fast.baseUrl}/v1`,
       })
     ).id;

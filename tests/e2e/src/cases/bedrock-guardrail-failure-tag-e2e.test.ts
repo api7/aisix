@@ -111,7 +111,7 @@ describe("Bedrock guardrail failure tags", () => {
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "bft-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const models: string[] = [];

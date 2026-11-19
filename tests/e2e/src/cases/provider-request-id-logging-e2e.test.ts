@@ -134,7 +134,7 @@ describe("provider_request_id reaches the access log and the plain log", () => {
     ] as const) {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({

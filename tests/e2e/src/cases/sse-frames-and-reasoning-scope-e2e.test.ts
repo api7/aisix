@@ -106,14 +106,14 @@ describe("sse frames + reasoning scope e2e (#1103/#1104)", () => {
       protocol === "anthropic"
         ? {
             display_name: `${display}-pk`,
-            secret: "sk-mock",
+            api_key: "sk-mock",
             api_base: upstream.baseUrl,
             provider: "anthropic",
             adapter: "anthropic",
           }
         : {
             display_name: `${display}-pk`,
-            secret: "sk-mock",
+            api_key: "sk-mock",
             api_base: `${upstream.baseUrl}/v1`,
           },
     );

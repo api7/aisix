@@ -69,8 +69,8 @@ describe("usage events sent to the control plane are bounded", () => {
     app = await spawnApp({ extra: { managed: cp.managed }, awaitProxyListener: false });
     const seed = new SeedClient(etcd, `${app.etcdPrefix}/${cp.envId}`);
 
-    const pkPlain = await seed.createProviderKey({ display_name: "tcb-pk-plain", secret: "sk-mock", api_base: `${plain.baseUrl}/v1` });
-    const pkVerbose = await seed.createProviderKey({ display_name: "tcb-pk-verbose", secret: "sk-mock", api_base: `${verbose.baseUrl}/v1` });
+    const pkPlain = await seed.createProviderKey({ display_name: "tcb-pk-plain", api_key: "sk-mock", api_base: `${plain.baseUrl}/v1` });
+    const pkVerbose = await seed.createProviderKey({ display_name: "tcb-pk-verbose", api_key: "sk-mock", api_base: `${verbose.baseUrl}/v1` });
     await seed.createModel({ display_name: "tcb/*", provider: "openai", model_name: "*", provider_key_id: pkPlain.id });
     await seed.createModel({ display_name: "tcb-verbose", provider: "openai", model_name: "gpt-4o-mini", provider_key_id: pkVerbose.id });
     await seed.createApiKey({ key_hash: hash(KEY), allowed_models: ["*"] });

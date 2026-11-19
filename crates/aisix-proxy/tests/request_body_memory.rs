@@ -272,7 +272,7 @@ fn snapshot(api_base: &str, capture_content: bool) -> AisixSnapshot {
     let snap = AisixSnapshot::new();
     for (pk_id, provider) in [(PK_ID, "openai"), (ANTHROPIC_PK_ID, "anthropic")] {
         let pk: aisix_core::ProviderKey = serde_json::from_str(&format!(
-            r#"{{"display_name":"{provider}-up","secret":"sk-upstream","api_base":"{api_base}","provider":"{provider}","adapter":"{provider}"}}"#
+            r#"{{"display_name":"{provider}-up","api_key":"sk-upstream","api_base":"{api_base}","provider":"{provider}","adapter":"{provider}"}}"#
         ))
         .unwrap();
         snap.provider_keys.insert(ResourceEntry::new(pk_id, pk, 1));

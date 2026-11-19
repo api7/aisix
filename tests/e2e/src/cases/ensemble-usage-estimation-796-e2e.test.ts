@@ -117,7 +117,7 @@ describe("ensemble usage estimation e2e (api7/aisix#796): every panel + judge su
     const seedModel = async (display: string, upstream: OpenAiUpstream) => {
       const pk = await seed!.createProviderKey({
         display_name: `${display}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed!.createModel({

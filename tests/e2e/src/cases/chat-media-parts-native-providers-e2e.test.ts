@@ -207,7 +207,7 @@ describe("chat media content parts → native provider media shapes", () => {
       display_name: "media-anthropic-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({
@@ -221,7 +221,7 @@ describe("chat media content parts → native provider media shapes", () => {
       display_name: "media-vertex-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_token: "ya29.media-e2e",
         project: "proj-e2e",
         region: "us-central1",
@@ -245,7 +245,7 @@ describe("chat media content parts → native provider media shapes", () => {
       display_name: "media-bedrock-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-media-e2e",
         secret_access_key: "sk-media-e2e",
         region: "us-west-2",
@@ -703,7 +703,7 @@ describe("chat media URLs with upstream.media_fetch.enabled: false", () => {
       display_name: "media-off-bedrock-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-media-e2e",
         secret_access_key: "sk-media-e2e",
         region: "us-west-2",
@@ -781,7 +781,7 @@ describe("chat media downloads count against proxy.request_body_limit_bytes", ()
       display_name: "media-total-bedrock-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-media-e2e",
         secret_access_key: "sk-media-e2e",
         region: "us-west-2",
@@ -998,7 +998,7 @@ async function spawnNovaGateway(
     display_name: `${caller}-bedrock-pk`,
     provider: "bedrock",
     adapter: "bedrock",
-    secret: JSON.stringify({
+    api_key: JSON.stringify({
       access_key_id: "AKIA-media-e2e",
       secret_access_key: "sk-media-e2e",
       region: "us-west-2",

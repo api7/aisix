@@ -78,7 +78,7 @@ describe("usage events sent to the control plane carry configured numbers as wri
     app = await spawnApp({ extra: { managed: cp.managed }, awaitProxyListener: false });
     const seed = new SeedClient(etcd, `${app.etcdPrefix}/${cp.envId}`);
 
-    const embedPk = await seed.createProviderKey({ display_name: "tcf-embed-pk", secret: "sk-mock", api_base: `${embed.baseUrl}/v1` });
+    const embedPk = await seed.createProviderKey({ display_name: "tcf-embed-pk", api_key: "sk-mock", api_base: `${embed.baseUrl}/v1` });
     await seed.createModel({
       display_name: EMBED_MODEL,
       provider: "openai",
@@ -86,7 +86,7 @@ describe("usage events sent to the control plane carry configured numbers as wri
       provider_key_id: embedPk.id,
       embedding: { dimensions: 4, normalize: true },
     });
-    const chatPk = await seed.createProviderKey({ display_name: "tcf-chat-pk", secret: "sk-mock", api_base: `${upstream.baseUrl}/v1` });
+    const chatPk = await seed.createProviderKey({ display_name: "tcf-chat-pk", api_key: "sk-mock", api_base: `${upstream.baseUrl}/v1` });
     const chat = await seed.createModel({
       display_name: CHAT_MODEL,
       provider: "openai",

@@ -140,7 +140,7 @@ describe("OpenAI /v1/embeddings encoding_format (#393)", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "openai-embed-b64-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({

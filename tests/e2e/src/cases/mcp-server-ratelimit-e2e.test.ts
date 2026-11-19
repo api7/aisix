@@ -143,12 +143,12 @@ describe("mcp server rate limit e2e: per api key × mcp server", () => {
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "alpha",
+      name: "alpha",
       url: alpha.url,
       enabled: true,
     });
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "beta",
+      name: "beta",
       url: beta.url,
       enabled: true,
     });

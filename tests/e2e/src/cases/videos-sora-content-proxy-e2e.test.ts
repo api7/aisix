@@ -168,7 +168,7 @@ describe("videos e2e: openai Sora content-streaming proxy", () => {
     const seedModel = async (name: string, apiBase: string) => {
       const pk = await seed!.createProviderKey({
         display_name: `${name}-pk`,
-        secret: PROVIDER_SECRET,
+        api_key: PROVIDER_SECRET,
         api_base: apiBase,
         provider: "openai",
       });

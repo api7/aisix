@@ -207,7 +207,7 @@ describe("streamed transcription duration cost basis", () => {
     const model = async (name: string, up: OpenAiUpstream, upstreamModel: string) => {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-openai-mock",
+        api_key: "sk-openai-mock",
         api_base: `${up.baseUrl}/v1`,
       });
       await seed.createModel({

@@ -170,7 +170,7 @@ describe("aliyun guardrail e2e: TextModerationPlus blocks risky input/output", (
 
     const benignPk = await seed.createProviderKey({
       display_name: "aliyun-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${benignUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -182,7 +182,7 @@ describe("aliyun guardrail e2e: TextModerationPlus blocks risky input/output", (
 
     const riskyOutPk = await seed.createProviderKey({
       display_name: "aliyun-out-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${riskyOutputUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -194,7 +194,7 @@ describe("aliyun guardrail e2e: TextModerationPlus blocks risky input/output", (
 
     const streamPk = await seed.createProviderKey({
       display_name: "aliyun-stream-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
     await seed.createModel({

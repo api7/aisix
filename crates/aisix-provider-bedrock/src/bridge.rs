@@ -4006,7 +4006,7 @@ mod tests {
     /// URI to drive `bridge.chat()` end-to-end.
     fn sample_pk_with_secret(secret_json: &str) -> Arc<ProviderKey> {
         let cfg = format!(
-            r#"{{"display_name": "bedrock-prod", "secret": {}}}"#,
+            r#"{{"display_name": "bedrock-prod", "api_key": {}}}"#,
             serde_json::to_string(secret_json).unwrap()
         );
         Arc::new(serde_json::from_str(&cfg).unwrap())
@@ -6877,7 +6877,7 @@ mod tests {
         Arc::new(
             serde_json::from_value(serde_json::json!({
                 "display_name": "bedrock-prod",
-                "secret": valid_secret_json(),
+                "api_key": valid_secret_json(),
                 "request": request,
             }))
             .expect("provider_key with request overrides deserializes"),
@@ -6889,7 +6889,7 @@ mod tests {
         Arc::new(
             serde_json::from_value(serde_json::json!({
                 "display_name": "bedrock-prod",
-                "secret": valid_secret_json(),
+                "api_key": valid_secret_json(),
                 "response": response,
             }))
             .expect("provider_key with response overrides deserializes"),

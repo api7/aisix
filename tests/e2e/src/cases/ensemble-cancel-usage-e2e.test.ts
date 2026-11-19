@@ -85,7 +85,7 @@ describe("an ensemble abandoned after its panel answered", () => {
     ] as const) {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: PROVIDER_SECRET,
+        api_key: PROVIDER_SECRET,
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({

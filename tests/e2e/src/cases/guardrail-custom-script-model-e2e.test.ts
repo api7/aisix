@@ -62,7 +62,7 @@ describe("custom guardrail script: ctx.model on the segment pass", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "csm-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const gr = await seed.createGuardrail(
@@ -91,7 +91,7 @@ describe("custom guardrail script: ctx.model on the segment pass", () => {
       display_name: "csm-anthropic-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
     for (const alias of [CT_BLOCKED, CT_ALLOWED]) {

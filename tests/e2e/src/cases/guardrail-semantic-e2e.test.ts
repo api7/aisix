@@ -343,7 +343,7 @@ describe("semantic guardrail kind e2e", () => {
     if (!seed) throw new Error("seed not ready");
     const pk = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const model = await seed.createModel({
@@ -362,7 +362,7 @@ describe("semantic guardrail kind e2e", () => {
     if (!seed) throw new Error("seed not ready");
     const pk = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${mock.baseUrl}/v1`,
     });
     await seed.createModel({

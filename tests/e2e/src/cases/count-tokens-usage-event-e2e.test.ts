@@ -119,7 +119,7 @@ describe("count_tokens usage e2e: served and refused requests both leave a row (
     // count_tokens only dispatches to Anthropic-protocol targets.
     const pk = await seed.createProviderKey({
       display_name: "ctu-pk",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({

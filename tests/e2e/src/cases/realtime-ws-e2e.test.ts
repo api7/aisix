@@ -219,7 +219,7 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     });
     const pk = await seed.createProviderKey({
       display_name: "realtime-e2e-pk",
-      secret: "sk-upstream-realtime",
+      api_key: "sk-upstream-realtime",
       api_base: `http://127.0.0.1:${upstream.port}/v1`,
     });
     await seed.createModel({
@@ -235,7 +235,7 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     // that proves the setting survives a real binary + etcd propagation.
     const fwdPk = await seed.createProviderKey({
       display_name: "realtime-e2e-fwd-pk",
-      secret: "sk-upstream-realtime",
+      api_key: "sk-upstream-realtime",
       api_base: `http://127.0.0.1:${upstream.port}/v1`,
       request: {
         forward_client_headers: ["x-user-jwt", "sec-websocket-protocol"],
@@ -252,7 +252,7 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     // nothing — the subject of the connect-budget case below.
     const silentPk = await seed.createProviderKey({
       display_name: "realtime-e2e-silent-pk",
-      secret: "sk-upstream-realtime",
+      api_key: "sk-upstream-realtime",
       api_base: `http://127.0.0.1:${silent.port}/v1`,
     });
     await seed.createModel({
@@ -265,7 +265,7 @@ describe("realtime e2e: /v1/realtime WebSocket relay (#721)", () => {
     // A model whose upstream drops the session on its first event.
     const droppingPk = await seed.createProviderKey({
       display_name: "realtime-e2e-drop-pk",
-      secret: "sk-upstream-realtime",
+      api_key: "sk-upstream-realtime",
       api_base: `http://127.0.0.1:${dropping.port}/v1`,
     });
     await seed.createModel({

@@ -124,7 +124,7 @@ describe("etcd.dial_timeout_ms & etcd.request_timeout_ms", () => {
     const seed = new SeedClient(etcd!, prefix);
     const pk = await seed.createProviderKey({
       display_name: `etcd-timeout-pk-${displayName}`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream!.baseUrl}/v1`,
     });
     await seed.createModel({

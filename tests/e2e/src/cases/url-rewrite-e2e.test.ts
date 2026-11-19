@@ -148,7 +148,7 @@ describe("url rewrite e2e: proxy.url_rewrites", () => {
     const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
 
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "alpha",
+      name: "alpha",
       url: alpha.url,
       enabled: true,
     });

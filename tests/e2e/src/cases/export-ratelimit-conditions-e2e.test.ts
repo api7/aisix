@@ -59,7 +59,7 @@ describe("aisix export: a conditional rate-limit policy on model and api_key lea
 
     const pk = await seed.createProviderKey({
       display_name: "erlc-pk",
-      secret: "sk-upstream",
+      api_key: "sk-upstream",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const models: Record<string, string> = {};

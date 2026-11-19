@@ -210,7 +210,7 @@ describe("an upstream 200 that reports a failure in its body", () => {
       if (kind === "anthropic") {
         const pk = await seed.createProviderKey({
           display_name: `${model}-pk`,
-          secret: "sk-ant-mock",
+          api_key: "sk-ant-mock",
           api_base: upstream.baseUrl,
           provider: "anthropic",
           adapter: "anthropic",
@@ -225,7 +225,7 @@ describe("an upstream 200 that reports a failure in its body", () => {
       }
       const pk = await seed.createProviderKey({
         display_name: `${model}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
         ...(kind === "responses-bridge" ? { apis: {} } : {}),
       });
@@ -278,7 +278,7 @@ describe("an upstream 200 that reports a failure in its body", () => {
       upstreams.push(upstream);
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       const route = await seed.createPassthroughRoute({

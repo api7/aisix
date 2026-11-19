@@ -127,14 +127,14 @@ describe("a Claude stream that stops before message_delta accounts the reported 
       display_name: "early-stop-anthropic-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-anth-mock",
+      api_key: "sk-anth-mock",
       api_base: baseUrl,
     });
     const vertexPk = await seed.createProviderKey({
       display_name: "early-stop-vertex-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({ access_token: "ya29.early-stop", project: "p", region: "us-east5" }),
+      api_key: JSON.stringify({ access_token: "ya29.early-stop", project: "p", region: "us-east5" }),
       api_base: baseUrl,
     });
     const names: string[] = [];

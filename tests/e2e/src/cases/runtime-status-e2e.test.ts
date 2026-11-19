@@ -83,12 +83,12 @@ describe("runtime status e2e", () => {
 
     const flakyPk = await seed.createProviderKey({
       display_name: "runtime-flaky-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${flakyUpstream.baseUrl}/v1`,
     });
     const stablePk = await seed.createProviderKey({
       display_name: "runtime-stable-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${stableUpstream.baseUrl}/v1`,
     });
     const flakyModel = await seed.createModel({

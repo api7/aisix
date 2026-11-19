@@ -131,7 +131,7 @@ describe("guardrail phase applicability e2e: samples only on attached hooks", ()
         display_name: `${model}-pk`,
         provider: "deepseek",
         adapter: "openai",
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${up.baseUrl}/v1`,
       });
       await seed.createModel({

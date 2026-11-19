@@ -58,7 +58,7 @@ describe("reasoning effort → Claude families without effort support: thinking 
       display_name: "budget-anthropic-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
     for (const [alias, name] of [
@@ -97,7 +97,7 @@ describe("reasoning effort → Claude families without effort support: thinking 
       display_name: "budget-bedrock-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-budget-e2e",
         secret_access_key: "sk-budget-e2e",
         region: "us-west-2",
@@ -115,7 +115,7 @@ describe("reasoning effort → Claude families without effort support: thinking 
       display_name: "budget-vertex-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_token: "ya29.budget-e2e",
         project: "proj-e2e",
         region: "us-east5",

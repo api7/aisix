@@ -194,7 +194,7 @@ describe("per-attempt telemetry e2e (#655): one UsageEvent per upstream attempt"
     if (!seed) throw new Error("seed client not initialized");
     const providerKey = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

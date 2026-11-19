@@ -661,7 +661,7 @@ mod tests {
 
     fn sample_provider_key(base: &str) -> Arc<ProviderKey> {
         let cfg = format!(
-            r#"{{"display_name":"anthropic-prod","secret":"sk-ant-test","api_base":"{base}"}}"#
+            r#"{{"display_name":"anthropic-prod","api_key":"sk-ant-test","api_base":"{base}"}}"#
         );
         Arc::new(serde_json::from_str(&cfg).unwrap())
     }
@@ -1026,7 +1026,7 @@ data: {\"type\":\"message_stop\"}\n\n";
     #[tokio::test]
     async fn missing_api_key_is_a_credentials_error() {
         let mut pk: ProviderKey =
-            serde_json::from_str(r#"{"display_name":"empty","secret":"placeholder"}"#).unwrap();
+            serde_json::from_str(r#"{"display_name":"empty","api_key":"placeholder"}"#).unwrap();
         pk.api_key.clear();
 
         let bridge = AnthropicBridge::new();
@@ -1043,7 +1043,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         // (control bytes) is a customer-fixable credential problem —
         // a 401 authentication_error, not a 500 (#367 follow-up).
         let pk: ProviderKey =
-            serde_json::from_str(r#"{"display_name":"bad","secret":"sk-live\n-injected"}"#)
+            serde_json::from_str(r#"{"display_name":"bad","api_key":"sk-live\n-injected"}"#)
                 .unwrap();
         let bridge = AnthropicBridge::new();
         let ctx = BridgeContext::new("req-1", sample_model(), Arc::new(pk));
@@ -1254,13 +1254,13 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
         // Default path: ProviderKey has no api_base → falls back to
         // ANTHROPIC_DEFAULT_BASE.
         let pk_default: ProviderKey =
-            serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
+            serde_json::from_str(r#"{"display_name":"x","api_key":"k"}"#).unwrap();
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_default));
         assert!(!resolve_base(&ctx).unwrap().is_empty());
 
         // api_base override: trailing slash stripped.
         let pk_override: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"x","secret":"k","api_base":"https://proxy.example.com/"}"#,
+            r#"{"display_name":"x","api_key":"k","api_base":"https://proxy.example.com/"}"#,
         )
         .unwrap();
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_override));
@@ -1268,7 +1268,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
     }
 
     fn pk_with_base(api_base: &str) -> ProviderKey {
-        let cfg = format!(r#"{{"display_name":"x","secret":"k","api_base":"{api_base}"}}"#);
+        let cfg = format!(r#"{{"display_name":"x","api_key":"k","api_base":"{api_base}"}}"#);
         serde_json::from_str(&cfg).unwrap()
     }
 
@@ -1330,7 +1330,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
             " bedrock-anthropic ",
         ] {
             let pk: ProviderKey = serde_json::from_str(&format!(
-                r#"{{"display_name":"x","secret":"k","provider":"{vendor}","adapter":"anthropic"}}"#
+                r#"{{"display_name":"x","api_key":"k","provider":"{vendor}","adapter":"anthropic"}}"#
             ))
             .unwrap();
             let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
@@ -1365,7 +1365,7 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
     #[test]
     fn family_bridge_allows_anthropic_vendor_with_empty_api_base() {
         let pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"a","secret":"sk-a","provider":"anthropic","adapter":"anthropic"}"#,
+            r#"{"display_name":"a","api_key":"sk-a","provider":"anthropic","adapter":"anthropic"}"#,
         )
         .unwrap();
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
@@ -1379,7 +1379,8 @@ data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\
     /// tolerate the legacy shape so the compat path doesn't 500.
     #[test]
     fn family_bridge_allows_legacy_empty_provider_with_empty_api_base() {
-        let pk: ProviderKey = serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
+        let pk: ProviderKey =
+            serde_json::from_str(r#"{"display_name":"x","api_key":"k"}"#).unwrap();
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
         assert_eq!(resolve_base(&ctx).unwrap(), ANTHROPIC_DEFAULT_BASE);
     }

@@ -105,7 +105,7 @@ describe("api_base tolerance e2e: endpoint suffix is stripped before dispatch", 
     // and `upstream.receivedRequests[*].path` would echo that.
     const pk = await seed.createProviderKey({
       display_name: "openai-suffix-tolerance-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/chat/completions`,
     });
     await seed.createModel({
@@ -185,7 +185,7 @@ describe("api_base tolerance e2e: endpoint suffix is stripped before dispatch", 
       display_name: "anthropic-suffix-tolerance-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: `${upstream.baseUrl}/v1/messages`,
     });
     await seed.createModel({

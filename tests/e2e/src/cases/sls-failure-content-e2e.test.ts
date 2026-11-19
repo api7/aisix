@@ -135,7 +135,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
 
     const okPk = await seed.createProviderKey({
       display_name: "failure-content-ok-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${okUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -146,7 +146,7 @@ describe("sls e2e: failed requests record the request body (#1013)", () => {
     });
     const failPk = await seed.createProviderKey({
       display_name: "failure-content-fail-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${failUpstream.baseUrl}/v1`,
     });
     await seed.createModel({

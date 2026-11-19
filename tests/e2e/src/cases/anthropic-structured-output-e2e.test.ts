@@ -110,7 +110,7 @@ describe("chat response_format → Anthropic structured outputs", () => {
       display_name: "structured-native-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: nativeUpstream.baseUrl,
     });
     // The alias is deliberately not the upstream name: the family gate
@@ -126,7 +126,7 @@ describe("chat response_format → Anthropic structured outputs", () => {
       display_name: "structured-tool-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: toolUpstream.baseUrl,
     });
     await seed.createModel({

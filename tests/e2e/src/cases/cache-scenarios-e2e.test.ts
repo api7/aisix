@@ -73,7 +73,7 @@ describe("cache scenarios e2e: different prompt → miss", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "cache-diff-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

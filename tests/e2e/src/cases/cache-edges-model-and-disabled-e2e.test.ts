@@ -68,7 +68,7 @@ describe("cache edges: model in fingerprint + enabled:false bypass", () => {
     // against the two Models must be cached independently.
     const pk = await seed.createProviderKey({
       display_name: "cache-edges-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

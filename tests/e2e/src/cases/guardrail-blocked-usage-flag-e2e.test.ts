@@ -135,7 +135,7 @@ describe("guardrail_blocked e2e: a /v1/responses refusal reaches the Blocked vie
 
     const pk = await seed.createProviderKey({
       display_name: "gbf-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

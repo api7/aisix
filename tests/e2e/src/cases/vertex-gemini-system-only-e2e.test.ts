@@ -63,7 +63,7 @@ describe("Vertex Gemini: a system-only chat request", () => {
       display_name: "vertex-gemini-system-only-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_token: "ya29.system-only",
         project: "proj-e2e",
         region: "us-central1",

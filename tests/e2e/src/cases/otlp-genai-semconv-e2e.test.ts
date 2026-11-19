@@ -248,7 +248,7 @@ describe("OTLP spans follow the GenAI semantic conventions", () => {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
         provider: "openai",
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({
@@ -265,7 +265,7 @@ describe("OTLP spans follow the GenAI semantic conventions", () => {
     const embedPk = await seed.createProviderKey({
       display_name: `${EMBED_MODEL}-pk`,
       provider: "openai",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstreams.embed.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -278,7 +278,7 @@ describe("OTLP spans follow the GenAI semantic conventions", () => {
       display_name: `${ANTHROPIC_MODEL}-pk`,
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: upstreams.anthropic.baseUrl,
     });
     await seed.createModel({
