@@ -1441,11 +1441,11 @@ pub(crate) struct RoutingRequest<'a> {
     pub headers: Option<&'a HeaderMap>,
     pub api_key_id: &'a str,
     pub source_ip: &'a str,
-    /// Model id of the target that produced the context a `/v1/responses`
-    /// follow-up carries ([`crate::responses_affinity`]). When set, that
-    /// target and its provider-key peers are attempted first, ahead of the
-    /// strategy's order. `None` everywhere else.
-    pub context_origin: Option<&'a str>,
+    /// The target that produced the context a `/v1/responses` follow-up
+    /// carries ([`crate::responses_affinity`]). When set, the targets that
+    /// can read that context are attempted first, ahead of the strategy's
+    /// order. `None` everywhere else.
+    pub context_origin: Option<&'a crate::responses_affinity::Origin>,
     /// The request's budget gate. A target whose provider key's budget is
     /// exhausted is not a candidate, and a direct model on one is refused.
     /// `None` only in tests that exercise no budget.
@@ -1678,7 +1678,7 @@ pub(crate) fn resolve_attempt_models(
         resolved = pin_context_origin(snapshot, runtime_status, routing, resolved, origin);
         tracing::debug!(
             virtual_model = %virtual_name,
-            origin,
+            origin = %origin.model_id,
             first = resolved.first().map(|a| a.model.display_name.as_str()),
             "responses context affinity reordered routing candidates",
         );
@@ -1709,7 +1709,8 @@ pub(crate) fn resolve_attempt_models(
 }
 
 /// Put the targets that can read a conversation's context first: the origin
-/// target, then the other targets on its provider key, then the rest in the
+/// target while it is inside the [`crate::responses_affinity::Boundary`], then
+/// the other targets on the boundary's provider key, then the rest in the
 /// strategy's order. Targets the strategy left out of `resolved` (its
 /// `max_fallbacks` cut) are brought back behind the ones it ordered, since
 /// the pinned order can push those out and the cut is applied again after
@@ -1723,7 +1724,7 @@ fn pin_context_origin(
     runtime_status: &crate::ModelRuntimeStatusTracker,
     routing: &Routing,
     resolved: Vec<AttemptModel>,
-    origin: &str,
+    origin: &crate::responses_affinity::Origin,
 ) -> Vec<AttemptModel> {
     let boundary = crate::responses_affinity::Boundary::of(snapshot, origin);
     let mut candidates = resolved;
@@ -2117,7 +2118,7 @@ mod tests {
         strategy: RoutingStrategy,
         targets: &[&str],
         max_fallbacks: Option<u32>,
-        origin: &str,
+        origin: &crate::responses_affinity::Origin,
     ) -> Vec<String> {
         let mut group: Model = serde_json::from_value(serde_json::json!({
             "display_name": "group",
@@ -2159,7 +2160,7 @@ mod tests {
                 RoutingStrategy::Failover,
                 &["c", "a", "b", "a2"],
                 None,
-                "id-a2"
+                &crate::responses_affinity::Origin::model("id-a2")
             ),
             ["a2", "a", "c", "b"],
         );
@@ -2171,7 +2172,7 @@ mod tests {
                 RoutingStrategy::Failover,
                 &["c", "b", "a2"],
                 Some(1),
-                "id-a"
+                &crate::responses_affinity::Origin::model("id-a")
             ),
             ["a2", "c"],
         );
@@ -2190,7 +2191,7 @@ mod tests {
                 RoutingStrategy::Failover,
                 &["a", "a2", "c"],
                 Some(1),
-                "id-a"
+                &crate::responses_affinity::Origin::model("id-a")
             ),
             ["c"],
         );
