@@ -1539,6 +1539,42 @@
       "type": "object"
     },
     {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "deny_examples": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "deny_examples"
+            ]
+          },
+          "then": {
+            "required": [
+              "deny_threshold"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "allow_examples": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "allow_examples"
+            ]
+          },
+          "then": {
+            "required": [
+              "allow_threshold"
+            ]
+          }
+        }
+      ],
       "description": "Embedding-similarity screening against operator-supplied example texts. Deny examples block on a close match; an allow-list, when present, blocks everything that matches none of it. Calls an `embedding`-kind Model through the gateway's provider bridges. Detection-only — never rewrites content. Applies on input, output, or both, including buffered streaming output.",
       "properties": {
         "allow_examples": {

@@ -548,7 +548,7 @@ pub fn validate_guardrail(value: &Value) -> Result<(), SchemaError> {
             "guardrail",
             &SCHEMAS.guardrail,
             value,
-            name_missing_semantic_threshold(value, err),
+            name_missing_semantic_threshold(&SCHEMAS.guardrail, value, err),
         )),
     }
 }
@@ -571,7 +571,11 @@ pub fn validate_guardrail(value: &Value) -> Result<(), SchemaError> {
 /// It deliberately does not suggest a value. Cosine scales differ enough
 /// between embedding models that any number printed here would be wrong for
 /// most rows, and a suggested number is one an operator will take.
-fn name_missing_semantic_threshold(value: &Value, err: SchemaError) -> SchemaError {
+fn name_missing_semantic_threshold(
+    validator: &Validator,
+    value: &Value,
+    err: SchemaError,
+) -> SchemaError {
     let Some(fields) = value.as_object() else {
         return err;
     };
@@ -601,7 +605,7 @@ fn name_missing_semantic_threshold(value: &Value, err: SchemaError) -> SchemaErr
             fields.insert((*threshold).to_string(), json!(0.5));
         }
     }
-    if validate(&SCHEMAS.guardrail, &probe).is_err() {
+    if validate(validator, &probe).is_err() {
         return err;
     }
     SchemaError {
@@ -762,6 +766,7 @@ pub fn validate_provider_key_lenient(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_guardrail_lenient(value: &Value) -> Result<(), SchemaError> {
     validate(&LENIENT_SCHEMAS.guardrail, value)
+        .map_err(|err| name_missing_semantic_threshold(&LENIENT_SCHEMAS.guardrail, value, err))
 }
 
 pub fn validate_cache_policy_lenient(value: &Value) -> Result<(), SchemaError> {
@@ -1932,21 +1937,40 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                 "semantic" => {
                     set_property_enum(b, "text_source", json!(["user_messages", "all_messages"]));
                     set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
-                    // WRITE PATH ONLY, all of it. Each of these fields is
-                    // defaulted at the type level so that a STORED row
-                    // lacking it still deserializes: the loader's failure
-                    // unit is the row, and a screening guardrail that
-                    // vanishes is fail-OPEN — strictly worse than the
-                    // field defaulting. What an operator may save is the
-                    // stricter question, and it is asked here.
+                    // Each threshold is required alongside ITS OWN example
+                    // list and only then — demanding an allow threshold on a
+                    // deny-only row would be asking for a number that
+                    // decides nothing. There is no value that is right for
+                    // every embedding model, so there is nothing to default
+                    // to; see the fields' doc comments. Required on the READ
+                    // path too: the last control plane that saved a
+                    // populated list without its threshold (v0.13.0) is below
+                    // the support floor, and the control plane re-runs its
+                    // backfill for any such row still stored.
+                    b.insert(
+                        "allOf".to_string(),
+                        json!([
+                            {
+                                "if": {
+                                    "required": ["deny_examples"],
+                                    "properties": { "deny_examples": { "minItems": 1 } }
+                                },
+                                "then": { "required": ["deny_threshold"] }
+                            },
+                            {
+                                "if": {
+                                    "required": ["allow_examples"],
+                                    "properties": { "allow_examples": { "minItems": 1 } }
+                                },
+                                "then": { "required": ["allow_threshold"] }
+                            }
+                        ]),
+                    );
                     if strict {
-                        // …and the type-level default goes with them. It
-                        // exists so a STORED row without the key still
-                        // loads; advertised on the write contract it reads
-                        // as a suggested value, which is the one thing this
-                        // change is trying to stop — a schema-driven form
-                        // or generator would pre-fill 0.75 and put the
-                        // operator back where they started.
+                        // The type-level default exists so a direction with
+                        // no example list may omit its key. Advertised on the
+                        // write contract it reads as a suggested value — a
+                        // schema-driven form or generator would pre-fill it.
                         for threshold in ["deny_threshold", "allow_threshold"] {
                             if let Some(Value::Object(properties)) = b.get_mut("properties") {
                                 if let Some(Value::Object(field)) = properties.get_mut(threshold) {
@@ -1954,32 +1978,6 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                                 }
                             }
                         }
-                        // Each threshold is required alongside ITS OWN
-                        // example list and only then — demanding an allow
-                        // threshold on a deny-only row would be asking for
-                        // a number that decides nothing. There is no value
-                        // that is right for every embedding model, so
-                        // there is nothing to default to; see the fields'
-                        // doc comments.
-                        b.insert(
-                            "allOf".to_string(),
-                            json!([
-                                {
-                                    "if": {
-                                        "required": ["deny_examples"],
-                                        "properties": { "deny_examples": { "minItems": 1 } }
-                                    },
-                                    "then": { "required": ["deny_threshold"] }
-                                },
-                                {
-                                    "if": {
-                                        "required": ["allow_examples"],
-                                        "properties": { "allow_examples": { "minItems": 1 } }
-                                    },
-                                    "then": { "required": ["allow_threshold"] }
-                                }
-                            ]),
-                        );
                         // A row saved without an embedding model would
                         // screen every request against a model that
                         // resolves to nothing. Either spelling satisfies
@@ -1990,12 +1988,11 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                     }
                 }
                 "custom" => {
-                    // Required on BOTH schemas, unlike the semantic fields
-                    // above, and the asymmetry is the point rather than an
-                    // oversight. Those two relax on the read path because a
-                    // row that loads behaves BETTER than one that vanishes:
-                    // an absent threshold keeps screening at its stored
-                    // default, and an empty `embedding_model` REFUSES every
+                    // Required on BOTH schemas, unlike the semantic embedding
+                    // model above, and the asymmetry is the point rather than
+                    // an oversight. That one relaxes on the read path because
+                    // a row that loads behaves BETTER than one that vanishes:
+                    // an empty `embedding_model` REFUSES every
                     // request in scope rather than admitting it, since
                     // `fail_open` defaults to false — fail-closed beats the
                     // row vanishing and letting the traffic through
@@ -4514,28 +4511,12 @@ mod tests {
     }
 
     #[test]
-    fn the_semantic_write_requirements_never_reach_the_read_path() {
+    fn a_semantic_row_without_an_embedding_model_still_loads() {
         // The loader's failure unit is the ROW, so a requirement that
         // leaks into the lenient schema does not make a stored guardrail
-        // stricter — it deletes it. A screening row that vanishes stops
-        // screening entirely, which is fail-OPEN on a security control and
-        // strictly worse than the field defaulting.
-        //
-        // Both fields below are the shape a control plane wrote before the
-        // write path demanded them, so both must still load.
-        let unthresholded = json!({
-            "name": "g",
-            "kind": "semantic",
-            "embedding_model": "embed-1",
-            "deny_examples": ["forbidden"]
-        });
-        validate_guardrail_lenient(&unthresholded)
-            .expect("a stored row written before the threshold was required keeps screening");
-        assert!(
-            validate_guardrail(&unthresholded).is_err(),
-            "but it cannot be SAVED"
-        );
-
+        // stricter — it deletes it. A modelless row refuses every request
+        // in scope (`fail_open` defaults to false), which is fail-closed;
+        // losing it would let the traffic through unscreened.
         let modelless = json!({
             "name": "g",
             "kind": "semantic",
@@ -4551,22 +4532,34 @@ mod tests {
     }
 
     #[test]
-    fn guardrail_semantic_row_without_a_threshold_still_loads() {
-        // The READ path keeps the default, and that asymmetry is the
-        // point: rows written before the requirement carry no key, and a
-        // row the loader cannot deserialize is skipped whole — a
-        // screening guardrail that disappears is fail-OPEN. They go on
-        // enforcing the 0.75 they enforce today until the control plane
-        // backfills them.
-        let row: crate::models::Guardrail = serde_json::from_value(semantic_row(json!({
-            "deny_examples": ["forbidden"]
+    fn a_stored_semantic_list_without_its_threshold_is_rejected_on_read() {
+        // The read path no longer fills a threshold in for a populated
+        // list (#1409): no number is right for every embedding model, and
+        // the last control plane that stored such a row is below the
+        // support floor. The rejection names the field, since it is what
+        // `/status/config` reports for the row.
+        for (examples, threshold) in [
+            ("deny_examples", "deny_threshold"),
+            ("allow_examples", "allow_threshold"),
+        ] {
+            let row = semantic_row(json!({ examples: ["listed"] }));
+            let err = validate_guardrail_lenient(&row)
+                .expect_err("a populated list without its threshold must not load");
+            assert!(
+                err.message.contains(&format!("`{threshold}`")),
+                "{}",
+                err.message
+            );
+            let mut fixed = row.clone();
+            fixed[threshold] = json!(0.5);
+            validate_guardrail_lenient(&fixed).unwrap();
+        }
+        // A direction with no list still omits its key.
+        validate_guardrail_lenient(&semantic_row(json!({}))).unwrap();
+        validate_guardrail_lenient(&semantic_row(json!({
+            "deny_examples": ["listed"], "deny_threshold": 0.5
         })))
-        .expect("an unmigrated row must still deserialize");
-        let crate::models::GuardrailKind::Semantic(cfg) = &row.config else {
-            panic!("not a semantic row");
-        };
-        assert_eq!(cfg.deny_threshold, 0.75);
-        assert_eq!(cfg.allow_threshold, 0.75);
+        .unwrap();
     }
 
     #[test]

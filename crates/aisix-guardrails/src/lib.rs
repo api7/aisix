@@ -1726,6 +1726,7 @@ mod tests {
                     "kind": "semantic",
                     "embedding_model": "embed-1",
                     "deny_examples": ["x"],
+                    "deny_threshold": 0.5,
                 }),
                 "presidio" => serde_json::json!({
                     "kind": "presidio",
