@@ -1709,9 +1709,9 @@ pub(crate) fn resolve_attempt_models(
 }
 
 /// Put the targets that can read a conversation's context first: the origin
-/// target while it is inside the [`crate::responses_affinity::Boundary`], then
-/// the other targets on the boundary's provider key, then the rest in the
-/// strategy's order. Targets the strategy left out of `resolved` (its
+/// target whenever it is a candidate, then the other targets inside the
+/// [`crate::responses_affinity::Boundary`] in the strategy's order, then the
+/// rest. Targets the strategy left out of `resolved` (its
 /// `max_fallbacks` cut) are brought back behind the ones it ordered, since
 /// the pinned order can push those out and the cut is applied again after
 /// this. Only targets that survived the tag and client-IP filters are
@@ -2175,6 +2175,27 @@ mod tests {
                 &crate::responses_affinity::Origin::model("id-a")
             ),
             ["a2", "c"],
+        );
+    }
+
+    #[test]
+    fn the_origin_goes_first_after_its_key_changed() {
+        // The context was served by `a` on pk-1; `a` has since moved to pk-2.
+        let snap = pk_snapshot(&[("c", "pk-3"), ("b", "pk-1"), ("a", "pk-2"), ("a2", "pk-2")]);
+        let status = crate::ModelRuntimeStatusTracker::new();
+        assert_eq!(
+            pinned_order(
+                &snap,
+                &status,
+                RoutingStrategy::Failover,
+                &["c", "b", "a", "a2"],
+                None,
+                &crate::responses_affinity::Origin {
+                    model_id: "id-a".into(),
+                    key: Some("pk-1".into()),
+                }
+            ),
+            ["a", "b", "a2", "c"],
         );
     }
 
