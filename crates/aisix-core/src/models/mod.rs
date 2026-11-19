@@ -1,8 +1,8 @@
 //! Typed entities persisted in etcd and loaded into the gateway snapshot.
 //!
-//! Each entity is paired with a JSON Schema (spec §3) compiled once at
-//! startup and reused on both the declarative write paths and the
-//! watch read path.
+//! Each entity is paired with a JSON Schema (spec §3): a strict one
+//! published as the write contract, and a lenient one the loader compiles
+//! once and runs on every configuration source and on watch events.
 //!
 //! Entities landing across the live PR series:
 //! - [`Model`] — routing target (§3)

@@ -1,8 +1,8 @@
 //! Read handlers for `/admin/v1/mcp_servers`: list and get-by-id,
 //! same shape as [`crate::models_handlers`]. Name constraints (no
 //! reserved `__` tool-namespace separator, no trailing `_`, and — on
-//! the write path only — no `*`) live in the canonical schema,
-//! enforced on every declarative write path.
+//! the strict write contract only — no `*`) live in the canonical
+//! schema.
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::McpServer;
