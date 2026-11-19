@@ -1201,8 +1201,8 @@ async fn estimate_missing_chat_usage(
 /// is billed changes: a provider counting overhead we cannot see is still
 /// not corrected downward.
 ///
-/// The bridged `/v1/messages` and `/v1/responses` exits fill the same way,
-/// for the same reason. Their NATIVE passthrough paths deliberately do
+/// The chat stream's `include_usage` frame and the bridged `/v1/messages`
+/// and `/v1/responses` exits fill the same way, for the same reason. Their NATIVE passthrough paths deliberately do
 /// not — the dividing line is whether the gateway serialises the body
 /// itself or relays the provider's bytes verbatim.
 fn apply_estimated_usage(
@@ -5943,6 +5943,19 @@ impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
         }
     }
 
+    /// The estimate for the client's `include_usage` frame, which is about
+    /// to be released: counted ahead and left for [`Self::complete`], so the
+    /// frame and the usage record carry one number. `None` when the upstream
+    /// reported both counters.
+    async fn usage_frame_estimate(&mut self) -> Option<crate::token_estimate::Filled> {
+        let delivered = self.delivered.load(Ordering::Relaxed).max(1);
+        let (_, c) = self.slot.as_ref()?;
+        self.estimate
+            .counted_ahead(chat_estimate_inputs(c, delivered))
+            .await
+            .filter(|filled| filled.estimated)
+    }
+
     /// Complete the stream once, from the count ahead when it still fits
     /// and otherwise counting inline (Drop cannot wait).
     fn complete(&mut self) {
@@ -6703,14 +6716,30 @@ where
         // sibling streams in messages.rs and responses_bridge.rs.
         guard.comp().reached_end = true;
         // The `include_usage` chunk. An ensemble's (#617) is the judge's
-        // field-wise max plus the panel sum; a single upstream's is the last
-        // report. Stamped like the last chunk.
-        let final_usage = if fold_base {
+        // field-wise max plus the panel sum, as reported, like the buffered
+        // ensemble's body; a single upstream's is the last report with the
+        // counters it left at zero estimated (`apply_estimated_usage`).
+        // Stamped like the last chunk.
+        let final_usage = if !client_requested_usage {
+            None
+        } else if fold_base {
             stream_usage.map(|u| u.saturating_add(&base_usage))
-        } else {
+        } else if errored {
             last_usage
-        }
-        .filter(|_| client_requested_usage);
+        } else {
+            match guard.usage_frame_estimate().await {
+                Some(filled) => {
+                    let mut usage = last_usage.unwrap_or_default();
+                    apply_estimated_usage(
+                        &mut usage,
+                        filled.prompt_tokens,
+                        filled.completion_tokens,
+                    );
+                    Some(usage)
+                }
+                None => last_usage,
+            }
+        };
         if let (Some(final_usage), false) = (final_usage, errored) {
             let chunk = aisix_gateway::ChatChunk { choice_index: 0, logprobs: None,
                 id: std::mem::take(&mut last_chunk_id),
