@@ -2,7 +2,8 @@
 //! shape as [`crate::models_handlers`]. The name is the path segment
 //! under which the agent is exposed (`/a2a/<name>`); its constraints
 //! and the per-auth_type credential coupling live in the canonical
-//! schema, enforced on every declarative write path.
+//! schema, enforced by the loader every configuration source goes
+//! through.
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::A2aAgent;

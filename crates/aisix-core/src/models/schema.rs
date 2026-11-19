@@ -5,10 +5,12 @@
 //! - **Strict** ([`SCHEMAS`], the plain `validate_*` functions): unknown
 //!   fields are rejected (where a resource closes them). Published as the
 //!   resource schema files in `schemas/resources/` — the write contract for
-//!   whoever writes documents — and used by this crate's tests. The gateway
-//!   itself writes no resource (the Admin API is read-only) and runs no
-//!   strict validation at load time; the control plane validates against
-//!   its own API schema.
+//!   whoever writes documents. The strict validators run only in this
+//!   crate's tests: the gateway writes no resource (the Admin API is
+//!   read-only) and never rejects a document against the strict schema,
+//!   though the loader reads unknown-field paths off its shape
+//!   ([`unknown_field_paths`]). The control plane validates against its own
+//!   API schema.
 //! - **Lenient** ([`LENIENT_SCHEMAS`], the `validate_*_lenient` functions):
 //!   unknown fields pass; every other constraint (types, required, ranges,
 //!   closed enums) still applies. Used by the snapshot loader, which every

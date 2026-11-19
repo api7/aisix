@@ -15,8 +15,8 @@
 //! Every run writes BOTH published sets, under the same file names:
 //!
 //! - `schemas/resources/` — the **strict** write contract
-//!   (`resource_root_schema(name, true)`), what `aisix validate` and the
-//!   resources-file source enforce.
+//!   (`resource_root_schema(name, true)`), what a writer of resource
+//!   documents should produce. The gateway itself does not enforce it.
 //! - `schemas/resources-lenient/` — the **read** contract
 //!   (`resource_root_schema(name, false)`), the schema the etcd loader
 //!   actually validates stored documents against. It is free of
@@ -65,9 +65,8 @@ fn main() {
     // `resource_root_schema(name, strict: true)` producer the strict
     // validators compile, so the published schema == the enforced write
     // contract by construction. The published files deliberately carry the
-    // STRICT shape: they document the declarative write contract (unknown
-    // fields are rejected by `aisix validate` and the file source wherever
-    // a resource closes them) and the
+    // STRICT shape: they document the write contract (unknown fields are
+    // rejected wherever a resource closes them) and the
     // etcd loader's lenient read tolerance is published beside them, as
     // `schemas/resources-lenient/`, from the same producer with
     // `strict: false` — the exact value `LENIENT_SCHEMAS` compiles, so the
