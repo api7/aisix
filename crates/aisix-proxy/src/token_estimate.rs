@@ -534,6 +534,13 @@ impl<K: PartialEq, V> CountedAhead<K, V> {
         self.0 = Some((key, value));
     }
 
+    /// The count held for `key`, left in place.
+    pub fn peek(&self, key: &K) -> Option<&V> {
+        self.0
+            .as_ref()
+            .and_then(|(counted, value)| (counted == key).then_some(value))
+    }
+
     /// The count held for `key`, else `inline()`.
     pub fn take_or(&mut self, key: &K, inline: impl FnOnce() -> V) -> V {
         match self.0.take() {
@@ -609,6 +616,14 @@ impl StreamEstimate {
                 )
             })
             .await;
+    }
+
+    /// [`Self::count_ahead`], returning the count while leaving it for
+    /// [`Self::fill`], which then takes these same numbers for the same
+    /// inputs. `None` when nothing needed counting.
+    pub async fn counted_ahead(&mut self, inputs: EstimateInputs<'_>) -> Option<Filled> {
+        self.count_ahead(inputs).await;
+        self.counted.peek(&inputs.key()).copied()
     }
 
     /// [`fill_missing`], once: from the count ahead when it was counted from
