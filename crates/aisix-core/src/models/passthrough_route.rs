@@ -77,10 +77,10 @@ pub struct PassthroughRoute {
     /// Header carrying the gateway credential (API key or JWT) when
     /// `auth_mode` is `header_key`, e.g. `x-aisix-api-key`. Lets
     /// `Authorization` carry the caller's own upstream credential. The
-    /// header is stripped before forwarding. Lowercase-only so the
-    /// forbidden credential-slot list in the coupling is exhaustive
-    /// (matching is case-insensitive on the wire regardless). Required
-    /// for `header_key`; ignored otherwise.
+    /// header is stripped before forwarding. Lowercase-only (matching is
+    /// case-insensitive on the wire regardless); `authorization`,
+    /// `proxy-authorization`, `cookie`, `set-cookie` and `x-api-key` are
+    /// refused. Required for `header_key`; ignored otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9a-z-]+$"), length(min = 1))]
     pub auth_header_name: Option<String>,
@@ -116,10 +116,14 @@ pub struct PassthroughRoute {
     /// Optional header carrying the end-user identity injected by the
     /// upstream network device (e.g. `x-aisix-user`). Its value is recorded
     /// on the usage event for per-employee audit attribution and stripped
-    /// before forwarding. Lowercase-only so the forbidden credential-slot
-    /// list in the coupling is exhaustive; credential-bearing names
-    /// (`authorization`, `cookie`, …) are rejected outright — their value
-    /// on the usage event would be credential retention, not identity.
+    /// before forwarding. Lowercase-only. Only `authorization`,
+    /// `proxy-authorization`, `cookie`, `set-cookie` and `x-api-key` are
+    /// refused; any other header's value is recorded as `client_identity`,
+    /// including credential-bearing ones such as `api-key`,
+    /// `x-goog-api-key`, `x-amz-security-token`, `x-amz-date`,
+    /// `x-amz-content-sha256`, `x-aisix-api-key`, or this route's own
+    /// `auth_header_name`. Never point it at a header that carries a
+    /// credential: its value would be retained on every usage event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(regex(pattern = "^[!#$%&'*+.^_`|~0-9a-z-]+$"), length(min = 1))]
     pub identity_header: Option<String>,
