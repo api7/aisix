@@ -1202,9 +1202,10 @@ async fn estimate_missing_chat_usage(
 /// not corrected downward.
 ///
 /// The chat stream's `include_usage` frame and the bridged `/v1/messages`
-/// and `/v1/responses` exits fill the same way, for the same reason. Their NATIVE passthrough paths deliberately do
-/// not — the dividing line is whether the gateway serialises the body
-/// itself or relays the provider's bytes verbatim.
+/// and `/v1/responses` exits fill the same way, for the same reason. Their
+/// NATIVE passthrough paths deliberately do not — the dividing line is
+/// whether the gateway serialises the body itself or relays the provider's
+/// bytes verbatim.
 fn apply_estimated_usage(
     usage: &mut aisix_gateway::chat::UsageStats,
     prompt_tokens: u32,
