@@ -6,11 +6,22 @@
 //! to another deployment or account, the first is rejected with
 //! `invalid_encrypted_content` and the second is not found.
 //!
-//! So the gateway tags what a group's target produced with that target's
-//! model id, in the values the client echoes back unchanged:
+//! So the gateway tags what a group's target produced, in the values the
+//! client echoes back unchanged:
 //!
-//! - `encrypted_content` → `aisix_enc_v1:<base64url(target id)>;<original>`
+//! - `encrypted_content` → `aisix_enc_v1:<base64url("<target id>;<provider key id>")>;<original>`,
+//!   the key id empty when the target has none. Ciphertext is bound to the
+//!   account that issued it, so the key that served it is what decides who
+//!   can read it — not the model, whose key can be changed in place.
 //! - response `id` → `resp_` + base64url(`aisix:v1;<target id>;<original>`)
+//!
+//! Gateways before the key was recorded read the first ciphertext segment as
+//! a bare model id. Keeping the prefix and the segment boundary makes them
+//! see an id no model has, so they strip the ciphertext rather than forward
+//! it or a tag. Their own tags (a bare model id) still decode here, and are
+//! judged by the origin model's current key. The response id cannot degrade
+//! that way — those gateways forward its original unconditionally and would
+//! lose the pin — so it keeps recording the model only.
 //!
 //! On every request the tags are removed before anything else reads the
 //! body, so a tagged value never reaches an upstream; for a group, the
@@ -34,8 +45,13 @@ fn b64() -> base64::engine::GeneralPurpose {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
 }
 
-pub(crate) fn mark_encrypted_content(target_id: &str, original: &str) -> String {
-    format!("{ENC_PREFIX}{};{original}", b64().encode(target_id))
+pub(crate) fn mark_encrypted_content(
+    target_id: &str,
+    provider_key_id: Option<&str>,
+    original: &str,
+) -> String {
+    let origin = format!("{target_id};{}", provider_key_id.unwrap_or_default());
+    format!("{ENC_PREFIX}{};{original}", b64().encode(origin))
 }
 
 pub(crate) fn mark_response_id(target_id: &str, original: &str) -> String {
@@ -45,11 +61,37 @@ pub(crate) fn mark_response_id(target_id: &str, original: &str) -> String {
     )
 }
 
+/// The target that produced a piece of context, as its tag recorded it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Origin {
+    pub(crate) model_id: String,
+    pub(crate) key: OriginKey,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum OriginKey {
+    /// The tag recorded only the model: read its current provider key.
+    Current,
+    /// The provider key that served it.
+    Recorded(String),
+    /// It was served without a provider key: only the origin model reads it.
+    Keyless,
+}
+
+impl Origin {
+    pub(crate) fn model(model_id: impl Into<String>) -> Self {
+        Self {
+            model_id: model_id.into(),
+            key: OriginKey::Current,
+        }
+    }
+}
+
 enum EncryptedContent {
     /// Not a gateway tag: forwarded as the client sent it.
     Plain,
     Marked {
-        origin: String,
+        origin: Origin,
         original: String,
     },
     /// Carries the tag prefix but does not decode.
@@ -62,7 +104,18 @@ fn decode_encrypted_content(value: &str) -> EncryptedContent {
     };
     let decoded = rest.split_once(';').and_then(|(origin, original)| {
         let origin = String::from_utf8(b64().decode(origin).ok()?).ok()?;
-        (!origin.is_empty()).then(|| (origin, original.to_string()))
+        let origin = match origin.split_once(';') {
+            Some((model_id, "")) => Origin {
+                model_id: model_id.to_string(),
+                key: OriginKey::Keyless,
+            },
+            Some((model_id, key)) => Origin {
+                model_id: model_id.to_string(),
+                key: OriginKey::Recorded(key.to_string()),
+            },
+            None => Origin::model(origin),
+        };
+        (!origin.model_id.is_empty()).then(|| (origin, original.to_string()))
     });
     match decoded {
         Some((origin, original)) => EncryptedContent::Marked { origin, original },
@@ -79,25 +132,39 @@ fn decode_response_id(value: &str) -> Option<(String, String)> {
     (!origin.is_empty()).then(|| (origin.to_string(), original.to_string()))
 }
 
-/// The targets that can read context produced by one origin target: the
-/// origin itself, and every target on the same provider key. The key is read
-/// from the origin's own model document, so it resolves even when the origin
-/// is not a member of the group the request addressed; an origin that no
-/// longer exists has an empty boundary.
+/// The targets that can read context produced by one origin: every target
+/// whose provider key is the one the tag recorded — the origin model
+/// included only while it is still on that key, and whether or not it still
+/// exists. A tag that recorded the model only (older gateways, and every
+/// response id) falls back to the origin itself plus the targets on the
+/// origin's current key, read from its own model document so it resolves
+/// even when the origin is not a member of the group the request addressed;
+/// such an origin that no longer exists has an empty boundary. Keyless
+/// context is readable by the origin model alone.
 #[derive(Debug, Clone)]
 pub(crate) struct Boundary {
     origin_id: String,
+    origin_reads: bool,
     provider_key_id: Option<String>,
 }
 
 impl Boundary {
-    pub(crate) fn of(snapshot: &aisix_core::AisixSnapshot, origin_id: &str) -> Self {
+    pub(crate) fn of(snapshot: &aisix_core::AisixSnapshot, origin: &Origin) -> Self {
+        let (origin_reads, provider_key_id) = match &origin.key {
+            OriginKey::Current => (
+                true,
+                snapshot
+                    .models
+                    .get_by_id(&origin.model_id)
+                    .and_then(|m| m.value.provider_key_id.clone()),
+            ),
+            OriginKey::Recorded(key) => (false, Some(key.clone())),
+            OriginKey::Keyless => (true, None),
+        };
         Self {
-            origin_id: origin_id.to_string(),
-            provider_key_id: snapshot
-                .models
-                .get_by_id(origin_id)
-                .and_then(|m| m.value.provider_key_id.clone()),
+            origin_id: origin.model_id.clone(),
+            origin_reads,
+            provider_key_id,
         }
     }
 
@@ -106,7 +173,7 @@ impl Boundary {
     }
 
     pub(crate) fn contains(&self, target_id: &str, target_provider_key_id: Option<&str>) -> bool {
-        self.is_origin(target_id)
+        (self.origin_reads && self.is_origin(target_id))
             || (self.provider_key_id.is_some()
                 && self.provider_key_id.as_deref() == target_provider_key_id)
     }
@@ -115,13 +182,13 @@ impl Boundary {
 /// What a request's tags said, recorded while removing them.
 #[derive(Debug, Default)]
 pub(crate) struct ContextAffinity {
-    previous_origin: Option<String>,
+    previous_origin: Option<Origin>,
     /// `(original, as the client sent it)` for a tagged `previous_response_id`,
     /// so the Response object can echo back the value the client sent.
     previous_echo: Option<(String, String)>,
     /// Index into `input[]` of each item whose ciphertext was tagged, with
     /// its origin. Items whose tag did not decode were already stripped.
-    encrypted: Vec<(usize, String)>,
+    encrypted: Vec<(usize, Origin)>,
 }
 
 impl ContextAffinity {
@@ -137,7 +204,7 @@ impl ContextAffinity {
                 if let Value::String(sent) = sent {
                     affinity.previous_echo = Some((original, sent));
                 }
-                affinity.previous_origin = Some(origin);
+                affinity.previous_origin = Some(Origin::model(origin));
             }
         }
         let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
@@ -175,10 +242,10 @@ impl ContextAffinity {
     /// The target that produced this conversation's context, if a tag named
     /// one: the stored `previous_response_id` first, else the latest tagged
     /// ciphertext in `input[]`.
-    pub(crate) fn origin(&self) -> Option<&str> {
+    pub(crate) fn origin(&self) -> Option<&Origin> {
         self.previous_origin
-            .as_deref()
-            .or_else(|| self.encrypted.last().map(|(_, o)| o.as_str()))
+            .as_ref()
+            .or_else(|| self.encrypted.last().map(|(_, o)| o))
     }
 
     /// The body one routing-group attempt sends: `None` when every tagged
@@ -216,11 +283,13 @@ impl ContextAffinity {
         Some(body)
     }
 
-    /// How a response to this request is tagged. `target_id` is the routing
-    /// target that served it, `None` outside a routing group.
-    pub(crate) fn response_mark(&self, target_id: Option<&str>) -> ResponseMark {
+    /// How a response to this request is tagged. `target` is the routing
+    /// target that served it and its provider key, `None` outside a routing
+    /// group.
+    pub(crate) fn response_mark(&self, target: Option<(&str, Option<&str>)>) -> ResponseMark {
         ResponseMark {
-            target_id: target_id.map(str::to_string),
+            target_id: target.map(|(id, _)| id.to_string()),
+            target_provider_key_id: target.and_then(|(_, key)| key.map(str::to_string)),
             previous_echo: self.previous_echo.clone(),
         }
     }
@@ -250,6 +319,7 @@ fn strip_ciphertext(mut item: Value) -> Option<Value> {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ResponseMark {
     target_id: Option<String>,
+    target_provider_key_id: Option<String>,
     previous_echo: Option<(String, String)>,
 }
 
@@ -290,7 +360,7 @@ impl ResponseMark {
                 .target_id
                 .as_deref()
                 .filter(|_| !value.is_empty())
-                .map(|t| mark_encrypted_content(t, value)),
+                .map(|t| mark_encrypted_content(t, self.target_provider_key_id.as_deref(), value)),
             Slot::PreviousResponseId => self
                 .previous_echo
                 .as_ref()
@@ -391,11 +461,24 @@ mod tests {
 
     #[test]
     fn tags_round_trip_and_foreign_values_are_plain() {
-        let enc = mark_encrypted_content("m-1", "gAAAA;x");
+        let enc = mark_encrypted_content("m-1", Some("pk-1"), "gAAAA;x");
         assert!(enc.starts_with("aisix_enc_v1:"));
         assert!(matches!(
             decode_encrypted_content(&enc),
-            EncryptedContent::Marked { origin, original } if origin == "m-1" && original == "gAAAA;x"
+            EncryptedContent::Marked { origin, original }
+                if origin == Origin { model_id: "m-1".into(), key: OriginKey::Recorded("pk-1".into()) }
+                    && original == "gAAAA;x"
+        ));
+        assert!(matches!(
+            decode_encrypted_content(&mark_encrypted_content("m-1", None, "CT")),
+            EncryptedContent::Marked { origin, .. }
+                if origin == Origin { model_id: "m-1".into(), key: OriginKey::Keyless }
+        ));
+        // A tag written before the key was recorded: the bare model id.
+        let v1 = format!("aisix_enc_v1:{};CT", b64().encode("m-1"));
+        assert!(matches!(
+            decode_encrypted_content(&v1),
+            EncryptedContent::Marked { origin, .. } if origin == Origin::model("m-1")
         ));
         assert!(matches!(
             decode_encrypted_content("gAAAA"),
@@ -425,15 +508,24 @@ mod tests {
                  "encrypted_content": "aisix_enc_v1:%%;junk"},
                 {"type": "message", "role": "user", "content": "hi"},
                 {"type": "reasoning", "id": "rs_2", "summary": [],
-                 "encrypted_content": mark_encrypted_content("m-2", "CT")},
+                 "encrypted_content": mark_encrypted_content("m-2", Some("pk-2"), "CT")},
             ]
         });
         let a = ContextAffinity::unwrap_request(&mut body);
         assert_eq!(body["previous_response_id"], "resp_up");
         assert_eq!(body["input"].as_array().unwrap().len(), 2);
         assert_eq!(body["input"][1]["encrypted_content"], "CT");
-        assert_eq!(a.origin(), Some("m-1"));
-        assert_eq!(a.encrypted, vec![(1, "m-2".to_string())]);
+        assert_eq!(a.origin(), Some(&Origin::model("m-1")));
+        assert_eq!(
+            a.encrypted,
+            vec![(
+                1,
+                Origin {
+                    model_id: "m-2".into(),
+                    key: OriginKey::Recorded("pk-2".into())
+                }
+            )]
+        );
     }
 
     #[test]
@@ -457,6 +549,7 @@ mod tests {
     fn sse_frame_tags_snapshot_and_item_events() {
         let mark = ResponseMark {
             target_id: Some("m-1".into()),
+            target_provider_key_id: Some("pk-1".into()),
             previous_echo: Some(("resp_prev".into(), "resp_SENT".into())),
         };
         let frame = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_up\",\"previous_response_id\":\"resp_prev\",\"output\":[{\"type\":\"reasoning\",\"encrypted_content\":\"CT\"}]}}\n\n";
@@ -475,7 +568,7 @@ mod tests {
         assert_eq!(payload["response"]["previous_response_id"], "resp_SENT");
         assert_eq!(
             payload["response"]["output"][0]["encrypted_content"],
-            mark_encrypted_content("m-1", "CT")
+            mark_encrypted_content("m-1", Some("pk-1"), "CT")
         );
         let item = b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"CT\"}}\n\n";
         let out = mark.apply_to_sse_frame(item).unwrap();

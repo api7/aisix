@@ -868,7 +868,10 @@ async fn dispatch(
                 }
             };
             let attempt_body = stripped_body.as_ref().unwrap_or(body);
-            let mark = affinity.response_mark(is_routing_request.then_some(target.id.as_str()));
+            let mark = affinity.response_mark(
+                is_routing_request
+                    .then_some((target.id.as_str(), target.model.provider_key_id.as_deref())),
+            );
             let result = if crate::dispatch::responses_served_natively(
                 snapshot,
                 &target.model,
