@@ -185,7 +185,7 @@ describe("an answer whose content is an array of parts", () => {
     const model = async (name: string, upstream: OpenAiUpstream) => {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({

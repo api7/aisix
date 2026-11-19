@@ -235,7 +235,7 @@ describe("presidio guardrail e2e: block, input/output redaction, operators", () 
 
     const pk = await seed.createProviderKey({
       display_name: "presidio-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -246,7 +246,7 @@ describe("presidio guardrail e2e: block, input/output redaction, operators", () 
     });
     const streamPk = await seed.createProviderKey({
       display_name: "presidio-stream-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
     await seed.createModel({

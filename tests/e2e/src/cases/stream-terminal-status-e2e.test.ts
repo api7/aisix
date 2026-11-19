@@ -125,7 +125,7 @@ describe("streamed responses record their terminal status", () => {
     for (const [name, opts] of Object.entries(SCENARIOS)) {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstreams[name].baseUrl}/v1`,
       });
       await seed.createModel({

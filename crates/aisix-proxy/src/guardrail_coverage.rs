@@ -361,7 +361,7 @@ fn census_snapshot() -> AisixSnapshot {
 
     let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
         "display_name": "census-openai",
-        "secret": "sk-unused",
+        "api_key": "sk-unused",
         "api_base": "http://127.0.0.1:1/v1",
         "provider": "openai",
         "adapter": "openai",
@@ -371,7 +371,7 @@ fn census_snapshot() -> AisixSnapshot {
 
     let anthropic_pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
         "display_name": "census-anthropic",
-        "secret": "sk-ant-unused",
+        "api_key": "sk-ant-unused",
         "api_base": "http://127.0.0.1:1",
         "provider": "anthropic",
         "adapter": "anthropic",
@@ -412,7 +412,7 @@ fn census_snapshot() -> AisixSnapshot {
         .insert(ResourceEntry::new("m-embedding", embedding, 1));
 
     let mcp: aisix_core::McpServer = serde_json::from_value(serde_json::json!({
-        "display_name": "census",
+        "name": "census",
         "url": "http://127.0.0.1:1/mcp",
         "enabled": true,
     }))

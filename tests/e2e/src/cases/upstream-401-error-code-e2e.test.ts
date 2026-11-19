@@ -69,7 +69,7 @@ describe("upstream 401 error.code preserved across Content-Type (#543)", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "err401-pk",
-      secret: "sk-mock-bad",
+      api_key: "sk-mock-bad",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

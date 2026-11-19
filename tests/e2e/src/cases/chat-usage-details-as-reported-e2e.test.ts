@@ -85,7 +85,7 @@ describe("chat completion usage details reach the caller as the upstream reporte
         const up = await upstreamReporting(usage, stream);
         upstreams.push(up);
         models.push(name);
-        const pk = await seed.createProviderKey({ display_name: `${name}-pk`, secret: "sk-mock", api_base: `${up.baseUrl}/v1` });
+        const pk = await seed.createProviderKey({ display_name: `${name}-pk`, api_key: "sk-mock", api_base: `${up.baseUrl}/v1` });
         await seed.createModel({ display_name: name, provider: "openai", model_name: "gpt-4o-mini", provider_key_id: pk.id });
       }
     }

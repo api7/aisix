@@ -76,7 +76,7 @@ describe("error_source on the request counters", () => {
     upstreams.push(mock);
     const pk = await seed.createProviderKey({
       display_name: `${name}-pk`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${mock.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -151,7 +151,7 @@ describe("error_source on the request counters", () => {
 
     const unmappedPk = await seed.createProviderKey({
       display_name: "es-video-unmapped-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       provider: "anthropic",
       api_base: "http://127.0.0.1:9",
     });
@@ -190,7 +190,7 @@ describe("error_source on the request counters", () => {
     upstreams.push(leakyUpstream);
     const leaky = await seed.createProviderKey({
       display_name: "es-leaky-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${leakyUpstream.baseUrl}/v1`,
     });
     const leakyModel = await seed.createModel({
@@ -205,7 +205,7 @@ describe("error_source on the request counters", () => {
     upstreams.push(routeUpstream);
     const routePk = await seed.createProviderKey({
       display_name: "es-route-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: routeUpstream.baseUrl,
     });
     await seed.createPassthroughRoute({
@@ -226,7 +226,7 @@ describe("error_source on the request counters", () => {
     for (const name of ["es-jobs-400", "es-realtime-400"]) {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${refusing}/v1`,
       });
       await seed.createModel({

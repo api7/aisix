@@ -371,20 +371,6 @@
       }
     }
   ],
-  "anyOf": [
-    {
-      "required": [
-        "name"
-      ],
-      "title": "name"
-    },
-    {
-      "required": [
-        "display_name"
-      ],
-      "title": "display_name"
-    }
-  ],
   "definitions": {
     "PassthroughAuthMode": {
       "description": "How the gateway authenticates callers of a passthrough route.",
@@ -473,11 +459,6 @@
       "default": "inject",
       "description": "How the upstream credential is produced."
     },
-    "display_name": {
-      "description": "Accepted as an alternative spelling of `name`. Provide the label under exactly one of the two names.",
-      "minLength": 1,
-      "type": "string"
-    },
     "enabled": {
       "default": true,
       "description": "Whether this route is active. A disabled route matches nothing.",
@@ -563,7 +544,9 @@
       ]
     }
   },
-  "required": [],
+  "required": [
+    "name"
+  ],
   "title": "PassthroughRoute",
   "type": "object"
 }

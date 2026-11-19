@@ -415,24 +415,6 @@ fn documents_are_written_as_stored_not_re_serialized() {
 }
 
 #[test]
-fn the_former_provider_key_secret_spelling_is_redacted_too() {
-    let doc = export(
-        &[(
-            "provider_keys",
-            PK,
-            json!({"display_name": "old", "secret": "sk-old-spelling"}),
-        )],
-        false,
-    );
-    let pk = &find(&doc, "provider_keys")[0];
-    assert_eq!(
-        pk["secret"],
-        json!("${AISIXSECRET_PROVIDER_KEY_OLD_SECRET}"),
-        "{pk}"
-    );
-}
-
-#[test]
 fn the_id_comes_from_the_key_not_from_a_stored_id_field() {
     let doc = export(
         &[(
@@ -578,6 +560,7 @@ fn fields_the_gateway_ignores_are_left_out_of_the_stored_documents() {
             "display_name": "pk",
             "api_key": "x",
             "access_token": "tok-left-over",
+            "secret": "tok-retired-spelling",
             "request": {"timeout_hint": "tok-nested"}
         }))
         .unwrap(),
@@ -589,7 +572,9 @@ fn fields_the_gateway_ignores_are_left_out_of_the_stored_documents() {
     let doc = &docs[&("provider_keys".to_string(), PK.to_string())];
     let text = serde_json::to_string(doc).unwrap();
     assert!(
-        !text.contains("tok-left-over") && !text.contains("tok-nested"),
+        !text.contains("tok-left-over")
+            && !text.contains("tok-retired-spelling")
+            && !text.contains("tok-nested"),
         "{text}"
     );
     assert_eq!(doc["api_key"], json!("x"));

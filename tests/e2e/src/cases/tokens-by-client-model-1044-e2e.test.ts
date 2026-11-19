@@ -110,7 +110,7 @@ describe("aisix_llm_tokens_by_client_total model label (AISIX-Cloud#1044)", () =
 
     const pkA = await seed.createProviderKey({
       display_name: "cm1044-pk-a",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${nonStreamUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -121,7 +121,7 @@ describe("aisix_llm_tokens_by_client_total model label (AISIX-Cloud#1044)", () =
     });
     const pkB = await seed.createProviderKey({
       display_name: "cm1044-pk-b",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -132,7 +132,7 @@ describe("aisix_llm_tokens_by_client_total model label (AISIX-Cloud#1044)", () =
     });
     const pkR = await seed.createProviderKey({
       display_name: "cm1044-pk-resp",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${responsesUpstream.baseUrl}/v1`,
     });
     await seed.createModel({

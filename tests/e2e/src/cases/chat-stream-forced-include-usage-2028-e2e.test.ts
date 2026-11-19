@@ -142,7 +142,7 @@ describe("streamed chat to an OpenAI-protocol upstream always asks it for usage"
     ] as const) {
       const pk = await seed.createProviderKey({
         display_name: `${model}-pk`,
-        secret: "sk-upstream-mock",
+        api_key: "sk-upstream-mock",
         api_base: `${baseUrl}/${prefix}`,
       });
       await seed.createModel({

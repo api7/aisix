@@ -130,7 +130,7 @@ async function startMockDatadog(): Promise<MockDatadog> {
 async function seedRouting(seed: SeedClient, upstream: OpenAiUpstream, model: string) {
   const pk = await seed.createProviderKey({
     display_name: `${model}-pk`,
-    secret: PROVIDER_SECRET,
+    api_key: PROVIDER_SECRET,
     api_base: `${upstream.baseUrl}/v1`,
   });
   await seed.createModel({

@@ -122,7 +122,7 @@ describe("what a blocked row says the guardrails did ignores the exporter's mode
       ] as const) {
         const pk = await seed.createProviderKey({
           display_name: `${name}-pk`,
-          secret: "sk-mock",
+          api_key: "sk-mock",
           provider,
           ...(adapter ? { adapter } : {}),
           api_base: base,
@@ -136,7 +136,7 @@ describe("what a blocked row says the guardrails did ignores the exporter's mode
       }
       const mcpId = randomUUID();
       await seed.update("mcp_servers", mcpId, {
-        display_name: "paritymcp",
+        name: "paritymcp",
         url: mcp.url,
         enabled: true,
       });

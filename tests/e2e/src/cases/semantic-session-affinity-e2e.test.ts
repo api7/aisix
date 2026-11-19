@@ -238,7 +238,7 @@ async function seedRouters(put: Put, mocks: Record<string, Mock>) {
     display_name: "sa-embed-pk",
     provider: "openai",
     adapter: "openai",
-    secret: "sk-mock",
+    api_key: "sk-mock",
     api_base: `${mocks.embed!.baseUrl}/v1`,
   });
   await put("models", {
@@ -254,7 +254,7 @@ async function seedRouters(put: Put, mocks: Record<string, Mock>) {
       display_name: `${name}-pk`,
       provider: "deepseek",
       adapter: "openai",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${mocks[name]!.baseUrl}/v1`,
     });
     models[name] = await put("models", {
@@ -269,7 +269,7 @@ async function seedRouters(put: Put, mocks: Record<string, Mock>) {
       display_name: `${name}-pk`,
       provider: "openai",
       adapter: "openai",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: mocks[name]!.baseUrl,
     });
     await put("models", {

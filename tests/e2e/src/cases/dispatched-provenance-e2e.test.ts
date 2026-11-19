@@ -75,7 +75,7 @@ describe("dispatched provenance e2e: a pre-dispatch failure is not upstream heal
     // the admin schema's min-length check rejects it at admission.)
     const badCredPk = await seed.createProviderKey({
       display_name: "dp-badcred-pk",
-      secret: "sk-live\n-injected",
+      api_key: "sk-live\n-injected",
       api_base: `${upstream.baseUrl}/v1`,
     });
     // Usable secret, but an api_base that is not a URL. The schema types
@@ -83,7 +83,7 @@ describe("dispatched provenance e2e: a pre-dispatch failure is not upstream heal
     // surfaces only when reqwest builds the request.
     const badUrlPk = await seed.createProviderKey({
       display_name: "dp-badurl-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: "ht tp://not a url/v1",
     });
 

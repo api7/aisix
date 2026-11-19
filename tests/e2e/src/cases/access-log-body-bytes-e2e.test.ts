@@ -135,7 +135,7 @@ describe("the access log reports request and response body sizes", () => {
     const model = async (name: string, u: OpenAiUpstream, provider = "openai", modelName = "gpt-4o-mini") => {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         provider,
         api_base: provider === "anthropic" ? u.baseUrl : `${u.baseUrl}/v1`,
       });
@@ -149,7 +149,7 @@ describe("the access log reports request and response body sizes", () => {
     await model("bytes-claude", anthropicUp, "anthropic", "claude-3-5-haiku-20241022");
     await model("bytes-responses", responsesUp);
     await model("bytes-tts", speechUp, "openai", "tts-1");
-    const ptrPk = await seed.createProviderKey({ display_name: "bytes-ptr-pk", secret: "sk-mock", api_base: "http://unused" });
+    const ptrPk = await seed.createProviderKey({ display_name: "bytes-ptr-pk", api_key: "sk-mock", api_base: "http://unused" });
     await seed.createPassthroughRoute({
       name: "bytes-ptr",
       path_prefix: "/bytes-ptr",

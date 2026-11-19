@@ -60,7 +60,7 @@ describe("api key lifecycle e2e: expired/disabled keys fail closed, secret swap 
 
     const pk = await seed.createProviderKey({
       display_name: "apikey-lifecycle-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

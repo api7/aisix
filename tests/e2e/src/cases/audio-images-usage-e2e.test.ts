@@ -58,7 +58,7 @@ describe("audio + images UsageEvent emission (#406/#407)", () => {
       const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
       const pk = await seed.createProviderKey({
         display_name: "img-usage-pk",
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({
@@ -117,7 +117,7 @@ describe("audio + images UsageEvent emission (#406/#407)", () => {
       const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
       const pk = await seed.createProviderKey({
         display_name: "audio-usage-pk",
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({

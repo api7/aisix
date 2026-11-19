@@ -227,7 +227,7 @@ describe("conditional rate limit policies e2e (AISIX-Cloud#892)", () => {
     if (!seed) throw new Error("seed client not initialized");
     const pk = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

@@ -264,7 +264,7 @@ describe("a retried 504 attempt stays in the usage export (AISIX-Cloud#1136)", (
         c.kind === "anthropic" || c.kind === "video" ? upstream.baseUrl : `${upstream.baseUrl}/v1`;
       const pk = await seed.createProviderKey({
         display_name: `${c.model}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: base,
         ...(c.kind === "anthropic" ? { provider: "anthropic", adapter: "anthropic" } : {}),
         ...(c.kind === "openai-bridged-responses" ? { apis: {} } : {}),

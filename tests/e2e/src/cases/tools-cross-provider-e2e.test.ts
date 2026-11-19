@@ -96,7 +96,7 @@ describe("tools cross-provider e2e: OpenAI tools → Anthropic upstream tool_use
       display_name: "tools-xprov-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({

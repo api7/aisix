@@ -205,7 +205,7 @@ async function seed(etcdRoot: string, embedBase: string, upstreamBase: string) {
   const seed = new SeedClient(new EtcdClient(), etcdRoot);
   const embedPk = await seed.createProviderKey({
     display_name: "cache-outage-embed-pk",
-    secret: "sk-mock",
+    api_key: "sk-mock",
     api_base: `${embedBase}/v1`,
   });
   await seed.createModel({
@@ -217,7 +217,7 @@ async function seed(etcdRoot: string, embedBase: string, upstreamBase: string) {
   });
   const chatPk = await seed.createProviderKey({
     display_name: "cache-outage-chat-pk",
-    secret: "sk-mock",
+    api_key: "sk-mock",
     api_base: `${upstreamBase}/v1`,
   });
   for (const model of [SEMANTIC_MODEL, EXACT_MODEL, MEMORY_MODEL]) {

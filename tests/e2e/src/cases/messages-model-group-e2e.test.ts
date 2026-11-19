@@ -104,7 +104,7 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
     if (!seed) throw new Error("seed client not initialized");
     const pk = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       // OpenAI bridge convention: host + /v1.
       api_base: `${upstream.baseUrl}/v1`,
     });
@@ -125,7 +125,7 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
       display_name: `${displayName}-pk`,
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       // Anthropic bridge appends /v1/messages, so point at the bare host.
       api_base: upstream.baseUrl,
     });

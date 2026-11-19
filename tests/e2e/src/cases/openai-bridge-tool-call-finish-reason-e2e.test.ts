@@ -131,7 +131,7 @@ describe("tool-calling turns ended with `stop` by an OpenAI-compatible upstream"
       const pk = await seed.createProviderKey({
         display_name: `${alias}-pk`,
         provider,
-        secret: "sk-finish-reason-mock",
+        api_key: "sk-finish-reason-mock",
         api_base: `http://127.0.0.1:${addr.port}`,
       });
       await seed.createModel({

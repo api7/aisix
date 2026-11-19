@@ -77,7 +77,7 @@ describe("global pricing e2e: pricing documents drive least_cost", () => {
     if (!seed) throw new Error("seed client not initialized");
     const providerKey = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     return seed.createModel({
@@ -517,7 +517,7 @@ describe("global pricing e2e: a priced model's usage events carry no cost", () =
     await global.createPricing({ key: "vendor/rt", input_per_1k: 1.0, output_per_1k: 2.0 });
     const pk = await seed.createProviderKey({
       display_name: "rt-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `http://127.0.0.1:${upstream.port}/v1`,
     });
     // Priced by the catalog: the gateway holds a price for it.

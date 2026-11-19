@@ -83,7 +83,7 @@ describe("request latency labels survive buffering and configuration reloads", (
       ] });
       upstreams.push(upstream);
       const pk = await seed.createProviderKey({ display_name: model, provider: "openai",
-        adapter: "openai", secret: "test", api_base: `${upstream.baseUrl}/v1`,
+        adapter: "openai", api_key: "test", api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({ display_name: model, model_name: model, provider: "openai", provider_key_id: pk.id });
     }
@@ -150,7 +150,7 @@ describe("request latency labels survive buffering and configuration reloads", (
       const provider = ensemble ? "openai" : context.provider;
       const pk = await seed.createProviderKey({ display_name: `lifetime-${index}`,
         provider, adapter: context.adapter,
-        secret: "test", api_base: `http://127.0.0.1:${port}/v1`,
+        api_key: "test", api_base: `http://127.0.0.1:${port}/v1`,
       });
       const displayName = ensemble ? "lifetime-member" : `lifetime-${index}/*`;
       const model = await seed.createModel({ display_name: displayName, model_name: "*",

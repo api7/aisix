@@ -111,7 +111,7 @@ describe("provider_key_name pairs with provider_key_id on every series (#941)", 
 
     const pk = await seed.createProviderKey({
       display_name: PK_NAME,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     pkId = pk.id;
@@ -124,7 +124,7 @@ describe("provider_key_name pairs with provider_key_id on every series (#941)", 
 
     const streamPk = await seed.createProviderKey({
       display_name: PK_NAME_STREAM,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
     streamPkId = streamPk.id;
@@ -137,7 +137,7 @@ describe("provider_key_name pairs with provider_key_id on every series (#941)", 
 
     const embedPk = await seed.createProviderKey({
       display_name: PK_NAME_EMBED,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${embedUpstream.baseUrl}/v1`,
     });
     embedPkId = embedPk.id;

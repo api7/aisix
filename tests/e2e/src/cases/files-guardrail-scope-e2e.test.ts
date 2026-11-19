@@ -181,7 +181,7 @@ describe("files: the surface is not guardrail-screened", () => {
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: `${MODEL}-pk`,
-      secret: "sk-upstream-files",
+      api_key: "sk-upstream-files",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

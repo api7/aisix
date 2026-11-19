@@ -74,7 +74,7 @@ describe("openrouter delta.reasoning normalization on streaming /v1/chat/complet
     // OpenRouter dispatches through the OpenAI-compat family bridge.
     const pk = await seed.createProviderKey({
       display_name: "or-stream-reasoning-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
       provider: "openrouter",
       adapter: "openai",

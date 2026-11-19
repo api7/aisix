@@ -63,7 +63,7 @@ describe("api key allowed_model_ids: grants follow the model id, not its name", 
 
     const pk = await seed.createProviderKey({
       display_name: "ami-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     providerKeyId = pk.id;

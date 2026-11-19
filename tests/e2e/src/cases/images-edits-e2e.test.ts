@@ -71,7 +71,7 @@ describe("images edits e2e: /v1/images/edits multipart forward + model translati
 
     const pk = await seed.createProviderKey({
       display_name: "img-edits-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -197,7 +197,7 @@ describe("images edits e2e: /v1/images/edits multipart forward + model translati
 
     const pk = await seed.createProviderKey({
       display_name: "img-edits-anthropic-pk",
-      secret: "sk-anthropic-mock",
+      api_key: "sk-anthropic-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

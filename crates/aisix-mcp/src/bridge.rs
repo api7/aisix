@@ -1375,7 +1375,7 @@ mod tests {
     fn cleartext_credential_detection() {
         let server = |auth_type: &str, url: &str, token_url: Option<&str>| -> McpServer {
             serde_json::from_value(serde_json::json!({
-                "display_name": "s",
+                "name": "s",
                 "url": url,
                 "auth_type": auth_type,
                 "secret": "k",

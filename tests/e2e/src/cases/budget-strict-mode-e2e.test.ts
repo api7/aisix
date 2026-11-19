@@ -52,8 +52,8 @@ describe("strict budget mode follows usage delivery", () => {
     app = await spawnApp({ extra: { managed: cp.managed }, awaitProxyListener: false });
     const seed = new SeedClient(etcd, `${app.etcdPrefix}/${cp.envId}`);
 
-    const pkPlain = await seed.createProviderKey({ display_name: "bs-pk-plain", secret: "sk-mock", api_base: `${upstream.baseUrl}/v1` });
-    const pkBudgeted = await seed.createProviderKey({ display_name: "bs-pk-budgeted", secret: "sk-mock", api_base: `${upstream.baseUrl}/v1` });
+    const pkPlain = await seed.createProviderKey({ display_name: "bs-pk-plain", api_key: "sk-mock", api_base: `${upstream.baseUrl}/v1` });
+    const pkBudgeted = await seed.createProviderKey({ display_name: "bs-pk-budgeted", api_key: "sk-mock", api_base: `${upstream.baseUrl}/v1` });
     const model = (display_name: string, provider_key_id: string) =>
       seed.createModel({ display_name, provider: "openai", model_name: "gpt-4o-mini", provider_key_id });
     await model("bs-plain", pkPlain.id);

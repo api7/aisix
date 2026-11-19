@@ -139,7 +139,7 @@ describe("upstream_protocol + prompt-cache token metrics e2e", () => {
       display_name: "proto-openai-pk",
       provider: "openai",
       adapter: "openai",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${openAiUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -156,7 +156,7 @@ describe("upstream_protocol + prompt-cache token metrics e2e", () => {
       display_name: "proto-anthropic-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: anthropicUpstream.baseUrl,
     });
     await seed.createModel({

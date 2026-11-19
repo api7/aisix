@@ -83,7 +83,7 @@ describe("OpenAI cache-write usage survives every supported entry point", () => 
     for (const provider of ["openai", "deepseek"]) {
       const pk = await seed.createProviderKey({
         display_name: `cache-write-${provider}`, provider, adapter: "openai",
-        secret: "test", api_base: `http://127.0.0.1:${port}/v1`,
+        api_key: "test", api_base: `http://127.0.0.1:${port}/v1`,
       });
       for (const scenario of cases.filter((c) => (c.surface === "responses-bridge") === (provider === "deepseek"))) {
         await seed.createModel({

@@ -29,11 +29,6 @@ pub struct A2aAgent {
     /// advertised agent-card URL without percent-encoding, so `/`, `?`, `#`, `%`
     /// and whitespace are rejected: `a?b` would advertise a URL whose path is
     /// just `/a2a/a`, and the lookup is an exact match on the stored name.
-    // `display_name` is the field's former name; stored documents and
-    // callers that still use it keep deserializing (schema-side acceptance
-    // lives in `schema::a2a_agent_root_schema`). Re-serialization always
-    // emits `name`.
-    #[serde(alias = "display_name")]
     #[schemars(
         regex(pattern = "^[^/?#%\\s\\x00-\\x1f\\x7f\u{0080}-\u{009f}]+$"),
         length(min = 1)
@@ -254,17 +249,12 @@ mod tests {
         for bad in [
             "a/b", "a?b", "a#b", "a%2Fb", "a b", "a\tb", "a\nb", "a\x7fb", "a\u{80}b", "a\u{9f}b",
         ] {
-            for key in ["name", "display_name"] {
-                let doc = json!({key: bad, "url": "https://x/a2a"});
-                crate::models::schema::validate_a2a_agent(&doc)
-                    .expect_err(&format!("{key}={bad:?} must be rejected"));
-            }
+            let doc = json!({"name": bad, "url": "https://x/a2a"});
+            crate::models::schema::validate_a2a_agent(&doc)
+                .expect_err(&format!("{bad:?} must be rejected"));
         }
-        // A plain name is still fine under both spellings.
-        for key in ["name", "display_name"] {
-            let doc = json!({key: "invoice-processor", "url": "https://x/a2a"});
-            crate::models::schema::validate_a2a_agent(&doc).expect("plain name is valid");
-        }
+        let doc = json!({"name": "invoice-processor", "url": "https://x/a2a"});
+        crate::models::schema::validate_a2a_agent(&doc).expect("plain name is valid");
         // Credential obligations: missing, empty and null all fail.
         for bad in [None, Some(json!("")), Some(json!(null))] {
             let mut doc = json!({"name": "a", "url": "https://x/a2a", "auth_type": "bearer"});
@@ -338,7 +328,7 @@ mod tests {
     #[test]
     fn deserialises_minimal_a2a_agent() {
         let a: A2aAgent = serde_json::from_str(
-            r#"{"display_name":"invoice-processor","url":"https://agents.example.com/a2a"}"#,
+            r#"{"name":"invoice-processor","url":"https://agents.example.com/a2a"}"#,
         )
         .unwrap();
         assert_eq!(a.name, "invoice-processor");
@@ -354,7 +344,7 @@ mod tests {
     #[test]
     fn deserialises_with_bearer_auth_and_pinned_v0_3() {
         let a: A2aAgent = serde_json::from_str(
-            r#"{"display_name":"tr","url":"https://x/a2a","protocol_version":"0.3","auth_type":"bearer","secret":"tok","timeout_ms":5000,"enabled":false}"#,
+            r#"{"name":"tr","url":"https://x/a2a","protocol_version":"0.3","auth_type":"bearer","secret":"tok","timeout_ms":5000,"enabled":false}"#,
         )
         .unwrap();
         assert_eq!(a.protocol_version, A2aProtocolVersion::V0_3);
@@ -369,7 +359,7 @@ mod tests {
         // `auth_type` accepts only `none` / `bearer` / `api_key` — the same
         // closed set as the control plane's a2a_agent resource.
         assert!(serde_json::from_str::<A2aAgent>(
-            r#"{"display_name":"a","url":"https://x/a2a","auth_type":"oauth2","secret":"cs-1"}"#,
+            r#"{"name":"a","url":"https://x/a2a","auth_type":"oauth2","secret":"cs-1"}"#,
         )
         .is_err());
         // The OAuth-specific fields were removed with the `oauth2` arm; serde
@@ -381,7 +371,7 @@ mod tests {
             r#""token_url":"https://auth/x/token""#,
             r#""scopes":["read","write"]"#,
         ] {
-            let doc = format!(r#"{{"display_name":"a","url":"https://x/a2a",{field}}}"#);
+            let doc = format!(r#"{{"name":"a","url":"https://x/a2a",{field}}}"#);
             let a: A2aAgent = serde_json::from_str(&doc)
                 .unwrap_or_else(|e| panic!("field must be tolerated as unknown: {doc}: {e}"));
             assert_eq!(a.name, "a");
@@ -390,8 +380,7 @@ mod tests {
 
     #[test]
     fn protocol_version_serialises_as_dotted_string() {
-        let a: A2aAgent =
-            serde_json::from_str(r#"{"display_name":"a","url":"https://x/a2a"}"#).unwrap();
+        let a: A2aAgent = serde_json::from_str(r#"{"name":"a","url":"https://x/a2a"}"#).unwrap();
         let s = serde_json::to_string(&a).unwrap();
         // Default V1_0 serialises as the wire string "1.0", not "v1_0".
         assert!(s.contains(r#""protocol_version":"1.0""#), "got: {s}");
@@ -400,7 +389,7 @@ mod tests {
     #[test]
     fn api_key_round_trips_and_omits_unset_optionals() {
         let original: A2aAgent = serde_json::from_str(
-            r#"{"display_name":"a","url":"https://x/a2a","auth_type":"api_key","secret":"k-1"}"#,
+            r#"{"name":"a","url":"https://x/a2a","auth_type":"api_key","secret":"k-1"}"#,
         )
         .unwrap();
         let s = serde_json::to_string(&original).unwrap();
@@ -419,12 +408,9 @@ mod tests {
         // A newer control plane may ship fields ahead of this DP; serde must
         // accept them (the write path still rejects them via
         // `validate_a2a_agent` in `models/schema.rs`).
-        let a: A2aAgent =
-            serde_json::from_str(r#"{"display_name":"x","url":"u","extra":1}"#).unwrap();
+        let a: A2aAgent = serde_json::from_str(r#"{"name":"x","url":"u","extra":1}"#).unwrap();
         assert_eq!(a.name, "x");
     }
-
-    // ---- `display_name` → `name` rename ----
 
     #[test]
     fn accepts_canonical_name_spelling() {
@@ -434,48 +420,29 @@ mod tests {
     }
 
     #[test]
-    fn serialises_label_under_name_only() {
-        // Emission contract: re-serialization uses the canonical `name`,
-        // never the former `display_name` spelling (the fixtures above
-        // keep exercising the deserialize-side alias).
-        let a: A2aAgent =
-            serde_json::from_str(r#"{"display_name":"invoice","url":"https://x/a2a"}"#).unwrap();
-        let json = serde_json::to_string(&a).unwrap();
-        assert!(json.contains(r#""name":"invoice""#), "got: {json}");
-        assert!(!json.contains("display_name"), "got: {json}");
-    }
-
-    #[test]
-    fn rejects_document_carrying_both_spellings() {
-        // serde maps the alias onto the same field, so a document that
-        // carries both spellings is a duplicate-field error — the
-        // ambiguity is rejected instead of one value silently winning.
-        let r: Result<A2aAgent, _> = serde_json::from_str(
-            r#"{"name":"invoice","display_name":"invoice-old","url":"https://x/a2a"}"#,
-        );
-        let err = r.expect_err("both spellings in one document must be rejected");
-        assert!(
-            err.to_string().contains("duplicate field"),
-            "expected a duplicate-field error, got: {err}"
-        );
+    fn the_retired_display_name_spelling_no_longer_deserialises() {
+        let err =
+            serde_json::from_str::<A2aAgent>(r#"{"display_name":"invoice","url":"https://x/a2a"}"#)
+                .expect_err("`display_name` is no longer read as `name`");
+        assert!(err.to_string().contains("missing field `name`"), "{err}");
     }
 
     #[test]
     fn rejects_unknown_protocol_version_and_auth_type() {
         assert!(serde_json::from_str::<A2aAgent>(
-            r#"{"display_name":"x","url":"u","protocol_version":"2.0"}"#
+            r#"{"name":"x","url":"u","protocol_version":"2.0"}"#
         )
         .is_err());
-        assert!(serde_json::from_str::<A2aAgent>(
-            r#"{"display_name":"x","url":"u","auth_type":"oauth"}"#
-        )
-        .is_err());
+        assert!(
+            serde_json::from_str::<A2aAgent>(r#"{"name":"x","url":"u","auth_type":"oauth"}"#)
+                .is_err()
+        );
     }
 
     #[test]
     fn resource_trait_routes_through_name() {
         let mut a: A2aAgent =
-            serde_json::from_str(r#"{"display_name":"invoice","url":"https://x/a2a"}"#).unwrap();
+            serde_json::from_str(r#"{"name":"invoice","url":"https://x/a2a"}"#).unwrap();
         a.runtime_id = "uuid-a2a-1".into();
         assert_eq!(<A2aAgent as Resource>::kind(), "a2a_agents");
         assert_eq!(a.id(), "uuid-a2a-1");

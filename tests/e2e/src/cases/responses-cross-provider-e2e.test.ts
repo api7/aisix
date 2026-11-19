@@ -191,7 +191,7 @@ describe("/v1/responses cross-provider → Anthropic (#825)", () => {
       display_name: "issue825-ns-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: nsUpstream.baseUrl,
     });
     await seed.createModel({
@@ -204,7 +204,7 @@ describe("/v1/responses cross-provider → Anthropic (#825)", () => {
       display_name: "issue825-stream-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: streamUpstream.baseUrl,
     });
     await seed.createModel({

@@ -109,7 +109,7 @@ describe("model IP restriction e2e (#557): allowed_cidrs gate before upstream", 
 
     const pk = await seed.createProviderKey({
       display_name: "model-ip-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     // Restricted model: only the 10.0.0.0/8 range may call it.
@@ -138,7 +138,7 @@ describe("model IP restriction e2e (#557): allowed_cidrs gate before upstream", 
     });
     const groupOpenPk = await seed.createProviderKey({
       display_name: "group-open-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${groupOpenUpstream!.baseUrl}/v1`,
     });
     await seed.createModel({

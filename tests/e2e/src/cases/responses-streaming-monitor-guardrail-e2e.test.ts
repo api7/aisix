@@ -121,7 +121,7 @@ describe("responses streaming with monitor-mode output guardrail (AISIX-Cloud#10
 
     const pk = await seed.createProviderKey({
       display_name: "gr-1010-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

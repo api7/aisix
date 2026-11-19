@@ -64,7 +64,7 @@ describe("metric name labels resolve from the named documents", () => {
     await seed.update("teams", teamId, { name: "Platform" });
     await seed.update("users", userId, { name: "Alice From Users" });
     const pk = await seed.createProviderKey({
-      display_name: "Primary OpenAI", secret: "sk-mock", api_base: `${upstream.baseUrl}/v1`,
+      display_name: "Primary OpenAI", api_key: "sk-mock", api_base: `${upstream.baseUrl}/v1`,
     });
     pkId = pk.id;
     await seed.createModel({
@@ -208,7 +208,7 @@ describe("name labels are opt-in", () => {
     const teamId = randomUUID();
     await seed.update("teams", teamId, { name: "Platform" });
     const pk = await seed.createProviderKey({
-      display_name: "Primary OpenAI", secret: "sk-mock", api_base: `${upstream.baseUrl}/v1`,
+      display_name: "Primary OpenAI", api_key: "sk-mock", api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
       display_name: MODEL, provider: "openai", model_name: "gpt-4o-mini", provider_key_id: pk.id,

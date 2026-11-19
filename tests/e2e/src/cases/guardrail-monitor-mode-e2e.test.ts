@@ -56,7 +56,7 @@ describe("guardrail e2e: enforcement_mode monitor observes without blocking", ()
 
     const pk = await seed.createProviderKey({
       display_name: "gr-monitor-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

@@ -105,7 +105,7 @@ describe("bridged tool parameters: custom tools, tool_choice forms, parallel_too
 
     const chatPk = await seed.createProviderKey({
       display_name: "tool-params-chat-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${chatUpstream.baseUrl}/v1`,
       apis: {},
     });
@@ -122,7 +122,7 @@ describe("bridged tool parameters: custom tools, tool_choice forms, parallel_too
       display_name: "tool-params-anthropic-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: anthropicUpstream.baseUrl,
     });
     await seed.createModel({

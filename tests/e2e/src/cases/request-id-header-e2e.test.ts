@@ -44,7 +44,7 @@ describe("data plane stamps x-aisix-request-id on every response", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "request-id-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

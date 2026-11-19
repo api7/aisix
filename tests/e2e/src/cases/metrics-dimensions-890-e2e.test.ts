@@ -59,7 +59,7 @@ describe("metrics dimensions #890 e2e", () => {
 
     const nsPk = await seed.createProviderKey({
       display_name: PK_NAME,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${nonStreamUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -71,7 +71,7 @@ describe("metrics dimensions #890 e2e", () => {
 
     const stPk = await seed.createProviderKey({
       display_name: `${PK_NAME}-stream`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -83,7 +83,7 @@ describe("metrics dimensions #890 e2e", () => {
 
     const errPk = await seed.createProviderKey({
       display_name: `${PK_NAME}-error`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${errorUpstream.baseUrl}/v1`,
     });
     await seed.createModel({

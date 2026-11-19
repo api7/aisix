@@ -65,7 +65,7 @@ describe("images generations e2e: /v1/images/generations verbatim forward + mode
 
     const pk = await seed.createProviderKey({
       display_name: "img-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -190,7 +190,7 @@ describe("images generations e2e: /v1/images/generations verbatim forward + mode
     // the e2e gap on this contract.
     const nonOaPk = await seed.createProviderKey({
       display_name: "img-anthropic-pk",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

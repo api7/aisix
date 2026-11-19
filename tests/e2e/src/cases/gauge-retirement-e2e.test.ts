@@ -77,7 +77,7 @@ describe("gauge retirement e2e: a deleted key stops reporting", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "gr-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

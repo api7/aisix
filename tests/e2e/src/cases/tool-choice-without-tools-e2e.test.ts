@@ -105,7 +105,7 @@ describe("tool_choice without tools is dropped at every bridge (#1614)", () => {
       display_name: "tc1614-chat-pk",
       provider: "deepseek",
       adapter: "openai",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${chatUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -121,7 +121,7 @@ describe("tool_choice without tools is dropped at every bridge (#1614)", () => {
       display_name: "tc1614-anthropic-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: anthropicUpstream.baseUrl,
     });
     await seed.createModel({

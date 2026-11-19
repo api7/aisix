@@ -50,7 +50,7 @@ describe("cache policy e2e: identical request hits cache", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "cache-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

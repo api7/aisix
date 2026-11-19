@@ -1557,7 +1557,7 @@ mod tests {
         };
         Arc::new(
             serde_json::from_str(&format!(
-                r#"{{"display_name": "azure-prod", "secret": "az-key"{api_base_json}}}"#
+                r#"{{"display_name": "azure-prod", "api_key": "az-key"{api_base_json}}}"#
             ))
             .unwrap(),
         )
@@ -1570,7 +1570,7 @@ mod tests {
         let aad_json = r#"{"tenant_id":"tenant-uuid-aaa","client_id":"client-uuid-bbb","client_secret":"aad-secret-rotation-managed"}"#;
         let pk = serde_json::from_value::<ProviderKey>(serde_json::json!({
             "display_name": "azure-aad-prod",
-            "secret": aad_json,
+            "api_key": aad_json,
             "api_base": api_base,
         }))
         .unwrap();
@@ -1580,7 +1580,7 @@ mod tests {
     fn sample_pk_with_overrides(api_base: &str, overrides_json: &str) -> Arc<ProviderKey> {
         Arc::new(
             serde_json::from_str(&format!(
-                r#"{{"display_name": "azure-prod", "secret": "az-key", "api_base": "{api_base}", {overrides_json}}}"#
+                r#"{{"display_name": "azure-prod", "api_key": "az-key", "api_base": "{api_base}", {overrides_json}}}"#
             ))
             .unwrap(),
         )
@@ -1867,7 +1867,7 @@ mod tests {
         // Build a PK whose api_key is empty.
         let pk: Arc<ProviderKey> = Arc::new(
             serde_json::from_str(
-                r#"{"display_name": "azure-prod", "secret": "", "api_base": "https://acme-west.openai.azure.com"}"#,
+                r#"{"display_name": "azure-prod", "api_key": "", "api_base": "https://acme-west.openai.azure.com"}"#,
             )
             .unwrap(),
         );

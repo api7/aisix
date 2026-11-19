@@ -197,7 +197,7 @@ describe("provider_key.resolve_addresses (AISIX-Cloud#1661)", () => {
     for (const [model, pkFields] of keys) {
       const pk = await seed.createProviderKey({
         display_name: `${model}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         ...pkFields,
       });
       await seed.createModel({

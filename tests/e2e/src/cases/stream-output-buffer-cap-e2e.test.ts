@@ -202,7 +202,7 @@ describe("streamed output hold-back cap measures held content (#513)", () => {
       upstreams.push(upstream);
       const pk = await seed.createProviderKey({
         display_name: `${display}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: provider === "openai" ? `${upstream.baseUrl}/v1` : upstream.baseUrl,
         ...pkExtra,
       });

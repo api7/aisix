@@ -384,7 +384,7 @@ async fn downstream_context_never_crosses_to_the_upstream() {
 async fn snapshot_row_with_protocol_version_reaches_modern_only_upstream() {
     let (stub_addr, recorder) = spawn_stub(StubGeneration::ModernOnly).await;
     let server: aisix_core::McpServer = serde_json::from_value(serde_json::json!({
-        "display_name": "modern",
+        "name": "modern",
         "url": format!("http://{stub_addr}/mcp"),
         "protocol_version": "2026-07-28",
     }))

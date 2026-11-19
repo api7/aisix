@@ -135,7 +135,7 @@ describe("Responses passthrough keeps generated media out of output guardrails",
 
     const providerKey = await seed.createProviderKey({
       display_name: "passthrough-responses-media-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: bufferedUpstream.baseUrl,
     });
     await seed.createPassthroughRoute({

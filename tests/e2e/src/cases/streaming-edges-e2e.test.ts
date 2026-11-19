@@ -93,7 +93,7 @@ describe("streaming edges e2e: client abort mid-stream", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "stream-abort-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -213,7 +213,7 @@ describe("streaming edges e2e: client abort mid-stream", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "stream-disc-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

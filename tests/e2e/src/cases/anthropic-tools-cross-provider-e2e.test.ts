@@ -81,7 +81,7 @@ describe("Anthropic Messages client → OpenAI upstream: tools translation (#236
 
     const pk = await seed.createProviderKey({
       display_name: "anth-tools-xprov-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -321,7 +321,7 @@ describe("Anthropic Messages client → OpenAI upstream: streaming tool_calls (#
 
     const pk = await seed.createProviderKey({
       display_name: "anth-tools-stream-xprov-pk",
-      secret: "sk-openai-stream-mock",
+      api_key: "sk-openai-stream-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

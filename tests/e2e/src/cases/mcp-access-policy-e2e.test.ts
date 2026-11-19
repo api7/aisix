@@ -181,12 +181,12 @@ describe("mcp access policy e2e: env, team and key layers intersect", () => {
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "alpha",
+      name: "alpha",
       url: alpha.url,
       enabled: true,
     });
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "beta",
+      name: "beta",
       url: beta.url,
       enabled: true,
     });

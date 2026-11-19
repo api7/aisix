@@ -889,11 +889,11 @@ describe("every proxy route emits every per-request metric family", () => {
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
-    const openaiPk = await seed.createProviderKey({ display_name: "par-openai-pk", secret: "sk-mock", api_base: `${upstream.baseUrl}/v1`, provider: "openai" });
-    const soraPk = await seed.createProviderKey({ display_name: "par-sora-pk", secret: "sk-mock", api_base: upstream.baseUrl, provider: "openai" });
-    const anthropicPk = await seed.createProviderKey({ display_name: "par-anthropic-pk", secret: "sk-ant", api_base: upstream.baseUrl });
-    const typesafePk = await seed.createProviderKey({ display_name: "par-typesafe-pk", provider: "typesafe", adapter: undefined, secret: "ts", api_base: upstream.baseUrl });
-    const realtimePk = await seed.createProviderKey({ display_name: "par-realtime-pk", secret: "sk-mock", api_base: `http://127.0.0.1:${realtime.port}/v1` });
+    const openaiPk = await seed.createProviderKey({ display_name: "par-openai-pk", api_key: "sk-mock", api_base: `${upstream.baseUrl}/v1`, provider: "openai" });
+    const soraPk = await seed.createProviderKey({ display_name: "par-sora-pk", api_key: "sk-mock", api_base: upstream.baseUrl, provider: "openai" });
+    const anthropicPk = await seed.createProviderKey({ display_name: "par-anthropic-pk", api_key: "sk-ant", api_base: upstream.baseUrl });
+    const typesafePk = await seed.createProviderKey({ display_name: "par-typesafe-pk", provider: "typesafe", adapter: undefined, api_key: "ts", api_base: upstream.baseUrl });
+    const realtimePk = await seed.createProviderKey({ display_name: "par-realtime-pk", api_key: "sk-mock", api_base: `http://127.0.0.1:${realtime.port}/v1` });
 
     const model = (display_name: string, model_name: string, provider_key_id: string, provider = "openai") =>
       seed.createModel({ display_name, provider, model_name, provider_key_id });
@@ -912,7 +912,7 @@ describe("every proxy route emits every per-request metric family", () => {
     await model("par-realtime", "gpt-realtime-mock", realtimePk.id);
     await model("par-jobs", "gpt-4o", openaiPk.id);
 
-    await seed.update("mcp_servers", randomUUID(), { display_name: "alpha", url: mcp.url, enabled: true });
+    await seed.update("mcp_servers", randomUUID(), { name: "alpha", url: mcp.url, enabled: true });
     await seed.update("a2a_agents", randomUUID(), { name: "par-agent", url: a2a.url, protocol_version: "1.0", auth_type: "none", enabled: true });
     await seed.createPassthroughRoute({ name: "par-ptr", path_prefix: "/passthrough/parity", target_url: `${upstream.baseUrl}/v1`, provider_key_id: openaiPk.id });
 

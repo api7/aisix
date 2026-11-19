@@ -83,7 +83,7 @@ describe("Anthropic Messages → OpenAI upstream: Anthropic-only extras are not 
 
     const pk = await seed.createProviderKey({
       display_name: "anth-extras-xprov-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -235,7 +235,7 @@ describe("Anthropic Messages → OpenAI upstream: streaming extras are not forwa
 
     const pk = await seed.createProviderKey({
       display_name: "anth-extras-stream-xprov-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

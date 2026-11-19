@@ -70,7 +70,7 @@ describe("byo + anthropic adapter e2e: the Anthropic-native routes key on the ad
 
     const pk = await seed.createProviderKey({
       display_name: "byo-anthropic-pk",
-      secret: "sk-byo-upstream",
+      api_key: "sk-byo-upstream",
       api_base: upstream.baseUrl,
       // The combination under test: a vendor id that is NOT "anthropic",
       // with the Anthropic protocol declared on the adapter.
@@ -85,7 +85,7 @@ describe("byo + anthropic adapter e2e: the Anthropic-native routes key on the ad
     });
     const firstPartyPk = await seed.createProviderKey({
       display_name: "first-party-anthropic-pk",
-      secret: "sk-first-party-upstream",
+      api_key: "sk-first-party-upstream",
       api_base: upstream.baseUrl,
       provider: "anthropic",
       adapter: "anthropic",

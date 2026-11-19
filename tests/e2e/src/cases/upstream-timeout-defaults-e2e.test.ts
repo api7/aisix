@@ -126,7 +126,7 @@ describe("deployment-wide upstream timeout default", () => {
         (
           await seed.createProviderKey({
             display_name: name,
-            secret: "sk-mock",
+            api_key: "sk-mock",
             api_base: `${u.baseUrl}/v1`,
           })
         ).id;
@@ -192,7 +192,7 @@ describe("deployment-wide upstream timeout default", () => {
       const pkId = (
         await seed.createProviderKey({
           display_name: "td-group-pk",
-          secret: "sk-mock",
+          api_key: "sk-mock",
           api_base: `${groupStalling.baseUrl}/v1`,
         })
       ).id;

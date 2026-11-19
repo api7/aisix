@@ -294,7 +294,7 @@ describe("OTLP output messages keep reasoning, text and tool calls apart", () =>
     const model = async (name: string, upstream: OpenAiUpstream, pk: Record<string, unknown> = {}) => {
       const key = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
         ...pk,
       });

@@ -231,7 +231,7 @@ describe("semantic classifier e2e", () => {
 
     const typesafe = await seed.createProviderKey({
       display_name: "typesafe-pk",
-      secret: TYPESAFE_SECRET,
+      api_key: TYPESAFE_SECRET,
       provider: "typesafe",
       adapter: undefined,
       api_base: decisions.baseUrl,
@@ -240,7 +240,7 @@ describe("semantic classifier e2e", () => {
     // rather than send its credential to the decision endpoint.
     const wrongProvider = await seed.createProviderKey({
       display_name: "not-typesafe-pk",
-      secret: "sk-wrong",
+      api_key: "sk-wrong",
       api_base: decisions.baseUrl,
     });
 
@@ -249,7 +249,7 @@ describe("semantic classifier e2e", () => {
       closers.push(() => upstream.close());
       const pk = await seed!.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed!.createModel({
@@ -288,7 +288,7 @@ describe("semantic classifier e2e", () => {
     closers.push(() => streaming.close());
     const streamPk = await seed.createProviderKey({
       display_name: "stream-model-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${streaming.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -307,7 +307,7 @@ describe("semantic classifier e2e", () => {
     ] as const) {
       const key = await seed.createProviderKey({
         display_name: `${pk}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${embedModel.baseUrl}/v1`,
       });
       await seed.createModel({

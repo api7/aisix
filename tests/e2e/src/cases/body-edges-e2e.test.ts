@@ -74,7 +74,7 @@ describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "body-edges-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -447,7 +447,7 @@ describe("body edges e2e: unlimited default (request_body_limit_bytes: 0)", () =
 
     const pk = await seed.createProviderKey({
       display_name: "body-unlimited-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

@@ -176,7 +176,7 @@ describe("an ensemble's failed sub-calls each leave a usage row", () => {
       upstreams.push(upstream);
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       const model = await seed.createModel({

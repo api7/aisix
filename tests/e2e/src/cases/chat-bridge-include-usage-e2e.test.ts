@@ -220,7 +220,7 @@ describe("chat streaming with stream_options.include_usage on bridged upstreams"
       display_name: `${MODELS.anthropic}-pk`,
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-anth-mock",
+      api_key: "sk-anth-mock",
       api_base: baseUrl,
     });
     await seed.createModel({
@@ -233,7 +233,7 @@ describe("chat streaming with stream_options.include_usage on bridged upstreams"
       display_name: "include-usage-vertex-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({ access_token: "ya29.include-usage", project: "p", region: "us-east5" }),
+      api_key: JSON.stringify({ access_token: "ya29.include-usage", project: "p", region: "us-east5" }),
       api_base: baseUrl,
     });
     await seed.createModel({
@@ -250,7 +250,7 @@ describe("chat streaming with stream_options.include_usage on bridged upstreams"
     });
     const compatPk = await seed.createProviderKey({
       display_name: "include-usage-openai-compat-pk",
-      secret: "sk-compat-mock",
+      api_key: "sk-compat-mock",
       api_base: `${baseUrl}/oai`,
     });
     await seed.createModel({

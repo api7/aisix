@@ -312,7 +312,7 @@ describe("Chat passthrough keeps media out of external output guardrails", () =>
 
     const providerKey = await seed.createProviderKey({
       display_name: "passthrough-chat-media-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: bufferedUpstream.baseUrl,
     });
     await seed.createPassthroughRoute({

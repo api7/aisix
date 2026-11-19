@@ -93,7 +93,7 @@ describe("native /v1/responses stream masks mcp_call arguments (AISIX-Cloud#1621
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "resp-mcp-1621-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const m = await seed.createModel({

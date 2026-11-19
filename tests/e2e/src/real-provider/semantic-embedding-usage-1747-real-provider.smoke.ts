@@ -174,7 +174,7 @@ describe("semantic embedding usage with a real OpenAI provider (#1747)", () => {
     });
     const providerKey = await seed.createProviderKey({
       display_name: "semantic-embedding-real-provider-openai",
-      secret: OPENAI_API_KEY,
+      api_key: OPENAI_API_KEY,
       api_base: "https://api.openai.com/v1",
     });
     const embedding = await seed.createModel({

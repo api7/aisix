@@ -161,7 +161,7 @@ describe("Bedrock Converse: identical requests send identical bodies", () => {
       display_name: "bedrock-converse-stable-body-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-converse-stable-body",
         secret_access_key: "sk-converse-stable-body",
         region: "us-east-1",

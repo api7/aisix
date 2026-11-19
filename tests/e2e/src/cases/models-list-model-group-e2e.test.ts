@@ -68,7 +68,7 @@ describe("models listing e2e: a Model Group is a discoverable entry point", () =
 
     const pk = await seed.createProviderKey({
       display_name: "ml-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

@@ -87,7 +87,7 @@ async function startOtlpReceiver(): Promise<OtlpReceiver> {
 async function seedRouting(seed: SeedClient, upstream: OpenAiUpstream) {
   const pk = await seed.createProviderKey({
     display_name: "client-source-pk",
-    secret: PROVIDER_SECRET,
+    api_key: PROVIDER_SECRET,
     api_base: `${upstream.baseUrl}/v1`,
   });
   await seed.createModel({

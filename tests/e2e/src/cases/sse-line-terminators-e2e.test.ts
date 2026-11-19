@@ -57,7 +57,7 @@ describe("sse line terminators e2e: a CR-framed upstream is read like any other"
   ): Promise<void> {
     const pk = await seed!.createProviderKey({
       display_name: `pk-${alias}`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
       provider,
       adapter: provider,

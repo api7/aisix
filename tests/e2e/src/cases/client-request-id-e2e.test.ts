@@ -171,7 +171,7 @@ describe("client-supplied request id (AISIX-Cloud#1288)", () => {
     if (!seed) throw new Error("seed client not initialized");
     const pk = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -516,7 +516,7 @@ describe("client-supplied request id: x-request-id opted in", () => {
       upstreams.push(upstream);
       const pk = await seed.createProviderKey({
         display_name: "reqid-optin-pk",
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({

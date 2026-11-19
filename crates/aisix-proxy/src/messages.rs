@@ -5057,7 +5057,7 @@ mod tests {
 
     fn anthropic_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"anthropic-up","secret":"sk-ant-test","api_base":"{api_base}","provider":"anthropic","adapter":"anthropic"}}"#
+            r#"{{"display_name":"anthropic-up","api_key":"sk-ant-test","api_base":"{api_base}","provider":"anthropic","adapter":"anthropic"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(ANTHROPIC_PK_ID, pk, 1)
@@ -5065,7 +5065,7 @@ mod tests {
 
     fn openai_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-openai-test","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+            r#"{{"display_name":"openai-up","api_key":"sk-openai-test","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(OPENAI_PK_ID, pk, 1)
@@ -5141,7 +5141,7 @@ mod tests {
 
         let snap = AisixSnapshot::new();
         let pk_json = format!(
-            r#"{{"display_name":"byo-anthropic","secret":"sk-byo","api_base":"{}","provider":"byo","adapter":"anthropic"}}"#,
+            r#"{{"display_name":"byo-anthropic","api_key":"sk-byo","api_base":"{}","provider":"byo","adapter":"anthropic"}}"#,
             upstream.uri()
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
@@ -5265,7 +5265,7 @@ mod tests {
     ) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = serde_json::json!({
             "display_name": "anthropic-up",
-            "secret": "sk-ant-test",
+            "api_key": "sk-ant-test",
             "api_base": api_base,
             "request": request_overrides,
         });
@@ -5996,7 +5996,7 @@ data: [DONE]\n\n";
 
     fn gemini_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"gemini-up","secret":"ya29-test","api_base":"{api_base}","provider":"google","adapter":"openai"}}"#
+            r#"{{"display_name":"gemini-up","api_key":"ya29-test","api_base":"{api_base}","provider":"google","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(GOOGLE_PK_ID, pk, 1)
@@ -6004,7 +6004,7 @@ data: [DONE]\n\n";
 
     fn deepseek_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"deepseek-up","secret":"sk-deepseek","api_base":"{api_base}","provider":"deepseek","adapter":"openai"}}"#
+            r#"{{"display_name":"deepseek-up","api_key":"sk-deepseek","api_base":"{api_base}","provider":"deepseek","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(DEEPSEEK_PK_ID, pk, 1)
@@ -6988,7 +6988,7 @@ data: [DONE]\n\n";
         // registered. `adapter: "openai"` is right for both gemini
         // and deepseek (OpenAI-compat wire shapes).
         let pk_json = format!(
-            r#"{{"display_name":"matrix-up","secret":"k","api_base":"{}","provider":"{bridge_provider}","adapter":"openai"}}"#,
+            r#"{{"display_name":"matrix-up","api_key":"k","api_base":"{}","provider":"{bridge_provider}","adapter":"openai"}}"#,
             upstream.uri()
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();

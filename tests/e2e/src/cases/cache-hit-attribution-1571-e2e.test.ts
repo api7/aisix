@@ -185,7 +185,7 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
 
     const soloPk = await seed.createProviderKey({
       display_name: "chit-solo-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     soloPkId = soloPk.id;
@@ -200,7 +200,7 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
     // line naming one names a target rather than merely some string.
     const pkA = await seed.createProviderKey({
       display_name: "chit-a-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstreamA.baseUrl}/v1`,
     });
     targetAPkId = pkA.id;
@@ -212,7 +212,7 @@ describe("cache-hit attribution e2e (AISIX-Cloud#1571)", () => {
     });
     const pkB = await seed.createProviderKey({
       display_name: "chit-b-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstreamB.baseUrl}/v1`,
     });
     await seed.createModel({

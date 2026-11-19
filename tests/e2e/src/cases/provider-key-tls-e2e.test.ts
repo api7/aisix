@@ -134,7 +134,7 @@ describe("provider_key.tls (#860)", () => {
     for (const [model, tls] of cases) {
       const pk = await seed.createProviderKey({
         display_name: `${model}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: upstream.baseUrl,
         tls,
       });

@@ -180,7 +180,7 @@ async fn main() {
     // gateway — the same construction `/mcp/{server}` uses in production,
     // so the suite exercises the shipped bridge + gateway chain.
     let server: aisix_core::McpServer = serde_json::from_value(serde_json::json!({
-        "display_name": "conformance",
+        "name": "conformance",
         "url": format!("http://{upstream_addr}/mcp"),
         "auth_type": "none",
     }))

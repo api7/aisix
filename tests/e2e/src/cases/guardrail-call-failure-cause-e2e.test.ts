@@ -70,7 +70,7 @@ describe("guardrail call failure logs its underlying cause", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "guardrail-cause-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
 
@@ -109,7 +109,7 @@ describe("guardrail call failure logs its underlying cause", () => {
     // endpoint.
     const embedPk = await seed.createProviderKey({
       display_name: "cause-embed-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `http://127.0.0.1:${refusedPort}/v1`,
     });
     await seed.createModel({
@@ -157,7 +157,7 @@ describe("guardrail call failure logs its underlying cause", () => {
     );
     const echoPk = await seed.createProviderKey({
       display_name: "cause-echo-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `http://127.0.0.1:${echoPort}/v1`,
     });
     await seed.createModel({
@@ -237,7 +237,7 @@ describe("guardrail call failure logs its underlying cause", () => {
       display_name: "cause-decode-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-cause-e2e",
         secret_access_key: "sk-cause-e2e",
         region: "us-west-2",
@@ -328,7 +328,7 @@ describe("guardrail call failure logs its underlying cause", () => {
     );
     const dimsPk = await seed.createProviderKey({
       display_name: "cause-dims-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `http://127.0.0.1:${dimsPort}/v1`,
     });
     const dimsEmbed = await seed.createModel({

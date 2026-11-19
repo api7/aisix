@@ -92,7 +92,7 @@ async function startMockSls(): Promise<MockSls> {
 async function seedRouting(seed: SeedClient, upstream: OpenAiUpstream) {
   const pk = await seed.createProviderKey({
     display_name: "sls-exporter-pk",
-    secret: PROVIDER_SECRET,
+    api_key: PROVIDER_SECRET,
     api_base: `${upstream.baseUrl}/v1`,
   });
   await seed.createModel({

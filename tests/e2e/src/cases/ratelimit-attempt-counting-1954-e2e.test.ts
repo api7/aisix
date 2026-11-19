@@ -130,7 +130,7 @@ describe.each(["memory", "redis"] as const)(
         const anthropic = extra.provider === "anthropic";
         const pk = await seed.createProviderKey({
           display_name: `${displayName}-pk`,
-          secret: "sk-mock",
+          api_key: "sk-mock",
           // The Anthropic bridge appends the path to the bare host.
           api_base: anthropic ? u.baseUrl : `${u.baseUrl}/v1`,
           ...(anthropic ? { provider: "anthropic", adapter: "anthropic" } : {}),

@@ -62,7 +62,7 @@ describe("an upstream that stalls its error body", () => {
       const vertex = provider === "google";
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: bedrock
+        api_key: bedrock
           ? JSON.stringify({ access_key_id: "AKIA-stall", secret_access_key: "sk-stall", region: "us-east-1" })
           : vertex
             ? JSON.stringify({ access_token: "ya29.stall", project: "proj-e2e", region: "us-central1" })

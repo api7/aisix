@@ -224,7 +224,7 @@ describe("UsageEvent total_tokens: the upstream's own total on every family", ()
     ) => {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: apiBase,
         provider,
       });
@@ -319,7 +319,7 @@ describe("UsageEvent total_tokens: the upstream's own total on every family", ()
 
     const routePk = await seed.createProviderKey({
       display_name: "tt-ptr-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: "http://unused-on-routes",
     });
     const route = async (r: { name: string; prefix: string }, u: OpenAiUpstream) =>

@@ -102,7 +102,7 @@ describe("the proxy listener waits for the first configuration", () => {
     const seed = new SeedClient(etcd!, prefix);
     const pk = await seed.createProviderKey({
       display_name: "startup-gate-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream!.baseUrl}/v1`,
     });
     await seed.createModel({

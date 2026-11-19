@@ -141,7 +141,7 @@ describe("tags from JWT claims on bearer tokens", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "jtc-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -151,7 +151,7 @@ describe("tags from JWT claims on bearer tokens", () => {
       provider_key_id: pk.id,
     });
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "jtc",
+      name: "jtc",
       url: mcp.url,
       enabled: true,
     });

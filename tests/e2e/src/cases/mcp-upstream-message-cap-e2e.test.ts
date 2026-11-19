@@ -41,7 +41,7 @@ describe("upstream MCP message size cap", () => {
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "big",
+      name: "big",
       url: upstream.url,
       enabled: true,
       timeout_ms: 60_000,

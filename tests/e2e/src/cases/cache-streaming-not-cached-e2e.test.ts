@@ -87,7 +87,7 @@ describe("cache streaming bypass e2e: streaming responses are never cached", () 
 
     const pkStream = await seed.createProviderKey({
       display_name: "stream-nocache-stream-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${streamMock.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -99,7 +99,7 @@ describe("cache streaming bypass e2e: streaming responses are never cached", () 
 
     const pkNon = await seed.createProviderKey({
       display_name: "stream-nocache-non-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${nonStreamMock.baseUrl}/v1`,
     });
     await seed.createModel({

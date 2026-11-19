@@ -116,7 +116,7 @@ describe("chat completion usage carries the upstream's audio tokens", () => {
         const up = await upstreamReporting(usage, stream);
         upstreams.push(up);
         models.push(name);
-        const pk = await seed.createProviderKey({ display_name: `${name}-pk`, secret: "sk-mock", api_base: `${up.baseUrl}/v1` });
+        const pk = await seed.createProviderKey({ display_name: `${name}-pk`, api_key: "sk-mock", api_base: `${up.baseUrl}/v1` });
         await seed.createModel({ display_name: name, provider: "openai", model_name: "gpt-4o-audio-preview", provider_key_id: pk.id });
       }
     }

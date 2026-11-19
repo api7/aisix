@@ -128,7 +128,7 @@ describe("trace hierarchy e2e (AISIX-Cloud#1279)", () => {
   ): Promise<void> {
     const providerKey = await seed!.createProviderKey({
       display_name: `${displayName}-pk`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
       ...extraPk,
     });
@@ -446,7 +446,7 @@ describe("trace hierarchy e2e (AISIX-Cloud#1279)", () => {
     upstreams.push(upstream);
     const pk = await seed.createProviderKey({
       display_name: "trace-pt-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createPassthroughRoute({

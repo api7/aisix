@@ -293,7 +293,7 @@ mod tests {
     }
 
     fn sample_provider_key() -> ProviderKey {
-        serde_json::from_str(r#"{"display_name":"openai-prod","secret":"sk-prod"}"#).unwrap()
+        serde_json::from_str(r#"{"display_name":"openai-prod","api_key":"sk-prod"}"#).unwrap()
     }
 
     #[test]

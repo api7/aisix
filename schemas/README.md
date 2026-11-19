@@ -116,9 +116,9 @@ so a consumer that models the lenient set as "the strict set with
 | resource | additionally relaxed on read |
 | --- | --- |
 | `api_key` | `McpAccess.allow` is not required; an `McpToolRef` entry needs neither half, and neither has to be non-empty; the write-path guards requiring `deny` beside `deny_ids` and `mcp_rate_limits` beside `mcp_rate_limits_by_id` are absent; the `tags` limits are absent (see `team`) |
-| `guardrail` | the `semantic` kind requires neither an embedding model (under either spelling) nor a threshold beside each example list; Bedrock `aws_credentials` may carry `external_id` or `role_session_name` without `role_arn` (unused without it) |
+| `guardrail` | the `semantic` kind does not require an embedding model (under either spelling); Bedrock `aws_credentials` may carry `external_id` or `role_session_name` without `role_arn` (unused without it) |
 | `mcp_policy` | `allow` is not required; the `McpToolRef` relaxations above apply here too, as does the absent `deny`-beside-`deny_ids` guard (its team-scope guard is on both sets) |
-| `mcp_server` | the label pattern (`name`, and its former spelling `display_name`) still forbids `__` and a trailing `_`, but not a `*` |
+| `mcp_server` | the label pattern (`name`) still forbids `__` and a trailing `_`, but not a `*` |
 | `observability_exporter` | `request_headers` / `upstream_response_headers` names are not checked (pattern, duplicates, refused credential and `set-cookie` names) — the gateway drops a refused name when capturing rather than the whole exporter |
 | `oidc_provider` | `tag_claims` is any object of strings, or `null` read as none: the key pattern, the non-empty path and the 32-entry cap are write-path limits, for the reason given under `team` — a row lost to one would stop the provider authenticating its callers |
 | `team`, `user` | `tags` is any object of strings, or `null` read as no tags: the key pattern, the 1–128-character value length and the 32-entry cap are write-path limits, so a stored row stays loadable if a later release relaxes them — for an `api_key` a row lost to one would stop the key authenticating |

@@ -137,7 +137,7 @@ describe("openai moderation guardrail e2e: flagged blocks, monitor allows, thres
 
     const pk = await seed.createProviderKey({
       display_name: "moderation-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

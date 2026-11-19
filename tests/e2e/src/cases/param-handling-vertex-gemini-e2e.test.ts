@@ -431,7 +431,7 @@ describe("Vertex Gemini: request fields by the target's contract", () => {
       display_name: "param-vertex-gemini-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({ access_token: "ya29.param", project: "proj-param", region: "us-central1" }),
+      api_key: JSON.stringify({ access_token: "ya29.param", project: "proj-param", region: "us-central1" }),
       api_base: `http://127.0.0.1:${addr.port}`,
     });
     const models: Array<[string, string]> = [
@@ -1238,7 +1238,7 @@ describe("Vertex Gemini: generated images on chat completions", () => {
       display_name: "vertex-images-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({ access_token: "ya29.images", project: "proj-images", region: "us-central1" }),
+      api_key: JSON.stringify({ access_token: "ya29.images", project: "proj-images", region: "us-central1" }),
       api_base: `http://127.0.0.1:${addr.port}`,
     });
     const model = (display_name: string) =>
@@ -1254,7 +1254,7 @@ describe("Vertex Gemini: generated images on chat completions", () => {
     ] as const) {
       const orPk = await seed.createProviderKey({
         display_name: `${display_name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${compatible.baseUrl}/v1`,
       });
       await seed.createModel({

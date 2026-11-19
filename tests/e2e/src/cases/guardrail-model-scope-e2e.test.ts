@@ -60,7 +60,7 @@ describe("guardrail e2e: model-scope attachment runs only for the scoped model (
 
     const pk = await seed.createProviderKey({
       display_name: "gr-modelscope-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const scoped = await seed.createModel({

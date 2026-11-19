@@ -4010,7 +4010,7 @@ mod tests {
     /// covered by the aisix-mcp integration tests and the e2e suite).
     fn insert_mcp_server(snapshot: &AisixSnapshot, id: &str, name: &str, enabled: bool) {
         let server: aisix_core::McpServer = serde_json::from_value(serde_json::json!({
-            "display_name": name,
+            "name": name,
             "url": "http://127.0.0.1:9/mcp",
             "enabled": enabled,
         }))

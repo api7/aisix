@@ -174,7 +174,7 @@ describe("downstream idle timeout (AISIX-Cloud#1126)", () => {
     const pk = (
       await seed.createProviderKey({
         display_name: "dc-slow-pk",
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${slow.baseUrl}/v1`,
       })
     ).id;
@@ -273,14 +273,14 @@ describe("downstream SSE heartbeat (AISIX-Cloud#1126)", () => {
     const chatPk = (
       await seed.createProviderKey({
         display_name: "hb-chat-pk",
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${chatUpstream.baseUrl}/v1`,
       })
     ).id;
     const responsesPk = (
       await seed.createProviderKey({
         display_name: "hb-responses-pk",
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${responsesUpstream.baseUrl}/v1`,
       })
     ).id;

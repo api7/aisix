@@ -71,7 +71,7 @@ describe("api key allow_all_models: every model, including ones added later", ()
 
     const pk = await seed.createProviderKey({
       display_name: "aam-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
 

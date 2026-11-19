@@ -319,7 +319,7 @@ describe("Bedrock provider key authentication modes", () => {
         display_name: `auth-${pkName}`,
         provider: "bedrock",
         adapter: "bedrock",
-        secret: JSON.stringify(secret),
+        api_key: JSON.stringify(secret),
         api_base: bedrock.url,
       });
       for (const [alias, name] of Object.entries(MODELS)) {
@@ -582,7 +582,7 @@ describe("Bedrock guardrail authentication modes", () => {
     }
     const pk = await seed.createProviderKey({
       display_name: "gr-auth-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -677,7 +677,7 @@ describe("Bedrock default chain on web identity (IRSA)", () => {
       display_name: "auth-web-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         auth_type: "default_chain",
         role_arn: `arn:aws:iam::${ACCOUNT}:role/WebRole`,
         region: "us-east-1",

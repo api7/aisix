@@ -45,7 +45,7 @@ describe("rate limit e2e: RPM=1 second call gets 429", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "rl-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -200,7 +200,7 @@ describe("rate limit policy schedules e2e (AISIX-Cloud#1104)", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "rlp-sched-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

@@ -80,12 +80,12 @@ describe("cooldown is opt-in — an unconfigured model stays in rotation", () =>
 
     const failPk = await seed.createProviderKey({
       display_name: "optin-fail-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${failing.baseUrl}/v1`,
     });
     const stablePk = await seed.createProviderKey({
       display_name: "optin-stable-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${stable.baseUrl}/v1`,
     });
 
@@ -196,12 +196,12 @@ describe("an enabled cooldown records the exclusion it causes", () => {
 
     const failPk = await seed.createProviderKey({
       display_name: "excl-fail-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${failing.baseUrl}/v1`,
     });
     const stablePk = await seed.createProviderKey({
       display_name: "excl-stable-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${stable.baseUrl}/v1`,
     });
 
@@ -333,14 +333,14 @@ describe("every routing endpoint records a failed target attempt", () => {
 
     const openaiPk = await seed.createProviderKey({
       display_name: "fam-openai-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${failing.baseUrl}/v1`,
     });
     const anthropicPk = await seed.createProviderKey({
       display_name: "fam-anthropic-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       // The Anthropic bridge appends /v1/messages itself.
       api_base: failing.baseUrl,
     });

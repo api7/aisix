@@ -270,7 +270,7 @@ describe("a realtime session the upstream never let start", () => {
     ) => {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         provider: "openai",
         api_base: `${base}/v1`,
       });

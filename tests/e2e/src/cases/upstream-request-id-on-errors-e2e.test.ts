@@ -260,7 +260,7 @@ describe("the provider's request id on failed attempts and token counts", () => 
     });
 
     const pk = (display_name: string, extra: Record<string, unknown>) =>
-      seed.createProviderKey({ display_name, secret: "sk-mock", ...extra });
+      seed.createProviderKey({ display_name, api_key: "sk-mock", ...extra });
     const openai = await pk("urid-openai-pk", { api_base: `${up.baseUrl}/oai/v1` });
     const retried = await pk("urid-openai-retried-pk", { api_base: `${up.baseUrl}/oai-retried/v1` });
     const answering = await pk("urid-openai-ok-pk", { api_base: `${up.baseUrl}/oai-ok/v1` });
@@ -273,13 +273,13 @@ describe("the provider's request id on failed attempts and token counts", () => 
     const bedrock = await pk("urid-bedrock-pk", {
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({ access_key_id: "AKIA-urid", secret_access_key: "sk-urid", region: "us-west-2" }),
+      api_key: JSON.stringify({ access_key_id: "AKIA-urid", secret_access_key: "sk-urid", region: "us-west-2" }),
       api_base: up.baseUrl,
     });
     const vertex = await pk("urid-vertex-pk", {
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({ access_token: "ya29.urid", project: "proj-e2e", region: "us-central1" }),
+      api_key: JSON.stringify({ access_token: "ya29.urid", project: "proj-e2e", region: "us-central1" }),
       api_base: up.baseUrl,
     });
     const decisions = await pk("urid-decisions-pk", {

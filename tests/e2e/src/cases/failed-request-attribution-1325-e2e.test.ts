@@ -81,7 +81,7 @@ describe("failed-request upstream attribution #1325 e2e", () => {
     ) => {
       const pk = await seed.createProviderKey({
         display_name: pkName,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({
@@ -111,7 +111,7 @@ describe("failed-request upstream attribution #1325 e2e", () => {
     // one to reach an upstream at all.
     const ctPk = await seed.createProviderKey({
       display_name: CT_PK,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${failing.baseUrl}/v1`,
       provider: "anthropic",
       adapter: "anthropic",

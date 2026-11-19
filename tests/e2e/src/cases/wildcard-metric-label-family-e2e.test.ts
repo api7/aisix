@@ -147,13 +147,13 @@ describe("wildcard-served success metrics label as the row across the endpoint f
 
     const pk = await seed.createProviderKey({
       display_name: "wfam-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     // The videos surface appends `/v1/videos` to the key's base itself.
     const videoPk = await seed.createProviderKey({
       display_name: "wvid-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({

@@ -1088,7 +1088,7 @@ mod tests {
 
     const VALID_PROVIDER_KEY: &[u8] = br#"{
         "display_name": "openai-mock",
-        "secret": "sk-test-not-real",
+        "api_key": "sk-test-not-real",
         "api_base": "http://mock-llm:8000/v1",
         "provider": "openai"
     }"#;
@@ -1116,7 +1116,7 @@ mod tests {
         // ever reaching dispatch.
         let entries = vec![raw(
             "/aisix/provider_keys/pk-bedrock",
-            br#"{"display_name":"bedrock-pk","secret":"x","provider":"amazon-bedrock","aws_region":"us-east-1"}"#,
+            br#"{"display_name":"bedrock-pk","api_key":"x","provider":"amazon-bedrock","aws_region":"us-east-1"}"#,
             1,
         )];
         let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
@@ -1141,7 +1141,7 @@ mod tests {
         // fields — YELLOW load, fields reported.
         let entries = vec![raw(
             "/aisix/provider_keys/pk-vertex",
-            br#"{"display_name":"vertex-pk","secret":"x","provider":"google-vertex","gcp_project":"my-proj","gcp_region":"us-central1"}"#,
+            br#"{"display_name":"vertex-pk","api_key":"x","provider":"google-vertex","gcp_project":"my-proj","gcp_region":"us-central1"}"#,
             1,
         )];
         let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
@@ -1172,7 +1172,7 @@ mod tests {
         // Provider Key field and is not reported.
         let entries = vec![raw(
             "/aisix/provider_keys/pk-azure",
-            br#"{"display_name":"azure-pk","secret":"x","provider":"azure","azure_resource_name":"my-azure","api_version":"2024-02-01"}"#,
+            br#"{"display_name":"azure-pk","api_key":"x","provider":"azure","azure_resource_name":"my-azure","api_version":"2024-02-01"}"#,
             1,
         )];
         let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
@@ -1515,17 +1515,25 @@ mod tests {
         assert_eq!(fields.last().map(String::as_str), Some("...truncated"));
     }
 
-    // ---- renamed-field dual acceptance ----
+    // ---- retired field names (#1375) ----
     //
-    // provider_key `secret`→`api_key` and mcp_server / a2a_agent
-    // `display_name`→`name`: documents written under the former names
-    // (existing etcd data a control plane left before 1.8.0) and documents
-    // written under the canonical names must BOTH pass this loader's
-    // schema gate and serde parse. A regression here silently drops
-    // resources from the snapshot in managed mode.
+    // provider_key `secret` (now `api_key`) and `display_name` on
+    // mcp_server, a2a_agent and passthrough_route (now `name`) are no
+    // longer read: a document carrying only the old name is missing a
+    // required field and is rejected whole, while its canonical twin in
+    // the same batch still loads.
 
     #[test]
-    fn provider_key_accepts_both_credential_spellings() {
+    fn documents_under_retired_field_names_are_rejected() {
+        let route = |name_key: &str| {
+            serde_json::json!({
+                name_key: "route",
+                "path_prefix": "/passthrough/x",
+                "target_url": "https://erp.internal",
+                "provider_key_id": "11111111-1111-1111-1111-111111111111"
+            })
+            .to_string()
+        };
         let entries = vec![
             raw(
                 "/aisix/provider_keys/pk-former",
@@ -1537,76 +1545,58 @@ mod tests {
                 br#"{"display_name":"pk-canonical","api_key":"sk-x"}"#,
                 2,
             ),
-        ];
-        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
-        assert_eq!(stats.accepted, 2, "rejections: {:?}", stats.rejections);
-        assert_eq!(snap.provider_keys.len(), 2);
-        // Both spellings land on the same typed field.
-        for id in ["pk-former", "pk-canonical"] {
-            let entry = snap.provider_keys.get_by_id(id).unwrap();
-            assert_eq!(entry.value.api_key, "sk-x");
-        }
-    }
-
-    #[test]
-    fn provider_key_with_both_spellings_is_rejected_as_parse_failure() {
-        // The schema's `anyOf` admits a document carrying both spellings;
-        // serde then rejects it as a duplicate field (both names map to
-        // the same field), so the ambiguous row is skipped — not loaded
-        // with one value silently winning — and the batch continues.
-        let entries = vec![
-            raw(
-                "/aisix/provider_keys/pk-ambiguous",
-                br#"{"display_name":"pk-a","api_key":"sk-new","secret":"sk-old"}"#,
-                1,
-            ),
-            raw(
-                "/aisix/provider_keys/pk-good",
-                br#"{"display_name":"pk-good","api_key":"sk-x"}"#,
-                2,
-            ),
-        ];
-        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
-        assert_eq!(stats.schema_rejected, 0);
-        assert_eq!(stats.parse_rejected, 1);
-        assert_eq!(stats.accepted, 1);
-        assert_eq!(stats.rejections.len(), 1);
-        assert_eq!(stats.rejections[0].kind, RejectionKind::ParseFailed);
-        assert!(snap.provider_keys.get_by_id("pk-good").is_some());
-        assert!(snap.provider_keys.get_by_id("pk-ambiguous").is_none());
-    }
-
-    #[test]
-    fn mcp_server_and_a2a_agent_accept_both_label_spellings() {
-        let entries = vec![
             raw(
                 "/aisix/mcp_servers/mcp-former",
                 br#"{"display_name":"gh-former","url":"https://x/mcp"}"#,
-                1,
+                3,
             ),
             raw(
                 "/aisix/mcp_servers/mcp-canonical",
                 br#"{"name":"gh-canonical","url":"https://x/mcp"}"#,
-                2,
+                4,
             ),
             raw(
                 "/aisix/a2a_agents/a2a-former",
                 br#"{"display_name":"agent-former","url":"https://x/a2a"}"#,
-                3,
+                5,
             ),
             raw(
                 "/aisix/a2a_agents/a2a-canonical",
                 br#"{"name":"agent-canonical","url":"https://x/a2a"}"#,
-                4,
+                6,
+            ),
+            raw(
+                "/aisix/passthrough_routes/pr-former",
+                route("display_name").as_bytes(),
+                7,
+            ),
+            raw(
+                "/aisix/passthrough_routes/pr-canonical",
+                route("name").as_bytes(),
+                8,
             ),
         ];
         let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
         assert_eq!(stats.accepted, 4, "rejections: {:?}", stats.rejections);
-        // The name index is fed by the renamed field for both spellings.
-        assert!(snap.mcp_servers.get_by_name("gh-former").is_some());
+        let mut rejected: Vec<&str> = stats.rejections.iter().map(|r| r.key.as_str()).collect();
+        rejected.sort_unstable();
+        assert_eq!(
+            rejected,
+            [
+                "/aisix/a2a_agents/a2a-former",
+                "/aisix/mcp_servers/mcp-former",
+                "/aisix/passthrough_routes/pr-former",
+                "/aisix/provider_keys/pk-former",
+            ]
+        );
+        assert!(stats
+            .rejections
+            .iter()
+            .all(|r| r.kind == RejectionKind::SchemaFailed));
+        assert!(snap.provider_keys.get_by_id("pk-canonical").is_some());
         assert!(snap.mcp_servers.get_by_name("gh-canonical").is_some());
-        assert!(snap.a2a_agents.get_by_name("agent-former").is_some());
         assert!(snap.a2a_agents.get_by_name("agent-canonical").is_some());
+        assert!(snap.passthrough_routes.get_by_id("pr-canonical").is_some());
     }
 
     #[test]

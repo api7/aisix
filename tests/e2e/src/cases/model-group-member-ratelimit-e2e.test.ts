@@ -150,7 +150,7 @@ describe("model group member rate limit e2e (AISIX-Cloud#1087)", () => {
     if (!seed) throw new Error("seed client not initialized");
     const pk = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -426,7 +426,7 @@ describe("model group member rate limit e2e (AISIX-Cloud#1087)", () => {
         display_name: `${name}-pk`,
         provider: "anthropic",
         adapter: "anthropic",
-        secret: "sk-ant-mock",
+        api_key: "sk-ant-mock",
         // Anthropic bridge appends /v1/messages: point at the bare host.
         api_base: up.baseUrl,
       });

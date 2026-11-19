@@ -69,7 +69,7 @@ describe("failure rows carry request and response bodies", () => {
     upstreams.push(upstream);
     const pk = await seed.createProviderKey({
       display_name: `${name}-pk`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -143,12 +143,12 @@ describe("failure rows carry request and response bodies", () => {
   async function modelAt(
     name: string,
     apiBase: string,
-    provider: { provider?: string; adapter?: string; model_name?: string; secret?: string } = {},
+    provider: { provider?: string; adapter?: string; model_name?: string; api_key?: string } = {},
   ): Promise<void> {
-    const { provider: providerName = "openai", adapter, model_name = "gpt-4o-mini", secret } = provider;
+    const { provider: providerName = "openai", adapter, model_name = "gpt-4o-mini", api_key } = provider;
     const pk = await seed.createProviderKey({
       display_name: `${name}-pk`,
-      secret: secret ?? "sk-mock",
+      api_key: api_key ?? "sk-mock",
       provider: providerName,
       ...(adapter ? { adapter } : {}),
       api_base: apiBase,
@@ -294,7 +294,7 @@ describe("failure rows carry request and response bodies", () => {
     await modelAt("row-truncated-empty", `${await truncatingUpstream("502 Bad Gateway", "")}/v1`);
     const truncatedPk = await seed.createProviderKey({
       display_name: "row-truncated-route-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${truncatedBase}/v1`,
     });
 
@@ -318,7 +318,7 @@ describe("failure rows carry request and response bodies", () => {
       provider: "bedrock",
       adapter: "bedrock",
       model_name: "openai.gpt-6-sol",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-failure-row",
         secret_access_key: "sk-failure-row",
         region: "us-east-1",
@@ -356,7 +356,7 @@ describe("failure rows carry request and response bodies", () => {
     mcpUpstream = await startMcpUpstream("rowmcp");
     const mcpId = randomUUID();
     await seed.update("mcp_servers", mcpId, {
-      display_name: "rowmcp",
+      name: "rowmcp",
       url: mcpUpstream.url,
       enabled: true,
     });

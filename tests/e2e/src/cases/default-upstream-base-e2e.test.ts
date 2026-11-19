@@ -77,19 +77,19 @@ describe("default upstream base on the direct-HTTP routes e2e", () => {
       display_name: "anthropic-no-base",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-ant-e2e",
+      api_key: "sk-ant-e2e",
     });
     const legacyAnthropicPk = await seed.createProviderKey({
       display_name: "legacy-anthropic-no-base",
       provider: "",
       adapter: "anthropic",
-      secret: "sk-ant-legacy-e2e",
+      api_key: "sk-ant-legacy-e2e",
     });
     const legacyOpenaiPk = await seed.createProviderKey({
       display_name: "legacy-openai-no-base",
       provider: "",
       adapter: "openai",
-      secret: "sk-oai-legacy-e2e",
+      api_key: "sk-oai-legacy-e2e",
     });
     await seed.createModel({
       display_name: "anthropic-default",

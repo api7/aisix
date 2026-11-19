@@ -163,17 +163,17 @@ describe("mcp scoped endpoint e2e: /mcp/{server}", () => {
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "alpha",
+      name: "alpha",
       url: alpha.url,
       enabled: true,
     });
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "beta",
+      name: "beta",
       url: beta.url,
       enabled: true,
     });
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "dark",
+      name: "dark",
       url: alpha.url,
       enabled: false,
     });

@@ -32,7 +32,7 @@ test("policy candidates follow creation, identity edits, fallback conditions and
     });
     await etcd.put(`${prefix}/provider_keys/${provider}`, JSON.stringify({
       provider: "openai", adapter: "openai", display_name: "candidate-provider",
-      secret: "sk-mock", api_base: `${upstream.baseUrl}/v1`,
+      api_key: "sk-mock", api_base: `${upstream.baseUrl}/v1`,
     }));
     await etcd.put(`${prefix}/models/${model}`, JSON.stringify({
       display_name: "candidate-model", provider: "openai", model_name: "gpt-4o-mini",

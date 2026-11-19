@@ -135,7 +135,7 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
     });
     const pk = await seed.createProviderKey({
       display_name: "c1571-pk",
-      secret: PROVIDER_SECRET,
+      api_key: PROVIDER_SECRET,
       api_base: `${slow.baseUrl}/v1`,
     });
     providerKeyId = pk.id;
@@ -152,7 +152,7 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
     targetModelId = target.id;
     const fastPk = await seed.createProviderKey({
       display_name: "c1571-fast-pk",
-      secret: PROVIDER_SECRET,
+      api_key: PROVIDER_SECRET,
       api_base: `${fast.baseUrl}/v1`,
     });
     fastProviderKeyId = fastPk.id;
@@ -164,7 +164,7 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
     });
     const streamPk = await seed.createProviderKey({
       display_name: "c1571-stream-pk",
-      secret: PROVIDER_SECRET,
+      api_key: PROVIDER_SECRET,
       api_base: `${trickle.baseUrl}/v1`,
     });
     streamProviderKeyId = streamPk.id;

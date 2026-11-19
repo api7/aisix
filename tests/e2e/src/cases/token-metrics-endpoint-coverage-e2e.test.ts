@@ -50,7 +50,7 @@ describe("token metrics endpoint coverage e2e", () => {
     ] as const) {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${up.baseUrl}/v1`,
       });
       await seed.createModel({

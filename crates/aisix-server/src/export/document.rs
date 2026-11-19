@@ -204,9 +204,7 @@ pub fn build_export_document(
         "PROVIDER_KEY",
         |pk| pk.display_name.clone(),
         |doc, ctx| {
-            // `secret` is the former spelling of `api_key`, still loaded.
             redact_top_level(doc, "api_key", ctx);
-            redact_top_level(doc, "secret", ctx);
             // `request.default_headers` are outbound auth headers to the
             // upstream and `request.default_body_fields` can carry a
             // secondary credential — neither is covered by `api_key`.

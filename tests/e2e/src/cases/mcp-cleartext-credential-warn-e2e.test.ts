@@ -63,7 +63,7 @@ describe("mcp cleartext credential warning e2e", () => {
     // ignores auth headers, so calls succeed while the credential is the
     // warning's subject.
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "alpha",
+      name: "alpha",
       url: upstream.url,
       enabled: true,
       auth_type: "bearer",

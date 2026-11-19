@@ -120,7 +120,7 @@ describe("native-provider embeddings e2e (#723)", () => {
       display_name: "vertex-embed-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_token: "ya29.e2e-test",
         project: "proj-e2e",
         region: "us-central1",
@@ -181,7 +181,7 @@ describe("native-provider embeddings e2e (#723)", () => {
       display_name: "bedrock-embed-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-e2e",
         secret_access_key: "sk-e2e",
         region: "us-west-2",

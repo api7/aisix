@@ -159,50 +159,50 @@ describe("direct-model effort mapping", () => {
 
     const openaiKey = await seed.createProviderKey({
       display_name: "effort-map-openai-key",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${openai.baseUrl}/v1`,
     });
     const anthropicKey = await seed.createProviderKey({
       display_name: "effort-map-anthropic-key",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-anthropic-mock",
+      api_key: "sk-anthropic-mock",
       api_base: anthropic.baseUrl,
     });
     const openaiStreamKey = await seed.createProviderKey({
       display_name: "effort-map-openai-stream-key",
-      secret: "sk-openai-stream-mock",
+      api_key: "sk-openai-stream-mock",
       api_base: `${openaiStream.baseUrl}/v1`,
     });
     const anthropicStreamKey = await seed.createProviderKey({
       display_name: "effort-map-anthropic-stream-key",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-anthropic-stream-mock",
+      api_key: "sk-anthropic-stream-mock",
       api_base: anthropicStream.baseUrl,
     });
     const ensembleStreamKey = await seed.createProviderKey({
       display_name: "effort-map-ensemble-stream-key",
-      secret: "sk-ensemble-stream-mock",
+      api_key: "sk-ensemble-stream-mock",
       api_base: `${ensembleStream.baseUrl}/v1`,
     });
     const tokensOpenaiKey = await seed.createProviderKey({
       display_name: "effort-map-tokens-openai-key",
-      secret: "sk-tokens-openai-mock",
+      api_key: "sk-tokens-openai-mock",
       api_base: `${tokensOpenai.baseUrl}/v1`,
     });
     const tokensAnthropicKey = await seed.createProviderKey({
       display_name: "effort-map-tokens-anthropic-key",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-tokens-anthropic-mock",
+      api_key: "sk-tokens-anthropic-mock",
       api_base: tokensAnthropic.baseUrl,
     });
     const tokensCountKey = await seed.createProviderKey({
       display_name: "effort-map-tokens-count-key",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-tokens-count-mock",
+      api_key: "sk-tokens-count-mock",
       api_base: tokensCount.baseUrl,
     });
 

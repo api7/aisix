@@ -235,7 +235,7 @@ describe("/v1/responses bridged onto a chat upstream: reasoning + client-visible
     const seedModel = async (display: string, upstream: OpenAiUpstream) => {
       const pk = await seed.createProviderKey({
         display_name: `${display}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
         apis: {},
       });

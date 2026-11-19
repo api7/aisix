@@ -68,7 +68,7 @@ describe("admin disabled, etcd source: gateway serves seeded-via-etcd config wit
 
     const pk = await seed.createProviderKey({
       display_name: "admin-off-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

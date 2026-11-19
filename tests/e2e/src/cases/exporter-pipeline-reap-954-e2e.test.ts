@@ -99,7 +99,7 @@ describe("a deleted or disabled exporter's pipeline is stopped (#954)", () => {
       const off = await seed.createObservabilityExporter(otlp("reap-off", offRecv));
       const pk = await seed.createProviderKey({
         display_name: "exporter-reap-pk",
-        secret: "sk-mock-exporter-reap",
+        api_key: "sk-mock-exporter-reap",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({

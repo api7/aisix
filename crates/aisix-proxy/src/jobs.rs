@@ -2344,7 +2344,7 @@ mod tests {
 
     fn openai_pk(id: &str, api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"pk-{id}","secret":"sk-up-{id}","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+            r#"{{"display_name":"pk-{id}","api_key":"sk-up-{id}","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(id, pk, 1)
@@ -2352,7 +2352,7 @@ mod tests {
 
     fn azure_pk(id: &str, api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"pk-az","secret":"az-secret","api_base":"{api_base}","provider":"azure-openai","adapter":"azure-openai"}}"#
+            r#"{{"display_name":"pk-az","api_key":"az-secret","api_base":"{api_base}","provider":"azure-openai","adapter":"azure-openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(id, pk, 1)
@@ -2360,7 +2360,7 @@ mod tests {
 
     fn anthropic_pk(id: &str, api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"pk-ant","secret":"sk-ant","api_base":"{api_base}","provider":"anthropic","adapter":"anthropic"}}"#
+            r#"{{"display_name":"pk-ant","api_key":"sk-ant","api_base":"{api_base}","provider":"anthropic","adapter":"anthropic"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(id, pk, 1)

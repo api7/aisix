@@ -68,17 +68,17 @@ describe("background health e2e", () => {
 
     const unhealthyPk = await seed.createProviderKey({
       display_name: "bg-unhealthy-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${unhealthyUpstream.baseUrl}/v1`,
     });
     const ignoredPk = await seed.createProviderKey({
       display_name: "bg-ignored-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${ignoredUpstream.baseUrl}/v1`,
     });
     const stablePk = await seed.createProviderKey({
       display_name: "bg-stable-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${stableUpstream.baseUrl}/v1`,
     });
 
@@ -225,7 +225,7 @@ describe("background health e2e", () => {
 
     const shortStalePk = await seed.createProviderKey({
       display_name: "bg-stale-short-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${unhealthyUpstream.baseUrl}/v1`,
     });
     await seed.createModel({

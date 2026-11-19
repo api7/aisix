@@ -239,7 +239,7 @@ describe("custom output guardrail on streamed responses", () => {
         const display = `${route.name}-${variant}`;
         const pk = await seed.createProviderKey({
           display_name: `${display}-pk`,
-          secret: "sk-mock",
+          api_key: "sk-mock",
           api_base: route.provider === "anthropic" ? upstream.baseUrl : `${upstream.baseUrl}/v1`,
           ...(route.apis ? { apis: route.apis } : {}),
         });

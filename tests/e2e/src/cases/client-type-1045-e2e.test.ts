@@ -137,7 +137,7 @@ describe("client_type built-ins + operator rules (AISIX-Cloud#1045)", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "ct1045-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

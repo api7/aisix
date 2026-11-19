@@ -172,7 +172,7 @@ describe("guardrail index invalidation", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "gi-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const model = (display_name: string) => ({

@@ -246,7 +246,7 @@ describe("request parameters follow the target platform's contract", () => {
     const openaiModel = async (name: string, upstream: OpenAiUpstream, modelName = "gpt-4o") => {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({ display_name: name, provider: "openai", model_name: modelName, provider_key_id: pk.id });
@@ -272,7 +272,7 @@ describe("request parameters follow the target platform's contract", () => {
         display_name: `${name}-pk`,
         provider: "anthropic",
         adapter: "anthropic",
-        secret: "sk-ant-mock",
+        api_key: "sk-ant-mock",
         api_base: upstream.baseUrl,
       });
       await seed.createModel({
@@ -287,7 +287,7 @@ describe("request parameters follow the target platform's contract", () => {
       display_name: "pc-gemini-pk",
       provider: "google",
       adapter: "vertex",
-      secret: JSON.stringify({ access_token: "ya29.param-contract", project: "proj-e2e", region: "us-central1" }),
+      api_key: JSON.stringify({ access_token: "ya29.param-contract", project: "proj-e2e", region: "us-central1" }),
       api_base: up.gemini.baseUrl,
     });
     await seed.createModel({
@@ -660,7 +660,7 @@ describe("output guardrails cover every choice and the refusal", () => {
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const model = async (name: string, upstream: OpenAiUpstream) => {
-      const pk = await seed.createProviderKey({ display_name: `${name}-pk`, secret: "sk-mock", api_base: `${upstream.baseUrl}/v1` });
+      const pk = await seed.createProviderKey({ display_name: `${name}-pk`, api_key: "sk-mock", api_base: `${upstream.baseUrl}/v1` });
       return seed.createModel({ display_name: name, provider: "openai", model_name: "gpt-4o", provider_key_id: pk.id });
     };
     const interleaved = await model("pg-interleaved", up.interleaved);

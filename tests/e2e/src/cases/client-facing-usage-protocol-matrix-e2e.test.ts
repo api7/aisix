@@ -247,7 +247,7 @@ describe("client-facing usage is the CALLER's protocol, not the upstream's (AISI
     ] as const) {
       const pk = await seed.createProviderKey({
         display_name: `${model}-pk`,
-        secret: "sk-ant-mock",
+        api_key: "sk-ant-mock",
         api_base: upstream.baseUrl,
         provider: "anthropic",
         adapter: "anthropic",
@@ -261,7 +261,7 @@ describe("client-facing usage is the CALLER's protocol, not the upstream's (AISI
     }
     const oaiPk = await seed.createProviderKey({
       display_name: "usage-matrix-openai-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${openaiUpstream.baseUrl}/v1`,
       provider: "openai",
       adapter: "openai",
