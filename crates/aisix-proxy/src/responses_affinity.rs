@@ -651,5 +651,10 @@ mod tests {
         assert!(String::from_utf8(out).unwrap().contains("aisix_enc_v1:"));
         let delta = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n";
         assert!(mark.apply_to_sse_frame(delta).is_none());
+        let direct = ContextAffinity::default().response_mark("m-1", Some("pk-1"), false);
+        assert!(direct.apply_to_sse_frame(delta).is_none());
+        let out = String::from_utf8(direct.apply_to_sse_frame(frame).unwrap()).unwrap();
+        assert!(out.contains("\"id\":\"resp_up\""));
+        assert!(!out.contains("\"encrypted_content\":\"CT\""));
     }
 }
