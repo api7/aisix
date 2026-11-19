@@ -37,9 +37,9 @@
 //! `serde_ignored`, so the loader takes their paths from
 //! [`unknown_field_paths`], which reads them off the strict schema.
 //!
-//! The watch path runs the lenient validator on incoming events too —
-//! malformed payloads are skipped with a warning and do not take down the
-//! gateway.
+//! The watch path runs the lenient validator on incoming events too: a
+//! row that fails it is logged at error level and skipped, and does not
+//! take down the gateway.
 
 use crate::models::model::Model;
 use jsonschema::Validator;
