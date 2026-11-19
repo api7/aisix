@@ -140,31 +140,38 @@ fn decode_response_id(value: &str) -> Option<(String, String)> {
 /// origin's current key, read from its own model document so it resolves
 /// even when the origin is not a member of the group the request addressed;
 /// such an origin that no longer exists has an empty boundary. Keyless
-/// context is readable by the origin model alone.
+/// context is readable by the origin model alone, while it has no key.
 #[derive(Debug, Clone)]
 pub(crate) struct Boundary {
     origin_id: String,
-    origin_reads: bool,
-    provider_key_id: Option<String>,
+    rule: BoundaryRule,
+}
+
+#[derive(Debug, Clone)]
+enum BoundaryRule {
+    /// The origin, plus the targets on this key (the origin's current one).
+    OriginOrKey(Option<String>),
+    /// The targets on this key.
+    Key(String),
+    /// The origin, while it still has no key.
+    KeylessOrigin,
 }
 
 impl Boundary {
     pub(crate) fn of(snapshot: &aisix_core::AisixSnapshot, origin: &Origin) -> Self {
-        let (origin_reads, provider_key_id) = match &origin.key {
-            OriginKey::Current => (
-                true,
+        let rule = match &origin.key {
+            OriginKey::Current => BoundaryRule::OriginOrKey(
                 snapshot
                     .models
                     .get_by_id(&origin.model_id)
                     .and_then(|m| m.value.provider_key_id.clone()),
             ),
-            OriginKey::Recorded(key) => (false, Some(key.clone())),
-            OriginKey::Keyless => (true, None),
+            OriginKey::Recorded(key) => BoundaryRule::Key(key.clone()),
+            OriginKey::Keyless => BoundaryRule::KeylessOrigin,
         };
         Self {
             origin_id: origin.model_id.clone(),
-            origin_reads,
-            provider_key_id,
+            rule,
         }
     }
 
@@ -173,9 +180,16 @@ impl Boundary {
     }
 
     pub(crate) fn contains(&self, target_id: &str, target_provider_key_id: Option<&str>) -> bool {
-        (self.origin_reads && self.is_origin(target_id))
-            || (self.provider_key_id.is_some()
-                && self.provider_key_id.as_deref() == target_provider_key_id)
+        match &self.rule {
+            BoundaryRule::OriginOrKey(key) => {
+                self.is_origin(target_id)
+                    || (key.is_some() && key.as_deref() == target_provider_key_id)
+            }
+            BoundaryRule::Key(key) => target_provider_key_id == Some(key.as_str()),
+            BoundaryRule::KeylessOrigin => {
+                self.is_origin(target_id) && target_provider_key_id.is_none()
+            }
+        }
     }
 }
 
@@ -497,6 +511,53 @@ mod tests {
         );
         assert_eq!(decode_response_id("resp_abc"), None);
         assert_eq!(decode_response_id("resp_68af0c1e2b"), None);
+    }
+
+    /// Gateways from before the key was recorded (1.7.0 through 1.10.0)
+    /// decode the first segment as a bare model id, verbatim below. A new tag
+    /// must still decode there, and to an id no model has, so a routing group
+    /// strips the ciphertext instead of forwarding the whole tag upstream.
+    #[test]
+    fn a_new_tag_decodes_to_an_unknown_model_on_older_gateways() {
+        fn released_decode(value: &str) -> Option<(String, String)> {
+            let rest = value.strip_prefix("aisix_enc_v1:")?;
+            rest.split_once(';').and_then(|(origin, original)| {
+                let origin = String::from_utf8(b64().decode(origin).ok()?).ok()?;
+                (!origin.is_empty()).then(|| (origin, original.to_string()))
+            })
+        }
+        for key in [Some("pk-1"), None] {
+            let (origin, original) =
+                released_decode(&mark_encrypted_content("m-1", key, "gAAAA;x")).unwrap();
+            assert_ne!(origin, "m-1");
+            assert!(origin.starts_with("m-1;"));
+            assert_eq!(original, "gAAAA;x");
+        }
+    }
+
+    #[test]
+    fn a_recorded_boundary_follows_the_key_not_the_model() {
+        let snap = aisix_core::AisixSnapshot::default();
+        let on_key = Boundary::of(
+            &snap,
+            &Origin {
+                model_id: "m-1".into(),
+                key: OriginKey::Recorded("pk-1".into()),
+            },
+        );
+        assert!(on_key.contains("m-1", Some("pk-1")));
+        assert!(on_key.contains("m-2", Some("pk-1")));
+        assert!(!on_key.contains("m-1", Some("pk-2")));
+        let keyless = Boundary::of(
+            &snap,
+            &Origin {
+                model_id: "m-1".into(),
+                key: OriginKey::Keyless,
+            },
+        );
+        assert!(keyless.contains("m-1", None));
+        assert!(!keyless.contains("m-1", Some("pk-2")));
+        assert!(!keyless.contains("m-2", None));
     }
 
     #[test]
