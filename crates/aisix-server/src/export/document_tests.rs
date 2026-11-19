@@ -560,6 +560,7 @@ fn fields_the_gateway_ignores_are_left_out_of_the_stored_documents() {
             "display_name": "pk",
             "api_key": "x",
             "access_token": "tok-left-over",
+            "secret": "tok-retired-spelling",
             "request": {"timeout_hint": "tok-nested"}
         }))
         .unwrap(),
@@ -571,7 +572,9 @@ fn fields_the_gateway_ignores_are_left_out_of_the_stored_documents() {
     let doc = &docs[&("provider_keys".to_string(), PK.to_string())];
     let text = serde_json::to_string(doc).unwrap();
     assert!(
-        !text.contains("tok-left-over") && !text.contains("tok-nested"),
+        !text.contains("tok-left-over")
+            && !text.contains("tok-retired-spelling")
+            && !text.contains("tok-nested"),
         "{text}"
     );
     assert_eq!(doc["api_key"], json!("x"));
