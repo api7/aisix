@@ -977,7 +977,8 @@ mod tests {
         // 3 InvalidArgument with etcd's wrong-password message, 7
         // PermissionDenied for a user without the rights, and 9
         // FailedPrecondition with the message for credentials sent to a
-        // cluster with authentication disabled.
+        // cluster with authentication disabled, and 12 Unimplemented for
+        // credentials sent to a server with no Auth service.
         let refused: &[(u16, &'static str)] = &[
             (
                 3,
@@ -985,6 +986,8 @@ mod tests {
             ),
             (7, "etcdserver: permission denied"),
             (9, "etcdserver: authentication is not enabled"),
+            // kine (and the DPM that embeds it) has no Auth service.
+            (12, "unknown service etcdserverpb.Auth"),
         ];
         for &(code, message) in refused {
             let endpoint = spawn_grpc_status_server(code, message).await;

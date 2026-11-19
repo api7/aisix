@@ -133,15 +133,17 @@ pub enum ConnectError {
 const GRPC_INVALID_ARGUMENT: i32 = 3;
 const GRPC_PERMISSION_DENIED: i32 = 7;
 const GRPC_FAILED_PRECONDITION: i32 = 9;
+const GRPC_UNIMPLEMENTED: i32 = 12;
 const GRPC_UNAUTHENTICATED: i32 = 16;
 
 /// etcd's answers that are a verdict on the configured credentials but
 /// share a status code with answers that are not: `InvalidArgument` also
-/// carries malformed-request answers, and `FailedPrecondition` also
-/// carries `not leader`, `not capable` and the learner refusals, which a
-/// cluster electing or catching up sends and then stops sending. Matched
+/// carries malformed-request answers, `FailedPrecondition` also carries
+/// `not leader`, `not capable` and the learner refusals, which a cluster
+/// electing or catching up sends and then stops sending, and
+/// `Unimplemented` is any service or method the server lacks. Matched
 /// by message for the same reason as [`STALE_TOKEN_MESSAGES`].
-const CREDENTIAL_REFUSAL_MESSAGES: [(i32, &str); 2] = [
+const CREDENTIAL_REFUSAL_MESSAGES: [(i32, &str); 3] = [
     // In full: `etcdserver: authentication failed, invalid user ID or
     // password`.
     (GRPC_INVALID_ARGUMENT, "etcdserver: authentication failed"),
@@ -149,6 +151,9 @@ const CREDENTIAL_REFUSAL_MESSAGES: [(i32, &str); 2] = [
         GRPC_FAILED_PRECONDITION,
         "etcdserver: authentication is not enabled",
     ),
+    // Credentials sent to a server with no Auth service at all — kine,
+    // and the control plane's DPM, which embeds it.
+    (GRPC_UNIMPLEMENTED, "unknown service etcdserverpb.Auth"),
 ];
 
 fn is_credential_refusal(code: i32, message: &str) -> bool {
@@ -265,7 +270,8 @@ pub(crate) fn classify(err: &EtcdError) -> ConnectError {
             }
             // etcd's verdicts on the credentials: a user without the
             // rights, a wrong user or password, credentials sent to a
-            // cluster that has authentication disabled.
+            // cluster that has authentication disabled or to a server
+            // with no Auth service.
             GRPC_PERMISSION_DENIED => ConnectError::Rejected(detail),
             code if is_credential_refusal(code, status.message()) => ConnectError::Rejected(detail),
             // Everything else heals without anyone editing a config.
