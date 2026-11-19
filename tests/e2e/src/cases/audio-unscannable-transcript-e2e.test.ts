@@ -124,7 +124,7 @@ describe("an undecodable transcription response follows the response-side failur
 
     const pk = await seed.createProviderKey({
       display_name: "audio-unscannable-up",
-      secret: "sk-mock-upstream",
+      api_key: "sk-mock-upstream",
       api_base: upstream.url,
     });
 

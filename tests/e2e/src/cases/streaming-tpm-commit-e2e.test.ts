@@ -116,12 +116,12 @@ describe("streaming TPM commit (#688)", () => {
 
     const pkMsg = await seed.createProviderKey({
       display_name: "688-msg-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstreamMsg.baseUrl}/v1`,
     });
     const pkResp = await seed.createProviderKey({
       display_name: "688-resp-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstreamResp.baseUrl}/v1`,
     });
     // Both models are OpenAI-protocol: /v1/messages bridges to it

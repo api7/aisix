@@ -40,7 +40,7 @@ describe("cache hit runs output guardrails (#448)", () => {
     seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "cache-gr-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

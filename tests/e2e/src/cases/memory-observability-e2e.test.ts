@@ -233,7 +233,7 @@ describe("memory observability", () => {
       upstreams.push(upstream);
       const pk = await seed.createProviderKey({
         display_name: `${display}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: provider === "openai" ? `${upstream.baseUrl}/v1` : upstream.baseUrl,
         ...pkExtra,
       });
@@ -270,7 +270,7 @@ describe("memory observability", () => {
     upstreams.push(ptUpstream);
     const ptKey = await seed.createProviderKey({
       display_name: "mem-pt-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: ptUpstream.baseUrl,
     });
     await seed.createPassthroughRoute({

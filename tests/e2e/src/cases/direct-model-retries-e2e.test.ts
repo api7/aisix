@@ -57,7 +57,7 @@ describe("direct model retries e2e: a model outside a group has a retry budget",
 
     const pk = await seed.createProviderKey({
       display_name: "direct-retries-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
 

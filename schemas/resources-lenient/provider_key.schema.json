@@ -1,19 +1,5 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "anyOf": [
-    {
-      "required": [
-        "api_key"
-      ],
-      "title": "api_key"
-    },
-    {
-      "required": [
-        "secret"
-      ],
-      "title": "secret"
-    }
-  ],
   "definitions": {
     "Adapter": {
       "description": "Upstream API protocol family used for provider dispatch.",
@@ -352,11 +338,6 @@
       ],
       "description": "Per-key response-shape overrides applied by provider bridges that support response transformation."
     },
-    "secret": {
-      "description": "Accepted as an alternative spelling of `api_key`. Provide the credential under exactly one of the two names.",
-      "minLength": 1,
-      "type": "string"
-    },
     "strip_headers": {
       "default": [
         "authorization",
@@ -394,6 +375,7 @@
     }
   },
   "required": [
+    "api_key",
     "display_name"
   ],
   "title": "ProviderKey",

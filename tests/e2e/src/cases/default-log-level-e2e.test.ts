@@ -66,7 +66,7 @@ describe("the gateway's default log level", () => {
       const seed = new SeedClient(etcd, app.etcdPrefix);
       const pk = await seed.createProviderKey({
         display_name: `${MODEL}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       await seed.createModel({

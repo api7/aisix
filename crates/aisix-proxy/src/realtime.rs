@@ -2331,7 +2331,7 @@ mod tests {
     fn snapshot(api_base: &str, adapter: &str, provider: &str) -> AisixSnapshot {
         let snap = AisixSnapshot::new();
         let pk_json = format!(
-            r#"{{"display_name":"rt-pk","secret":"sk-up","api_base":"{api_base}","provider":"{provider}","adapter":"{adapter}"}}"#
+            r#"{{"display_name":"rt-pk","api_key":"sk-up","api_base":"{api_base}","provider":"{provider}","adapter":"{adapter}"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
         snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
@@ -2350,7 +2350,7 @@ mod tests {
     fn snapshot_forwarding(api_base: &str, forward: &[&str]) -> AisixSnapshot {
         let snap = snapshot(api_base, "openai", "openai");
         let pk_json = format!(
-            r#"{{"display_name":"rt-pk","secret":"sk-up","api_base":"{api_base}",
+            r#"{{"display_name":"rt-pk","api_key":"sk-up","api_base":"{api_base}",
                  "provider":"openai","adapter":"openai",
                  "request":{{"forward_client_headers":{}}}}}"#,
             serde_json::to_string(forward).unwrap()

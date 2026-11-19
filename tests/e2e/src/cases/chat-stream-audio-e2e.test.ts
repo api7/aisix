@@ -77,7 +77,7 @@ describe("a streamed audio chat completion reaches the caller whole", () => {
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "stream-audio-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

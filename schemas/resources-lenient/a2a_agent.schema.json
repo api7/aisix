@@ -48,20 +48,6 @@
       }
     }
   ],
-  "anyOf": [
-    {
-      "required": [
-        "name"
-      ],
-      "title": "name"
-    },
-    {
-      "required": [
-        "display_name"
-      ],
-      "title": "display_name"
-    }
-  ],
   "definitions": {
     "A2aAuthType": {
       "description": "How the gateway authenticates to an upstream A2A agent.",
@@ -124,12 +110,6 @@
       "default": "none",
       "description": "How the gateway authenticates to the upstream agent. The credential is held by the gateway and is not exposed to the calling client. The one case where the agent sees a caller-supplied credential instead is when `forward_client_headers` names the slot this `auth_type` fills, which substitutes the caller's own value for the gateway's rather than sending both."
     },
-    "display_name": {
-      "description": "Accepted as an alternative spelling of `name`. Provide the label under exactly one of the two names.",
-      "minLength": 1,
-      "pattern": "^[^/?#%\\s\\x00-\\x1f\\x7f-]+$",
-      "type": "string"
-    },
     "enabled": {
       "default": true,
       "description": "Whether this agent is active. When `false`, it is not served and cannot be reached.",
@@ -180,6 +160,7 @@
     }
   },
   "required": [
+    "name",
     "url"
   ],
   "title": "A2aAgent",

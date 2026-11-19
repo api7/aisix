@@ -73,7 +73,7 @@ describe.each([false, true])("upstream User-Agent (threadPerCore=%s)", (threadPe
           display_name: `ua-${provider}-${pool}`,
           provider,
           adapter: provider,
-          secret: "sk-mock",
+          api_key: "sk-mock",
           api_base: upstream.baseUrl + (provider === "openai" ? "/v1" : ""),
           // Select the per-key client even on loopback HTTP.
           ...(pool === "provider-key" ? { tls: { verify: false } } : {}),

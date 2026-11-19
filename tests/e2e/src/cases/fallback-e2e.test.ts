@@ -66,12 +66,12 @@ describe("fallback e2e: virtual routing fails over from 5xx to next target", () 
 
     const badPk = await seed.createProviderKey({
       display_name: "fb-bad-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${badUpstream.baseUrl}/v1`,
     });
     const goodPk = await seed.createProviderKey({
       display_name: "fb-good-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${goodUpstream.baseUrl}/v1`,
     });
     await seed.createModel({

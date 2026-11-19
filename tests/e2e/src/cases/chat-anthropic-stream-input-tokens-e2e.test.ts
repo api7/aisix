@@ -63,7 +63,7 @@ describe("/v1/chat/completions anthropic streaming input tokens (#450)", () => {
       display_name: "chat-anth-stream-pk",
       provider: "anthropic",
       adapter: "anthropic",
-      secret: "sk-anth-mock",
+      api_key: "sk-anth-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({

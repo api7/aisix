@@ -257,11 +257,11 @@ describe("base64 media under content_mode full", () => {
       content_mode: "full",
       content_max_bytes: CONTENT_MAX_BYTES,
     });
-    const openai = await seed.createProviderKey({ display_name: "cap-openai-pk", secret: "sk-mock", api_base: `${base}/v1` });
-    const bridged = await seed.createProviderKey({ display_name: "cap-bridged-pk", secret: "sk-mock", api_base: `${base}/v1`, apis: {} });
+    const openai = await seed.createProviderKey({ display_name: "cap-openai-pk", api_key: "sk-mock", api_base: `${base}/v1` });
+    const bridged = await seed.createProviderKey({ display_name: "cap-bridged-pk", api_key: "sk-mock", api_base: `${base}/v1`, apis: {} });
     const anthropic = await seed.createProviderKey({
       display_name: "cap-anthropic-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       provider: "anthropic",
       adapter: "anthropic",
       api_base: base,
@@ -270,8 +270,8 @@ describe("base64 media under content_mode full", () => {
     await seed.createModel({ display_name: "cap-bridged", provider: "openai", model_name: "gpt-4o-mini", provider_key_id: bridged.id });
     await seed.createModel({ display_name: "cap-anthropic", provider: "anthropic", model_name: "claude-sonnet-4-5", provider_key_id: anthropic.id });
     await seed.createPassthroughRoute({ name: "cap-pt", path_prefix: "/cap-pt", target_url: base, provider_key_id: openai.id });
-    await seed.update("mcp_servers", randomUUID(), { display_name: "media", url: mcp.url, enabled: true });
-    await seed.update("mcp_servers", randomUUID(), { display_name: "large", url: mcpLarge.url, enabled: true });
+    await seed.update("mcp_servers", randomUUID(), { name: "media", url: mcp.url, enabled: true });
+    await seed.update("mcp_servers", randomUUID(), { name: "large", url: mcpLarge.url, enabled: true });
     // Seeded last: this key authenticating implies the whole seed set landed.
     await seed.createApiKey({
       key_hash: CALLER_HASH,

@@ -81,7 +81,7 @@ describe("etcd compaction behind a lagging watch", () => {
     const seed = new SeedClient(etcd, prefix);
     const pk = await seed.createProviderKey({
       display_name: "compaction-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const model = (display_name: string) =>

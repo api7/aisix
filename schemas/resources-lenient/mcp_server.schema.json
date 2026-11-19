@@ -235,20 +235,6 @@
       }
     }
   ],
-  "anyOf": [
-    {
-      "required": [
-        "name"
-      ],
-      "title": "name"
-    },
-    {
-      "required": [
-        "display_name"
-      ],
-      "title": "display_name"
-    }
-  ],
   "definitions": {
     "McpAuthType": {
       "description": "How the gateway authenticates to an upstream MCP server.",
@@ -403,12 +389,6 @@
         "null"
       ]
     },
-    "display_name": {
-      "description": "Accepted as an alternative spelling of `name`. Provide the label under exactly one of the two names.",
-      "minLength": 1,
-      "pattern": "^(?:[^_]|_[^_])*$",
-      "type": "string"
-    },
     "enabled": {
       "default": true,
       "description": "Whether this server is active. When `false`, its tools are not listed and cannot be called.",
@@ -517,6 +497,7 @@
     }
   },
   "required": [
+    "name",
     "url"
   ],
   "title": "McpServer",

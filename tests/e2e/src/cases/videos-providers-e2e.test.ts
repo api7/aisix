@@ -213,7 +213,7 @@ describe("videos e2e: zhipu + ark + runway provider adapters", () => {
     ) => {
       const pk = await seed!.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock-provider",
+        api_key: "sk-mock-provider",
         api_base: apiBase,
         provider,
       });

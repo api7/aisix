@@ -71,7 +71,7 @@ describe("passthrough guardrail (#911 [6])", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "pt-gr-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

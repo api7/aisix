@@ -88,7 +88,7 @@ describe("Bedrock Converse: a tool result without tool_call_id", () => {
       display_name: "bedrock-unnamed-tool-result-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-unnamed-tool-result",
         secret_access_key: "sk-unnamed-tool-result",
         region: "us-east-1",

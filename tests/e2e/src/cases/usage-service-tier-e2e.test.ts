@@ -210,7 +210,7 @@ describe("usage events record the service tier the upstream served on", () => {
       const anthropic = provider === "anthropic";
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         // The Anthropic bridge appends `/v1/messages` to the bare host.
         api_base: anthropic ? upstream.baseUrl : `${upstream.baseUrl}/v1`,
         provider,
@@ -241,7 +241,7 @@ describe("usage events record the service tier the upstream served on", () => {
 
     const routePk = await seed.createProviderKey({
       display_name: "tier-route-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: "http://unused-on-routes",
     });
     for (const [route, opts] of [

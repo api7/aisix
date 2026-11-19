@@ -46,11 +46,6 @@ pub struct McpServer {
     /// Operator-facing label, unique within the gateway. It is used as the
     /// namespace prefix for this server's tools, which are exposed to clients as
     /// `<name>__<tool>`, so it must not contain the reserved separator `__`.
-    // `display_name` is the field's former name; stored documents and
-    // callers that still use it keep deserializing (schema-side acceptance
-    // lives in `schema::mcp_server_root_schema`). Re-serialization always
-    // emits `name`.
-    #[serde(alias = "display_name")]
     // The name is the tool-namespace prefix: this server's tools are exposed to
     // MCP clients as `<name>__<tool>` and parsed back with `split_once("__")`
     // (see `aisix_mcp::gateway`). So the name must contain no `__` AND must not
@@ -789,10 +784,9 @@ mod tests {
 
     #[test]
     fn deserialises_minimal_mcp_server() {
-        let s: McpServer = serde_json::from_str(
-            r#"{"display_name":"github","url":"https://api.example.com/mcp"}"#,
-        )
-        .unwrap();
+        let s: McpServer =
+            serde_json::from_str(r#"{"name":"github","url":"https://api.example.com/mcp"}"#)
+                .unwrap();
         assert_eq!(s.name, "github");
         assert_eq!(s.url, "https://api.example.com/mcp");
         // Defaults.
@@ -809,7 +803,7 @@ mod tests {
     #[test]
     fn deserialises_with_bearer_auth() {
         let s: McpServer = serde_json::from_str(
-            r#"{"display_name":"gh","url":"https://x/mcp","auth_type":"bearer","secret":"tok","timeout_ms":5000,"enabled":false}"#,
+            r#"{"name":"gh","url":"https://x/mcp","auth_type":"bearer","secret":"tok","timeout_ms":5000,"enabled":false}"#,
         )
         .unwrap();
         assert_eq!(s.auth_type, McpAuthType::Bearer);
@@ -821,7 +815,7 @@ mod tests {
     #[test]
     fn deserialises_with_api_key_auth() {
         let s: McpServer = serde_json::from_str(
-            r#"{"display_name":"gh","url":"https://x/mcp","auth_type":"api_key","secret":"k-1"}"#,
+            r#"{"name":"gh","url":"https://x/mcp","auth_type":"api_key","secret":"k-1"}"#,
         )
         .unwrap();
         assert_eq!(s.auth_type, McpAuthType::ApiKey);
@@ -831,7 +825,7 @@ mod tests {
     #[test]
     fn deserialises_with_oauth2_auth() {
         let s: McpServer = serde_json::from_str(
-            r#"{"display_name":"gh","url":"https://x/mcp","auth_type":"oauth2","secret":"cs-1","client_id":"cid","token_url":"https://auth/x/token","scopes":["read","write"]}"#,
+            r#"{"name":"gh","url":"https://x/mcp","auth_type":"oauth2","secret":"cs-1","client_id":"cid","token_url":"https://auth/x/token","scopes":["read","write"]}"#,
         )
         .unwrap();
         assert_eq!(s.auth_type, McpAuthType::OAuth2);
@@ -847,7 +841,7 @@ mod tests {
     #[test]
     fn oauth2_round_trips_and_omits_unset_optionals() {
         let original: McpServer = serde_json::from_str(
-            r#"{"display_name":"gh","url":"https://x/mcp","auth_type":"oauth2","secret":"cs","client_id":"cid","token_url":"https://auth/token"}"#,
+            r#"{"name":"gh","url":"https://x/mcp","auth_type":"oauth2","secret":"cs","client_id":"cid","token_url":"https://auth/token"}"#,
         )
         .unwrap();
         let s = serde_json::to_string(&original).unwrap();
@@ -864,12 +858,9 @@ mod tests {
         // A newer control plane may ship fields ahead of this DP; serde must
         // accept them. The write path still rejects them via the strict
         // `schema::validate_mcp_server`.
-        let s: McpServer =
-            serde_json::from_str(r#"{"display_name":"x","url":"u","extra":1}"#).unwrap();
+        let s: McpServer = serde_json::from_str(r#"{"name":"x","url":"u","extra":1}"#).unwrap();
         assert_eq!(s.name, "x");
     }
-
-    // ---- `display_name` → `name` rename ----
 
     #[test]
     fn accepts_canonical_name_spelling() {
@@ -879,48 +870,29 @@ mod tests {
     }
 
     #[test]
-    fn serialises_label_under_name_only() {
-        // Emission contract: re-serialization uses the canonical `name`,
-        // never the former `display_name` spelling (the fixtures above
-        // keep exercising the deserialize-side alias).
-        let s: McpServer =
-            serde_json::from_str(r#"{"display_name":"github","url":"https://x/mcp"}"#).unwrap();
-        let json = serde_json::to_string(&s).unwrap();
-        assert!(json.contains(r#""name":"github""#), "got: {json}");
-        assert!(!json.contains("display_name"), "got: {json}");
-    }
-
-    #[test]
-    fn rejects_document_carrying_both_spellings() {
-        // serde maps the alias onto the same field, so a document that
-        // carries both spellings is a duplicate-field error — the
-        // ambiguity is rejected instead of one value silently winning.
-        let r: Result<McpServer, _> = serde_json::from_str(
-            r#"{"name":"github","display_name":"github-old","url":"https://x/mcp"}"#,
-        );
-        let err = r.expect_err("both spellings in one document must be rejected");
-        assert!(
-            err.to_string().contains("duplicate field"),
-            "expected a duplicate-field error, got: {err}"
-        );
+    fn the_retired_display_name_spelling_no_longer_deserialises() {
+        let err =
+            serde_json::from_str::<McpServer>(r#"{"display_name":"github","url":"https://x/mcp"}"#)
+                .expect_err("`display_name` is no longer read as `name`");
+        assert!(err.to_string().contains("missing field `name`"), "{err}");
     }
 
     #[test]
     fn rejects_unknown_transport_and_auth_type() {
-        assert!(serde_json::from_str::<McpServer>(
-            r#"{"display_name":"x","url":"u","transport":"stdio"}"#
-        )
-        .is_err());
-        assert!(serde_json::from_str::<McpServer>(
-            r#"{"display_name":"x","url":"u","auth_type":"oauth"}"#
-        )
-        .is_err());
+        assert!(
+            serde_json::from_str::<McpServer>(r#"{"name":"x","url":"u","transport":"stdio"}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<McpServer>(r#"{"name":"x","url":"u","auth_type":"oauth"}"#)
+                .is_err()
+        );
     }
 
     #[test]
     fn resource_trait_routes_through_name() {
         let mut s: McpServer =
-            serde_json::from_str(r#"{"display_name":"github","url":"https://x/mcp"}"#).unwrap();
+            serde_json::from_str(r#"{"name":"github","url":"https://x/mcp"}"#).unwrap();
         s.runtime_id = "uuid-mcp-1".into();
         assert_eq!(<McpServer as Resource>::kind(), "mcp_servers");
         assert_eq!(s.id(), "uuid-mcp-1");

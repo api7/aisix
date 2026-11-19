@@ -163,12 +163,12 @@ describe("mcp anonymous access e2e", () => {
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "docs",
+      name: "docs",
       url: docs.url,
       enabled: true,
     });
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "kb",
+      name: "kb",
       url: kb.url,
       enabled: true,
     });

@@ -73,7 +73,7 @@ describe("data plane identifies itself via Server header on every response", () 
 
     const pk = await seed.createProviderKey({
       display_name: "server-header-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

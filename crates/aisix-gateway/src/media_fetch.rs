@@ -1110,7 +1110,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
-            Arc::new(serde_json::from_str::<ProviderKey>(r#"{"display_name":"pk","secret":"s"}"#).unwrap()),
+            Arc::new(serde_json::from_str::<ProviderKey>(r#"{"display_name":"pk","api_key":"s"}"#).unwrap()),
         )
     }
 

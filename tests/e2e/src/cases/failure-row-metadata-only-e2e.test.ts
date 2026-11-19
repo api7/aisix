@@ -93,7 +93,7 @@ describe("failure rows name the failure under metadata_only", () => {
     const modelAt = async (name: string, base: string) => {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: base,
       });
       await seed.createModel({
@@ -150,7 +150,7 @@ describe("failure rows name the failure under metadata_only", () => {
     );
     const anthropicPk = await seed.createProviderKey({
       display_name: "meta-anthropic-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       provider: "anthropic",
       api_base: failing,
     });
@@ -162,7 +162,7 @@ describe("failure rows name the failure under metadata_only", () => {
     });
     mcpUpstream = await startMcpUpstream("metamcp");
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "metamcp",
+      name: "metamcp",
       url: mcpUpstream.url,
     });
     const failingPk = await modelAt("meta-chat-500", `${failing}/v1`);

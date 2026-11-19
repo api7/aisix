@@ -77,7 +77,7 @@ describe("deepseek reasoning_content passthrough on /v1/chat/completions (#466)"
     // DeepSeek dispatches through the OpenAI-compat family bridge.
     const pk = await seed.createProviderKey({
       display_name: "ds-reasoning-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
       provider: "deepseek",
       adapter: "openai",

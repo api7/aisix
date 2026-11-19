@@ -185,7 +185,7 @@ mod tests {
 
     fn provider_key_entry() -> ResourceEntry<aisix_core::ProviderKey> {
         let pk: aisix_core::ProviderKey =
-            serde_json::from_str(r#"{"display_name":"openai-up","secret":"sk-up","provider":"openai","adapter":"openai"}"#).unwrap();
+            serde_json::from_str(r#"{"display_name":"openai-up","api_key":"sk-up","provider":"openai","adapter":"openai"}"#).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
     }
 

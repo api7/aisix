@@ -78,7 +78,7 @@ describe("OpenAI /v1/embeddings tolerates missing usage.prompt_tokens (#474)", (
 
     const pk = await seed.createProviderKey({
       display_name: "jina-embed-pk",
-      secret: "sk-jina-mock",
+      api_key: "sk-jina-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({

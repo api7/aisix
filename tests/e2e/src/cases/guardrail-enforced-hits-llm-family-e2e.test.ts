@@ -261,7 +261,7 @@ describe("guardrail enforced hits on the LLM handler family", () => {
     ): Promise<void> => {
       const pk = await seed.createProviderKey({
         display_name: `${display}-pk`,
-        secret: "sk-mock-upstream",
+        api_key: "sk-mock-upstream",
         api_base: up.baseUrl,
         provider: adapter,
         adapter,
@@ -600,7 +600,7 @@ describe("a fail-closed guardrail outage is audited apart from a policy block", 
     });
     const pk = await seed.createProviderKey({
       display_name: "unavailable-pk",
-      secret: "sk-mock-upstream",
+      api_key: "sk-mock-upstream",
       api_base: upstream.baseUrl,
       provider: "openai",
       adapter: "openai",

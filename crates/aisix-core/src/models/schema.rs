@@ -448,10 +448,9 @@ pub fn validate(validator: &Validator, value: &Value) -> Result<(), SchemaError>
             path: err.instance_path().to_string(),
             // Mask instance values in the message. Validation errors flow
             // into logs, the rejection buffer surfaced upstream, and admin
-            // 400 bodies — and resource documents carry credentials. The
-            // renamed-field `anyOf` (see `accept_renamed_field`) sits at
-            // the document root, so its unmasked message would echo the
-            // whole stored document, credentials included.
+            // 400 bodies — and resource documents carry credentials. A
+            // failure at the document root would otherwise echo the whole
+            // stored document, credentials included.
             message: err.masked().to_string(),
         });
     }
@@ -549,7 +548,7 @@ pub fn validate_guardrail(value: &Value) -> Result<(), SchemaError> {
             "guardrail",
             &SCHEMAS.guardrail,
             value,
-            name_missing_semantic_threshold(value, err),
+            name_missing_semantic_threshold(&SCHEMAS.guardrail, value, err),
         )),
     }
 }
@@ -572,7 +571,11 @@ pub fn validate_guardrail(value: &Value) -> Result<(), SchemaError> {
 /// It deliberately does not suggest a value. Cosine scales differ enough
 /// between embedding models that any number printed here would be wrong for
 /// most rows, and a suggested number is one an operator will take.
-fn name_missing_semantic_threshold(value: &Value, err: SchemaError) -> SchemaError {
+fn name_missing_semantic_threshold(
+    validator: &Validator,
+    value: &Value,
+    err: SchemaError,
+) -> SchemaError {
     let Some(fields) = value.as_object() else {
         return err;
     };
@@ -602,7 +605,7 @@ fn name_missing_semantic_threshold(value: &Value, err: SchemaError) -> SchemaErr
             fields.insert((*threshold).to_string(), json!(0.5));
         }
     }
-    if validate(&SCHEMAS.guardrail, &probe).is_err() {
+    if validate(validator, &probe).is_err() {
         return err;
     }
     SchemaError {
@@ -763,6 +766,7 @@ pub fn validate_provider_key_lenient(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_guardrail_lenient(value: &Value) -> Result<(), SchemaError> {
     validate(&LENIENT_SCHEMAS.guardrail, value)
+        .map_err(|err| name_missing_semantic_threshold(&LENIENT_SCHEMAS.guardrail, value, err))
 }
 
 pub fn validate_cache_policy_lenient(value: &Value) -> Result<(), SchemaError> {
@@ -1347,17 +1351,8 @@ fn require_name_or_id(node: &mut serde_json::Map<String, Value>, name: &str, id:
 /// `Option` representation (`true`): `TelemetryTags` carries fields cp-api
 /// sends as explicit `null` (`branded_provider`/`pk_label`/`byo_label`), and
 /// keeping all optionals nullable matches the resource's wire contract.
-/// The credential is accepted under both its canonical name `api_key` and
-/// its former name `secret` (see [`accept_renamed_field`]).
 pub fn provider_key_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::ProviderKey>(true);
-    accept_renamed_field(
-        &mut schema,
-        "api_key",
-        "secret",
-        "Accepted as an alternative spelling of `api_key`. \
-         Provide the credential under exactly one of the two names.",
-    );
     // `schemars` annotates `IpAddr` with `format: "ip"`, which nothing
     // validates: `format` is an annotation in draft-07 and the compiled
     // validators do not opt into checking it. Without a constraint the
@@ -1390,61 +1385,6 @@ pub fn provider_key_root_schema() -> Value {
     schema
 }
 
-/// Mirror a struct field's `#[serde(alias = "…")]` in the generated schema.
-///
-/// `schemars` does not emit serde aliases, so a naively generated schema
-/// would list only the canonical name and — with `additionalProperties:
-/// false` — reject every stored document that still uses the former one at
-/// the snapshot loader's schema gate. This transform makes the generated
-/// schema accept both spellings:
-///
-/// - the former name is declared as a property with the same shape as the
-///   canonical one (so `minLength` and type constraints keep applying);
-/// - the canonical name is removed from `required` and requiredness becomes
-///   a top-level `anyOf` of the two single-field `required` forms — at
-///   least one spelling must be present;
-/// - `additionalProperties: false` stays intact, so unknown fields are
-///   still rejected.
-///
-/// A document carrying **both** spellings passes this schema and is then
-/// rejected by serde's duplicate-field check at deserialize (both names map
-/// to the same field), so the ambiguity never loads.
-fn accept_renamed_field(schema: &mut Value, canonical: &str, former: &str, note: &str) {
-    let obj = schema
-        .as_object_mut()
-        .expect("resource root schema is a JSON object");
-    assert!(
-        !obj.contains_key("anyOf"),
-        "top-level anyOf already in use; compose the rename acceptance with allOf instead"
-    );
-
-    let properties = obj
-        .get_mut("properties")
-        .and_then(Value::as_object_mut)
-        .expect("resource root schema has properties");
-    let mut former_schema = properties
-        .get(canonical)
-        .unwrap_or_else(|| panic!("schema property `{canonical}` exists"))
-        .clone();
-    if let Some(former_obj) = former_schema.as_object_mut() {
-        former_obj.insert("description".to_string(), Value::String(note.to_string()));
-    }
-    properties.insert(former.to_string(), former_schema);
-
-    if let Some(Value::Array(required)) = obj.get_mut("required") {
-        required.retain(|v| v.as_str() != Some(canonical));
-    }
-    // The branch titles label the two spellings in rendered references
-    // (reference UIs use `title` for `anyOf` tab labels).
-    obj.insert(
-        "anyOf".to_string(),
-        json!([
-            { "title": canonical, "required": [canonical] },
-            { "title": former, "required": [former] },
-        ]),
-    );
-}
-
 /// Canonical JSON Schema for the `mcp_server` resource, derived from the
 /// [`McpServer`](crate::models::McpServer) struct. Uses the nullable `Option`
 /// representation (`true`) so the optional fields (`secret`, `client_id`,
@@ -1456,9 +1396,7 @@ fn accept_renamed_field(schema: &mut Value, canonical: &str, former: &str, note:
 /// credential coupling, and the openapi-only `spec`/`api_key_header` fields, are
 /// injected here as an `allOf` of `if`/`then` subschemas (see
 /// [`super::mcp_server::mcp_server_credential_coupling`]) so every configuration
-/// path enforces them. The label
-/// is accepted under both its canonical name `name` and its former name
-/// `display_name` (see [`accept_renamed_field`]).
+/// path enforces them.
 ///
 /// `strict` additionally forbids a `*` in the label
 /// ([`NAME_PATTERN_STRICT`](super::mcp_server::NAME_PATTERN_STRICT), whose
@@ -1480,9 +1418,6 @@ pub fn mcp_server_root_schema(strict: bool) -> Value {
             super::mcp_server::mcp_server_credential_coupling(),
         );
     if strict {
-        // Applied BEFORE the rename acceptance below, which copies this
-        // property to `display_name` — the two spellings of one label
-        // cannot enforce different patterns.
         let name = schema
             .pointer_mut("/properties/name")
             .and_then(Value::as_object_mut)
@@ -1492,13 +1427,6 @@ pub fn mcp_server_root_schema(strict: bool) -> Value {
             json!(super::mcp_server::NAME_PATTERN_STRICT),
         );
     }
-    accept_renamed_field(
-        &mut schema,
-        "name",
-        "display_name",
-        "Accepted as an alternative spelling of `name`. \
-         Provide the label under exactly one of the two names.",
-    );
     if let Some(Value::Object(defs)) = schema.get_mut("definitions") {
         title_single_value_enum_variants(
             defs,
@@ -1542,9 +1470,7 @@ pub fn mcp_server_root_schema(strict: bool) -> Value {
 }
 
 /// Canonical JSON Schema for the `a2a_agent` resource, derived from the
-/// [`A2aAgent`](crate::models::A2aAgent) struct. The label is accepted under
-/// both its canonical name `name` and its former name `display_name` (see
-/// [`accept_renamed_field`]).
+/// [`A2aAgent`](crate::models::A2aAgent) struct.
 pub fn a2a_agent_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::A2aAgent>(true);
     schema
@@ -1554,13 +1480,6 @@ pub fn a2a_agent_root_schema() -> Value {
             "allOf".to_string(),
             super::a2a_agent::a2a_agent_credential_coupling(),
         );
-    accept_renamed_field(
-        &mut schema,
-        "name",
-        "display_name",
-        "Accepted as an alternative spelling of `name`. \
-         Provide the label under exactly one of the two names.",
-    );
     if let Some(Value::Object(defs)) = schema.get_mut("definitions") {
         title_single_value_enum_variants(
             defs,
@@ -1681,8 +1600,7 @@ pub fn claim_mapping_root_schema() -> Value {
 /// cross-field invariant (match dimensions, target shape, per-mode required
 /// companions) is injected as an `allOf` (see
 /// [`super::passthrough_route::passthrough_route_coupling`]) so the
-/// published write contract and the lenient loader enforce the same coupling. The
-/// label is accepted under both `name` and its `display_name` alias.
+/// published write contract and the lenient loader enforce the same coupling.
 pub fn passthrough_route_root_schema() -> Value {
     let mut schema = struct_root_schema::<crate::models::PassthroughRoute>(true);
     schema
@@ -1692,13 +1610,6 @@ pub fn passthrough_route_root_schema() -> Value {
             "allOf".to_string(),
             super::passthrough_route::passthrough_route_coupling(),
         );
-    accept_renamed_field(
-        &mut schema,
-        "name",
-        "display_name",
-        "Accepted as an alternative spelling of `name`. \
-         Provide the label under exactly one of the two names.",
-    );
     if let Some(Value::Object(defs)) = schema.get_mut("definitions") {
         title_single_value_enum_variants(
             defs,
@@ -2026,21 +1937,40 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                 "semantic" => {
                     set_property_enum(b, "text_source", json!(["user_messages", "all_messages"]));
                     set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
-                    // WRITE PATH ONLY, all of it. Each of these fields is
-                    // defaulted at the type level so that a STORED row
-                    // lacking it still deserializes: the loader's failure
-                    // unit is the row, and a screening guardrail that
-                    // vanishes is fail-OPEN — strictly worse than the
-                    // field defaulting. What an operator may save is the
-                    // stricter question, and it is asked here.
+                    // Each threshold is required alongside ITS OWN example
+                    // list and only then — demanding an allow threshold on a
+                    // deny-only row would be asking for a number that
+                    // decides nothing. There is no value that is right for
+                    // every embedding model, so there is nothing to default
+                    // to; see the fields' doc comments. Required on the READ
+                    // path too: the last control plane that saved a
+                    // populated list without its threshold (v0.13.0) is below
+                    // the support floor, and the control plane re-runs its
+                    // backfill for any such row still stored.
+                    b.insert(
+                        "allOf".to_string(),
+                        json!([
+                            {
+                                "if": {
+                                    "required": ["deny_examples"],
+                                    "properties": { "deny_examples": { "minItems": 1 } }
+                                },
+                                "then": { "required": ["deny_threshold"] }
+                            },
+                            {
+                                "if": {
+                                    "required": ["allow_examples"],
+                                    "properties": { "allow_examples": { "minItems": 1 } }
+                                },
+                                "then": { "required": ["allow_threshold"] }
+                            }
+                        ]),
+                    );
                     if strict {
-                        // …and the type-level default goes with them. It
-                        // exists so a STORED row without the key still
-                        // loads; advertised on the write contract it reads
-                        // as a suggested value, which is the one thing this
-                        // change is trying to stop — a schema-driven form
-                        // or generator would pre-fill 0.75 and put the
-                        // operator back where they started.
+                        // The type-level default exists so a direction with
+                        // no example list may omit its key. Advertised on the
+                        // write contract it reads as a suggested value — a
+                        // schema-driven form or generator would pre-fill it.
                         for threshold in ["deny_threshold", "allow_threshold"] {
                             if let Some(Value::Object(properties)) = b.get_mut("properties") {
                                 if let Some(Value::Object(field)) = properties.get_mut(threshold) {
@@ -2048,32 +1978,6 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                                 }
                             }
                         }
-                        // Each threshold is required alongside ITS OWN
-                        // example list and only then — demanding an allow
-                        // threshold on a deny-only row would be asking for
-                        // a number that decides nothing. There is no value
-                        // that is right for every embedding model, so
-                        // there is nothing to default to; see the fields'
-                        // doc comments.
-                        b.insert(
-                            "allOf".to_string(),
-                            json!([
-                                {
-                                    "if": {
-                                        "required": ["deny_examples"],
-                                        "properties": { "deny_examples": { "minItems": 1 } }
-                                    },
-                                    "then": { "required": ["deny_threshold"] }
-                                },
-                                {
-                                    "if": {
-                                        "required": ["allow_examples"],
-                                        "properties": { "allow_examples": { "minItems": 1 } }
-                                    },
-                                    "then": { "required": ["allow_threshold"] }
-                                }
-                            ]),
-                        );
                         // A row saved without an embedding model would
                         // screen every request against a model that
                         // resolves to nothing. Either spelling satisfies
@@ -2084,12 +1988,11 @@ pub fn guardrail_root_schema(strict: bool) -> Value {
                     }
                 }
                 "custom" => {
-                    // Required on BOTH schemas, unlike the semantic fields
-                    // above, and the asymmetry is the point rather than an
-                    // oversight. Those two relax on the read path because a
-                    // row that loads behaves BETTER than one that vanishes:
-                    // an absent threshold keeps screening at its stored
-                    // default, and an empty `embedding_model` REFUSES every
+                    // Required on BOTH schemas, unlike the semantic embedding
+                    // model above, and the asymmetry is the point rather than
+                    // an oversight. That one relaxes on the read path because
+                    // a row that loads behaves BETTER than one that vanishes:
+                    // an empty `embedding_model` REFUSES every
                     // request in scope rather than admitting it, since
                     // `fail_open` defaults to false — fail-closed beats the
                     // row vanishing and letting the traffic through
@@ -4608,28 +4511,12 @@ mod tests {
     }
 
     #[test]
-    fn the_semantic_write_requirements_never_reach_the_read_path() {
+    fn a_semantic_row_without_an_embedding_model_still_loads() {
         // The loader's failure unit is the ROW, so a requirement that
         // leaks into the lenient schema does not make a stored guardrail
-        // stricter — it deletes it. A screening row that vanishes stops
-        // screening entirely, which is fail-OPEN on a security control and
-        // strictly worse than the field defaulting.
-        //
-        // Both fields below are the shape a control plane wrote before the
-        // write path demanded them, so both must still load.
-        let unthresholded = json!({
-            "name": "g",
-            "kind": "semantic",
-            "embedding_model": "embed-1",
-            "deny_examples": ["forbidden"]
-        });
-        validate_guardrail_lenient(&unthresholded)
-            .expect("a stored row written before the threshold was required keeps screening");
-        assert!(
-            validate_guardrail(&unthresholded).is_err(),
-            "but it cannot be SAVED"
-        );
-
+        // stricter — it deletes it. A modelless row refuses every request
+        // in scope (`fail_open` defaults to false), which is fail-closed;
+        // losing it would let the traffic through unscreened.
         let modelless = json!({
             "name": "g",
             "kind": "semantic",
@@ -4645,22 +4532,34 @@ mod tests {
     }
 
     #[test]
-    fn guardrail_semantic_row_without_a_threshold_still_loads() {
-        // The READ path keeps the default, and that asymmetry is the
-        // point: rows written before the requirement carry no key, and a
-        // row the loader cannot deserialize is skipped whole — a
-        // screening guardrail that disappears is fail-OPEN. They go on
-        // enforcing the 0.75 they enforce today until the control plane
-        // backfills them.
-        let row: crate::models::Guardrail = serde_json::from_value(semantic_row(json!({
-            "deny_examples": ["forbidden"]
+    fn a_stored_semantic_list_without_its_threshold_is_rejected_on_read() {
+        // The read path no longer fills a threshold in for a populated
+        // list (#1409): no number is right for every embedding model, and
+        // the last control plane that stored such a row is below the
+        // support floor. The rejection names the field, since it is what
+        // `/status/config` reports for the row.
+        for (examples, threshold) in [
+            ("deny_examples", "deny_threshold"),
+            ("allow_examples", "allow_threshold"),
+        ] {
+            let row = semantic_row(json!({ examples: ["listed"] }));
+            let err = validate_guardrail_lenient(&row)
+                .expect_err("a populated list without its threshold must not load");
+            assert!(
+                err.message.contains(&format!("`{threshold}`")),
+                "{}",
+                err.message
+            );
+            let mut fixed = row.clone();
+            fixed[threshold] = json!(0.5);
+            validate_guardrail_lenient(&fixed).unwrap();
+        }
+        // A direction with no list still omits its key.
+        validate_guardrail_lenient(&semantic_row(json!({}))).unwrap();
+        validate_guardrail_lenient(&semantic_row(json!({
+            "deny_examples": ["listed"], "deny_threshold": 0.5
         })))
-        .expect("an unmigrated row must still deserialize");
-        let crate::models::GuardrailKind::Semantic(cfg) = &row.config else {
-            panic!("not a semantic row");
-        };
-        assert_eq!(cfg.deny_threshold, 0.75);
-        assert_eq!(cfg.allow_threshold, 0.75);
+        .unwrap();
     }
 
     #[test]
@@ -5401,7 +5300,7 @@ mod tests {
     fn provider_key_minimal_passes() {
         let v = json!({
             "display_name": "openai-prod",
-            "secret": "sk-x"
+            "api_key": "sk-x"
         });
         validate_provider_key(&v).unwrap();
     }
@@ -5412,7 +5311,7 @@ mod tests {
         // Must still validate so existing on-disk rows keep loading.
         let v = json!({
             "display_name": "openai-prod",
-            "secret": "sk-x",
+            "api_key": "sk-x",
             "api_base": "https://api.openai.com/v1"
         });
         validate_provider_key(&v).unwrap();
@@ -5422,7 +5321,7 @@ mod tests {
     fn provider_key_with_phase_a_fields_passes() {
         let v = json!({
             "display_name": "deepseek-prod",
-            "secret": "sk-x",
+            "api_key": "sk-x",
             "api_base": "https://api.deepseek.com/v1",
             "provider": "deepseek",
             "adapter": "openai",
@@ -5444,7 +5343,7 @@ mod tests {
     fn provider_key_with_apis_entries_passes() {
         let v = json!({
             "display_name": "deepseek-prod",
-            "secret": "sk-x",
+            "api_key": "sk-x",
             "api_base": "https://api.deepseek.com/v1",
             "provider": "deepseek",
             "adapter": "openai",
@@ -5459,7 +5358,7 @@ mod tests {
         // nothing beyond what its adapter implies.
         let v = json!({
             "display_name": "vllm",
-            "secret": "sk-x",
+            "api_key": "sk-x",
             "api_base": "https://vllm.internal/v1",
             "provider": "openai",
             "apis": {}
@@ -5474,7 +5373,7 @@ mod tests {
     fn provider_key_rejects_an_unknown_api_surface() {
         let v = json!({
             "display_name": "x",
-            "secret": "sk-x",
+            "api_key": "sk-x",
             "apis": {"embeddings": {"base": "https://up/v1"}}
         });
         validate_provider_key(&v).unwrap_err();
@@ -5487,7 +5386,7 @@ mod tests {
     fn lenient_provider_key_tolerates_an_unknown_api_surface() {
         let v = json!({
             "display_name": "x",
-            "secret": "sk-x",
+            "api_key": "sk-x",
             "apis": {"embeddings": {"base": "https://up/v1"}}
         });
         validate_provider_key_lenient(&v).unwrap();
@@ -5497,7 +5396,7 @@ mod tests {
     fn provider_key_with_byo_telemetry_shape_passes() {
         let v = json!({
             "display_name": "internal-llm",
-            "secret": "sk-x",
+            "api_key": "sk-x",
             "telemetry_tags": {
                 "kind": "byo",
                 "branded_provider": null,
@@ -5511,7 +5410,7 @@ mod tests {
     fn provider_key_rejects_unknown_adapter_value() {
         let v = json!({
             "display_name": "x",
-            "secret": "k",
+            "api_key": "k",
             "adapter": "not-a-real-adapter"
         });
         assert!(validate_provider_key(&v).is_err());
@@ -5521,7 +5420,7 @@ mod tests {
     fn provider_key_rejects_unknown_telemetry_field() {
         let v = json!({
             "display_name": "x",
-            "secret": "k",
+            "api_key": "k",
             "telemetry_tags": { "unknown_tag": "v" }
         });
         assert!(validate_provider_key(&v).is_err());
@@ -5533,7 +5432,7 @@ mod tests {
         // the explicitly-listed Phase A fields are accepted.
         let v = json!({
             "display_name": "x",
-            "secret": "k",
+            "api_key": "k",
             "rogue": 1
         });
         assert!(validate_provider_key(&v).is_err());
@@ -5544,7 +5443,7 @@ mod tests {
         // `kind` is the closed `"catalog" | "byo"` set.
         let v = json!({
             "display_name": "x",
-            "secret": "k",
+            "api_key": "k",
             "telemetry_tags": { "kind": "third-party" }
         });
         assert!(validate_provider_key(&v).is_err());
@@ -5557,7 +5456,7 @@ mod tests {
         // Mirror the on-disk example in issue #302 §5 exactly.
         let v = json!({
             "display_name": "deepseek-prod",
-            "secret": "sk-x",
+            "api_key": "sk-x",
             "request": {
                 "param_renames":       { "max_completion_tokens": "max_tokens" },
                 "param_constraints":   { "temperature_max": 1.0 },
@@ -5572,7 +5471,7 @@ mod tests {
     fn provider_key_with_response_block_passes() {
         let v = json!({
             "display_name": "deepseek-prod",
-            "secret": "sk-x",
+            "api_key": "sk-x",
             "response": {
                 "stream_done_marker":     "required",
                 "content_list_to_string": false,
@@ -5589,7 +5488,7 @@ mod tests {
         // all-default deserialization path.
         let v = json!({
             "display_name": "x",
-            "secret": "k",
+            "api_key": "k",
             "request": {},
             "response": {}
         });
@@ -5600,7 +5499,7 @@ mod tests {
     fn provider_key_request_rejects_unknown_field() {
         let v = json!({
             "display_name": "x",
-            "secret": "k",
+            "api_key": "k",
             "request": { "param_rename": {} }
         });
         assert!(validate_provider_key(&v).is_err());
@@ -5610,7 +5509,7 @@ mod tests {
     fn provider_key_response_rejects_unknown_field() {
         let v = json!({
             "display_name": "x",
-            "secret": "k",
+            "api_key": "k",
             "response": { "reasoning_fields": "delta.foo" }
         });
         assert!(validate_provider_key(&v).is_err());
@@ -5620,7 +5519,7 @@ mod tests {
     fn provider_key_response_rejects_unknown_stream_done_marker() {
         let v = json!({
             "display_name": "x",
-            "secret": "k",
+            "api_key": "k",
             "response": { "stream_done_marker": "maybe" }
         });
         assert!(validate_provider_key(&v).is_err());
@@ -5633,7 +5532,7 @@ mod tests {
         // sneak past today's DP.
         let v = json!({
             "display_name": "x",
-            "secret": "k",
+            "api_key": "k",
             "request": {
                 "param_constraints": { "top_p_max": 0.9 }
             }
@@ -5641,48 +5540,71 @@ mod tests {
         assert!(validate_provider_key(&v).is_err());
     }
 
-    // ---- renamed-field dual acceptance ----
+    // ---- retired field names (#1375) ----
     //
-    // provider_key `secret`→`api_key` and mcp_server / a2a_agent
-    // `display_name`→`name`: the generated schema must accept both
-    // spellings (documents a control plane wrote before 1.8.0 can still
-    // carry the former names), require at least one, and keep rejecting
-    // unknown fields. A document carrying both spellings passes the
-    // schema and is rejected by serde's duplicate-field check — that
-    // split is pinned by the loader tests in `aisix-etcd`.
+    // provider_key `secret` (now `api_key`) and `display_name` on
+    // mcp_server, a2a_agent and passthrough_route (now `name`) are refused
+    // by both the write contract and the read schema: a document carrying
+    // only the old name is missing a required field.
 
     #[test]
-    fn provider_key_accepts_both_credential_spellings() {
-        validate_provider_key(&json!({"display_name": "x", "api_key": "sk-x"})).unwrap();
-        validate_provider_key(&json!({"display_name": "x", "secret": "sk-x"})).unwrap();
+    fn retired_field_names_are_refused_on_both_paths() {
+        let route = |label: &str| {
+            json!({
+                label: "r",
+                "path_prefix": "/passthrough/x",
+                "target_url": "https://erp.internal",
+                "provider_key_id": "11111111-1111-1111-1111-111111111111"
+            })
+        };
+        type V = fn(&Value) -> Result<(), SchemaError>;
+        let cases: [(&str, V, V, Value, Value); 4] = [
+            (
+                "provider_key",
+                validate_provider_key,
+                validate_provider_key_lenient,
+                json!({"display_name": "x", "api_key": "sk-x"}),
+                json!({"display_name": "x", "secret": "sk-x"}),
+            ),
+            (
+                "mcp_server",
+                validate_mcp_server,
+                validate_mcp_server_lenient,
+                json!({"name": "github", "url": "https://x/mcp"}),
+                json!({"display_name": "github", "url": "https://x/mcp"}),
+            ),
+            (
+                "a2a_agent",
+                validate_a2a_agent,
+                validate_a2a_agent_lenient,
+                json!({"name": "invoice", "url": "https://x/a2a"}),
+                json!({"display_name": "invoice", "url": "https://x/a2a"}),
+            ),
+            (
+                "passthrough_route",
+                validate_passthrough_route,
+                validate_passthrough_route_lenient,
+                route("name"),
+                route("display_name"),
+            ),
+        ];
+        for (kind, strict, lenient, canonical, retired) in cases {
+            strict(&canonical).unwrap_or_else(|e| panic!("{kind} strict: {e}"));
+            lenient(&canonical).unwrap_or_else(|e| panic!("{kind} lenient: {e}"));
+            assert!(
+                strict(&retired).is_err(),
+                "{kind}: strict accepted {retired}"
+            );
+            assert!(
+                lenient(&retired).is_err(),
+                "{kind}: lenient accepted {retired}"
+            );
+        }
     }
 
     #[test]
-    fn provider_key_requires_at_least_one_credential_spelling() {
-        assert!(validate_provider_key(&json!({"display_name": "x"})).is_err());
-    }
-
-    #[test]
-    fn provider_key_former_spelling_keeps_field_constraints() {
-        // The former property clones the canonical one, so `minLength: 1`
-        // keeps applying under either name.
+    fn provider_key_api_key_keeps_its_length_floor() {
         assert!(validate_provider_key(&json!({"display_name": "x", "api_key": ""})).is_err());
-        assert!(validate_provider_key(&json!({"display_name": "x", "secret": ""})).is_err());
-    }
-
-    #[test]
-    fn provider_key_schema_passes_document_with_both_spellings() {
-        // Schema-layer half of the both-spellings corner: `anyOf` admits
-        // the document; the serde layer rejects it as a duplicate field.
-        validate_provider_key(&json!({"display_name": "x", "api_key": "a", "secret": "b"}))
-            .unwrap();
-    }
-
-    #[test]
-    fn mcp_server_accepts_both_label_spellings() {
-        validate_mcp_server(&json!({"name": "github", "url": "https://x/mcp"})).unwrap();
-        validate_mcp_server(&json!({"display_name": "github", "url": "https://x/mcp"})).unwrap();
-        assert!(validate_mcp_server(&json!({"url": "https://x/mcp"})).is_err());
     }
 
     #[test]
@@ -5690,23 +5612,21 @@ mod tests {
         // A name is pasted into the `<server>__*` glob patterns every
         // name-form MCP grant, deny and anonymous ceiling is written as,
         // so `gh*` would reach `ghost`'s tools as well as its own.
-        for label in ["name", "display_name"] {
-            for bad in ["gh*", "*", "a*b", "*gh"] {
-                assert!(
-                    validate_mcp_server(&json!({label: bad, "url": "https://x/mcp"})).is_err(),
-                    "{label}: {bad} must be refused on the write path"
-                );
-            }
-            // The shapes the pattern already refused, and one it never
-            // did — the tightening must not have moved either.
-            for bad in ["gh__ub", "gh_"] {
-                assert!(
-                    validate_mcp_server(&json!({label: bad, "url": "https://x/mcp"})).is_err(),
-                    "{label}: {bad} must stay refused"
-                );
-            }
-            validate_mcp_server(&json!({label: "gh_ub", "url": "https://x/mcp"})).unwrap();
+        for bad in ["gh*", "*", "a*b", "*gh"] {
+            assert!(
+                validate_mcp_server(&json!({"name": bad, "url": "https://x/mcp"})).is_err(),
+                "{bad} must be refused on the write path"
+            );
         }
+        // The shapes the pattern already refused, and one it never
+        // did — the tightening must not have moved either.
+        for bad in ["gh__ub", "gh_"] {
+            assert!(
+                validate_mcp_server(&json!({"name": bad, "url": "https://x/mcp"})).is_err(),
+                "{bad} must stay refused"
+            );
+        }
+        validate_mcp_server(&json!({"name": "gh_ub", "url": "https://x/mcp"})).unwrap();
     }
 
     #[test]
@@ -5734,16 +5654,9 @@ mod tests {
     }
 
     #[test]
-    fn a2a_agent_accepts_both_label_spellings() {
-        validate_a2a_agent(&json!({"name": "invoice", "url": "https://x/a2a"})).unwrap();
-        validate_a2a_agent(&json!({"display_name": "invoice", "url": "https://x/a2a"})).unwrap();
-        assert!(validate_a2a_agent(&json!({"url": "https://x/a2a"})).is_err());
-    }
-
-    #[test]
     fn schema_error_for_missing_name_does_not_echo_the_document() {
-        // The renamed-field `anyOf` sits at the document root, and an
-        // unmasked anyOf failure message interpolates the entire failing
+        // A missing required field fails at the document root, and an
+        // unmasked root failure message can interpolate the entire failing
         // instance — which for these resources can carry a live upstream
         // credential. `validate` masks instance values, so a name-less
         // document's error must not echo its `secret`.
@@ -5759,30 +5672,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn renamed_field_acceptance_keeps_unknown_fields_rejected() {
-        // The dual-name transform must not loosen `additionalProperties`.
-        assert!(
-            validate_provider_key(&json!({"display_name": "x", "api_key": "k", "rogue": 1}))
-                .is_err()
-        );
-        assert!(validate_mcp_server(
-            &json!({"name": "github", "url": "https://x/mcp", "rogue": 1})
-        )
-        .is_err());
-        assert!(validate_a2a_agent(
-            &json!({"name": "invoice", "url": "https://x/a2a", "rogue": 1})
-        )
-        .is_err());
-    }
-
     // ---- mcp_server schema tests (#666 timeout_ms guard) ----
 
     #[test]
     fn mcp_server_minimal_passes() {
         // `timeout_ms` is optional; omitting it must validate.
         let v = json!({
-            "display_name": "github",
+            "name": "github",
             "url": "https://api.example.com/mcp"
         });
         validate_mcp_server(&v).unwrap();
@@ -5791,7 +5687,7 @@ mod tests {
     #[test]
     fn mcp_server_accepts_positive_timeout_ms() {
         let v = json!({
-            "display_name": "github",
+            "name": "github",
             "url": "https://api.example.com/mcp",
             "timeout_ms": 1
         });
@@ -5801,7 +5697,7 @@ mod tests {
     #[test]
     fn mcp_server_accepts_api_key_auth() {
         let v = json!({
-            "display_name": "github",
+            "name": "github",
             "url": "https://api.example.com/mcp",
             "auth_type": "api_key",
             "secret": "k-123"
@@ -5812,7 +5708,7 @@ mod tests {
     #[test]
     fn mcp_server_accepts_oauth2_auth_with_client_fields() {
         let v = json!({
-            "display_name": "github",
+            "name": "github",
             "url": "https://api.example.com/mcp",
             "auth_type": "oauth2",
             "secret": "client-secret",
@@ -5827,7 +5723,7 @@ mod tests {
     fn mcp_server_rejects_unknown_auth_type_and_bad_scopes_shape() {
         // The `auth_type` set is closed: near-misses like `oauth` must fail.
         let v = json!({
-            "display_name": "x",
+            "name": "x",
             "url": "https://x/mcp",
             "auth_type": "oauth"
         });
@@ -5835,7 +5731,7 @@ mod tests {
 
         // `scopes` is an array of strings, not a single space-joined string.
         let v = json!({
-            "display_name": "x",
+            "name": "x",
             "url": "https://x/mcp",
             "auth_type": "oauth2",
             "secret": "s",
@@ -5860,7 +5756,7 @@ mod tests {
         // rejected row is named in `GET /status/config`'s `rejected` array,
         // whereas a loaded-but-degraded server silently serves no tools.
         let v = json!({
-            "display_name": "x",
+            "name": "x",
             "url": "https://x/mcp",
             "auth_type": "oauth2"
         });
@@ -5868,7 +5764,7 @@ mod tests {
 
         // The complete set still validates.
         let v = json!({
-            "display_name": "x",
+            "name": "x",
             "url": "https://x/mcp",
             "auth_type": "oauth2",
             "secret": "cs",
@@ -6366,7 +6262,7 @@ mod tests {
         // drops the server from `tools/list`; reject it at the schema layer
         // (enforced on both the Admin write-path and the etcd loader).
         let v = json!({
-            "display_name": "github",
+            "name": "github",
             "url": "https://api.example.com/mcp",
             "timeout_ms": 0
         });

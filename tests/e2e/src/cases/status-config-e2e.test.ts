@@ -104,7 +104,7 @@ describe("status/config: etcd watch source", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "status-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

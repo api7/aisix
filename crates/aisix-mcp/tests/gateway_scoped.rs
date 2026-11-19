@@ -114,7 +114,7 @@ async fn serve(app: axum::Router) -> SocketAddr {
 /// Build a snapshot resource entry for an upstream at `addr`.
 fn mcp_entry(id: &str, name: &str, addr: &SocketAddr, enabled: bool) -> ResourceEntry<McpServer> {
     let server: McpServer = serde_json::from_value(serde_json::json!({
-        "display_name": name,
+        "name": name,
         "url": format!("http://{addr}/mcp"),
         "enabled": enabled
     }))

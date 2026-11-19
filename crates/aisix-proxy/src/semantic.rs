@@ -1785,7 +1785,7 @@ mod tests {
         .unwrap();
         let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
             "display_name": "embed-key",
-            "secret": "sk-embed",
+            "api_key": "sk-embed",
             "api_base": "http://127.0.0.1:1",
             "provider": "openai",
             "adapter": "openai",

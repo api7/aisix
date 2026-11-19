@@ -118,7 +118,7 @@ describe("group-referencing model conditions e2e (AISIX-Cloud#1267)", () => {
     if (!seed) throw new Error("seed client not initialized");
     const pk = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const m = await seed.createModel({
@@ -184,7 +184,7 @@ describe("group-referencing model conditions e2e (AISIX-Cloud#1267)", () => {
     upstreams.push(sse);
     const sPk = await seed.createProviderKey({
       display_name: "m-1267-s-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${sse.baseUrl}/v1`,
     });
     await seed.createModel({

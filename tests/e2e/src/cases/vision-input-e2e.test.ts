@@ -91,7 +91,7 @@ describe("vision input e2e: OpenAI-native image content blocks pass through to u
 
     const pk = await seed.createProviderKey({
       display_name: "vision-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

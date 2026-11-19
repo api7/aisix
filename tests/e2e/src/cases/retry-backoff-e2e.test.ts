@@ -56,7 +56,7 @@ describe("retry backoff e2e: same-target retries wait before re-hitting upstream
 
     const pk = await seed.createProviderKey({
       display_name: "retry-backoff-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

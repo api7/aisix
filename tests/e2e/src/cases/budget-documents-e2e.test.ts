@@ -115,7 +115,7 @@ describe("budgets pushed as documents decide requests locally", () => {
     seed = new SeedClient(etcd, app.etcdPrefix);
 
     const pk = (name: string, up: OpenAiUpstream) =>
-      seed!.createProviderKey({ display_name: name, secret: "sk-mock", api_base: `${up.baseUrl}/v1` });
+      seed!.createProviderKey({ display_name: name, api_key: "sk-mock", api_base: `${up.baseUrl}/v1` });
     const pkA = await pk("bd-pk-a", upA);
     const pkB = await pk("bd-pk-b", upB);
     const pkOut1 = await pk("bd-pk-out-1", upA);

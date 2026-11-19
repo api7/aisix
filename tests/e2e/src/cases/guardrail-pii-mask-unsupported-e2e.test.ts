@@ -163,7 +163,7 @@ describe("a pii mask rule where content cannot be rewritten is reported, not sil
     const pk = async (name: string, up: OpenAiUpstream, extra: Record<string, unknown> = {}) =>
       seed.createProviderKey({
         display_name: name,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${up.baseUrl}/v1`,
         ...extra,
       });
@@ -171,13 +171,13 @@ describe("a pii mask rule where content cannot be rewritten is reported, not sil
     const streamPk = await pk("pmu-stream-pk", streamUp);
     const videoPk = await seed.createProviderKey({
       display_name: "pmu-video-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: videoUp.baseUrl,
       provider: "alibaba",
     });
     const realtimePk = await seed.createProviderKey({
       display_name: "pmu-realtime-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `http://127.0.0.1:${realtime.port}/v1`,
     });
     const model = (display_name: string, provider_key_id: string, provider: string, model_name: string) =>

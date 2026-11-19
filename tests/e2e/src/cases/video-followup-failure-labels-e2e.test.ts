@@ -105,7 +105,7 @@ describe("failure labels on the routes that resolve their model mid-request", ()
     const seedVideoModel = async (name: string, apiBase: string, extra: Record<string, unknown> = {}) => {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: apiBase,
         provider: "zhipuai",
       });
@@ -128,7 +128,7 @@ describe("failure labels on the routes that resolve their model mid-request", ()
 
     const realtimePk = await seed.createProviderKey({
       display_name: `${REALTIME_MODEL}-pk`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: refusing.baseUrl,
       provider: "openai",
     });
@@ -147,7 +147,7 @@ describe("failure labels on the routes that resolve their model mid-request", ()
     });
     const noProtocolPk = await seed.createProviderKey({
       display_name: `${REALTIME_NO_PROTOCOL}-pk`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: refusing.baseUrl,
       provider: "anthropic",
       adapter: "anthropic",
@@ -164,7 +164,7 @@ describe("failure labels on the routes that resolve their model mid-request", ()
     const sessionPort = (sessionUpstream.address() as { port: number }).port;
     const sessionPk = await seed.createProviderKey({
       display_name: "followup-session-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `http://127.0.0.1:${sessionPort}/v1`,
       provider: "openai",
     });

@@ -188,7 +188,7 @@ describe("jobs e2e: /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720)", () =
 
     const pk = await seed.createProviderKey({
       display_name: "jobs-e2e-pk",
-      secret: "sk-upstream-jobs",
+      api_key: "sk-upstream-jobs",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -202,7 +202,7 @@ describe("jobs e2e: /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720)", () =
     // with a gateway-owned name — see the header test below.
     const hdrPk = await seed.createProviderKey({
       display_name: "jobs-e2e-hdr-pk",
-      secret: "sk-upstream-jobs",
+      api_key: "sk-upstream-jobs",
       api_base: `${upstream.baseUrl}/v1`,
       request: {
         default_headers: {

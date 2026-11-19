@@ -87,7 +87,7 @@ describe("embedding failure logs keep the upstream's echo of the prompt out", ()
 
     const pk = await seed.createProviderKey({
       display_name: "redaction-chat-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const chatModel = (name: string) =>
@@ -110,7 +110,7 @@ describe("embedding failure logs keep the upstream's echo of the prompt out", ()
     servers.push(echo, titan);
     const echoPk = await seed.createProviderKey({
       display_name: "redaction-echo-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `http://127.0.0.1:${await listen(echo)}/v1`,
     });
     await seed.createModel({
@@ -124,7 +124,7 @@ describe("embedding failure logs keep the upstream's echo of the prompt out", ()
       display_name: "redaction-titan-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({
+      api_key: JSON.stringify({
         access_key_id: "AKIA-redaction-e2e",
         secret_access_key: "sk-redaction-e2e",
         region: "us-west-2",

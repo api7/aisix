@@ -84,7 +84,7 @@ describe("streamed ensemble with stream_options", () => {
     const seed = new SeedClient(etcd, app.etcdPrefix);
     const pk = await seed.createProviderKey({
       display_name: "ens-stream-options-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `http://127.0.0.1:${addr.port}/v1`,
     });
     for (const [display, upstreamModel] of [

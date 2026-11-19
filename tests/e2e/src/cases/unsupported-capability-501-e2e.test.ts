@@ -58,7 +58,7 @@ describe("unsupported capability e2e: an adapter that lacks the operation answer
 
     const pk = await seed.createProviderKey({
       display_name: "capability-gap-pk",
-      secret: "sk-anthropic-mock",
+      api_key: "sk-anthropic-mock",
       api_base: upstream.baseUrl,
       provider: "anthropic",
       adapter: "anthropic",

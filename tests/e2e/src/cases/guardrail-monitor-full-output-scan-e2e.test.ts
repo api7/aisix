@@ -238,7 +238,7 @@ describe("monitor-mode output guardrail scans all of a streamed response", () =>
       const display = `late-${route.name}`;
       const pk = await seed.createProviderKey({
         display_name: `${display}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: route.provider === "anthropic" ? upstream.baseUrl : `${upstream.baseUrl}/v1`,
         ...(route.apis ? { apis: route.apis } : {}),
       });

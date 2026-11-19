@@ -862,7 +862,7 @@ mod tests {
 
     fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+            r#"{{"display_name":"openai-up","api_key":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
@@ -873,7 +873,7 @@ mod tests {
     /// attribution fields stamped via `usage_attr::apply_pk_telemetry`.
     fn provider_key_entry_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-images-key"}}}}"#
+            r#"{{"display_name":"openai-up","api_key":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-images-key"}}}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)

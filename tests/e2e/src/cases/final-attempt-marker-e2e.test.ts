@@ -188,7 +188,7 @@ describe("is_final_attempt marks the one last row of a request", () => {
     const modelAt = async (name: string, base: string) => {
       const pk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${base}/v1`,
       });
       await seed.createModel({
@@ -291,7 +291,7 @@ describe("is_final_attempt marks the one last row of a request", () => {
     });
     mcp = await startMcpUpstream("fmmcp");
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "fmmcp",
+      name: "fmmcp",
       url: mcp.url,
       enabled: true,
     });

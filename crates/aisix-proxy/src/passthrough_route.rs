@@ -7616,7 +7616,7 @@ mod tests {
 
     fn provider_key_entry(api_base_unused: &str) -> ResourceEntry<ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-upstream","api_base":"{api_base_unused}","provider":"openai","adapter":"openai"}}"#
+            r#"{{"display_name":"openai-up","api_key":"sk-upstream","api_base":"{api_base_unused}","provider":"openai","adapter":"openai"}}"#
         );
         let pk: ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
@@ -10974,7 +10974,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
             .await;
 
         let snap = AisixSnapshot::new();
-        let pk_json = r#"{"display_name":"openai-up","secret":"sk-upstream","api_base":"http://unused",
+        let pk_json = r#"{"display_name":"openai-up","api_key":"sk-upstream","api_base":"http://unused",
                  "provider":"openai","adapter":"openai","strip_headers":[]}"#;
         let pk: ProviderKey = serde_json::from_str(pk_json).unwrap();
         snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
@@ -11223,7 +11223,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
         // the glob firing. Without one in the strip set, a passthrough
         // route forwards it by default whatever the patterns say — an
         // assertion that proves nothing about this rule.
-        let pk_json = r#"{"display_name":"openai-up","secret":"sk-upstream",
+        let pk_json = r#"{"display_name":"openai-up","api_key":"sk-upstream",
              "api_base":"http://unused","provider":"openai","adapter":"openai",
              "strip_headers":["authorization","x-api-key","x-gw-key","x-end-user",
                               "x-stripped-control"]}"#;

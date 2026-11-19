@@ -245,7 +245,7 @@ describe("usage operation e2e (AISIX-Cloud#1461)", () => {
       ) => {
         const pk = await seed.createProviderKey({
           display_name: `${name}-pk`,
-          secret: PROVIDER_SECRET,
+          api_key: PROVIDER_SECRET,
           api_base: apiBase,
           provider,
         });

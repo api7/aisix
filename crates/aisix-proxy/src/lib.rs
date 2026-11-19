@@ -1696,7 +1696,7 @@ mod tests {
 
     fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let cfg = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-upstream","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+            r#"{{"display_name":"openai-up","api_key":"sk-upstream","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&cfg).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
@@ -6776,7 +6776,7 @@ data: [DONE]\n\n";
 
     fn pk_entry_with_id(pk_id: &str, api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let cfg = format!(
-            r#"{{"display_name":"openai-{pk_id}","secret":"sk-upstream","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+            r#"{{"display_name":"openai-{pk_id}","api_key":"sk-upstream","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&cfg).unwrap();
         ResourceEntry::new(pk_id, pk, 1)
@@ -11000,7 +11000,7 @@ data: [DONE]\n\n";
         adapter: &str,
     ) -> ResourceEntry<aisix_core::ProviderKey> {
         let cfg = format!(
-            r#"{{"display_name":"matrix-up","secret":"{secret}","api_base":"{api_base}","provider":"{provider}","adapter":"{adapter}"}}"#
+            r#"{{"display_name":"matrix-up","api_key":"{secret}","api_base":"{api_base}","provider":"{provider}","adapter":"{adapter}"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&cfg).unwrap();
         ResourceEntry::new(id, pk, 1)

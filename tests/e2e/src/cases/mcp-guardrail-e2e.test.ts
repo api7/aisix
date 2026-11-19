@@ -102,12 +102,12 @@ describe("mcp guardrails e2e: /mcp", () => {
 
     const alphaId = randomUUID();
     await seed.update("mcp_servers", alphaId, {
-      display_name: "alpha",
+      name: "alpha",
       url: alpha.url,
       enabled: true,
     });
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "beta",
+      name: "beta",
       url: beta.url,
       enabled: true,
     });

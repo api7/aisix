@@ -132,7 +132,7 @@ describe("cache-hit latency is never reported as unmeasured", () => {
     });
     const pk = await seed.createProviderKey({
       display_name: "latency-floor-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

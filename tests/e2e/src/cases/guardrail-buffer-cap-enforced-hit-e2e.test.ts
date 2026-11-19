@@ -250,7 +250,7 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
       upstreams.push(upstream);
       const pk = await seed.createProviderKey({
         display_name: `${display}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: provider === "openai" ? `${upstream.baseUrl}/v1` : upstream.baseUrl,
         ...(provider === "anthropic" ? { provider: "anthropic", adapter: "anthropic" } : {}),
         ...pkExtra,
@@ -299,7 +299,7 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
     upstreams.push(tailUp);
     const tailPk = await seed.createProviderKey({
       display_name: "cap-tail-backing-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${tailUp.baseUrl}/v1`,
     });
     const tailRoute = await seed.createPassthroughRoute({
@@ -325,7 +325,7 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
     upstreams.push(completeFrameUp);
     const completeFramePk = await seed.createProviderKey({
       display_name: "cap-complete-frame-backing-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${completeFrameUp.baseUrl}/v1`,
     });
     const completeFrameRoute = await seed.createPassthroughRoute({
@@ -339,7 +339,7 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
     upstreams.push(cumulativeTailUp);
     const cumulativeTailPk = await seed.createProviderKey({
       display_name: "cap-cumulative-tail-backing-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${cumulativeTailUp.baseUrl}/v1`,
     });
     const cumulativeTailRoute = await seed.createPassthroughRoute({

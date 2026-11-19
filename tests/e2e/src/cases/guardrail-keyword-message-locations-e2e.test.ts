@@ -60,7 +60,7 @@ describe("guardrail keyword e2e: blocks forbidden literal in any message role", 
 
     const pk = await seed.createProviderKey({
       display_name: "gr-loc-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

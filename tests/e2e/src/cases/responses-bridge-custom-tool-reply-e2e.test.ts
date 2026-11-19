@@ -252,7 +252,7 @@ describe("bridged custom tool calls come back as custom_tool_call items", () => 
     ] as const) {
       const pk = await seed.createProviderKey({
         display_name: `${model}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
         apis: {},
       });
@@ -266,7 +266,7 @@ describe("bridged custom tool calls come back as custom_tool_call items", () => 
 
     const noUsagePk = await seed.createProviderKey({
       display_name: "custom-tool-no-usage-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${noUsageUpstream.baseUrl}/v1`,
     });
     for (const model of ["custom-tool-no-usage", "custom-tool-no-usage-cached"]) {

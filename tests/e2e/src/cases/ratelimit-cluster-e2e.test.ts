@@ -180,7 +180,7 @@ async function seed(etcdRoot: string, upstreamBase: string, model: string) {
   const seed = new SeedClient(new EtcdClient(), etcdRoot);
   const pk = await seed.createProviderKey({
     display_name: `${model}-pk`,
-    secret: "sk-mock",
+    api_key: "sk-mock",
     api_base: `${upstreamBase}/v1`,
   });
   await seed.createModel({
@@ -332,7 +332,7 @@ describe("passthrough SSE concurrency is shared and renewed across Redis replica
     const seed = new SeedClient(new EtcdClient(), prefix);
     const providerKey = await seed.createProviderKey({
       display_name: "rl-cluster-passthrough-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: "http://unused-on-passthrough-route",
     });
     await seed.createPassthroughRoute({
@@ -535,7 +535,7 @@ describe("passthrough 502 SSE concurrency is shared through delayed EOF (#1737)"
     const seed = new SeedClient(new EtcdClient(), prefix);
     const providerKey = await seed.createProviderKey({
       display_name: "rl-cluster-passthrough-502-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: "http://unused-on-passthrough-route",
     });
     await seed.createPassthroughRoute({
@@ -864,7 +864,7 @@ async function seedGenerousLimit(
   const seed = new SeedClient(new EtcdClient(), etcdRoot);
   const pk = await seed.createProviderKey({
     display_name: `${model}-pk`,
-    secret: "sk-mock",
+    api_key: "sk-mock",
     api_base: `${upstreamBase}/v1`,
   });
   await seed.createModel({

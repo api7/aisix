@@ -153,7 +153,7 @@ describe("streaming transcription usage emission (#1138)", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "issue1138-pk",
-      secret: "sk-openai-mock",
+      api_key: "sk-openai-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

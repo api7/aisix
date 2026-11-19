@@ -287,7 +287,7 @@ describe("upstream TTFT stops on the first streamed frame", () => {
     if (!seed) throw new Error("seed client not initialized");
     const pk = await seed.createProviderKey({
       display_name: `${displayName}-pk`,
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     const modelName = {

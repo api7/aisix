@@ -104,7 +104,7 @@ async fn forward(endpoint: &Endpoint, body: &str, overrides: Value) -> String {
 
     let snapshot = AisixSnapshot::new();
     let pk: ProviderKey = serde_json::from_value(json!({
-        "display_name": "native-upstream", "secret": "test-upstream-credential",
+        "display_name": "native-upstream", "api_key": "test-upstream-credential",
         "api_base": upstream.uri(), "provider": endpoint.provider,
         "adapter": endpoint.provider, "request": overrides
     }))

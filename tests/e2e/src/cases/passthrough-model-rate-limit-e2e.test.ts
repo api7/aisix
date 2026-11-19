@@ -90,7 +90,7 @@ describe("passthrough e2e: body-model rate limiting on the raw tunnel", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "pt-rl-alibaba-pk",
-      secret: "sk-mock-dashscope",
+      api_key: "sk-mock-dashscope",
       api_base: upstream.baseUrl,
       provider: "alibaba",
     });

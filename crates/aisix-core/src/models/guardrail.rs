@@ -912,15 +912,10 @@ pub struct SemanticConfig {
     /// transcription and translation do run both); `/a2a` also resolves no
     /// model and no MCP server, so only a row attached at the
     /// environment, API-key or team scope reaches it at all.
-    // Defaulted at the TYPE level and required by the strict write schema
-    // instead, for the reason `embedding_model` gives: rows written before
-    // the field was required carry no key at all, and a row the loader
-    // cannot deserialize is skipped whole — a screening row that vanishes
-    // is a guardrail that stopped screening, which is fail-OPEN on a
-    // security control. The default keeps the historical value rather than
-    // a lowered one, because those rows enforce it today and changing what
-    // they enforce without the operator asking would be a worse surprise;
-    // see `default_semantic_threshold`.
+    // Defaulted at the TYPE level only so that a direction with no
+    // example list may omit its key; both the write and the read schema
+    // require it whenever `deny_examples` is non-empty, so the default is
+    // never what an enforced direction screens at.
     #[serde(default = "default_semantic_threshold")]
     #[schemars(range(min = -1.0, max = 1.0))]
     pub deny_threshold: f32,
@@ -969,15 +964,9 @@ pub struct SemanticConfig {
     pub output_fail_open: bool,
 }
 
-/// Read-path only. The strict write schema requires each threshold
-/// alongside its example list, so nothing an operator saves today lands
-/// here — this exists for rows written before that requirement, which
-/// enforce 0.75 and must go on enforcing it until the control plane's
-/// backfill rewrites them. The value can go in the release that re-runs that
-/// backfill with the floor past the last control plane that accepted a
-/// populated example list without its threshold (v0.13.0; v1.0.0 requires it).
-/// The field stays defaulted, because a direction with no example list still
-/// omits its key.
+/// Fills only a direction with no example list, where no score is compared
+/// against it: both schemas require each threshold beside its own non-empty
+/// example list, and reject a row that leaves one out.
 fn default_semantic_threshold() -> f32 {
     0.75
 }

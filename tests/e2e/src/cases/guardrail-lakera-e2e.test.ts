@@ -158,7 +158,7 @@ describe("lakera guardrail e2e: injection blocks, PII-only masks, 5xx fail-open"
 
     const pk = await seed.createProviderKey({
       display_name: "lakera-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

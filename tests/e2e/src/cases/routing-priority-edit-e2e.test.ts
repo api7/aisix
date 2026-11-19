@@ -79,12 +79,12 @@ describe("routing live-edit: swapping target priorities shifts real traffic (#19
 
     const pkA = await seed.createProviderKey({
       display_name: "wre-a-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstreamA.baseUrl}/v1`,
     });
     const pkB = await seed.createProviderKey({
       display_name: "wre-b-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstreamB.baseUrl}/v1`,
     });
     await seed.createModel({

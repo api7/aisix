@@ -107,12 +107,12 @@ describe("fallback edge cases e2e", () => {
 
     const badPk = await seed.createProviderKey({
       display_name: "fb-edges-400-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${badRequestUpstream.baseUrl}/v1`,
     });
     const goodPk = await seed.createProviderKey({
       display_name: "fb-edges-400-good-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${goodUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -235,12 +235,12 @@ describe("fallback edge cases e2e", () => {
 
     const pk1 = await seed.createProviderKey({
       display_name: "fb-edges-allfail-1-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${bad1.baseUrl}/v1`,
     });
     const pk2 = await seed.createProviderKey({
       display_name: "fb-edges-allfail-2-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${bad2.baseUrl}/v1`,
     });
     await seed.createModel({

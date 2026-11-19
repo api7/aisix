@@ -140,7 +140,7 @@ describe("exporter endpoints accept plain http on any host", () => {
     });
     const pk = await seed.createProviderKey({
       display_name: "plain-http-endpoint-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

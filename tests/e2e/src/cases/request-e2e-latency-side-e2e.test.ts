@@ -149,7 +149,7 @@ describe("aisix_request_e2e_latency_seconds splits each request by side", () => 
       if (c.upstream !== null) upstreams.push(up);
       const pk = await seed.createProviderKey({
         display_name: `${c.name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         provider: c.provider,
         api_base: c.provider === "anthropic" ? up.baseUrl : `${up.baseUrl}/v1`,
       });
@@ -177,7 +177,7 @@ describe("aisix_request_e2e_latency_seconds splits each request by side", () => 
       upstreams.push(failing, serving);
       failingUpstreams.set(g.name, failing);
       for (const [member, up] of [[`${g.name}-fails`, failing], [`${g.name}-serves`, serving]] as const) {
-        const pk = await seed.createProviderKey({ display_name: `${member}-pk`, secret: "sk-mock", api_base: `${up.baseUrl}/v1` });
+        const pk = await seed.createProviderKey({ display_name: `${member}-pk`, api_key: "sk-mock", api_base: `${up.baseUrl}/v1` });
         await seed.createModel({ display_name: member, provider: "openai", model_name: "gpt-4o-mini", provider_key_id: pk.id });
       }
       await seed.createModel({

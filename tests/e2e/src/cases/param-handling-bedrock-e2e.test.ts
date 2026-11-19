@@ -125,7 +125,7 @@ describe("Amazon Bedrock: request fields by the target's contract", () => {
       display_name: "param-bedrock-pk",
       provider: "bedrock",
       adapter: "bedrock",
-      secret: JSON.stringify({ access_key_id: "AKIA-param", secret_access_key: "sk-param", region: "us-east-1" }),
+      api_key: JSON.stringify({ access_key_id: "AKIA-param", secret_access_key: "sk-param", region: "us-east-1" }),
       api_base: `http://127.0.0.1:${addr.port}`,
     });
     const models: Array<[string, string]> = [

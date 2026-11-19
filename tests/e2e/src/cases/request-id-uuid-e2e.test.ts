@@ -58,7 +58,7 @@ describe("request id e2e: gateway-generated request IDs are UUIDs", () => {
 
     const chatPk = await seed.createProviderKey({
       display_name: "request-id-chat-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${chatUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -70,7 +70,7 @@ describe("request id e2e: gateway-generated request IDs are UUIDs", () => {
 
     const embeddingsPk = await seed.createProviderKey({
       display_name: "request-id-embeddings-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${embeddingsUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -82,7 +82,7 @@ describe("request id e2e: gateway-generated request IDs are UUIDs", () => {
 
     const messagesPk = await seed.createProviderKey({
       display_name: "request-id-messages-pk",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: messagesUpstream.baseUrl,
     });
     await seed.createModel({

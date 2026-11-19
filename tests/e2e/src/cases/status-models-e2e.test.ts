@@ -94,12 +94,12 @@ describe("status/models: etcd mode — equivalence with the admin endpoint", () 
 
     const failPk = await seed.createProviderKey({
       display_name: "status-models-401-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${authFailUpstream.baseUrl}/v1`,
     });
     const stablePk = await seed.createProviderKey({
       display_name: "status-models-stable-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${stableUpstream.baseUrl}/v1`,
     });
     authFailModelID = (

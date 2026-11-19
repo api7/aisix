@@ -328,7 +328,7 @@ describe("held-back stream raw-byte bound", () => {
       const u = await upstream(events, opts.raw ?? false);
       const pk = await seed.createProviderKey({
         display_name: `${display}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: provider === "openai" ? `${u.baseUrl}/v1` : u.baseUrl,
         ...opts.pk,
       });

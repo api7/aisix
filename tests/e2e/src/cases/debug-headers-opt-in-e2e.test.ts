@@ -87,7 +87,7 @@ describe.each([
 
     const pk = await seed.createProviderKey({
       display_name: "dh-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -98,7 +98,7 @@ describe.each([
     });
     const embedPk = await seed.createProviderKey({
       display_name: "dh-embed-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${embed.baseUrl}/v1`,
     });
     await seed.createModel({

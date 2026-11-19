@@ -252,7 +252,7 @@ describe("/v1/responses context affinity through model groups", () => {
       (
         await seed!.createProviderKey({
           display_name: `pk-${account}`,
-          secret: account,
+          api_key: account,
           api_base: upstream!.baseUrl,
           ...extra,
         })

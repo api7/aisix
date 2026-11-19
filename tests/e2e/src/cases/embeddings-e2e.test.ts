@@ -110,7 +110,7 @@ describe("embeddings e2e: /v1/embeddings dispatch + response passthrough", () =>
 
     const pk = await seed.createProviderKey({
       display_name: "emb-array-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -202,7 +202,7 @@ describe("embeddings e2e: /v1/embeddings dispatch + response passthrough", () =>
 
     const pk = await seed.createProviderKey({
       display_name: "emb-single-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

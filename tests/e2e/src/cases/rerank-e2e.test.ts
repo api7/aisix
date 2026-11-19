@@ -86,7 +86,7 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "rerank-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -221,7 +221,7 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
     const cohereSecret = "sk-cohere-mock-e2e";
     const coherePk = await seed.createProviderKey({
       display_name: "rerank-cohere-pk",
-      secret: cohereSecret,
+      api_key: cohereSecret,
       // The bare host, as Cohere's own default base is written.
       api_base: upstream.baseUrl,
     });
@@ -344,7 +344,7 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
     const jinaSecret = "jina_mock_secret_e2e";
     const jinaPk = await seed.createProviderKey({
       display_name: "rerank-jina-pk",
-      secret: jinaSecret,
+      api_key: jinaSecret,
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -453,7 +453,7 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
     // /v1/rerank). #212 covers the e2e gap on this contract.
     const nonOaPk = await seed.createProviderKey({
       display_name: "rerank-anthropic-pk",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({

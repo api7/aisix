@@ -1003,7 +1003,7 @@ mod tests {
             Some("https://api.typesafe.ai/v1/systemone"),
         ] {
             let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
-                "display_name": "ts", "secret": "k", "provider": "typesafe", "api_base": base,
+                "display_name": "ts", "api_key": "k", "provider": "typesafe", "api_base": base,
             }))
             .unwrap();
             assert_eq!(
@@ -1073,7 +1073,7 @@ mod tests {
         let snap = aisix_core::AisixSnapshot::new();
         let pk: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
             "display_name": "foundry",
-            "secret": secret,
+            "api_key": secret,
             "api_base": format!("{}/api/projects/p1", server.uri()),
             "provider": "azure",
             "adapter": "azure-openai",

@@ -107,7 +107,7 @@ describe("anthropic /v1/messages streaming usage telemetry (#245)", () => {
     // streaming branch (the one #245 fixes), not the translated path.
     const pk = await seed.createProviderKey({
       display_name: "anth-stream-usage-pk",
-      secret: "sk-anth-mock",
+      api_key: "sk-anth-mock",
       api_base: upstream.baseUrl,
     });
     await seed.createModel({

@@ -209,7 +209,7 @@ describe("aliyun guardrail e2e: upstream RequestId is preserved and correlatable
 
     const benignPk = await seed.createProviderKey({
       display_name: "aliyun-reqid-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${benignUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -221,7 +221,7 @@ describe("aliyun guardrail e2e: upstream RequestId is preserved and correlatable
 
     const streamPk = await seed.createProviderKey({
       display_name: "aliyun-reqid-stream-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -233,7 +233,7 @@ describe("aliyun guardrail e2e: upstream RequestId is preserved and correlatable
 
     const anthropicPk = await seed.createProviderKey({
       display_name: "aliyun-reqid-msg-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: anthropicStreamUpstream.baseUrl,
     });
     await seed.createModel({

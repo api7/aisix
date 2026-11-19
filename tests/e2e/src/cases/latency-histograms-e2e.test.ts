@@ -132,7 +132,7 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "histo-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -143,7 +143,7 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
     });
     const streamPk = await seed.createProviderKey({
       display_name: "histo-stream-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -154,7 +154,7 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
     });
     const responsesNativePk = await seed.createProviderKey({
       display_name: "histo-responses-native-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${responsesNativeUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -167,7 +167,7 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
       display_name: "histo-responses-bridge-pk",
       provider: "deepseek",
       adapter: "openai",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${responsesBridgeUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -178,7 +178,7 @@ describe("latency histograms e2e: bucketed TTFT + e2e latency (#1011)", () => {
     });
     const failPk = await seed.createProviderKey({
       display_name: "histo-fail-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${failUpstream.baseUrl}/v1`,
     });
     await seed.createModel({

@@ -200,7 +200,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
 
     const pk = await seed.createProviderKey({
       display_name: "gem-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -212,7 +212,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
 
     const leakyPk = await seed.createProviderKey({
       display_name: "gem-leaky-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${leaky.baseUrl}/v1`,
     });
     const leakyModel = await seed.createModel({
@@ -225,7 +225,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
     // A classifier the gateway cannot reach, under a `fail` policy.
     const typesafe = await seed.createProviderKey({
       display_name: "gem-typesafe-pk",
-      secret: "ts-mock",
+      api_key: "ts-mock",
       provider: "typesafe",
       adapter: undefined,
       api_base: "http://127.0.0.1:9",
@@ -264,7 +264,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
     await seed.attachGuardrailToModel(outputGuard.id, leakyModel.id);
     const leakyResponsesPk = await seed.createProviderKey({
       display_name: "gem-leaky-responses-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${leakyResponses.baseUrl}/v1`,
     });
     const leakyResponsesModel = await seed.createModel({
@@ -280,7 +280,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
     // provider with no native Responses API) and a passthrough route.
     const leakyStreamPk = await seed.createProviderKey({
       display_name: "gem-leaky-stream-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${leakyStream.baseUrl}/v1`,
     });
     const leakyStreamModel = await seed.createModel({
@@ -297,7 +297,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
     ] as const) {
       const leakyPk = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstreamUrl}/v1`,
       });
       const m = await seed.createModel({
@@ -312,7 +312,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
     // The Anthropic-native /v1/messages passthrough stream.
     const anthropicPk = await seed.createProviderKey({
       display_name: "gem-leaky-anthropic-pk",
-      secret: "sk-ant-mock",
+      api_key: "sk-ant-mock",
       provider: "anthropic",
       adapter: "anthropic",
       api_base: leakyAnthropic.baseUrl,
@@ -326,7 +326,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
     await seed.attachGuardrailToModel(outputGuard.id, anthropicModel.id);
     const bridgedPk = await seed.createProviderKey({
       display_name: "gem-leaky-bridged-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${leakyStream.baseUrl}/v1`,
       provider: "deepseek",
       adapter: "openai",
@@ -353,7 +353,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
 
     const realtimePk = await seed.createProviderKey({
       display_name: "gem-realtime-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `http://127.0.0.1:${realtime.port}/v1`,
     });
     await seed.createModel({
@@ -371,7 +371,7 @@ describe("gateway-side failures name themselves on the usage event", () => {
       enabled: true,
     });
     await seed.update("mcp_servers", randomUUID(), {
-      display_name: "gemmcp",
+      name: "gemmcp",
       url: mcp.url,
       enabled: true,
     });

@@ -75,7 +75,7 @@ describe("output guardrail e2e: model-emitted forbidden text is blocked before r
 
     const pk = await seed.createProviderKey({
       display_name: "gr-out-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -117,7 +117,7 @@ describe("output guardrail e2e: model-emitted forbidden text is blocked before r
     });
     const streamPk = await seed.createProviderKey({
       display_name: "gr-out-stream-e2e-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${streamUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -350,7 +350,7 @@ describe("output guardrail e2e: model-emitted forbidden text is blocked before r
     });
     const cleanPk = await seed.createProviderKey({
       display_name: "gr-out-stream-clean-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${cleanUpstream.baseUrl}/v1`,
     });
     await seed.createModel({

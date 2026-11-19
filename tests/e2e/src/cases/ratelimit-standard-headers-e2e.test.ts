@@ -131,7 +131,7 @@ describe("rate limit e2e: standard 429 headers", () => {
 
     const fastPk = await seed.createProviderKey({
       display_name: "rlh-fast-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${fastUpstream.baseUrl}/v1`,
     });
     await seed.createModel({
@@ -142,7 +142,7 @@ describe("rate limit e2e: standard 429 headers", () => {
     });
     const slowPk = await seed.createProviderKey({
       display_name: "rlh-slow-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${slowUpstream.baseUrl}/v1`,
     });
     await seed.createModel({

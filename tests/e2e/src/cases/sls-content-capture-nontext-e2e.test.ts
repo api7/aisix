@@ -154,7 +154,7 @@ describe("sls content capture e2e (#700): embeddings / rerank / images / audio",
       const seed = async (name: string, modelName: string, upstream: OpenAiUpstream) => {
         const pk = await seedClient.createProviderKey({
           display_name: `${name}-pk`,
-          secret: PROVIDER_SECRET,
+          api_key: PROVIDER_SECRET,
           api_base: `${upstream.baseUrl}/v1`,
         });
         await seedClient.createModel({

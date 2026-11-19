@@ -279,7 +279,7 @@ describe("a window-mode output guardrail holds a streamed response it cannot rel
         upstreams.push(upstream);
         const pk = await seed.createProviderKey({
           display_name: `${modelName(r.slug, v)}-pk`,
-          secret: "sk-mock",
+          api_key: "sk-mock",
           api_base: r.provider === "openai" ? `${upstream.baseUrl}/v1` : upstream.baseUrl,
           ...(r.provider === "anthropic" ? { provider: "anthropic", adapter: "anthropic" } : {}),
           ...r.pk,
@@ -304,7 +304,7 @@ describe("a window-mode output guardrail holds a streamed response it cannot rel
       passthroughUpstreams.set(name, upstream);
       const providerKey = await seed.createProviderKey({
         display_name: `${name}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       const route = await seed.createPassthroughRoute({

@@ -260,7 +260,7 @@ describe("Model Group dispatch on the single-shot endpoints (AISIX-Cloud#1111)",
     // The videos surface appends `/v1/videos` to the key's base itself;
     // every other endpoint takes a `/v1` base.
     const pk = async (name: string, base: string) =>
-      (await seed.createProviderKey({ display_name: name, secret: "sk-mock", api_base: base })).id;
+      (await seed.createProviderKey({ display_name: name, api_key: "sk-mock", api_base: base })).id;
     const badPk = await pk("grp-bad-pk", `${bad.baseUrl}/v1`);
     const okPk = await pk("grp-ok-pk", `${ok.baseUrl}/v1`);
     const badVideoPk = await pk("grp-bad-video-pk", bad.baseUrl);

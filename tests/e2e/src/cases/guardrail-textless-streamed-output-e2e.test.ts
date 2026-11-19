@@ -212,7 +212,7 @@ describe("output guardrails decide a response with no text", () => {
         const display = `${route.name}-${variant}`;
         const pk = await seed.createProviderKey({
           display_name: `${display}-pk`,
-          secret: "sk-mock",
+          api_key: "sk-mock",
           api_base: route.provider === "anthropic" ? upstream.baseUrl : `${upstream.baseUrl}/v1`,
           ...(route.apis ? { apis: route.apis } : {}),
         });
@@ -234,7 +234,7 @@ describe("output guardrails decide a response with no text", () => {
     upstreams.push(failing);
     const failingPk = await seed.createProviderKey({
       display_name: "messages-native-failed-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: failing.baseUrl,
     });
     const failingModel = await seed.createModel({
@@ -262,7 +262,7 @@ describe("output guardrails decide a response with no text", () => {
     upstreams.push(failedResponses);
     const failedPk = await seed.createProviderKey({
       display_name: "responses-native-failed-pk",
-      secret: "sk-mock",
+      api_key: "sk-mock",
       api_base: `${failedResponses.baseUrl}/v1`,
     });
     const failedModel = await seed.createModel({
@@ -296,7 +296,7 @@ describe("output guardrails decide a response with no text", () => {
       upstreams.push(upstream);
       const pk = await seed.createProviderKey({
         display_name: `${display}-pk`,
-        secret: "sk-mock",
+        api_key: "sk-mock",
         api_base: `${upstream.baseUrl}/v1`,
       });
       const model = await seed.createModel({

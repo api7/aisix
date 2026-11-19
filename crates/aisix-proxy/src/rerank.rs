@@ -1088,7 +1088,7 @@ mod tests {
 
     fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+            r#"{{"display_name":"openai-up","api_key":"sk-test","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
@@ -1106,7 +1106,7 @@ mod tests {
     /// shows. Reuses `PK_ID` so the rerank model fixtures still reference it.
     fn provider_key_entry_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-rerank-key"}}}}"#
+            r#"{{"display_name":"openai-up","api_key":"sk-test","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-rerank-key"}}}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
@@ -1126,7 +1126,7 @@ mod tests {
     /// overrides reach the rerank upstream body + headers.
     fn provider_key_entry_overrides(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}","provider":"openai","adapter":"openai","request":{{"default_body_fields":{{"safe_flag":true}},"default_headers":{{"x-custom":"trace-on"}}}}}}"#
+            r#"{{"display_name":"openai-up","api_key":"sk-test","api_base":"{api_base}","provider":"openai","adapter":"openai","request":{{"default_body_fields":{{"safe_flag":true}},"default_headers":{{"x-custom":"trace-on"}}}}}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
@@ -1264,7 +1264,7 @@ mod tests {
 
         let snap = AisixSnapshot::new();
         let pk_json = format!(
-            r#"{{"display_name":"cohere-up","secret":"sk-cohere-mock","api_base":"{}","provider":"cohere","adapter":"openai"}}"#,
+            r#"{{"display_name":"cohere-up","api_key":"sk-cohere-mock","api_base":"{}","provider":"cohere","adapter":"openai"}}"#,
             upstream.uri()
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
@@ -1408,7 +1408,7 @@ mod tests {
         // The gateway's `build_openai_url` produces `/v1/rerank` correctly
         // for both `https://api.jina.ai` and `https://api.jina.ai/v1`.
         let pk_json = format!(
-            r#"{{"display_name":"jina-up","secret":"jina_mock_secret","api_base":"{}","provider":"jina"}}"#,
+            r#"{{"display_name":"jina-up","api_key":"jina_mock_secret","api_base":"{}","provider":"jina"}}"#,
             upstream.uri()
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
@@ -1483,7 +1483,7 @@ mod tests {
         // Cohere's API base form: bare host. Rerank goes to the native
         // `/v2/rerank` under it.
         let pk_json = format!(
-            r#"{{"display_name":"cohere-up","secret":"sk-cohere-mock","api_base":"{}","provider":"cohere","adapter":"openai"}}"#,
+            r#"{{"display_name":"cohere-up","api_key":"sk-cohere-mock","api_base":"{}","provider":"cohere","adapter":"openai"}}"#,
             upstream.uri()
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
