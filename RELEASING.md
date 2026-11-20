@@ -12,7 +12,8 @@ git push origin vX.Y.Z
 Pushing the tag triggers two workflows:
 
 - **`docker-image.yml`** builds and publishes
-  `ghcr.io/api7/aisix:X.Y.Z` (plus `:latest` and `:sha-<short>`; a version
+  `ghcr.io/api7/aisix:X.Y.Z` (plus `:sha-<short>`, and `:latest` when
+  `X.Y.Z` is the highest stable tag — an older line's patch leaves it; a version
   tag is published in full only, with no `:X.Y` or `:X` abbreviation),
   mirrors the release tag to `docker.io/api7/aisix` for private/offline
   deployments, signs the images with cosign, and stamps the version into the

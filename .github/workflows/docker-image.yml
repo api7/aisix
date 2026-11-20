@@ -5,7 +5,9 @@ name: docker-image
 # Tag strategy. Every push always carries a :sha-<shortsha> tag for
 # traceability; the other tags layer on top based on the trigger:
 #   - push to main              → :dev + :sha-<shortsha>
-#   - push tag vX.Y.Z           → :X.Y.Z + :latest + :sha-<shortsha>
+#   - push tag vX.Y.Z           → :X.Y.Z + :sha-<shortsha>, plus :latest only
+#                                 when it is the highest stable vX.Y.Z tag (a
+#                                 patch on an older line leaves :latest alone)
 #   - push tag vX.Y.Z-rc.N      → :X.Y.Z-rc.N + :sha-<shortsha>  (NO :latest)
 #   - workflow_dispatch         → on main or a tag ref: :sha-<shortsha> +
 #                                 optional tag input; on any other ref ONLY
@@ -122,9 +124,9 @@ jobs:
           profile=thin
           case "$GITHUB_REF" in
             # Stable release tag only: `-rc.N` (and any other pre-release
-            # suffix) keeps the single-compile path. Same predicate the
-            # :latest tag guard uses, so the PGO'd image and :latest never
-            # disagree.
+            # suffix) keeps the single-compile path. Every :latest image is
+            # therefore PGO'd; an older line's stable patch is PGO'd too but
+            # does not move :latest.
             refs/tags/v*)
               profile=release
               case "$GITHUB_REF_NAME" in
@@ -221,6 +223,16 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
+      - name: Decide whether this tag moves :latest
+        id: latestrel
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          value="$(git ls-remote --tags --refs origin 'refs/tags/v*' \
+            | sed 's#.*refs/tags/##' | scripts/is-latest-release.sh "$GITHUB_REF_NAME")"
+          echo "${GITHUB_REF_NAME} moves :latest: ${value}"
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+
       - name: Compute tags + labels
         id: meta
         uses: docker/metadata-action@v6
@@ -232,13 +244,16 @@ jobs:
             ${{ startsWith(github.ref, 'refs/tags/v') && format('{0}/{1}', secrets.DOCKER_REGISTRY, env.IMAGE_NAME) || '' }}
           # A version tag publishes the full version only — no
           # {{major}}.{{minor}} / {{major}} abbreviations, see the tag strategy
-          # at the top. `latest` is guarded on `!contains(ref_name, '-')` so a
-          # `-rc.N` tag cannot move it.
+          # at the top. `latest` follows "Decide whether this tag moves
+          # :latest" only; the flavor's automatic `latest` (on by default for
+          # every stable semver tag) is turned off so it cannot bypass that.
+          flavor: |
+            latest=false
           tags: |
             type=raw,value=dev,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
             type=sha,prefix=sha-,format=short,enable=${{ steps.shortsha.outputs.scratch != 'true' }}
             type=semver,pattern={{version}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ steps.latestrel.outputs.value == 'true' }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' && steps.shortsha.outputs.scratch != 'true' }}
             type=raw,value=ci-test-${{ steps.shortsha.outputs.value }},enable=${{ steps.shortsha.outputs.scratch == 'true' }}
           labels: |
@@ -571,14 +586,21 @@ jobs:
           echo "digests: $(ls | tr '\n' ' ')-> ${archs}"
           test "$archs" = "amd64,arm64"
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
       # Group the tag set by repository and create one manifest list per
       # repository from every digest the build job exported. The digest each
       # `create` pushed is recorded from its own metadata, never read back by
       # tag: a tag that already existed (`:latest`, `:dev`, a re-pushed
       # `sha-*`) can still resolve to the previous index right after the
-      # push, and every later check and signature would then be about that
-      # old index.
-      - name: Create manifest lists
+      # push, or to a concurrent run's index.
+      #
+      # That digest is signed at once — keyless (GitHub OIDC), same scheme
+      # as api7-ee-3-gateway — so the signature never depends on where a tag
+      # points afterwards. Signatures land in a sibling <registry>/api7/notary
+      # repo, so `cosign verify` must set COSIGN_REPOSITORY to the same value.
+      - name: Create and sign manifest lists
         working-directory: ${{ runner.temp }}/digests
         run: |
           set -euo pipefail
@@ -611,6 +633,11 @@ jobs:
             esac
             echo "${repo} -> ${digest}"
             echo "${repo} ${digest}" >> "$RUNNER_TEMP/index-digests.txt"
+            registry="${repo%%/*}"
+            echo "Signing ${repo}@${digest} (notary: ${registry}/api7/notary)"
+            COSIGN_REPOSITORY="${registry}/api7/notary" \
+              "$GITHUB_WORKSPACE"/scripts/registry-retry.sh \
+              cosign sign --yes --recursive "${repo}@${digest}" < /dev/null
           done
 
       # The gate this workflow exists for (AISIX-Cloud#903): a tag that lost
@@ -618,42 +645,36 @@ jobs:
       # green run, because the surviving leg publishes a perfectly valid
       # single-platform image.
       #
-      # Each tag must first resolve to the index this run created (retried,
-      # since a just-moved tag can briefly still serve the previous one); the
-      # platform check then reads that index by digest.
+      # A tag only this run publishes (a version tag, `ci-test-*`, a
+      # dispatch's extra tag) must resolve to the index this run created —
+      # retried, since a just-moved tag can briefly still serve the previous
+      # one — and is then checked by that digest. `sha-*`, `latest` and `dev`
+      # can legitimately be owned by a concurrent run in another concurrency
+      # group (a main push and a version tag on the same commit share
+      # `sha-*`), so they only have to resolve to a multi-arch index.
       - name: Verify every published tag is multi-arch
         run: |
           set -euo pipefail
           TAGS="$(cat "$RUNNER_TEMP/tagset/tags.txt")"
           for ref in $TAGS; do
             repo="${ref%:*}"
-            digest="$(awk -v r="$repo" '$1 == r { print $2 }' "$RUNNER_TEMP/index-digests.txt")"
-            test -n "$digest"
-            scripts/registry-retry.sh scripts/tag-resolves-to.sh "$ref" "$digest" \
-              || { echo "::error::${ref} never resolved to the index this run pushed (${digest})"; exit 1; }
-            platforms="$(scripts/registry-retry.sh docker buildx imagetools inspect --raw "${repo}@${digest}" \
+            case "${ref##*:}" in
+              sha-* | latest | dev)
+                target="$ref"
+                ;;
+              *)
+                digest="$(awk -v r="$repo" '$1 == r { print $2 }' "$RUNNER_TEMP/index-digests.txt")"
+                test -n "$digest"
+                scripts/registry-retry.sh scripts/tag-resolves-to.sh "$ref" "$digest" \
+                  || { echo "::error::${ref} never resolved to the index this run pushed (${digest})"; exit 1; }
+                target="${repo}@${digest}"
+                ;;
+            esac
+            platforms="$(scripts/registry-retry.sh docker buildx imagetools inspect --raw "$target" \
               | jq -r '[.manifests[].platform | .os + "/" + .architecture] | unique | join(",")')"
-            echo "${ref} -> ${digest} -> ${platforms}"
+            echo "${ref} -> ${target} -> ${platforms}"
             test "$platforms" = "linux/amd64,linux/arm64"
           done
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v3
-
-      # Keyless (GitHub OIDC) signature over the index digest each
-      # repository's `create` pushed, same scheme as api7-ee-3-gateway. Tags
-      # sharing a digest collapse to one signature; signatures land in a
-      # sibling <registry>/api7/notary repo, so `cosign verify` must set
-      # COSIGN_REPOSITORY to the same value.
-      - name: Sign images with cosign
-        run: |
-          set -euo pipefail
-          while read -r -u 3 repo digest; do
-            registry="${repo%%/*}"
-            echo "Signing ${repo}@${digest} (notary: ${registry}/api7/notary)"
-            COSIGN_REPOSITORY="${registry}/api7/notary" \
-              cosign sign --yes --recursive "${repo}@${digest}"
-          done 3< "$RUNNER_TEMP/index-digests.txt"
 
       - name: Check OpenAPI publishing secrets
         id: openapi-secrets
@@ -710,19 +731,21 @@ jobs:
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET }}
         run: |
+          set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           jq --arg version "$VERSION" '.info.version = $version' ./openapi.json > "openapi-${VERSION}.json"
           aws s3 cp "./openapi-${VERSION}.json" "s3://${S3_BUCKET}/ai-gateway/openapi-${VERSION}.json"
           PATHS="/ai-gateway/openapi-${VERSION}.json"
-          # A release candidate publishes its own version-pinned spec (QA reads
-          # it) but must leave `openapi-latest.json` on the last stable release.
-          case "$VERSION" in
-            *-*) echo "::notice::pre-release ${VERSION}: openapi-latest.json left untouched" ;;
-            *)
-              aws s3 cp "./openapi-${VERSION}.json" "s3://${S3_BUCKET}/ai-gateway/openapi-latest.json"
-              PATHS="$PATHS /ai-gateway/openapi-latest.json"
-              ;;
-          esac
+          # Every release tag publishes its own version-pinned spec (QA reads
+          # a candidate's); `openapi-latest.json` moves with :latest only.
+          latest="$(git ls-remote --tags --refs origin 'refs/tags/v*' \
+            | sed 's#.*refs/tags/##' | scripts/is-latest-release.sh "$GITHUB_REF_NAME")"
+          if [ "$latest" = true ]; then
+            aws s3 cp "./openapi-${VERSION}.json" "s3://${S3_BUCKET}/ai-gateway/openapi-latest.json"
+            PATHS="$PATHS /ai-gateway/openapi-latest.json"
+          else
+            echo "::notice::${GITHUB_REF_NAME} is not the highest stable release: openapi-latest.json left untouched"
+          fi
           echo "$PATHS" > .updated_openapi_files
 
       - name: Invalidate OpenAPI CloudFront paths
