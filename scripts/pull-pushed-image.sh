@@ -13,5 +13,5 @@ for i in $(seq 1 "$attempts"); do
     sleep "$delay"
   fi
 done
-echo "::error::${img} still not pullable after ${attempts} attempts; the pushed digest never became resolvable"
+echo "::error::${img} still not pullable after ${attempts} attempts (see the docker pull errors above)"
 exit 1
