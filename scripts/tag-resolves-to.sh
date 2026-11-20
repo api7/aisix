@@ -4,5 +4,5 @@
 # index the tag pointed at before the push.
 set -euo pipefail
 ref="$1" want="$2"
-got="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$ref" | jq -r .digest)"
+got="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$ref" | jq -r .digest)" || got=""
 [ "$got" = "$want" ] || { echo "${ref} resolves to ${got:-nothing}, expected ${want}" >&2; exit 1; }
