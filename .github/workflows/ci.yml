@@ -29,6 +29,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      # The :latest / openapi-latest.json decision docker-image.yml makes on
+      # a release tag, which no PR run can reach.
+      - name: Test the release-tag :latest comparison
+        run: scripts/is-latest-release-test.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
