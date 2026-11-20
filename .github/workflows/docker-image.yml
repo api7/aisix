@@ -223,16 +223,6 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Decide whether this tag moves :latest
-        id: latestrel
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          set -euo pipefail
-          value="$(git ls-remote --tags --refs origin 'refs/tags/v*' \
-            | sed 's#.*refs/tags/##' | scripts/is-latest-release.sh "$GITHUB_REF_NAME")"
-          echo "${GITHUB_REF_NAME} moves :latest: ${value}"
-          echo "value=$value" >> "$GITHUB_OUTPUT"
-
       - name: Compute tags + labels
         id: meta
         uses: docker/metadata-action@v6
@@ -244,8 +234,9 @@ jobs:
             ${{ startsWith(github.ref, 'refs/tags/v') && format('{0}/{1}', secrets.DOCKER_REGISTRY, env.IMAGE_NAME) || '' }}
           # A version tag publishes the full version only — no
           # {{major}}.{{minor}} / {{major}} abbreviations, see the tag strategy
-          # at the top. `latest` follows "Decide whether this tag moves
-          # :latest" only; the flavor's automatic `latest` (on by default for
+          # at the top. `latest` is not decided here: the merge job adds it
+          # right before tagging (see "Decide whether this tag moves :latest"
+          # there), and the flavor's automatic `latest` (on by default for
           # every stable semver tag) is turned off so it cannot bypass that.
           flavor: |
             latest=false
@@ -253,7 +244,6 @@ jobs:
             type=raw,value=dev,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
             type=sha,prefix=sha-,format=short,enable=${{ steps.shortsha.outputs.scratch != 'true' }}
             type=semver,pattern={{version}}
-            type=raw,value=latest,enable=${{ steps.latestrel.outputs.value == 'true' }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' && steps.shortsha.outputs.scratch != 'true' }}
             type=raw,value=ci-test-${{ steps.shortsha.outputs.value }},enable=${{ steps.shortsha.outputs.scratch == 'true' }}
           labels: |
@@ -586,6 +576,28 @@ jobs:
           echo "digests: $(ls | tr '\n' ' ')-> ${archs}"
           test "$archs" = "amd64,arm64"
 
+      # Decided here, immediately before tagging, rather than when the build
+      # started (a PGO build takes over an hour, and a higher tag can land
+      # meanwhile), and recomputed if this job is re-run. The OpenAPI step
+      # reuses this output so `:latest` and `openapi-latest.json` agree.
+      - name: Decide whether this tag moves :latest
+        id: latestrel
+        run: |
+          set -euo pipefail
+          value=false
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            value="$(git ls-remote --tags --refs origin 'refs/tags/v*' \
+              | sed 's#.*refs/tags/##' | scripts/is-latest-release.sh "$GITHUB_REF_NAME")"
+          fi
+          echo "${GITHUB_REF_NAME} moves :latest: ${value}"
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+          if [ "$value" = true ]; then
+            tagset="$RUNNER_TEMP/tagset/tags.txt"
+            for repo in $(sed 's/:[^:]*$//' "$tagset" | sort -u); do
+              echo "${repo}:latest" >> "$tagset"
+            done
+          fi
+
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
@@ -596,9 +608,9 @@ jobs:
       # `sha-*`) can still resolve to the previous index right after the
       # push, or to a concurrent run's index.
       #
-      # That digest is signed at once — keyless (GitHub OIDC), same scheme
-      # as api7-ee-3-gateway — so the signature never depends on where a tag
-      # points afterwards. Signatures land in a sibling <registry>/api7/notary
+      # Once every repository's index exists, each is signed by that digest —
+      # keyless (GitHub OIDC), same scheme as api7-ee-3-gateway — so the
+      # signature never depends on where a tag points afterwards. Signatures land in a sibling <registry>/api7/notary
       # repo, so `cosign verify` must set COSIGN_REPOSITORY to the same value.
       - name: Create and sign manifest lists
         working-directory: ${{ runner.temp }}/digests
@@ -633,12 +645,14 @@ jobs:
             esac
             echo "${repo} -> ${digest}"
             echo "${repo} ${digest}" >> "$RUNNER_TEMP/index-digests.txt"
+          done
+          while read -r -u 3 repo digest; do
             registry="${repo%%/*}"
             echo "Signing ${repo}@${digest} (notary: ${registry}/api7/notary)"
             COSIGN_REPOSITORY="${registry}/api7/notary" \
               "$GITHUB_WORKSPACE"/scripts/registry-retry.sh \
               cosign sign --yes --recursive "${repo}@${digest}" < /dev/null
-          done
+          done 3< "$RUNNER_TEMP/index-digests.txt"
 
       # The gate this workflow exists for (AISIX-Cloud#903): a tag that lost
       # an architecture is a broken release and is invisible in an otherwise
@@ -648,10 +662,11 @@ jobs:
       # A tag only this run publishes (a version tag, `ci-test-*`, a
       # dispatch's extra tag) must resolve to the index this run created —
       # retried, since a just-moved tag can briefly still serve the previous
-      # one — and is then checked by that digest. `sha-*`, `latest` and `dev`
-      # can legitimately be owned by a concurrent run in another concurrency
+      # one — and is then checked by that digest. The rolling pointers only
+      # have to resolve to a multi-arch index: `sha-*` and `latest` can
+      # legitimately be owned by a concurrent run in another concurrency
       # group (a main push and a version tag on the same commit share
-      # `sha-*`), so they only have to resolve to a multi-arch index.
+      # `sha-*`), and `dev` is held to the same rule as the other two.
       - name: Verify every published tag is multi-arch
         run: |
           set -euo pipefail
@@ -730,6 +745,7 @@ jobs:
         if: steps.openapi-secrets.outputs.enabled == 'true' && startsWith(github.ref, 'refs/tags/v')
         env:
           S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          LATEST: ${{ steps.latestrel.outputs.value }}
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
@@ -738,9 +754,7 @@ jobs:
           PATHS="/ai-gateway/openapi-${VERSION}.json"
           # Every release tag publishes its own version-pinned spec (QA reads
           # a candidate's); `openapi-latest.json` moves with :latest only.
-          latest="$(git ls-remote --tags --refs origin 'refs/tags/v*' \
-            | sed 's#.*refs/tags/##' | scripts/is-latest-release.sh "$GITHUB_REF_NAME")"
-          if [ "$latest" = true ]; then
+          if [ "$LATEST" = true ]; then
             aws s3 cp "./openapi-${VERSION}.json" "s3://${S3_BUCKET}/ai-gateway/openapi-latest.json"
             PATHS="$PATHS /ai-gateway/openapi-latest.json"
           else
