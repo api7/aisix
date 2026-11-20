@@ -360,7 +360,15 @@ impl AzureUpstreamRef {
             return Ok((String::new(), Some(format!("{scheme}{rest}"))));
         }
 
-        // Bare-resource shorthand (`acme-east` → canonical Azure URL).
+        // Bare-resource shorthand (`acme-east` → canonical Azure URL). A
+        // resource name has no dots, so a dotted value is a host pasted
+        // without its scheme.
+        if base.contains('.') {
+            return Err(BridgeError::InvalidUpstreamConfig(format!(
+                "azure api_base {base:?} has no scheme — write it as \
+                 https://<resource>.openai.azure.com, or give the bare resource name"
+            )));
+        }
         validate_url_token("resource name", base)?;
         Ok((base.to_string(), None))
     }
@@ -1351,9 +1359,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_dotted_resource_name() {
-        let err = AzureUpstreamRef::resolve("dep", Some("acme.east")).unwrap_err();
-        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
+    fn resolve_names_the_missing_scheme_of_a_dotted_api_base() {
+        for base in [
+            "acme.east",
+            "acme-east.openai.azure.com",
+            "proxy.acme.internal/azure",
+        ] {
+            let err = AzureUpstreamRef::resolve("dep", Some(base)).unwrap_err();
+            assert!(
+                matches!(&err, BridgeError::InvalidUpstreamConfig(m) if m.contains("has no scheme")),
+                "{base:?}: {err:?}"
+            );
+        }
     }
 
     #[test]
