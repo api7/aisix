@@ -426,8 +426,8 @@ fn validate_url_token(name: &str, value: &str) -> Result<(), BridgeError> {
 /// A deployment name is one path segment of
 /// `/openai/deployments/<deployment>/…`. Azure accepts dots in it
 /// (`gpt-4.1`, `gpt-5.6-sol`), so `.` is allowed alongside
-/// `[A-Za-z0-9_-]`; a name made only of dots is refused because it would
-/// resolve as a `.`/`..` segment and rewrite the path.
+/// `[A-Za-z0-9_-]`. A name made only of dots is refused on every route:
+/// `.` and `..` would resolve as dot segments and rewrite the path.
 fn validate_deployment_name(value: &str) -> Result<(), BridgeError> {
     if value.is_empty() {
         return Err(BridgeError::InvalidUpstreamConfig(
@@ -440,14 +440,14 @@ fn validate_deployment_name(value: &str) -> Result<(), BridgeError> {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
     {
         return Err(BridgeError::InvalidUpstreamConfig(format!(
-            "azure deployment name {value:?} contains URL-control characters — \
-             must match [A-Za-z0-9._-]+ (no spaces, slashes, query params, or hash)"
+            "azure deployment name {value:?} contains characters outside [A-Za-z0-9._-] — \
+             no spaces, slashes, `%`, query params, or hash"
         )));
     }
     if value.bytes().all(|b| b == b'.') {
         return Err(BridgeError::InvalidUpstreamConfig(format!(
-            "azure deployment name {value:?} is made only of dots — \
-             it would resolve as a relative path segment"
+            "azure deployment name {value:?} is made only of dots, \
+             which is not a valid deployment name"
         )));
     }
     Ok(())
@@ -1322,7 +1322,10 @@ mod tests {
         let err = AzureUpstreamRef::resolve("foo?api-version=evil", Some("acme-east")).unwrap_err();
         match err {
             BridgeError::InvalidUpstreamConfig(msg) => {
-                assert!(msg.contains("URL-control characters"), "got {msg}");
+                assert!(
+                    msg.contains("characters outside [A-Za-z0-9._-]"),
+                    "got {msg}"
+                );
             }
             other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
