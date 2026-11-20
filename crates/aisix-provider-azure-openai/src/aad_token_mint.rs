@@ -112,20 +112,20 @@ impl AadCredentials {
             ("tenant_id", &self.tenant_id),
             ("client_id", &self.client_id),
         ] {
-            if value.contains('/')
-                || value.contains('?')
-                || value.contains('#')
-                || value.contains(' ')
-                || value.contains('\t')
-                || value.contains('\n')
-                || value.contains('%')
-                || value.contains("..")
-                || value.bytes().all(|b| b == b'.')
+            if value.bytes().any(|b| {
+                matches!(b, b'/' | b'\\' | b'?' | b'#' | b'%' | b' ') || b.is_ascii_control()
+            }) || value.contains("..")
             {
                 return Err(BridgeError::InvalidUpstreamCredentials(format!(
                     "azure aad credentials.{name} {value:?} contains URL-control \
-                     characters — reject `/`, `?`, `#`, `%`, whitespace, `..`, \
-                     and a value of only dots"
+                     characters — reject `/`, `\\`, `?`, `#`, `%`, space, control \
+                     characters, and `..`"
+                )));
+            }
+            if value.bytes().all(|b| b == b'.') {
+                return Err(BridgeError::InvalidUpstreamCredentials(format!(
+                    "azure aad credentials.{name} {value:?} is made only of dots, \
+                     which is not a valid identifier"
                 )));
             }
         }
@@ -661,8 +661,16 @@ mod tests {
 
     #[test]
     fn tenant_and_client_id_refuse_dot_segments_and_percent() {
-        for (tenant_id, client_id) in [(".", "abc"), ("%2e%2e", "abc"), ("t", "."), ("t", "a%2Fb")]
-        {
+        for (tenant_id, client_id) in [
+            (".", "abc"),
+            ("%2e%2e", "abc"),
+            ("t", "."),
+            ("t", "a%2Fb"),
+            (".\\.", "abc"),
+            ("a\\b", "abc"),
+            ("t\r", "abc"),
+            ("t", "a\u{7f}"),
+        ] {
             let creds = AadCredentials {
                 tenant_id: tenant_id.into(),
                 client_id: client_id.into(),
@@ -670,7 +678,10 @@ mod tests {
                 authority_host: None,
             };
             assert!(
-                matches!(creds.validate(), Err(BridgeError::InvalidUpstreamCredentials(m)) if m.contains("URL-control")),
+                matches!(
+                    creds.validate(),
+                    Err(BridgeError::InvalidUpstreamCredentials(_))
+                ),
                 "{tenant_id:?}/{client_id:?} must be refused"
             );
         }

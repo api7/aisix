@@ -361,12 +361,17 @@ impl AzureUpstreamRef {
         }
 
         // Bare-resource shorthand (`acme-east` → canonical Azure URL). A
-        // resource name has no dots, so a dotted value is a host pasted
-        // without its scheme.
-        if base.contains('.') {
+        // resource name has no `.`, `:` or `/`, so a value with one is a URL
+        // with an unsupported scheme or a host pasted without one.
+        if base.contains(":/") {
+            return Err(BridgeError::InvalidUpstreamConfig(format!(
+                "azure api_base {base:?} must start with https:// (or http://)"
+            )));
+        }
+        if base.contains(['.', ':', '/']) {
             return Err(BridgeError::InvalidUpstreamConfig(format!(
                 "azure api_base {base:?} has no scheme — write it as \
-                 https://<resource>.openai.azure.com, or give the bare resource name"
+                 https://<host>, or give the bare resource name"
             )));
         }
         validate_url_token("resource name", base)?;
@@ -1359,15 +1364,28 @@ mod tests {
     }
 
     #[test]
-    fn resolve_names_the_missing_scheme_of_a_dotted_api_base() {
+    fn resolve_names_a_missing_or_unsupported_api_base_scheme() {
         for base in [
             "acme.east",
             "acme-east.openai.azure.com",
             "proxy.acme.internal/azure",
+            "azure-mock:8080",
+            "azure-mock/azure",
         ] {
             let err = AzureUpstreamRef::resolve("dep", Some(base)).unwrap_err();
             assert!(
                 matches!(&err, BridgeError::InvalidUpstreamConfig(m) if m.contains("has no scheme")),
+                "{base:?}: {err:?}"
+            );
+        }
+        for base in [
+            "ftp://proxy.acme.internal",
+            "wss://acme-east.openai.azure.com",
+            "https:/acme-east.openai.azure.com",
+        ] {
+            let err = AzureUpstreamRef::resolve("dep", Some(base)).unwrap_err();
+            assert!(
+                matches!(&err, BridgeError::InvalidUpstreamConfig(m) if m.contains("must start with https://")),
                 "{base:?}: {err:?}"
             );
         }

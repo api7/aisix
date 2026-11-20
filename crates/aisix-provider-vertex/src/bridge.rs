@@ -550,28 +550,29 @@ impl VertexSecret {
 /// safe to interpolate into the Vertex URL. GCP project ids are
 /// `[a-z][a-z0-9-]{4,28}[a-z0-9]`; region names are
 /// `[a-z]+[0-9]+(-[a-z])?`; model names are vendor-pinned strings.
-/// Reject `?`, `#`, `/`, `%`, whitespace, `..`, and a value made only of
-/// dots, so a malicious model_name can't redirect dispatch: `.`, `..` and
-/// their percent-encoded spellings resolve as dot segments.
+/// Reject `/`, `\\` (the URL parser reads it as `/`), `?`, `#`, `%`, space,
+/// any ASCII control character, `..`, and a value made only of dots, so a
+/// malicious value can't redirect dispatch: the region is part of the host,
+/// and `.`, `..` and their encoded spellings resolve as dot segments.
 fn validate_url_token(name: &str, value: &str) -> Result<(), BridgeError> {
     if value.is_empty() {
         return Err(BridgeError::Config(format!(
             "vertex {name} is empty (expected an identifier)"
         )));
     }
-    if value.contains('/')
-        || value.contains('?')
-        || value.contains('#')
-        || value.contains(' ')
-        || value.contains('\t')
-        || value.contains('\n')
-        || value.contains('%')
+    if value
+        .bytes()
+        .any(|b| matches!(b, b'/' | b'\\' | b'?' | b'#' | b'%' | b' ') || b.is_ascii_control())
         || value.contains("..")
-        || value.bytes().all(|b| b == b'.')
     {
         return Err(BridgeError::Config(format!(
             "vertex {name} {value:?} contains URL-control characters — \
-             reject `/`, `?`, `#`, `%`, whitespace, `..`, and a value of only dots"
+             reject `/`, `\\`, `?`, `#`, `%`, space, control characters, and `..`"
+        )));
+    }
+    if value.bytes().all(|b| b == b'.') {
+        return Err(BridgeError::Config(format!(
+            "vertex {name} {value:?} is made only of dots, which is not a valid identifier"
         )));
     }
     Ok(())
@@ -3951,6 +3952,12 @@ mod tests {
             ("project", "%2e%2e"),
             ("region", ".%2E"),
             ("upstream_id", "gemini%2Fadmin"),
+            ("project", ".\\."),
+            ("region", "evil.com\\"),
+            ("upstream_id", "gemini\\..\\admin"),
+            ("region", "us-central1\r"),
+            ("project", "p\u{7f}"),
+            ("upstream_id", "gemini\u{0}"),
         ] {
             assert!(
                 matches!(validate_url_token(name, value), Err(BridgeError::Config(_))),
