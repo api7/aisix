@@ -118,11 +118,14 @@ impl AadCredentials {
                 || value.contains(' ')
                 || value.contains('\t')
                 || value.contains('\n')
+                || value.contains('%')
                 || value.contains("..")
+                || value.bytes().all(|b| b == b'.')
             {
                 return Err(BridgeError::InvalidUpstreamCredentials(format!(
                     "azure aad credentials.{name} {value:?} contains URL-control \
-                     characters — reject `/`, `?`, `#`, whitespace, `..`"
+                     characters — reject `/`, `?`, `#`, `%`, whitespace, `..`, \
+                     and a value of only dots"
                 )));
             }
         }
@@ -654,6 +657,30 @@ mod tests {
             }
             other => panic!("expected InvalidUpstreamCredentials, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tenant_and_client_id_refuse_dot_segments_and_percent() {
+        for (tenant_id, client_id) in [(".", "abc"), ("%2e%2e", "abc"), ("t", "."), ("t", "a%2Fb")]
+        {
+            let creds = AadCredentials {
+                tenant_id: tenant_id.into(),
+                client_id: client_id.into(),
+                client_secret: "xyz".into(),
+                authority_host: None,
+            };
+            assert!(
+                matches!(creds.validate(), Err(BridgeError::InvalidUpstreamCredentials(m)) if m.contains("URL-control")),
+                "{tenant_id:?}/{client_id:?} must be refused"
+            );
+        }
+        let creds = AadCredentials {
+            tenant_id: "contoso.onmicrosoft.com".into(),
+            client_id: "11111111-1111-1111-1111-111111111111".into(),
+            client_secret: "xyz".into(),
+            authority_host: None,
+        };
+        creds.validate().unwrap();
     }
 
     // ─── authority_host production seam (ai-gateway#413 / #302 D6.6) ───

@@ -550,8 +550,9 @@ impl VertexSecret {
 /// safe to interpolate into the Vertex URL. GCP project ids are
 /// `[a-z][a-z0-9-]{4,28}[a-z0-9]`; region names are
 /// `[a-z]+[0-9]+(-[a-z])?`; model names are vendor-pinned strings.
-/// Reject `?`, `#`, `/`, whitespace, `..` so a malicious model_name
-/// can't redirect dispatch.
+/// Reject `?`, `#`, `/`, `%`, whitespace, `..`, and a value made only of
+/// dots, so a malicious model_name can't redirect dispatch: `.`, `..` and
+/// their percent-encoded spellings resolve as dot segments.
 fn validate_url_token(name: &str, value: &str) -> Result<(), BridgeError> {
     if value.is_empty() {
         return Err(BridgeError::Config(format!(
@@ -564,11 +565,13 @@ fn validate_url_token(name: &str, value: &str) -> Result<(), BridgeError> {
         || value.contains(' ')
         || value.contains('\t')
         || value.contains('\n')
+        || value.contains('%')
         || value.contains("..")
+        || value.bytes().all(|b| b == b'.')
     {
         return Err(BridgeError::Config(format!(
             "vertex {name} {value:?} contains URL-control characters — \
-             reject `/`, `?`, `#`, whitespace, `..`"
+             reject `/`, `?`, `#`, `%`, whitespace, `..`, and a value of only dots"
         )));
     }
     Ok(())
@@ -3938,6 +3941,22 @@ mod tests {
         // the reject set that banned `@` would break real Claude-on-
         // Vertex dispatch, so pin it here.
         validate_url_token("upstream_id", "claude-3-5-sonnet@20241022").unwrap();
+        validate_url_token("project", "example.com:my-proj").unwrap();
+    }
+
+    #[test]
+    fn validate_url_token_rejects_dot_segments_and_percent() {
+        for (name, value) in [
+            ("project", "."),
+            ("project", "%2e%2e"),
+            ("region", ".%2E"),
+            ("upstream_id", "gemini%2Fadmin"),
+        ] {
+            assert!(
+                matches!(validate_url_token(name, value), Err(BridgeError::Config(_))),
+                "{name}={value:?} must be refused"
+            );
+        }
     }
 
     #[test]
