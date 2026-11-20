@@ -288,6 +288,7 @@ jobs:
           set -eux
           VER="${GITHUB_REF_NAME#v}"
           IMG="${REGISTRY}/${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
+          .github/scripts/pull-pushed-image.sh "$IMG"
           docker run --rm --entrypoint /usr/local/bin/aisix "$IMG" --version | tee /tmp/aisix-version
           grep -qx "aisix ${VER}" /tmp/aisix-version
 
@@ -302,7 +303,7 @@ jobs:
         run: |
           set -eux
           IMG="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
-          docker pull "$IMG"
+          .github/scripts/pull-pushed-image.sh "$IMG"
           docker run --rm --entrypoint /usr/local/bin/aisix "$IMG" --version | tee /tmp/aisix-version
           test -n "$SHORT_SHA"
           grep -qxF "aisix dev+sha-${SHORT_SHA}" /tmp/aisix-version
@@ -327,7 +328,7 @@ jobs:
         run: |
           set -eux
           IMG="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
-          docker pull "$IMG"
+          .github/scripts/pull-pushed-image.sh "$IMG"
           docker run --rm --entrypoint cat "$IMG" /usr/local/share/aisix/pgo-verified.json \
             | tee /tmp/pgo-verified.json
           shapes="$(jq -r '.shapes | length' /tmp/pgo-verified.json)"
@@ -347,7 +348,7 @@ jobs:
         run: |
           set -eux
           IMAGE="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
-          docker pull "$IMAGE"
+          .github/scripts/pull-pushed-image.sh "$IMAGE"
           docker run -d --name smoke-etcd -p 2379:2379 ghcr.io/api7/etcd:v3.5.18 \
             etcd --listen-client-urls=http://0.0.0.0:2379 \
                  --advertise-client-urls=http://127.0.0.1:2379
@@ -404,7 +405,7 @@ jobs:
         run: |
           set -eux
           IMAGE="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
-          docker pull "$IMAGE"
+          .github/scripts/pull-pushed-image.sh "$IMAGE"
           test "$(docker inspect --format '{{.Config.User}}' "$IMAGE")" = "10001"
           mkdir -p /tmp/uid-smoke
           printf '_format_version: "2"\n' > /tmp/uid-smoke/resources.yaml
@@ -450,7 +451,7 @@ jobs:
         run: |
           set -eux
           IMAGE="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
-          docker pull "$IMAGE"
+          .github/scripts/pull-pushed-image.sh "$IMAGE"
           cid="$(docker create "$IMAGE")"
           docker cp "$cid:/usr/local/bin/aisix" /tmp/aisix-shipped
           docker rm "$cid"
