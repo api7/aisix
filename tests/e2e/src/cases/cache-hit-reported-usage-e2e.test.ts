@@ -121,13 +121,16 @@ describe("a redis cache hit estimates only the usage counts its upstream left ou
   let embed: { baseUrl: string; close(): Promise<void> } | undefined;
   const upstreams: OpenAiUpstream[] = [];
   let ready = false;
+  let vectorReady = false;
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
     if (!(await etcd.ping())) return;
     // The semantic layer on Redis needs the vector query engine (redis:8+,
-    // what CI provisions).
-    if ((await redisVectorSupport(REDIS_URL)) !== true) return;
+    // what CI provisions); the exact layer runs on any reachable Redis.
+    const vector = await redisVectorSupport(REDIS_URL);
+    if (vector === null) return;
+    vectorReady = vector;
 
     sls = await startMockSls();
     embed = await startEmbeddingMock();
@@ -165,6 +168,7 @@ describe("a redis cache hit estimates only the usage counts its upstream left ou
     // A non-OpenAI upstream model name, so the estimator's fallback
     // encoding applies.
     for (const [display, { usage, semantic }] of Object.entries(MODELS)) {
+      if (semantic && !vectorReady) continue;
       const upstream = await startOpenAiUpstream({ nonStreamBody: chatBody(usage) });
       upstreams.push(upstream);
       const pk = await seed.createProviderKey({
@@ -243,8 +247,10 @@ describe("a redis cache hit estimates only the usage counts its upstream left ou
   for (const layer of ["exact", "semantic"] as const) {
     const prefix = layer === "exact" ? "hit-exact" : "hit-sem";
 
+    const runs = () => ready && (layer === "exact" || vectorReady);
+
     test(`${layer} hit: a reported prompt_tokens 0 stands`, async (ctx) => {
-      if (!ready) return ctx.skip();
+      if (!runs()) return ctx.skip();
       const served = await hit(`${prefix}-zero`, layer);
       expect(served.usage.prompt_tokens).toBe(0);
       expect(served.usage.completion_tokens).toBe(OUT);
@@ -258,7 +264,7 @@ describe("a redis cache hit estimates only the usage counts its upstream left ou
     });
 
     test(`${layer} hit: a prompt_tokens left out is estimated`, async (ctx) => {
-      if (!ready) return ctx.skip();
+      if (!runs()) return ctx.skip();
       const served = await hit(`${prefix}-absent`, layer);
       const log = await record(served.requestId);
       expect(log.get("cache_status")).toBe("hit");

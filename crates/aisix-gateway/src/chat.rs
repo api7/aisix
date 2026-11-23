@@ -671,27 +671,26 @@ pub struct UsageStats {
     /// Audio / image breakdowns of the two sides, as the upstream reported
     /// them. Subsets, never added to a total.
     ///
-    /// Not serialized: a cached `ChatResponse` carries this type, and this
-    /// type denies unknown fields, so writing it would make every entry a
-    /// gateway release without the field shares the cache with (a rolling
-    /// upgrade, a rollback) unreadable. A cache hit reports none.
+    /// Not serialized, so it is not part of a cached `ChatResponse`: a hit
+    /// from an in-process store keeps it, a hit read back from Redis has
+    /// none. Serializing a field changes the cached form, which takes a bump
+    /// of `aisix_cache`'s entry-format version.
     #[serde(skip)]
     pub modality: ModalityTokens,
     /// The split of `cache_creation_tokens` and of `cache_write_tokens` by
     /// cache lifetime, as far as the upstream reported one: zeroing one of
-    /// those totals clears only its own pair. Not serialized, for the same
-    /// reason as `modality`.
+    /// those totals clears only its own pair. Not serialized, like
+    /// `modality`.
     #[serde(skip)]
     pub cache_creation_ttl: CacheCreationTtl,
     /// The OpenAI-shape `*_tokens_details` counters an upstream reported,
-    /// for the client-facing OpenAI projection only. Not serialized, for
-    /// the same reason as `modality`.
+    /// for the client-facing OpenAI projection only. Not serialized, like
+    /// `modality`.
     #[serde(skip)]
     pub openai_details: OpenAiUsageDetails,
     /// Which of the prompt and completion counts the upstream's usage
     /// carried, a reported `0` included. Serialized, unlike `modality`: a
-    /// cache hit estimates from it, so a cached entry must keep it. Adding it
-    /// changed the cached form, hence `aisix_cache`'s entry-format version.
+    /// cache hit estimates from it, so a cached entry must keep it.
     pub reported: ReportedCounts,
 }
 
@@ -1511,9 +1510,7 @@ pub struct ChatResponse {
     pub more_choices: Vec<ChatChoice>,
     pub usage: UsageStats,
     /// Not serialized: a cached response was served by no upstream, so a
-    /// cache hit reports no tier — and this type denies unknown fields, so
-    /// writing it would make every cache entry unreadable to a gateway
-    /// release without the field.
+    /// cache hit reports no tier.
     #[serde(skip)]
     pub service_tier: Option<ServiceTier>,
 }
