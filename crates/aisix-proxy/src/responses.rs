@@ -139,9 +139,12 @@ struct ResponseUsage {
     reached_end: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// Which of the two counts above the upstream reported.
+    usage_reported: aisix_gateway::ReportedCounts,
     /// True when any token counter was filled by the local estimator
     /// because the upstream reported no usage (AISIX-Cloud#1074).
     usage_estimated: bool,
+    estimated_counts: aisix_obs::EstimatedCounts,
     /// o1/o3/GPT-5 class models surface reasoning tokens as a
     /// subset of `completion_tokens` via
     /// `usage.output_tokens_details.reasoning_tokens`. Zero for
@@ -1741,7 +1744,7 @@ async fn responses_to_target(
             if usage.provider_request_id.is_empty() {
                 usage.provider_request_id = responses_sse_provider_request_id(&buf);
             }
-            if usage.prompt_tokens == 0 || usage.completion_tokens == 0 {
+            if usage.has_missing_count() {
                 let est = crate::token_estimate::Estimator::new(
                     &upstream_model,
                     crate::token_estimate::PromptInput::Responses(crate::util::outbound_value(
@@ -1763,9 +1766,8 @@ async fn responses_to_target(
                 )
                 .await;
                 if filled.estimated {
-                    usage.prompt_tokens = filled.prompt_tokens;
-                    usage.completion_tokens = filled.completion_tokens;
-                    usage.usage_estimated = true;
+                    usage.apply_estimate(&filled);
+                    buf = estimated_usage_into_sse(&buf, &filled);
                 }
             }
             crate::quota::commit_answered_attempt(
@@ -2168,7 +2170,7 @@ async fn responses_to_target(
             captured_content: None,
         })
     } else {
-        let json_body: Value =
+        let mut json_body: Value =
             crate::dispatch::json_body_within(upstream_resp, buffered_body_deadline)
                 .await
                 .and_then(|body| match responses_body_in_band_error(&body) {
@@ -2205,7 +2207,7 @@ async fn responses_to_target(
             if u.service_tier.is_none() {
                 u.service_tier = response_service_tier(&json_body);
             }
-            if u.prompt_tokens == 0 || u.completion_tokens == 0 {
+            if u.has_missing_count() {
                 let est = crate::token_estimate::Estimator::new(
                     &upstream_model,
                     crate::token_estimate::PromptInput::Responses(crate::util::outbound_value(
@@ -2227,9 +2229,8 @@ async fn responses_to_target(
                 )
                 .await;
                 if filled.estimated {
-                    u.prompt_tokens = filled.prompt_tokens;
-                    u.completion_tokens = filled.completion_tokens;
-                    u.usage_estimated = true;
+                    u.apply_estimate(&filled);
+                    estimated_usage_into_response(&mut json_body, &filled);
                 }
             }
             Some(u)
@@ -2247,7 +2248,6 @@ async fn responses_to_target(
         // configured output block isn't bypassable by calling /v1/responses
         // (the input half is enforced in `dispatch`). Only when an
         // output-hook guardrail is attached; otherwise this is a no-op.
-        let mut json_body = json_body;
         let mut output_seg_counts = crate::redact::RedactionCounts::new();
         let mut output_monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
         if aisix_guardrails::Guardrail::runs_on_output(chain) {
@@ -2645,6 +2645,8 @@ async fn responses_cross_provider_to_target(
                     reached_end: comp.reached_end,
                     prompt_tokens: comp.prompt_tokens,
                     completion_tokens: comp.completion_tokens,
+                    usage_reported: comp.usage_reported,
+                    estimated_counts: comp.estimated_counts,
                     reasoning_tokens: comp.reasoning_tokens,
                     cached_prompt_tokens: comp.cached_prompt_tokens,
                     cache_write_tokens: comp.cache_write_tokens,
@@ -2789,6 +2791,8 @@ async fn responses_cross_provider_to_target(
             reached_end: true,
             prompt_tokens: resp.usage.prompt_tokens,
             completion_tokens: resp.usage.completion_tokens,
+            usage_reported: resp.usage.reported,
+            estimated_counts: Default::default(),
             reasoning_tokens: resp.usage.reasoning_tokens,
             cached_prompt_tokens: resp.usage.cached_prompt_tokens,
             cache_write_tokens: resp.usage.cache_write_tokens,
@@ -2816,7 +2820,7 @@ async fn responses_cross_provider_to_target(
         // that with what the dashboard bills. The estimate is reported in
         // the ordinary usage shape — there is no client-facing marker
         // saying it was estimated.
-        if u.prompt_tokens == 0 || u.completion_tokens == 0 {
+        if u.has_missing_count() {
             let est = crate::token_estimate::Estimator::new(
                 model.upstream_model().unwrap_or("unknown"),
                 crate::token_estimate::PromptInput::Responses(body.clone()),
@@ -2836,13 +2840,11 @@ async fn responses_cross_provider_to_target(
             )
             .await;
             if filled.estimated {
-                u.prompt_tokens = filled.prompt_tokens;
-                u.completion_tokens = filled.completion_tokens;
-                u.usage_estimated = true;
+                u.apply_estimate(&filled);
                 resp.usage.prompt_tokens = filled.prompt_tokens;
                 resp.usage.completion_tokens = filled.completion_tokens;
-                // A total the upstream reported beside a zero sub-counter
-                // no longer adds up once that zero is filled; zeroing it
+                // A total the upstream reported beside a missing counter
+                // no longer adds up once that counter is filled; zeroing it
                 // makes the projection derive prompt + completion, the
                 // same arithmetic it uses when no total was reported.
                 resp.usage.total_tokens = 0;
@@ -2993,12 +2995,9 @@ async fn responses_cross_provider_to_target(
 /// #474). Spec:
 /// <https://platform.openai.com/docs/api-reference/responses/object>
 fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
-    let usage = body.get("usage")?;
-    let prompt_tokens = usage.get("input_tokens").and_then(|v| v.as_u64())? as u32;
-    let completion_tokens = usage
-        .get("output_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
+    let usage = body.get("usage").filter(|u| u.is_object())?;
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64).map(|n| n as u32);
+    let (prompt_tokens, completion_tokens) = (count("input_tokens"), count("output_tokens"));
     let reasoning_tokens = usage
         .get("output_tokens_details")
         .and_then(|d| d.get("reasoning_tokens"))
@@ -3021,9 +3020,14 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         // Parsed from a fully buffered response body, so by definition the
         // response was delivered in full.
         reached_end: true,
-        prompt_tokens,
-        completion_tokens,
+        prompt_tokens: prompt_tokens.unwrap_or(0),
+        completion_tokens: completion_tokens.unwrap_or(0),
+        usage_reported: aisix_gateway::ReportedCounts {
+            prompt: prompt_tokens.is_some(),
+            completion: completion_tokens.is_some(),
+        },
         usage_estimated: false,
+        estimated_counts: Default::default(),
         reasoning_tokens,
         cached_prompt_tokens,
         cache_write_tokens,
@@ -3050,6 +3054,48 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         provider_request_id: crate::usage_attr::provider_response_id(body),
         service_tier: response_service_tier(body),
         failure: None,
+    })
+}
+
+/// Write an estimate into the `usage` of a Response object the client reads,
+/// so it reports the counts its usage record carries: the counts the
+/// upstream reported stand, the ones it left out are filled, and the total
+/// is recomputed as input + output, since one reported beside a missing
+/// count does not add up once that count is filled.
+fn estimated_usage_into_response(response: &mut Value, filled: &crate::token_estimate::Filled) {
+    let Some(response) = response.as_object_mut() else {
+        return;
+    };
+    let usage = response
+        .entry("usage")
+        .or_insert_with(|| Value::Object(Default::default()));
+    if !usage.is_object() {
+        *usage = Value::Object(Default::default());
+    }
+    let Some(usage) = usage.as_object_mut() else {
+        return;
+    };
+    if filled.counts.prompt {
+        usage.insert("input_tokens".into(), filled.prompt_tokens.into());
+    }
+    if filled.counts.completion {
+        usage.insert("output_tokens".into(), filled.completion_tokens.into());
+    }
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let total = count("input_tokens") + count("output_tokens");
+    usage.insert("total_tokens".into(), total.into());
+}
+
+/// [`estimated_usage_into_response`] on the terminal event of a streamed
+/// Responses document; every other frame is left as the upstream sent it.
+fn estimated_usage_into_sse(buf: &[u8], filled: &crate::token_estimate::Filled) -> Vec<u8> {
+    crate::model_echo::splice_sse_buffer(buf, |payload| {
+        let mut event: Value = serde_json::from_slice(payload).ok()?;
+        if !is_terminal_response_event(&event) {
+            return None;
+        }
+        estimated_usage_into_response(event.get_mut("response")?, filled);
+        serde_json::to_vec(&event).ok()
     })
 }
 
@@ -3099,6 +3145,24 @@ fn is_terminal_response_event(json: &Value) -> bool {
 }
 
 impl ResponseUsage {
+    /// Whether the upstream left the prompt or the completion count out.
+    fn has_missing_count(&self) -> bool {
+        self.usage_reported
+            .prompt_tokens(self.prompt_tokens)
+            .is_none()
+            || self
+                .usage_reported
+                .completion_tokens(self.completion_tokens)
+                .is_none()
+    }
+
+    fn apply_estimate(&mut self, filled: &crate::token_estimate::Filled) {
+        self.prompt_tokens = filled.prompt_tokens;
+        self.completion_tokens = filled.completion_tokens;
+        self.usage_estimated = true;
+        self.estimated_counts = filled.counts;
+    }
+
     fn usage_stats(&self) -> aisix_gateway::UsageStats {
         aisix_gateway::UsageStats {
             cached_prompt_tokens: self.cached_prompt_tokens,
@@ -3110,6 +3174,7 @@ impl ResponseUsage {
             cache_read_tokens: self.cache_read_tokens,
             upstream_total_tokens: self.upstream_total_tokens,
             reasoning_folded_into_completion: self.reasoning_folded_into_completion,
+            reported: self.usage_reported,
             ..aisix_gateway::UsageStats::new(self.prompt_tokens, self.completion_tokens)
         }
     }
@@ -3143,13 +3208,17 @@ fn response_usage_charge(usage: &ResponseUsage) -> aisix_ratelimit::TokenCharge 
 /// ([`extract_response_usage`]), shared with passthrough routes relaying the
 /// same envelope.
 pub(crate) fn response_usage_stats(body: &Value) -> Option<aisix_gateway::UsageStats> {
-    extract_response_usage(body).map(|u| u.usage_stats())
+    extract_response_usage(body)
+        .filter(|u| u.usage_reported.prompt)
+        .map(|u| u.usage_stats())
 }
 
 /// This endpoint's reading of one streamed Responses event's usage
 /// ([`parse_responses_terminal_usage`]): only a terminal event reports it.
 pub(crate) fn responses_terminal_usage_stats(event: &Value) -> Option<aisix_gateway::UsageStats> {
-    parse_responses_terminal_usage(event).map(|u| u.usage_stats())
+    parse_responses_terminal_usage(event)
+        .filter(|u| u.usage_reported.prompt)
+        .map(|u| u.usage_stats())
 }
 
 /// Whether the buffered prefix contains at least one complete, parseable
@@ -3557,6 +3626,18 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
         }
     }
 
+    /// [`Self::count_ahead`], returning the count while leaving it for
+    /// [`Self::complete`]; `None` when nothing was estimated.
+    async fn counted_ahead(&mut self) -> Option<crate::token_estimate::Filled> {
+        let (_, usage, capture) = self.slot.as_ref()?;
+        let text = capture.as_ref().map_or("", SseTextCapture::text);
+        let revision = capture.as_ref().map_or(0, |c| c.revision);
+        self.estimate
+            .counted_ahead(responses_estimate_inputs(usage.as_ref(), text, revision))
+            .await
+            .filter(|filled| filled.estimated)
+    }
+
     /// Complete the stream once, from the count ahead when it still fits
     /// and otherwise counting inline (Drop cannot wait).
     fn complete(&mut self) {
@@ -3571,9 +3652,7 @@ impl<F: FnOnce(ResponseUsage, String, Vec<aisix_core::GuardrailMonitorHit>)>
             self.estimate
                 .fill(responses_estimate_inputs(Some(&usage), &out_text, revision));
         if let Some(filled) = filled.filter(|filled| filled.estimated) {
-            usage.prompt_tokens = filled.prompt_tokens;
-            usage.completion_tokens = filled.completion_tokens;
-            usage.usage_estimated = true;
+            usage.apply_estimate(&filled);
         }
         f(usage, out_text, hits);
     }
@@ -3588,8 +3667,9 @@ fn responses_estimate_inputs<'a>(
     revision: u32,
 ) -> crate::token_estimate::EstimateInputs<'a> {
     crate::token_estimate::EstimateInputs {
-        upstream_prompt: usage.map_or(0, |u| u.prompt_tokens),
-        upstream_completion: usage.map_or(0, |u| u.completion_tokens),
+        upstream_prompt: usage.and_then(|u| u.usage_reported.prompt_tokens(u.prompt_tokens)),
+        upstream_completion: usage
+            .and_then(|u| u.usage_reported.completion_tokens(u.completion_tokens)),
         output: Some(text),
         output_revision: revision,
     }
@@ -3733,8 +3813,12 @@ where
                     acc.downstream_latency_ms =
                         crate::attempt::measured_ms(started.elapsed());
                 }
+                // The terminal event reports the usage the record gets,
+                // estimate included, so it is counted before it is released.
                 if terminal {
-                    guard.count_ahead().await;
+                    if let Some(filled) = guard.counted_ahead().await {
+                        forward = estimated_usage_into_sse(&forward, &filled);
+                    }
                 }
                 yield Ok(bytes::Bytes::from(forward));
                 continue;
@@ -3785,7 +3869,7 @@ where
             buf.extend_from_slice(pad);
             let mut drained: Vec<u8> = Vec::new();
             let (usage_acc, capture) = guard.parts();
-            drain_responses_sse_frames(
+            let terminal = drain_responses_sse_frames(
                 &mut buf,
                 usage_acc,
                 capture,
@@ -3795,11 +3879,16 @@ where
                 &mark,
                 &mut drained,
             );
-            let tail = match drained.len().checked_sub(pad.len()) {
+            let mut tail = match drained.len().checked_sub(pad.len()) {
                 // Drop only the bytes this branch appended.
                 Some(n) if drained.ends_with(pad) => drained[..n].to_vec(),
                 _ => drained,
             };
+            if terminal {
+                if let Some(filled) = guard.counted_ahead().await {
+                    tail = estimated_usage_into_sse(&tail, &filled);
+                }
+            }
             let (usage_acc, _) = guard.parts();
             let acc = usage_acc.get_or_insert_with(Default::default);
             if acc.downstream_latency_ms == 0 {
@@ -4180,6 +4269,7 @@ fn emit_usage_event(
         cache_creation_tokens: usage.cache_creation_tokens,
         cache_read_tokens: usage.cache_read_tokens,
         usage_estimated: usage.usage_estimated,
+        estimated_counts: usage.estimated_counts,
         upstream_latency_ms: crate::attempt::measured_ms(elapsed),
         upstream_ttft_ms: usage.upstream_ttft_ms,
         downstream_latency_ms: usage.downstream_latency_ms,

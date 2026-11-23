@@ -1350,6 +1350,8 @@ impl Bridge for BedrockBridge {
                 // The upstream reports no total; the one above is the prompt
                 // count, filled for the client.
                 upstream_total_tokens: 0,
+                prompt_reported: matches!(source, EmbeddingUsageSource::Reported),
+                total_reported: false,
                 source,
             },
         })
@@ -2657,6 +2659,7 @@ fn converse_output_into_chat_response(
     let usage = resp
         .usage()
         .map(|u| UsageStats {
+            reported: aisix_gateway::ReportedCounts::BOTH,
             prompt_tokens: u.input_tokens().max(0) as u32,
             completion_tokens: u.output_tokens().max(0) as u32,
             total_tokens: u.total_tokens().max(0) as u32,
@@ -2914,6 +2917,7 @@ fn emit_converse_chunk(
                     delta: ChatDelta::default(),
                     finish_reason: None,
                     usage: Some(UsageStats {
+                        reported: aisix_gateway::ReportedCounts::BOTH,
                         prompt_tokens: u.input_tokens.max(0) as u32,
                         completion_tokens: u.output_tokens.max(0) as u32,
                         total_tokens: u.total_tokens.max(0) as u32,

@@ -63,7 +63,7 @@ pub use trace::{
     parse_traceparent, screen_tracestate, RemoteTraceContext, RequestTraceBundle, SpanEmit,
     SpanRole, TraceEmission, TRACEPARENT_HEADER, TRACESTATE_HEADER,
 };
-pub use usage::{InternalCallPurpose, UsageEvent, UsageSink};
+pub use usage::{EstimatedCounts, InternalCallPurpose, UsageEvent, UsageSink};
 pub use usage_delivery::UsageDeliveryHealth;
 
 #[derive(Debug, thiserror::Error)]

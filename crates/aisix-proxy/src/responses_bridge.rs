@@ -1865,32 +1865,51 @@ impl ResponsesSseEncoder {
     /// for a bridged stream whose upstream left them unreported. The
     /// internal usage record is filled from the same estimate, and a client
     /// reading `response.completed.usage` must not be told zero while the
-    /// record says otherwise (AISIX-Cloud#1074). Per counter, and only
-    /// into a zero: a number the upstream actually reported is never
-    /// overridden, and a frame that reported one counter and left the
-    /// other at zero still gets that zero filled — the record fills it
-    /// the same way, and the two must not disagree. A no-op once the
-    /// terminal event has gone out: the client must never be handed
-    /// numbers contradicting what it was already sent.
-    pub fn set_estimated_usage(&mut self, prompt_tokens: u32, completion_tokens: u32) {
+    /// record says otherwise (AISIX-Cloud#1074). Per counter: only the
+    /// counts the estimate filled, the ones the upstream left out, are
+    /// taken; a number the upstream reported, `0` included, stands. A
+    /// no-op once the terminal event has gone out: the client must never be
+    /// handed numbers contradicting what it was already sent.
+    pub fn set_estimated_usage(&mut self, filled: &crate::token_estimate::Filled) {
         if self.finished {
             return;
         }
-        let mut filled = false;
-        if self.prompt_tokens == 0 && prompt_tokens > 0 {
-            self.prompt_tokens = prompt_tokens;
-            filled = true;
+        self.adopt_estimate(filled);
+    }
+
+    fn adopt_estimate(&mut self, filled: &crate::token_estimate::Filled) {
+        if filled.counts.prompt {
+            self.prompt_tokens = filled.prompt_tokens;
         }
-        if self.completion_tokens == 0 && completion_tokens > 0 {
-            self.completion_tokens = completion_tokens;
-            filled = true;
+        if filled.counts.completion {
+            self.completion_tokens = filled.completion_tokens;
         }
-        if filled {
-            // A total the upstream reported beside a zero sub-counter no
+        if filled.estimated {
+            // A total the upstream reported beside a missing count no
             // longer describes what the client is about to be told.
             // Zeroing it makes the projection derive prompt + completion,
             // the same arithmetic it uses when no total was reported.
             self.total_tokens = 0;
+        }
+    }
+
+    /// [`Self::set_estimated_usage`] for the terminal event `events` holds,
+    /// built by the [`Self::next_events`] call that returned them and not yet
+    /// sent: its usage is rewritten with the estimate.
+    pub fn estimate_into_terminal(
+        &mut self,
+        events: &mut [ResponsesSseEvent],
+        filled: &crate::token_estimate::Filled,
+    ) {
+        self.adopt_estimate(filled);
+        let usage = self.usage_value();
+        for ev in events
+            .iter_mut()
+            .filter(|ev| matches!(ev.event_type, "response.completed" | "response.incomplete"))
+        {
+            if let Some(response) = ev.data.get_mut("response").and_then(Value::as_object_mut) {
+                response.insert("usage".to_string(), usage.clone());
+            }
         }
     }
 
@@ -2523,9 +2542,12 @@ pub struct ResponsesStreamCompletion {
     /// wants full content (bounded to the capture cap). Empty otherwise.
     /// Read by the on_complete telemetry closure; never reaches the CP sink.
     pub response_text: String,
+    /// Which of the prompt and completion counts a usage frame reported.
+    pub usage_reported: aisix_gateway::ReportedCounts,
     /// True when the Drop guard filled any token counter from the local
     /// estimator (AISIX-Cloud#1074).
     pub usage_estimated: bool,
+    pub estimated_counts: aisix_obs::EstimatedCounts,
     /// Generated output (content + reasoning + tool-call text) accumulated
     /// for the token-estimation fallback (AISIX-Cloud#1074). Always on,
     /// bounded to `token_estimate::OUTPUT_ACCUMULATION_CAP`; never leaves
@@ -2551,8 +2573,10 @@ fn bridged_responses_estimate_inputs(
     comp: &ResponsesStreamCompletion,
 ) -> crate::token_estimate::EstimateInputs<'_> {
     crate::token_estimate::EstimateInputs {
-        upstream_prompt: comp.prompt_tokens,
-        upstream_completion: comp.completion_tokens,
+        upstream_prompt: comp.usage_reported.prompt_tokens(comp.prompt_tokens),
+        upstream_completion: comp
+            .usage_reported
+            .completion_tokens(comp.completion_tokens),
         output: Some(comp.est_output_text.as_str()),
         // The output buffer only grows: its length identifies it.
         output_revision: 0,
@@ -2580,6 +2604,16 @@ impl<F: FnOnce(ResponsesStreamCompletion)> CompleteOnDrop<F> {
         }
     }
 
+    /// The estimate counted ahead, left for [`Self::fill_estimate`]; `None`
+    /// when nothing was estimated.
+    async fn counted_ahead(&mut self) -> Option<crate::token_estimate::Filled> {
+        let (_, comp) = self.slot.as_ref()?;
+        self.estimate
+            .counted_ahead(bridged_responses_estimate_inputs(comp))
+            .await
+            .filter(|filled| filled.estimated)
+    }
+
     /// Fill the counters the upstream never reported, once.
     fn fill_estimate(&mut self) -> Option<crate::token_estimate::Filled> {
         let (_, comp) = self.slot.as_ref()?;
@@ -2598,6 +2632,7 @@ impl<F: FnOnce(ResponsesStreamCompletion)> Drop for CompleteOnDrop<F> {
                 comp.prompt_tokens = filled.prompt_tokens;
                 comp.completion_tokens = filled.completion_tokens;
                 comp.usage_estimated = true;
+                comp.estimated_counts = filled.counts;
             }
             f(comp);
         }
@@ -2755,6 +2790,7 @@ pub fn build_responses_bridge_stream(
                         if let Some(u) = chunk.usage.as_ref().or(chunk.accounting_usage.as_ref()) {
                             comp.prompt_tokens = comp.prompt_tokens.max(u.prompt_tokens);
                             comp.completion_tokens = comp.completion_tokens.max(u.completion_tokens);
+                            comp.usage_reported = comp.usage_reported.or(u.reported);
                             comp.reasoning_tokens = comp.reasoning_tokens.max(u.reasoning_tokens);
                             comp.cached_prompt_tokens = comp.cached_prompt_tokens.max(u.cached_prompt_tokens);
                             comp.cache_write_tokens = comp.cache_write_tokens.max(u.cache_write_tokens);
@@ -2772,9 +2808,13 @@ pub fn build_responses_bridge_stream(
                     if buffering {
                         held_content.hold(crate::held_content::chat_delta(&chunk.delta), 0);
                     }
-                    let events = encoder.next_events(&chunk);
+                    let mut events = encoder.next_events(&chunk);
                     if encoder.is_finished() {
-                        guard.count_ahead().await;
+                        // The terminal event this chunk produced reports the
+                        // usage the record gets, estimate included.
+                        if let Some(filled) = guard.counted_ahead().await {
+                            encoder.estimate_into_terminal(&mut events, &filled);
+                        }
                     }
                     for ev in events {
                         let b = bytes::Bytes::from(ev.to_sse_string());
@@ -2896,7 +2936,8 @@ pub fn build_responses_bridge_stream(
             comp.prompt_tokens = filled.prompt_tokens;
             comp.completion_tokens = filled.completion_tokens;
             comp.usage_estimated = true;
-            encoder.set_estimated_usage(filled.prompt_tokens, filled.completion_tokens);
+            comp.estimated_counts = filled.counts;
+            encoder.set_estimated_usage(&filled);
         }
 
         if !overflowed && !encoder.is_finished() {
@@ -5106,7 +5147,7 @@ mod tests {
         });
         // …the trailing usage frame never arrives; the relay hands the
         // encoder the same estimate it wrote to the usage record.
-        enc.set_estimated_usage(11, 7);
+        enc.set_estimated_usage(&estimate(Some(11), Some(7)));
         let events = enc.force_finish();
         let completed = events.last().unwrap();
         assert_eq!(completed.event_type, "response.completed");
@@ -5136,60 +5177,79 @@ mod tests {
         );
     }
 
-    /// The estimate never overwrites what the upstream actually reported.
-    /// The relay hands the encoder an estimate whenever it computed one, so
-    /// a usage frame that landed WITHOUT a finish chunk — the shape an
-    /// OpenAI-compatible upstream sends — must still win at force_finish.
+    /// What the relay hands the encoder: `Some` for a count it estimated.
+    fn estimate(prompt: Option<u32>, completion: Option<u32>) -> crate::token_estimate::Filled {
+        crate::token_estimate::Filled {
+            prompt_tokens: prompt.unwrap_or(0),
+            completion_tokens: completion.unwrap_or(0),
+            estimated: prompt.is_some() || completion.is_some(),
+            counts: aisix_obs::EstimatedCounts {
+                prompt: prompt.is_some(),
+                completion: completion.is_some(),
+            },
+        }
+    }
+
+    fn usage_chunk(usage: UsageStats) -> ChatChunk {
+        ChatChunk {
+            choice_index: 0,
+            logprobs: None,
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta::default(),
+            finish_reason: None,
+            usage: Some(usage),
+            service_tier: None,
+            accounting_usage: None,
+        }
+    }
+
+    /// A usage frame that reported the prompt and left the completion out,
+    /// landing WITHOUT a finish chunk — the shape an OpenAI-compatible
+    /// upstream sends: the estimate fills only the missing count.
     #[test]
     fn a_usage_frame_reporting_only_one_counter_still_gets_the_other_filled() {
-        // A relay that streams `{prompt_tokens: 3, completion_tokens: 0}`
-        // used to block the whole estimate, so the client read
-        // `output_tokens: 0` while the usage record — which fills per
-        // counter — billed the estimate.
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let _ = enc.next_events(&content_chunk("hi"));
         let mut partial = UsageStats::new(3, 0);
         partial.total_tokens = 3;
-        let _ = enc.next_events(&ChatChunk {
-            choice_index: 0,
-            logprobs: None,
-            id: "c".into(),
-            model: "m".into(),
-            delta: ChatDelta::default(),
-            finish_reason: None,
-            usage: Some(partial),
-            service_tier: None,
-            accounting_usage: None,
-        });
-        enc.set_estimated_usage(3, 7);
+        partial.reported.prompt = true;
+        let _ = enc.next_events(&usage_chunk(partial));
+        enc.set_estimated_usage(&estimate(None, Some(7)));
         let events = enc.force_finish();
         let usage = &events.last().unwrap().data["response"]["usage"];
         assert_eq!(usage["input_tokens"], 3, "the reported counter stands");
-        assert_eq!(usage["output_tokens"], 7, "the zero was filled");
+        assert_eq!(usage["output_tokens"], 7, "the missing one was filled");
         // The total the frame carried described the pre-fill counters.
         assert_eq!(usage["total_tokens"], 10);
     }
 
+    /// The terminal event a usage frame releases live is built before the
+    /// relay counts the estimate; the relay writes the estimate into it
+    /// before it is sent, so the client reads what the record gets.
     #[test]
-    fn set_estimated_usage_is_ignored_once_a_usage_frame_landed() {
+    fn the_estimate_reaches_a_terminal_event_released_by_the_usage_frame() {
         let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, no_custom_tools());
         let _ = enc.next_events(&content_chunk("hi"));
         let _ = enc.next_events(&ChatChunk {
-            choice_index: 0,
-            logprobs: None,
-            id: "c".into(),
-            model: "m".into(),
-            delta: ChatDelta::default(),
-            finish_reason: None,
-            usage: Some(UsageStats::new(3, 4)),
-            service_tier: None,
-            accounting_usage: None,
+            finish_reason: Some(FinishReason::Stop),
+            usage: None,
+            ..content_chunk("")
         });
-        enc.set_estimated_usage(99, 99);
-        let events = enc.force_finish();
-        let usage = &events.last().unwrap().data["response"]["usage"];
-        assert_eq!(usage["input_tokens"], 3, "the frame was read, not guessed");
+        let mut usage = UsageStats::new(0, 4);
+        usage.total_tokens = 4;
+        usage.reported.completion = true;
+        let mut events = enc.next_events(&usage_chunk(usage));
+        assert!(enc.is_finished());
+        enc.estimate_into_terminal(&mut events, &estimate(Some(9), None));
+        let completed = events
+            .iter()
+            .find(|e| e.event_type == "response.completed")
+            .expect("terminal event");
+        let usage = &completed.data["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 9);
         assert_eq!(usage["output_tokens"], 4);
+        assert_eq!(usage["total_tokens"], 13);
     }
 
     // ── Replayed reasoning ───────────────────────────────────────

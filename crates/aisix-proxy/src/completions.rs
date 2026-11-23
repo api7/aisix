@@ -95,9 +95,13 @@ struct CompletionDispatchSuccess {
 /// `prompt_tokens` + `completion_tokens` are both present (unlike
 /// embeddings which has only prompt_tokens). Source:
 /// <https://platform.openai.com/docs/api-reference/completions/object>
+#[derive(Default)]
 struct CompletionUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// Which of the two counts above the upstream reported.
+    usage_reported: aisix_gateway::ReportedCounts,
+    estimated_counts: aisix_obs::EstimatedCounts,
     /// `prompt_tokens_details.cached_tokens` — the upstream prompt-cache
     /// hits, already counted INSIDE `prompt_tokens` (AISIX-Cloud#1404).
     /// Reported by this endpoint for the same providers that report it
@@ -243,17 +247,8 @@ pub async fn completions(
                 &audit,
             );
             {
-                let usage = success.usage.as_ref().unwrap_or(&CompletionUsage {
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    cached_prompt_tokens: 0,
-                    cache_write_tokens: None,
-                    cache_write_ttl: aisix_gateway::CacheCreationTtl::NONE,
-                    modality: aisix_gateway::ModalityTokens::NONE,
-                    reasoning_tokens: 0,
-                    upstream_total_tokens: 0,
-                    usage_estimated: false,
-                });
+                let no_usage = CompletionUsage::default();
+                let usage = success.usage.as_ref().unwrap_or(&no_usage);
                 emit_usage_event(
                     &state,
                     &snapshot,
@@ -610,33 +605,28 @@ async fn dispatch(
             // so the success struct carries typed counters rather
             // than re-parsing JSON downstream.
             //
-            // Token-estimation fallback (AISIX-Cloud#1074): a missing or
-            // zero usage block fills locally — legacy completions is plain
-            // text on both sides, so the plain-text counting rule applies
-            // to each. The 200-without-usage edge previously skipped the
-            // event entirely; it now emits an estimated record instead.
-            // Telemetry only — the response body forwards untouched.
+            // Token-estimation fallback (AISIX-Cloud#1074): a count the
+            // usage block left out fills locally — legacy completions is
+            // plain text on both sides, so the plain-text counting rule
+            // applies to each; a reported count stands, `0` included. The
+            // 200-without-usage edge previously skipped the event entirely;
+            // it now emits an estimated record instead. The client reads
+            // the same counts as the record.
             // AISIX-Cloud#1289: read the response object id BEFORE the
             // redaction pass below rewrites the body.
             let provider_request_id = crate::usage_attr::provider_response_id(&resp_json);
             let usage = {
-                let mut u = extract_completion_usage(&resp_json).unwrap_or(CompletionUsage {
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    cached_prompt_tokens: 0,
-                    cache_write_tokens: None,
-                    cache_write_ttl: aisix_gateway::CacheCreationTtl::NONE,
-                    modality: Default::default(),
-                    reasoning_tokens: 0,
-                    upstream_total_tokens: 0,
-                    usage_estimated: false,
-                });
-                if u.prompt_tokens == 0 || u.completion_tokens == 0 {
+                let mut u = extract_completion_usage(&resp_json).unwrap_or_default();
+                let prompt_missing = u.usage_reported.prompt_tokens(u.prompt_tokens).is_none();
+                let completion_missing = u
+                    .usage_reported
+                    .completion_tokens(u.completion_tokens)
+                    .is_none();
+                if prompt_missing || completion_missing {
                     // Counted off the request worker unless the text is small.
                     let est_model = model.upstream_model().unwrap_or("unknown").to_owned();
-                    let prompt = (u.prompt_tokens == 0).then(|| body.get("prompt").cloned());
-                    let output =
-                        (u.completion_tokens == 0).then(|| completion_output_text(&resp_json));
+                    let prompt = prompt_missing.then(|| body.get("prompt").cloned());
+                    let output = completion_missing.then(|| completion_output_text(&resp_json));
                     let text_bytes = prompt
                         .as_ref()
                         .map_or(0, crate::estimate_pool::serialized_bytes_bound)
@@ -664,18 +654,20 @@ async fn dispatch(
                         },
                         move |(prompt_n, completion_n): (Option<u32>, Option<u32>)| {
                             let mut usage = upstream;
-                            let mut usage_estimated = false;
+                            let mut estimated_counts = aisix_obs::EstimatedCounts::default();
                             if let Some(n) = prompt_n.filter(|n| *n > 0) {
                                 usage.prompt_tokens = n;
-                                usage_estimated = true;
+                                estimated_counts.prompt = true;
                             }
                             if let Some(n) = completion_n.filter(|n| *n > 0) {
                                 usage.completion_tokens = n;
-                                usage_estimated = true;
+                                estimated_counts.completion = true;
                             }
                             crate::token_estimate::CancelledUsage {
                                 usage,
-                                usage_estimated,
+                                usage_estimated: estimated_counts.prompt
+                                    || estimated_counts.completion,
+                                estimated_counts,
                                 answered_after_ms: None,
                             }
                         },
@@ -694,10 +686,12 @@ async fn dispatch(
                     if let Some(n) = prompt_n.filter(|n| *n > 0) {
                         u.prompt_tokens = n;
                         u.usage_estimated = true;
+                        u.estimated_counts.prompt = true;
                     }
                     if let Some(n) = completion_n.filter(|n| *n > 0) {
                         u.completion_tokens = n;
                         u.usage_estimated = true;
+                        u.estimated_counts.completion = true;
                     }
                 }
                 Some(u)
@@ -726,6 +720,9 @@ async fn dispatch(
             // already billed (tokens committed above), so a block surfaces a
             // redacted 422 rather than the response.
             let mut resp_json = resp_json;
+            if let Some(u) = usage.as_ref().filter(|u| u.usage_estimated) {
+                estimated_usage_into_body(&mut resp_json, u);
+            }
             if !resolved_chain.is_empty() {
                 let synth = ChatResponse {
                     logprobs: None,
@@ -888,13 +885,36 @@ async fn dispatch(
 /// #429 follow-up. Dropping the whole event would under-record more than
 /// the zeroed-completion it was meant to avoid. Wire shape:
 /// <https://platform.openai.com/docs/api-reference/completions/object>
+/// Write the estimated counts into the body the client reads, so it reports
+/// the counts its usage record carries: the counts the upstream reported
+/// stand, the ones it left out are filled, and `total_tokens` is recomputed
+/// as prompt + completion, since one reported beside a missing count does not
+/// add up once that count is filled.
+fn estimated_usage_into_body(body: &mut Value, usage: &CompletionUsage) {
+    let Some(body) = body.as_object_mut() else {
+        return;
+    };
+    let slot = body
+        .entry("usage")
+        .or_insert_with(|| Value::Object(Default::default()));
+    if !slot.is_object() {
+        *slot = Value::Object(Default::default());
+    }
+    let Some(slot) = slot.as_object_mut() else {
+        return;
+    };
+    slot.insert("prompt_tokens".into(), usage.prompt_tokens.into());
+    slot.insert("completion_tokens".into(), usage.completion_tokens.into());
+    slot.insert(
+        "total_tokens".into(),
+        (u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens)).into(),
+    );
+}
+
 fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
-    let usage = body.get("usage")?;
-    let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64())? as u32;
-    let completion_tokens = usage
-        .get("completion_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
+    let usage = body.get("usage").filter(|u| u.is_object())?;
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64).map(|n| n as u32);
+    let (prompt_tokens, completion_tokens) = (count("prompt_tokens"), count("completion_tokens"));
     let cached_prompt_tokens = usage
         .get("prompt_tokens_details")
         .and_then(|d| d.get("cached_tokens"))
@@ -911,8 +931,13 @@ fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
             .map_or(0, |n| n.min(u32::MAX as u64) as u32)
     };
     Some(CompletionUsage {
-        prompt_tokens,
-        completion_tokens,
+        prompt_tokens: prompt_tokens.unwrap_or(0),
+        completion_tokens: completion_tokens.unwrap_or(0),
+        usage_reported: aisix_gateway::ReportedCounts {
+            prompt: prompt_tokens.is_some(),
+            completion: completion_tokens.is_some(),
+        },
+        estimated_counts: Default::default(),
         cached_prompt_tokens,
         cache_write_tokens,
         cache_write_ttl: aisix_gateway::CacheCreationTtl::from_openai_cache_write_details(
@@ -932,7 +957,7 @@ fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
 /// of a completions body, shared with passthrough routes relaying the same
 /// envelope so the two cannot record one upstream reply differently.
 pub(crate) fn completion_usage_stats(body: &Value) -> Option<UsageStats> {
-    let u = extract_completion_usage(body)?;
+    let u = extract_completion_usage(body).filter(|u| u.usage_reported.prompt)?;
     Some(UsageStats {
         cached_prompt_tokens: u.cached_prompt_tokens,
         cache_write_tokens: u.cache_write_tokens,
@@ -1044,6 +1069,7 @@ fn emit_usage_event(
         reasoning_tokens: usage.reasoning_tokens,
         total_tokens: usage.upstream_total_tokens,
         usage_estimated: usage.usage_estimated,
+        estimated_counts: usage.estimated_counts,
         // Narrowed to the winning attempt's own latency below
         // (`apply_winning_attempt`) once a failover put earlier attempts
         // in front of it; they emitted their own events.

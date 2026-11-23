@@ -1957,13 +1957,15 @@ pub enum AnthropicResponseBlock {
 }
 
 // `#[serde(default)]` at the container level so a response missing any
-// token counter deserializes to 0 rather than failing the whole body
-// decode (same bug class as OpenAI usage, #474).
+// token counter deserializes rather than failing the whole body decode
+// (same bug class as OpenAI usage, #474). The input and output counts stay
+// `None` when omitted, apart from a reported `0`: only an omitted count is
+// estimated.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct AnthropicUsage {
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
     /// Tokens written to the prompt cache (1.25× input rate). Optional
     /// — present only on requests with cache_control segments.
     #[serde(default)]
@@ -2079,9 +2081,13 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
             // cached-prompt / reasoning taxonomy (those default to 0).
             UsageStats {
                 cache_creation_ttl: CacheCreationTtl::from_anthropic(u.cache_creation.as_ref()),
+                reported: aisix_gateway::ReportedCounts {
+                    prompt: u.input_tokens.is_some(),
+                    completion: u.output_tokens.is_some(),
+                },
                 ..UsageStats::with_cache(
-                    u.input_tokens,
-                    u.output_tokens,
+                    u.input_tokens.unwrap_or(0),
+                    u.output_tokens.unwrap_or(0),
                     u.cache_creation_input_tokens,
                     u.cache_read_input_tokens,
                 )
@@ -2403,6 +2409,8 @@ pub struct StreamState {
     /// emitted on the terminal `message_delta` so the final `UsageStats`
     /// carries both prompt and completion (and a correct total).
     pub input_tokens: u32,
+    /// Whether a `message_start` or `message_delta` reported `input_tokens`.
+    pub input_tokens_reported: bool,
     /// Cache write / read counters captured from `message_start`, carried
     /// onto the terminal usage so the bridge doesn't drop them (#906).
     pub cache_creation_tokens: u32,
@@ -2441,11 +2449,9 @@ impl StreamState {
                 self.model = message.model.clone();
                 // Reset on every message_start so a later message_start without
                 // usage can't leave a stale prompt-token count from a prior one.
-                self.input_tokens = message
-                    .usage
-                    .as_ref()
-                    .and_then(|u| u.input_tokens)
-                    .unwrap_or(0);
+                let input_tokens = message.usage.as_ref().and_then(|u| u.input_tokens);
+                self.input_tokens_reported = input_tokens.is_some();
+                self.input_tokens = input_tokens.unwrap_or(0);
                 self.cache_creation_tokens = message
                     .usage
                     .as_ref()
@@ -2469,8 +2475,14 @@ impl StreamState {
                 {
                     self.service_tier = Some(tier);
                 }
+                // Its `output_tokens` is a placeholder, not a count: the
+                // completion is reported only by the terminal message_delta.
                 self.start_usage = message.usage.as_ref().map(|_| UsageStats {
                     cache_creation_ttl: self.cache_creation_ttl,
+                    reported: aisix_gateway::ReportedCounts {
+                        prompt: self.input_tokens_reported,
+                        completion: false,
+                    },
                     ..UsageStats::with_cache(
                         self.input_tokens,
                         0,
@@ -2525,6 +2537,7 @@ impl StreamState {
             } => {
                 if let Some(t) = usage.input_tokens {
                     self.input_tokens = self.input_tokens.max(t);
+                    self.input_tokens_reported = true;
                 }
                 if let Some(t) = usage.cache_creation_input_tokens {
                     self.cache_creation_tokens = self.cache_creation_tokens.max(t);
@@ -2666,6 +2679,10 @@ impl StreamState {
                 let usage = usage.as_ref().and_then(|u| {
                     u.output_tokens.map(|n| UsageStats {
                         cache_creation_ttl: self.cache_creation_ttl,
+                        reported: aisix_gateway::ReportedCounts {
+                            prompt: self.input_tokens_reported,
+                            completion: true,
+                        },
                         ..UsageStats::with_cache(
                             self.input_tokens,
                             n,
@@ -3740,6 +3757,8 @@ pub struct AnthropicSseEncoder {
     /// Best-known cumulative usage across all chunks. Max semantics —
     /// robust to providers that double-emit usage.
     seen_input_tokens: u32,
+    /// Whether a usage frame reported the input count, `0` included.
+    input_tokens_reported: bool,
     seen_output_tokens: u32,
     /// Cache counters seen on the stream, in both of `UsageStats`'
     /// representations — folded into the Anthropic shape by
@@ -3776,6 +3795,7 @@ impl AnthropicSseEncoder {
             refused: false,
             pending_stop_reason: None,
             seen_input_tokens: 0,
+            input_tokens_reported: false,
             seen_output_tokens: 0,
             seen_cached_prompt_tokens: 0,
             seen_cache_creation_tokens: 0,
@@ -3796,6 +3816,7 @@ impl AnthropicSseEncoder {
         if let Some(u) = chunk.usage.as_ref() {
             self.usage_seen = true;
             self.seen_input_tokens = self.seen_input_tokens.max(u.prompt_tokens);
+            self.input_tokens_reported |= u.reported.prompt;
             self.seen_output_tokens = self.seen_output_tokens.max(u.completion_tokens);
             self.seen_cached_prompt_tokens =
                 self.seen_cached_prompt_tokens.max(u.cached_prompt_tokens);
@@ -4020,22 +4041,44 @@ impl AnthropicSseEncoder {
     /// internal usage record is filled from the same estimate, and a client
     /// reading the closing `message_delta` must not be told
     /// `output_tokens: 0` for a response it can read the text of
-    /// (AISIX-Cloud#1074). Per counter, and only into a zero: a number
-    /// the upstream actually reported is never overridden, and a frame
-    /// that reported one counter and left the other at zero still gets
-    /// that zero filled — the record fills it the same way, and the two
-    /// must not disagree. A no-op once the closing pair has gone out:
-    /// the client must never be handed numbers contradicting what it was
-    /// already sent.
-    pub fn set_estimated_usage(&mut self, prompt_tokens: u32, completion_tokens: u32) {
+    /// (AISIX-Cloud#1074). Per counter: `Some` is a count the estimate
+    /// filled because the upstream left it out; a count the upstream
+    /// reported, `0` included, is passed as `None` and stands. A no-op once
+    /// the closing pair has gone out: the client must never be handed
+    /// numbers contradicting what it was already sent.
+    pub fn set_estimated_usage(
+        &mut self,
+        prompt_tokens: Option<u32>,
+        completion_tokens: Option<u32>,
+    ) {
         if self.finished {
             return;
         }
-        if self.seen_input_tokens == 0 {
-            self.seen_input_tokens = prompt_tokens;
+        self.adopt_estimate(prompt_tokens, completion_tokens);
+    }
+
+    fn adopt_estimate(&mut self, prompt_tokens: Option<u32>, completion_tokens: Option<u32>) {
+        if let Some(n) = prompt_tokens {
+            self.seen_input_tokens = n;
         }
-        if self.seen_output_tokens == 0 {
-            self.seen_output_tokens = completion_tokens;
+        if let Some(n) = completion_tokens {
+            self.seen_output_tokens = n;
+        }
+    }
+
+    /// [`Self::set_estimated_usage`] for the closing pair `events` holds,
+    /// built by the [`Self::next_events`] call that returned them and not
+    /// yet sent: its `message_delta` usage is rewritten with the estimate.
+    pub fn estimate_into_closing(
+        &mut self,
+        events: &mut [AnthropicSseEvent],
+        prompt_tokens: Option<u32>,
+        completion_tokens: Option<u32>,
+    ) {
+        self.adopt_estimate(prompt_tokens, completion_tokens);
+        let usage = self.closing_usage();
+        for ev in events.iter_mut().filter(|ev| ev.event == "message_delta") {
+            ev.data["usage"] = serde_json::Value::Object(usage.clone());
         }
     }
 
@@ -4046,22 +4089,7 @@ impl AnthropicSseEncoder {
     /// place the client can learn the prompt token count. The same goes
     /// for the cache counters (AISIX-Cloud#1405).
     fn closing_pair(&mut self, stop_reason: &'static str) -> Vec<AnthropicSseEvent> {
-        let input = AnthropicInputUsage::from_usage(&UsageStats {
-            prompt_tokens: self.seen_input_tokens,
-            cached_prompt_tokens: self.seen_cached_prompt_tokens,
-            cache_creation_tokens: self.seen_cache_creation_tokens,
-            cache_read_tokens: self.seen_cache_read_tokens,
-            ..UsageStats::default()
-        });
-        let mut usage = serde_json::Map::new();
-        // Gate on the RAW prompt count, not the cache-adjusted one: a
-        // fully-cached prompt is a real `input_tokens: 0`, distinct from
-        // an upstream that reported no input count at all.
-        if self.seen_input_tokens > 0 {
-            usage.insert("input_tokens".into(), input.input_tokens.into());
-        }
-        usage.insert("output_tokens".into(), self.seen_output_tokens.into());
-        input.insert_cache_fields(&mut usage);
+        let usage = self.closing_usage();
         self.finished = true;
         vec![
             AnthropicSseEvent {
@@ -4080,6 +4108,26 @@ impl AnthropicSseEncoder {
                 data: serde_json::json!({"type": "message_stop"}),
             },
         ]
+    }
+
+    fn closing_usage(&self) -> serde_json::Map<String, serde_json::Value> {
+        let input = AnthropicInputUsage::from_usage(&UsageStats {
+            prompt_tokens: self.seen_input_tokens,
+            cached_prompt_tokens: self.seen_cached_prompt_tokens,
+            cache_creation_tokens: self.seen_cache_creation_tokens,
+            cache_read_tokens: self.seen_cache_read_tokens,
+            ..UsageStats::default()
+        });
+        let mut usage = serde_json::Map::new();
+        // Gate on the RAW prompt count, not the cache-adjusted one: a
+        // fully-cached prompt is a real `input_tokens: 0`, distinct from
+        // an upstream that reported no input count at all.
+        if self.seen_input_tokens > 0 || self.input_tokens_reported {
+            usage.insert("input_tokens".into(), input.input_tokens.into());
+        }
+        usage.insert("output_tokens".into(), self.seen_output_tokens.into());
+        input.insert_cache_fields(&mut usage);
+        usage
     }
 
     pub fn is_finished(&self) -> bool {
@@ -7623,7 +7671,7 @@ mod tests {
     fn sse_encoder_force_finish_reports_the_adopted_estimate() {
         let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
         let _ = enc.next_events(&delta_chunk("hi"));
-        enc.set_estimated_usage(31, 7);
+        enc.set_estimated_usage(Some(31), Some(7));
         let events = enc.force_finish();
         let delta = events
             .iter()
@@ -7633,21 +7681,23 @@ mod tests {
         assert_eq!(delta.data["usage"]["output_tokens"], 7);
     }
 
-    /// The estimate never overrides what an upstream actually reported —
-    /// including a usage frame that landed while the stream was still open,
-    /// before the closing pair was built.
+    /// A usage frame that reported the input count and left the output
+    /// count out, landing while the stream was still open: the estimate
+    /// fills only the missing count.
     #[test]
-    fn sse_encoder_partial_usage_frame_still_gets_the_zero_counter_filled() {
-        // The sibling of the `/v1/responses` case: a frame carrying an
-        // input count and a zero output count used to block the whole
-        // estimate, leaving the client `output_tokens: 0` against a bill
-        // computed from it.
+    fn sse_encoder_partial_usage_frame_gets_the_missing_counter_filled() {
         let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
         let mut with_usage = delta_chunk("hi");
-        with_usage.usage = Some(UsageStats::new(5, 0));
+        with_usage.usage = Some(UsageStats {
+            reported: aisix_gateway::ReportedCounts {
+                prompt: true,
+                completion: false,
+            },
+            ..UsageStats::new(5, 0)
+        });
         let _ = enc.next_events(&with_usage);
 
-        enc.set_estimated_usage(5, 9);
+        enc.set_estimated_usage(None, Some(9));
         let events = enc.force_finish();
         let delta = events
             .iter()
@@ -7657,21 +7707,54 @@ mod tests {
         assert_eq!(delta.data["usage"]["output_tokens"], 9);
     }
 
+    /// An input count the upstream reported as `0` reaches the client as
+    /// reported, rather than being left out as if it had not been reported.
     #[test]
-    fn sse_encoder_set_estimated_usage_is_ignored_once_a_usage_frame_landed() {
+    fn sse_encoder_closing_pair_carries_a_reported_zero_input() {
         let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
         let mut with_usage = delta_chunk("hi");
-        with_usage.usage = Some(UsageStats::new(5, 2));
+        with_usage.usage = Some(UsageStats {
+            reported: aisix_gateway::ReportedCounts {
+                prompt: true,
+                completion: true,
+            },
+            ..UsageStats::new(0, 2)
+        });
         let _ = enc.next_events(&with_usage);
-        assert!(!enc.is_finished(), "still mid-stream");
-
-        enc.set_estimated_usage(900, 900);
         let events = enc.force_finish();
         let delta = events
             .iter()
             .find(|e| e.event == "message_delta")
             .expect("closing pair emitted");
-        assert_eq!(delta.data["usage"]["input_tokens"], 5);
+        assert_eq!(delta.data["usage"]["input_tokens"], 0);
+        assert_eq!(delta.data["usage"]["output_tokens"], 2);
+    }
+
+    /// A closing pair built live, by the usage frame that released it, takes
+    /// the estimate before it is sent.
+    #[test]
+    fn sse_encoder_estimate_rewrites_a_closing_pair_not_yet_sent() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
+        let _ = enc.next_events(&delta_chunk("hi"));
+        let mut stop = delta_chunk("");
+        stop.finish_reason = Some(FinishReason::Stop);
+        let _ = enc.next_events(&stop);
+        let mut usage_only = delta_chunk("");
+        usage_only.usage = Some(UsageStats {
+            reported: aisix_gateway::ReportedCounts {
+                prompt: false,
+                completion: true,
+            },
+            ..UsageStats::new(0, 2)
+        });
+        let mut events = enc.next_events(&usage_only);
+        assert!(enc.is_finished());
+        enc.estimate_into_closing(&mut events, Some(12), None);
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("closing pair emitted");
+        assert_eq!(delta.data["usage"]["input_tokens"], 12);
         assert_eq!(delta.data["usage"]["output_tokens"], 2);
     }
 
