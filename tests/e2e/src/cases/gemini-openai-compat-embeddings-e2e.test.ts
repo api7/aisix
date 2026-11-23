@@ -5,8 +5,11 @@ import {
   ProxyClient,
   SeedClient,
   spawnApp,
+  startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForSlsLog,
+  type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -19,13 +22,17 @@ import {
 // field: `data[].index` is absent on the first (or only) vector, and the
 // response carries no `usage` block. The bodies below are the shapes
 // Gemini returned for `gemini-embedding-001` (captured from live calls),
-// shortened to two floats.
+// shortened to two floats. With no usage reported, the gateway estimates
+// the prompt and tells the client the count its usage record carries (read
+// off a metadata-only SLS exporter).
 
 const CALLER_PLAINTEXT = "sk-gemini-compat-embed-caller";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
 const MODEL = "gemini-compat-embed";
+const CREDENTIAL_REF = "e2e";
+const LOGSTORE = "gemini-compat-embed-store";
 
 const SINGLE_RESPONSE = {
   object: "list",
@@ -45,6 +52,7 @@ const BATCH_RESPONSE = {
 describe("Gemini OpenAI-compatible /v1/embeddings", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
+  let sls: MockSls | undefined;
   let proxy: ProxyClient;
   let etcdReachable = false;
 
@@ -58,8 +66,24 @@ describe("Gemini OpenAI-compatible /v1/embeddings", () => {
       scriptedResponses: [{ nonStreamBody: SINGLE_RESPONSE }, { nonStreamBody: BATCH_RESPONSE }],
     });
 
-    app = await spawnApp();
+    sls = await startMockSls();
+    app = await spawnApp({
+      extraEnv: {
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-ak-id",
+        [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-ak-secret",
+      },
+    });
     const seed = new SeedClient(etcd, app.etcdPrefix);
+    await seed.createObservabilityExporter({
+      name: "gemini-compat-embed-sls",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: "gemini-compat-embed-proj",
+      logstore: LOGSTORE,
+      credential_ref: CREDENTIAL_REF,
+      content_mode: "metadata_only",
+    });
     const pk = await seed.createProviderKey({
       display_name: "gemini-compat-embed-pk",
       provider: "google",
@@ -89,6 +113,7 @@ describe("Gemini OpenAI-compatible /v1/embeddings", () => {
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
+    await sls?.close();
   });
 
   async function embed(input: string | string[]) {
@@ -100,7 +125,11 @@ describe("Gemini OpenAI-compatible /v1/embeddings", () => {
       },
       body: JSON.stringify({ model: MODEL, input }),
     });
-    return { status: res.status, body: (await res.json()) as Record<string, any> };
+    return {
+      status: res.status,
+      requestId: res.headers.get("x-aisix-request-id") ?? "",
+      body: (await res.json()) as Record<string, any>,
+    };
   }
 
   test("single input: a vector without `index` is index 0", async (ctx) => {
@@ -114,7 +143,18 @@ describe("Gemini OpenAI-compatible /v1/embeddings", () => {
     expect(res.body.data).toEqual([
       { index: 0, object: "embedding", embedding: [0.11, -0.22] },
     ]);
-    expect(res.body.usage).toEqual({ prompt_tokens: 0, total_tokens: 0 });
+    const log = await waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (l) => l.get("request_id") === res.requestId,
+      `usage row for ${res.requestId}`,
+      15_000,
+    );
+    expect(log.get("usage_estimated")).toBe("true");
+    expect(log.get("total_tokens")).toBeUndefined();
+    const prompt = Number(log.get("prompt_tokens") ?? "0");
+    expect(prompt).toBeGreaterThan(0);
+    expect(res.body.usage).toEqual({ prompt_tokens: prompt, total_tokens: prompt });
 
     const sent = upstream!.receivedRequests;
     expect(sent).toHaveLength(1);

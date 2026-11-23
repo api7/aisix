@@ -111,6 +111,17 @@ const ANTHROPIC_BODY_INPUT_ZERO = {
   usage: { input_tokens: 0, output_tokens: OUT },
 };
 
+const ANTHROPIC_BODY_INPUT_LEFT_OUT = {
+  ...ANTHROPIC_BODY_INPUT_ZERO,
+  usage: { output_tokens: OUT },
+};
+
+const EMBEDDINGS_NO_USAGE = {
+  object: "list",
+  model: "relay-compat-x",
+  data: [{ object: "embedding", index: 0, embedding: [0.11, -0.22] }],
+};
+
 /** The usage each upstream returns, by the shape its endpoint speaks. */
 const PROMPT_LEFT_OUT = { completion_tokens: OUT, total_tokens: OUT };
 const PROMPT_ZERO = { prompt_tokens: 0, completion_tokens: OUT, total_tokens: OUT };
@@ -145,6 +156,8 @@ const MODELS: Record<string, { served: Served; provider?: string; bridge?: boole
   "est-cmpl-absent": { served: { nonStreamBody: completionsBody(PROMPT_LEFT_OUT) } },
   "est-cmpl-zero": { served: { nonStreamBody: completionsBody(PROMPT_ZERO) } },
   "est-anth-zero": { served: { nonStreamBody: ANTHROPIC_BODY_INPUT_ZERO }, provider: "anthropic" },
+  "est-anth-absent": { served: { nonStreamBody: ANTHROPIC_BODY_INPUT_LEFT_OUT }, provider: "anthropic" },
+  "est-embed-absent": { served: { nonStreamBody: EMBEDDINGS_NO_USAGE } },
 };
 
 function sseFrames(text: string): Array<Record<string, any>> {
@@ -377,6 +390,27 @@ describe("estimated usage counts only what the upstream left out", () => {
       const usage = responsesStreamUsage(res.text);
       const prompt = await expectEstimatedWithoutTotal(res.requestId);
       expect(usage).toMatchObject({ input_tokens: prompt, output_tokens: OUT, total_tokens: prompt + OUT });
+    });
+
+    test("/v1/messages, native, buffered", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const res = await call("/v1/messages", messagesRequest("est-anth-absent"));
+      const usage = bodyUsage(res.text);
+      const prompt = await expectEstimatedWithoutTotal(res.requestId);
+      expect(usage).toMatchObject({ input_tokens: prompt, output_tokens: OUT });
+      expect(usage).not.toHaveProperty("total_tokens");
+    });
+
+    test("/v1/embeddings, no usage reported", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const res = await call("/v1/embeddings", { model: "est-embed-absent", input: "hello world" });
+      const usage = bodyUsage(res.text);
+      const log = await record(res.requestId);
+      expect(log.get("usage_estimated")).toBe("true");
+      expect(log.get("total_tokens")).toBeUndefined();
+      const prompt = Number(log.get("prompt_tokens") ?? "0");
+      expect(prompt).toBeGreaterThan(0);
+      expect(usage).toEqual({ prompt_tokens: prompt, total_tokens: prompt });
     });
 
     test("/v1/completions", async (ctx) => {

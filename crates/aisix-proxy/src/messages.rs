@@ -1823,8 +1823,8 @@ async fn anthropic_passthrough_dispatch(
         let mut metrics = anthropic_metrics_from_response_json(&json_body);
         // Token-estimation fallback (AISIX-Cloud#1074): an
         // Anthropic-compatible relay may omit `usage` entirely — fill
-        // the missing counters locally before the emit below. The
-        // response body is forwarded verbatim, untouched.
+        // the missing counters locally before the emit below, and tell
+        // the client the same counts.
         fill_missing_anthropic_metrics(
             &mut metrics,
             &upstream_model,
@@ -1840,6 +1840,9 @@ async fn anthropic_passthrough_dispatch(
             Some(attempt_started),
         )
         .await;
+        if metrics.usage_estimated {
+            estimated_usage_into_anthropic_body(&mut json_body, &metrics);
+        }
         crate::quota::commit_answered_attempt(
             reservation,
             member_reservation,
@@ -2133,6 +2136,30 @@ async fn fill_missing_anthropic_metrics(
         metrics.completion_tokens = filled.completion_tokens;
         metrics.usage_estimated = true;
         metrics.estimated_counts = filled.counts;
+    }
+}
+
+/// Write the estimate into the `usage` of a Messages body the client reads,
+/// so it reports the counts its usage record carries: a count the upstream
+/// reported stands, one it left out is filled. Anthropic usage has no total.
+fn estimated_usage_into_anthropic_body(body: &mut Value, metrics: &AnthropicUsageMetrics) {
+    let Some(body) = body.as_object_mut() else {
+        return;
+    };
+    let usage = body
+        .entry("usage")
+        .or_insert_with(|| Value::Object(Default::default()));
+    if !usage.is_object() {
+        *usage = Value::Object(Default::default());
+    }
+    let Some(usage) = usage.as_object_mut() else {
+        return;
+    };
+    if metrics.estimated_counts.prompt {
+        usage.insert("input_tokens".into(), metrics.prompt_tokens.into());
+    }
+    if metrics.estimated_counts.completion {
+        usage.insert("output_tokens".into(), metrics.completion_tokens.into());
     }
 }
 

@@ -705,8 +705,8 @@ async fn dispatch(
             // rerank/embed backends) get prompt from total — upstream-
             // authoritative, not an estimate. A reported count stands, `0`
             // included; only when the upstream reports neither does the
-            // local estimator count the request `input`. Telemetry only —
-            // the response body is forwarded untouched.
+            // local estimator count the request `input`, and the client is
+            // told that estimate, as the usage record carries it.
             let (prompt_tokens, usage_estimated) = if let Some(reported) =
                 reported_prompt_tokens(&embed_resp.usage)
             {
@@ -757,6 +757,10 @@ async fn dispatch(
                 };
                 (estimated, estimated > 0)
             };
+            if usage_estimated {
+                embed_resp.usage.prompt_tokens = prompt_tokens;
+                embed_resp.usage.total_tokens = prompt_tokens;
+            }
             // Commit the reservation — release the concurrency permit
             // and finalise RPM. Embeddings do report prompt_tokens via
             // EmbeddingResponse.usage; thread it through so TPM works
