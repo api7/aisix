@@ -7747,6 +7747,40 @@ mod complete_on_drop_tests {
             subcall_estimated_counts(&zero, &effective.usage),
             aisix_obs::EstimatedCounts::default()
         );
+
+        // An estimated completion beside reported reasoning stays as
+        // estimated once its row drops the total: it was counted from text
+        // that already holds the reasoning.
+        let completion_left_out = UsageStats {
+            prompt_tokens: 10,
+            completion_tokens: 0,
+            reasoning_tokens: 3,
+            upstream_total_tokens: 15,
+            reported: aisix_gateway::ReportedCounts {
+                prompt: true,
+                completion: false,
+            },
+            ..Default::default()
+        };
+        let effective =
+            effective_subcall_usage(req, "relay-model", &completion_left_out, "Hello world");
+        assert!(effective.estimated);
+        let counts = subcall_estimated_counts(&completion_left_out, &effective.usage);
+        assert!(!counts.prompt && counts.completion);
+        let estimated_completion = effective.usage.completion_tokens;
+        assert!(estimated_completion > 0);
+        let mut row = aisix_obs::UsageEvent {
+            prompt_tokens: effective.usage.prompt_tokens,
+            completion_tokens: estimated_completion,
+            reasoning_tokens: 3,
+            total_tokens: 15,
+            usage_estimated: true,
+            estimated_counts: counts,
+            ..Default::default()
+        };
+        row.drop_total_beside_estimate();
+        assert_eq!(row.completion_tokens, estimated_completion);
+        assert_eq!(row.total_tokens, 0);
     }
 
     /// A count the upstream reported as `0` is a count, not a gap: it is
