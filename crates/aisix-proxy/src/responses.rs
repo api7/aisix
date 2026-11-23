@@ -2978,21 +2978,10 @@ async fn responses_cross_provider_to_target(
     })
 }
 
-/// Pull the usage counters out of a Responses-API non-streaming
-/// response body. Returns `None` only when:
-///   - The `usage` block is missing entirely, OR
-///   - `usage.input_tokens` is missing / non-numeric
-///
-/// The caller then estimates the counts locally (AISIX-Cloud#1074). The
-/// `input_tokens` gate distinguishes "no upstream usage at all" from a
-/// legitimate reply.
-///
-/// `output_tokens`, by contrast, defaults to 0 when absent: a 200 that
-/// reports an input side but omits the output side is still a real
-/// billable call and must be recorded. A missing completion/output side
-/// coerces to 0 and the event is still logged/billed
-/// (#429 follow-up; mirrors the tolerant wire-layer decode of
-/// #474). Spec:
+/// Pull the usage counters out of a Responses-API response object. `None`
+/// when it carries no `usage` object; otherwise each count is taken as
+/// reported, and `usage_reported` says which ones the upstream left out, for
+/// the caller to estimate (AISIX-Cloud#1074). Spec:
 /// <https://platform.openai.com/docs/api-reference/responses/object>
 fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
     let usage = body.get("usage").filter(|u| u.is_object())?;

@@ -4041,28 +4041,25 @@ impl AnthropicSseEncoder {
     /// internal usage record is filled from the same estimate, and a client
     /// reading the closing `message_delta` must not be told
     /// `output_tokens: 0` for a response it can read the text of
-    /// (AISIX-Cloud#1074). Per counter: `Some` is a count the estimate
-    /// filled because the upstream left it out; a count the upstream
-    /// reported, `0` included, is passed as `None` and stands. A no-op once
-    /// the closing pair has gone out: the client must never be handed
-    /// numbers contradicting what it was already sent.
-    pub fn set_estimated_usage(
-        &mut self,
-        prompt_tokens: Option<u32>,
-        completion_tokens: Option<u32>,
-    ) {
+    /// (AISIX-Cloud#1074). The counts are the record's: estimated where the
+    /// upstream left one out, as reported otherwise. They go only into a
+    /// count the encoder holds as `0`, which also carries a count the
+    /// upstream reported on a frame the encoder does not read; a reported
+    /// `0` stays `0`. A no-op once the closing pair has gone out: the client
+    /// must never be handed numbers contradicting what it was already sent.
+    pub fn set_estimated_usage(&mut self, prompt_tokens: u32, completion_tokens: u32) {
         if self.finished {
             return;
         }
         self.adopt_estimate(prompt_tokens, completion_tokens);
     }
 
-    fn adopt_estimate(&mut self, prompt_tokens: Option<u32>, completion_tokens: Option<u32>) {
-        if let Some(n) = prompt_tokens {
-            self.seen_input_tokens = n;
+    fn adopt_estimate(&mut self, prompt_tokens: u32, completion_tokens: u32) {
+        if self.seen_input_tokens == 0 {
+            self.seen_input_tokens = prompt_tokens;
         }
-        if let Some(n) = completion_tokens {
-            self.seen_output_tokens = n;
+        if self.seen_output_tokens == 0 {
+            self.seen_output_tokens = completion_tokens;
         }
     }
 
@@ -4072,8 +4069,8 @@ impl AnthropicSseEncoder {
     pub fn estimate_into_closing(
         &mut self,
         events: &mut [AnthropicSseEvent],
-        prompt_tokens: Option<u32>,
-        completion_tokens: Option<u32>,
+        prompt_tokens: u32,
+        completion_tokens: u32,
     ) {
         self.adopt_estimate(prompt_tokens, completion_tokens);
         let usage = self.closing_usage();
@@ -7671,7 +7668,7 @@ mod tests {
     fn sse_encoder_force_finish_reports_the_adopted_estimate() {
         let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
         let _ = enc.next_events(&delta_chunk("hi"));
-        enc.set_estimated_usage(Some(31), Some(7));
+        enc.set_estimated_usage(31, 7);
         let events = enc.force_finish();
         let delta = events
             .iter()
@@ -7697,7 +7694,7 @@ mod tests {
         });
         let _ = enc.next_events(&with_usage);
 
-        enc.set_estimated_usage(None, Some(9));
+        enc.set_estimated_usage(5, 9);
         let events = enc.force_finish();
         let delta = events
             .iter()
@@ -7749,7 +7746,7 @@ mod tests {
         });
         let mut events = enc.next_events(&usage_only);
         assert!(enc.is_finished());
-        enc.estimate_into_closing(&mut events, Some(12), None);
+        enc.estimate_into_closing(&mut events, 12, 2);
         let delta = events
             .iter()
             .find(|e| e.event == "message_delta")

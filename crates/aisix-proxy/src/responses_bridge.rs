@@ -1865,11 +1865,10 @@ impl ResponsesSseEncoder {
     /// for a bridged stream whose upstream left them unreported. The
     /// internal usage record is filled from the same estimate, and a client
     /// reading `response.completed.usage` must not be told zero while the
-    /// record says otherwise (AISIX-Cloud#1074). Per counter: only the
-    /// counts the estimate filled, the ones the upstream left out, are
-    /// taken; a number the upstream reported, `0` included, stands. A
-    /// no-op once the terminal event has gone out: the client must never be
-    /// handed numbers contradicting what it was already sent.
+    /// record says otherwise (AISIX-Cloud#1074). `filled` is the record's
+    /// counts: estimated where the upstream left one out, as reported
+    /// otherwise. A no-op once the terminal event has gone out: the client
+    /// must never be handed numbers contradicting what it was already sent.
     pub fn set_estimated_usage(&mut self, filled: &crate::token_estimate::Filled) {
         if self.finished {
             return;
@@ -1877,14 +1876,21 @@ impl ResponsesSseEncoder {
         self.adopt_estimate(filled);
     }
 
+    /// Only into a count the encoder holds as `0`: the record's counts, the
+    /// estimate and every count the upstream reported (including on frames
+    /// the encoder does not read, such as `message_start`), replace a gap
+    /// the encoder never saw filled, and a reported `0` stays `0`.
     fn adopt_estimate(&mut self, filled: &crate::token_estimate::Filled) {
-        if filled.counts.prompt {
+        let mut changed = false;
+        if self.prompt_tokens == 0 && filled.prompt_tokens > 0 {
             self.prompt_tokens = filled.prompt_tokens;
+            changed = true;
         }
-        if filled.counts.completion {
+        if self.completion_tokens == 0 && filled.completion_tokens > 0 {
             self.completion_tokens = filled.completion_tokens;
+            changed = true;
         }
-        if filled.estimated {
+        if changed {
             // A total the upstream reported beside a missing count no
             // longer describes what the client is about to be told.
             // Zeroing it makes the projection derive prompt + completion,

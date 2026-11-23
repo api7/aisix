@@ -1321,6 +1321,20 @@ pub(crate) fn effective_subcall_usage(
     EffectiveSubcallUsage { usage, estimated }
 }
 
+/// Which counts [`effective_subcall_usage`] estimated: the ones the upstream
+/// left out that the estimate changed.
+fn subcall_estimated_counts(
+    reported: &aisix_gateway::chat::UsageStats,
+    effective: &aisix_gateway::chat::UsageStats,
+) -> aisix_obs::EstimatedCounts {
+    aisix_obs::EstimatedCounts {
+        prompt: reported.reported_prompt_tokens().is_none()
+            && effective.prompt_tokens != reported.prompt_tokens,
+        completion: reported.reported_completion_tokens().is_none()
+            && effective.completion_tokens != reported.completion_tokens,
+    }
+}
+
 /// Compute the value of [`Success::served_by_target`] for a request.
 ///
 /// Centralises the "should we surface routing identity?" policy so
@@ -2814,6 +2828,9 @@ async fn dispatch(
                 // replays zeros — fill them like the fresh-response path
                 // so hit rows (and their saved-token stats) don't record
                 // silent zeros.
+                // Not kept by every cache backend (see `UsageStats`): a hit
+                // read back from Redis takes a `0` its upstream reported as
+                // left out, and estimates it.
                 let reported = cached.usage.reported;
                 let (prompt, completion, total, usage_estimated, estimated_counts) =
                     if reported.prompt_tokens(prompt as u32).is_none()
@@ -4440,6 +4457,7 @@ async fn dispatch_ensemble(
                 cache_creation_tokens: effective_judge.usage.cache_creation_tokens,
                 cache_read_tokens: effective_judge.usage.cache_read_tokens,
                 usage_estimated: effective_judge.estimated,
+                estimated_counts: subcall_estimated_counts(&judge_usage, &effective_judge.usage),
                 provider_request_id: crate::usage_attr::sanitize_provider_response_id(
                     &outcome.response.id,
                 ),
@@ -5473,6 +5491,7 @@ struct EnsembleSubcall {
     attempt_model: String,
     usage: aisix_gateway::chat::UsageStats,
     usage_estimated: bool,
+    estimated_counts: aisix_obs::EstimatedCounts,
     service_tier: Option<String>,
 }
 
@@ -5486,6 +5505,7 @@ impl EnsembleSubcall {
             attempt_model: outcome.model.clone(),
             usage: outcome.effective_usage.clone(),
             usage_estimated: outcome.usage_estimated,
+            estimated_counts: subcall_estimated_counts(&outcome.usage, &outcome.effective_usage),
             service_tier: outcome.service_tier.clone(),
         }
     }
@@ -5523,6 +5543,7 @@ impl EnsembleSubcall {
             cache_creation_tokens: self.usage.cache_creation_tokens,
             cache_read_tokens: self.usage.cache_read_tokens,
             usage_estimated: self.usage_estimated,
+            estimated_counts: self.estimated_counts,
             service_tier: self.service_tier.clone(),
             bypass_reason: bypass.to_string(),
             cache_status: CacheStatus::Disabled.as_str().to_string(),
@@ -7446,8 +7467,8 @@ mod complete_on_drop_tests {
     //! callback args.
     use super::{
         apply_estimated_usage, cache_inclusive_total, effective_subcall_usage,
-        estimate_missing_chat_usage, estimate_subcall_tokens, AtomicU32, CompleteOnDrop,
-        StreamCompletion,
+        estimate_missing_chat_usage, estimate_subcall_tokens, subcall_estimated_counts, AtomicU32,
+        CompleteOnDrop, StreamCompletion,
     };
     use aisix_gateway::chat::UsageStats;
     use std::sync::{Arc, Mutex};
@@ -7692,6 +7713,38 @@ mod complete_on_drop_tests {
         assert_eq!(
             rendered.usage.total_tokens, 99,
             "a total the upstream reported is not second-guessed"
+        );
+    }
+
+    /// An ensemble sub-call's row names which of its counts were estimated,
+    /// so dropping its total can fold reasoning reported beside a completion.
+    #[test]
+    fn a_subcall_names_the_counts_its_estimate_filled() {
+        let req = || subcall_req("Hello");
+        let left_out = UsageStats {
+            completion_tokens: 20,
+            reasoning_tokens: 30,
+            upstream_total_tokens: 50,
+            reported: aisix_gateway::ReportedCounts {
+                prompt: false,
+                completion: true,
+            },
+            ..Default::default()
+        };
+        let effective = effective_subcall_usage(req, "relay-model", &left_out, "Hello world");
+        assert!(effective.estimated);
+        let counts = subcall_estimated_counts(&left_out, &effective.usage);
+        assert!(counts.prompt && !counts.completion);
+
+        let zero = UsageStats {
+            reported: aisix_gateway::ReportedCounts::BOTH,
+            ..left_out
+        };
+        let effective = effective_subcall_usage(req, "relay-model", &zero, "Hello world");
+        assert!(!effective.estimated);
+        assert_eq!(
+            subcall_estimated_counts(&zero, &effective.usage),
+            aisix_obs::EstimatedCounts::default()
         );
     }
 

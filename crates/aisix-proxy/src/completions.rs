@@ -869,22 +869,6 @@ async fn dispatch(
     }
 }
 
-/// Pull the usage counters out of a legacy /v1/completions response
-/// body. Returns `None` only when:
-///   - The `usage` block is missing entirely (non-conformant edge), or
-///   - `usage.prompt_tokens` is missing / non-numeric (malformed)
-///
-/// The caller then estimates the counts locally (AISIX-Cloud#1074).
-///
-/// `completion_tokens`, by contrast, defaults to 0 when absent: a 200
-/// that reports a prompt side but omits the completion side is still a
-/// real billable call (the prompt was processed) and must be recorded.
-/// A missing completion side coerces to 0 and the event is still
-/// logged/billed (the usage block's `completion_tokens` defaults to 0
-/// when absent) — see
-/// #429 follow-up. Dropping the whole event would under-record more than
-/// the zeroed-completion it was meant to avoid. Wire shape:
-/// <https://platform.openai.com/docs/api-reference/completions/object>
 /// Write the estimated counts into the body the client reads, so it reports
 /// the counts its usage record carries: the counts the upstream reported
 /// stand, the ones it left out are filled, and `total_tokens` is recomputed
@@ -911,6 +895,11 @@ fn estimated_usage_into_body(body: &mut Value, usage: &CompletionUsage) {
     );
 }
 
+/// Pull the usage counters out of a legacy /v1/completions response body.
+/// `None` when the body carries no `usage` object; otherwise each count is
+/// taken as reported, and `usage_reported` says which ones the upstream left
+/// out, for the caller to estimate (AISIX-Cloud#1074). Wire shape:
+/// <https://platform.openai.com/docs/api-reference/completions/object>
 fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
     let usage = body.get("usage").filter(|u| u.is_object())?;
     let count = |key: &str| usage.get(key).and_then(Value::as_u64).map(|n| n as u32);

@@ -3257,10 +3257,7 @@ fn build_anthropic_sse_stream(
             comp.completion_tokens = filled.completion_tokens;
             comp.usage_estimated = true;
             comp.estimated_counts = filled.counts;
-            encoder.set_estimated_usage(
-                filled.counts.prompt.then_some(filled.prompt_tokens),
-                filled.counts.completion.then_some(filled.completion_tokens),
-            );
+            encoder.set_estimated_usage(filled.prompt_tokens, filled.completion_tokens);
         }
         if !encoder.is_finished() {
             for ev in encoder.force_finish() {
@@ -3483,11 +3480,7 @@ impl<F: FnOnce(AnthropicStreamCompletion)> CompleteAnthropicStreamOnDrop<F> {
             .counted_ahead(bridged_anthropic_estimate_inputs(c))
             .await;
         if let Some(filled) = filled.filter(|filled| filled.estimated) {
-            encoder.estimate_into_closing(
-                events,
-                filled.counts.prompt.then_some(filled.prompt_tokens),
-                filled.counts.completion.then_some(filled.completion_tokens),
-            );
+            encoder.estimate_into_closing(events, filled.prompt_tokens, filled.completion_tokens);
         }
     }
 
