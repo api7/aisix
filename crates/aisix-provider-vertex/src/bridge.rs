@@ -3225,8 +3225,8 @@ impl GeminiUsageMetadata {
     }
 
     fn reports_counts(&self) -> bool {
-        self.prompt_token_count.unwrap_or(0) > 0
-            || self.candidates_token_count.unwrap_or(0) > 0
+        self.prompt_token_count.is_some()
+            || self.candidates_token_count.is_some()
             || self.total_token_count > 0
             || self.cached_content_token_count > 0
             || self.thoughts_token_count > 0
@@ -4426,6 +4426,34 @@ mod tests {
             resp.more_choices[0].logprobs.as_ref().unwrap()["content"][0]["logprob"],
             0.0
         );
+    }
+
+    /// Counts reported as `0` are a usage report, not a gap to estimate; a
+    /// frame carrying only `serviceTier` still is not one.
+    #[test]
+    fn a_stream_frame_reporting_zero_counts_carries_them() {
+        let frame = |v: serde_json::Value| serde_json::from_value(v).unwrap();
+        let chunks = gemini_chunk_into_chat_chunks(
+            frame(serde_json::json!({
+                "candidates": [{"index": 0, "finishReason": "STOP"}],
+                "usageMetadata": {"promptTokenCount": 0, "candidatesTokenCount": 0}
+            })),
+            "gemini-2.5-flash",
+            &mut GeminiStreamState::default(),
+        );
+        let usage = chunks.iter().find_map(|c| c.usage.as_ref()).unwrap();
+        assert_eq!(usage.reported_prompt_tokens(), Some(0));
+        assert_eq!(usage.reported_completion_tokens(), Some(0));
+
+        let tier_only = gemini_chunk_into_chat_chunks(
+            frame(serde_json::json!({
+                "candidates": [{"index": 0, "content": {"parts": [{"text": "A"}]}}],
+                "usageMetadata": {"serviceTier": "standard"}
+            })),
+            "gemini-2.5-flash",
+            &mut GeminiStreamState::default(),
+        );
+        assert!(tier_only.iter().all(|c| c.usage.is_none()));
     }
 
     #[test]

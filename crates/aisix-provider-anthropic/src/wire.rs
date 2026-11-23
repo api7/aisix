@@ -2676,21 +2676,24 @@ impl StreamState {
                     .stop_reason
                     .as_deref()
                     .map(|r| map_stop_reason(Some(r)));
-                let usage = usage.as_ref().and_then(|u| {
-                    u.output_tokens.map(|n| UsageStats {
+                // A delta reporting only its input count still carries it;
+                // the completion stays unreported for the estimate to fill.
+                let usage = usage
+                    .as_ref()
+                    .filter(|u| u.output_tokens.is_some() || u.input_tokens.is_some())
+                    .map(|u| UsageStats {
                         cache_creation_ttl: self.cache_creation_ttl,
                         reported: aisix_gateway::ReportedCounts {
                             prompt: self.input_tokens_reported,
-                            completion: true,
+                            completion: u.output_tokens.is_some(),
                         },
                         ..UsageStats::with_cache(
                             self.input_tokens,
-                            n,
+                            u.output_tokens.unwrap_or(0),
                             self.cache_creation_tokens,
                             self.cache_read_tokens,
                         )
-                    })
-                });
+                    });
                 if finish.is_none() && usage.is_none() {
                     return None;
                 }
@@ -6513,6 +6516,21 @@ mod tests {
         let chunk = state.to_chunk(&end).unwrap();
         assert_eq!(chunk.finish_reason, Some(FinishReason::Stop));
         assert_eq!(chunk.usage.unwrap().completion_tokens, 3);
+    }
+
+    /// A terminal delta reporting only `input_tokens: 0` carries that count:
+    /// it was reported, so it is not estimated; the completion it left out
+    /// stays unreported.
+    #[test]
+    fn stream_state_carries_an_input_only_delta_usage() {
+        let mut state = StreamState::default();
+        let end: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0}}"#,
+        )
+        .unwrap();
+        let usage = state.next_chunk(&end).unwrap().usage.unwrap();
+        assert_eq!(usage.reported_prompt_tokens(), Some(0));
+        assert_eq!(usage.reported_completion_tokens(), None);
     }
 
     #[test]
