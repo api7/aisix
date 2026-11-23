@@ -57,6 +57,12 @@ const CHAT_STREAM = [
   "[DONE]",
 ];
 
+// A full report: nothing to estimate, so the upstream's total stays.
+const CHAT_BODY_REPORTED = {
+  ...CHAT_BODY,
+  usage: { prompt_tokens: 5, completion_tokens: OUT, total_tokens: 5 + OUT },
+};
+
 // Responses shape, served natively.
 const RESPONSE_OBJECT = {
   id: "resp_est_total",
@@ -96,6 +102,7 @@ const COMPLETIONS_BODY = {
 
 type Upstreams = {
   chat: OpenAiUpstream;
+  chatReported: OpenAiUpstream;
   chatStream: OpenAiUpstream;
   responses: OpenAiUpstream;
   responsesStream: OpenAiUpstream;
@@ -107,6 +114,7 @@ type Upstreams = {
  * to Chat Completions). */
 const MODELS: Record<string, { upstream: keyof Upstreams; bridge?: boolean }> = {
   "est-total-chat": { upstream: "chat" },
+  "est-total-chat-reported": { upstream: "chatReported" },
   "est-total-chat-stream": { upstream: "chatStream" },
   "est-total-responses": { upstream: "responses" },
   "est-total-responses-stream": { upstream: "responsesStream" },
@@ -185,6 +193,7 @@ describe("a usage record with an estimated counter carries no total", () => {
     sls = await startMockSls();
     upstreams = {
       chat: await startOpenAiUpstream({ nonStreamBody: CHAT_BODY }),
+      chatReported: await startOpenAiUpstream({ nonStreamBody: CHAT_BODY_REPORTED }),
       chatStream: await startOpenAiUpstream({ streamEvents: CHAT_STREAM }),
       responses: await startOpenAiUpstream({ nonStreamBody: RESPONSE_OBJECT }),
       responsesStream: await startOpenAiUpstream({ streamEvents: RESPONSES_STREAM }),
@@ -237,6 +246,24 @@ describe("a usage record with an estimated counter carries no total", () => {
     await app?.exit();
     await sls?.close();
     for (const u of Object.values(upstreams ?? {})) await u.close();
+  });
+
+  test("control: a fully reported usage keeps the upstream's total", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const res = await call("/v1/chat/completions", {
+      model: "est-total-chat-reported",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const log = await waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (l) => l.get("request_id") === res.requestId,
+      `usage row for ${res.requestId}`,
+      15_000,
+    );
+    expect(log.get("usage_estimated")).toBeUndefined();
+    expect(log.get("prompt_tokens")).toBe("5");
+    expect(log.get("total_tokens")).toBe(String(5 + OUT));
   });
 
   test("/v1/chat/completions, buffered, prompt_tokens absent", async (ctx) => {
