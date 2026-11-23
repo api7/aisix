@@ -703,10 +703,10 @@ async fn dispatch(
             // input-only, so `prompt_tokens == total_tokens` on the OpenAI
             // shape. Providers that report only `total_tokens` (e.g. some
             // rerank/embed backends) get prompt from total — upstream-
-            // authoritative, not an estimate. Only when the upstream
-            // reports nothing at all does the local estimator count the
-            // request `input`. Telemetry only — the response body is
-            // forwarded untouched.
+            // authoritative, not an estimate. A reported count stands, `0`
+            // included; only when the upstream reports neither does the
+            // local estimator count the request `input`, and the client is
+            // told that estimate, as the usage record carries it.
             let (prompt_tokens, usage_estimated) = if let Some(reported) =
                 reported_prompt_tokens(&embed_resp.usage)
             {
@@ -735,6 +735,10 @@ async fn dispatch(
                             |prompt_tokens| crate::token_estimate::CancelledUsage {
                                 usage: aisix_gateway::UsageStats::new(prompt_tokens, 0),
                                 usage_estimated: prompt_tokens > 0,
+                                estimated_counts: aisix_obs::EstimatedCounts {
+                                    prompt: prompt_tokens > 0,
+                                    completion: false,
+                                },
                                 answered_after_ms: None,
                             },
                             || {
@@ -753,6 +757,10 @@ async fn dispatch(
                 };
                 (estimated, estimated > 0)
             };
+            if usage_estimated {
+                embed_resp.usage.prompt_tokens = prompt_tokens;
+                embed_resp.usage.total_tokens = prompt_tokens;
+            }
             // Commit the reservation — release the concurrency permit
             // and finalise RPM. Embeddings do report prompt_tokens via
             // EmbeddingResponse.usage; thread it through so TPM works
@@ -889,9 +897,13 @@ fn emit_access_log(
 /// `total_tokens` from a provider that reports only that (embeddings are
 /// input-only). `None` when it reports neither.
 pub(crate) fn reported_prompt_tokens(usage: &aisix_gateway::EmbeddingUsage) -> Option<u32> {
-    [usage.prompt_tokens, usage.total_tokens]
-        .into_iter()
-        .find(|&n| n > 0)
+    if usage.prompt_reported || usage.prompt_tokens > 0 {
+        Some(usage.prompt_tokens)
+    } else if usage.total_reported || usage.total_tokens > 0 {
+        Some(usage.total_tokens)
+    } else {
+        None
+    }
 }
 
 /// This endpoint's reading of an embeddings body's usage, shared with

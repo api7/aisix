@@ -1655,6 +1655,8 @@ async fn anthropic_passthrough_dispatch(
                 let metrics = AnthropicUsageMetrics {
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
+                    usage_reported: Default::default(),
+                    estimated_counts: usage.estimated_counts,
                     // Anthropic upstream: the cache hit arrives as
                     // `cache_read_input_tokens`, never the OpenAI-shape subset.
                     cached_prompt_tokens: 0,
@@ -1821,8 +1823,8 @@ async fn anthropic_passthrough_dispatch(
         let mut metrics = anthropic_metrics_from_response_json(&json_body);
         // Token-estimation fallback (AISIX-Cloud#1074): an
         // Anthropic-compatible relay may omit `usage` entirely — fill
-        // the missing counters locally before the emit below. The
-        // response body is forwarded verbatim, untouched.
+        // the missing counters locally before the emit below, and tell
+        // the client the same counts.
         fill_missing_anthropic_metrics(
             &mut metrics,
             &upstream_model,
@@ -1838,6 +1840,9 @@ async fn anthropic_passthrough_dispatch(
             Some(attempt_started),
         )
         .await;
+        if metrics.usage_estimated {
+            estimated_usage_into_anthropic_body(&mut json_body, &metrics);
+        }
         crate::quota::commit_answered_attempt(
             reservation,
             member_reservation,
@@ -2106,7 +2111,12 @@ async fn fill_missing_anthropic_metrics(
     rate: impl FnOnce() -> Option<crate::token_estimate::RateCommit>,
     attempt_started: Option<Instant>,
 ) {
-    if metrics.prompt_tokens != 0 && metrics.completion_tokens != 0 {
+    let reported = metrics.usage_reported;
+    if reported.prompt_tokens(metrics.prompt_tokens).is_some()
+        && reported
+            .completion_tokens(metrics.completion_tokens)
+            .is_some()
+    {
         return;
     }
     let est = crate::token_estimate::Estimator::new(
@@ -2125,6 +2135,31 @@ async fn fill_missing_anthropic_metrics(
         metrics.prompt_tokens = filled.prompt_tokens;
         metrics.completion_tokens = filled.completion_tokens;
         metrics.usage_estimated = true;
+        metrics.estimated_counts = filled.counts;
+    }
+}
+
+/// Write the estimate into the `usage` of a Messages body the client reads,
+/// so it reports the counts its usage record carries: a count the upstream
+/// reported stands, one it left out is filled. Anthropic usage has no total.
+fn estimated_usage_into_anthropic_body(body: &mut Value, metrics: &AnthropicUsageMetrics) {
+    let Some(body) = body.as_object_mut() else {
+        return;
+    };
+    let usage = body
+        .entry("usage")
+        .or_insert_with(|| Value::Object(Default::default()));
+    if !usage.is_object() {
+        *usage = Value::Object(Default::default());
+    }
+    let Some(usage) = usage.as_object_mut() else {
+        return;
+    };
+    if metrics.estimated_counts.prompt {
+        usage.insert("input_tokens".into(), metrics.prompt_tokens.into());
+    }
+    if metrics.estimated_counts.completion {
+        usage.insert("output_tokens".into(), metrics.completion_tokens.into());
     }
 }
 
@@ -2215,6 +2250,13 @@ fn anthropic_response_text(body: &Value) -> String {
 /// fields land as zero / empty string.
 fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
     let usage = body.get("usage");
+    let count = |key: &str| {
+        usage
+            .and_then(|u| u.get(key))
+            .and_then(Value::as_u64)
+            .map(|n| n as u32)
+    };
+    let (prompt_tokens, completion_tokens) = (count("input_tokens"), count("output_tokens"));
     AnthropicUsageMetrics {
         usage_estimated: false,
         // Anthropic upstream: see the streaming sibling — no OpenAI-shape subset.
@@ -2227,14 +2269,13 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
         reasoning_tokens: 0,
         upstream_total_tokens: 0,
         reasoning_folded_into_completion: 0,
-        prompt_tokens: usage
-            .and_then(|u| u.get("input_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32,
-        completion_tokens: usage
-            .and_then(|u| u.get("output_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32,
+        prompt_tokens: prompt_tokens.unwrap_or(0),
+        completion_tokens: completion_tokens.unwrap_or(0),
+        usage_reported: aisix_gateway::ReportedCounts {
+            prompt: prompt_tokens.is_some(),
+            completion: completion_tokens.is_some(),
+        },
+        estimated_counts: Default::default(),
         cache_creation_tokens: usage
             .and_then(|u| u.get("cache_creation_input_tokens"))
             .and_then(Value::as_u64)
@@ -2561,6 +2602,8 @@ async fn cross_provider_dispatch(
                 let metrics = AnthropicUsageMetrics {
                     prompt_tokens: comp.prompt_tokens,
                     completion_tokens: comp.completion_tokens,
+                    usage_reported: comp.usage_reported,
+                    estimated_counts: comp.estimated_counts,
                     cached_prompt_tokens: comp.cached_prompt_tokens,
                     cache_write_tokens: comp.cache_write_tokens,
                     modality: comp.modality,
@@ -2696,6 +2739,8 @@ async fn cross_provider_dispatch(
     let mut metrics = AnthropicUsageMetrics {
         prompt_tokens: resp.usage.prompt_tokens,
         completion_tokens: resp.usage.completion_tokens,
+        usage_reported: resp.usage.reported,
+        estimated_counts: Default::default(),
         cached_prompt_tokens: resp.usage.cached_prompt_tokens,
         cache_write_tokens: resp.usage.cache_write_tokens,
         modality: resp.usage.modality,
@@ -2945,6 +2990,7 @@ fn build_anthropic_sse_stream(
                     if let Some(u) = chunk.usage.as_ref().or(chunk.accounting_usage.as_ref()) {
                         comp.prompt_tokens = comp.prompt_tokens.max(u.prompt_tokens);
                         comp.completion_tokens = comp.completion_tokens.max(u.completion_tokens);
+                        comp.usage_reported = comp.usage_reported.or(u.reported);
                         comp.cache_write_tokens = comp.cache_write_tokens.max(u.cache_write_tokens);
                         comp.modality = comp.modality.max_fieldwise(&u.modality);
                         comp.cache_creation_ttl = comp.cache_creation_ttl.max_fieldwise(&u.cache_creation_ttl);
@@ -3028,9 +3074,9 @@ fn build_anthropic_sse_stream(
                             crate::guardrail_stream::release_output_buffer_unscanned(chain.as_ref());
                         }
                         for chunk in held_chunks.drain(..) {
-                            let events = encoder.next_events(&chunk);
+                            let mut events = encoder.next_events(&chunk);
                             if encoder.is_finished() {
-                                guard.count_ahead().await;
+                                guard.estimate_into_closing(&mut encoder, &mut events).await;
                             }
                             for ev in events {
                                 yield Ok::<_, std::io::Error>(downstream_bytes!(guard, ev));
@@ -3045,9 +3091,9 @@ fn build_anthropic_sse_stream(
                         }
                         continue;
                     }
-                    let events = encoder.next_events(&chunk);
+                    let mut events = encoder.next_events(&chunk);
                     if encoder.is_finished() {
-                        guard.count_ahead().await;
+                        guard.estimate_into_closing(&mut encoder, &mut events).await;
                     }
                     for ev in events {
                         yield Ok::<_, std::io::Error>(downstream_bytes!(guard, ev));
@@ -3209,9 +3255,9 @@ fn build_anthropic_sse_stream(
                 }
             }
             for chunk in held_chunks.drain(..) {
-                let events = encoder.next_events(&chunk);
+                let mut events = encoder.next_events(&chunk);
                 if encoder.is_finished() {
-                    guard.count_ahead().await;
+                    guard.estimate_into_closing(&mut encoder, &mut events).await;
                 }
                 for ev in events {
                     yield Ok::<_, std::io::Error>(downstream_bytes!(guard, ev));
@@ -3237,6 +3283,7 @@ fn build_anthropic_sse_stream(
             comp.prompt_tokens = filled.prompt_tokens;
             comp.completion_tokens = filled.completion_tokens;
             comp.usage_estimated = true;
+            comp.estimated_counts = filled.counts;
             encoder.set_estimated_usage(filled.prompt_tokens, filled.completion_tokens);
         }
         if !encoder.is_finished() {
@@ -3336,6 +3383,8 @@ struct AnthropicStreamCompletion {
     reached_end: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
+    usage_reported: aisix_gateway::ReportedCounts,
+    estimated_counts: aisix_obs::EstimatedCounts,
     /// See [`AnthropicUsageMetrics::cached_prompt_tokens`].
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
@@ -3413,8 +3462,8 @@ fn bridged_anthropic_estimate_inputs(
     c: &AnthropicStreamCompletion,
 ) -> crate::token_estimate::EstimateInputs<'_> {
     crate::token_estimate::EstimateInputs {
-        upstream_prompt: c.prompt_tokens,
-        upstream_completion: c.completion_tokens,
+        upstream_prompt: c.usage_reported.prompt_tokens(c.prompt_tokens),
+        upstream_completion: c.usage_reported.completion_tokens(c.completion_tokens),
         output: Some(c.est_output_text.as_str()),
         // The output buffer only grows: its length identifies it.
         output_revision: 0,
@@ -3442,6 +3491,26 @@ impl<F: FnOnce(AnthropicStreamCompletion)> CompleteAnthropicStreamOnDrop<F> {
         }
     }
 
+    /// Count the estimate ahead and write it into the closing pair `events`
+    /// holds, built live by the usage frame that released it, before it is
+    /// sent: the client reads the counts the record gets.
+    async fn estimate_into_closing(
+        &mut self,
+        encoder: &mut aisix_provider_anthropic::wire::AnthropicSseEncoder,
+        events: &mut [aisix_provider_anthropic::wire::AnthropicSseEvent],
+    ) {
+        let Some((_, c)) = &self.slot else {
+            return;
+        };
+        let filled = self
+            .estimate
+            .counted_ahead(bridged_anthropic_estimate_inputs(c))
+            .await;
+        if let Some(filled) = filled.filter(|filled| filled.estimated) {
+            encoder.estimate_into_closing(events, filled.prompt_tokens, filled.completion_tokens);
+        }
+    }
+
     /// Fill the counters the upstream never reported, once.
     fn fill_estimate(&mut self) -> Option<crate::token_estimate::Filled> {
         let (_, c) = self.slot.as_ref()?;
@@ -3459,6 +3528,7 @@ impl<F: FnOnce(AnthropicStreamCompletion)> Drop for CompleteAnthropicStreamOnDro
                 c.prompt_tokens = filled.prompt_tokens;
                 c.completion_tokens = filled.completion_tokens;
                 c.usage_estimated = true;
+                c.estimated_counts = filled.counts;
             }
             f(c);
         }
@@ -3535,6 +3605,9 @@ impl From<ProxyError> for MessagesDispatchError {
 struct AnthropicUsageMetrics {
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// Which of the two counts above the upstream reported.
+    usage_reported: aisix_gateway::ReportedCounts,
+    estimated_counts: aisix_obs::EstimatedCounts,
     /// OpenAI-shape prompt-cache hit — a SUBSET of `prompt_tokens`,
     /// non-zero only on the bridged path where the upstream speaks
     /// OpenAI (AISIX-Cloud#1405). Kept in the upstream's own shape so a
@@ -3604,6 +3677,7 @@ impl AnthropicUsageMetrics {
             cache_read_tokens: self.cache_read_tokens,
             upstream_total_tokens: self.upstream_total_tokens,
             reasoning_folded_into_completion: self.reasoning_folded_into_completion,
+            reported: self.usage_reported,
             ..aisix_gateway::UsageStats::new(self.prompt_tokens, self.completion_tokens)
         }
     }
@@ -3709,6 +3783,7 @@ fn emit_anthropic_usage_event(
         cache_creation_tokens: metrics.cache_creation_tokens,
         cache_read_tokens: metrics.cache_read_tokens,
         usage_estimated: metrics.usage_estimated,
+        estimated_counts: metrics.estimated_counts,
         upstream_latency_ms: crate::attempt::measured_ms(elapsed),
         downstream_latency_ms: metrics.downstream_latency_ms,
         status_code,
@@ -3877,6 +3952,10 @@ struct AnthropicStreamUsage {
     cache_creation_tokens: u32,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     cache_read_tokens: u32,
+    /// True once a `message_start` or `message_delta` carried a numeric
+    /// `input_tokens`.
+    input_tokens_reported: bool,
+    estimated_counts: aisix_obs::EstimatedCounts,
     /// True once a `message_delta` carried a numeric `output_tokens`.
     /// Without it, `completion_tokens` holds only the `message_start`
     /// placeholder floor (often 1) — the token-estimation fallback
@@ -3983,6 +4062,7 @@ fn update_anthropic_usage(
                 }
                 if let Some(t) = usage.get("input_tokens").and_then(Value::as_u64) {
                     acc.prompt_tokens = t as u32;
+                    acc.input_tokens_reported = true;
                 }
                 if let Some(t) = usage
                     .get("cache_creation_input_tokens")
@@ -4089,6 +4169,7 @@ fn update_anthropic_usage(
                 // the message_start values (LiteLLM reads both frames).
                 if let Some(t) = usage.get("input_tokens").and_then(Value::as_u64) {
                     acc.prompt_tokens = acc.prompt_tokens.max(t as u32);
+                    acc.input_tokens_reported = true;
                 }
                 if let Some(t) = usage
                     .get("cache_creation_input_tokens")
@@ -4271,6 +4352,7 @@ impl<F: FnOnce(AnthropicStreamUsage)> AnthropicStreamGuard<F> {
                     usage.prompt_tokens = filled.prompt_tokens;
                     usage.completion_tokens = filled.completion_tokens.max(usage.completion_tokens);
                     usage.usage_estimated = true;
+                    usage.estimated_counts = filled.counts;
                 }
             }
             f(usage);
@@ -4283,13 +4365,11 @@ fn estimate_inputs(
     usage: &AnthropicStreamUsage,
     delivered: u32,
 ) -> crate::token_estimate::EstimateInputs<'_> {
-    let upstream_completion = if delivered > 0 && usage.output_tokens_from_delta {
-        usage.completion_tokens
-    } else {
-        0
-    };
+    let upstream_completion =
+        (delivered > 0 && usage.output_tokens_from_delta).then_some(usage.completion_tokens);
     crate::token_estimate::EstimateInputs {
-        upstream_prompt: usage.prompt_tokens,
+        upstream_prompt: (usage.input_tokens_reported || usage.prompt_tokens > 0)
+            .then_some(usage.prompt_tokens),
         upstream_completion,
         output: (delivered > 0).then_some(usage.est_output_text.as_str()),
         // The output buffer only grows: its length identifies it.

@@ -305,13 +305,15 @@ pub struct OpenAiResponseMessage {
 
 // `#[serde(default)]` at the container level so an upstream that omits
 // any token counter (OpenAI-compatible providers vary on which fields
-// they return) deserializes to 0 instead of failing the whole response
-// body decode with `502 upstream_decode_error` (#474).
+// they return) deserializes instead of failing the whole response body
+// decode with `502 upstream_decode_error` (#474). The prompt and
+// completion counts stay `None` when omitted, apart from a reported `0`:
+// only an omitted count is estimated.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct OpenAiUsage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
     pub total_tokens: u32,
     /// Present on responses that touched the prompt cache. Subset of
     /// `prompt_tokens`. Optional so older API versions / non-cached
@@ -484,8 +486,12 @@ pub fn into_usage(u: OpenAiUsage) -> UsageStats {
     let prompt = u.prompt_tokens_details.as_ref();
     let completion = u.completion_tokens_details.as_ref();
     UsageStats {
-        prompt_tokens: u.prompt_tokens,
-        completion_tokens: u.completion_tokens,
+        prompt_tokens: u.prompt_tokens.unwrap_or(0),
+        completion_tokens: u.completion_tokens.unwrap_or(0),
+        reported: aisix_gateway::ReportedCounts {
+            prompt: u.prompt_tokens.is_some(),
+            completion: u.completion_tokens.is_some(),
+        },
         total_tokens: u.total_tokens,
         // Normalize the cache-hit count into the canonical field for
         // ALL providers (#542): OpenAI nests it under
@@ -1010,25 +1016,19 @@ pub fn embed_response_into(raw: OpenAiEmbedResponse) -> EmbeddingResponse {
 
 /// An OpenAI embeddings `usage` block as [`EmbeddingUsage`].
 pub fn embed_usage_into(usage: Option<OpenAiEmbedUsage>) -> EmbeddingUsage {
-    let (prompt_tokens, total_tokens, source) = match usage {
-        Some(usage) => {
-            let source = if usage.prompt_tokens.is_some() && usage.total_tokens.is_some() {
-                EmbeddingUsageSource::Reported
-            } else {
-                EmbeddingUsageSource::Unavailable
-            };
-            (
-                usage.prompt_tokens.unwrap_or_default(),
-                usage.total_tokens.unwrap_or_default(),
-                source,
-            )
-        }
-        None => (0, 0, EmbeddingUsageSource::Unavailable),
+    let usage = usage.unwrap_or_default();
+    let source = if usage.prompt_tokens.is_some() && usage.total_tokens.is_some() {
+        EmbeddingUsageSource::Reported
+    } else {
+        EmbeddingUsageSource::Unavailable
     };
+    let total_tokens = usage.total_tokens.unwrap_or_default();
     EmbeddingUsage {
-        prompt_tokens,
+        prompt_tokens: usage.prompt_tokens.unwrap_or_default(),
         total_tokens,
         upstream_total_tokens: total_tokens,
+        prompt_reported: usage.prompt_tokens.is_some(),
+        total_reported: usage.total_tokens.is_some(),
         source,
     }
 }

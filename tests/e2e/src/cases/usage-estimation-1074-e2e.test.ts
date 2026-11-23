@@ -66,10 +66,11 @@ const CHAT_STREAM_EVENTS_NO_USAGE = [
 ];
 
 // Chat SSE whose only usage report counts the prompt and leaves the
-// completion at zero.
+// completion out. (A completion reported as `0` is a count, not a gap:
+// usage-estimated-total-e2e pins that it is recorded as reported.)
 const CHAT_STREAM_EVENTS_PROMPT_ONLY_USAGE = [
   ...CHAT_STREAM_EVENTS_NO_USAGE.slice(0, -1),
-  '{"id":"chatcmpl-est-1","object":"chat.completion.chunk","model":"relay-mini","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":0,"total_tokens":5}}',
+  '{"id":"chatcmpl-est-1","object":"chat.completion.chunk","model":"relay-mini","choices":[],"usage":{"prompt_tokens":5,"total_tokens":5}}',
   "[DONE]",
 ];
 const PARTIAL_PROMPT_TOKENS = 5;
@@ -543,7 +544,7 @@ describe("usage estimation e2e (AISIX-Cloud#1074): missing upstream usage is loc
     });
   }, 60_000);
 
-  test("chat SSE with include_usage, upstream counts only the prompt: its prompt is kept and the completion estimated", async (ctx) => {
+  test("chat SSE with include_usage, upstream counts only the prompt and leaves the completion out: its prompt is kept and the completion estimated", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;

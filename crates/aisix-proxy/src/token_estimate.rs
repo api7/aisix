@@ -3,18 +3,18 @@
 //! When an upstream response — streaming or not — carries no `usage`
 //! block, the emit paths fall back to counting tokens locally so usage
 //! events, post-stream TPM/TPD accounting, and metrics record real
-//! numbers instead of silent zeros. Upstream values always win when
-//! non-zero (per-field `or` semantics, matching the reference
-//! stream-rebuild implementations), and any event that carries an
-//! estimated component sets `UsageEvent::usage_estimated`.
+//! numbers instead of silent zeros. A counter the upstream reported
+//! always stands, a reported `0` included: only a counter it left out is
+//! estimated, and any event that carries an estimated component sets
+//! `UsageEvent::usage_estimated`.
 //!
-//! On the bridged `/v1/responses` and `/v1/messages` paths the estimate
+//! Wherever the gateway writes the usage the client reads, the estimate
 //! is ALSO what the client is told, so the caller cannot read a zero
 //! against a bill they cannot reconcile. Those paths fill per counter,
 //! exactly as the record does: a counter the upstream reported stands,
-//! and one it left at zero is filled even when the other arrived in the
-//! same usage block. A total reported beside such a zero no longer adds
-//! up once it is filled, so it is recomputed rather than echoed.
+//! and one it left out is filled even when the other arrived in the
+//! same usage block. A total reported beside such a counter no longer
+//! adds up once it is filled, so it is recomputed rather than echoed.
 //!
 //! Counting follows the OpenAI cookbook message scheme: 3 tokens per
 //! message, +1 per `name`, +3 reply priming, tool definitions rendered
@@ -125,12 +125,14 @@ pub struct Estimator {
 }
 
 /// Outcome of [`fill_missing`]: the (possibly filled) token counts and
-/// whether estimation supplied any non-zero component.
+/// which of them estimation supplied.
 #[derive(Clone, Copy)]
 pub struct Filled {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// Either count was estimated.
     pub estimated: bool,
+    pub counts: aisix_obs::EstimatedCounts,
 }
 
 impl Estimator {
@@ -235,59 +237,72 @@ impl serde::Serialize for ChatMessageProbe<'_> {
     }
 }
 
-/// Per-field `or` fill: upstream values win when non-zero; zeros are
-/// replaced with local counts. `output_text: None` disables the
-/// completion side (nothing was delivered, or nothing was accumulated).
-/// Sub-counters (cache/reasoning) are never estimated.
+impl Filled {
+    /// The upstream's counts, nothing estimated; a count it left out is 0.
+    pub fn reported(upstream_prompt: Option<u32>, upstream_completion: Option<u32>) -> Self {
+        Self {
+            prompt_tokens: upstream_prompt.unwrap_or(0),
+            completion_tokens: upstream_completion.unwrap_or(0),
+            estimated: false,
+            counts: aisix_obs::EstimatedCounts::default(),
+        }
+    }
+}
+
+/// Per-field fill: a count the upstream reported stands as reported, `0`
+/// included; one it left out (`None`) is counted locally. `output_text:
+/// None` disables the completion side (nothing was delivered, or nothing
+/// was accumulated). Sub-counters (cache/reasoning) are never estimated.
 pub fn fill_missing(
     est: &Estimator,
-    upstream_prompt: u32,
-    upstream_completion: u32,
+    upstream_prompt: Option<u32>,
+    upstream_completion: Option<u32>,
     output_text: Option<&str>,
 ) -> Filled {
-    let mut filled = Filled {
-        prompt_tokens: upstream_prompt,
-        completion_tokens: upstream_completion,
-        estimated: false,
-    };
-    if upstream_prompt == 0 {
+    let mut filled = Filled::reported(upstream_prompt, upstream_completion);
+    if upstream_prompt.is_none() {
         let n = est.count_prompt();
         if n > 0 {
             filled.prompt_tokens = n;
-            filled.estimated = true;
+            filled.counts.prompt = true;
         }
     }
-    if upstream_completion == 0 {
+    if upstream_completion.is_none() {
         if let Some(text) = output_text {
             let n = est.count_output(text);
             if n > 0 {
                 filled.completion_tokens = n;
-                filled.estimated = true;
+                filled.counts.completion = true;
             }
         }
     }
+    filled.estimated = filled.counts.prompt || filled.counts.completion;
     filled
 }
 
 /// Whether [`fill_missing`] has anything to tokenize for these counters.
-pub fn needs_counting(upstream_prompt: u32, upstream_completion: u32, has_output: bool) -> bool {
-    upstream_prompt == 0 || (upstream_completion == 0 && has_output)
+pub fn needs_counting(
+    upstream_prompt: Option<u32>,
+    upstream_completion: Option<u32>,
+    has_output: bool,
+) -> bool {
+    upstream_prompt.is_none() || (upstream_completion.is_none() && has_output)
 }
 
 /// An upper bound on the text [`fill_missing`] tokenizes for these inputs.
 fn estimate_bytes(
     est: &Estimator,
-    upstream_prompt: u32,
-    upstream_completion: u32,
+    upstream_prompt: Option<u32>,
+    upstream_completion: Option<u32>,
     output_text: Option<&str>,
 ) -> usize {
-    let prompt_bytes = if upstream_prompt == 0 {
+    let prompt_bytes = if upstream_prompt.is_none() {
         est.prompt_bytes_bound()
     } else {
         0
     };
     let output_bytes = match output_text {
-        Some(text) if upstream_completion == 0 => text.len(),
+        Some(text) if upstream_completion.is_none() => text.len(),
         _ => 0,
     };
     prompt_bytes.saturating_add(output_bytes)
@@ -299,16 +314,12 @@ fn estimate_bytes(
 /// leaving the worker.
 pub async fn fill_missing_pooled(
     est: Estimator,
-    upstream_prompt: u32,
-    upstream_completion: u32,
+    upstream_prompt: Option<u32>,
+    upstream_completion: Option<u32>,
     output_text: Option<String>,
 ) -> Filled {
     if !needs_counting(upstream_prompt, upstream_completion, output_text.is_some()) {
-        return Filled {
-            prompt_tokens: upstream_prompt,
-            completion_tokens: upstream_completion,
-            estimated: false,
-        };
+        return Filled::reported(upstream_prompt, upstream_completion);
     }
     let text_bytes = estimate_bytes(
         &est,
@@ -334,6 +345,7 @@ pub async fn fill_missing_pooled(
 pub(crate) struct CancelledUsage {
     pub usage: aisix_gateway::chat::UsageStats,
     pub usage_estimated: bool,
+    pub estimated_counts: aisix_obs::EstimatedCounts,
     /// How long the attempt took to answer, for a family whose attempt is
     /// settled only after the estimate: the row then says the call reached
     /// its upstream and how long it took, as the settled attempt would.
@@ -356,6 +368,7 @@ impl CancelledUsage {
                 ..upstream
             },
             usage_estimated: filled.estimated,
+            estimated_counts: filled.counts,
             answered_after_ms,
         }
     }
@@ -372,6 +385,8 @@ impl CancelledUsage {
             u.reasoning_folded_into_completion,
             u.upstream_total_tokens,
         );
+        event.reasoning_unfolded_from_completion =
+            u.completion_tokens.saturating_sub(event.completion_tokens);
         event.total_tokens = u.upstream_total_tokens;
         event.cached_prompt_tokens = u.cached_prompt_tokens;
         event.cache_write_tokens = u.cache_write_tokens;
@@ -381,6 +396,7 @@ impl CancelledUsage {
         event.cache_creation_tokens = u.cache_creation_tokens;
         event.cache_read_tokens = u.cache_read_tokens;
         event.usage_estimated = self.usage_estimated;
+        event.estimated_counts = self.estimated_counts;
         if let Some(ms) = self.answered_after_ms {
             event.upstream_latency_ms = ms;
         }
@@ -473,14 +489,12 @@ pub(crate) async fn fill_missing_recorded(
     // attempt only after this count (see `CancelledUsage::answered_after_ms`).
     attempt_started: Option<std::time::Instant>,
 ) -> Filled {
-    let (upstream_prompt, upstream_completion) =
-        (upstream.prompt_tokens, upstream.completion_tokens);
+    let (upstream_prompt, upstream_completion) = (
+        upstream.reported_prompt_tokens(),
+        upstream.reported_completion_tokens(),
+    );
     if !needs_counting(upstream_prompt, upstream_completion, output_text.is_some()) {
-        return Filled {
-            prompt_tokens: upstream_prompt,
-            completion_tokens: upstream_completion,
-            estimated: false,
-        };
+        return Filled::reported(upstream_prompt, upstream_completion);
     }
     let text_bytes = estimate_bytes(
         &est,
@@ -550,20 +564,20 @@ impl<K: PartialEq, V> CountedAhead<K, V> {
     }
 }
 
-/// What one stream estimate counts: the upstream counters (zero where it
-/// reported none) and the delivered output text. The output is identified
+/// What one stream estimate counts: the upstream counters (`None` where
+/// it reported none) and the delivered output text. The output is identified
 /// by its length and a revision: a buffer that only grows is identified by
 /// its length alone (revision 0), and one that can be replaced by other
 /// text bumps the revision on each replacement.
 #[derive(Clone, Copy)]
 pub struct EstimateInputs<'a> {
-    pub upstream_prompt: u32,
-    pub upstream_completion: u32,
+    pub upstream_prompt: Option<u32>,
+    pub upstream_completion: Option<u32>,
     pub output: Option<&'a str>,
     pub output_revision: u32,
 }
 
-type CountKey = (u32, u32, Option<(usize, u32)>);
+type CountKey = (Option<u32>, Option<u32>, Option<(usize, u32)>);
 
 impl EstimateInputs<'_> {
     fn key(&self) -> CountKey {
@@ -1528,22 +1542,23 @@ mod tests {
             "relay-model",
             ChatFormat::new("relay-model", vec![msg(Role::User, "hi")]),
         );
-        let inputs = |completion: u32, output: &'static str, revision: u32| EstimateInputs {
-            upstream_prompt: 0,
-            upstream_completion: completion,
-            output: Some(output),
-            output_revision: revision,
-        };
+        let inputs =
+            |completion: Option<u32>, output: &'static str, revision: u32| EstimateInputs {
+                upstream_prompt: None,
+                upstream_completion: completion,
+                output: Some(output),
+                output_revision: revision,
+            };
         let mut once = StreamEstimate::new(Some(est.clone()));
-        once.count_ahead(inputs(0, "Hello world", 0)).await;
+        once.count_ahead(inputs(None, "Hello world", 0)).await;
 
         // Fill each case from a fresh count made at the same inputs.
         async fn filled(est: &Estimator, later: EstimateInputs<'static>) -> Filled {
             let mut ahead = StreamEstimate::new(Some(est.clone()));
             ahead
                 .count_ahead(EstimateInputs {
-                    upstream_prompt: 0,
-                    upstream_completion: 0,
+                    upstream_prompt: None,
+                    upstream_completion: None,
                     output: Some("Hello world"),
                     output_revision: 0,
                 })
@@ -1551,8 +1566,8 @@ mod tests {
             ahead.fill(later).unwrap()
         }
 
-        let same = filled(&est, inputs(0, "Hello world", 0)).await;
-        let inline = fill_missing(&est, 0, 0, Some("Hello world"));
+        let same = filled(&est, inputs(None, "Hello world", 0)).await;
+        let inline = fill_missing(&est, None, None, Some("Hello world"));
         assert_eq!(
             (same.prompt_tokens, same.completion_tokens, same.estimated),
             (
@@ -1563,24 +1578,24 @@ mod tests {
         );
 
         // More output arrived after the count ahead: it must not stand in.
-        let grown = filled(&est, inputs(0, "Hello world, and then some more", 0)).await;
-        let fresh = fill_missing(&est, 0, 0, Some("Hello world, and then some more"));
+        let grown = filled(&est, inputs(None, "Hello world, and then some more", 0)).await;
+        let fresh = fill_missing(&est, None, None, Some("Hello world, and then some more"));
         assert_eq!(grown.completion_tokens, fresh.completion_tokens);
         assert_ne!(grown.completion_tokens, same.completion_tokens);
 
         // A counter the upstream reported after the count ahead stands.
-        let reported = filled(&est, inputs(7, "Hello world", 0)).await;
+        let reported = filled(&est, inputs(Some(7), "Hello world", 0)).await;
         assert_eq!(reported.completion_tokens, 7);
 
         // Output replaced by other text of the same length.
-        let replaced = filled(&est, inputs(0, "1 2 3 4 5 6", 1)).await;
-        let fresh = fill_missing(&est, 0, 0, Some("1 2 3 4 5 6"));
+        let replaced = filled(&est, inputs(None, "1 2 3 4 5 6", 1)).await;
+        let fresh = fill_missing(&est, None, None, Some("1 2 3 4 5 6"));
         assert_eq!(replaced.completion_tokens, fresh.completion_tokens);
         assert_ne!(replaced.completion_tokens, same.completion_tokens);
 
         // An estimate fills once.
-        assert!(once.fill(inputs(0, "Hello world", 0)).is_some());
-        assert!(once.fill(inputs(0, "Hello world", 0)).is_none());
+        assert!(once.fill(inputs(None, "Hello world", 0)).is_some());
+        assert!(once.fill(inputs(None, "Hello world", 0)).is_none());
     }
 
     #[test]
@@ -2036,44 +2051,80 @@ mod tests {
     }
 
     #[test]
-    fn fill_missing_or_semantics() {
+    fn fill_missing_estimates_only_the_counts_the_upstream_left_out() {
         let est = chat_est(
             "gpt-4",
             ChatFormat::new("gpt-4", vec![msg(Role::User, "Hello")]),
         );
+        let outcome = |f: Filled| (f.prompt_tokens, f.completion_tokens, f.estimated, f.counts);
+        let counts = |prompt, completion| aisix_obs::EstimatedCounts { prompt, completion };
 
         // Upstream reported both: untouched, not estimated.
-        let f = fill_missing(&est, 12, 34, Some("Hello world"));
-        assert_eq!(
-            (f.prompt_tokens, f.completion_tokens, f.estimated),
-            (12, 34, false)
-        );
+        let f = fill_missing(&est, Some(12), Some(34), Some("Hello world"));
+        assert_eq!(outcome(f), (12, 34, false, counts(false, false)));
 
-        // Both missing: both filled.
-        let f = fill_missing(&est, 0, 0, Some("Hello world"));
-        assert_eq!(f.prompt_tokens, 8);
-        assert_eq!(f.completion_tokens, 2);
-        assert!(f.estimated);
+        // A reported `0` is a count like any other: it stands.
+        let f = fill_missing(&est, Some(0), Some(0), Some("Hello world"));
+        assert_eq!(outcome(f), (0, 0, false, counts(false, false)));
+
+        // Both left out: both filled.
+        let f = fill_missing(&est, None, None, Some("Hello world"));
+        assert_eq!(outcome(f), (8, 2, true, counts(true, true)));
 
         // Partial: only the missing side fills.
-        let f = fill_missing(&est, 12, 0, Some("Hello world"));
-        assert_eq!(
-            (f.prompt_tokens, f.completion_tokens, f.estimated),
-            (12, 2, true)
-        );
+        let f = fill_missing(&est, Some(12), None, Some("Hello world"));
+        assert_eq!(outcome(f), (12, 2, true, counts(false, true)));
+        let f = fill_missing(&est, None, Some(0), Some("Hello world"));
+        assert_eq!(outcome(f), (8, 0, true, counts(true, false)));
 
         // No output text (nothing delivered): completion stays 0, prompt fills.
-        let f = fill_missing(&est, 0, 0, None);
-        assert_eq!(
-            (f.prompt_tokens, f.completion_tokens, f.estimated),
-            (8, 0, true)
-        );
+        let f = fill_missing(&est, None, None, None);
+        assert_eq!(outcome(f), (8, 0, true, counts(true, false)));
 
         // Empty output text estimates to 0 — not marked estimated for it.
-        let f = fill_missing(&est, 5, 0, Some(""));
+        let f = fill_missing(&est, Some(5), None, Some(""));
+        assert_eq!(outcome(f), (5, 0, false, counts(false, false)));
+    }
+
+    /// The cancel guard's record of a call whose completion the upstream
+    /// split against its total (reasoning beside the completion) carries the
+    /// split, so the total dropped beside its estimate puts it back together
+    /// like any handler's own record.
+    #[test]
+    fn a_cancelled_record_refolds_a_split_completion_when_its_total_is_dropped() {
+        let upstream = aisix_gateway::chat::UsageStats {
+            prompt_tokens: 0,
+            completion_tokens: 50,
+            reasoning_tokens: 30,
+            reasoning_folded_into_completion: 30,
+            upstream_total_tokens: 58,
+            reported: aisix_gateway::ReportedCounts {
+                prompt: false,
+                completion: true,
+            },
+            ..Default::default()
+        };
+        let filled = Filled {
+            prompt_tokens: 8,
+            completion_tokens: 50,
+            estimated: true,
+            counts: aisix_obs::EstimatedCounts {
+                prompt: true,
+                completion: false,
+            },
+        };
+        let mut event = aisix_obs::UsageEvent::default();
+        CancelledUsage::filled(upstream, filled, None).apply(&mut event);
         assert_eq!(
-            (f.prompt_tokens, f.completion_tokens, f.estimated),
-            (5, 0, false)
+            event.completion_tokens, 20,
+            "recorded as the upstream split it"
+        );
+        assert_eq!(event.reasoning_unfolded_from_completion, 30);
+        event.drop_total_beside_estimate();
+        assert_eq!(event.total_tokens, 0);
+        assert_eq!(
+            event.completion_tokens, 50,
+            "reasoning back inside the completion"
         );
     }
 

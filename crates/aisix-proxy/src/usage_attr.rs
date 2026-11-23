@@ -1136,6 +1136,7 @@ pub(crate) fn emit_usage(
     // streaming one (AISIX-Cloud#1461).
     event.operation = surface.operation.to_string();
     event.is_final_attempt = terminal;
+    event.drop_total_beside_estimate();
     stamp_requested_model_id(&mut event);
     if event.route_target_model_id.is_empty() {
         if let Some(id) = crate::attribution::route_target_model_id(&event.requested_model) {

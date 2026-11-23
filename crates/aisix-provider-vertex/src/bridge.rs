@@ -965,6 +965,8 @@ impl Bridge for VertexBridge {
                     // The upstream reports no total; the one above is the
                     // prompt count, filled for the client.
                     upstream_total_tokens: 0,
+                    prompt_reported: matches!(source, EmbeddingUsageSource::Reported),
+                    total_reported: false,
                     source,
                 },
             })
@@ -3173,10 +3175,12 @@ fn openai_images(images: Vec<GeminiInlineData>, first: usize) -> serde_json::Val
 
 #[derive(Debug, Default, Deserialize)]
 struct GeminiUsageMetadata {
+    /// `None` when omitted, apart from a reported `0`: only an omitted
+    /// count is estimated.
     #[serde(default, rename = "promptTokenCount")]
-    prompt_token_count: u32,
+    prompt_token_count: Option<u32>,
     #[serde(default, rename = "candidatesTokenCount")]
-    candidates_token_count: u32,
+    candidates_token_count: Option<u32>,
     #[serde(default, rename = "totalTokenCount")]
     total_token_count: u32,
     /// Context-cache hits, which Gemini reports as a SUBSET of
@@ -3221,8 +3225,8 @@ impl GeminiUsageMetadata {
     }
 
     fn reports_counts(&self) -> bool {
-        self.prompt_token_count > 0
-            || self.candidates_token_count > 0
+        self.prompt_token_count.is_some()
+            || self.candidates_token_count.is_some()
             || self.total_token_count > 0
             || self.cached_content_token_count > 0
             || self.thoughts_token_count > 0
@@ -3247,8 +3251,10 @@ impl GeminiUsageMetadata {
         // so `candidates` still summing to the total means it has
         // already absorbed the thoughts, and adding them again would
         // bill the thinking twice.
+        let candidates_token_count = self.candidates_token_count.unwrap_or(0);
         let prompt_tokens = self
             .prompt_token_count
+            .unwrap_or(0)
             .saturating_add(self.tool_use_prompt_token_count);
         //
         // `thoughts <= candidates` is part of the test, not a safety
@@ -3262,8 +3268,8 @@ impl GeminiUsageMetadata {
         // outright, dropping the request from Logs and billing with only
         // a warning. Reading it as exclusive is also simply correct.
         let candidates_inclusive = self.total_token_count > 0
-            && prompt_tokens.saturating_add(self.candidates_token_count) == self.total_token_count
-            && self.thoughts_token_count <= self.candidates_token_count;
+            && prompt_tokens.saturating_add(candidates_token_count) == self.total_token_count
+            && self.thoughts_token_count <= candidates_token_count;
         //
         // The fold is client-facing accounting only. The UsageEvent records
         // Gemini's own counters — `candidatesTokenCount` as the completion
@@ -3275,12 +3281,15 @@ impl GeminiUsageMetadata {
         } else {
             self.thoughts_token_count
         };
-        let completion_tokens = self
-            .candidates_token_count
-            .saturating_add(reasoning_folded_into_completion);
+        let completion_tokens =
+            candidates_token_count.saturating_add(reasoning_folded_into_completion);
         UsageStats {
             prompt_tokens,
             completion_tokens,
+            reported: aisix_gateway::ReportedCounts {
+                prompt: self.prompt_token_count.is_some(),
+                completion: self.candidates_token_count.is_some(),
+            },
             total_tokens: prompt_tokens.saturating_add(completion_tokens),
             cached_prompt_tokens: self.cached_content_token_count,
             reasoning_tokens: self.thoughts_token_count,
@@ -4417,6 +4426,34 @@ mod tests {
             resp.more_choices[0].logprobs.as_ref().unwrap()["content"][0]["logprob"],
             0.0
         );
+    }
+
+    /// Counts reported as `0` are a usage report, not a gap to estimate; a
+    /// frame carrying only `serviceTier` still is not one.
+    #[test]
+    fn a_stream_frame_reporting_zero_counts_carries_them() {
+        let frame = |v: serde_json::Value| serde_json::from_value(v).unwrap();
+        let chunks = gemini_chunk_into_chat_chunks(
+            frame(serde_json::json!({
+                "candidates": [{"index": 0, "finishReason": "STOP"}],
+                "usageMetadata": {"promptTokenCount": 0, "candidatesTokenCount": 0}
+            })),
+            "gemini-2.5-flash",
+            &mut GeminiStreamState::default(),
+        );
+        let usage = chunks.iter().find_map(|c| c.usage.as_ref()).unwrap();
+        assert_eq!(usage.reported_prompt_tokens(), Some(0));
+        assert_eq!(usage.reported_completion_tokens(), Some(0));
+
+        let tier_only = gemini_chunk_into_chat_chunks(
+            frame(serde_json::json!({
+                "candidates": [{"index": 0, "content": {"parts": [{"text": "A"}]}}],
+                "usageMetadata": {"serviceTier": "standard"}
+            })),
+            "gemini-2.5-flash",
+            &mut GeminiStreamState::default(),
+        );
+        assert!(tier_only.iter().all(|c| c.usage.is_none()));
     }
 
     #[test]

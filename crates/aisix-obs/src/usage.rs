@@ -212,9 +212,11 @@ pub struct UsageEvent {
 
     /// The upstream's own total token count, verbatim (Gemini
     /// `totalTokenCount`, OpenAI / Responses `usage.total_tokens`, Bedrock
-    /// `totalTokens`); omitted when the upstream reported none. Never a sum
-    /// the gateway computed: cp-api reads `prompt + completion + reasoning
-    /// == total_tokens` as reasoning counted beside the completion.
+    /// `totalTokens`); omitted when the upstream reported none, and on a
+    /// record whose prompt or completion count the gateway estimated
+    /// ([`Self::drop_total_beside_estimate`]). Never a sum the gateway
+    /// computed: cp-api reads `prompt + completion + reasoning ==
+    /// total_tokens` as reasoning counted beside the completion.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub total_tokens: u32,
 
@@ -294,6 +296,12 @@ pub struct UsageEvent {
     /// false is omitted via `skip_serializing_if`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub usage_estimated: bool,
+
+    /// In-process only, never on the wire: which of the prompt and
+    /// completion counts the gateway estimated, for
+    /// [`Self::drop_total_beside_estimate`].
+    #[serde(skip)]
+    pub estimated_counts: EstimatedCounts,
 
     /// Audio length in seconds — the cost basis for models billed by
     /// duration rather than tokens (AISIX-Cloud#1138, api7/aisix#457).
@@ -998,6 +1006,14 @@ fn is_zero_u32(n: &u32) -> bool {
     *n == 0
 }
 
+/// Which of a record's prompt and completion counts the gateway estimated
+/// because the upstream left them out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EstimatedCounts {
+    pub prompt: bool,
+    pub completion: bool,
+}
+
 impl UsageEvent {
     /// The current time in the one `occurred_at` format every emitter
     /// writes. Millisecond precision because the control plane orders a
@@ -1005,6 +1021,41 @@ impl UsageEvent {
     /// seconds tie for everything a request emits.
     pub fn occurred_at_now() -> String {
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    /// Omit the upstream's total from a record carrying an estimated
+    /// counter. That total was reported beside the counter the upstream
+    /// left out, so it no longer adds up to the counts the record carries;
+    /// an omitted total is one the control plane derives itself.
+    ///
+    /// Without a total the control plane reads reasoning as inside the
+    /// completion, so a completion that counted reasoning beside itself
+    /// takes that reasoning in: one the record split against the total is
+    /// put back together, and one the upstream reported beside its
+    /// reasoning — its total equal to its own prompt + completion +
+    /// reasoning, the control plane's rule — absorbs it. An estimated
+    /// completion already counts the reasoning text it was counted from.
+    pub fn drop_total_beside_estimate(&mut self) {
+        if !self.usage_estimated {
+            return;
+        }
+        if self.reasoning_unfolded_from_completion > 0 {
+            self.completion_tokens = self.folded_completion_tokens();
+            self.reasoning_unfolded_from_completion = 0;
+        } else if !self.estimated_counts.completion && self.reasoning_tokens > 0 {
+            let upstream_prompt = if self.estimated_counts.prompt {
+                0
+            } else {
+                u64::from(self.prompt_tokens)
+            };
+            let pc = upstream_prompt + u64::from(self.completion_tokens);
+            let total = u64::from(self.total_tokens);
+            if pc != total && pc + u64::from(self.reasoning_tokens) == total {
+                self.completion_tokens =
+                    self.completion_tokens.saturating_add(self.reasoning_tokens);
+            }
+        }
+        self.total_tokens = 0;
     }
 
     /// The completion count every in-gateway consumer reports — the
@@ -1384,6 +1435,88 @@ impl UsageSink {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_estimated_record_drops_its_total_and_refolds_its_completion() {
+        let mut estimated = UsageEvent {
+            prompt_tokens: 8,
+            completion_tokens: 20,
+            reasoning_tokens: 30,
+            reasoning_unfolded_from_completion: 30,
+            total_tokens: 58,
+            usage_estimated: true,
+            ..UsageEvent::default()
+        };
+        estimated.drop_total_beside_estimate();
+        assert_eq!(estimated.total_tokens, 0);
+        assert_eq!(estimated.completion_tokens, 50);
+        assert_eq!(estimated.reasoning_unfolded_from_completion, 0);
+        assert!(!estimated.reasoning_beside_completion());
+
+        let mut reported = UsageEvent {
+            prompt_tokens: 8,
+            completion_tokens: 20,
+            reasoning_tokens: 30,
+            reasoning_unfolded_from_completion: 30,
+            total_tokens: 58,
+            ..UsageEvent::default()
+        };
+        reported.drop_total_beside_estimate();
+        assert_eq!(reported.total_tokens, 58);
+        assert_eq!(reported.completion_tokens, 20);
+    }
+
+    /// An upstream that counted reasoning beside its completion — its total
+    /// equal to its own prompt + completion + reasoning — and left the
+    /// prompt out: once the total is dropped the control plane reads
+    /// reasoning as inside the completion, so the completion takes it in.
+    #[test]
+    fn an_estimated_record_folds_reasoning_reported_beside_its_completion() {
+        let additive = |estimated_counts| UsageEvent {
+            prompt_tokens: 8,
+            completion_tokens: 20,
+            reasoning_tokens: 30,
+            total_tokens: 50,
+            usage_estimated: true,
+            estimated_counts,
+            ..UsageEvent::default()
+        };
+        let mut prompt_estimated = additive(EstimatedCounts {
+            prompt: true,
+            completion: false,
+        });
+        prompt_estimated.drop_total_beside_estimate();
+        assert_eq!(prompt_estimated.total_tokens, 0);
+        assert_eq!(prompt_estimated.completion_tokens, 50);
+        assert_eq!(prompt_estimated.reasoning_tokens, 30);
+
+        // An estimated completion was counted from text that includes the
+        // reasoning: nothing to fold.
+        let mut completion_estimated = additive(EstimatedCounts {
+            prompt: true,
+            completion: true,
+        });
+        completion_estimated.drop_total_beside_estimate();
+        assert_eq!(completion_estimated.completion_tokens, 20);
+
+        // Reasoning inside the completion (total = prompt + completion):
+        // nothing to fold.
+        let mut inclusive = UsageEvent {
+            prompt_tokens: 8,
+            completion_tokens: 40,
+            reasoning_tokens: 30,
+            total_tokens: 40,
+            usage_estimated: true,
+            estimated_counts: EstimatedCounts {
+                prompt: true,
+                completion: false,
+            },
+            ..UsageEvent::default()
+        };
+        inclusive.drop_total_beside_estimate();
+        assert_eq!(inclusive.completion_tokens, 40);
+        assert_eq!(inclusive.total_tokens, 0);
+    }
     /// A Gemini thinking call whose thoughts sit beside the candidates.
     fn gemini_additive() -> UsageEvent {
         UsageEvent {

@@ -688,6 +688,47 @@ pub struct UsageStats {
     /// the same reason as `modality`.
     #[serde(skip)]
     pub openai_details: OpenAiUsageDetails,
+    /// Which of the prompt and completion counts the upstream's usage
+    /// carried, a reported `0` included. Not serialized, for the same
+    /// reason as `modality`.
+    #[serde(skip)]
+    pub reported: ReportedCounts,
+}
+
+/// Whether the upstream's usage carried its prompt and completion counts.
+/// Only a count the upstream left out is estimated: one it reported stands
+/// as reported, `0` included. A non-zero count is reported whatever the
+/// flag says, so only a decoder that can see a reported `0` sets it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReportedCounts {
+    pub prompt: bool,
+    pub completion: bool,
+}
+
+impl ReportedCounts {
+    pub const BOTH: Self = Self {
+        prompt: true,
+        completion: true,
+    };
+
+    /// `prompt_tokens` as the upstream reported it, `None` when it left
+    /// the count out.
+    pub fn prompt_tokens(self, prompt_tokens: u32) -> Option<u32> {
+        (self.prompt || prompt_tokens > 0).then_some(prompt_tokens)
+    }
+
+    /// `completion_tokens` as the upstream reported it, `None` when it
+    /// left the count out.
+    pub fn completion_tokens(self, completion_tokens: u32) -> Option<u32> {
+        (self.completion || completion_tokens > 0).then_some(completion_tokens)
+    }
+
+    pub fn or(self, other: Self) -> Self {
+        Self {
+            prompt: self.prompt || other.prompt,
+            completion: self.completion || other.completion,
+        }
+    }
 }
 
 /// Prompt-cache writes by cache lifetime, as the upstream reported them,
@@ -1129,6 +1170,18 @@ pub fn merge_stream_upstream_total(acc: &mut Option<u32>, frame_total: u32) {
 }
 
 impl UsageStats {
+    /// `prompt_tokens` as the upstream reported it, `None` when it left
+    /// the count out.
+    pub fn reported_prompt_tokens(&self) -> Option<u32> {
+        self.reported.prompt_tokens(self.prompt_tokens)
+    }
+
+    /// `completion_tokens` as the upstream reported it, `None` when it
+    /// left the count out.
+    pub fn reported_completion_tokens(&self) -> Option<u32> {
+        self.reported.completion_tokens(self.completion_tokens)
+    }
+
     pub fn new(prompt: u32, completion: u32) -> Self {
         Self {
             prompt_tokens: prompt,
@@ -1219,6 +1272,7 @@ impl UsageStats {
                 .cache_creation_ttl
                 .saturating_add(&other.cache_creation_ttl),
             openai_details: self.openai_details.saturating_add(&other.openai_details),
+            reported: self.reported.or(other.reported),
         }
     }
 
@@ -1259,6 +1313,7 @@ impl UsageStats {
                 .cache_creation_ttl
                 .max_fieldwise(&other.cache_creation_ttl),
             openai_details: self.openai_details.max_fieldwise(&other.openai_details),
+            reported: self.reported.or(other.reported),
         }
     }
 
@@ -1776,6 +1831,13 @@ pub struct EmbeddingUsage {
     /// [`UsageStats::upstream_total_tokens`].
     #[serde(skip)]
     pub upstream_total_tokens: u32,
+    /// Whether the upstream reported the prompt count and the total, a
+    /// reported `0` included. Only a usage that reported neither is
+    /// estimated.
+    #[serde(skip)]
+    pub prompt_reported: bool,
+    #[serde(skip)]
+    pub total_reported: bool,
     /// Internal provenance for telemetry. Client embedding response bodies
     /// retain their established OpenAI-compatible `usage` shape.
     #[serde(skip)]
@@ -2404,6 +2466,10 @@ mod tests {
                 rejected_prediction_tokens: Some(0),
                 ..OpenAiUsageDetails::default()
             },
+            reported: ReportedCounts {
+                prompt: true,
+                completion: false,
+            },
         };
         let b = UsageStats {
             prompt_tokens: 20,
@@ -2429,8 +2495,13 @@ mod tests {
                 prompt_text_tokens: Some(7),
                 ..OpenAiUsageDetails::default()
             },
+            reported: ReportedCounts {
+                prompt: false,
+                completion: true,
+            },
         };
         let sum = a.saturating_add(&b);
+        assert_eq!(sum.reported, ReportedCounts::BOTH);
         assert_eq!(
             sum.openai_details,
             OpenAiUsageDetails {
