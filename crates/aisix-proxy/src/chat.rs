@@ -2829,9 +2829,8 @@ async fn dispatch(
                 // replays zeros — fill them like the fresh-response path
                 // so hit rows (and their saved-token stats) don't record
                 // silent zeros.
-                // Not kept by every cache backend (see `UsageStats`): a hit
-                // read back from Redis takes a `0` its upstream reported as
-                // left out, and estimates it.
+                // Every backend keeps which counts the upstream reported, so
+                // a reported `0` stands here as it did on the miss.
                 let reported = cached.usage.reported;
                 let (prompt, completion, total, usage_estimated, estimated_counts) =
                     if reported.prompt_tokens(prompt as u32).is_none()

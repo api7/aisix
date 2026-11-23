@@ -13,6 +13,13 @@
 use aisix_gateway::{ChatFormat, ChatMessage, Role};
 use std::hash::{Hash, Hasher};
 
+/// Version of the stored entry's serialized form, hashed into every key and
+/// scope fingerprint. Bump it whenever that form changes: an entry another
+/// release wrote under the old form is then never looked up — a miss on
+/// every backend — instead of failing to decode or decoding with a field
+/// defaulted.
+const ENTRY_FORMAT: u32 = 2;
+
 /// Stable fingerprint of a chat request — the inputs to the upstream call.
 /// We hash this struct (not the whole `ChatFormat`) so caching policy is
 /// explicit about what counts as "the same request".
@@ -110,6 +117,7 @@ impl CacheKey {
     /// [`CacheKey::scope_fingerprint`] so the two can never disagree on
     /// which fields scope an entry.
     fn hash_scope<H: Hasher>(&self, state: &mut H) {
+        ENTRY_FORMAT.hash(state);
         self.model.hash(state);
         self.temperature_milli.hash(state);
         self.top_p_milli.hash(state);

@@ -689,9 +689,9 @@ pub struct UsageStats {
     #[serde(skip)]
     pub openai_details: OpenAiUsageDetails,
     /// Which of the prompt and completion counts the upstream's usage
-    /// carried, a reported `0` included. Not serialized, for the same
-    /// reason as `modality`.
-    #[serde(skip)]
+    /// carried, a reported `0` included. Serialized, unlike `modality`: a
+    /// cache hit estimates from it, so a cached entry must keep it. Adding it
+    /// changed the cached form, hence `aisix_cache`'s entry-format version.
     pub reported: ReportedCounts,
 }
 
@@ -699,7 +699,8 @@ pub struct UsageStats {
 /// Only a count the upstream left out is estimated: one it reported stands
 /// as reported, `0` included. A non-zero count is reported whatever the
 /// flag says, so only a decoder that can see a reported `0` sets it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReportedCounts {
     pub prompt: bool,
     pub completion: bool,
@@ -2344,6 +2345,23 @@ mod tests {
         assert!(!json.contains("modality"), "{json}");
         let back: UsageStats = serde_json::from_str(&json).unwrap();
         assert!(back.modality.is_empty());
+    }
+
+    /// A cache hit estimates only the counts the stored usage left out, so
+    /// the cached form keeps a reported `0` apart from a missing count.
+    #[test]
+    fn reported_counts_survive_the_cached_form() {
+        let u = UsageStats {
+            reported: ReportedCounts {
+                prompt: true,
+                completion: false,
+            },
+            ..UsageStats::new(0, 0)
+        };
+        let back: UsageStats = serde_json::from_str(&serde_json::to_string(&u).unwrap()).unwrap();
+        assert_eq!(back.reported, u.reported);
+        assert_eq!(back.reported_prompt_tokens(), Some(0));
+        assert_eq!(back.reported_completion_tokens(), None);
     }
 
     #[test]
