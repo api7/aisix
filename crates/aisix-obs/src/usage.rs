@@ -212,9 +212,11 @@ pub struct UsageEvent {
 
     /// The upstream's own total token count, verbatim (Gemini
     /// `totalTokenCount`, OpenAI / Responses `usage.total_tokens`, Bedrock
-    /// `totalTokens`); omitted when the upstream reported none. Never a sum
-    /// the gateway computed: cp-api reads `prompt + completion + reasoning
-    /// == total_tokens` as reasoning counted beside the completion.
+    /// `totalTokens`); omitted when the upstream reported none, and on a
+    /// record whose prompt or completion count the gateway estimated
+    /// ([`Self::drop_total_beside_estimate`]). Never a sum the gateway
+    /// computed: cp-api reads `prompt + completion + reasoning ==
+    /// total_tokens` as reasoning counted beside the completion.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub total_tokens: u32,
 
@@ -1005,6 +1007,16 @@ impl UsageEvent {
     /// seconds tie for everything a request emits.
     pub fn occurred_at_now() -> String {
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    /// Omit the upstream's total from a record carrying an estimated
+    /// counter. That total was reported beside the counter the upstream
+    /// left at zero, so it no longer adds up to the counts the record
+    /// carries; an omitted total is one the control plane derives itself.
+    pub fn drop_total_beside_estimate(&mut self) {
+        if self.usage_estimated {
+            self.total_tokens = 0;
+        }
     }
 
     /// The completion count every in-gateway consumer reports — the
