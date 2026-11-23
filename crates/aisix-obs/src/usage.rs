@@ -1013,9 +1013,14 @@ impl UsageEvent {
     /// counter. That total was reported beside the counter the upstream
     /// left at zero, so it no longer adds up to the counts the record
     /// carries; an omitted total is one the control plane derives itself.
+    /// Without a total the control plane reads reasoning as inside the
+    /// completion, so a completion the record split against that total is
+    /// put back together.
     pub fn drop_total_beside_estimate(&mut self) {
         if self.usage_estimated {
             self.total_tokens = 0;
+            self.completion_tokens = self.folded_completion_tokens();
+            self.reasoning_unfolded_from_completion = 0;
         }
     }
 
@@ -1396,6 +1401,36 @@ impl UsageSink {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_estimated_record_drops_its_total_and_refolds_its_completion() {
+        let mut estimated = UsageEvent {
+            prompt_tokens: 8,
+            completion_tokens: 20,
+            reasoning_tokens: 30,
+            reasoning_unfolded_from_completion: 30,
+            total_tokens: 58,
+            usage_estimated: true,
+            ..UsageEvent::default()
+        };
+        estimated.drop_total_beside_estimate();
+        assert_eq!(estimated.total_tokens, 0);
+        assert_eq!(estimated.completion_tokens, 50);
+        assert_eq!(estimated.reasoning_unfolded_from_completion, 0);
+        assert!(!estimated.reasoning_beside_completion());
+
+        let mut reported = UsageEvent {
+            prompt_tokens: 8,
+            completion_tokens: 20,
+            reasoning_tokens: 30,
+            reasoning_unfolded_from_completion: 30,
+            total_tokens: 58,
+            ..UsageEvent::default()
+        };
+        reported.drop_total_beside_estimate();
+        assert_eq!(reported.total_tokens, 58);
+        assert_eq!(reported.completion_tokens, 20);
+    }
     /// A Gemini thinking call whose thoughts sit beside the candidates.
     fn gemini_additive() -> UsageEvent {
         UsageEvent {

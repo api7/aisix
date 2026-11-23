@@ -20,10 +20,10 @@ import {
 // total no longer adds up to the counts the usage record carries.
 //
 // Contract pinned here, on every inbound protocol and both response modes:
-//
-//   usage record  → `usage_estimated: true` and NO `total_tokens` — the
-//                   control plane derives a total for a record without one
-//   client        → a total that adds up: estimated prompt + N
+// the usage record carries `usage_estimated: true` and NO `total_tokens` —
+// the control plane derives a total for a record without one. Where the
+// endpoint hands the client the estimate, the client's counters are the
+// record's and its total adds up: estimated prompt + N.
 //
 // The record is read off a metadata-only SLS exporter, which serializes the
 // usage event field for field (a field the event omits is absent there).
