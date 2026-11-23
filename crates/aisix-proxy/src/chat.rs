@@ -1203,10 +1203,11 @@ async fn estimate_missing_chat_usage(
 /// not corrected downward.
 ///
 /// The chat stream's `include_usage` frame, the bridged `/v1/messages`
-/// exits, every `/v1/responses` exit (native and bridged) and
-/// `/v1/completions` fill the same way, for the same reason. The native
-/// `/v1/messages` passthrough and `/v1/embeddings` still relay the
-/// provider's usage as it reported it.
+/// exits, the buffered native `/v1/messages` passthrough, every
+/// `/v1/responses` exit (native and bridged), `/v1/completions` and
+/// `/v1/embeddings` fill the same way, for the same reason. Only the native
+/// `/v1/messages` stream still relays the provider's usage as it reported
+/// it.
 fn apply_estimated_usage(
     usage: &mut aisix_gateway::chat::UsageStats,
     prompt_tokens: u32,

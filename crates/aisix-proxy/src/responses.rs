@@ -2191,15 +2191,15 @@ async fn responses_to_target(
         // emission. Pulled here (before the response is moved into
         // `Json::into_response`) so the success struct can carry
         // typed counters rather than re-parsing JSON downstream.
-        // Token-estimation fallback (AISIX-Cloud#1074): a body with zero or
-        // missing usage fills the counters locally — telemetry only, the
-        // response body is forwarded untouched. A body with no `usage`
-        // object at all becomes a wholly-estimated record instead of None.
+        // Token-estimation fallback (AISIX-Cloud#1074): a count the body's
+        // usage leaves out is filled locally, in the record and in the body
+        // the client reads. A body with no `usage` object at all becomes a
+        // wholly-estimated record instead of None.
         let usage = {
             let mut u = extract_response_usage(&json_body).unwrap_or_default();
-            // `extract_response_usage` returns None on a body with no usable
-            // `usage` block, and the estimation fallback below then works off
-            // a default — which would drop a perfectly good top-level `id`
+            // `extract_response_usage` returns None on a body with no `usage`
+            // object, and the estimation fallback below then works off a
+            // default — which would drop a perfectly good top-level `id`
             // (AISIX-Cloud#1289).
             if u.provider_request_id.is_empty() {
                 u.provider_request_id = crate::usage_attr::provider_response_id(&json_body);
@@ -6845,8 +6845,8 @@ mod tests {
         assert_ne!(ev.request_id, ev.provider_request_id);
     }
 
-    /// AISIX-Cloud#1289 follow-up: `extract_response_usage` gates on a usable
-    /// `usage.input_tokens` and returns `None` without one, so the estimation
+    /// AISIX-Cloud#1289 follow-up: `extract_response_usage` returns `None` for
+    /// a body without a `usage` object, so the estimation
     /// fallback (AISIX-Cloud#1074) works off a defaulted `ResponseUsage` — and
     /// used to drop a perfectly good top-level `id` with it. The estimated
     /// record must still name the upstream call it came from. Fails before the
