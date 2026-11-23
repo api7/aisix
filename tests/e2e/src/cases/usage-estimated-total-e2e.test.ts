@@ -6,6 +6,7 @@ import {
   SeedClient,
   spawnApp,
   startMockSls,
+  slsLogsFor,
   startOpenAiUpstream,
   waitConfigPropagation,
   waitForSlsLog,
@@ -122,6 +123,13 @@ const EMBEDDINGS_NO_USAGE = {
   data: [{ object: "embedding", index: 0, embedding: [0.11, -0.22] }],
 };
 
+// A completion left out beside reasoning the upstream counted outside it:
+// 10 + 2 + 3 = 15, where 2 is what "Hello world" estimates to.
+const COMPLETION_LEFT_OUT_BESIDE_REASONING = {
+  ...chatBody({}),
+  usage: { prompt_tokens: 10, total_tokens: 15, completion_tokens_details: { reasoning_tokens: 3 } },
+};
+
 /** The usage each upstream returns, by the shape its endpoint speaks. */
 const PROMPT_LEFT_OUT = { completion_tokens: OUT, total_tokens: OUT };
 const PROMPT_ZERO = { prompt_tokens: 0, completion_tokens: OUT, total_tokens: OUT };
@@ -158,7 +166,9 @@ const MODELS: Record<string, { served: Served; provider?: string; bridge?: boole
   "est-anth-zero": { served: { nonStreamBody: ANTHROPIC_BODY_INPUT_ZERO }, provider: "anthropic" },
   "est-anth-absent": { served: { nonStreamBody: ANTHROPIC_BODY_INPUT_LEFT_OUT }, provider: "anthropic" },
   "est-embed-absent": { served: { nonStreamBody: EMBEDDINGS_NO_USAGE } },
+  "est-ens-member": { served: { nonStreamBody: COMPLETION_LEFT_OUT_BESIDE_REASONING } },
 };
+const ENSEMBLE = "est-ens-reasoning";
 
 function sseFrames(text: string): Array<Record<string, any>> {
   const frames: Array<Record<string, any>> = [];
@@ -299,7 +309,19 @@ describe("estimated usage counts only what the upstream left out", () => {
 
     // Caller key last: it authenticating implies the whole seed set is in
     // the snapshot (tests/e2e/AGENTS.md).
-    await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: Object.keys(MODELS) });
+    await seed.createModel({
+      display_name: ENSEMBLE,
+      ensemble: {
+        panel: [{ model: "est-ens-member" }],
+        judge: { model: "est-ens-member" },
+        min_responses: 1,
+      },
+    });
+
+    await seed.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: [...Object.keys(MODELS), ENSEMBLE],
+    });
     const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
   });
@@ -411,6 +433,27 @@ describe("estimated usage counts only what the upstream left out", () => {
       const prompt = Number(log.get("prompt_tokens") ?? "0");
       expect(prompt).toBeGreaterThan(0);
       expect(usage).toEqual({ prompt_tokens: prompt, total_tokens: prompt });
+    });
+
+    test("ensemble panel and judge rows keep an estimated completion beside reasoning", async (ctx) => {
+      if (!etcdReachable || !app) return ctx.skip();
+      const res = await call("/v1/chat/completions", chatRequest(ENSEMBLE));
+      const deadline = Date.now() + 15_000;
+      let rows: Array<Map<string, string>> = [];
+      while (Date.now() < deadline) {
+        rows = slsLogsFor(sls!, LOGSTORE).filter((l) => l.get("request_id") === res.requestId);
+        if (rows.some((r) => r.get("attempt_kind") === "judge") && rows.some((r) => r.get("attempt_kind") === "panel")) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      for (const kind of ["panel", "judge"]) {
+        const row = rows.find((r) => r.get("attempt_kind") === kind);
+        expect(row, `${kind} row`).toBeDefined();
+        expect(row!.get("usage_estimated")).toBe("true");
+        expect(row!.get("prompt_tokens")).toBe("10");
+        expect(row!.get("reasoning_tokens")).toBe("3");
+        expect(row!.get("completion_tokens")).toBe(String(OUT));
+        expect(row!.get("total_tokens")).toBeUndefined();
+      }
     });
 
     test("/v1/completions", async (ctx) => {
