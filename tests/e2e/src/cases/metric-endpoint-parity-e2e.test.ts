@@ -52,6 +52,7 @@ interface Row {
   name: string;
   /** The metric `endpoint` label the route records under. */
   endpoint: string;
+  protocols?: { inbound_protocol: string; upstream_protocol: string };
   /** The model the row's model-keyed families attribute to, if any. */
   model?: string;
   families: Family[];
@@ -405,6 +406,21 @@ describe("every proxy route emits every per-request metric family", () => {
 
   const jobsModel = { "x-aisix-model": "par-jobs" };
 
+  const geminiCalls = [
+    { route: "/v1beta/models/*model_action", modelPath: "/v1beta/models/par-chat" },
+    {
+      route: "/v1beta1/projects/:project/locations/:location/publishers/google/models/*model_action",
+      modelPath: "/v1beta1/projects/local/locations/us-central1/publishers/google/models/par-chat",
+    },
+  ].flatMap(({ route, modelPath }) =>
+    ["generateContent", "streamGenerateContent"].map((action) => ({
+      route,
+      path: `${modelPath}:${action}`,
+      endpoint: `/v1beta/models/:model:${action}`,
+      stream: action === "streamGenerateContent",
+    })),
+  );
+
   const ROWS: Row[] = [
     { route: "/v1/models", name: "GET /v1/models", endpoint: "/v1/models", families: [...REQUEST], drive: async () => void (await expectCall("/v1/models")) },
     {
@@ -424,6 +440,17 @@ describe("every proxy route emits every per-request metric family", () => {
       drive: async () =>
         void (await postJson("/v1/chat/completions", { model: "par-chat", stream: true, stream_options: { include_usage: true }, messages: [{ role: "user", content: "hi" }] })),
     },
+    ...geminiCalls.map(({ route, path, endpoint, stream }): Row => ({
+      route,
+      name: path,
+      endpoint,
+      protocols: { inbound_protocol: "gemini", upstream_protocol: "openai" },
+      model: "par-chat",
+      families: stream ? [...MODEL_ROUTE, "tokens", "ttft"] : [...MODEL_ROUTE, "tokens"],
+      drive: async () => void (await postJson(stream ? `${path}?alt=sse` : path, {
+        contents: [{ role: "user", parts: [{ text: "hi" }] }],
+      })),
+    })),
     {
       route: "/v1/completions",
       name: "completions",
@@ -850,6 +877,7 @@ describe("every proxy route emits every per-request metric family", () => {
   const AUTH_ROUTES: Array<[string, string, string]> = [
     ["GET", "/v1/models", "/v1/models"],
     ["POST", "/v1/chat/completions", "/v1/chat/completions"],
+    ...geminiCalls.map(({ path, endpoint }): [string, string, string] => ["POST", path, endpoint]),
     ["POST", "/v1/completions", "/v1/completions"],
     ["POST", "/v1/embeddings", "/v1/embeddings"],
     ["POST", "/v1/images/generations", "/v1/images/generations"],
@@ -944,11 +972,12 @@ describe("every proxy route emits every per-request metric family", () => {
   function moved(row: Row, family: Family, before: MetricSample[], after: MetricSample[]): number {
     const d = (name: string, want: Record<string, string>) => metricDelta(before, after, name, want);
     const ep = { endpoint: row.endpoint };
+    const protocolLabels = { ...ep, ...row.protocols };
     switch (family) {
       case "proxy_requests":
-        return d("aisix_proxy_requests_total", ep);
+        return d("aisix_proxy_requests_total", protocolLabels);
       case "llm_requests":
-        return d("aisix_llm_requests_total", ep);
+        return d("aisix_llm_requests_total", protocolLabels);
       case "e2e_downstream":
         return d("aisix_request_e2e_latency_seconds_count", { ...ep, side: "downstream" });
       case "e2e_upstream":
@@ -956,12 +985,12 @@ describe("every proxy route emits every per-request metric family", () => {
       case "ttft":
         return Math.min(
           d("aisix_request_ttft_seconds_count", { ...ep, side: "upstream" }),
-          d("aisix_llm_time_to_first_token_seconds_count", { ...ep, side: "upstream" }),
+          d("aisix_llm_time_to_first_token_seconds_count", { ...protocolLabels, side: "upstream" }),
         );
       case "tokens": {
         const model = { model: row.model ?? "" };
         return Math.min(
-          d("aisix_llm_input_tokens_total", ep),
+          d("aisix_llm_input_tokens_total", protocolLabels),
           d("aisix_tokens_consumed_total", model),
           d("aisix_llm_tokens_by_client_total", model),
         );
