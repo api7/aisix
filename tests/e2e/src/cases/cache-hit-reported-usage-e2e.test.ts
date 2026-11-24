@@ -145,28 +145,23 @@ describe("cache hits preserve reported usage", () => {
   let sls: MockSls | undefined;
   let embed: { baseUrl: string; close(): Promise<void> } | undefined;
   const upstreams: OpenAiUpstream[] = [];
-  let ready = false;
-  let vectorReady = false;
+  let vector: boolean | null = null;
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
     if (!(await etcd.ping())) return;
     // The semantic layer on Redis needs the vector query engine (redis:8+,
     // what CI provisions); the exact layer runs on any reachable Redis.
-    const vector = await redisVectorSupport(REDIS_URL);
+    vector = await redisVectorSupport(REDIS_URL);
     // CI provisions a vector-capable Redis: anything else there is a broken
     // prerequisite, not a reason to pass with nothing asserted.
     if (onCI() && vector !== true) {
       throw new Error("AISIX_E2E_REDIS must point to a reachable, vector-capable Redis on CI");
     }
-    if (vector === null) return;
-    vectorReady = vector;
-
     sls = await startMockSls();
-    embed = await startEmbeddingMock();
     app = await spawnApp({
       exposeDebugHeaders: true,
-      extra: { cache: { backend: "memory", redis: { url: REDIS_URL } } },
+      extra: vector === null ? {} : { cache: { backend: "memory", redis: { url: REDIS_URL } } },
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-ak-id",
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-ak-secret",
@@ -183,22 +178,25 @@ describe("cache hits preserve reported usage", () => {
       credential_ref: CREDENTIAL_REF,
       content_mode: "metadata_only",
     });
-    const embedPk = await seed.createProviderKey({
-      display_name: "cache-hit-usage-embed-pk",
-      api_key: "sk-mock",
-      api_base: `${embed.baseUrl}/v1`,
-    });
-    await seed.createModel({
-      display_name: "cache-hit-usage-embed",
-      provider: "openai",
-      model_name: "embed-mock",
-      provider_key_id: embedPk.id,
-      embedding: { dimensions: 4, normalize: true },
-    });
+    if (vector) {
+      embed = await startEmbeddingMock();
+      const embedPk = await seed.createProviderKey({
+        display_name: "cache-hit-usage-embed-pk",
+        api_key: "sk-mock",
+        api_base: `${embed.baseUrl}/v1`,
+      });
+      await seed.createModel({
+        display_name: "cache-hit-usage-embed",
+        provider: "openai",
+        model_name: "embed-mock",
+        provider_key_id: embedPk.id,
+        embedding: { dimensions: 4, normalize: true },
+      });
+    }
     // A non-OpenAI upstream model name, so the estimator's fallback
     // encoding applies.
     for (const [display, { usage, backend, semantic }] of Object.entries(MODELS)) {
-      if (semantic && !vectorReady) continue;
+      if ((backend !== "memory" && vector === null) || (semantic && !vector)) continue;
       const upstream = await startOpenAiUpstream({ nonStreamBody: chatBody(usage) });
       upstreams.push(upstream);
       const pk = await seed.createProviderKey({
@@ -227,7 +225,6 @@ describe("cache hits preserve reported usage", () => {
     await seed.createApiKey({ key_hash: CALLER_KEY_HASH, allowed_models: ["*"] });
     const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
-    ready = true;
   });
 
   afterAll(async () => {
@@ -292,7 +289,7 @@ describe("cache hits preserve reported usage", () => {
   for (const layer of ["exact", "semantic"] as const) {
     const prefix = layer === "exact" ? "hit-exact" : "hit-sem";
 
-    const runs = () => ready && (layer === "exact" || vectorReady);
+    const runs = () => layer === "exact" ? vector !== null : vector === true;
 
     test(`${layer} hit: a reported prompt_tokens 0 stands`, async (ctx) => {
       if (!runs()) return ctx.skip();
@@ -330,7 +327,7 @@ describe("cache hits preserve reported usage", () => {
   }
 
   test("in-process hit: usage details, modality and cache-write lifetimes match the fresh response", async (ctx) => {
-    if (!ready) return ctx.skip();
+    if (!app) return ctx.skip();
     await expectBreakdownsKept("hit-memory-details", "exact");
   });
 });

@@ -613,6 +613,16 @@ mod tests {
     }
 
     #[test]
+    fn both_fingerprints_isolate_entries_written_in_the_unversioned_format() {
+        let r = req("m", vec![ChatMessage::user("hi")], None);
+        let key = CacheKey::from_request(&r).with_scope("p", 0, None);
+
+        // Fingerprints written for this request by the unversioned gateway at 1e5bc7b9.
+        assert_ne!(key.fingerprint(), "d09ac371b3e2af56");
+        assert_ne!(key.scope_fingerprint(), "bbe63c139f8f6e07");
+    }
+
+    #[test]
     fn api_key_scope_isolates_callers_env_scope_shares() {
         let r = req("m", vec![ChatMessage::user("hi")], None);
         let a = CacheKey::from_request(&r).with_scope("p", 0, Some("key-a"));
