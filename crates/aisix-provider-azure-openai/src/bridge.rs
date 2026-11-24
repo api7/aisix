@@ -811,14 +811,16 @@ impl Bridge for AzureOpenAiBridge {
         let body = {
             let messages = messages_from(&req, AZURE_DEVELOPER_ROLE_MODE);
             let typed = build_request(&req, deployment, &messages, false);
-            aisix_gateway::json_body(&prepare_outbound_body(
+            let outbound = prepare_outbound_body(
                 &typed,
                 req.gateway_strict_schema,
                 is_reasoning_model(ReasoningFamily::AzureOpenai, deployment),
                 ctx.provider_key.request.as_ref(),
                 ctx.provider_key.response.as_ref(),
-            )?)
-            .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?
+            )?;
+            ctx.note_chat_audio_format(&outbound);
+            aisix_gateway::json_body(&outbound)
+                .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?
         };
         // The owned request is not needed past its wire bytes.
         drop(req);
@@ -972,14 +974,16 @@ impl Bridge for AzureOpenAiBridge {
         let body = {
             let messages = messages_from(&req, AZURE_DEVELOPER_ROLE_MODE);
             let typed = build_request(&req, deployment, &messages, true);
-            aisix_gateway::json_body(&prepare_outbound_body(
+            let outbound = prepare_outbound_body(
                 &typed,
                 req.gateway_strict_schema,
                 is_reasoning_model(ReasoningFamily::AzureOpenai, deployment),
                 ctx.provider_key.request.as_ref(),
                 ctx.provider_key.response.as_ref(),
-            )?)
-            .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?
+            )?;
+            ctx.note_chat_audio_format(&outbound);
+            aisix_gateway::json_body(&outbound)
+                .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?
         };
         // The owned request is not needed past its wire bytes.
         drop(req);

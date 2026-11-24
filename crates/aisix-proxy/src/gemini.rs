@@ -158,7 +158,7 @@ pub(crate) fn native_error(err: &BridgeError) -> Option<&Value> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Wire {
     OpenAi,
-    Converted,
+    Converted { audio_mime: Option<&'static str> },
     Native,
 }
 
@@ -169,7 +169,16 @@ impl Wire {
         } else if native {
             Self::Native
         } else {
-            Self::Converted
+            Self::Converted { audio_mime: None }
+        }
+    }
+
+    pub(crate) fn with_chat_audio(self, ctx: &aisix_gateway::BridgeContext) -> Self {
+        match self {
+            Self::Converted { .. } => Self::Converted {
+                audio_mime: ctx.chat_audio_mime.get().copied(),
+            },
+            wire => wire,
         }
     }
 
@@ -188,20 +197,24 @@ impl Wire {
             );
             (content, cap)
         });
-        if self == Self::OpenAi {
-            let content = capture.map(|(c, cap)| {
-                c.with_output(crate::chat::chat_message_output(&resp.message, cap))
-            });
-            return (
-                Json(crate::render::render_response(now, resp, &req.model)).into_response(),
-                content,
-            );
-        }
-        let body = if self == Self::Native {
-            native::render_response(&resp)
-        } else {
-            let openai = crate::render::render_response(now, resp, &req.model);
-            response::unary(serde_json::to_value(openai).expect("serializable chat completion"))
+        let body = match self {
+            Self::OpenAi => {
+                let content = capture.map(|(c, cap)| {
+                    c.with_output(crate::chat::chat_message_output(&resp.message, cap))
+                });
+                return (
+                    Json(crate::render::render_response(now, resp, &req.model)).into_response(),
+                    content,
+                );
+            }
+            Self::Native => native::render_response(&resp),
+            Self::Converted { audio_mime } => {
+                let openai = crate::render::render_response(now, resp, &req.model);
+                response::unary(
+                    serde_json::to_value(openai).expect("serializable chat completion"),
+                    audio_mime,
+                )
+            }
         };
         let content = capture.map(|(c, cap)| {
             c.with_output(Some(OutputCollector::from_body(
@@ -235,15 +248,18 @@ impl Encoder {
                 .map(|v| Event::default().data(v.to_string()));
         }
         let openai = crate::render::render_chunk(now, chunk, alias);
-        if wire == Wire::OpenAi {
+        let Wire::Converted { audio_mime } = wire else {
             return Some(
                 Event::default()
                     .json_data(openai)
                     .expect("serializable chat chunk"),
             );
-        }
+        };
         self.converted
-            .chunk(serde_json::to_value(openai).expect("serializable chat chunk"))
+            .chunk(
+                serde_json::to_value(openai).expect("serializable chat chunk"),
+                audio_mime,
+            )
             .map(|v| Event::default().data(v.to_string()))
     }
 
@@ -251,7 +267,7 @@ impl Encoder {
         match wire {
             Wire::Native => None,
             Wire::OpenAi => Some(Event::default().data("[DONE]")),
-            Wire::Converted => self
+            Wire::Converted { .. } => self
                 .converted
                 .finish()
                 .map(|v| Event::default().data(v.to_string())),
@@ -289,4 +305,4 @@ pub(crate) fn stream_error(
     Event::default().data(body.to_string())
 }
 
-pub(crate) use request::{redact, translate, with_model_effort};
+pub(crate) use request::{has_execution, policy_input, redact, translate, with_model_effort};

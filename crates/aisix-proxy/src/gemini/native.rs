@@ -11,7 +11,7 @@ use aisix_gateway::{
     FinishReason, ServiceTier, SseDecoder, SseEvent, UpstreamErrorView, UpstreamWire, UsageStats,
 };
 use aisix_provider_openai::overrides::{
-    apply_default_body_fields, apply_param_constraints, apply_param_renames,
+    apply_default_body_fields, apply_param_renames, apply_temperature_constraint,
 };
 use axum::http::{header, HeaderMap, HeaderValue};
 use futures::StreamExt;
@@ -94,8 +94,13 @@ async fn send(
         apply_param_renames(body, &overrides.param_renames);
         if let Some(constraints) = &overrides.param_constraints {
             for name in ["generationConfig", "generation_config"] {
-                if let Some(config) = body.get_mut(name) {
-                    apply_param_constraints(config, constraints);
+                if let Some(temp) = body
+                    .get_mut(name)
+                    .and_then(|cfg| cfg.get_mut("temperature"))
+                {
+                    if let Some(current) = super::request::number(temp) {
+                        apply_temperature_constraint(temp, current, constraints);
+                    }
                 }
             }
         }
@@ -169,6 +174,12 @@ fn project(candidate: &mut Value) -> ChatMessage {
                 }
                 *slot = Value::from(s.len());
             }
+            // Native code execution is a server tool. Each source/result string
+            // needs its own rewritable argument slot, separate from prose.
+            if let Some((key, child)) = super::request::execution_slot(part) {
+                let payload = part[key][child].take();
+                calls.push(json!({"type":"function","function":{"arguments":payload.to_string()}}));
+            }
             if let Some(call) = part.get_mut("functionCall") {
                 let args = call.get_mut("args").map(Value::take);
                 calls.push(json!({"type":"function", "function":{
@@ -212,6 +223,16 @@ fn restore<'a>(candidate: &mut Value, mut text: &'a str, mut reasoning: &'a str,
                 *remaining = tail;
             }
         }
+        if let Some((key, child)) = super::request::execution_slot(part) {
+            if let Some(encoded) = calls
+                .next()
+                .and_then(|call| call.pointer("/function/arguments"))
+                .and_then(Value::as_str)
+            {
+                part[key][child] =
+                    serde_json::from_str(encoded).unwrap_or_else(|_| Value::from(encoded));
+            }
+        }
         if let Some(call) = part.get_mut("functionCall") {
             let projected = calls.next();
             if let Some(args) = call.get_mut("args") {
@@ -240,6 +261,13 @@ fn restore<'a>(candidate: &mut Value, mut text: &'a str, mut reasoning: &'a str,
             }
         }
     }
+}
+
+fn has_client_calls(candidate: &Value) -> bool {
+    candidate
+        .pointer("/content/parts")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| parts.iter().any(|p| p.get("functionCall").is_some()))
 }
 
 fn finish(candidate: &Value, has_calls: bool) -> FinishReason {
@@ -276,7 +304,7 @@ fn response(mut raw: Value) -> Result<ChatResponse, BridgeError> {
             let message = project(candidate);
             ChatChoice {
                 index: candidate["index"].as_u64().unwrap_or(position as u64) as u32,
-                finish_reason: finish(candidate, message.extra.contains_key("tool_calls")),
+                finish_reason: finish(candidate, has_client_calls(candidate)),
                 message,
                 logprobs: None,
             }
@@ -366,7 +394,7 @@ pub(crate) async fn chat_stream(
 
 fn chunks(
     mut frame: Value,
-    next_tool: &mut HashMap<u32, u64>,
+    next_tool: &mut HashMap<u32, (u64, bool)>,
 ) -> Result<Vec<ChatChunk>, BridgeError> {
     if let Some(err) = in_band_error(&mut frame) {
         return Err(err);
@@ -396,10 +424,16 @@ fn chunks(
                 Value::Array(calls) => Some(calls),
                 _ => None,
             });
+            let saw_call = has_client_calls(&candidate);
+            if saw_call {
+                next_tool.entry(chunk.choice_index).or_default().1 = true;
+            }
             chunk.finish_reason = candidate["finishReason"].as_str().map(|_| {
                 finish(
                     &candidate,
-                    calls.is_some() || next_tool.contains_key(&chunk.choice_index),
+                    next_tool
+                        .get(&chunk.choice_index)
+                        .is_some_and(|(_, saw)| *saw),
                 )
             });
             chunk.delta.content = msg.content;
@@ -409,7 +443,7 @@ fn chunks(
                     _ => None,
                 });
             chunk.delta.tool_calls = calls.map(|mut calls| {
-                let index = next_tool.entry(chunk.choice_index).or_default();
+                let (index, _) = next_tool.entry(chunk.choice_index).or_default();
                 for call in &mut calls {
                     call["index"] = (*index).into();
                     *index += 1;

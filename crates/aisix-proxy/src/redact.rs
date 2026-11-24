@@ -233,7 +233,7 @@ fn offer_unrewritable(
 /// A tool name is structural — masking it would break the call it
 /// identifies — so it is judged and forwarded: a block rule refuses, a
 /// mask hit passes.
-fn offer_tool_name(chain: &dyn Guardrail, dir: Direction, name: Option<&Value>) {
+pub(crate) fn offer_tool_name(chain: &dyn Guardrail, dir: Direction, name: Option<&Value>) {
     if let Some(name) = name.and_then(Value::as_str) {
         offer_unrewritable(chain, dir, name, aisix_guardrails::SegmentRole::ScanOnly);
     }

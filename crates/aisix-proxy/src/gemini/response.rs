@@ -83,7 +83,29 @@ fn candidate(choice: &Value, parts: Vec<Value>, malformed: bool) -> Value {
     candidate
 }
 
-fn text_parts(msg: &Value) -> Vec<Value> {
+fn image_part(block: &Value) -> Option<Value> {
+    use aisix_gateway::content_part::{parse_part, ContentPart, MediaSource};
+    if block["type"] != "image_url" {
+        return None;
+    }
+    let ContentPart::Media(media) = parse_part(block).ok()? else {
+        return None;
+    };
+    Some(match media.source {
+        MediaSource::Inline { data, mime_type } => {
+            json!({"inlineData":{"mimeType":mime_type,"data":data}})
+        }
+        MediaSource::Uri { uri, mime_type, .. } => {
+            let mut file = json!({"fileUri":uri});
+            if let Some(mime) = mime_type {
+                file["mimeType"] = mime.into();
+            }
+            json!({"fileData":file})
+        }
+    })
+}
+
+fn message_parts(msg: &Value, requested_audio_mime: Option<&str>) -> Vec<Value> {
     let mut parts = Vec::new();
     if let Some(text) = msg["reasoning_content"].as_str().filter(|s| !s.is_empty()) {
         parts.push(json!({"text":text,"thought":true}));
@@ -93,19 +115,26 @@ fn text_parts(msg: &Value) -> Vec<Value> {
     }
     if let Some(blocks) = msg["content"].as_array() {
         for block in blocks {
-            if let Some(text) = block["text"].as_str() {
+            if let Some(image) = image_part(block) {
+                parts.push(image);
+            } else if let Some(text) = block["text"].as_str() {
                 parts.push(json!({"text":text}));
             }
         }
     }
+    if let Some(images) = msg["images"].as_array() {
+        parts.extend(images.iter().filter_map(image_part));
+    }
     if let Some(text) = msg["refusal"].as_str() {
         parts.push(json!({"text":text}));
     }
-    if let (Some(data), Some(format)) = (
-        msg.pointer("/audio/data"),
-        msg.pointer("/audio/format").and_then(Value::as_str),
-    ) {
-        parts.push(json!({"inlineData":{"mimeType":format!("audio/{format}"),"data":data}}));
+    let mime = match msg.pointer("/audio/format").and_then(Value::as_str) {
+        Some(format) => aisix_gateway::chat::audio_mime_type(format)
+            .or_else(|| format.starts_with("audio/").then_some(format)),
+        None => requested_audio_mime,
+    };
+    if let (Some(data), Some(mime)) = (msg.pointer("/audio/data").and_then(Value::as_str), mime) {
+        parts.push(json!({"inlineData":{"mimeType":mime,"data":data}}));
     }
     parts
 }
@@ -120,11 +149,16 @@ struct FunctionCall {
 
 impl FunctionCall {
     fn append(&mut self, call: &Value) {
+        let repeated_id = call["id"].as_str() == Some(&self.id);
         if let Some(s) = call["id"].as_str() {
-            self.id.push_str(s);
+            if !repeated_id {
+                self.id.push_str(s);
+            }
         }
         if let Some(s) = call.pointer("/function/name").and_then(Value::as_str) {
-            self.name.push_str(s);
+            if !repeated_id || self.name != s {
+                self.name.push_str(s);
+            }
         }
         if let Some(s) = call.pointer("/function/arguments").and_then(Value::as_str) {
             self.arguments.push_str(s);
@@ -160,11 +194,11 @@ impl FunctionCall {
     }
 }
 
-pub(super) fn unary(chat: Value) -> Value {
+pub(super) fn unary(chat: Value, audio_mime: Option<&str>) -> Value {
     let mut candidates = Vec::new();
     for choice in chat["choices"].as_array().into_iter().flatten() {
         let msg = &choice["message"];
-        let mut parts = text_parts(msg);
+        let mut parts = message_parts(msg, audio_mime);
         let mut malformed = false;
         for call in msg["tool_calls"].as_array().into_iter().flatten() {
             let mut function = FunctionCall::default();
@@ -186,11 +220,11 @@ pub(super) struct Stream {
 }
 
 impl Stream {
-    pub(super) fn chunk(&mut self, chat: Value) -> Option<Value> {
+    pub(super) fn chunk(&mut self, chat: Value, audio_mime: Option<&str>) -> Option<Value> {
         let mut candidates = Vec::new();
         for choice in chat["choices"].as_array().into_iter().flatten() {
             let delta = &choice["delta"];
-            let mut parts = text_parts(delta);
+            let mut parts = message_parts(delta, audio_mime);
             let index = choice["index"].as_u64().unwrap_or(0);
             for call in delta["tool_calls"].as_array().into_iter().flatten() {
                 let calls = self.calls.entry(index).or_default();

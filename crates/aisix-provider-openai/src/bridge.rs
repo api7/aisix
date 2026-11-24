@@ -545,13 +545,15 @@ impl Bridge for OpenAiBridge {
         let body = {
             let messages = messages_from(&req, developer_role_mode(ctx));
             let typed = build_request(&req, upstream, &messages, false);
-            outbound_bytes(&prepare_outbound_body(
+            let outbound = prepare_outbound_body(
                 &typed,
                 req.gateway_strict_schema,
                 renames_token_cap(ctx, upstream),
                 ctx.provider_key.request.as_ref(),
                 ctx.provider_key.response.as_ref(),
-            )?)?
+            )?;
+            ctx.note_chat_audio_format(&outbound);
+            outbound_bytes(&outbound)?
         };
         // The owned request is not needed past its wire bytes.
         drop(req);
@@ -787,13 +789,15 @@ impl Bridge for OpenAiBridge {
         let body = {
             let messages = messages_from(&req, developer_role_mode(ctx));
             let typed = build_request(&req, upstream, &messages, true);
-            outbound_bytes(&prepare_outbound_body(
+            let outbound = prepare_outbound_body(
                 &typed,
                 req.gateway_strict_schema,
                 renames_token_cap(ctx, upstream),
                 ctx.provider_key.request.as_ref(),
                 ctx.provider_key.response.as_ref(),
-            )?)?
+            )?;
+            ctx.note_chat_audio_format(&outbound);
+            outbound_bytes(&outbound)?
         };
         // The owned request is not needed past its wire bytes.
         drop(req);

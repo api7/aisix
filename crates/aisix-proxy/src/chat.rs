@@ -123,6 +123,9 @@ impl<'a> ChatTarget<'a> {
             Self::Gemini(raw) => {
                 gemini::native::chat(ctx, &gemini::with_model_effort(raw, &ctx.model)).await
             }
+            Self::Bridge(_) if req.messages.is_empty() => Err(BridgeError::InvalidRequest(
+                "contents has no messages representable in Chat Completions".into(),
+            )),
             Self::Bridge(bridge) => {
                 bridge
                     .chat_cow(crate::effort_mapping::chat_request(req, &ctx.model), ctx)
@@ -140,6 +143,9 @@ impl<'a> ChatTarget<'a> {
             Self::Gemini(raw) => {
                 gemini::native::chat_stream(ctx, &gemini::with_model_effort(raw, &ctx.model)).await
             }
+            Self::Bridge(_) if req.messages.is_empty() => Err(BridgeError::InvalidRequest(
+                "contents has no messages representable in Chat Completions".into(),
+            )),
             Self::Bridge(bridge) => {
                 bridge
                     .chat_stream_cow(crate::effort_mapping::chat_request(req, &ctx.model), ctx)
@@ -1576,7 +1582,7 @@ async fn dispatch(
     // `Arc<dyn Guardrail>`, which carries neither `applied()` nor the log.
     audit_out: &mut crate::usage_attr::GuardrailAudit,
 ) -> Result<Success, DispatchFailure> {
-    if req.messages.is_empty() {
+    if req.messages.is_empty() && !native_body.as_ref().is_some_and(gemini::has_execution) {
         // Refused ahead of model resolution, but a resolvable name still
         // reports the model it addressed, like every later refusal.
         let model_id = crate::model_resolve::resolve_model(snapshot, &req.model)
@@ -1664,7 +1670,16 @@ async fn dispatch(
     // Split moderation: local/blob members check first (on the original
     // text), then the segment pass runs the Bedrock call and writes
     // ANONYMIZE masks back into `req` (#932 bedrock follow-up).
-    let (input_verdict, hits) = resolved_chain.check_input_non_segment_observed(req).await;
+    let policy_req = native_body
+        .as_ref()
+        .filter(|raw| resolved_chain.runs_on_input() && gemini::has_execution(raw))
+        .map(|raw| gemini::policy_input(&req.model, raw))
+        .transpose()
+        .map_err(&with_model)?;
+    let (input_verdict, hits) = resolved_chain
+        .check_input_non_segment_observed(policy_req.as_ref().unwrap_or(req))
+        .await;
+    drop(policy_req);
     monitor_hits_out.extend(hits);
     // The segment walker below borrows `req` mutably, so the addressed
     // model the check pass just read from `req.model` is taken first.
@@ -2126,7 +2141,7 @@ async fn dispatch(
                             },
                         );
                         won = Some(StreamWin {
-                            wire: target.wire(client),
+                            wire: target.wire(client).with_chat_audio(&ctx),
                             model: model.clone(),
                             target_id: attempt.id.clone(),
                             provider_lc: provider.to_ascii_lowercase(),
@@ -2817,6 +2832,16 @@ async fn dispatch(
             )
             .await
         };
+        // Cached Chat audio can omit its format. Only the winning upstream
+        // attempt knows which format it requested for the Gemini media part.
+        let resolved = resolved.filter(|(cached, _, _)| {
+            native_body.is_none()
+                || cached.messages().all(|m| {
+                    !m.extra.get("audio").is_some_and(|audio| {
+                        audio["data"].is_string() && !audio["format"].is_string()
+                    })
+                })
+        });
         match resolved {
             Some((mut cached, hit_layer, hit_similarity)) => {
                 // The request is now answered from the cache and will
@@ -3318,7 +3343,7 @@ async fn dispatch(
                         },
                     );
                     won_member_reservation = member_reservation;
-                    winner_wire = target.wire(client);
+                    winner_wire = target.wire(client).with_chat_audio(&ctx);
                     upstream = Some(resp);
                     break;
                 }
