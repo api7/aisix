@@ -1259,7 +1259,14 @@ async fn enforce_request_body_limit(
     let path = request.uri().path();
     let is_anthropic_path =
         path == "/v1/messages" || path == "/v1/messages/" || path == "/v1/messages/count_tokens";
-    let envelope = if gemini::path(path).is_some() {
+    // Passthrough mounts enter through a fallback router without a MatchedPath.
+    let typed_gemini = request.method() == axum::http::Method::POST
+        && gemini::path(path).is_some()
+        && request
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .is_some();
+    let envelope = if typed_gemini {
         reject::Envelope::Gemini
     } else if is_anthropic_path {
         reject::Envelope::Anthropic
