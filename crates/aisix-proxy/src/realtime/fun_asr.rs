@@ -67,11 +67,14 @@ fn upstream_error(message: impl ToString) -> ProxyError {
     ProxyError::Bridge(BridgeError::Transport(message.to_string()))
 }
 
-async fn fail(ws: &mut WebSocket, id: &str, err: &ProxyError) {
+fn failure_frame(id: &str, err: &ProxyError) -> String {
     let error = err.envelope().error;
-    let frame = json!({"header": {"task_id": id, "event": "task-failed",
-        "error_code": error.code.unwrap_or(error.kind), "error_message": error.message}, "payload": {}});
-    let _ = ws.send(Message::Text(frame.to_string())).await;
+    json!({"header": {"task_id": id, "event": "task-failed",
+        "error_code": error.code.unwrap_or(error.kind), "error_message": error.message}, "payload": {}}).to_string()
+}
+
+async fn fail(ws: &mut WebSocket, id: &str, err: &ProxyError) {
+    let _ = ws.send(Message::Text(failure_frame(id, err))).await;
     let _ = ws.send(Message::Close(None)).await;
 }
 
@@ -101,19 +104,45 @@ async fn serve(
         let Ok(Some(Ok(frame))) = bounded(state.default_timeouts.stream, ws.recv()).await else {
             return;
         };
-        let text = match frame {
-            Message::Text(text) => text,
-            Message::Ping(_) | Message::Pong(_) => continue,
-            Message::Close(_) => return,
-            Message::Binary(_) => {
-                fail(ws, "", &invalid("expected run-task before audio")).await;
-                return;
-            }
+        if matches!(frame, Message::Ping(_) | Message::Pong(_)) {
+            continue;
+        }
+        if matches!(frame, Message::Close(_)) {
+            return;
+        }
+        let span = handshake_span.take().unwrap_or_else(|| {
+            client.request_id = crate::request_id::new_request_id();
+            client.trace = client
+                .trace
+                .as_ref()
+                .map(|trace| Arc::new(trace.next_request()));
+            tracing::error_span!(parent: None, "request", request_id = %client.request_id)
+        });
+        let started = Instant::now();
+        let reject = |err: &ProxyError| {
+            span.in_scope(|| {
+                crate::reject::record_rejection(
+                    state,
+                    "GET",
+                    PATH,
+                    &client.request_id,
+                    Some(&auth.entry.id),
+                    started,
+                    err,
+                )
+            });
         };
-        let mut run: Value = match serde_json::from_str(&text) {
-            Ok(run) => run,
-            Err(_) => {
-                fail(ws, "", &invalid("expected a JSON run-task command")).await;
+        let command = match frame {
+            Message::Text(text) => serde_json::from_str::<Value>(&text)
+                .map(|run| (run, text))
+                .map_err(|_| invalid("expected a JSON run-task command")),
+            _ => Err(invalid("expected run-task before audio")),
+        };
+        let (mut run, text) = match command {
+            Ok((run, text)) => (run, text),
+            Err(err) => {
+                reject(&err);
+                fail(ws, "", &err).await;
                 return;
             }
         };
@@ -127,34 +156,54 @@ async fn serve(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
-        let span = handshake_span.take().unwrap_or_else(|| {
-            client.request_id = crate::request_id::new_request_id();
-            client.trace = client
-                .trace
-                .as_ref()
-                .map(|trace| Arc::new(trace.next_request()));
-            tracing::error_span!(parent: None, "request", request_id = %client.request_id)
-        });
+        if run.pointer("/header/action").and_then(Value::as_str) != Some("run-task")
+            || uuid::Uuid::parse_str(&id).is_err()
+            || run.pointer("/payload/task_group").and_then(Value::as_str) != Some("audio")
+            || run.pointer("/payload/task").and_then(Value::as_str) != Some("asr")
+            || run.pointer("/payload/function").and_then(Value::as_str) != Some("recognition")
+            || model.is_empty()
+        {
+            let err = invalid("expected an audio/asr/recognition run-task with task_id and model");
+            reject(&err);
+            fail(ws, &id, &err).await;
+            return;
+        }
+        let snap = state.snapshot.load();
+        client.request_headers = crate::client_ip::capture_request_headers(&client.headers, &snap);
+        let cap = crate::usage_attr::content_cap(&snap).map(|n| n as usize);
+        let attribution = Arc::new(
+            crate::attribution::RequestAttribution::with_response_headers(
+                crate::client_ip::exported_header_names(&snap, true),
+                cap.is_some(),
+                client.request_id.clone(),
+            ),
+        );
+        drop(snap);
         let mut task = Task {
             id,
             model,
-            started: Instant::now(),
+            started,
             dial_started: None,
             duration: 0.0,
+            upstream_confirmed_id: false,
+            capture: cap.map(|cap| (aisix_obs::CapturedContent::new(&text, "", cap), cap)),
             audit: Default::default(),
             hits: Vec::new(),
         };
-        let result = crate::attribution::detached(async {
-            let result = task.run(state, &mut auth, &client, ws, &mut run).await;
+        let result = crate::attribution::scope(attribution, async {
+            let result = task.run(state, &mut auth, &mut client, ws, &mut run).await;
             task.record(state, &auth, &client, &result);
             result
         })
         .instrument(span)
         .await;
         match result {
-            Ok(End::Finished | End::Failed(_)) => continue,
-            Ok(End::Disconnected) => {
-                let _ = ws.send(Message::Close(None)).await;
+            Ok(End::Finished) => continue,
+            Ok(End::Disconnected) => return,
+            Ok(End::Failed(_)) => {
+                let _ =
+                    tokio::time::timeout(super::UPSTREAM_CLOSE_ACK, ws.send(Message::Close(None)))
+                        .await;
                 return;
             }
             Err(err) => {
@@ -177,6 +226,8 @@ struct Task {
     started: Instant,
     dial_started: Option<Instant>,
     duration: f64,
+    upstream_confirmed_id: bool,
+    capture: Option<(aisix_obs::CapturedContent, usize)>,
     audit: crate::usage_attr::GuardrailAudit,
     hits: Vec<aisix_core::GuardrailMonitorHit>,
 }
@@ -186,21 +237,10 @@ impl Task {
         &mut self,
         state: &ProxyState,
         auth: &mut AuthenticatedKey,
-        client: &ClientContext,
+        client: &mut ClientContext,
         ws: &mut WebSocket,
         run: &mut Value,
     ) -> Result<End, ProxyError> {
-        if run.pointer("/header/action") != Some(&json!("run-task"))
-            || uuid::Uuid::parse_str(&self.id).is_err()
-            || run.pointer("/payload/task_group") != Some(&json!("audio"))
-            || run.pointer("/payload/task") != Some(&json!("asr"))
-            || run.pointer("/payload/function") != Some(&json!("recognition"))
-            || self.model.is_empty()
-        {
-            return Err(invalid(
-                "expected an audio/asr/recognition run-task with task_id and model",
-            ));
-        }
         // A reused socket can outlive its caller's key or model grants.
         let token =
             crate::auth::header_credential(&client.headers).ok_or(ProxyError::InvalidApiKey)??;
@@ -215,6 +255,7 @@ impl Task {
             },
         )
         .await?;
+        client.caller = auth.caller();
         let snap = state.snapshot.load();
         let entry = crate::model_resolve::resolve_model(&snap, &self.model)
             .ok_or_else(|| ProxyError::ModelNotFound(self.model.clone()))?;
@@ -232,6 +273,11 @@ impl Task {
             return Err(invalid("Fun-ASR requires a direct Alibaba model"));
         }
         let pk = crate::dispatch::resolve_provider_key(&snap, model)?;
+        if pk.value.upstream_connection().is_some() {
+            return Err(ProxyError::Bridge(BridgeError::InvalidUpstreamConfig(
+                "Fun-ASR WebSocket does not support provider key resolve_addresses or custom TLS settings".into(),
+            )));
+        }
         let secret = crate::dispatch::require_api_key(&pk.value, model)?;
         let upstream_model = crate::dispatch::require_upstream_model(model)?;
         let mut url = url::Url::parse(&to_ws_scheme(&crate::dispatch::resolve_base_url(
@@ -251,11 +297,15 @@ impl Task {
                 .parse()
                 .map_err(|_| invalid("invalid provider credential"))?,
         );
-        let mut forwarded = aisix_gateway::ForwardedClientHeaders::resolve(
-            &aisix_gateway::UpstreamHeaderContext::from_overrides(pk.value.request.as_ref())
-                .with_client_headers(&client.headers)
-                .with_surface_blocked(REALTIME_HANDSHAKE_SLOTS),
-        );
+        let header_ctx =
+            crate::dispatch::upstream_header_ctx(&pk.value, &pk.id, model, &entry.id, client)
+                .with_surface_blocked(REALTIME_HANDSHAKE_SLOTS);
+        for (name, value) in aisix_gateway::resolve_default_headers(&header_ctx) {
+            if !REALTIME_HANDSHAKE_SLOTS.contains(&name.as_str()) && value.to_str().is_ok() {
+                request.headers_mut().entry(name).or_insert(value);
+            }
+        }
+        let mut forwarded = aisix_gateway::ForwardedClientHeaders::resolve(&header_ctx);
         forwarded.drop_non_ascii_values();
         forwarded.apply(request.headers_mut());
         let chain = state
@@ -270,7 +320,7 @@ impl Task {
         self.audit = chain.audit_log();
         run["payload"]["model"] = json!(upstream_model);
         let start = run.to_string();
-        self.scan(&chain, &start, true).await?;
+        self.scan(&chain, &start, None, true).await?;
         crate::budget::gate(state, &snap).check_provider_key(&pk.id)?;
         let reservation = crate::quota::enforce(
             state,
@@ -287,7 +337,7 @@ impl Task {
         drop(snap);
         let dial_started = Instant::now();
         self.dial_started = Some(dial_started);
-        crate::attribution::note_upstream_wait_unmeasured();
+        crate::attribution::note_upstream_wait_begin();
         let dial = connect_upstream(request);
         tokio::pin!(dial);
         let connected = loop {
@@ -301,7 +351,8 @@ impl Task {
             }
         };
         let result = match connected {
-            Ok((mut upstream, _)) => {
+            Ok((mut upstream, response)) => {
+                aisix_gateway::note_upstream_response(response.headers());
                 bounded(idle, upstream.send(UpMessage::Text(start)))
                     .await?
                     .map_err(upstream_error)?;
@@ -310,7 +361,7 @@ impl Task {
                 result
             }
             Err(failure) => {
-                let (error, _) = connect_failure(
+                let (error, refused) = connect_failure(
                     failure,
                     dial_started.elapsed(),
                     idle,
@@ -324,6 +375,10 @@ impl Task {
                     },
                 )
                 .await;
+                if let Some(refused) = refused {
+                    aisix_gateway::note_upstream_response(&refused.headers);
+                    aisix_gateway::note_upstream_error_body(&refused.body);
+                }
                 Err(ProxyError::Bridge(error))
             }
         };
@@ -336,10 +391,20 @@ impl Task {
     async fn scan(
         &mut self,
         chain: &aisix_guardrails::GuardrailChain,
-        text: &str,
+        frame: &str,
+        transcript: Option<&str>,
         input: bool,
     ) -> Result<(), ProxyError> {
         if !chain.is_empty() {
+            let decoded;
+            let text = match transcript {
+                Some(text) => text,
+                None => {
+                    decoded = crate::json_splice::collect_string_values(frame.as_bytes())
+                        .map_err(|_| invalid("task frame exceeds guardrail scan limits"))?;
+                    &decoded
+                }
+            };
             if let Some((_, err)) =
                 guardrail_block_event(chain, &self.model, text, input, &mut self.hits).await
             {
@@ -365,7 +430,14 @@ impl Task {
                     frame = upstream.next() => super::Dir::FromUpstream(frame),
                 }
             })
-            .await?;
+            .await
+            .map_err(|err| {
+                if started && !finishing {
+                    invalid("DashScope task timed out waiting for client audio or finish-task")
+                } else {
+                    err
+                }
+            })?;
             match next {
                 super::Dir::FromClient(Some(Ok(frame))) => {
                     let outgoing = match frame {
@@ -382,7 +454,7 @@ impl Task {
                                 return Err(invalid("expected finish-task for the active task"));
                             }
                             finishing = true;
-                            self.scan(chain, &text, true).await?;
+                            self.scan(chain, &text, None, true).await?;
                             UpMessage::Text(text)
                         }
                         Message::Ping(_) | Message::Pong(_) => continue,
@@ -406,6 +478,7 @@ impl Task {
                             "upstream event did not match the active task",
                         ));
                     }
+                    self.upstream_confirmed_id = true;
                     let kind = event.pointer("/header/event").and_then(Value::as_str);
                     if let Some(duration) = event
                         .pointer("/payload/usage/duration")
@@ -415,7 +488,14 @@ impl Task {
                         // DashScope reports cumulative seconds on result-generated frames.
                         self.duration = duration;
                     }
-                    self.scan(chain, &text, false).await?;
+                    let transcript = if kind == Some("result-generated") {
+                        event
+                            .pointer("/payload/output/sentence/text")
+                            .and_then(Value::as_str)
+                    } else {
+                        None
+                    };
+                    self.scan(chain, &text, transcript, false).await?;
                     let end = match kind {
                         Some("task-started") => {
                             started = true;
@@ -433,7 +513,14 @@ impl Task {
                                 .unwrap_or("DashScope task failed");
                             Some(End::Failed(ProxyError::Bridge(
                                 BridgeError::UpstreamInBand {
-                                    status: None,
+                                    status: match code {
+                                        "BadRequest"
+                                        | "CLIENT_ERROR"
+                                        | "InvalidParameter"
+                                        | "NO_INPUT_AUDIO_ERROR"
+                                        | "NO_VALID_AUDIO_ERROR" => Some(400),
+                                        _ => None,
+                                    },
                                     message: format!("{code}: {message}"),
                                     parsed: None,
                                     wire: aisix_gateway::UpstreamWire::Unknown,
@@ -442,12 +529,31 @@ impl Task {
                         }
                         _ => None,
                     };
-                    let sent = bounded(idle, ws.send(Message::Text(text))).await;
+                    if matches!(end, Some(End::Failed(_))) {
+                        self.capture = self
+                            .capture
+                            .take()
+                            .map(|(content, cap)| (content.with_response(&text, cap), cap));
+                    } else if let Some((content, cap)) = &mut self.capture {
+                        if !content.response_truncated {
+                            if !content.response.is_empty() && content.response.len() < *cap {
+                                content.response.push('\n');
+                            }
+                            let end = text
+                                .floor_char_boundary(cap.saturating_sub(content.response.len()));
+                            content.response.push_str(&text[..end]);
+                            content.response_truncated = end < text.len();
+                            content.truncated |= content.response_truncated;
+                        }
+                    }
+                    if !matches!(
+                        bounded(idle, ws.send(Message::Text(text))).await,
+                        Ok(Ok(()))
+                    ) {
+                        return Ok(End::Disconnected);
+                    }
                     if let Some(end) = end {
                         return Ok(end);
-                    }
-                    if !matches!(sent, Ok(Ok(()))) {
-                        return Ok(End::Disconnected);
                     }
                 }
                 super::Dir::FromUpstream(Some(Ok(UpMessage::Ping(_) | UpMessage::Pong(_)))) => {
@@ -462,7 +568,7 @@ impl Task {
     }
 
     fn record(
-        &self,
+        &mut self,
         state: &ProxyState,
         auth: &AuthenticatedKey,
         client: &ClientContext,
@@ -480,6 +586,19 @@ impl Task {
             Ok(End::Failed(err)) | Err(err) => err.status().as_u16(),
         };
         let source = error.map_or(ErrorSource::None, crate::attempt::error_source);
+        if self.dial_started.is_some() {
+            crate::attribution::note_upstream_wait_end(result.is_ok());
+        }
+        if let Some((content, _)) = &mut self.capture {
+            if matches!(result, Err(_) | Ok(End::Disconnected)) {
+                content.response.clear();
+                content.response_truncated = false;
+                content.truncated = content.prompt_truncated;
+            }
+            if let Err(err) = result {
+                crate::attribution::note_client_error_body(failure_frame(&self.id, err));
+            }
+        }
         let elapsed = self.started.elapsed();
         let snap = state.snapshot.load();
         let target = crate::attribution::current().unwrap_or_default();
@@ -519,7 +638,7 @@ impl Task {
         let mut event = aisix_obs::UsageEvent {
             request_id: client.request_id.clone(),
             occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
-            provider_request_id: if self.dial_started.is_some() {
+            provider_request_id: if self.upstream_confirmed_id {
                 self.id.clone()
             } else {
                 String::new()
@@ -532,9 +651,6 @@ impl Task {
             inbound_protocol: "dashscope".into(),
             audio_duration_seconds: self.duration,
             downstream_latency_ms: crate::attempt::measured_ms(elapsed),
-            gateway_overhead_ms: self
-                .dial_started
-                .map(|t| crate::attempt::measured_ms(t.duration_since(self.started))),
             upstream_latency_ms: self
                 .dial_started
                 .map_or(0, |t| crate::attempt::measured_ms(t.elapsed())),
@@ -564,11 +680,12 @@ impl Task {
             crate::operation::TRANSCRIPTION,
             event,
             usage::usage_event_labels(&model_label, &pk),
-            None,
+            self.capture.as_ref().map(|(content, _)| content),
             client.trace.as_ref(),
             true,
             self.dial_started.is_some(),
         );
+        let upstream_id = crate::attribution::terminal_provider_request_id();
         super::emit_access_log(
             PATH,
             &axum::http::Method::GET,
@@ -579,7 +696,7 @@ impl Task {
             Some((&target.provider, &self.model)),
             error,
             None,
-            self.dial_started.map(|_| self.id.as_str()),
+            (!upstream_id.is_empty()).then_some(upstream_id.as_str()),
         );
     }
 }

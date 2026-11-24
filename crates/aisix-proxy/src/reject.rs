@@ -62,9 +62,26 @@ pub(crate) fn reject_before_dispatch(
     envelope: Envelope,
     err: ProxyError,
 ) -> Response {
+    record_rejection(state, method, path, request_id, api_key_id, started, &err);
+    match envelope {
+        Envelope::OpenAi => err.into_response(),
+        Envelope::Gemini => err.into_gemini_response(),
+        Envelope::Anthropic => err.into_anthropic_response(),
+    }
+}
+
+pub(crate) fn record_rejection(
+    state: &ProxyState,
+    method: &str,
+    path: &str,
+    request_id: &str,
+    api_key_id: Option<&str>,
+    started: Instant,
+    err: &ProxyError,
+) {
     let status = err.status().as_u16();
     let elapsed = started.elapsed();
-    let (error_kind, error) = crate::attempt::access_log_error(&err);
+    let (error_kind, error) = crate::attempt::access_log_error(err);
     crate::attribution::emit_access_log(AccessLog {
         method,
         path,
@@ -109,14 +126,9 @@ pub(crate) fn reject_before_dispatch(
             ..Default::default()
         },
         status,
-        crate::attempt::error_source(&err),
+        crate::attempt::error_source(err),
         elapsed,
     );
-    match envelope {
-        Envelope::OpenAi => err.into_response(),
-        Envelope::Gemini => err.into_gemini_response(),
-        Envelope::Anthropic => err.into_anthropic_response(),
-    }
 }
 
 /// Write the access-log line for a request answered without dispatch and

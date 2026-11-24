@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { EtcdClient, keyHash, metricDelta, ProxyClient, scrapeMetrics, SeedClient, spawnApp, waitConfigPropagation, type SpawnedApp } from "../harness/index.js";
+import {
+  AdminClient, EtcdClient, keyHash, metricDelta, ProxyClient, scrapeMetrics, SeedClient, spawnApp,
+  startMockSls, waitConfigPropagation, waitForLogLine, waitForSlsLog, type MockSls, type SpawnedApp,
+} from "../harness/index.js";
 import { funAsrPath, openFunAsr, recognize, runTask, startFunAsrUpstream } from "../harness/fun-asr.js";
 import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 
@@ -10,6 +13,7 @@ describe("DashScope Fun-ASR native tasks", () => {
   let app: SpawnedApp;
   let seed: SeedClient;
   let otlp: MockOtlp;
+  let sls: MockSls;
   let vendor: Awaited<ReturnType<typeof startFunAsrUpstream>>;
   let revokedKeyId: string;
   const ids = new Map<string, string>();
@@ -19,12 +23,41 @@ describe("DashScope Fun-ASR native tasks", () => {
     if (!(await etcd.ping())) return;
     vendor = await startFunAsrUpstream();
     otlp = await startMockOtlp();
-    app = await spawnApp();
+    sls = await startMockSls();
+    app = await spawnApp({ logLevel: "info", extraEnv: {
+      SLS_CRED_MOCK_AK_ID: "test-key", SLS_CRED_MOCK_AK_SECRET: "test-secret",
+    } });
     seed = new SeedClient(etcd, app.etcdPrefix);
     await seed.createObservabilityExporter({ name: "asr-usage", kind: "otlp_http", endpoint: otlp.url });
-    for (const [alias, provider] of [["cn", "alibaba-cn"], ["intl", "alibaba"], ["failure", "alibaba"], ["drop", "alibaba"], ["over-budget", "alibaba"]]) {
+    for (const mode of ["full", "metadata_only"]) {
+      await seed.createObservabilityExporter({
+        name: "asr-" + mode, enabled: true, kind: "aliyun_sls", endpoint: sls.url, project: "test",
+        logstore: "asr-" + mode, credential_ref: "mock", content_mode: mode, content_max_bytes: 2048,
+        upstream_response_headers: ["x-asr-region"],
+      });
+    }
+    for (const alias of [
+      "cn", "intl", "failure", "drop", "over-budget", "refuse", "refuse-no-id", "guard-control",
+      "guard-output", "tls", "resolve", "idle", "unread-terminal",
+    ]) {
+      const provider = alias === "cn" ? "alibaba-cn" : "alibaba";
+      const base = alias === "resolve" ? vendor.base.replace("127.0.0.1", "localhost") : vendor.base;
+      const path = alias.startsWith("refuse") ? "/" + alias : "/relay";
       const pk = await seed.createProviderKey({
-        provider, display_name: alias, api_key: "sk-provider-" + alias, api_base: vendor.base + "/relay/compatible-mode/v1",
+        provider, display_name: alias, api_key: "sk-provider-" + alias, api_base: base + path + "/compatible-mode/v1",
+        ...(alias === "resolve" && { resolve_addresses: ["127.0.0.1"] }),
+        ...(alias === "tls" && { tls: { verify: false } }),
+        ...(alias === "cn" && {
+          tls: { verify: true },
+          request: {
+            default_headers: {
+              "x-dashscope-workspace": "${model.name}-${provider_key.name}",
+              "x-asr-caller": "${request.api_key.name}", "x-asr-request": "${request.id}",
+              "sec-websocket-protocol": "unnegotiated",
+            },
+            forward_client_headers: ["x-asr-extra", "x-dashscope-workspace", "sec-websocket-extensions"],
+          },
+        }),
       });
       if (alias === "over-budget") {
         const scope = { scope: "provider_key", scope_ref: pk.id, period: "month" };
@@ -34,12 +67,16 @@ describe("DashScope Fun-ASR native tasks", () => {
       }
       ids.set(alias, (await seed.createModel({
         display_name: alias, model_name: "vendor-" + alias, provider, provider_key_id: pk.id,
+        ...(["idle", "drop", "failure"].includes(alias) && { cooldown: { enabled: true } }),
+        ...(["idle", "unread-terminal"].includes(alias) && { stream_timeout: 400 }),
       })).id);
     }
     await seed.createGuardrail({ name: "reject-marker", kind: "keyword", enabled: true,
       hook_point: "input", fail_open: false, patterns: [{ kind: "literal", value: "blocked-marker" }] });
+    await seed.createGuardrail({ name: "reject-transcript", kind: "keyword", enabled: true,
+      hook_point: "output", fail_open: false, patterns: [{ kind: "literal", value: "测试词" }] });
     revokedKeyId = (await seed.createApiKey({ key_hash: keyHash(revoked), allowed_models: ["cn"] })).id;
-    await seed.createApiKey({ key_hash: keyHash(caller), allowed_models: [...ids.keys()] });
+    await seed.createApiKey({ display_name: "asr-caller", key_hash: keyHash(caller), allowed_models: [...ids.keys()] });
     const probe = new ProxyClient(app.proxyUrl, caller);
     await waitConfigPropagation(async () => (await probe.listModels()).status === 200);
   });
@@ -48,6 +85,7 @@ describe("DashScope Fun-ASR native tasks", () => {
     await app?.exit();
     await vendor?.close();
     await otlp?.close();
+    await sls?.close();
   });
 
   async function usage(id: string) {
@@ -57,6 +95,152 @@ describe("DashScope Fun-ASR native tasks", () => {
     expect(carrier()).toHaveLength(1);
     return carrier()[0];
   }
+
+  const log = (requestId: string, mode = "full") => waitForSlsLog(sls, "asr-" + mode,
+    row => row.get("request_id") === requestId && row.get("is_final_attempt") === "true", "ASR task row");
+
+  const modelStatus = async (alias: string) =>
+    (await new AdminClient(app.adminUrl, app.adminKey, app.metricsUrl).listModelStatuses())
+      .find(row => row.id === ids.get(alias))!.status;
+
+  test("applies provider headers and captures accepted handshake metadata and text by exporter mode", async ctx => {
+    if (!app) return ctx.skip();
+    const client = await openFunAsr(app.proxyUrl, caller, { "x-dashscope-workspace": "caller", "x-asr-extra": "forwarded" });
+    try {
+      const { id, audio } = await recognize(client, "cn");
+      const headers = vendor.handshakes.at(-1)!;
+      expect(headers).toMatchObject({ "x-dashscope-workspace": "cn-cn", "x-asr-extra": "forwarded",
+        "x-asr-caller": "asr-caller", "x-asr-request": client.requestId, authorization: "Bearer sk-provider-cn" });
+      expect(headers["sec-websocket-protocol"]).toBeUndefined();
+      expect(headers["sec-websocket-extensions"]).toBeUndefined();
+      const row = await log(client.requestId);
+      expect(row.get("provider_request_id")).toBe(id);
+      expect(JSON.parse(row.get("upstream_response_headers")!)).toEqual({ "x-asr-region": "accepted" });
+      expect(JSON.parse(row.get("prompt")!)).toEqual(runTask(id, "cn"));
+      expect(row.get("response")).toContain("你好世界");
+      expect(row.get("response")).not.toContain(audio.toString("base64"));
+      const meta = await log(client.requestId, "metadata_only");
+      expect(meta.get("response")).toBeUndefined();
+      expect(meta.get("prompt")).toBeUndefined();
+    } finally { client.ws.close(); }
+  });
+
+  test("keeps the vendor request id, selected headers and refusal body on a refused upgrade", async ctx => {
+    if (!app) return ctx.skip();
+    const client = await openFunAsr(app.proxyUrl, caller);
+    try {
+      const id = randomUUID();
+      client.ws.send(JSON.stringify(runTask(id, "refuse")));
+      expect((await client.frame()).header).toMatchObject({ task_id: id, event: "task-failed" });
+      const full = await log(client.requestId);
+      expect(full.get("provider_request_id")).toBe("upstream-refused-id");
+      expect(JSON.parse(full.get("upstream_response_headers")!)).toEqual({ "x-asr-region": "refused" });
+      expect(full.get("response")).toBe(JSON.stringify({ code: "AccessDenied", message: "workspace denied" }));
+      expect(JSON.parse(full.get("prompt")!)).toEqual(runTask(id, "refuse"));
+      expect((await log(client.requestId, "metadata_only")).get("response")).toBeUndefined();
+    } finally { client.ws.close(); }
+  });
+
+  test("leaves the provider request id empty when the refused handshake has none", async ctx => {
+    if (!app) return ctx.skip();
+    const client = await openFunAsr(app.proxyUrl, caller);
+    try {
+      client.ws.send(JSON.stringify(runTask(randomUUID(), "refuse-no-id")));
+      expect((await client.frame()).header.event).toBe("task-failed");
+      expect((await log(client.requestId)).get("provider_request_id")).toBeUndefined();
+    } finally { client.ws.close(); }
+  });
+
+  test.each(["resolve", "tls"])("refuses the %s override before opening an upstream connection", async alias => {
+    if (!app) return;
+    const client = await openFunAsr(app.proxyUrl, caller);
+    try {
+      const count = vendor.handshakes.length;
+      client.ws.send(JSON.stringify(runTask(randomUUID(), alias)));
+      const failure = (await client.frame()).header;
+      expect(failure.event).toBe("task-failed");
+      expect(failure.error_message).toMatch(/resolve_addresses.*TLS/);
+      expect(vendor.handshakes).toHaveLength(count);
+      expect((await log(client.requestId)).get("provider_request_id")).toBeUndefined();
+    } finally { client.ws.close(); }
+  });
+
+  test("filters the decoded transcript and charges its reported duration once", async ctx => {
+    if (!app) return ctx.skip();
+    const client = await openFunAsr(app.proxyUrl, caller);
+    try {
+      const id = randomUUID();
+      client.ws.send(JSON.stringify(runTask(id, "guard-output")));
+      expect((await client.frame()).header.event).toBe("task-started");
+      client.ws.send(Buffer.from([0, 1]));
+      expect((await client.frame()).header).toMatchObject({ task_id: id, event: "task-failed" });
+      const row = await usage(id);
+      expect(row.attributes["aisix.audio.duration_seconds"]).toBe(2);
+      expect((await log(client.requestId)).get("guardrail_blocked")).toBe("true");
+    } finally { client.ws.close(); }
+  });
+
+  test("checks decoded control-frame content in both directions", async ctx => {
+    if (!app) return ctx.skip();
+    for (const model of ["cn", "guard-control"]) {
+      const client = await openFunAsr(app.proxyUrl, caller);
+      try {
+        const id = randomUUID();
+        client.ws.send(JSON.stringify(runTask(id, model)));
+        if (model === "cn") {
+          expect((await client.frame()).header.event).toBe("task-started");
+          const finish = { header: { action: "finish-task", task_id: id }, payload: { input: { text: "blocked-marker" } } };
+          client.ws.send(JSON.stringify(finish).replace("blocked-marker", "blocked\\u002dmarker"));
+        }
+        expect((await client.frame()).header).toMatchObject({ task_id: id, event: "task-failed" });
+        expect((await log(client.requestId)).get("guardrail_blocked")).toBe("true");
+      } finally { client.ws.close(); }
+    }
+  });
+
+  test("records malformed first frames without emitting usage", async ctx => {
+    if (!app) return ctx.skip();
+    const before = await scrapeMetrics(app.metricsUrl);
+    for (const frame of ["invalid JSON", Buffer.from([0, 1])]) {
+      const client = await openFunAsr(app.proxyUrl, caller);
+      try {
+        client.ws.send(frame);
+        expect((await client.frame()).header.event).toBe("task-failed");
+        await waitForLogLine(app, line => line.includes(client.requestId) && line.includes("status_code=400"), "invalid ASR control frame");
+      } finally { client.ws.close(); }
+    }
+    const after = await scrapeMetrics(app.metricsUrl);
+    expect(metricDelta(before, after, "aisix_proxy_requests_total", { endpoint: funAsrPath, status: "400" })).toBe(2);
+    expect(metricDelta(before, after, "aisix_usage_events_emitted_total", { handler: "audio", inbound_protocol: "dashscope" })).toBe(0);
+  });
+
+  test("records a client disconnect when its terminal frame cannot be delivered", async ctx => {
+    if (!app) return ctx.skip();
+    const client = await openFunAsr(app.proxyUrl, caller);
+    try {
+      const id = randomUUID();
+      client.ws.send(JSON.stringify(runTask(id, "unread-terminal")));
+      expect((await client.frame()).header.event).toBe("task-started");
+      client.ws.pause();
+      client.ws.send(JSON.stringify({ header: { action: "finish-task", task_id: id }, payload: { input: {} } }));
+      expect((await usage(id)).attributes).toMatchObject({
+        "http.response.status_code": 499, "aisix.audio.duration_seconds": 6, "aisix.error_class": "client_disconnected",
+      });
+    } finally { client.ws.terminate(); }
+  });
+
+  test("waiting for client audio does not cool down a healthy model", async ctx => {
+    if (!app) return ctx.skip();
+    const client = await openFunAsr(app.proxyUrl, caller);
+    try {
+      const id = randomUUID();
+      client.ws.send(JSON.stringify(runTask(id, "idle")));
+      expect((await client.frame()).header.event).toBe("task-started");
+      expect((await client.frame()).header.event).toBe("task-failed");
+      expect((await usage(id)).attributes["http.response.status_code"]).toBe(400);
+      expect(await modelStatus("idle")).not.toBe("cooldown");
+    } finally { client.ws.close(); }
+  });
 
   test("one connection routes two serial tasks and meters the last cumulative duration on each", async ctx => {
     if (!app) return ctx.skip();
@@ -168,8 +352,15 @@ describe("DashScope Fun-ASR native tasks", () => {
         ...(alias === "failure" ? { error_code: "BadRequest", error_message: "bad audio" } : {}),
       });
       expect((await usage(id)).attributes).toMatchObject({
-        "aisix.audio.duration_seconds": 6, "aisix.error_class": errorClass, "http.response.status_code": 502,
+        "aisix.audio.duration_seconds": 6, "aisix.error_class": errorClass, "http.response.status_code": alias === "failure" ? 400 : 502,
       });
+      if (alias === "failure") {
+        expect(await modelStatus(alias)).not.toBe("cooldown");
+        expect(JSON.parse((await log(client.requestId)).get("response")!)).toEqual(frames.at(-1));
+        await waitConfigPropagation(async () => client.ws.readyState === client.ws.CLOSED);
+      } else {
+        expect(await modelStatus(alias)).toBe("cooldown");
+      }
     } finally {
       client.ws.close();
     }
