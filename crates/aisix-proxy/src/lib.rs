@@ -178,6 +178,7 @@ pub fn build_router(state: ProxyState) -> Router {
         // OpenAI Realtime WebSocket relay (#721). Auth/ACL/quota are
         // enforced pre-upgrade inside the handler.
         .route("/v1/realtime", get(realtime::realtime))
+        .route("/api-ws/v1/inference", get(realtime::fun_asr::inference))
         // Files / Batches / Fine-tuning jobs surface (#720). Provider
         // routing rides the gateway-encoded resource ids; see jobs.rs.
         .route(
@@ -442,6 +443,7 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/v1/videos" => "/v1/videos",
         "/mcp" | "/mcp/" => "/mcp",
         "/v1/realtime" => "/v1/realtime",
+        "/api-ws/v1/inference" => "/api-ws/v1/inference",
         "/v1/files" => "/v1/files",
         "/v1/batches" => "/v1/batches",
         "/v1/fine_tuning/jobs" => "/v1/fine_tuning/jobs",
@@ -511,6 +513,8 @@ fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
         "mcp"
     } else if endpoint == "/a2a" || endpoint == "/a2a/{agent}/.well-known/agent-card.json" {
         "a2a"
+    } else if endpoint == "/api-ws/v1/inference" {
+        "dashscope"
     } else if endpoint == "/v1/realtime" {
         "realtime"
     } else if endpoint == "/passthrough_route" {

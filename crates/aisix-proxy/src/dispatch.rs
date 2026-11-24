@@ -437,6 +437,16 @@ fn strip_endpoint_suffix(base: &str) -> &str {
     trimmed
 }
 
+/// Preserve a reverse proxy's path prefix when switching a DashScope base to a native API.
+pub(crate) fn dashscope_native_root(base: &str) -> &str {
+    let base = base.trim_end_matches('/');
+    ["/compatible-mode/v1", "/api/v1", "/v1"]
+        .iter()
+        .find_map(|suffix| base.strip_suffix(suffix))
+        .unwrap_or(base)
+        .trim_end_matches('/')
+}
+
 /// The upstream base URL: `provider_key.api_base` override if set,
 /// otherwise the one built-in vendor default. Tolerates an operator
 /// pasting the full upstream URL into `api_base` by stripping any

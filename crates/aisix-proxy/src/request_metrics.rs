@@ -381,6 +381,7 @@ const LLM_ENDPOINTS: &[&str] = &[
     "/v1/videos",
     "/v1/videos/:id",
     "/v1/realtime",
+    "/api-ws/v1/inference",
 ];
 
 /// Whether this endpoint's requests are model inference.
@@ -1141,6 +1142,7 @@ mod tests {
         "/v1/videos/vid_abc123",
         "/v1/videos/vid_abc123/content",
         "/v1/realtime",
+        "/api-ws/v1/inference",
         "/v1/files",
         "/v1/files/file_abc123",
         "/v1/files/file_abc123/content",
@@ -1203,6 +1205,7 @@ mod tests {
             "/v1/videos/vid_abc123/content",
             // Moved in once realtime started reporting its tokens + cost.
             "/v1/realtime",
+            "/api-ws/v1/inference",
         ] {
             assert!(
                 is_llm_endpoint(crate::normalize_endpoint_label(route)),

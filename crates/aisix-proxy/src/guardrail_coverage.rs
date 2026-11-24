@@ -199,6 +199,12 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
     ("/mcp/:server", Posture::Enforced),
     ("/a2a/:agent", Posture::Enforced),
     (
+        "/api-ws/v1/inference",
+        Posture::EnforcedNotDrivableInCrate(
+            "WebSocket task controls and transcript frames require a live connection.",
+        ),
+    ),
+    (
         "/v1/realtime",
         Posture::EnforcedNotDrivableInCrate(
             "WebSocket upgrade; the per-frame scan (realtime.rs `guardrail_block_event`) needs a \
