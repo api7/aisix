@@ -76,6 +76,9 @@ describe("native Gemini generation", () => {
     upstreams.stream = await startOpenAiUpstream({
       streamEvents: STREAM.map((frame) => JSON.stringify(frame)),
     });
+    upstreams.streamerror = await startOpenAiUpstream({
+      streamEvents: [STREAM[0], GOOGLE_ERROR].map((v) => JSON.stringify(v)),
+    });
     upstreams.error = await startOpenAiUpstream({ status: 400, errorBody: GOOGLE_ERROR });
     upstreams.busy = await startOpenAiUpstream({ status: 503, errorBody: {
       error: { code: 503, status: "UNAVAILABLE", message: "Try later", details: [] },
@@ -94,6 +97,10 @@ describe("native Gemini generation", () => {
     ].map((v) => JSON.stringify(v)) });
     upstreams.legacy = await startOpenAiUpstream({});
     upstreams.undeclared = await startOpenAiUpstream({});
+    const guard = await seed.createGuardrail({
+      name: "mask-email", kind: "pii", enabled: true, hook_point: "both",
+      detectors: [{ type: "email", action: "mask" }],
+    }, { attach: false });
     for (const [alias, up] of Object.entries(upstreams)) {
       const root = up.baseUrl + "/v1beta";
       const override = alias === "tools";
@@ -104,17 +111,19 @@ describe("native Gemini generation", () => {
       const pk = await seed.createProviderKey({
         display_name: "native-key-" + alias, api_key: UPSTREAM_KEY,
         api_base: chat || override ? up.baseUrl + "/v1beta/openai" : root, ...surfaces,
-        request: { forward_client_headers: ["authorization", "x-goog-api-key", "x-client-tag"] },
+        request: {
+          forward_client_headers: ["authorization", "x-goog-api-key", "x-client-tag"],
+          ...(alias === "mask" ? { param_constraints: { temperature_max: 0.5 } } : {}),
+        },
       });
-      await seed.createModel({
+      const model = await seed.createModel({
         display_name: alias, provider: "openai", provider_key_id: pk.id,
         model_name: "gemini-upstream",
       });
+      if (alias === "mask" || alias === "maskstream") {
+        await seed.attachGuardrailToModel(guard.id, model.id);
+      }
     }
-    await seed.createGuardrail({
-      name: "mask-email", kind: "pii", enabled: true, hook_point: "both",
-      detectors: [{ type: "email", action: "mask" }],
-    });
     await seed.createApiKey({
       key_hash: createHash("sha256").update(CALLER).digest("hex"),
       allowed_models: Object.keys(upstreams),
@@ -175,12 +184,15 @@ describe("native Gemini generation", () => {
     expect(res.status).toBe(200);
     const answer = await res.json();
     expect(JSON.stringify(answer.candidates)).toContain("mock reply");
-    expect(upstreams[alias].receivedRequests[0].path).toBe("/v1beta/openai/chat/completions");
+    const [sent] = upstreams[alias].receivedRequests;
+    expect(sent.path).toBe("/v1beta/openai/chat/completions");
+    expect(sent.headers.authorization).toBe("Bearer " + UPSTREAM_KEY);
+    expect(sent.headers["x-goog-api-key"]).toBeUndefined();
   });
 
   test("applies input and output masks to native text and tool arguments", async (ctx) => {
     if (!app) return ctx.skip();
-    const ask = { contents: [{ parts: [{ text: "Write to owner@example.com" }] }] };
+    const ask = { contents: [{ parts: [{ text: "Write to owner@example.com" }] }], generationConfig: { temperature: 1 } };
     const res = await call("mask", "generateContent", ask);
     expect(res.status).toBe(200);
     const body = await res.json();
@@ -188,8 +200,9 @@ describe("native Gemini generation", () => {
       { text: "[EMAIL_REDACTED]" },
       { functionCall: { name: "notify", args: { to: "[EMAIL_REDACTED]" } }, thoughtSignature: "c2lnbmF0dXJl" },
     ]);
-    expect(JSON.parse(upstreams.mask.receivedRequests[0].body).contents[0].parts[0].text)
-      .toBe("Write to [EMAIL_REDACTED]");
+    const sent = JSON.parse(upstreams.mask.receivedRequests[0].body);
+    expect(sent.contents[0].parts[0].text).toBe("Write to [EMAIL_REDACTED]");
+    expect(sent.generationConfig.temperature).toBe(0.5);
   });
 
   test("masks a later stream candidate across frames and masks its tool arguments", async (ctx) => {
@@ -203,6 +216,15 @@ describe("native Gemini generation", () => {
     expect(parts.map(p => p.text ?? "").join("")).toBe("[EMAIL_REDACTED]");
     expect(parts.at(-1).functionCall.args.to).toBe("[EMAIL_REDACTED]");
     expect(frames.map(f => f.candidates[0].index)).toEqual([1, 1]);
+  });
+
+  test("returns Google's in-band error after the first native event", async (ctx) => {
+    if (!app) return ctx.skip();
+    const res = await call("streamerror", "streamGenerateContent?alt=sse", ASK);
+    expect(res.status).toBe(200);
+    const frames = (await res.text()).split(/\r?\n/).filter((line) => line.startsWith("data:"))
+      .map((line) => JSON.parse(line.slice(5)));
+    expect(frames).toEqual([STREAM[0], GOOGLE_ERROR]);
   });
 
   test("keeps the Google service error's HTTP status consistent with its JSON body", async (ctx) => {

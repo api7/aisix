@@ -1,7 +1,7 @@
 //! Google AI Studio's generateContent wire, also used by streamGenerateContent.
 //! <https://ai.google.dev/api/generate-content>
 
-use std::{collections::HashMap, time::Instant};
+use std::{borrow::Cow, collections::HashMap, time::Instant};
 
 use aisix_core::ApiSurface;
 use aisix_gateway::{
@@ -9,6 +9,9 @@ use aisix_gateway::{
     gemini::{finish_with_tool_calls, map_gemini_finish_reason, GeminiUsageMetadata},
     BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatDelta, ChatMessage, ChatResponse,
     FinishReason, ServiceTier, SseDecoder, SseEvent, UpstreamErrorView, UpstreamWire, UsageStats,
+};
+use aisix_provider_openai::overrides::{
+    apply_default_body_fields, apply_param_constraints, apply_param_renames,
 };
 use axum::http::{header, HeaderMap, HeaderValue};
 use futures::StreamExt;
@@ -89,9 +92,21 @@ async fn send(
         }
     }
     let client = crate::http_client::client_for(pk.upstream_connection().as_ref());
-    let bytes = aisix_gateway::json_body(body).map_err(|e| BridgeError::Config(e.to_string()))?;
-    let bytes = crate::decisions::apply_body_overrides(pk, bytes)
-        .map_err(|e| BridgeError::Config(e.to_string()))?;
+    let mut body = Cow::Borrowed(body);
+    if let Some(overrides) = pk.request.as_ref().filter(|r| r.rewrites_body()) {
+        let body = body.to_mut();
+        apply_param_renames(body, &overrides.param_renames);
+        if let Some(constraints) = &overrides.param_constraints {
+            for name in ["generationConfig", "generation_config"] {
+                if let Some(config) = body.get_mut(name) {
+                    apply_param_constraints(config, constraints);
+                }
+            }
+        }
+        apply_default_body_fields(body, &overrides.default_body_fields);
+    }
+    let bytes =
+        aisix_gateway::json_body(body.as_ref()).map_err(|e| BridgeError::Config(e.to_string()))?;
     let mut request = client
         .post(endpoint(ctx, streaming)?)
         .headers(headers)
@@ -112,13 +127,13 @@ async fn send(
     .await)
 }
 
-fn in_band_error(raw: &Value) -> Option<BridgeError> {
+fn in_band_error(raw: &mut Value) -> Option<BridgeError> {
     let mut err = aisix_gateway::capture_in_band_error_value(raw, UpstreamWire::Vertex)?;
     if let BridgeError::UpstreamInBand {
         parsed: Some(view), ..
     } = &mut err
     {
-        view.native_body = Some(raw.clone());
+        view.native_body = Some(raw.take());
     }
     Some(err)
 }
@@ -251,7 +266,7 @@ pub(crate) async fn chat(ctx: &BridgeContext, body: &Value) -> Result<ChatRespon
 }
 
 fn response(mut raw: Value) -> Result<ChatResponse, BridgeError> {
-    if let Some(e) = in_band_error(&raw) {
+    if let Some(e) = in_band_error(&mut raw) {
         return Err(e);
     }
     let (usage, service_tier) = usage(&raw)?;
@@ -357,7 +372,7 @@ fn chunks(
     mut frame: Value,
     next_tool: &mut HashMap<u32, u64>,
 ) -> Result<Vec<ChatChunk>, BridgeError> {
-    if let Some(err) = in_band_error(&frame) {
+    if let Some(err) = in_band_error(&mut frame) {
         return Err(err);
     }
     let (usage, tier) = usage(&frame)?;
