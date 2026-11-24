@@ -140,7 +140,10 @@ describe("native Gemini generation", () => {
       ["mixed-cache", ["undeclared", "nativeonly"]],
     ] as const) {
       await seed.createModel({
-        display_name: name, routing: { strategy: "failover", targets: targets.map(model => ({ model })) },
+        display_name: name, routing: {
+          strategy: "failover", ...(name === "mixed-chat" ? { max_fallbacks: 0 } : {}),
+          targets: targets.map(model => ({ model })),
+        },
       });
       await seed.createCachePolicy({ name: name + "-policy", enabled: true, applies_to: "model:" + name });
     }

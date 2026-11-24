@@ -1300,6 +1300,15 @@ fn select_eligible(
     if candidates.is_empty() {
         return Err(ProxyError::ModelIpRestricted(router.display_name.clone()));
     }
+    if let Some(admits) = routing.gemini_target {
+        candidates.retain(|(candidate, _)| match candidate {
+            Candidate::Direct(entry) => admits(&entry.value),
+            Candidate::Group(_) => true,
+        });
+        if candidates.is_empty() {
+            return Err(crate::gemini::unsupported_target());
+        }
+    }
     // A candidate on a provider key whose budget is exhausted is excluded
     // as hard as one outside its allowlist. A group carries no provider
     // key: its members are judged when it selects them.

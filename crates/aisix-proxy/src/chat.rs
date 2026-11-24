@@ -32,7 +32,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::{Stream, StreamExt};
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1758,7 +1758,21 @@ async fn dispatch(
     // the matched route name (None on a fall-through to `default` or a
     // non-semantic request) for the `x-aisix-route` response header.
     let budget_gate = crate::budget::gate(state, snapshot);
-    let mut plan = crate::dispatch_plan::plan(
+    let bypass_chat_cache = AtomicBool::new(false);
+    let gemini_target = |model: &aisix_core::Model| {
+        let target = model
+            .provider_key_id
+            .as_deref()
+            .and_then(|id| snapshot.provider_keys.get_by_id(id))
+            .and_then(|key| ChatTarget::resolve(state, model, &key.value, native_body.as_ref()));
+        // A native reply has fields outside ChatFormat. A discarded target
+        // could have populated this alias's cache through the Chat endpoint.
+        if !matches!(target, Some(ChatTarget::Bridge(_))) {
+            bypass_chat_cache.store(true, Ordering::Relaxed);
+        }
+        target.is_some()
+    };
+    let plan = crate::dispatch_plan::plan(
         state,
         snapshot,
         &req.model,
@@ -1771,6 +1785,7 @@ async fn dispatch(
             api_key_id: auth.entry.id.as_str(),
             source_ip: &client.source_ip,
             context_origin: None,
+            gemini_target: native_body.is_some().then_some(&gemini_target),
             budget: Some(&budget_gate),
             client: Some(client),
         },
@@ -1781,26 +1796,7 @@ async fn dispatch(
     )
     .await
     .map_err(&with_model)?;
-    let mut bypass_chat_cache = false;
-    if let Some(raw) = &native_body {
-        plan.attempts.retain(|a| {
-            let target = a
-                .model
-                .provider_key_id
-                .as_deref()
-                .and_then(|id| snapshot.provider_keys.get_by_id(id))
-                .and_then(|key| ChatTarget::resolve(state, &a.model, &key.value, Some(raw)));
-            // A native reply has fields outside ChatFormat. A discarded target
-            // could have populated this alias's cache through the Chat endpoint.
-            bypass_chat_cache |= !matches!(target, Some(ChatTarget::Bridge(_)));
-            target.is_some()
-        });
-        if plan.attempts.is_empty() {
-            return Err(with_model(ProxyError::InvalidRequest(
-                "this model has no Gemini or OpenAI Chat Completions target".into(),
-            )));
-        }
-    }
+    let bypass_chat_cache = bypass_chat_cache.into_inner();
     let attempt_models = &plan.attempts;
     let semantic_route = plan.semantic_route.clone();
 

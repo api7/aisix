@@ -18,6 +18,10 @@ use crate::{auth::AuthenticatedKey, client_ip::ClientContext, ProxyError, ProxyS
 pub(crate) const ENDPOINT: &str = "/v1beta/models/:model:generateContent";
 pub(crate) const STREAM_ENDPOINT: &str = "/v1beta/models/:model:streamGenerateContent";
 
+pub(crate) fn unsupported_target() -> ProxyError {
+    ProxyError::InvalidRequest("this model has no Gemini or OpenAI Chat Completions target".into())
+}
+
 pub(crate) fn path(path: &str) -> Option<(&str, bool)> {
     let model_action = if let Some(short) = path.strip_prefix("/v1beta/models/") {
         short
