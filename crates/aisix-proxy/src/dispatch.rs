@@ -280,6 +280,7 @@ pub(crate) fn serves_natively_with(
     }
     let declared = pk.and_then(|p| p.apis.as_ref());
     match surface {
+        ApiSurface::Gemini => declared.is_some_and(|apis| apis.gemini.is_some()),
         ApiSurface::Messages => {
             model.provider.as_deref() == Some("anthropic")
                 || pk.is_some_and(|p| p.adapter == Some(aisix_core::Adapter::Anthropic))
@@ -497,6 +498,9 @@ pub(crate) fn configured_base_url(
     provider_key: &ProviderKey,
     surface: Option<ApiSurface>,
 ) -> Option<String> {
+    if surface == Some(ApiSurface::Gemini) {
+        return Some(gemini_base(provider_key).to_owned());
+    }
     if let Some(base) = surface.and_then(|s| surface_base(provider_key, s)) {
         return Some(strip_endpoint_suffix(base.trim()).to_string());
     }
@@ -666,6 +670,9 @@ pub(crate) fn resolve_base_url_for(
     provider_key: &ProviderKey,
     surface: ApiSurface,
 ) -> Result<String, ProxyError> {
+    if surface == ApiSurface::Gemini {
+        return Ok(gemini_base(provider_key).to_owned());
+    }
     match surface_base(provider_key, surface) {
         Some(base) => Ok(strip_endpoint_suffix(base.trim()).to_string()),
         None if surface == ApiSurface::Messages
@@ -679,6 +686,17 @@ pub(crate) fn resolve_base_url_for(
         }
         None => resolve_base_url(provider_key),
     }
+}
+
+fn gemini_base(key: &ProviderKey) -> &str {
+    surface_base(key, ApiSurface::Gemini)
+        .or_else(|| {
+            key.api_base
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("https://generativelanguage.googleapis.com/v1beta")
 }
 
 /// Whether a key with no `api_base` reaches the built-in Anthropic base
@@ -1204,18 +1222,20 @@ mod tests {
             let snap = snapshot_with_pk_json(
                 "pk-1",
                 &format!(
-                    r#"{{"display_name":"p","api_key":"{{}}","api_base":"https://up","provider":"byo","adapter":"{adapter}","apis":{{"responses":{{}},"messages":{{}}}}}}"#
+                    r#"{{"display_name":"p","api_key":"{{}}","api_base":"https://up","provider":"byo","adapter":"{adapter}","apis":{{"responses":{{}},"messages":{{}},"gemini":{{}}}}}}"#
                 ),
             );
             let m = model_on("byo", "pk-1");
-            assert!(
-                !serves_natively(&snap, &m, ApiSurface::Responses),
-                "{adapter} must not take the verbatim responses path",
-            );
-            assert!(
-                !serves_natively(&snap, &m, ApiSurface::Messages),
-                "{adapter} must not take the verbatim messages path",
-            );
+            for surface in [
+                ApiSurface::Responses,
+                ApiSurface::Messages,
+                ApiSurface::Gemini,
+            ] {
+                assert!(
+                    !serves_natively(&snap, &m, surface),
+                    "{adapter} must not dispatch {surface:?} natively"
+                );
+            }
         }
     }
 
@@ -1244,6 +1264,17 @@ mod tests {
                 "{adapter} + vendor {vendor} must not reach a verbatim path",
             );
         }
+    }
+
+    #[test]
+    fn declared_gemini_without_any_base_uses_the_google_api() {
+        let key: ProviderKey =
+            serde_json::from_str(r#"{"display_name":"google","api_key":"k","apis":{"gemini":{}}}"#)
+                .unwrap();
+        assert_eq!(
+            resolve_base_url_for(&key, ApiSurface::Gemini).unwrap(),
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
     }
 
     /// An empty `base` resolves as "no override" rather than building a

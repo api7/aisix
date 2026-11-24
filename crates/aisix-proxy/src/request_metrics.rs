@@ -362,6 +362,8 @@ impl<'a> LastTarget<'a> {
 /// a session reports its tokens and cost, that reason is gone and it belongs
 /// with the rest.
 const LLM_ENDPOINTS: &[&str] = &[
+    crate::gemini::ENDPOINT,
+    crate::gemini::STREAM_ENDPOINT,
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/embeddings",
@@ -1102,6 +1104,10 @@ mod tests {
     /// are what force a new endpoint's `endpoint` label and LLM-vs-proxy
     /// tier to be decided rather than defaulted.
     const ROUTES: &[&str] = &[
+        "/v1beta/models/example:generateContent",
+        "/v1beta/models/example:streamGenerateContent",
+        "/v1beta1/projects/example/locations/global/publishers/google/models/example:generateContent",
+        "/v1beta1/projects/example/locations/global/publishers/google/models/example:streamGenerateContent",
         "/v1/models",
         "/.well-known/oauth-protected-resource",
         "/.well-known/oauth-protected-resource/mcp",

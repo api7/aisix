@@ -156,6 +156,10 @@ describe("the access log reports request and response body sizes", () => {
       target_url: `${passthroughUp.baseUrl}/v1`,
       provider_key_id: ptrPk.id,
     });
+    await seed.createPassthroughRoute({
+      name: "bytes-gemini-mount", path_prefix: "/v1beta/models",
+      target_url: passthroughUp.baseUrl, provider_key_id: ptrPk.id,
+    });
     await seed.createApiKey({ key_hash: sha256(KEY), allowed_models: ["*"], allowed_routes: ["*"] });
     const proxy = new ProxyClient(app.proxyUrl, KEY);
     await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
@@ -324,6 +328,17 @@ describe("the access log reports request and response body sizes", () => {
     const line = await lineFor(r.requestId, "the passthrough line");
     expect(numField(line, "request_body_bytes"), line).toBe(r.sent);
     expect(numField(line, "response_body_bytes"), line).toBe(r.received);
+  });
+
+  test("a Gemini body-limit refusal uses the configured route's envelope", async (ctx) => {
+    if (!app) return ctx.skip();
+    const body = JSON.stringify({ contents: [{ parts: [{ text: "x".repeat(BODY_LIMIT) }] }] });
+    const mounted = await send("POST", "/v1beta/models/mounted:generateContent", body);
+    expect(mounted.status).toBe(413);
+    expect(JSON.parse(mounted.text)).toMatchObject({ error: { type: "invalid_request_error" } });
+    const typed = await send("POST", "/v1beta1/projects/p/locations/l/publishers/google/models/typed:generateContent", body);
+    expect(typed.status).toBe(413);
+    expect(JSON.parse(typed.text)).toMatchObject({ error: { code: 413, status: "INVALID_ARGUMENT" } });
   });
 
   test("a 413 decided from Content-Length reports no request size", async (ctx) => {

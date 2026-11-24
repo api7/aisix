@@ -734,6 +734,7 @@ async fn dispatch(
             api_key_id: auth.entry.id.as_str(),
             source_ip: &client.source_ip,
             context_origin: affinity.origin(),
+            gemini_target: None,
             budget: Some(&budget_gate),
             client: Some(client),
         },

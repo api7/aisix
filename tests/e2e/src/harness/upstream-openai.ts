@@ -24,6 +24,8 @@ export interface OpenAiUpstreamOptions {
    * headers too) and `eventDelayMs` (only applies between events).
    */
   firstEventDelayMs?: number;
+  /** Hold the remaining SSE events and EOF until the test releases the first event. */
+  afterFirstEvent?: Promise<void>;
   /** Inserted between SSE events. */
   eventDelayMs?: number;
   /** Status code to return (default 200). */
@@ -93,6 +95,7 @@ export interface OpenAiUpstreamStep {
   responseDelayMs?: number;
   /** See `OpenAiUpstreamOptions.firstEventDelayMs`. */
   firstEventDelayMs?: number;
+  afterFirstEvent?: Promise<void>;
   eventDelayMs?: number;
   status?: number;
   errorBody?: unknown;
@@ -294,6 +297,7 @@ export async function startOpenAiUpstream(
             return;
           }
           res.write(raw ? events[i] : `data: ${events[i]}\n\n`);
+          if (i === 0 && step.afterFirstEvent) await step.afterFirstEvent;
           if (step.eventDelayMs) await sleep(step.eventDelayMs);
         }
         if (!res.writableEnded && !res.destroyed) res.end();

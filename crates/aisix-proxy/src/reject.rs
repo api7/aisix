@@ -41,6 +41,7 @@ const UNRESOLVED_PROVIDER_LABEL: &str = "unknown";
 #[derive(Clone, Copy)]
 pub(crate) enum Envelope {
     OpenAi,
+    Gemini,
     Anthropic,
 }
 
@@ -113,6 +114,7 @@ pub(crate) fn reject_before_dispatch(
     );
     match envelope {
         Envelope::OpenAi => err.into_response(),
+        Envelope::Gemini => err.into_gemini_response(),
         Envelope::Anthropic => err.into_anthropic_response(),
     }
 }

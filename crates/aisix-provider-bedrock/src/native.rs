@@ -368,6 +368,7 @@ impl StreamException {
                 message: None,
                 code: None,
                 param: None,
+                native_body: None,
             })),
             wire: aisix_gateway::UpstreamWire::Bedrock,
         }

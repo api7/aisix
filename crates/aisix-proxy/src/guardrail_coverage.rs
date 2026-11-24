@@ -160,6 +160,11 @@ pub(crate) const POSTURE: &[(&str, Posture)] = &[
         Posture::NoUpstreamContent("cancels by id; carries no caller text"),
     ),
     // --- content-bearing surfaces --------------------------------------
+    ("/v1beta/models/*model_action", Posture::Enforced),
+    (
+        "/v1beta1/projects/:project/locations/:location/publishers/google/models/*model_action",
+        Posture::Enforced,
+    ),
     ("/v1/chat/completions", Posture::Enforced),
     ("/v1/completions", Posture::Enforced),
     ("/v1/embeddings", Posture::Enforced),
@@ -584,6 +589,8 @@ pub(crate) fn fixture(surface: &str) -> Option<Request<Body>> {
     };
 
     Some(match surface {
+        "/v1beta/models/*model_action" => json("/v1beta/models/census-openai:generateContent",serde_json::json!({"contents":[{"parts":[{"text":""}]}]})),
+        "/v1beta1/projects/:project/locations/:location/publishers/google/models/*model_action" => json("/v1beta1/projects/test/locations/us/publishers/google/models/census-openai:streamGenerateContent?alt=sse",serde_json::json!({"contents":[{"parts":[{"text":""}]}]})),
         "/v1/chat/completions" => json(
             surface,
             serde_json::json!({

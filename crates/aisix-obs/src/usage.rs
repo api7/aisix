@@ -1388,6 +1388,7 @@ impl UsageSink {
         let bounded_protocol: &'static str = match event.inbound_protocol.as_str() {
             "openai" => "openai",
             "anthropic" => "anthropic",
+            "gemini" => "gemini",
             "mcp" => "mcp",
             _ => "other",
         };

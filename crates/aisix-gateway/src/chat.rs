@@ -1492,6 +1492,20 @@ pub fn anthropic_usage_service_tier(usage: &serde_json::Value) -> Option<String>
     anthropic_service_tier(field("speed"), field("service_tier"))
 }
 
+/// MIME type for a Chat Completions audio output format.
+/// <https://platform.openai.com/docs/api-reference/chat/create#chat-create-audio>
+pub fn audio_mime_type(format: &str) -> Option<&'static str> {
+    match format {
+        "wav" => Some("audio/wav"),
+        "mp3" => Some("audio/mpeg"),
+        "flac" => Some("audio/flac"),
+        "aac" => Some("audio/aac"),
+        "opus" => Some("audio/opus"),
+        "pcm16" => Some("audio/pcm"),
+        _ => None,
+    }
+}
+
 /// Full (non-streaming) chat response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

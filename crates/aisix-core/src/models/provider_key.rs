@@ -186,12 +186,13 @@ pub enum ApiSurface {
     Responses,
     /// Anthropic-wire `/v1/messages`, and its `/count_tokens` sub-route.
     Messages,
+    /// Google Gemini generateContent and streamGenerateContent.
+    Gemini,
 }
 
 /// Per-surface native entry points on one upstream.
 ///
-/// The two surfaces resolve differently, because the evidence for them
-/// differs:
+/// Each protocol can use a separate base URL:
 ///
 /// - `messages` is **additive**. An `adapter: anthropic` key (or the
 ///   `anthropic` vendor) speaks that wire by declaration and keeps serving
@@ -211,8 +212,10 @@ pub enum ApiSurface {
 ///   gets the request translated to chat completions instead of 404'd
 ///   upstream.
 ///
-/// With no map at all, each falls back to what the gateway inferred
-/// before this field existed: `/v1/messages` from the vendor id or the
+/// - `gemini` enables native Google Gemini generation for Gemini requests.
+///   Without this entry, the gateway translates those requests to chat.
+///
+/// With no map at all, the gateway infers `/v1/messages` from the vendor id or the
 /// `anthropic` adapter, `/v1/responses` from the vendor id alone.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 pub struct ProviderApis {
@@ -223,6 +226,13 @@ pub struct ProviderApis {
     /// Anthropic-wire `/v1/messages` (and `/v1/messages/count_tokens`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages: Option<ApiEndpoint>,
+
+    /// Google Gemini generateContent and streamGenerateContent. Set `base`
+    /// to the versioned Gemini API root. When omitted, the gateway uses
+    /// `api_base`, or Google's `https://generativelanguage.googleapis.com/v1beta`
+    /// when neither base is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemini: Option<ApiEndpoint>,
 }
 
 impl ProviderApis {
@@ -231,6 +241,7 @@ impl ProviderApis {
         match surface {
             ApiSurface::Responses => self.responses.as_ref(),
             ApiSurface::Messages => self.messages.as_ref(),
+            ApiSurface::Gemini => self.gemini.as_ref(),
         }
     }
 }

@@ -5366,6 +5366,15 @@ mod tests {
         validate_provider_key(&v).unwrap();
     }
 
+    #[test]
+    fn provider_key_accepts_gemini_at_the_default_or_an_explicit_base() {
+        for entry in [json!({}), json!({"base": "https://native.example/v1beta"})] {
+            let row = json!({"display_name":"dual", "api_key":"k", "apis":{"gemini":entry}});
+            validate_provider_key(&row).unwrap();
+            validate_provider_key_lenient(&row).unwrap();
+        }
+    }
+
     /// The surface key set is closed on the write path, so a typo (or a
     /// surface this release does not serve) fails loudly rather than
     /// sitting in the document doing nothing.

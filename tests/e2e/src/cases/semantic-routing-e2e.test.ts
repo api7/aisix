@@ -167,6 +167,20 @@ describe("semantic routing e2e", () => {
     await createEmbeddingModel("bge-mock", embed);
     await createDirectModel("legal-model", legal);
     await createDirectModel("default-model", fallback);
+    const anthropic = await seed.createProviderKey({
+      display_name: "semantic-anthropic", provider: "anthropic", adapter: "anthropic",
+      api_key: "mock-key", api_base: legal.baseUrl,
+    });
+    await seed.createModel({
+      display_name: "anthropic-legal", provider: "anthropic", model_name: "legal", provider_key_id: anthropic.id,
+    });
+    await seed.createModel({
+      display_name: "gemini-semantic",
+      semantic: {
+        embedding_model: "bge-mock", default: "default-model", match: { threshold: 0.5 },
+        routes: [{ name: "legal", target: "anthropic-legal", examples: ["legal risk"] }],
+      },
+    });
     await seed.createModel({
       display_name: "prod-chat",
       semantic: {
@@ -356,6 +370,17 @@ describe("semantic routing e2e", () => {
     expect(r.content).toBe("served-by-legal");
     expect(r.route).toBe("legal");
     expect(r.servedBy).toBe("legal-model");
+  });
+
+  test("Gemini requests use the semantic default when the matching target cannot serve them", async (ctx) => {
+    if (!app) return ctx.skip();
+    const res = await fetch(app.proxyUrl + "/v1beta/models/gemini-semantic:generateContent", {
+      method: "POST", headers: { "content-type": "application/json", authorization: "Bearer " + CALLER_PLAINTEXT },
+      body: JSON.stringify({ contents: [{ parts: [{ text: "please review the contract for risk" }] }] }),
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-aisix-route")).toBeNull();
+    expect((await res.json()).candidates[0].content.parts).toEqual([{ text: "served-by-default" }]);
   });
 
   test("falls through to default when no route clears its threshold (no x-aisix-route)", async (ctx) => {

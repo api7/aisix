@@ -625,6 +625,7 @@ where
             api_key_id: auth.entry.id.as_str(),
             source_ip: &client.source_ip,
             context_origin: None,
+            gemini_target: None,
             budget: Some(&budget_gate),
             client: Some(client),
         },
@@ -1446,6 +1447,9 @@ pub(crate) struct RoutingRequest<'a> {
     /// can read that context are attempted first, ahead of the strategy's
     /// order. `None` everywhere else.
     pub context_origin: Option<&'a crate::responses_affinity::Origin>,
+    /// On Gemini requests, only targets that can serve the generation
+    /// protocol participate in balancing and consume a fallback slot.
+    pub gemini_target: Option<&'a (dyn Fn(&Model) -> bool + Sync)>,
     /// The request's budget gate. A target whose provider key's budget is
     /// exhausted is not a candidate, and a direct model on one is refused.
     /// `None` only in tests that exercise no budget.
@@ -1541,6 +1545,12 @@ pub(crate) fn resolve_attempt_models(
     req: RoutingRequest<'_>,
 ) -> Result<Vec<AttemptModel>, ProxyError> {
     let Some(routing) = virtual_model.routing.as_ref() else {
+        if req
+            .gemini_target
+            .is_some_and(|admits| !admits(virtual_model))
+        {
+            return Err(crate::gemini::unsupported_target());
+        }
         if let Some(gate) = req.budget {
             gate.check_model(virtual_model)?;
         }
@@ -1617,10 +1627,21 @@ pub(crate) fn resolve_attempt_models(
     // exhausted is not a candidate either, for the same reasons as the IP
     // allowlist — it must not consume a `max_fallbacks` slot, and it has no
     // "try anyway".
-    let eligible = match req.budget {
+    let mut eligible = match req.budget {
         Some(gate) => targets_within_budget(snapshot, gate, eligible)?,
         None => eligible,
     };
+    if let Some(admits) = req.gemini_target {
+        eligible.retain(|t| {
+            snapshot
+                .models
+                .get_by_name(&t.model)
+                .is_none_or(|e| admits(&e.value))
+        });
+        if eligible.is_empty() {
+            return Err(crate::gemini::unsupported_target());
+        }
+    }
     let filtered_routing = Routing {
         targets: eligible,
         ..routing.clone()

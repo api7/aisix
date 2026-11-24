@@ -48,8 +48,19 @@
       "type": "object"
     },
     "ProviderApis": {
-      "description": "Per-surface native entry points on one upstream.\n\nThe two surfaces resolve differently, because the evidence for them differs:\n\n- `messages` is **additive**. An `adapter: anthropic` key (or the `anthropic` vendor) speaks that wire by declaration and keeps serving `/v1/messages` natively whatever this map says; listing it here adds the route to a key whose adapter is something else. That is the DeepSeek/Zhipu shape — an OpenAI-compatible key whose vendor also fronts an Anthropic-compatible path. An entry's own `base` always decides WHERE the Anthropic wire lives, for the verbatim passthrough and for the bridge that translates into it alike; without one it is `api_base`. - `responses` is **authoritative**. Once this map exists, `/v1/responses` is served natively only if it is listed. The Responses API is a strict superset of chat completions rather than a rename, so an OpenAI-compatible endpoint serving one does not necessarily serve the other, and `adapter: openai` is not evidence either way. Leaving it out is how an operator says \"this endpoint has no `/v1/responses`\" and gets the request translated to chat completions instead of 404'd upstream.\n\nWith no map at all, each falls back to what the gateway inferred before this field existed: `/v1/messages` from the vendor id or the `anthropic` adapter, `/v1/responses` from the vendor id alone.",
+      "description": "Per-surface native entry points on one upstream.\n\nEach protocol can use a separate base URL:\n\n- `messages` is **additive**. An `adapter: anthropic` key (or the `anthropic` vendor) speaks that wire by declaration and keeps serving `/v1/messages` natively whatever this map says; listing it here adds the route to a key whose adapter is something else. That is the DeepSeek/Zhipu shape — an OpenAI-compatible key whose vendor also fronts an Anthropic-compatible path. An entry's own `base` always decides WHERE the Anthropic wire lives, for the verbatim passthrough and for the bridge that translates into it alike; without one it is `api_base`. - `responses` is **authoritative**. Once this map exists, `/v1/responses` is served natively only if it is listed. The Responses API is a strict superset of chat completions rather than a rename, so an OpenAI-compatible endpoint serving one does not necessarily serve the other, and `adapter: openai` is not evidence either way. Leaving it out is how an operator says \"this endpoint has no `/v1/responses`\" and gets the request translated to chat completions instead of 404'd upstream.\n\n- `gemini` enables native Google Gemini generation for Gemini requests. Without this entry, the gateway translates those requests to chat.\n\nWith no map at all, the gateway infers `/v1/messages` from the vendor id or the `anthropic` adapter, `/v1/responses` from the vendor id alone.",
       "properties": {
+        "gemini": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ApiEndpoint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Google Gemini generateContent and streamGenerateContent. Set `base` to the versioned Gemini API root. When omitted, the gateway uses `api_base`, or Google's `https://generativelanguage.googleapis.com/v1beta` when neither base is set."
+        },
         "messages": {
           "anyOf": [
             {

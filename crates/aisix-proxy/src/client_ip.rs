@@ -128,6 +128,7 @@ pub const ROUTING_TAGS_HEADER: &str = "x-aisix-routing-tags";
 /// threaded into the usage event by each handler's emit fn.
 #[derive(Debug, Clone, Default)]
 pub struct ClientContext {
+    pub(crate) endpoint: &'static str,
     pub source_ip: String,
     pub user_agent: String,
     /// Routing tags from [`ROUTING_TAGS_HEADER`], used to select among a
@@ -289,6 +290,7 @@ where
             .get::<Arc<aisix_core::ResourceEntry<aisix_core::ApiKey>>>();
 
         let ctx = ClientContext {
+            endpoint: crate::normalize_endpoint_label(parts.uri.path()),
             source_ip,
             user_agent,
             routing_tags,

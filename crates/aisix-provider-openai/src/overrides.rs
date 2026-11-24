@@ -97,6 +97,16 @@ pub fn apply_param_constraints(body: &mut Value, constraints: &ParamConstraints)
     let Some(current) = temp.as_f64() else {
         return;
     };
+    apply_temperature_constraint(temp, current, constraints);
+}
+
+/// Clamp a temperature already decoded from the incoming wire. Leave its
+/// original JSON representation intact when it lies within the configured range.
+pub fn apply_temperature_constraint(
+    temp: &mut Value,
+    current: f64,
+    constraints: &ParamConstraints,
+) {
     let mut next = current;
     if let Some(max) = constraints.temperature_max {
         if next > max {

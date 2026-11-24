@@ -62,7 +62,9 @@
 //!   fall into a typed route that happens to share the path (forward-proxy
 //!   traffic: a TLS-terminating device delivers e.g.
 //!   `Host: api.githubcopilot.com` with its original path). On a host
-//!   match the middleware dispatches straight to [`entry`].
+//!   match the middleware dispatches straight to [`entry`]. Existing
+//!   path mounts for Gemini generation also take this path, preserving
+//!   their routing and authentication when the gateway is upgraded.
 //!
 //! ## Auth
 //!
@@ -175,7 +177,11 @@ pub async fn host_dispatch(
     next: Next,
 ) -> Response {
     let snapshot = state.snapshot.load();
-    let matched = has_host_match(&snapshot, inbound_host(&req).as_deref());
+    let path = req.uri().path();
+    let matched = has_host_match(&snapshot, inbound_host(&req).as_deref())
+        || (req.method() == axum::http::Method::POST
+            && crate::gemini::path(path).is_some()
+            && match_route(&snapshot, None, path).is_some());
     drop(snapshot);
     if matched {
         use tower::ServiceExt;
