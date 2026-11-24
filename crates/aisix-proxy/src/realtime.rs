@@ -60,6 +60,8 @@
 //! the rate-limit reservation like the other non-chat surfaces (#911
 //! [21]).
 
+pub(crate) mod fun_asr;
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -610,6 +612,7 @@ pub(crate) async fn realtime(
             let last_target = crate::request_metrics::LastTarget::new(&snapshot, &attributed);
             let addressed = Some(attributed.requested_model.as_str()).filter(|m| !m.is_empty());
             emit_access_log(
+                "/v1/realtime",
                 &method,
                 status,
                 started.elapsed(),
@@ -1174,6 +1177,7 @@ async fn run_session(
                 })))
                 .await;
             emit_access_log(
+                "/v1/realtime",
                 &Method::GET,
                 status,
                 started.elapsed(),
@@ -1519,6 +1523,7 @@ async fn run_session(
         .await;
 
     emit_access_log(
+        "/v1/realtime",
         &Method::GET,
         close_status,
         elapsed,
@@ -1949,6 +1954,7 @@ async fn guardrail_block_event(
 
 #[allow(clippy::too_many_arguments)]
 fn emit_access_log(
+    path: &str,
     method: &Method,
     status: u16,
     elapsed: Duration,
@@ -1974,7 +1980,7 @@ fn emit_access_log(
     let log_target = crate::attribution::AccessLogTarget::current();
     crate::attribution::emit_access_log(AccessLog {
         method: method.as_str(),
-        path: "/v1/realtime",
+        path,
         status,
         latency: elapsed,
         duration: elapsed,

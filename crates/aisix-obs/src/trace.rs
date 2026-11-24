@@ -288,6 +288,13 @@ impl RequestTraceBundle {
         }
     }
 
+    /// Start another independently metered task on the same inbound connection.
+    pub fn next_request(&self) -> Self {
+        let mut next = Self::new(self.remote.clone());
+        next.http = self.http.clone();
+        next
+    }
+
     /// Attach the inbound HTTP request the SERVER span reports.
     pub fn with_http_server(mut self, http: crate::genai::HttpServerFacts) -> Self {
         self.http = Some(Arc::new(http));

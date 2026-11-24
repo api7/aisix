@@ -615,7 +615,7 @@ impl VideoProvider {
     fn root(self, base: &str) -> &str {
         let trimmed = base.trim_end_matches('/');
         let suffixes: &[&str] = match self {
-            Self::Alibaba => &["/compatible-mode/v1", "/api/v1", "/v1"],
+            Self::Alibaba => return crate::dispatch::dashscope_native_root(trimmed),
             // The CP catalog pre-fills `https://open.bigmodel.cn/api/paas/v4`.
             Self::Zhipu => &["/api/paas/v4"],
             // The common Ark base is `https://ark.cn-beijing.volces.com/api/v3`.

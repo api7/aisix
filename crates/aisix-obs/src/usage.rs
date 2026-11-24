@@ -1389,6 +1389,7 @@ impl UsageSink {
             "openai" => "openai",
             "anthropic" => "anthropic",
             "gemini" => "gemini",
+            "dashscope" => "dashscope",
             "mcp" => "mcp",
             _ => "other",
         };

@@ -21,6 +21,8 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
+import { funAsrPath, openFunAsr, recognize, startFunAsrUpstream } from "../harness/fun-asr.js";
+
 // Every client-facing proxy route emits every per-request metric family,
 // unless the quantity the family measures does not exist on that route
 // (AISIX-Cloud#1935). The table below is that contract: one row per route
@@ -338,6 +340,7 @@ describe("every proxy route emits every per-request metric family", () => {
   let app: SpawnedApp | undefined;
   let upstream: Awaited<ReturnType<typeof startUpstream>> | undefined;
   let realtime: Awaited<ReturnType<typeof startRealtimeUpstream>> | undefined;
+  let asr: Awaited<ReturnType<typeof startFunAsrUpstream>> | undefined;
   let mcp: McpUpstream | undefined;
   let a2a: A2aUpstream | undefined;
   let etcdReachable = false;
@@ -658,6 +661,20 @@ describe("every proxy route emits every per-request metric family", () => {
         });
       },
     },
+    {
+      // DashScope measures an ASR task in audio seconds and reports no tokens.
+      route: funAsrPath, endpoint: funAsrPath, name: "Fun-ASR", model: "par-funasr",
+      protocols: { inbound_protocol: "dashscope", upstream_protocol: "openai" },
+      families: [...REQUEST, "llm_requests", "e2e_upstream", "deployment", "ratelimit_remaining"],
+      drive: async () => {
+        const client = await openFunAsr(app!.proxyUrl, CALLER);
+        try {
+          expect((await recognize(client, "par-funasr")).frames.at(-1).header.event).toBe("task-finished");
+        } finally {
+          client.ws.close();
+        }
+      },
+    },
     // Files / batches / fine-tuning: management calls, outside the LLM tier.
     {
       route: "/v1/files",
@@ -912,6 +929,7 @@ describe("every proxy route emits every per-request metric family", () => {
 
     upstream = await startUpstream();
     realtime = await startRealtimeUpstream();
+    asr = await startFunAsrUpstream();
     mcp = await startMcpUpstream("alpha");
     a2a = await startA2aUpstream({ streamAnswer: true });
     app = await spawnApp();
@@ -938,6 +956,8 @@ describe("every proxy route emits every per-request metric family", () => {
     await model("par-tts", "tts-1", openaiPk.id);
     await model("par-video", "sora-2", soraPk.id);
     await model("par-realtime", "gpt-realtime-mock", realtimePk.id);
+    const asrPk = await seed.createProviderKey({ display_name: "asr-pk", provider: "alibaba", api_key: "sk-mock", api_base: asr.base });
+    await model("par-funasr", "fun-asr-realtime", asrPk.id, "alibaba");
     await model("par-jobs", "gpt-4o", openaiPk.id);
 
     await seed.update("mcp_servers", randomUUID(), { name: "alpha", url: mcp.url, enabled: true });
@@ -962,6 +982,7 @@ describe("every proxy route emits every per-request metric family", () => {
     await app?.exit();
     await upstream?.close();
     await realtime?.close();
+    await asr?.close();
     await mcp?.close();
     await a2a?.close();
   });
