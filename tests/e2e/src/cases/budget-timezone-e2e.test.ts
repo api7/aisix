@@ -91,9 +91,11 @@ async function syncThroughSentinel(seed: SeedClient, app: SpawnedApp) {
   await waitConfigPropagation(async () => {
     try {
       return (await sentinel.listModels()).status === 200;
-    } catch {
+    } catch (error) {
       // A managed gateway binds its proxy listener after its first configuration.
-      return false;
+      const err = error as { code?: string; cause?: { code?: string } };
+      if ((err.code ?? err.cause?.code) === "ECONNREFUSED") return false;
+      throw error;
     }
   });
 }
