@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use aisix_core::models::{
     budget_next_period_start, budget_period_start, parse_budget_timezone, Budget, BudgetFailMode,
-    BudgetScope,
+    BudgetPeriod, BudgetPolicy, BudgetReason as DocumentReason, BudgetScope,
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::snapshot::ResourceTable;
@@ -41,6 +41,11 @@ use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
 
 type Entry = Arc<ResourceEntry<Budget>>;
+
+struct ActiveMark<'a> {
+    reason: &'a DocumentReason,
+    resets_at: DateTime<Tz>,
+}
 
 /// Customer-facing detail for a budget denial, lifted into the 429 `error`
 /// block so a programmatic client can see which budget tripped (`scope` /
@@ -211,6 +216,7 @@ pub(crate) struct BudgetGate {
     index: Arc<BudgetIndex>,
     now: DateTime<Utc>,
     tz: Tz,
+    managed: bool,
     /// Strict mode is in force: delivery has been failing for at least the
     /// policy's grace period.
     unverified: bool,
@@ -218,22 +224,22 @@ pub(crate) struct BudgetGate {
 
 /// The gate for a request served from `snapshot`.
 pub(crate) fn gate(state: &crate::ProxyState, snapshot: &AisixSnapshot) -> BudgetGate {
+    let policies = snapshot.budget_policy.entries();
     BudgetGate {
         index: state.budgets.for_table(&snapshot.budgets),
         now: Utc::now(),
-        tz: policy_timezone(snapshot),
-        unverified: strict_grace(snapshot)
+        tz: policy_timezone(&policies),
+        managed: state.managed,
+        unverified: strict_grace(&policies)
             .is_some_and(|grace| state.metrics.usage_delivery().unhealthy_for() >= grace),
     }
 }
 
 /// Calendar timezone for budget period boundaries. Absent means UTC. Multiple
 /// rows can only be a stale key; select deterministically by lowest entry id.
-fn policy_timezone(snapshot: &AisixSnapshot) -> Tz {
-    snapshot
-        .budget_policy
-        .entries()
-        .into_iter()
+fn policy_timezone(policies: &[Arc<ResourceEntry<BudgetPolicy>>]) -> Tz {
+    policies
+        .iter()
         .filter(|e| e.value.timezone.is_some())
         .min_by(|a, b| a.id.cmp(&b.id))
         .and_then(|e| {
@@ -248,10 +254,8 @@ fn policy_timezone(snapshot: &AisixSnapshot) -> Tz {
 /// The grace period when the environment's policy is `closed`. Two rows can
 /// only be a stale key; the stricter reading wins rather than whichever
 /// sorts first.
-fn strict_grace(snapshot: &AisixSnapshot) -> Option<Duration> {
-    snapshot
-        .budget_policy
-        .entries()
+fn strict_grace(policies: &[Arc<ResourceEntry<BudgetPolicy>>]) -> Option<Duration> {
+    policies
         .iter()
         .filter(|e| e.value.fail_mode == BudgetFailMode::Closed)
         .map(|e| Duration::from_secs(e.value.closed_grace_seconds))
@@ -264,7 +268,7 @@ impl BudgetGate {
     pub(crate) fn key_verdict(&self, auth: &AuthenticatedKey) -> Verdict {
         let user_id = auth.entry.value.user_id.as_deref();
         let mut applies = false;
-        let mut denied: Option<(u8, BudgetScope, &Entry, &aisix_core::models::BudgetReason)> = None;
+        let mut denied: Option<(u8, BudgetScope, &Entry, ActiveMark<'_>)> = None;
         for entry in self.index.applicable(auth) {
             applies = true;
             let budget = &entry.value;
@@ -327,34 +331,63 @@ impl BudgetGate {
         &self,
         budget: &'a Budget,
         user_id: Option<&str>,
-    ) -> Option<&'a aisix_core::models::BudgetReason> {
-        let current = budget_period_start(self.now, budget.period, self.tz).with_timezone(&Utc);
-        let in_force = |start: Option<&str>| {
-            start.is_none_or(|s| {
-                DateTime::parse_from_rfc3339(s).is_ok_and(|t| t.with_timezone(&Utc) == current)
-            })
-        };
-        if let Some(exhausted) = &budget.exhausted {
-            if in_force(exhausted.period_start.as_deref()) {
-                return Some(&exhausted.reason);
+    ) -> Option<ActiveMark<'a>> {
+        if let Some(mark) = &budget.exhausted {
+            if let Some(resets_at) = self.active_until(
+                budget.period,
+                mark.period_start.as_deref(),
+                mark.period_end.as_deref(),
+            ) {
+                return Some(ActiveMark {
+                    reason: &mark.reason,
+                    resets_at,
+                });
             }
         }
-        if budget.scope == BudgetScope::TeamMember {
-            let member = budget.exhausted_members.get(user_id?)?;
-            if in_force(Some(&member.period_start)) {
-                return Some(&member.reason);
-            }
+        if budget.scope != BudgetScope::TeamMember {
+            return None;
         }
-        None
+        let mark = budget.exhausted_members.get(user_id?)?;
+        let resets_at = self.active_until(
+            budget.period,
+            Some(&mark.period_start),
+            mark.period_end.as_deref(),
+        )?;
+        Some(ActiveMark {
+            reason: &mark.reason,
+            resets_at,
+        })
     }
 
-    fn reason(&self, budget: &Budget, doc: &aisix_core::models::BudgetReason) -> BudgetReason {
-        let resets_at = budget_next_period_start(self.now, budget.period, self.tz);
-        let period_resets_at = if self.tz == Tz::UTC {
-            resets_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
-        } else {
-            resets_at.to_rfc3339_opts(SecondsFormat::Secs, true)
+    fn active_until(
+        &self,
+        period: BudgetPeriod,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Option<DateTime<Tz>> {
+        let Some(start) = start else {
+            return end
+                .is_none()
+                .then(|| budget_next_period_start(self.now, period, self.tz));
         };
+        let start = DateTime::parse_from_rfc3339(start).ok()?;
+        if let Some(end) = end {
+            let end = DateTime::parse_from_rfc3339(end).ok()?;
+            return (start <= self.now && self.now < end).then(|| end.with_timezone(&self.tz));
+        }
+        // Before managed budgets carried both boundaries the control plane
+        // counted in UTC. A newer policy can arrive before those marks change.
+        let calendar = if self.managed { Tz::UTC } else { self.tz };
+        (start == budget_period_start(self.now, period, calendar))
+            .then(|| budget_next_period_start(self.now, period, calendar).with_timezone(&self.tz))
+    }
+
+    fn reason(&self, budget: &Budget, mark: ActiveMark<'_>) -> BudgetReason {
+        let ActiveMark {
+            reason: doc,
+            resets_at,
+        } = mark;
+        let period_resets_at = resets_at.to_rfc3339_opts(SecondsFormat::AutoSi, self.tz == Tz::UTC);
         // Amounts are restated in the two-decimal string form the response
         // has always carried.
         let amount = |v: &Option<String>| {
@@ -367,11 +400,18 @@ impl BudgetGate {
             .clone()
             .unwrap_or_else(|| budget.scope.as_str().to_string());
         BudgetReason {
-            message: doc
-                .message
-                .clone()
-                .filter(|m| !m.is_empty())
-                .unwrap_or_else(|| format!("{} budget exceeded", scope.replace('_', " "))),
+            message: match &doc.message_prefix {
+                Some(prefix) => format!(
+                    "{prefix} Resets {} {}.",
+                    resets_at.format("%Y-%m-%d %H:%M"),
+                    self.tz
+                ),
+                None => doc
+                    .message
+                    .clone()
+                    .filter(|m| !m.is_empty())
+                    .unwrap_or_else(|| format!("{} budget exceeded", scope.replace('_', " "))),
+            },
             scope_ref: doc.scope_ref.clone().or_else(|| budget.scope_ref.clone()),
             scope: Some(scope),
             limit: amount(&doc.limit),
@@ -422,7 +462,6 @@ pub(crate) fn enforce_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aisix_core::models::{BudgetPeriod, BudgetPolicy};
     use chrono::TimeZone;
 
     fn at(y: i32, m: u32, d: u32, h: u32) -> DateTime<Utc> {
@@ -506,7 +545,8 @@ mod tests {
         BudgetGate {
             index: Arc::new(BudgetIndex::build(&snap.budgets)),
             now,
-            tz: policy_timezone(snap),
+            tz: policy_timezone(&snap.budget_policy.entries()),
+            managed: false,
             unverified,
         }
     }
@@ -856,6 +896,51 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_member_interval_blocks_from_start_to_end_even_under_a_different_policy() {
+        let doc = serde_json::json!({
+            "scope": "team_member", "scope_ref": "team-1", "period": "day",
+            "exhausted_members": { "user-1": {
+                "period_start": "2026-11-24T00:00:00+08:00",
+                "period_end": "2026-11-25T00:00:00.500+08:00",
+                "reason": {"message_prefix": "Member budget exhausted."}
+            }}
+        });
+        let snap = snapshot_with(&[("b-1", doc)]);
+        let k = key(
+            &snap,
+            "k-1",
+            serde_json::json!({"team_id": "team-1", "user_id": "user-1"}),
+        );
+        let start = Utc.with_ymd_and_hms(2026, 11, 23, 16, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 11, 24, 16, 0, 0).unwrap()
+            + chrono::Duration::milliseconds(500);
+        let second = chrono::Duration::seconds(1);
+        for now in [start - second, end] {
+            assert!(matches!(
+                gate_at(&snap, now, false).key_verdict(&k),
+                Verdict::Allow
+            ));
+        }
+        for now in [start, end - second] {
+            let Verdict::Exceeded(r) = gate_at(&snap, now, false).key_verdict(&k) else {
+                panic!("the member exhausted this interval");
+            };
+            assert_eq!(
+                r.period_resets_at.as_deref(),
+                Some("2026-11-24T16:00:00.500Z")
+            );
+            assert_eq!(
+                r.retry_after_seconds,
+                Some((end - now).num_seconds() as u64)
+            );
+            assert_eq!(
+                r.message,
+                "Member budget exhausted. Resets 2026-11-24 16:00 UTC."
+            );
+        }
+    }
+
+    #[test]
     fn timezone_applies_to_team_member_provider_key_and_limit_zero_sentinel() {
         let tm_doc = serde_json::json!({
             "scope": "team_member",
@@ -882,7 +967,7 @@ mod tests {
             "scope_ref": "k-sentinel",
             "period": "day",
             "exhausted": {
-                "reason": {"message": "zero limit"}
+                "reason": {"message_prefix": "Zero limit.", "message": "stale reset text"}
             }
         });
         let snap = snapshot_with(&[
@@ -928,13 +1013,19 @@ mod tests {
         // Limit=0 sentinel (period_start: None) stays in force after midnight too,
         // and updates period_resets_at to the next Shanghai day.
         let sentinel_key = key(&snap, "k-sentinel", serde_json::json!({}));
-        let Verdict::Exceeded(s_r) = gate_at(&snap, after, false).key_verdict(&sentinel_key) else {
-            panic!("limit=0 sentinel must stay in force in any period");
-        };
-        assert_eq!(
-            s_r.period_resets_at.as_deref(),
-            Some("2026-11-26T00:00:00+08:00")
-        );
+        for (now, reset_date) in [(before, "2026-11-25"), (after, "2026-11-26")] {
+            let Verdict::Exceeded(r) = gate_at(&snap, now, false).key_verdict(&sentinel_key) else {
+                panic!("limit=0 sentinel must stay in force in any period");
+            };
+            assert_eq!(
+                r.period_resets_at.unwrap(),
+                format!("{reset_date}T00:00:00+08:00")
+            );
+            assert_eq!(
+                r.message,
+                format!("Zero limit. Resets {reset_date} 00:00 Asia/Shanghai.")
+            );
+        }
     }
 
     #[test]
@@ -952,12 +1043,15 @@ mod tests {
         insert_policy(&snap_multi, "a-none", None);
         insert_policy(&snap_multi, "c-ny", Some("America/New_York"));
         insert_policy(&snap_multi, "b-shanghai", Some("Asia/Shanghai"));
-        assert_eq!(policy_timezone(&snap_multi), Tz::Asia__Shanghai);
+        assert_eq!(
+            policy_timezone(&snap_multi.budget_policy.entries()),
+            Tz::Asia__Shanghai
+        );
 
         // In-memory invalid timezone (bypassing loader) falls back to UTC.
         let snap_bad = snapshot_with(&[("b-1", sentinel.clone())]);
         insert_policy(&snap_bad, "env-1", Some("Local"));
-        assert_eq!(policy_timezone(&snap_bad), Tz::UTC);
+        assert_eq!(policy_timezone(&snap_bad.budget_policy.entries()), Tz::UTC);
         let k = key(&snap_bad, "k-1", serde_json::json!({}));
         let Verdict::Exceeded(r) = gate_at(&snap_bad, now, false).key_verdict(&k) else {
             panic!("expected block");
@@ -967,9 +1061,9 @@ mod tests {
         // Explicit UTC keeps Z suffix; non-whole-hour and DST zones emit RFC 3339 offsets.
         for (tz_name, instant, expected) in [
             ("UTC", now, "2026-11-25T00:00:00Z"),
-            ("Etc/UTC", now, "2026-11-25T00:00:00Z"),
+            ("Etc/UTC", now, "2026-11-25T00:00:00+00:00"),
             ("Asia/Kathmandu", now, "2026-11-25T00:00:00+05:45"),
-            ("Europe/London", now, "2026-11-25T00:00:00Z"),
+            ("Europe/London", now, "2026-11-25T00:00:00+00:00"),
             (
                 "Europe/London",
                 Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap(),

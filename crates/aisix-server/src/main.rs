@@ -1213,6 +1213,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         cache.clone(),
         &cfg.proxy,
     );
+    proxy_state.managed = cfg.managed.is_managed();
     // Wire the prometheus emit/drop counters into the sink (#408)
     // so a real DP scrape surfaces UsageEvent throughput without
     // needing cp-api or an OTLP receiver in the loop.

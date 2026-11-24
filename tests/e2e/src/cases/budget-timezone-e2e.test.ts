@@ -6,6 +6,7 @@ import {
   scrapeMetrics,
   SeedClient,
   spawnApp,
+  startMockControlPlane,
   startOpenAiUpstream,
   waitConfigPropagation,
   type OpenAiUpstream,
@@ -71,7 +72,6 @@ function utcNextMonthWindow(nowMs: number) {
 const KEYS = {
   daily: "sk-btz-e2e-daily",
   sentinelMonthly: "sk-btz-e2e-sentinel-monthly",
-  ready: "sk-btz-e2e-ready",
 };
 
 const IDS = {
@@ -82,13 +82,27 @@ const IDS = {
   sentinelBudget: randomUUID(),
 };
 
+// etcd watch events apply in revision order. Authenticating a freshly written
+// key proves all earlier updates have reached the request path.
+async function syncThroughSentinel(seed: SeedClient, app: SpawnedApp) {
+  const plaintext = `sk-btz-sync-${randomUUID()}`;
+  await seed.createApiKey({ key_hash: hash(plaintext), allowed_models: ["*"] });
+  const sentinel = new ProxyClient(app.proxyUrl, plaintext);
+  await waitConfigPropagation(async () => {
+    try {
+      return (await sentinel.listModels()).status === 200;
+    } catch {
+      // A managed gateway binds its proxy listener after its first configuration.
+      return false;
+    }
+  });
+}
+
 describe("budget_policy.timezone governs budget periods and reset headers", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let seed: SeedClient | undefined;
   let etcdReachable = false;
-  let zone: FixedZone = SHANGHAI;
-  let dayWindow = fixedZoneDayWindow(Date.now(), SHANGHAI);
 
   const rawChat = async (key: string) => {
     const res = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
@@ -128,25 +142,10 @@ describe("budget_policy.timezone governs budget periods and reset headers", () =
     };
   };
 
-  // Watch events apply in etcd revision order, so seeding a fresh sentinel key
-  // after a mutation and waiting for it to authenticate guarantees every prior
-  // write has been processed — keeping assertions out of wait loops.
-  const syncThroughSentinel = async () => {
-    const plaintext = `sk-btz-sync-${randomUUID()}`;
-    await seed!.createApiKey({ key_hash: hash(plaintext), allowed_models: ["*"] });
-    await waitConfigPropagation(
-      async () => (await new ProxyClient(app!.proxyUrl, plaintext).listModels()).status === 200,
-    );
-  };
-
   beforeAll(async () => {
     const etcd = new EtcdClient();
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
-
-    const now = new Date();
-    zone = pickDifferentDayZone(now);
-    dayWindow = fixedZoneDayWindow(now.getTime(), zone);
 
     upstream = await startOpenAiUpstream();
     app = await spawnApp();
@@ -163,6 +162,37 @@ describe("budget_policy.timezone governs budget periods and reset headers", () =
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
     });
+    await seed.update("budgets", IDS.sentinelBudget, {
+      scope: "api_key",
+      scope_ref: IDS.sentinelKey,
+      period: "month",
+      exhausted: {
+        reason: {
+          message_prefix: "Monthly budget exceeded.",
+          scope: "api_key",
+          scope_ref: IDS.sentinelKey,
+          limit: "0.00",
+          spent: "0.00",
+          remaining: "0.00",
+          period: "month",
+        },
+      },
+    });
+
+    await seed.update("api_keys", IDS.dailyKey, { key_hash: hash(KEYS.daily), allowed_models: ["*"] });
+    await seed.update("api_keys", IDS.sentinelKey, { key_hash: hash(KEYS.sentinelMonthly), allowed_models: ["*"] });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+  });
+
+  test("enforces a configured non-UTC timezone on /v1/chat/completions and /v1/messages, and lets a mismatched UTC period_start pass", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return ctx.skip();
+
+    const zone = pickDifferentDayZone(new Date());
+    const dayWindow = fixedZoneDayWindow(Date.now(), zone);
     await seed.update("budget_policy", IDS.policy, {
       fail_mode: "sticky",
       closed_grace_seconds: 300,
@@ -185,40 +215,7 @@ describe("budget_policy.timezone governs budget periods and reset headers", () =
         },
       },
     });
-    await seed.update("budgets", IDS.sentinelBudget, {
-      scope: "api_key",
-      scope_ref: IDS.sentinelKey,
-      period: "month",
-      exhausted: {
-        reason: {
-          message: "monthly sentinel budget exceeded",
-          scope: "api_key",
-          scope_ref: IDS.sentinelKey,
-          limit: "0.00",
-          spent: "0.00",
-          remaining: "0.00",
-          period: "month",
-        },
-      },
-    });
-
-    // Seed caller keys last so authenticating `KEYS.ready` implies all earlier writes landed.
-    await seed.update("api_keys", IDS.dailyKey, { key_hash: hash(KEYS.daily), allowed_models: ["*"] });
-    await seed.update("api_keys", IDS.sentinelKey, { key_hash: hash(KEYS.sentinelMonthly), allowed_models: ["*"] });
-    await seed.createApiKey({ key_hash: hash(KEYS.ready), allowed_models: ["*"] });
-
-    await waitConfigPropagation(
-      async () => (await new ProxyClient(app!.proxyUrl, KEYS.ready).listModels()).status === 200,
-    );
-  });
-
-  afterAll(async () => {
-    await app?.exit();
-    await upstream?.close();
-  });
-
-  test("enforces a configured non-UTC timezone on /v1/chat/completions and /v1/messages, and lets a mismatched UTC period_start pass", async (ctx) => {
-    if (!etcdReachable || !app || !seed) return ctx.skip();
+    await syncThroughSentinel(seed, app);
 
     const beforeUpstream = upstream!.receivedRequests.length;
     const chatRes = await rawChat(KEYS.daily);
@@ -266,7 +263,7 @@ describe("budget_policy.timezone governs budget periods and reset headers", () =
         },
       },
     });
-    await syncThroughSentinel();
+    await syncThroughSentinel(seed, app);
     expect((await rawChat(KEYS.daily)).status).toBe(200);
     expect((await rawMessages(KEYS.daily)).status).toBe(200);
   });
@@ -279,7 +276,7 @@ describe("budget_policy.timezone governs budget periods and reset headers", () =
       closed_grace_seconds: 300,
       timezone: SHANGHAI.name,
     });
-    await syncThroughSentinel();
+    await syncThroughSentinel(seed, app);
 
     const beforeMs = Date.now();
     const shanghaiRes = await rawChat(KEYS.sentinelMonthly);
@@ -291,6 +288,8 @@ describe("budget_policy.timezone governs budget periods and reset headers", () =
       fixedZoneNextMonthWindow(afterMs, SHANGHAI).nextLocalRfc3339,
     ]);
     expect(validResets.has(String(shanghaiErr.period_resets_at))).toBe(true);
+    const resetDate = String(shanghaiErr.period_resets_at).slice(0, 10);
+    expect(shanghaiErr.message).toBe(`Monthly budget exceeded. Resets ${resetDate} 00:00 Asia/Shanghai.`);
     const shanghaiRetryAfter = Number(shanghaiRes.headers.get("retry-after"));
     expect(shanghaiRetryAfter).toBe(shanghaiErr.retry_after_seconds);
 
@@ -301,7 +300,7 @@ describe("budget_policy.timezone governs budget periods and reset headers", () =
       closed_grace_seconds: 300,
       timezone: "Mars/Olympus",
     });
-    await syncThroughSentinel();
+    await syncThroughSentinel(seed, app);
 
     const rejected = (await fetchConfigStatus()).rejected;
     const entry = rejected.find(
@@ -326,7 +325,7 @@ describe("budget_policy.timezone governs budget periods and reset headers", () =
       fail_mode: "sticky",
       closed_grace_seconds: 300,
     });
-    await syncThroughSentinel();
+    await syncThroughSentinel(seed, app);
 
     const clearedStatus = await fetchConfigStatus();
     expect(clearedStatus.rejected.some((r) => r.resource_kind === "budget_policy")).toBe(false);
@@ -340,4 +339,70 @@ describe("budget_policy.timezone governs budget periods and reset headers", () =
     ]);
     expect(validUtcResets.has(String((utcRes.body.error as Record<string, unknown>).period_resets_at))).toBe(true);
   });
+});
+
+test("a managed gateway keeps an exhausted budget blocked in either watch order", async (ctx) => {
+  const etcd = new EtcdClient();
+  if (!(await etcd.ping())) return ctx.skip();
+
+  const cp = await startMockControlPlane();
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  try {
+    upstream = await startOpenAiUpstream();
+    app = await spawnApp({ extra: { managed: cp.managed }, awaitProxyListener: false });
+    const seed = new SeedClient(etcd, `${app.etcdPrefix}/${cp.envId}`);
+    const caller = new ProxyClient(app.proxyUrl, KEYS.daily);
+    const pk = await seed.createProviderKey({ display_name: "managed-pk", api_key: "sk-mock", api_base: `${upstream.baseUrl}/v1` });
+    await seed.createModel({ display_name: "btz-direct", provider: "openai", model_name: "gpt-4o-mini", provider_key_id: pk.id });
+    await seed.update("api_keys", IDS.dailyKey, { key_hash: hash(KEYS.daily), allowed_models: ["*"] });
+    const policy = (timezone: string) =>
+      seed.update("budget_policy", cp.envId, { fail_mode: "sticky", closed_grace_seconds: 300, timezone });
+    const budget = (start: number, end?: number) => seed.update("budgets", IDS.dailyBudget, {
+      scope: "api_key", scope_ref: IDS.dailyKey, period: "day",
+      exhausted: {
+        period_start: rfc3339Utc(start), period_end: end === undefined ? undefined : rfc3339Utc(end),
+        reason: { message_prefix: "Daily budget exhausted." },
+      },
+    });
+
+    const assertBlocked = async (end: number) => {
+      await syncThroughSentinel(seed, app!);
+      const before = Date.now();
+      const res = await caller.chat({ model: "btz-direct", messages: [{ role: "user", content: "hi" }] });
+      expect(res.status).toBe(429);
+      const { error } = res.body as { error: { code: string; period_resets_at: string; retry_after_seconds: number } };
+      expect(error.code).toBe("budget_exceeded");
+      expect(Date.parse(error.period_resets_at)).toBe(end);
+      expect(error.retry_after_seconds).toBeGreaterThanOrEqual(Math.floor((end - Date.now() - 1) / 1000));
+      expect(error.retry_after_seconds).toBeLessThanOrEqual(Math.floor((end - before) / 1000));
+    };
+
+    const now = new Date();
+    const zone = pickDifferentDayZone(now);
+    const utc = fixedZoneDayWindow(now.getTime(), { name: "UTC", offsetMinutes: 0, offsetSuffix: "Z" });
+    const local = fixedZoneDayWindow(now.getTime(), zone);
+    // Start with the row an earlier control plane wrote. Its period remains UTC
+    // after the policy arrives, until the budget projection catches up.
+    await budget(utc.startUtcMs);
+    await policy(zone.name);
+    await assertBlocked(utc.nextUtcMs);
+    await budget(local.startUtcMs, local.nextUtcMs);
+    await assertBlocked(local.nextUtcMs);
+
+    // Change back to UTC, delivering the bounded UTC mark before the policy.
+    await budget(utc.startUtcMs, utc.nextUtcMs);
+    await assertBlocked(utc.nextUtcMs);
+    await policy("UTC");
+    await assertBlocked(utc.nextUtcMs);
+    // On a later change the local policy can precede a bounded UTC mark's replacement.
+    await policy(zone.name);
+    await assertBlocked(utc.nextUtcMs);
+    await budget(local.startUtcMs, local.nextUtcMs);
+    await assertBlocked(local.nextUtcMs);
+  } finally {
+    await app?.exit();
+    await cp.close();
+    await upstream?.close();
+  }
 });

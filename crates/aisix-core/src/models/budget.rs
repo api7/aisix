@@ -12,8 +12,8 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Datelike, LocalResult, NaiveDate, NaiveTime, TimeZone, Utc};
-use chrono_tz::Tz;
+use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono_tz::{GapInfo, Tz};
 use serde::{Deserialize, Serialize};
 
 use crate::resource::Resource;
@@ -129,12 +129,17 @@ impl BudgetPeriod {
 /// The budget is exhausted for everything it applies to.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BudgetExhausted {
-    /// Start of the period the budget was exhausted in, as an RFC 3339
-    /// timestamp. The block holds only while this is the start of the
-    /// current period, so it lifts at the next period boundary on its own.
-    /// Omitted, the block holds in every period.
+    /// Inclusive start of the exhausted period as an RFC 3339 timestamp.
+    /// Omit both boundaries to block in every period.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub period_start: Option<String>,
+    /// Exclusive end of the exhausted period as an RFC 3339 timestamp.
+    /// With both boundaries set, the block applies throughout that interval
+    /// even if the policy timezone changes. Without an end, the gateway
+    /// matches the start against the current period in the policy timezone
+    /// in standalone mode and UTC in managed mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period_end: Option<String>,
     /// What a rejected request is told.
     pub reason: BudgetReason,
 }
@@ -142,10 +147,15 @@ pub struct BudgetExhausted {
 /// One member's share of a `team_member` budget is exhausted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BudgetMemberExhausted {
-    /// Start of the period the member exhausted their share in, as an
-    /// RFC 3339 timestamp. The block holds only while this is the start of
-    /// the current period.
+    /// Inclusive start of the member's exhausted period as an RFC 3339 timestamp.
     pub period_start: String,
+    /// Exclusive end of the exhausted period as an RFC 3339 timestamp.
+    /// With both boundaries set, the block applies throughout that interval
+    /// even if the policy timezone changes. Without an end, the gateway
+    /// matches the start against the current period in the policy timezone
+    /// in standalone mode and UTC in managed mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period_end: Option<String>,
     /// What a rejected request is told.
     pub reason: BudgetReason,
 }
@@ -163,6 +173,11 @@ pub struct BudgetReason {
     /// Human-readable message returned to the caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Message text preceding the reset time. When present, the gateway
+    /// appends the reset date, time, and policy timezone to this text and
+    /// returns the result in place of `message`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_prefix: Option<String>,
     /// Scope of the exhausted budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
@@ -230,12 +245,17 @@ pub struct BudgetPolicy {
     /// IANA timezone used for calendar budget period boundaries (`day`,
     /// `week`, `month`). Absent means UTC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(default = "default_timezone")]
     pub timezone: Option<String>,
 
     /// Set by the loader from the key's id segment. Not part of the wire
     /// shape.
     #[serde(skip)]
     pub(crate) runtime_id: String,
+}
+
+fn default_timezone() -> Option<String> {
+    Some("UTC".to_owned())
 }
 
 /// Parse an IANA timezone name for budget period calculations.
@@ -261,29 +281,13 @@ impl BudgetPolicy {
     }
 }
 
-/// First valid local instant on `date` in `tz`.
-///
-/// Handles midnight DST transitions consistently with the control plane:
-/// - Normal midnight (`Single`) returns `00:00:00`.
-/// - Fall-back repeated midnight (`Ambiguous`) returns the earliest occurrence.
-/// - Spring-forward skipped midnight (`None`, e.g. `America/Havana` 2024-03-10,
-///   `Asia/Beirut` 2024-03-31) probes forward by 1 minute up to 24 hours to
-///   find the first representable instant on that date.
+/// Earliest local midnight, or the first instant after a gap that covers it.
 fn local_day_start(date: NaiveDate, tz: Tz) -> DateTime<Tz> {
     let midnight = date.and_time(NaiveTime::MIN);
-    match tz.from_local_datetime(&midnight) {
-        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
-        LocalResult::None => {
-            for mins in 1..=(24 * 60) {
-                let candidate = midnight + chrono::Duration::minutes(mins);
-                match tz.from_local_datetime(&candidate) {
-                    LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => return dt,
-                    LocalResult::None => continue,
-                }
-            }
-            midnight.and_utc().with_timezone(&tz)
-        }
-    }
+    tz.from_local_datetime(&midnight)
+        .earliest()
+        .or_else(|| GapInfo::new(&midnight, &tz)?.end)
+        .expect("a calendar midnight has an occurrence or a transition ending its gap")
 }
 
 fn budget_period_dates(now: DateTime<Utc>, period: BudgetPeriod, tz: Tz) -> (NaiveDate, NaiveDate) {
@@ -366,6 +370,8 @@ mod tests {
     #[test]
     fn the_per_scope_shape_binds_the_write_path_only() {
         for doc in [
+            json!({"scope": "api_key", "scope_ref": "k", "period": "day",
+                   "exhausted": {"period_end": "2026-10-01T00:00:00Z", "reason": {}}}),
             json!({"scope": "tag", "period": "day"}),
             json!({"scope": "tag", "scope_ref": "x", "tag": {"key": "k", "value": "v"}, "period": "day"}),
             json!({"scope": "team", "period": "day"}),
@@ -448,6 +454,9 @@ mod tests {
         assert!(validate_budget_policy_lenient(&wrong_type).is_err());
 
         // Serialization omits `timezone` when None and preserves it when Some.
+        let schema = crate::models::schema::budget_policy_root_schema();
+        assert_eq!(schema["properties"]["timezone"]["default"], "UTC");
+
         let p_none: BudgetPolicy = serde_json::from_value(without).unwrap();
         assert_eq!(p_none.timezone, None);
         assert!(serde_json::to_value(&p_none)
@@ -655,6 +664,32 @@ mod tests {
         assert_eq!(fallback_start_1, fallback_start_2);
         assert_eq!(fmt_utc(fallback_start_1), "2024-11-03T04:00:00Z");
         assert_eq!(fmt_rfc3339(fallback_start_1), "2024-11-03T00:00:00-04:00");
+    }
+
+    #[test]
+    fn midnight_gaps_end_at_the_exact_transition_even_when_a_whole_date_is_skipped() {
+        // Monrovia advanced by 44 minutes and 30 seconds at midnight.
+        let before = utc(1972, 1, 7, 0, 44, 29);
+        let after = utc(1972, 1, 7, 0, 44, 30);
+        assert_eq!(
+            budget_next_period_start(before, BudgetPeriod::Day, Tz::Africa__Monrovia),
+            after
+        );
+        assert_eq!(
+            budget_period_start(after, BudgetPeriod::Day, Tz::Africa__Monrovia),
+            after
+        );
+        // Apia skipped December 30, 2011 entirely.
+        let before = utc(2011, 12, 30, 9, 59, 59);
+        let after = utc(2011, 12, 30, 10, 0, 0);
+        assert_eq!(
+            budget_next_period_start(before, BudgetPeriod::Day, Tz::Pacific__Apia),
+            after
+        );
+        assert_eq!(
+            budget_period_start(after, BudgetPeriod::Day, Tz::Pacific__Apia),
+            after
+        );
     }
 
     #[test]
