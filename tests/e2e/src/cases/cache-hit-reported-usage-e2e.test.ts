@@ -15,18 +15,12 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import { onCI } from "../harness/etcd.js";
 import { pickFreePort } from "../harness/ports.js";
 
-// A Redis cache hit treats the stored usage exactly as the response that
-// was stored: a count the upstream reported stands, `0` included, and only
-// a count it left out is estimated. The client and the usage record agree,
-// and an estimated record carries no total.
-//
-// Pinned on the shared Redis backend, both layers: the exact layer, and the
-// semantic layer (a rephrased request served by the vector index). The
-// in-process stores hold the response itself; the Redis stores round-trip
-// it through JSON, which is where "reported 0" and "left out" used to
-// collapse into one.
+// A Redis hit replays a JSON-encoded ChatResponse. Both cache layers must
+// preserve the distinction between a reported zero and a missing count,
+// along with the usage details available on a fresh response or memory hit.
 
 const REDIS_URL = process.env.AISIX_E2E_REDIS ?? "redis://127.0.0.1:6379";
 
@@ -40,8 +34,33 @@ const LOGSTORE = "cache-hit-usage-store";
 const OUT = 2;
 const PROMPT_ZERO = { prompt_tokens: 0, completion_tokens: OUT, total_tokens: OUT };
 const PROMPT_LEFT_OUT = { completion_tokens: OUT, total_tokens: OUT };
+const WITH_DETAILS = {
+  prompt_tokens: 10,
+  completion_tokens: OUT,
+  total_tokens: 10 + OUT,
+  prompt_tokens_details: {
+    cached_tokens: 0,
+    audio_tokens: 3,
+    text_tokens: 7,
+    cache_write_tokens: 4,
+    cache_write_tokens_details: { ttl_30m_tokens: 0, ttl_12h_tokens: 4 },
+  },
+  completion_tokens_details: {
+    reasoning_tokens: 0,
+    audio_tokens: 0,
+    text_tokens: OUT,
+    accepted_prediction_tokens: 0,
+    rejected_prediction_tokens: 0,
+  },
+};
+const EXPECTED_RECORD_DETAILS = {
+  prompt_audio_tokens: "3",
+  completion_audio_tokens: "0",
+  cache_write_30m_tokens: "0",
+  cache_write_12h_tokens: "4",
+};
 
-const chatBody = (usage: Record<string, number>) => ({
+const chatBody = (usage: Record<string, unknown>) => ({
   id: "chatcmpl-cache-hit-usage",
   object: "chat.completion",
   created: 1_700_000_000,
@@ -106,16 +125,22 @@ async function startEmbeddingMock(): Promise<{ baseUrl: string; close(): Promise
   };
 }
 
-/** Model display name → the usage its upstream reports, and whether its
- * cache policy carries a semantic layer. */
-const MODELS: Record<string, { usage: Record<string, number>; semantic: boolean }> = {
+/** Model display name → the usage its upstream reports, its cache policy's
+ * backend, and whether that policy carries a semantic layer. */
+const MODELS: Record<
+  string,
+  { usage: Record<string, unknown>; backend?: "memory"; semantic: boolean }
+> = {
   "hit-exact-zero": { usage: PROMPT_ZERO, semantic: false },
   "hit-exact-absent": { usage: PROMPT_LEFT_OUT, semantic: false },
+  "hit-exact-details": { usage: WITH_DETAILS, semantic: false },
   "hit-sem-zero": { usage: PROMPT_ZERO, semantic: true },
   "hit-sem-absent": { usage: PROMPT_LEFT_OUT, semantic: true },
+  "hit-sem-details": { usage: WITH_DETAILS, semantic: true },
+  "hit-memory-details": { usage: WITH_DETAILS, backend: "memory", semantic: false },
 };
 
-describe("a redis cache hit estimates only the usage counts its upstream left out", () => {
+describe("cache hits preserve reported usage", () => {
   let app: SpawnedApp | undefined;
   let sls: MockSls | undefined;
   let embed: { baseUrl: string; close(): Promise<void> } | undefined;
@@ -129,6 +154,11 @@ describe("a redis cache hit estimates only the usage counts its upstream left ou
     // The semantic layer on Redis needs the vector query engine (redis:8+,
     // what CI provisions); the exact layer runs on any reachable Redis.
     const vector = await redisVectorSupport(REDIS_URL);
+    // CI provisions a vector-capable Redis: anything else there is a broken
+    // prerequisite, not a reason to pass with nothing asserted.
+    if (onCI() && vector !== true) {
+      throw new Error("AISIX_E2E_REDIS must point to a reachable, vector-capable Redis on CI");
+    }
     if (vector === null) return;
     vectorReady = vector;
 
@@ -167,7 +197,7 @@ describe("a redis cache hit estimates only the usage counts its upstream left ou
     });
     // A non-OpenAI upstream model name, so the estimator's fallback
     // encoding applies.
-    for (const [display, { usage, semantic }] of Object.entries(MODELS)) {
+    for (const [display, { usage, backend, semantic }] of Object.entries(MODELS)) {
       if (semantic && !vectorReady) continue;
       const upstream = await startOpenAiUpstream({ nonStreamBody: chatBody(usage) });
       upstreams.push(upstream);
@@ -184,7 +214,7 @@ describe("a redis cache hit estimates only the usage counts its upstream left ou
       });
       await seed.createCachePolicy({
         name: `${display}-policy`,
-        backend: "redis",
+        backend: backend ?? "redis",
         applies_to: `model:${display}`,
         ttl_seconds: 600,
         ...(semantic
@@ -221,7 +251,7 @@ describe("a redis cache hit estimates only the usage counts its upstream left ou
       requestId,
       cache: res.headers.get("x-aisix-cache"),
       layer: res.headers.get("x-aisix-cache-layer"),
-      usage: (JSON.parse(text) as { usage: Record<string, number> }).usage,
+      usage: (JSON.parse(text) as { usage: Record<string, unknown> }).usage,
     };
   }
 
@@ -230,7 +260,7 @@ describe("a redis cache hit estimates only the usage counts its upstream left ou
 
   /** Store the upstream's response with one request, then answer a second
    * one from the cache on `layer`. */
-  async function hit(model: string, layer: "exact" | "semantic") {
+  async function missThenHit(model: string, layer: "exact" | "semantic") {
     // Redis outlives the test process: a run-unique prompt starts cold.
     const runTag = `${process.pid}-${Date.now()}-${model}`;
     const first = await chat(model, `cache-hit-usage question ${runTag}`);
@@ -241,7 +271,22 @@ describe("a redis cache hit estimates only the usage counts its upstream left ou
     );
     expect(second.cache).toBe("hit");
     expect(second.layer).toBe(layer);
-    return second;
+    return { miss: first, hit: second };
+  }
+
+  async function expectBreakdownsKept(model: string, layer: "exact" | "semantic") {
+    const { miss, hit: served } = await missThenHit(model, layer);
+    expect(miss.usage.prompt_tokens_details).toMatchObject({
+      cached_tokens: 0, audio_tokens: 3, text_tokens: 7, cache_write_tokens: 4,
+    });
+    expect(miss.usage.completion_tokens_details).toEqual(WITH_DETAILS.completion_tokens_details);
+    expect(served.usage).toEqual(miss.usage);
+    const [missLog, hitLog] = await Promise.all([record(miss.requestId), record(served.requestId)]);
+    expect(hitLog.get("cache_status")).toBe("hit");
+    for (const [field, expected] of Object.entries(EXPECTED_RECORD_DETAILS)) {
+      expect(missLog.get(field), field).toBe(expected);
+      expect(hitLog.get(field), field).toBe(expected);
+    }
   }
 
   for (const layer of ["exact", "semantic"] as const) {
@@ -251,7 +296,7 @@ describe("a redis cache hit estimates only the usage counts its upstream left ou
 
     test(`${layer} hit: a reported prompt_tokens 0 stands`, async (ctx) => {
       if (!runs()) return ctx.skip();
-      const served = await hit(`${prefix}-zero`, layer);
+      const { hit: served } = await missThenHit(`${prefix}-zero`, layer);
       expect(served.usage.prompt_tokens).toBe(0);
       expect(served.usage.completion_tokens).toBe(OUT);
       expect(served.usage.total_tokens).toBe(OUT);
@@ -265,7 +310,7 @@ describe("a redis cache hit estimates only the usage counts its upstream left ou
 
     test(`${layer} hit: a prompt_tokens left out is estimated`, async (ctx) => {
       if (!runs()) return ctx.skip();
-      const served = await hit(`${prefix}-absent`, layer);
+      const { hit: served } = await missThenHit(`${prefix}-absent`, layer);
       const log = await record(served.requestId);
       expect(log.get("cache_status")).toBe("hit");
       expect(log.get("usage_estimated")).toBe("true");
@@ -277,5 +322,15 @@ describe("a redis cache hit estimates only the usage counts its upstream left ou
       expect(served.usage.completion_tokens).toBe(OUT);
       expect(served.usage.total_tokens).toBe(prompt + OUT);
     });
+
+    test(`${layer} hit: usage details, modality and cache-write lifetimes match the fresh response`, async (ctx) => {
+      if (!runs()) return ctx.skip();
+      await expectBreakdownsKept(`${prefix}-details`, layer);
+    });
   }
+
+  test("in-process hit: usage details, modality and cache-write lifetimes match the fresh response", async (ctx) => {
+    if (!ready) return ctx.skip();
+    await expectBreakdownsKept("hit-memory-details", "exact");
+  });
 });

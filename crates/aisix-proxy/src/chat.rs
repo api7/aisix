@@ -2779,9 +2779,7 @@ async fn dispatch(
                 let cached_prompt_tokens = cached.usage.cached_prompt_tokens;
                 let cache_write_tokens = cached.usage.cache_write_tokens;
                 let modality = cached.usage.modality;
-                // Not kept by every cache backend (see `UsageStats`), so no
-                // hit reports it, whichever backend served it.
-                let cache_creation_ttl = aisix_gateway::CacheCreationTtl::NONE;
+                let cache_creation_ttl = cached.usage.cache_creation_ttl;
                 let reasoning_tokens = cached.usage.reasoning_tokens;
                 // The replayed body carries it to the caller, so the row
                 // reports it too — the exported output message requires it.

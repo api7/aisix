@@ -6117,11 +6117,8 @@ data: [DONE]\n\n";
         assert_eq!(hit_event.completion_tokens, 11);
     }
 
-    /// A response-cache hit reports the cached write's total but no
-    /// split by cache lifetime: not every cache backend keeps the split, so
-    /// a hit reports none whichever backend served it.
     #[tokio::test]
-    async fn cache_hit_reports_no_cache_write_split() {
+    async fn cache_hit_preserves_the_anthropic_cache_creation_split() {
         use aisix_obs::UsageSink;
         use aisix_provider_anthropic::AnthropicBridge;
 
@@ -6180,6 +6177,7 @@ data: [DONE]\n\n";
             .expect("event was never emitted")
             .expect("sender dropped");
         assert_eq!(miss.cache_status, "miss");
+        assert_eq!(miss.cache_creation_ttl.cache_creation_5m_tokens, Some(0));
         assert_eq!(miss.cache_creation_ttl.cache_creation_1h_tokens, Some(300));
 
         let _ = run(build_router(state), make_req()).await;
@@ -6189,11 +6187,7 @@ data: [DONE]\n\n";
             .expect("sender dropped");
         assert_eq!(hit.cache_status, "hit");
         assert_eq!(hit.cache_creation_tokens, 300);
-        assert!(
-            hit.cache_creation_ttl.is_empty(),
-            "{:?}",
-            hit.cache_creation_ttl
-        );
+        assert_eq!(hit.cache_creation_ttl, miss.cache_creation_ttl);
     }
 
     /// AISIX-Cloud#1571: a cache hit answers "which model produced the body
