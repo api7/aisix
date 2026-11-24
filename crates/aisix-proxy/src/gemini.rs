@@ -68,15 +68,9 @@ pub(crate) async fn entry(
         Ok(auth) => auth,
         Err(e) => return e.into_gemini_response(),
     };
-    let mut client = ClientContext::from_request_parts(&mut parts, &state)
+    let client = ClientContext::from_request_parts(&mut parts, &state)
         .await
         .unwrap();
-    // A forwarded-header allowlist may replace an upstream credential. Gemini
-    // SDK and Antigravity credentials authenticate the caller to this gateway.
-    let headers = std::sync::Arc::make_mut(&mut client.headers);
-    for &name in aisix_core::CREDENTIAL_SLOT_HEADERS {
-        headers.remove(name);
-    }
     let reject = |err| {
         crate::reject::reject_before_dispatch(
             &state,

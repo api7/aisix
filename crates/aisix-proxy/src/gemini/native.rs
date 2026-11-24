@@ -78,11 +78,7 @@ async fn send(
         HeaderValue::from_str(&ctx.request_id)
             .map_err(|e| BridgeError::Config(format!("invalid request id: {e}")))?,
     );
-    aisix_gateway::apply_request_headers(
-        &mut headers,
-        &ctx.header_ctx()
-            .with_surface_blocked(aisix_core::CREDENTIAL_SLOT_HEADERS),
-    );
+    aisix_gateway::apply_request_headers(&mut headers, &ctx.header_ctx());
 
     if let Some(inbound) = &ctx.client_headers {
         for name in ["user-agent", "x-goog-api-client"] {

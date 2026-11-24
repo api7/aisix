@@ -7,6 +7,11 @@ import {
 
 const CALLER = "native-gemini-caller";
 const UPSTREAM_KEY = "native-gemini-provider-key";
+const CLIENT_CREDENTIALS = {
+  "x-aisix-api-key": CALLER,
+  authorization: "Bearer client-upstream-token",
+  "x-goog-api-key": "client-upstream-google-key",
+};
 const ASK = {
   contents: [{ role: "user", parts: [{ text: "Check the weather." }] }],
   tools: [{ functionDeclarations: [{ name: "weather", parameters: {
@@ -112,7 +117,9 @@ describe("native Gemini generation", () => {
         display_name: "native-key-" + alias, api_key: UPSTREAM_KEY,
         api_base: chat || override ? up.baseUrl + "/v1beta/openai" : root, ...surfaces,
         request: {
-          forward_client_headers: ["authorization", "x-goog-api-key", "x-client-tag"],
+          forward_client_headers: alias === "tools" || alias === "legacy"
+            ? ["authorization", "x-goog-api-key", "x-client-tag"]
+            : alias === "stream" ? ["*"] : [],
           ...(alias === "mask" ? { param_constraints: { temperature_max: 0.5 } } : {}),
         },
       });
@@ -140,8 +147,8 @@ describe("native Gemini generation", () => {
   function call(alias: string, method: string, body: unknown) {
     return fetch(app!.proxyUrl + "/v1beta/models/" + alias + ":" + method, {
       method: "POST", headers: {
-        "content-type": "application/json", authorization: "Bearer " + CALLER,
-        "x-client-tag": "antigravity", "x-goog-api-key": CALLER,
+        "content-type": "application/json", ...CLIENT_CREDENTIALS,
+        "x-client-tag": "antigravity",
         "user-agent": "test-agent/1", "x-goog-api-client": "gl-test/1",
       }, body: JSON.stringify(body),
     });
@@ -157,8 +164,9 @@ describe("native Gemini generation", () => {
       expect(sent.method).toBe("POST");
       expect(sent.path).toBe("/v1beta/models/gemini-upstream:generateContent");
       expect(JSON.parse(sent.body)).toEqual(request);
-      expect(sent.headers["x-goog-api-key"]).toBe(UPSTREAM_KEY);
-      expect(sent.headers.authorization).toBeUndefined();
+      expect(sent.headers["x-goog-api-key"]).toBe(CLIENT_CREDENTIALS["x-goog-api-key"]);
+      expect(sent.headers.authorization).toBe(CLIENT_CREDENTIALS.authorization);
+      expect(sent.headers["x-aisix-api-key"]).toBeUndefined();
       expect(sent.headers["user-agent"]).toBe("test-agent/1");
       expect(sent.headers["x-goog-api-client"]).toBe("gl-test/1");
       expect(sent.headers["x-client-tag"]).toBe("antigravity");
@@ -174,6 +182,9 @@ describe("native Gemini generation", () => {
       .map((line) => JSON.parse(line.slice(5)));
     expect(frames).toEqual(STREAM);
     const [sent] = upstreams.stream.receivedRequests;
+    expect(sent.headers["x-goog-api-key"]).toBe(UPSTREAM_KEY);
+    expect(sent.headers.authorization).toBeUndefined();
+    expect(sent.headers["x-aisix-api-key"]).toBeUndefined();
     expect(sent.path).toBe("/v1beta/models/gemini-upstream:streamGenerateContent?alt=sse");
     expect(JSON.parse(sent.body)).toEqual(TOOL_RESULT);
   });
@@ -186,8 +197,9 @@ describe("native Gemini generation", () => {
     expect(JSON.stringify(answer.candidates)).toContain("mock reply");
     const [sent] = upstreams[alias].receivedRequests;
     expect(sent.path).toBe("/v1beta/openai/chat/completions");
-    expect(sent.headers.authorization).toBe("Bearer " + UPSTREAM_KEY);
-    expect(sent.headers["x-goog-api-key"]).toBeUndefined();
+    expect(sent.headers.authorization).toBe(alias === "legacy" ? CLIENT_CREDENTIALS.authorization : "Bearer " + UPSTREAM_KEY);
+    expect(sent.headers["x-goog-api-key"]).toBe(alias === "legacy" ? CLIENT_CREDENTIALS["x-goog-api-key"] : undefined);
+    expect(sent.headers["x-aisix-api-key"]).toBeUndefined();
   });
 
   test("applies input and output masks to native text and tool arguments", async (ctx) => {
