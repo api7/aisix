@@ -2997,17 +2997,6 @@ async fn dispatch(
                     cache_creation_tokens,
                     cache_read_tokens,
                 );
-                // Capture the prompt + cached response for content-capturing
-                // exporters (gated). A cache hit still served content to the
-                // caller, so it's logged like a fresh response.
-                let captured_content = content_cap.map(|cap| {
-                    CapturedContent::new(
-                        &captured_request_json(req),
-                        &cached.message.content_str(),
-                        cap as usize,
-                    )
-                    .with_output(chat_message_output(&cached.message, cap))
-                });
                 state.metrics.record_cache_event(
                     matched_policy
                         .as_ref()
@@ -3031,7 +3020,8 @@ async fn dispatch(
                         completion.min(u64::from(u32::MAX)) as u32,
                     );
                 }
-                let mut response = Wire::for_target(client, false).unary(now, cached, &req.model);
+                let (mut response, captured_content) =
+                    Wire::for_target(client, false).unary(now, cached, req, content_cap);
                 if state.expose_debug_headers {
                     response
                         .headers_mut()
@@ -3671,19 +3661,6 @@ async fn dispatch(
         }
     }
 
-    // Capture request/response content for the observability fan-out (gated:
-    // `content_cap` is `None` when no exporter wants it). Built here, where both
-    // the request and the upstream response text are in scope; threaded to
-    // `fan_out` via `Success`, never to the CP sink.
-    let captured_content = content_cap.map(|cap| {
-        CapturedContent::new(
-            &captured_request_json(req),
-            &upstream.message.content_str(),
-            cap as usize,
-        )
-        .with_output(chat_message_output(&upstream.message, cap))
-    });
-
     // AISIX-Cloud#1074: the client reads the same counters the usage record
     // got. Deliberately here and not at the estimate above — the cache
     // entry and the quota total in between must see what the upstream
@@ -3695,7 +3672,7 @@ async fn dispatch(
             completion_tokens_u32,
         );
     }
-    let mut response = winner_wire.unary(now, upstream, &req.model);
+    let (mut response, captured_content) = winner_wire.unary(now, upstream, req, content_cap);
     // Header only when the gate was open — policy-disabled requests have
     // no cache header at all so a user can tell at a glance whether the
     // gate ran. `bypass` = the caller's `Cache-Control: no-cache`
@@ -4712,7 +4689,8 @@ async fn dispatch_ensemble(
             acc.saturating_add(&p.usage)
         });
     outcome.response.usage = aggregate_usage.clone();
-    let response = Wire::for_target(client, false).unary(created_ts, outcome.response, &req.model);
+    let (response, _) =
+        Wire::for_target(client, false).unary(created_ts, outcome.response, req, None);
     Ok(Success {
         response,
         // No single provider/model/key governs an ensemble response.
@@ -6452,7 +6430,10 @@ where
                     if let Some(tier) = &chunk.service_tier {
                         comp.service_tier = Some(tier.as_str().to_owned());
                     }
-                    if let Some(fr) = chunk.finish_reason.as_ref() {
+                    // A Gemini output message describes candidate zero, including its finish reason.
+                    if let Some(fr) = chunk.finish_reason.as_ref()
+                        .filter(|_| wire == Wire::OpenAi || chunk.choice_index == 0)
+                    {
                         comp.finish_reason = finish_reason_label(fr);
                     }
                     // Accumulate the assistant's content for the output

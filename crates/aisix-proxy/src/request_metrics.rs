@@ -1106,6 +1106,8 @@ mod tests {
     const ROUTES: &[&str] = &[
         "/v1beta/models/example:generateContent",
         "/v1beta/models/example:streamGenerateContent",
+        "/v1beta1/projects/example/locations/global/publishers/google/models/example:generateContent",
+        "/v1beta1/projects/example/locations/global/publishers/google/models/example:streamGenerateContent",
         "/v1/models",
         "/.well-known/oauth-protected-resource",
         "/.well-known/oauth-protected-resource/mcp",

@@ -9,6 +9,7 @@
 //!
 //! What it keeps, per wire:
 //!
+//! - Gemini: ordered text, thought text, and `functionCall` parts of candidate zero.
 //! - OpenAI Chat: `reasoning_content` (or `reasoning`), `content`, and
 //!   `tool_calls`.
 //! - Anthropic Messages: `text`, `thinking` and `tool_use` blocks.
@@ -27,6 +28,7 @@ use serde_json::{json, Value};
 /// The client-facing protocol an output was written in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputWire {
+    Gemini,
     OpenAiChat,
     AnthropicMessages,
     OpenAiResponses,
@@ -109,12 +111,11 @@ pub struct OutputCollector {
     wire: OutputWire,
     cap: usize,
     slots: BTreeMap<SlotKey, Part>,
-    /// Chat assigns slots in arrival order: a tool call keeps its own by
-    /// index, and text or reasoning opens a new one whenever the kind
-    /// changes, so interleaved reasoning stays where it was received.
+    /// Chat and Gemini text or reasoning opens a new slot whenever the kind
+    /// changes. Chat also keeps each fragmented tool call's slot by index.
     next_sub: u64,
     chat_tools: BTreeMap<u64, u64>,
-    chat_run: Option<(&'static str, u64)>,
+    text_run: Option<(&'static str, u64)>,
     /// Anthropic `tool_use` slots holding the `{}` a block opened with,
     /// which the first `input_json_delta` replaces rather than extends.
     placeholder_args: std::collections::BTreeSet<SlotKey>,
@@ -130,7 +131,7 @@ impl OutputCollector {
             slots: BTreeMap::new(),
             next_sub: 0,
             chat_tools: BTreeMap::new(),
-            chat_run: None,
+            text_run: None,
             placeholder_args: Default::default(),
             truncated: false,
             decoder: aisix_gateway::SseDecoder::new(),
@@ -211,6 +212,7 @@ impl OutputCollector {
 
     fn observe_body(&mut self, body: &Value) {
         match self.wire {
+            OutputWire::Gemini => self.observe_gemini(body),
             OutputWire::OpenAiChat => {
                 if let Some(message) = first_choice(body).and_then(|c| c.get("message")) {
                     self.observe_chat(message);
@@ -231,6 +233,7 @@ impl OutputCollector {
 
     fn observe_event(&mut self, event: &Value) {
         match self.wire {
+            OutputWire::Gemini => self.observe_gemini(event),
             OutputWire::OpenAiChat => {
                 if let Some(delta) = first_choice(event).and_then(|c| c.get("delta")) {
                     self.observe_chat(delta);
@@ -241,8 +244,6 @@ impl OutputCollector {
         }
     }
 
-    // ── OpenAI Chat ──────────────────────────────────────────────────────
-
     fn fresh_sub(&mut self) -> u64 {
         let sub = self.next_sub;
         self.next_sub += 1;
@@ -251,17 +252,59 @@ impl OutputCollector {
 
     /// The slot text or reasoning extends: the current run's while the kind
     /// is unchanged, a new one when it changes.
-    fn chat_run_slot(&mut self, kind: &'static str) -> SlotKey {
-        let sub = match self.chat_run {
+    fn text_run_slot(&mut self, kind: &'static str) -> SlotKey {
+        let sub = match self.text_run {
             Some((k, sub)) if k == kind => sub,
             _ => {
                 let sub = self.fresh_sub();
-                self.chat_run = Some((kind, sub));
+                self.text_run = Some((kind, sub));
                 sub
             }
         };
         SlotKey { position: 0, sub }
     }
+
+    fn observe_gemini(&mut self, frame: &Value) {
+        let Some(candidate) = array(frame.get("candidates"))
+            .iter()
+            .enumerate()
+            .find_map(|(i, c)| (c["index"].as_u64().unwrap_or(i as u64) == 0).then_some(c))
+        else {
+            return;
+        };
+        for part in array(candidate.pointer("/content/parts")) {
+            if let Some(text) = part["text"].as_str() {
+                if part["thought"] == true {
+                    let key = self.text_run_slot("reasoning");
+                    self.append(key, || Part::Reasoning(String::new()), text);
+                } else {
+                    let key = self.text_run_slot("text");
+                    self.append(key, || Part::Text(String::new()), text);
+                }
+            }
+            if let Some(call) = part.get("functionCall") {
+                if let Some(name) = call["name"].as_str() {
+                    self.text_run = None;
+                    let key = SlotKey {
+                        position: 0,
+                        sub: self.fresh_sub(),
+                    };
+                    self.put(
+                        key,
+                        Part::ToolCall {
+                            id: call["id"].as_str().map(str::to_owned),
+                            name: name.to_owned(),
+                            arguments: call
+                                .get("args")
+                                .map_or_else(|| "{}".into(), Value::to_string),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    // ── OpenAI Chat ──────────────────────────────────────────────────────
 
     fn chat_tool_slot(&mut self, index: u64) -> SlotKey {
         let sub = match self.chat_tools.get(&index) {
@@ -272,7 +315,7 @@ impl OutputCollector {
                 sub
             }
         };
-        self.chat_run = None;
+        self.text_run = None;
         SlotKey { position: 0, sub }
     }
 
@@ -285,18 +328,18 @@ impl OutputCollector {
             .filter(|s| !s.is_empty())
             .or_else(|| m.get("reasoning").and_then(Value::as_str));
         if let Some(text) = reasoning {
-            let key = self.chat_run_slot("reasoning");
+            let key = self.text_run_slot("reasoning");
             self.append(key, || Part::Reasoning(String::new()), text);
         }
         match m.get("content") {
             Some(Value::String(text)) => {
-                let key = self.chat_run_slot("text");
+                let key = self.text_run_slot("text");
                 self.append(key, || Part::Text(String::new()), text);
             }
             Some(Value::Array(parts)) => {
                 for p in parts {
                     if let Some(text) = p.get("text").and_then(Value::as_str) {
-                        let key = self.chat_run_slot("text");
+                        let key = self.text_run_slot("text");
                         self.append(key, || Part::Text(String::new()), text);
                     }
                 }

@@ -3,7 +3,8 @@ pub(crate) mod native;
 mod request;
 mod response;
 
-use aisix_gateway::{BridgeError, ChatChunk, ChatResponse};
+use aisix_gateway::{BridgeError, ChatChunk, ChatFormat, ChatResponse};
+use aisix_obs::{CapturedContent, OutputCollector, OutputWire};
 use axum::response::sse::Event;
 use axum::{
     extract::{FromRequestParts, State},
@@ -172,18 +173,44 @@ impl Wire {
         }
     }
 
-    pub(crate) fn unary(self, now: i64, resp: ChatResponse, alias: &str) -> Response {
-        if self == Self::Native {
-            return Json(native::render_response(&resp)).into_response();
-        }
-        let openai = crate::render::render_response(now, resp, alias);
+    pub(crate) fn unary(
+        self,
+        now: i64,
+        resp: ChatResponse,
+        req: &ChatFormat,
+        content_cap: Option<u32>,
+    ) -> (Response, Option<CapturedContent>) {
+        let capture = content_cap.map(|cap| {
+            let content = CapturedContent::new(
+                &crate::chat::captured_request_json(req),
+                &resp.message.content_str(),
+                cap as usize,
+            );
+            (content, cap)
+        });
         if self == Self::OpenAi {
-            return Json(openai).into_response();
+            let content = capture.map(|(c, cap)| {
+                c.with_output(crate::chat::chat_message_output(&resp.message, cap))
+            });
+            return (
+                Json(crate::render::render_response(now, resp, &req.model)).into_response(),
+                content,
+            );
         }
-        Json(response::unary(
-            serde_json::to_value(openai).expect("serializable chat completion"),
-        ))
-        .into_response()
+        let body = if self == Self::Native {
+            native::render_response(&resp)
+        } else {
+            let openai = crate::render::render_response(now, resp, &req.model);
+            response::unary(serde_json::to_value(openai).expect("serializable chat completion"))
+        };
+        let content = capture.map(|(c, cap)| {
+            c.with_output(Some(OutputCollector::from_body(
+                OutputWire::Gemini,
+                cap as usize,
+                &body,
+            )))
+        });
+        (Json(body).into_response(), content)
     }
 }
 

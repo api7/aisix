@@ -780,6 +780,7 @@ fn capture_streamed_output(
     cell: &attribution::RequestAttribution,
 ) {
     let wire = match endpoint {
+        gemini::ENDPOINT | gemini::STREAM_ENDPOINT => aisix_obs::OutputWire::Gemini,
         "/v1/chat/completions" => aisix_obs::OutputWire::OpenAiChat,
         "/v1/messages" => aisix_obs::OutputWire::AnthropicMessages,
         "/v1/responses" => aisix_obs::OutputWire::OpenAiResponses,

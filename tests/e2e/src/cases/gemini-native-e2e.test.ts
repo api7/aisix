@@ -68,6 +68,7 @@ const GOOGLE_ERROR = {
 
 describe("native Gemini generation", () => {
   let app: SpawnedApp | undefined;
+  let releaseFirstEvent: () => void;
   const upstreams: Record<string, OpenAiUpstream> = {};
 
   beforeAll(async () => {
@@ -80,6 +81,7 @@ describe("native Gemini generation", () => {
     });
     upstreams.stream = await startOpenAiUpstream({
       streamEvents: STREAM.map((frame) => JSON.stringify(frame)),
+      afterFirstEvent: new Promise<void>((resolve) => { releaseFirstEvent = resolve; }),
     });
     upstreams.streamerror = await startOpenAiUpstream({
       streamEvents: [STREAM[0], GOOGLE_ERROR].map((v) => JSON.stringify(v)),
@@ -162,13 +164,14 @@ describe("native Gemini generation", () => {
   });
 
   afterAll(async () => {
+    releaseFirstEvent?.();
     await app?.exit();
     await Promise.all(Object.values(upstreams).map((u) => u.close()));
   });
 
-  function call(alias: string, method: string, body: unknown) {
+  function call(alias: string, method: string, body: unknown, signal?: AbortSignal) {
     return fetch(app!.proxyUrl + "/v1beta/models/" + alias + ":" + method, {
-      method: "POST", headers: {
+      method: "POST", signal, headers: {
         "content-type": "application/json", ...CLIENT_CREDENTIALS,
         "x-client-tag": "antigravity",
         "user-agent": "test-agent/1", "x-goog-api-client": "gl-test/1",
@@ -195,12 +198,30 @@ describe("native Gemini generation", () => {
     }
   });
 
-  test("relays multi-candidate SSE frames and their usage-only terminal frame", async (ctx) => {
+  test("relays the first multi-candidate SSE event before upstream EOF and preserves the usage trailer", async (ctx) => {
     if (!app) return ctx.skip();
-    const res = await call("stream", "streamGenerateContent?alt=sse", TOOL_RESULT);
+    const res = await call("stream", "streamGenerateContent?alt=sse", TOOL_RESULT, AbortSignal.timeout(8_000));
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toMatch(/text\/event-stream/);
-    const frames = (await res.text()).split(/\r?\n/).filter((l) => l.startsWith("data:"))
+    const reader = res.body!.pipeThrough(new TextDecoderStream()).getReader();
+    let wire = "";
+    try {
+      // Keep the upstream open until a complete data event reaches the client.
+      while (!/^data:[^\n]*\r?\n\r?\n/m.test(wire)) {
+        const { done, value } = await reader.read();
+        expect(done).toBe(false);
+        wire += value;
+      }
+      expect(JSON.parse(wire.match(/^data:([^\n]*)/m)![1])).toEqual(STREAM[0]);
+    } finally {
+      releaseFirstEvent();
+    }
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      wire += value;
+    }
+    const frames = wire.split(/\r?\n/).filter((l) => l.startsWith("data:"))
       .map((line) => JSON.parse(line.slice(5)));
     expect(frames).toEqual(STREAM);
     const [sent] = upstreams.stream.receivedRequests;

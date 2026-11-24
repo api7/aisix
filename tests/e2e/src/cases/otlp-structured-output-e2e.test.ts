@@ -111,6 +111,17 @@ const CHAT_STREAM = [
   "[DONE]",
 ];
 
+const GEMINI_CANDIDATES = [{
+  content: { role: "model", parts: [
+    { text: ANSWER },
+    { thought: true, text: REASONING, thoughtSignature: "c2ln" },
+    { functionCall: { id: "call_wx", name: TOOL, args: { email: "owner@example.com" } } },
+    { text: "Email owner@example.com" },
+  ] },
+  finishReason: "STOP",
+}, { index: 1, content: { role: "model", parts: [{ text: "Alternate answer" }] }, finishReason: "STOP" }];
+const GEMINI_USAGE = { promptTokenCount: 9, candidatesTokenCount: 12, totalTokenCount: 21 };
+
 const CHAT_BODY = {
   id: "chatcmpl-structured-2",
   object: "chat.completion",
@@ -250,6 +261,12 @@ describe("OTLP output messages keep reasoning, text and tool calls apart", () =>
     upstreams.responsesStream = await startOpenAiUpstream({ rawStreamFrames: RESPONSES_STREAM });
     upstreams.responsesBody = await startOpenAiUpstream({ nonStreamBody: RESPONSES_BODY });
     upstreams.responsesIncomplete = await startOpenAiUpstream({ nonStreamBody: RESPONSES_INCOMPLETE_BODY });
+    upstreams.geminiBody = await startOpenAiUpstream({ nonStreamBody: {
+      candidates: GEMINI_CANDIDATES, usageMetadata: GEMINI_USAGE,
+    } });
+    upstreams.geminiStream = await startOpenAiUpstream({ streamEvents: [
+      { candidates: GEMINI_CANDIDATES }, { usageMetadata: GEMINI_USAGE },
+    ].map((frame) => JSON.stringify(frame)) });
     otlp = await startMockOtlp();
     sls = await startMockSls();
     dd = await startMockDatadog();
@@ -298,13 +315,21 @@ describe("OTLP output messages keep reasoning, text and tool calls apart", () =>
         api_base: `${upstream.baseUrl}/v1`,
         ...pk,
       });
-      await seed.createModel({
+      return seed.createModel({
         display_name: name,
         provider: (pk.provider as string | undefined) ?? "openai",
         model_name: pk.provider === "anthropic" ? "claude-sonnet-4-5" : "gpt-4o-mini",
         provider_key_id: key.id,
       });
     };
+    const mask = await seed.createGuardrail({
+      name: "mask-output-email", kind: "pii", hook_point: "output", enabled: true,
+      detectors: [{ type: "email", action: "mask" }],
+    }, { attach: false });
+    for (const [name, upstream] of [["so-gemini-body", upstreams.geminiBody], ["so-gemini-stream", upstreams.geminiStream]] as const) {
+      const target = await model(name, upstream, { apis: { gemini: {} } });
+      await seed.attachGuardrailToModel(mask.id, target.id);
+    }
     await model("so-chat-stream", upstreams.chatStream);
     await model("so-chat-body", upstreams.chatBody);
     await model("so-anthropic", upstreams.anthropic, {
@@ -445,6 +470,35 @@ describe("OTLP output messages keep reasoning, text and tool calls apart", () =>
     const slsInput = JSON.parse(row.get("input_messages")!);
     expect(slsInput.map((m: { role: string }) => m.role)).toEqual(["system", "user"]);
     expect(row.has("system_instructions")).toBe(false);
+  });
+
+  test.for([
+    ["so-gemini-body", "generateContent"],
+    ["so-gemini-stream", "streamGenerateContent?alt=sse"],
+  ])("Gemini native %s captures the delivered parts in order after masking", async ([model, method], ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const { status, requestId, text } = await post(`/v1beta/models/${model}:${method}`, {
+      contents: [{ parts: [{ text: "Check the weather." }] }],
+    });
+    expect(status).toBe(200);
+    expect(text).toContain("[EMAIL_REDACTED]");
+    expect(text).not.toContain("owner@example.com");
+    const span = await operationSpan(requestId);
+    expect(outputParts(span)).toEqual([
+      { type: "text", content: ANSWER }, { type: "reasoning", content: REASONING },
+      { type: "tool_call", id: "call_wx", name: TOOL, arguments: { email: "[EMAIL_REDACTED]" } },
+      { type: "text", content: "Email [EMAIL_REDACTED]" },
+    ]);
+  });
+
+  test("Gemini streams the chat bridge's final tool call into the exported answer", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const { status, requestId } = await post(
+      "/v1beta1/projects/test/locations/global/publishers/google/models/so-chat-stream:streamGenerateContent?alt=sse",
+      { contents: [{ parts: [{ text: "Check the weather." }] }] },
+    );
+    expect(status).toBe(200);
+    expect(outputParts(await operationSpan(requestId))).toEqual(EXPECTED_PARTS);
   });
 
   test("chat, buffered", async (ctx) => {
