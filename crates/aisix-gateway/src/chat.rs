@@ -591,6 +591,9 @@ pub enum FinishReason {
 /// provider-specific cache / reasoning detail used by cp-api's cost
 /// formula (see `aisix-cloud:internal/dpmgr/dpstore/pricing.go`).
 ///
+/// Redis serializes this type inside a cached `ChatResponse`. Changes to
+/// its stored format require a bump to `aisix-cache`'s `ENTRY_FORMAT`.
+///
 /// Provider-protocol mapping (the canonical comment lives in cp-api's
 /// schema; mirrored here for grep-ability):
 ///
@@ -670,28 +673,20 @@ pub struct UsageStats {
     pub reasoning_folded_into_completion: u32,
     /// Audio / image breakdowns of the two sides, as the upstream reported
     /// them. Subsets, never added to a total.
-    ///
-    /// Not serialized: a cached `ChatResponse` carries this type, and this
-    /// type denies unknown fields, so writing it would make every entry a
-    /// gateway release without the field shares the cache with (a rolling
-    /// upgrade, a rollback) unreadable. A cache hit reports none.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "ModalityTokens::is_empty")]
     pub modality: ModalityTokens,
     /// The split of `cache_creation_tokens` and of `cache_write_tokens` by
     /// cache lifetime, as far as the upstream reported one: zeroing one of
-    /// those totals clears only its own pair. Not serialized, for the same
-    /// reason as `modality`.
-    #[serde(skip)]
+    /// those totals clears only its own pair.
+    #[serde(default, skip_serializing_if = "CacheCreationTtl::is_empty")]
     pub cache_creation_ttl: CacheCreationTtl,
     /// The OpenAI-shape `*_tokens_details` counters an upstream reported,
-    /// for the client-facing OpenAI projection only. Not serialized, for
-    /// the same reason as `modality`.
-    #[serde(skip)]
+    /// for the client-facing OpenAI projection only.
+    #[serde(default, skip_serializing_if = "OpenAiUsageDetails::is_empty")]
     pub openai_details: OpenAiUsageDetails,
     /// Which of the prompt and completion counts the upstream's usage
-    /// carried, a reported `0` included. Not serialized, for the same
-    /// reason as `modality`.
-    #[serde(skip)]
+    /// carried, a reported `0` included.
+    #[serde(default)]
     pub reported: ReportedCounts,
 }
 
@@ -699,7 +694,8 @@ pub struct UsageStats {
 /// Only a count the upstream left out is estimated: one it reported stands
 /// as reported, `0` included. A non-zero count is reported whatever the
 /// flag says, so only a decoder that can see a reported `0` sets it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReportedCounts {
     pub prompt: bool,
     pub completion: bool,
@@ -1055,7 +1051,8 @@ impl ModalityTokens {
 /// client sees what the upstream sent and nothing it did not. The values
 /// that do have a slot (`cached_prompt_tokens`, `reasoning_tokens`,
 /// `modality`) stay there; the two `*_reported` flags only mark presence.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpenAiUsageDetails {
     pub cached_tokens_reported: bool,
     pub reasoning_tokens_reported: bool,
@@ -1066,6 +1063,10 @@ pub struct OpenAiUsageDetails {
 }
 
 impl OpenAiUsageDetails {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
     /// Field-wise sum, `None` only where neither side reported.
     pub fn saturating_add(&self, other: &Self) -> Self {
         fn add(a: Option<u32>, b: Option<u32>) -> Option<u32> {
@@ -1510,9 +1511,7 @@ pub struct ChatResponse {
     pub more_choices: Vec<ChatChoice>,
     pub usage: UsageStats,
     /// Not serialized: a cached response was served by no upstream, so a
-    /// cache hit reports no tier — and this type denies unknown fields, so
-    /// writing it would make every cache entry unreadable to a gateway
-    /// release without the field.
+    /// cache hit reports no tier.
     #[serde(skip)]
     pub service_tier: Option<ServiceTier>,
 }
@@ -2328,22 +2327,35 @@ mod tests {
         );
     }
 
-    /// A cached response carries `UsageStats`, and a gateway release that
-    /// predates `modality` denies unknown fields: the field never reaches
-    /// the serialized form a shared cache stores.
+    /// A cache hit reports the stored usage as the miss did, so the cached
+    /// form keeps every reported breakdown, and a reported `0` apart from a
+    /// missing count.
     #[test]
-    fn modality_stays_out_of_the_cached_form() {
+    fn usage_survives_the_cached_form() {
         let u = UsageStats {
+            reported: ReportedCounts {
+                prompt: true,
+                completion: false,
+            },
             modality: ModalityTokens {
                 prompt_audio_tokens: Some(0),
                 ..ModalityTokens::NONE
             },
-            ..UsageStats::new(1, 2)
+            cache_creation_ttl: CacheCreationTtl {
+                cache_creation_1h_tokens: Some(3),
+                ..CacheCreationTtl::NONE
+            },
+            openai_details: OpenAiUsageDetails {
+                cached_tokens_reported: true,
+                accepted_prediction_tokens: Some(0),
+                ..OpenAiUsageDetails::default()
+            },
+            ..UsageStats::new(0, 0)
         };
-        let json = serde_json::to_string(&u).unwrap();
-        assert!(!json.contains("modality"), "{json}");
-        let back: UsageStats = serde_json::from_str(&json).unwrap();
-        assert!(back.modality.is_empty());
+        let back: UsageStats = serde_json::from_str(&serde_json::to_string(&u).unwrap()).unwrap();
+        assert_eq!(back, u);
+        assert_eq!(back.reported_prompt_tokens(), Some(0));
+        assert_eq!(back.reported_completion_tokens(), None);
     }
 
     #[test]
@@ -2612,14 +2624,6 @@ mod tests {
         assert_eq!(recorded_completion_tokens(100, 30, 30, 30, 100), 30);
     }
 
-    /// PR #442 audit MEDIUM-4 (forward-compat): an *old-shape*
-    /// `UsageStats` JSON — written before the #542 native cache fields
-    /// existed — must still deserialize cleanly into the new struct,
-    /// defaulting the new Option fields to `None`. This pins the
-    /// new-DP-reads-old-cache direction of a mixed-version rolling
-    /// deploy (the `ChatResponse` type is persisted to the Redis cache).
-    /// The reverse direction (old DP reading new-shape) is bounded +
-    /// documented in the PR body.
     #[test]
     fn usage_stats_deserializes_old_shape_without_native_cache_fields() {
         let old = r#"{
@@ -2633,7 +2637,11 @@ mod tests {
         }"#;
         let u: UsageStats =
             serde_json::from_str(old).expect("old-shape UsageStats must deserialize");
-        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.reported_prompt_tokens(), Some(100));
+        assert_eq!(u.reported, ReportedCounts::default());
+        assert!(u.modality.is_empty());
+        assert!(u.cache_creation_ttl.is_empty());
+        assert!(u.openai_details.is_empty());
         assert_eq!(u.cached_prompt_tokens, 40);
         assert_eq!(u.prompt_cache_hit_tokens, None);
         assert_eq!(u.prompt_cache_miss_tokens, None);
