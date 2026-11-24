@@ -83,6 +83,15 @@ pub(crate) async fn entry(
             err,
         )
     };
+    if stream
+        && !url::form_urlencoded::parse(parts.uri.query().unwrap_or_default().as_bytes())
+            .filter_map(|(name, value)| (name == "alt").then_some(value))
+            .eq(["sse"])
+    {
+        return reject(ProxyError::InvalidRequest(
+            "streamGenerateContent requires alt=sse".into(),
+        ));
+    }
     let body = match Json::<Value>::from_request(
         axum::extract::Request::from_parts(parts, raw_body),
         &state,

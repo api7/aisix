@@ -206,6 +206,17 @@ describe("native Gemini generation", () => {
     expect(JSON.parse(sent.body)).toEqual(TOOL_RESULT);
   });
 
+  test.for(["", "?alt=json", "?alt=json&alt=sse"])("requires SSE for streaming requests with %s", async (query, ctx) => {
+    if (!app) return ctx.skip();
+    const before = upstreams.stream.receivedRequests.length;
+    const res = await call("stream", "streamGenerateContent" + query, ASK);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error: { status: "INVALID_ARGUMENT", message: expect.stringContaining("alt=sse") },
+    });
+    expect(upstreams.stream.receivedRequests).toHaveLength(before);
+  });
+
   test.for(["legacy", "undeclared"])("a %s key uses chat without a native declaration", async (alias, ctx) => {
     if (!app) return ctx.skip();
     const res = await call(alias, "generateContent", ASK);
