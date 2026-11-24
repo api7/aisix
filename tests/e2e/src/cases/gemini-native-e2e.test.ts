@@ -104,6 +104,7 @@ describe("native Gemini generation", () => {
     upstreams.undeclared = await startOpenAiUpstream({});
     upstreams.nativeonly = await startOpenAiUpstream({ nonStreamBody: ANSWER });
     upstreams.anthropic = await startOpenAiUpstream({});
+    upstreams.azure = await startOpenAiUpstream({});
     const guard = await seed.createGuardrail({
       name: "mask-email", kind: "pii", enabled: true, hook_point: "both",
       detectors: [{ type: "email", action: "mask" }],
@@ -111,7 +112,7 @@ describe("native Gemini generation", () => {
     for (const [alias, up] of Object.entries(upstreams)) {
       const root = up.baseUrl + "/v1beta";
       const override = alias === "tools";
-      const chat = ["legacy", "undeclared", "anthropic"].includes(alias);
+      const chat = ["legacy", "undeclared", "anthropic", "azure"].includes(alias);
       const surfaces = alias === "legacy" ? {} : {
         apis: chat ? {} : { gemini: override ? { base: root } : {} },
       };
@@ -120,6 +121,7 @@ describe("native Gemini generation", () => {
         ...(alias === "anthropic" ? { provider: "anthropic", adapter: "anthropic" } : {}),
         ...(alias === "nativeonly" ? { provider: "byo", adapter: undefined } : {}),
         api_base: chat || override ? up.baseUrl + "/v1beta/openai" : root, ...surfaces,
+        ...(alias === "azure" ? { provider: "azure", adapter: "azure-openai", api_base: up.baseUrl } : {}),
         request: {
           forward_client_headers: alias === "tools" || alias === "legacy"
             ? ["authorization", "x-goog-api-key", "x-client-tag"]
@@ -253,6 +255,29 @@ describe("native Gemini generation", () => {
     const res = await call("nativeonly", "generateContent", ASK);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual(ANSWER);
+  });
+
+  test.for(["nativeonly", "undeclared", "azure"])("%s preserves named function choices on its wire", async (alias, ctx) => {
+    if (!app) return ctx.skip();
+    const names = ["weather", "forecast"];
+    const functions = [...names, "lookup"].map(name => ({ name }));
+    const request = {
+      contents: ASK.contents, tools: [{ functionDeclarations: functions }, { googleSearch: {} }],
+      toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: names } },
+    };
+    const res = await call(alias, "generateContent", request);
+    expect(res.status).toBe(200);
+    await res.json();
+    const sent = JSON.parse(upstreams[alias].receivedRequests.at(-1)!.body);
+    if (alias === "nativeonly") {
+      expect(sent).toEqual(request);
+    } else {
+      expect(sent.tools).toEqual(functions.map(f => ({ type: "function", function: f })));
+      expect(sent.tool_choice).toEqual({
+        type: "allowed_tools", allowed_tools: { mode: "required", tools: names.map(name => ({ type: "function", function: { name } })) },
+      });
+      expect(sent).not.toHaveProperty("web_search_options");
+    }
   });
 
   test("a Gemini request selects only compatible targets in its routing plan", async (ctx) => {
