@@ -49,8 +49,9 @@ pub mod user;
 pub use a2a_agent::{A2aAgent, A2aAuthType, A2aProtocolVersion};
 pub use apikey::{ApiKey, McpServerLimit};
 pub use budget::{
-    Budget, BudgetExhausted, BudgetFailMode, BudgetMemberExhausted, BudgetPeriod, BudgetPolicy,
-    BudgetReason, BudgetScope, BudgetTag,
+    budget_next_period_start, budget_period_start, parse_budget_timezone, Budget, BudgetExhausted,
+    BudgetFailMode, BudgetMemberExhausted, BudgetPeriod, BudgetPolicy, BudgetReason, BudgetScope,
+    BudgetTag,
 };
 pub use cache_policy::{AppliesTo, CacheBackend, CachePolicy, CacheScope, SemanticCacheConfig};
 pub use claim_mapping::{ClaimMapping, ClaimMatch, ClaimMatchOp, ClaimResolve};

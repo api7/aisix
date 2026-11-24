@@ -75,6 +75,7 @@ percent-encoding.workspace = true
 # a constant that aliases against the modulus).
 rand = { workspace = true }
 chrono.workspace = true
+chrono-tz.workspace = true
 sha2.workspace = true
 hex.workspace = true
 # Bounded in-process cache in front of the shared store for session pins.

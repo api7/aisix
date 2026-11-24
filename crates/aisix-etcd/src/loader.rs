@@ -541,12 +541,13 @@ pub fn build_snapshot(prefixes: &PrefixSet, entries: &[RawEntry]) -> (AisixSnaps
                 }
             }
             "budget_policy" => {
-                if let Some(entry) = validate_and_parse::<BudgetPolicy>(
+                if let Some(entry) = validate_and_parse_with_semantics::<BudgetPolicy>(
                     &raw.key,
                     raw.revision,
                     parsed,
                     &value,
                     validate_budget_policy_lenient,
+                    BudgetPolicy::validate_semantics,
                     &mut stats,
                 ) {
                     snapshot.budget_policy.insert(entry);
@@ -1805,6 +1806,87 @@ mod tests {
                 .closed_grace_seconds,
             120
         );
+    }
+
+    #[test]
+    fn budget_policy_rejects_invalid_timezone_and_accepts_valid_ones() {
+        let entries = vec![
+            raw(
+                "/aisix/budget_policy/valid-shanghai",
+                br#"{"fail_mode":"sticky","closed_grace_seconds":300,"timezone":"Asia/Shanghai"}"#,
+                1,
+            ),
+            raw(
+                "/aisix/budget_policy/valid-utc",
+                br#"{"fail_mode":"sticky","closed_grace_seconds":300,"timezone":"UTC"}"#,
+                2,
+            ),
+            raw(
+                "/aisix/budget_policy/valid-absent",
+                br#"{"fail_mode":"sticky","closed_grace_seconds":300}"#,
+                3,
+            ),
+            raw(
+                "/aisix/budget_policy/bad-empty",
+                br#"{"fail_mode":"sticky","closed_grace_seconds":300,"timezone":""}"#,
+                4,
+            ),
+            raw(
+                "/aisix/budget_policy/bad-local",
+                br#"{"fail_mode":"sticky","closed_grace_seconds":300,"timezone":"Local"}"#,
+                5,
+            ),
+            raw(
+                "/aisix/budget_policy/bad-unknown",
+                br#"{"fail_mode":"sticky","closed_grace_seconds":300,"timezone":"Mars/Olympus"}"#,
+                6,
+            ),
+            raw(
+                "/aisix/budget_policy/bad-padded",
+                br#"{"fail_mode":"sticky","closed_grace_seconds":300,"timezone":" Asia/Shanghai"}"#,
+                7,
+            ),
+        ];
+        let (snap, stats) = build_snapshot(&env_prefixes(), &entries);
+        assert_eq!(stats.accepted, 3, "{:?}", stats.rejections);
+        assert_eq!(stats.schema_rejected, 4);
+        assert_eq!(
+            snap.budget_policy
+                .get_by_id("valid-shanghai")
+                .unwrap()
+                .value
+                .timezone
+                .as_deref(),
+            Some("Asia/Shanghai")
+        );
+        assert_eq!(
+            snap.budget_policy
+                .get_by_id("valid-utc")
+                .unwrap()
+                .value
+                .timezone
+                .as_deref(),
+            Some("UTC")
+        );
+        assert_eq!(
+            snap.budget_policy
+                .get_by_id("valid-absent")
+                .unwrap()
+                .value
+                .timezone,
+            None
+        );
+        for bad in ["bad-empty", "bad-local", "bad-unknown", "bad-padded"] {
+            assert!(snap.budget_policy.get_by_id(bad).is_none());
+            let key = format!("/aisix/budget_policy/{bad}");
+            let r = stats
+                .rejections
+                .iter()
+                .find(|r| r.key == key)
+                .unwrap_or_else(|| panic!("missing rejection for {key}"));
+            assert_eq!(r.kind, RejectionKind::SchemaFailed);
+            assert!(r.error.contains("IANA timezone"), "{}", r.error);
+        }
     }
 
     #[test]

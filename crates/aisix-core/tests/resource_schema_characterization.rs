@@ -1038,7 +1038,10 @@ fn published_strict_schemas_are_what_the_write_path_compiles() {
 ///   semantic thresholds' `default: 0.75`). `script` itself is required on
 ///   BOTH sets.
 const EXTRA_RELAXATIONS: &[(&str, &[&str])] = &[
-    ("budget", &["/allOf"]),
+    (
+        "budget",
+        &["/allOf", "/definitions/BudgetExhausted/dependencies"],
+    ),
     ("usage_accounting", &["/required"]),
     (
         "api_key",

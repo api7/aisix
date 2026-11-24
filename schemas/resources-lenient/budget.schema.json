@@ -4,8 +4,12 @@
     "BudgetExhausted": {
       "description": "The budget is exhausted for everything it applies to.",
       "properties": {
+        "period_end": {
+          "description": "Exclusive end of the exhausted period as an RFC 3339 timestamp. With both boundaries set, the block applies throughout that interval even if the policy timezone changes. Without an end, the gateway matches the start against the current period in the policy timezone in standalone mode and UTC in managed mode.",
+          "type": "string"
+        },
         "period_start": {
-          "description": "Start of the period the budget was exhausted in, as an RFC 3339 timestamp. The block holds only while this is the start of the current period, so it lifts at the next period boundary on its own. Omitted, the block holds in every period.",
+          "description": "Inclusive start of the exhausted period as an RFC 3339 timestamp. Omit both boundaries to block in every period.",
           "type": "string"
         },
         "reason": {
@@ -25,8 +29,12 @@
     "BudgetMemberExhausted": {
       "description": "One member's share of a `team_member` budget is exhausted.",
       "properties": {
+        "period_end": {
+          "description": "Exclusive end of the exhausted period as an RFC 3339 timestamp. With both boundaries set, the block applies throughout that interval even if the policy timezone changes. Without an end, the gateway matches the start against the current period in the policy timezone in standalone mode and UTC in managed mode.",
+          "type": "string"
+        },
         "period_start": {
-          "description": "Start of the period the member exhausted their share in, as an RFC 3339 timestamp. The block holds only while this is the start of the current period.",
+          "description": "Inclusive start of the member's exhausted period as an RFC 3339 timestamp.",
           "type": "string"
         },
         "reason": {
@@ -65,6 +73,10 @@
         },
         "message": {
           "description": "Human-readable message returned to the caller.",
+          "type": "string"
+        },
+        "message_prefix": {
+          "description": "Message text preceding the reset time. When present, the gateway appends the reset date, time, and policy timezone to this text and returns the result in place of `message`.",
           "type": "string"
         },
         "period": {
@@ -154,7 +166,7 @@
           "$ref": "#/definitions/BudgetPeriod"
         }
       ],
-      "description": "Accounting period. Periods follow the UTC calendar: a day starts at 00:00 UTC, a week on Monday at 00:00 UTC, and a month on the 1st at 00:00 UTC."
+      "description": "Accounting period. Calendar boundaries follow `budget_policy.timezone` when configured, or UTC when omitted: a day starts at 00:00, a week on Monday at 00:00, and a month on the 1st at 00:00."
     },
     "scope": {
       "allOf": [

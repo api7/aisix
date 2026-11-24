@@ -2251,6 +2251,8 @@ pub fn pricing_root_schema() -> Value {
 pub fn budget_root_schema(strict: bool) -> Value {
     let mut schema = struct_root_schema::<crate::models::Budget>(false);
     if strict {
+        schema["definitions"]["BudgetExhausted"]["dependencies"] =
+            json!({"period_end": ["period_start"]});
         schema
             .as_object_mut()
             .expect("budget root schema is a JSON object")
