@@ -171,7 +171,7 @@ fn project(candidate: &mut Value) -> ChatMessage {
     message
 }
 
-fn restore(candidate: &mut Value, mut text: &str, mut reasoning: &str, calls: &[Value]) {
+fn restore<'a>(candidate: &mut Value, mut text: &'a str, mut reasoning: &'a str, calls: &[Value]) {
     let Some(parts) = candidate
         .pointer_mut("/content/parts")
         .and_then(Value::as_array_mut)
