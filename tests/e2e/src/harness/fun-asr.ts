@@ -97,7 +97,14 @@ export async function startFunAsrUpstream() {
           send("task-started");
         }
       } else if (header.action === "finish-task") {
-        send("result-generated", { output: { sentence: { text: "你好世界" } }, usage: { duration: 6 } });
+        const result = { output: { sentence: { text: "你好世界" } }, usage: { duration: 6 } };
+        if (call.model === "vendor-slow-finish") {
+          const partial = setTimeout(() => send("result-generated", result), 480);
+          const terminal = setTimeout(() => send("task-finished"), 1050);
+          socket.once("close", () => { clearTimeout(partial); clearTimeout(terminal); });
+          return;
+        }
+        send("result-generated", result);
         if (call.model === "vendor-failure") {
           send("task-failed", {}, { error_code: "BadRequest", error_message: "bad audio" });
         } else if (call.model === "vendor-unread-terminal") {

@@ -74,23 +74,32 @@ fn failure_frame(id: &str, err: &ProxyError) -> String {
 }
 
 async fn fail(ws: &mut WebSocket, id: &str, err: &ProxyError) {
-    let _ = ws.send(Message::Text(failure_frame(id, err))).await;
-    let _ = ws.send(Message::Close(None)).await;
+    let _ = tokio::time::timeout(super::UPSTREAM_CLOSE_ACK, async {
+        ws.send(Message::Text(failure_frame(id, err))).await?;
+        ws.send(Message::Close(None)).await
+    })
+    .await;
 }
 
 async fn bounded<F: std::future::Future>(
     limit: Option<Duration>,
+    finish_sent: Option<Instant>,
     f: F,
 ) -> Result<F::Output, ProxyError> {
-    match limit {
-        Some(limit) => tokio::time::timeout(limit, f).await.map_err(|_| {
-            ProxyError::Bridge(BridgeError::Timeout {
-                elapsed_ms: limit.as_millis() as u64,
-                cause: "DashScope WebSocket idle timeout".into(),
-            })
-        }),
-        None => Ok(f.await),
-    }
+    let Some(limit) = limit else {
+        return Ok(f.await);
+    };
+    let timeout = || {
+        ProxyError::Bridge(BridgeError::Timeout {
+            elapsed_ms: limit.as_millis() as u64,
+            cause: "DashScope WebSocket idle timeout".into(),
+        })
+    };
+    let elapsed = finish_sent.map_or(Duration::ZERO, |start| start.elapsed());
+    let remaining = limit.checked_sub(elapsed).ok_or_else(timeout)?;
+    tokio::time::timeout(remaining, f)
+        .await
+        .map_err(|_| timeout())
 }
 
 async fn serve(
@@ -101,7 +110,8 @@ async fn serve(
 ) {
     let mut handshake_span = Some(tracing::Span::current());
     loop {
-        let Ok(Some(Ok(frame))) = bounded(state.default_timeouts.stream, ws.recv()).await else {
+        let Ok(Some(Ok(frame))) = bounded(state.default_timeouts.stream, None, ws.recv()).await
+        else {
             return;
         };
         if matches!(frame, Message::Ping(_) | Message::Pong(_)) {
@@ -218,6 +228,16 @@ enum End {
     Finished,
     Failed(ProxyError),
     Disconnected,
+}
+
+impl End {
+    fn after_write(reported: Option<Self>, delivered: bool) -> Option<Self> {
+        if delivered || matches!(reported, Some(Self::Failed(_))) {
+            reported
+        } else {
+            Some(Self::Disconnected)
+        }
+    }
 }
 
 struct Task {
@@ -353,7 +373,7 @@ impl Task {
         let result = match connected {
             Ok((mut upstream, response)) => {
                 aisix_gateway::note_upstream_response(response.headers());
-                bounded(idle, upstream.send(UpMessage::Text(start)))
+                bounded(idle, None, upstream.send(UpMessage::Text(start)))
                     .await?
                     .map_err(upstream_error)?;
                 let result = self.relay(ws, &mut upstream, idle, &chain).await;
@@ -422,9 +442,9 @@ impl Task {
         chain: &aisix_guardrails::GuardrailChain,
     ) -> Result<End, ProxyError> {
         let mut started = false;
-        let mut finishing = false;
+        let mut finish_sent = None;
         loop {
-            let next = bounded(idle, async {
+            let next = bounded(idle, finish_sent, async {
                 tokio::select! {
                     frame = ws.recv() => super::Dir::FromClient(frame),
                     frame = upstream.next() => super::Dir::FromUpstream(frame),
@@ -432,7 +452,7 @@ impl Task {
             })
             .await
             .map_err(|err| {
-                if started && !finishing {
+                if started && finish_sent.is_none() {
                     invalid("DashScope task timed out waiting for client audio or finish-task")
                 } else {
                     err
@@ -441,19 +461,20 @@ impl Task {
             match next {
                 super::Dir::FromClient(Some(Ok(frame))) => {
                     let outgoing = match frame {
-                        Message::Binary(audio) if started && !finishing => UpMessage::Binary(audio),
+                        Message::Binary(audio) if started && finish_sent.is_none() => {
+                            UpMessage::Binary(audio)
+                        }
                         Message::Text(text) => {
                             let command: Value = serde_json::from_str(&text)
                                 .map_err(|_| invalid("invalid task command"))?;
                             if !started
-                                || finishing
+                                || finish_sent.is_some()
                                 || command.pointer("/header/task_id").and_then(Value::as_str)
                                     != Some(&self.id)
                                 || command.pointer("/header/action") != Some(&json!("finish-task"))
                             {
                                 return Err(invalid("expected finish-task for the active task"));
                             }
-                            finishing = true;
                             self.scan(chain, &text, None, true).await?;
                             UpMessage::Text(text)
                         }
@@ -465,9 +486,13 @@ impl Task {
                             ))
                         }
                     };
-                    bounded(idle, upstream.send(outgoing))
+                    let is_finish = matches!(outgoing, UpMessage::Text(_));
+                    bounded(idle, None, upstream.send(outgoing))
                         .await?
                         .map_err(upstream_error)?;
+                    if is_finish {
+                        finish_sent = Some(Instant::now());
+                    }
                 }
                 super::Dir::FromClient(_) => return Ok(End::Disconnected),
                 super::Dir::FromUpstream(Some(Ok(UpMessage::Text(text)))) => {
@@ -546,13 +571,8 @@ impl Task {
                             content.truncated |= content.response_truncated;
                         }
                     }
-                    if !matches!(
-                        bounded(idle, ws.send(Message::Text(text))).await,
-                        Ok(Ok(()))
-                    ) {
-                        return Ok(End::Disconnected);
-                    }
-                    if let Some(end) = end {
+                    let write = bounded(idle, None, ws.send(Message::Text(text))).await;
+                    if let Some(end) = End::after_write(end, matches!(write, Ok(Ok(())))) {
                         return Ok(end);
                     }
                 }
@@ -698,5 +718,23 @@ impl Task {
             None,
             (!upstream_id.is_empty()).then_some(upstream_id.as_str()),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn undelivered_terminal_events_preserve_provider_failures() {
+        let failure = End::Failed(upstream_error("recognition failed"));
+        assert!(matches!(
+            End::after_write(Some(failure), false),
+            Some(End::Failed(_))
+        ));
+        assert!(matches!(
+            End::after_write(Some(End::Finished), false),
+            Some(End::Disconnected)
+        ));
     }
 }

@@ -38,7 +38,7 @@ describe("DashScope Fun-ASR native tasks", () => {
     }
     for (const alias of [
       "cn", "intl", "failure", "drop", "over-budget", "refuse", "refuse-no-id", "guard-control",
-      "guard-output", "tls", "resolve", "idle", "unread-terminal",
+      "guard-output", "tls", "resolve", "idle", "unread-terminal", "slow-finish",
     ]) {
       const provider = alias === "cn" ? "alibaba-cn" : "alibaba";
       const base = alias === "resolve" ? vendor.base.replace("127.0.0.1", "localhost") : vendor.base;
@@ -69,6 +69,7 @@ describe("DashScope Fun-ASR native tasks", () => {
         display_name: alias, model_name: "vendor-" + alias, provider, provider_key_id: pk.id,
         ...(["idle", "drop", "failure"].includes(alias) && { cooldown: { enabled: true } }),
         ...(["idle", "unread-terminal"].includes(alias) && { stream_timeout: 400 }),
+        ...(alias === "slow-finish" && { stream_timeout: 800 }),
       })).id);
     }
     await seed.createGuardrail({ name: "reject-marker", kind: "keyword", enabled: true,
@@ -141,6 +142,20 @@ describe("DashScope Fun-ASR native tasks", () => {
     } finally { client.ws.close(); }
   });
 
+  test("captures the opening command when model resolution fails before the upstream handshake", async ctx => {
+    if (!app) return ctx.skip();
+    const client = await openFunAsr(app.proxyUrl, caller);
+    try {
+      const run = runTask(randomUUID(), "missing-model");
+      const before = vendor.handshakes.length;
+      client.ws.send(JSON.stringify(run));
+      expect((await client.frame()).header).toMatchObject({ task_id: run.header.task_id, event: "task-failed", error_code: "model_not_found" });
+      expect(vendor.handshakes).toHaveLength(before);
+      expect(JSON.parse((await log(client.requestId)).get("prompt")!)).toEqual(run);
+      expect((await log(client.requestId, "metadata_only")).get("prompt")).toBeUndefined();
+    } finally { client.ws.close(); }
+  });
+
   test("leaves the provider request id empty when the refused handshake has none", async ctx => {
     if (!app) return ctx.skip();
     const client = await openFunAsr(app.proxyUrl, caller);
@@ -151,8 +166,8 @@ describe("DashScope Fun-ASR native tasks", () => {
     } finally { client.ws.close(); }
   });
 
-  test.each(["resolve", "tls"])("refuses the %s override before opening an upstream connection", async alias => {
-    if (!app) return;
+  test.for(["resolve", "tls"])("refuses the %s override before opening an upstream connection", async (alias, ctx) => {
+    if (!app) return ctx.skip();
     const client = await openFunAsr(app.proxyUrl, caller);
     try {
       const count = vendor.handshakes.length;
@@ -242,9 +257,27 @@ describe("DashScope Fun-ASR native tasks", () => {
     } finally { client.ws.close(); }
   });
 
-  test("one connection routes two serial tasks and meters the last cumulative duration on each", async ctx => {
+  test("applies one stream budget to the remaining results after finish-task", async ctx => {
     if (!app) return ctx.skip();
     const client = await openFunAsr(app.proxyUrl, caller);
+    try {
+      const id = randomUUID();
+      client.ws.send(JSON.stringify(runTask(id, "slow-finish")));
+      expect((await client.frame()).header.event).toBe("task-started");
+      client.ws.send(JSON.stringify({ header: { action: "finish-task", task_id: id }, payload: { input: {} } }));
+      expect((await client.frame()).header.event).toBe("result-generated");
+      client.ws.ping();
+      expect((await client.frame()).header).toMatchObject({ task_id: id, event: "task-failed", error_message: "upstream request timed out after 800ms" });
+      expect((await usage(id)).attributes).toMatchObject({ "http.response.status_code": 504, "aisix.audio.duration_seconds": 6 });
+    } finally { client.ws.close(); }
+  });
+
+  test.for([false, true])("routes and meters two serial tasks on one connection (incoming traceparent=%s)", async (hasParent, ctx) => {
+    if (!app) return ctx.skip();
+    const remoteTrace = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const remoteParent = "00f067aa0ba902b7";
+    const client = await openFunAsr(app.proxyUrl, caller,
+      hasParent ? { traceparent: `00-${remoteTrace}-${remoteParent}-01` } : {});
     try {
       const before = await scrapeMetrics(app.metricsUrl);
       const tasks = [];
@@ -262,6 +295,8 @@ describe("DashScope Fun-ASR native tasks", () => {
         tasks.push({ id, alias });
       }
       const requests = [];
+      const traces = [];
+      const serverIds = [];
       for (const { id, alias } of tasks) {
         const row = await usage(id);
         expect(row.attributes).toMatchObject({
@@ -269,10 +304,19 @@ describe("DashScope Fun-ASR native tasks", () => {
           "aisix.model_id": ids.get(alias), "http.response.status_code": 200, "aisix.is_final_attempt": true,
         });
         const req = row.attributes["aisix.request_id"];
-        expect(otlp.spans.filter(s => s.kind === 2 && s.attributes["aisix.request_id"] === req)).toHaveLength(1);
+        const servers = otlp.spans.filter(s => s.kind === 2 && s.attributes["aisix.request_id"] === req);
+        expect(servers).toHaveLength(1);
+        expect(row.traceId).toMatch(/^[0-9a-f]{32}$/);
+        expect(servers[0].traceId).toBe(row.traceId);
+        expect(servers[0].parentSpanId).toBe(hasParent ? remoteParent : "");
+        traces.push(row.traceId);
+        serverIds.push(servers[0].spanId);
         requests.push(req);
       }
       expect(new Set(requests).size).toBe(2);
+      expect(new Set(serverIds).size).toBe(2);
+      if (hasParent) expect(traces).toEqual([remoteTrace, remoteTrace]);
+      else expect(new Set(traces).size).toBe(2);
       expect(metricDelta(before, await scrapeMetrics(app.metricsUrl), "aisix_usage_events_emitted_total",
         { handler: "audio", inbound_protocol: "dashscope" })).toBe(2);
     } finally {
@@ -302,9 +346,10 @@ describe("DashScope Fun-ASR native tasks", () => {
           await waitConfigPropagation(async () => (await observer.listModels()).status === 401);
         }
         const id = randomUUID();
+        const before = vendor.handshakes.length;
         client.ws.send(JSON.stringify(runTask(id, "cn")));
         expect((await client.frame()).header).toMatchObject({ task_id: id, event: "task-failed" });
-        expect(vendor.calls.some(call => call.id === id)).toBe(false);
+        expect(vendor.handshakes).toHaveLength(before);
       } finally {
         client.ws.close();
       }
@@ -317,9 +362,10 @@ describe("DashScope Fun-ASR native tasks", () => {
     try {
       await recognize(client, "cn");
       const id = randomUUID();
+      const before = vendor.handshakes.length;
       client.ws.send(JSON.stringify(runTask(id, "over-budget")));
       expect((await client.frame()).header).toMatchObject({ task_id: id, event: "task-failed", error_code: "budget_exceeded" });
-      expect(vendor.calls.some(call => call.id === id)).toBe(false);
+      expect(vendor.handshakes).toHaveLength(before);
     } finally {
       client.ws.close();
     }
@@ -330,20 +376,21 @@ describe("DashScope Fun-ASR native tasks", () => {
     const client = await openFunAsr(app.proxyUrl, caller);
     try {
       const id = randomUUID();
+      const before = vendor.handshakes.length;
       const run = runTask(id, "cn");
       client.ws.send(JSON.stringify({ ...run, payload: { ...run.payload, input: { text: "blocked-marker" } } }));
-      expect((await client.frame()).header).toMatchObject({ task_id: id, event: "task-failed" });
-      expect(vendor.calls.some(call => call.id === id)).toBe(false);
+      expect((await client.frame()).header).toMatchObject({ task_id: id, event: "task-failed", error_code: "content_filter" });
+      expect(vendor.handshakes).toHaveLength(before);
     } finally {
       client.ws.close();
     }
   });
 
-  test.each([
+  test.for([
     ["failure", "upstream_in_band"],
     ["drop", "transport"],
-  ])("reports upstream %s on the task that received it", async (alias, errorClass) => {
-    if (!app) return;
+  ])("reports upstream %s on the task that received it", async ([alias, errorClass], ctx) => {
+    if (!app) return ctx.skip();
     const client = await openFunAsr(app.proxyUrl, caller);
     try {
       const { id, frames } = await recognize(client, alias);

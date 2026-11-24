@@ -664,6 +664,7 @@ describe("every proxy route emits every per-request metric family", () => {
     {
       // DashScope measures an ASR task in audio seconds and reports no tokens.
       route: funAsrPath, endpoint: funAsrPath, name: "Fun-ASR", model: "par-funasr",
+      protocols: { inbound_protocol: "dashscope", upstream_protocol: "openai" },
       families: [...REQUEST, "llm_requests", "e2e_upstream", "deployment", "ratelimit_remaining"],
       drive: async () => {
         const client = await openFunAsr(app!.proxyUrl, CALLER);
