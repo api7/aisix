@@ -996,6 +996,16 @@ impl BridgeError {
     pub fn http_status(&self) -> u16 {
         match self {
             BridgeError::Timeout { .. } => 504,
+            BridgeError::UpstreamStatus {
+                status,
+                parsed: Some(view),
+                ..
+            }
+            | BridgeError::UpstreamInBand {
+                status: Some(status),
+                parsed: Some(view),
+                ..
+            } if view.native_body.is_some() => *status,
             BridgeError::UpstreamStatus { status, .. } => {
                 // We only forward 4xx directly; everything else collapses
                 // to 502 so clients don't see upstream 5xx bleed through.

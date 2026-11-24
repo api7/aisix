@@ -611,7 +611,15 @@ fn raw_credential(
 }
 
 fn extract_bearer(parts: &Parts) -> Result<String, ProxyError> {
-    header_credential(&parts.headers).unwrap_or(Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)))
+    header_credential(&parts.headers)
+        .or_else(|| {
+            crate::gemini::path(parts.uri.path())?;
+            parts
+                .headers
+                .get("x-goog-api-key")
+                .map(|raw| raw_credential(raw, "x-goog-api-key"))
+        })
+        .unwrap_or(Err(ProxyError::MissingAuth(AUTHORIZATION_LABEL)))
 }
 
 #[cfg(test)]

@@ -1051,6 +1051,25 @@ pub(crate) fn anthropic_kind_from_status(status: StatusCode) -> &'static str {
 }
 
 impl ProxyError {
+    pub fn into_gemini_response(self) -> Response {
+        let status = self.status();
+        let raw = if let ProxyError::Bridge(bridge) = &self {
+            crate::gemini::native_error(bridge)
+        } else {
+            None
+        };
+        let body = raw.cloned().unwrap_or_else(|| {
+            crate::gemini::error(status.as_u16(), &self.envelope().error.message)
+        });
+        let mut response = (status, Json(body)).into_response();
+        apply_retry_headers(
+            &mut response,
+            self.retry_after_secs(),
+            self.rate_limit_detail(),
+        );
+        response
+    }
+
     /// Render this error as an Anthropic-shape `{type:"error", error:
     /// {type, message}}` HTTP response, plus `error.code` on a guardrail
     /// refusal ([`anthropic_guardrail_code`]). Used by `/v1/messages` so the

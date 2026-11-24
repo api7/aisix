@@ -49,6 +49,7 @@ mod error;
 mod error_translate;
 mod estimate_pool;
 pub use estimate_pool::configure as configure_estimate_pool;
+mod gemini;
 #[cfg(test)]
 mod guardrail_blocked_telemetry;
 #[cfg(test)]
@@ -148,6 +149,8 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/v1/models", get(models::list_models))
+        .route("/v1beta/models/*model_action", any(gemini::entry))
+        .route("/v1beta1/projects/:project/locations/:location/publishers/google/models/*model_action", any(gemini::entry))
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/v1/completions", post(completions::completions))
         .route("/v1/embeddings", post(embeddings::embeddings))
@@ -405,7 +408,18 @@ fn apply_shared_proxy_layers(
 /// allowlist in sync with the routes registered in `build_router`; any
 /// unrecognized path (including unmatched 404s) maps to `"other"`.
 fn normalize_endpoint_label(path: &str) -> &'static str {
+    if let Some((_, stream)) = gemini::path(path) {
+        return if stream {
+            gemini::STREAM_ENDPOINT
+        } else {
+            gemini::ENDPOINT
+        };
+    }
     match path {
+        "/v1beta/models/*model_action"
+        | "/v1beta1/projects/:project/locations/:location/publishers/google/models/*model_action" => {
+            gemini::ENDPOINT
+        }
         "/livez" => "/livez",
         "/readyz" => "/readyz",
         "/v1/models" => "/v1/models",
@@ -483,7 +497,9 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
 /// Shared by the in-flight gauge and the detailed request families
 /// (`request_metrics`) so the two can't disagree.
 fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
-    if endpoint == "/v1/messages" || endpoint == "/v1/messages/count_tokens" {
+    if matches!(endpoint, gemini::ENDPOINT | gemini::STREAM_ENDPOINT) {
+        "gemini"
+    } else if endpoint == "/v1/messages" || endpoint == "/v1/messages/count_tokens" {
         "anthropic"
     } else if endpoint == "/mcp"
         || endpoint.starts_with("/mcp/")
@@ -1243,7 +1259,9 @@ async fn enforce_request_body_limit(
     let path = request.uri().path();
     let is_anthropic_path =
         path == "/v1/messages" || path == "/v1/messages/" || path == "/v1/messages/count_tokens";
-    let envelope = if is_anthropic_path {
+    let envelope = if gemini::path(path).is_some() {
+        reject::Envelope::Gemini
+    } else if is_anthropic_path {
         reject::Envelope::Anthropic
     } else {
         reject::Envelope::OpenAi
