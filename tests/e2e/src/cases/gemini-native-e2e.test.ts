@@ -73,7 +73,7 @@ describe("native Gemini generation", () => {
   beforeAll(async () => {
     const etcd = new EtcdClient();
     if (!(await etcd.ping())) return;
-    app = await spawnApp();
+    app = await spawnApp({ exposeDebugHeaders: true });
     const seed = new SeedClient(etcd, app.etcdPrefix);
     upstreams.tools = await startOpenAiUpstream({
       scriptedResponses: [{ nonStreamBody: ANSWER }, { nonStreamBody: FINAL }],
@@ -102,6 +102,8 @@ describe("native Gemini generation", () => {
     ].map((v) => JSON.stringify(v)) });
     upstreams.legacy = await startOpenAiUpstream({});
     upstreams.undeclared = await startOpenAiUpstream({});
+    upstreams.nativeonly = await startOpenAiUpstream({ nonStreamBody: ANSWER });
+    upstreams.anthropic = await startOpenAiUpstream({});
     const guard = await seed.createGuardrail({
       name: "mask-email", kind: "pii", enabled: true, hook_point: "both",
       detectors: [{ type: "email", action: "mask" }],
@@ -109,12 +111,14 @@ describe("native Gemini generation", () => {
     for (const [alias, up] of Object.entries(upstreams)) {
       const root = up.baseUrl + "/v1beta";
       const override = alias === "tools";
-      const chat = alias === "legacy" || alias === "undeclared";
+      const chat = ["legacy", "undeclared", "anthropic"].includes(alias);
       const surfaces = alias === "legacy" ? {} : {
         apis: chat ? {} : { gemini: override ? { base: root } : {} },
       };
       const pk = await seed.createProviderKey({
         display_name: "native-key-" + alias, api_key: UPSTREAM_KEY,
+        ...(alias === "anthropic" ? { provider: "anthropic", adapter: "anthropic" } : {}),
+        ...(alias === "nativeonly" ? { provider: "byo", adapter: undefined } : {}),
         api_base: chat || override ? up.baseUrl + "/v1beta/openai" : root, ...surfaces,
         request: {
           forward_client_headers: alias === "tools" || alias === "legacy"
@@ -131,9 +135,22 @@ describe("native Gemini generation", () => {
         await seed.attachGuardrailToModel(guard.id, model.id);
       }
     }
+    for (const [name, targets] of [
+      ["mixed-chat", ["anthropic", "undeclared"]],
+      ["mixed-cache", ["undeclared", "nativeonly"]],
+    ] as const) {
+      await seed.createModel({
+        display_name: name, routing: { strategy: "failover", targets: targets.map(model => ({ model })) },
+      });
+      await seed.createCachePolicy({ name: name + "-policy", enabled: true, applies_to: "model:" + name });
+    }
+    await seed.createModel({
+      display_name: "ensemble",
+      ensemble: { panel: [{ model: "anthropic" }, { model: "undeclared" }], judge: { model: "legacy" } },
+    });
     await seed.createApiKey({
       key_hash: createHash("sha256").update(CALLER).digest("hex"),
-      allowed_models: Object.keys(upstreams),
+      allowed_models: [...Object.keys(upstreams), "mixed-chat", "mixed-cache", "ensemble"],
     });
     const proxy = new ProxyClient(app.proxyUrl, CALLER);
     await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
@@ -215,6 +232,51 @@ describe("native Gemini generation", () => {
     const sent = JSON.parse(upstreams.mask.receivedRequests[0].body);
     expect(sent.contents[0].parts[0].text).toBe("Write to [EMAIL_REDACTED]");
     expect(sent.generationConfig.temperature).toBe(0.5);
+  });
+
+  test("a native-only key works without a Chat bridge", async (ctx) => {
+    if (!app) return ctx.skip();
+    const res = await call("nativeonly", "generateContent", ASK);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(ANSWER);
+  });
+
+  test("a Gemini request selects only compatible targets in its routing plan", async (ctx) => {
+    if (!app) return ctx.skip();
+    const body = { contents: [{ parts: [{ text: "hello" }] }] };
+    for (const name of ["anthropic", "ensemble"]) {
+      const res = await call(name, "generateContent", body);
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ error: { code: 400, status: "INVALID_ARGUMENT" } });
+    }
+    const before = upstreams.undeclared.receivedRequests.length;
+    const fallback = await call("mixed-chat", "generateContent", ASK);
+    expect(fallback.status).toBe(200);
+    expect(JSON.stringify((await fallback.json()).candidates)).toContain("mock reply");
+    expect(upstreams.undeclared.receivedRequests).toHaveLength(before + 1);
+    expect(upstreams.anthropic.receivedRequests).toHaveLength(0);
+  });
+
+  test.for(["mixed-cache", "mixed-chat"])("the %s Gemini plan skips a warm Chat cache", async (alias, ctx) => {
+    if (!app) return ctx.skip();
+    const text = "Which wire is cached?";
+    for (const expected of ["miss", "hit"]) {
+      const res = await fetch(app.proxyUrl + "/v1/chat/completions", {
+        method: "POST", headers: { "content-type": "application/json", ...CLIENT_CREDENTIALS },
+        body: JSON.stringify({ model: alias, stream: false, messages: [{ role: "user", content: text }] }),
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-aisix-cache")).toBe(expected);
+      await res.json();
+    }
+    const before = upstreams.undeclared.receivedRequests.length;
+    for (let i = 0; i < 2; i++) {
+      const res = await call(alias, "generateContent", { contents: [{ parts: [{ text }] }] });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-aisix-cache")).toBeNull();
+      expect(JSON.stringify((await res.json()).candidates)).toContain("mock reply");
+    }
+    expect(upstreams.undeclared.receivedRequests).toHaveLength(before + 2);
   });
 
   test("masks a later stream candidate across frames and masks its tool arguments", async (ctx) => {

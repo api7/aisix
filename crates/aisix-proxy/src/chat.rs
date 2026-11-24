@@ -88,7 +88,7 @@ use crate::cooldown::decide_cooldown;
 
 enum ChatTarget<'a> {
     Bridge(Arc<dyn aisix_gateway::Bridge>),
-    Gemini(std::borrow::Cow<'a, serde_json::Value>),
+    Gemini(&'a serde_json::Value),
 }
 
 impl<'a> ChatTarget<'a> {
@@ -101,9 +101,13 @@ impl<'a> ChatTarget<'a> {
         if let Some(raw) = gemini_body.filter(|_| {
             crate::dispatch::serves_natively_with(model, Some(key), aisix_core::ApiSurface::Gemini)
         }) {
-            return Some(Self::Gemini(gemini::with_model_effort(raw, model)));
+            return Some(Self::Gemini(raw));
         }
-        crate::dispatch::resolve_bridge(&state.hub, key).map(Self::Bridge)
+        let bridge = crate::dispatch::resolve_bridge(&state.hub, key)?;
+        if gemini_body.is_some() && !matches!(bridge.wire_protocol(), "openai" | "azure-openai") {
+            return None;
+        }
+        Some(Self::Bridge(bridge))
     }
 
     fn wire(&self, client: &ClientContext) -> Wire {
@@ -116,7 +120,9 @@ impl<'a> ChatTarget<'a> {
         ctx: &aisix_gateway::BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
         match self {
-            Self::Gemini(raw) => gemini::native::chat(ctx, raw).await,
+            Self::Gemini(raw) => {
+                gemini::native::chat(ctx, &gemini::with_model_effort(raw, &ctx.model)).await
+            }
             Self::Bridge(bridge) => {
                 bridge
                     .chat_cow(crate::effort_mapping::chat_request(req, &ctx.model), ctx)
@@ -131,7 +137,9 @@ impl<'a> ChatTarget<'a> {
         ctx: &aisix_gateway::BridgeContext,
     ) -> Result<aisix_gateway::ChatChunkStream, BridgeError> {
         match self {
-            Self::Gemini(raw) => gemini::native::chat_stream(ctx, raw).await,
+            Self::Gemini(raw) => {
+                gemini::native::chat_stream(ctx, &gemini::with_model_effort(raw, &ctx.model)).await
+            }
             Self::Bridge(bridge) => {
                 bridge
                     .chat_stream_cow(crate::effort_mapping::chat_request(req, &ctx.model), ctx)
@@ -1750,7 +1758,7 @@ async fn dispatch(
     // the matched route name (None on a fall-through to `default` or a
     // non-semantic request) for the `x-aisix-route` response header.
     let budget_gate = crate::budget::gate(state, snapshot);
-    let plan = crate::dispatch_plan::plan(
+    let mut plan = crate::dispatch_plan::plan(
         state,
         snapshot,
         &req.model,
@@ -1773,6 +1781,26 @@ async fn dispatch(
     )
     .await
     .map_err(&with_model)?;
+    let mut bypass_chat_cache = false;
+    if let Some(raw) = &native_body {
+        plan.attempts.retain(|a| {
+            let target = a
+                .model
+                .provider_key_id
+                .as_deref()
+                .and_then(|id| snapshot.provider_keys.get_by_id(id))
+                .and_then(|key| ChatTarget::resolve(state, &a.model, &key.value, Some(raw)));
+            // A native reply has fields outside ChatFormat. A discarded target
+            // could have populated this alias's cache through the Chat endpoint.
+            bypass_chat_cache |= !matches!(target, Some(ChatTarget::Bridge(_)));
+            target.is_some()
+        });
+        if plan.attempts.is_empty() {
+            return Err(with_model(ProxyError::InvalidRequest(
+                "this model has no Gemini or OpenAI Chat Completions target".into(),
+            )));
+        }
+    }
     let attempt_models = &plan.attempts;
     let semantic_route = plan.semantic_route.clone();
 
@@ -1792,7 +1820,7 @@ async fn dispatch(
         // family/specialized bridge surfaces as 503 here, before
         // we commit to a long upstream call.
         let pk_entry = crate::dispatch::resolve_provider_key(snapshot, only).map_err(with_model)?;
-        if crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value).is_none() {
+        if ChatTarget::resolve(state, only, &pk_entry.value, native_body.as_ref()).is_none() {
             return Err(with_model(ProxyError::ProviderUnavailable));
         }
     }
@@ -2618,27 +2646,12 @@ async fn dispatch(
     // the entry-table iteration order decides — that's an
     // unspecified-but-stable tiebreak we'll formalise (probably
     // "narrowest scope wins") in a follow-up if operators ever care.
-    // A native candidate's response and cache identity include fields outside ChatFormat.
-    let has_native = native_body.is_some()
-        && attempt_models.iter().any(|a| {
-            a.model
-                .provider_key_id
-                .as_deref()
-                .and_then(|id| snapshot.provider_keys.get_by_id(id))
-                .is_some_and(|key| {
-                    crate::dispatch::serves_natively_with(
-                        &a.model,
-                        Some(&key.value),
-                        aisix_core::ApiSurface::Gemini,
-                    )
-                })
-        });
     let matched_policy = snapshot
         .cache_policies
         .entries()
         .iter()
         .find(|entry| {
-            !has_native
+            !bypass_chat_cache
                 && entry.value.enabled
                 && entry
                     .value
