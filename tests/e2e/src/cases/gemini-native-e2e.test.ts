@@ -20,7 +20,10 @@ const CALL = {
   thoughtSignature: "c2lnbmF0dXJl",
 };
 const CALL_CONTENT = {
-  role: "model", parts: [{ text: "Checking. " }, CALL, { text: "One moment." }],
+  role: "model", parts: [
+    { thought: true, text: "Plan", thoughtSignature: "YQo=" },
+    { text: "Checking. " }, CALL, { text: "One moment." }, { futurePart: ["opaque"] },
+  ],
 };
 const USAGE = {
   promptTokenCount: 12, candidatesTokenCount: 3, thoughtsTokenCount: 2,
@@ -83,6 +86,12 @@ describe("native Gemini generation", () => {
         thoughtSignature: "c2lnbmF0dXJl",
       }] }, finishReason: "STOP" }], usageMetadata: USAGE,
     } });
+    upstreams.maskstream = await startOpenAiUpstream({ streamEvents: [
+      { candidates: [{ index: 1, content: { parts: [{ text: "owner@" }] } }] },
+      { candidates: [{ index: 1, content: { parts: [{ text: "example.com" }, {
+        functionCall: { name: "notify", args: { to: "second@example.com" } },
+      }] }, finishReason: "STOP" }], usageMetadata: USAGE },
+    ].map((v) => JSON.stringify(v)) });
     upstreams.legacy = await startOpenAiUpstream({});
     upstreams.undeclared = await startOpenAiUpstream({});
     for (const [alias, up] of Object.entries(upstreams)) {
@@ -160,7 +169,7 @@ describe("native Gemini generation", () => {
     expect(JSON.parse(sent.body)).toEqual(TOOL_RESULT);
   });
 
-  test.each(["legacy", "undeclared"])("a %s key uses chat without a native declaration", async (alias, ctx) => {
+  test.for(["legacy", "undeclared"])("a %s key uses chat without a native declaration", async (alias, ctx) => {
     if (!app) return ctx.skip();
     const res = await call(alias, "generateContent", ASK);
     expect(res.status).toBe(200);
@@ -183,6 +192,19 @@ describe("native Gemini generation", () => {
       .toBe("Write to [EMAIL_REDACTED]");
   });
 
+  test("masks a later stream candidate across frames and masks its tool arguments", async (ctx) => {
+    if (!app) return ctx.skip();
+    const res = await call("maskstream", "streamGenerateContent?alt=sse", ASK);
+    expect(res.status).toBe(200);
+    const frames = (await res.text()).split(/\r?\n/).filter((line) => line.startsWith("data:"))
+      .map((line) => JSON.parse(line.slice(5)));
+    expect(frames).toHaveLength(2);
+    const parts = frames.flatMap(f => f.candidates[0].content.parts);
+    expect(parts.map(p => p.text ?? "").join("")).toBe("[EMAIL_REDACTED]");
+    expect(parts.at(-1).functionCall.args.to).toBe("[EMAIL_REDACTED]");
+    expect(frames.map(f => f.candidates[0].index)).toEqual([1, 1]);
+  });
+
   test("keeps the Google service error's HTTP status consistent with its JSON body", async (ctx) => {
     if (!app) return ctx.skip();
     const res = await call("busy", "generateContent", ASK);
@@ -192,7 +214,7 @@ describe("native Gemini generation", () => {
     });
   });
 
-  test.each(["generateContent", "streamGenerateContent?alt=sse"])(
+  test.for(["generateContent", "streamGenerateContent?alt=sse"])(
     "%s preserves the upstream Google error and its details", async (method, ctx) => {
       if (!app) return ctx.skip();
       const res = await call("error", method, ASK);
