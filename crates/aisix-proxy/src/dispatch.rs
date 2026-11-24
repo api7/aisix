@@ -280,6 +280,7 @@ pub(crate) fn serves_natively_with(
     }
     let declared = pk.and_then(|p| p.apis.as_ref());
     match surface {
+        ApiSurface::Gemini => declared.is_some_and(|apis| apis.gemini.is_some()),
         ApiSurface::Messages => {
             model.provider.as_deref() == Some("anthropic")
                 || pk.is_some_and(|p| p.adapter == Some(aisix_core::Adapter::Anthropic))
@@ -497,6 +498,9 @@ pub(crate) fn configured_base_url(
     provider_key: &ProviderKey,
     surface: Option<ApiSurface>,
 ) -> Option<String> {
+    if surface == Some(ApiSurface::Gemini) {
+        return Some(gemini_base(provider_key).to_owned());
+    }
     if let Some(base) = surface.and_then(|s| surface_base(provider_key, s)) {
         return Some(strip_endpoint_suffix(base.trim()).to_string());
     }
@@ -666,6 +670,9 @@ pub(crate) fn resolve_base_url_for(
     provider_key: &ProviderKey,
     surface: ApiSurface,
 ) -> Result<String, ProxyError> {
+    if surface == ApiSurface::Gemini {
+        return Ok(gemini_base(provider_key).to_owned());
+    }
     match surface_base(provider_key, surface) {
         Some(base) => Ok(strip_endpoint_suffix(base.trim()).to_string()),
         None if surface == ApiSurface::Messages
@@ -679,6 +686,17 @@ pub(crate) fn resolve_base_url_for(
         }
         None => resolve_base_url(provider_key),
     }
+}
+
+fn gemini_base(key: &ProviderKey) -> &str {
+    surface_base(key, ApiSurface::Gemini)
+        .or_else(|| {
+            key.api_base
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("https://generativelanguage.googleapis.com/v1beta")
 }
 
 /// Whether a key with no `api_base` reaches the built-in Anthropic base

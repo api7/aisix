@@ -4886,6 +4886,7 @@ mod tests {
                 message: Some("upstream said no".into()),
                 code: code.map(str::to_string),
                 param: None,
+                native_body: None,
             })),
             wire: aisix_gateway::UpstreamWire::Unknown,
         }

@@ -80,6 +80,8 @@ pub struct UpstreamErrorView {
     pub code: Option<String>,
     /// OpenAI envelope only.
     pub param: Option<String>,
+    /// Original JSON error envelope on a same-protocol Gemini request.
+    pub native_body: Option<serde_json::Value>,
 }
 
 /// Context carried through the whole request lifecycle.
@@ -870,6 +872,7 @@ pub fn capture_in_band_error_value(
                 message,
                 code: text(code).filter(|_| numeric_status.is_none()),
                 param: text(inner.get("param")),
+                native_body: None,
             };
             let message = view
                 .message

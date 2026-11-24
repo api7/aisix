@@ -345,6 +345,7 @@ pub fn parse_openai_error_envelope(body: &[u8]) -> Option<aisix_gateway::Upstrea
         message: outer.error.message,
         code: text(outer.error.code),
         param: text(outer.error.param),
+        native_body: None,
     })
 }
 

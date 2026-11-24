@@ -202,6 +202,7 @@ mod tests {
             message: Some("upstream said hi".into()),
             code: None,
             param: None,
+            native_body: None,
         }
     }
 
@@ -372,6 +373,7 @@ mod tests {
             message: Some("hi".into()),
             code: Some("rate_limit_exceeded".into()),
             param: None,
+            native_body: None,
         };
         let body = render_openai_envelope(Some(&v), UpstreamWire::AzureOpenAI, "fb");
         assert_eq!(body.kind, "upstream_error");
@@ -390,6 +392,7 @@ mod tests {
             message: Some("hi".into()),
             code: Some("custom_code_added_yesterday".into()),
             param: Some("model".into()),
+            native_body: None,
         };
         let body = render_openai_envelope(Some(&v), UpstreamWire::OpenAI, "fb");
         assert_eq!(body.kind, "upstream_error");
@@ -412,6 +415,7 @@ mod tests {
             message: None,
             code: None,
             param: None,
+            native_body: None,
         };
         let body = render_openai_envelope(Some(&v), UpstreamWire::Anthropic, "raw fallback");
         assert_eq!(body.kind, "upstream_error");

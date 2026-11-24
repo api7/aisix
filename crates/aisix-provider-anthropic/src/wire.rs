@@ -2313,6 +2313,7 @@ pub fn stream_error_into_bridge_error(err: &AnthropicStreamErrorBody) -> BridgeE
             message,
             code: None,
             param: None,
+            native_body: None,
         })),
         wire: aisix_gateway::UpstreamWire::Anthropic,
     }

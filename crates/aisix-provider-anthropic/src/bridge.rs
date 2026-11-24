@@ -262,6 +262,7 @@ fn parse_anthropic_error_envelope(body: &[u8]) -> Option<aisix_gateway::Upstream
         message: outer.error.message,
         code: None,
         param: None,
+        native_body: None,
     })
 }
 
