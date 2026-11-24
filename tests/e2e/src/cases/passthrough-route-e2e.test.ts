@@ -556,6 +556,37 @@ describe("passthrough-route e2e: explicit routes, BYO credentials, unclaimed pat
     expect(upstream.receivedRequests).toHaveLength(baseline);
   });
 
+  test("existing Gemini path mounts keep their upstream and route authentication", async (ctx) => {
+    if (!app || !seed) return ctx.skip();
+    const upstream = await startOpenAiUpstream({ nonStreamBody: { routed: "gemini-mount" } });
+    upstreams.push(upstream);
+    const prefixes = ["/v1beta/models", "/v1beta1/projects/p/locations/l/publishers/google/models"];
+    for (const [i, prefix] of prefixes.entries()) {
+      await seed.createPassthroughRoute({
+        name: `gemini-mount-${i}`, path_prefix: prefix,
+        target_url: upstream.baseUrl + "/existing", auth_mode: "header_key",
+        auth_header_name: "x-route-login", credential_mode: "forward_client",
+      });
+    }
+    const login = "gemini-mount-caller";
+    await seed.createApiKey({
+      key_hash: createHash("sha256").update(login).digest("hex"),
+      allowed_models: ["*"], allowed_routes: ["*"],
+    });
+    const proxy = new ProxyClient(app.proxyUrl, login);
+    await waitConfigPropagation(async () => (await proxy.listModels()).status === 200);
+    for (const [i, action] of ["generateContent", "streamGenerateContent"].entries()) {
+      const suffix = "/upstream-alias:" + action;
+      const res = await fetch(app.proxyUrl + prefixes[i] + suffix, {
+        method: "POST", headers: { "content-type": "application/json", "x-route-login": login },
+        body: JSON.stringify({ contents: [{ parts: [{ text: "hello" }] }] }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ routed: "gemini-mount" });
+      expect(upstream.receivedRequests.at(-1)?.path).toBe("/existing" + suffix);
+    }
+  });
+
   test("forward-proxy BYO: host match beats typed routes; Authorization forwarded verbatim", async (ctx) => {
     if (!etcdReachable || !app || !seed) {
       ctx.skip();
