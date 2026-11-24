@@ -206,7 +206,7 @@
           "$ref": "#/definitions/BudgetPeriod"
         }
       ],
-      "description": "Accounting period. Periods follow the UTC calendar: a day starts at 00:00 UTC, a week on Monday at 00:00 UTC, and a month on the 1st at 00:00 UTC."
+      "description": "Accounting period. Calendar boundaries follow `budget_policy.timezone` when configured, or UTC when omitted: a day starts at 00:00, a week on Monday at 00:00, and a month on the 1st at 00:00."
     },
     "scope": {
       "allOf": [

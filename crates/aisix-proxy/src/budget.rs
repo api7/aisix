@@ -26,12 +26,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aisix_core::models::{Budget, BudgetFailMode, BudgetPeriod, BudgetScope};
+use aisix_core::models::{
+    budget_next_period_start, budget_period_start, parse_budget_timezone, Budget, BudgetFailMode,
+    BudgetScope,
+};
 use aisix_core::resource::ResourceEntry;
 use aisix_core::snapshot::ResourceTable;
 use aisix_core::AisixSnapshot;
 use arc_swap::ArcSwapOption;
-use chrono::{DateTime, Datelike, NaiveTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
+use chrono_tz::Tz;
 
 use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
@@ -206,6 +210,7 @@ impl Verdict {
 pub(crate) struct BudgetGate {
     index: Arc<BudgetIndex>,
     now: DateTime<Utc>,
+    tz: Tz,
     /// Strict mode is in force: delivery has been failing for at least the
     /// policy's grace period.
     unverified: bool,
@@ -216,9 +221,28 @@ pub(crate) fn gate(state: &crate::ProxyState, snapshot: &AisixSnapshot) -> Budge
     BudgetGate {
         index: state.budgets.for_table(&snapshot.budgets),
         now: Utc::now(),
+        tz: policy_timezone(snapshot),
         unverified: strict_grace(snapshot)
             .is_some_and(|grace| state.metrics.usage_delivery().unhealthy_for() >= grace),
     }
+}
+
+/// Calendar timezone for budget period boundaries. Absent means UTC. Multiple
+/// rows can only be a stale key; select deterministically by lowest entry id.
+fn policy_timezone(snapshot: &AisixSnapshot) -> Tz {
+    snapshot
+        .budget_policy
+        .entries()
+        .into_iter()
+        .filter(|e| e.value.timezone.is_some())
+        .min_by(|a, b| a.id.cmp(&b.id))
+        .and_then(|e| {
+            e.value
+                .timezone
+                .as_deref()
+                .and_then(|tz| parse_budget_timezone(tz).ok())
+        })
+        .unwrap_or(Tz::UTC)
 }
 
 /// The grace period when the environment's policy is `closed`. Two rows can
@@ -304,7 +328,7 @@ impl BudgetGate {
         budget: &'a Budget,
         user_id: Option<&str>,
     ) -> Option<&'a aisix_core::models::BudgetReason> {
-        let current = period_start(self.now, budget.period);
+        let current = budget_period_start(self.now, budget.period, self.tz).with_timezone(&Utc);
         let in_force = |start: Option<&str>| {
             start.is_none_or(|s| {
                 DateTime::parse_from_rfc3339(s).is_ok_and(|t| t.with_timezone(&Utc) == current)
@@ -325,7 +349,12 @@ impl BudgetGate {
     }
 
     fn reason(&self, budget: &Budget, doc: &aisix_core::models::BudgetReason) -> BudgetReason {
-        let resets_at = next_period_start(period_start(self.now, budget.period), budget.period);
+        let resets_at = budget_next_period_start(self.now, budget.period, self.tz);
+        let period_resets_at = if self.tz == Tz::UTC {
+            resets_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+        } else {
+            resets_at.to_rfc3339_opts(SecondsFormat::Secs, true)
+        };
         // Amounts are restated in the two-decimal string form the response
         // has always carried.
         let amount = |v: &Option<String>| {
@@ -349,8 +378,12 @@ impl BudgetGate {
             spent: amount(&doc.spent),
             remaining: amount(&doc.remaining),
             period: Some(budget.period.as_str().to_string()),
-            period_resets_at: Some(resets_at.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
-            retry_after_seconds: Some((resets_at - self.now).num_seconds().max(0) as u64),
+            period_resets_at: Some(period_resets_at),
+            retry_after_seconds: Some(
+                (resets_at.with_timezone(&Utc) - self.now)
+                    .num_seconds()
+                    .max(0) as u64,
+            ),
         }
     }
 }
@@ -366,27 +399,6 @@ fn scope_rank(scope: BudgetScope) -> u8 {
         BudgetScope::ProviderKey => 3,
         BudgetScope::Environment => 2,
         BudgetScope::Org => 1,
-    }
-}
-
-/// Start of the UTC calendar period containing `now`.
-pub(crate) fn period_start(now: DateTime<Utc>, period: BudgetPeriod) -> DateTime<Utc> {
-    let day = now.date_naive();
-    let first = match period {
-        BudgetPeriod::Day => day,
-        BudgetPeriod::Week => {
-            day - chrono::Days::new(u64::from(day.weekday().num_days_from_monday()))
-        }
-        BudgetPeriod::Month => day.with_day(1).expect("the 1st exists in every month"),
-    };
-    first.and_time(NaiveTime::MIN).and_utc()
-}
-
-fn next_period_start(start: DateTime<Utc>, period: BudgetPeriod) -> DateTime<Utc> {
-    match period {
-        BudgetPeriod::Day => start + chrono::Days::new(1),
-        BudgetPeriod::Week => start + chrono::Days::new(7),
-        BudgetPeriod::Month => start + chrono::Months::new(1),
     }
 }
 
@@ -410,10 +422,20 @@ pub(crate) fn enforce_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aisix_core::models::{BudgetPeriod, BudgetPolicy};
     use chrono::TimeZone;
 
     fn at(y: i32, m: u32, d: u32, h: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, m, d, h, 30, 0).unwrap()
+    }
+
+    fn insert_policy(snap: &AisixSnapshot, id: &str, tz: Option<&str>) {
+        let mut doc = serde_json::json!({"fail_mode": "sticky", "closed_grace_seconds": 300});
+        if let Some(tz) = tz {
+            doc["timezone"] = serde_json::json!(tz);
+        }
+        let policy: BudgetPolicy = serde_json::from_value(doc).unwrap();
+        snap.budget_policy.insert(ResourceEntry::new(id, policy, 1));
     }
 
     #[test]
@@ -421,28 +443,25 @@ mod tests {
         // Thursday 2026-10-29.
         let now = at(2026, 10, 29, 13);
         assert_eq!(
-            period_start(now, BudgetPeriod::Day),
+            budget_period_start(now, BudgetPeriod::Day, Tz::UTC).with_timezone(&Utc),
             at(2026, 10, 29, 0) - chrono::Duration::minutes(30)
         );
         assert_eq!(
-            period_start(now, BudgetPeriod::Week).to_rfc3339(),
+            budget_period_start(now, BudgetPeriod::Week, Tz::UTC).to_rfc3339(),
             "2026-10-26T00:00:00+00:00"
         );
         assert_eq!(
-            period_start(now, BudgetPeriod::Month).to_rfc3339(),
+            budget_period_start(now, BudgetPeriod::Month, Tz::UTC).to_rfc3339(),
             "2026-10-01T00:00:00+00:00"
         );
         // A Monday is its own week's start.
         assert_eq!(
-            period_start(at(2026, 10, 26, 0), BudgetPeriod::Week).to_rfc3339(),
+            budget_period_start(at(2026, 10, 26, 0), BudgetPeriod::Week, Tz::UTC).to_rfc3339(),
             "2026-10-26T00:00:00+00:00"
         );
         assert_eq!(
-            next_period_start(
-                period_start(at(2026, 12, 31, 23), BudgetPeriod::Month),
-                BudgetPeriod::Month
-            )
-            .to_rfc3339(),
+            budget_next_period_start(at(2026, 12, 31, 23), BudgetPeriod::Month, Tz::UTC)
+                .to_rfc3339(),
             "2027-01-01T00:00:00+00:00"
         );
     }
@@ -487,6 +506,7 @@ mod tests {
         BudgetGate {
             index: Arc::new(BudgetIndex::build(&snap.budgets)),
             now,
+            tz: policy_timezone(snap),
             unverified,
         }
     }
@@ -764,5 +784,208 @@ mod tests {
             strict.provider_key_verdict("pk-none"),
             Verdict::Allow
         ));
+    }
+
+    #[test]
+    fn shanghai_timezone_enforces_lifts_and_formats_offset_reset() {
+        let doc = serde_json::json!({
+            "scope": "api_key",
+            "scope_ref": "k-1",
+            "period": "day",
+            "exhausted": {
+                "period_start": "2026-11-23T16:00:00Z",
+                "reason": {"message": "daily cap", "scope": "api_key", "limit": "10", "spent": "10"}
+            }
+        });
+        let snap = snapshot_with(&[("b-1", doc)]);
+        insert_policy(&snap, "env-1", Some("Asia/Shanghai"));
+        let k = key(&snap, "k-1", serde_json::json!({}));
+
+        // 2026-11-24T15:59:00Z is 2026-11-24T23:59:00+08:00: still in the Nov 24 Shanghai day.
+        let before = Utc.with_ymd_and_hms(2026, 11, 24, 15, 59, 0).unwrap();
+        let Verdict::Exceeded(r) = gate_at(&snap, before, false).key_verdict(&k) else {
+            panic!("expected block before Beijing midnight");
+        };
+        assert_eq!(
+            r.period_resets_at.as_deref(),
+            Some("2026-11-25T00:00:00+08:00")
+        );
+        assert_eq!(r.retry_after_seconds, Some(60));
+        assert_eq!(r.gauges().reset_seconds, Some(60));
+
+        // 2026-11-24T16:00:00Z is 2026-11-25T00:00:00+08:00: block automatically lifts.
+        let after = Utc.with_ymd_and_hms(2026, 11, 24, 16, 0, 0).unwrap();
+        assert!(matches!(
+            gate_at(&snap, after, false).key_verdict(&k),
+            Verdict::Allow
+        ));
+
+        // An offset-formatted RFC 3339 period_start representing the same instant also matches.
+        let offset_doc = serde_json::json!({
+            "scope": "api_key",
+            "scope_ref": "k-1",
+            "period": "day",
+            "exhausted": {
+                "period_start": "2026-11-24T00:00:00+08:00",
+                "reason": {"message": "daily cap"}
+            }
+        });
+        let snap_offset = snapshot_with(&[("b-1", offset_doc)]);
+        insert_policy(&snap_offset, "env-1", Some("Asia/Shanghai"));
+        assert!(matches!(
+            gate_at(&snap_offset, before, false).key_verdict(&k),
+            Verdict::Exceeded(_)
+        ));
+
+        // A UTC midnight period_start does NOT match under Asia/Shanghai -> allowed.
+        let utc_doc = serde_json::json!({
+            "scope": "api_key",
+            "scope_ref": "k-1",
+            "period": "day",
+            "exhausted": {
+                "period_start": "2026-11-24T00:00:00Z",
+                "reason": {"message": "utc start"}
+            }
+        });
+        let snap_utc_start = snapshot_with(&[("b-1", utc_doc)]);
+        insert_policy(&snap_utc_start, "env-1", Some("Asia/Shanghai"));
+        assert!(matches!(
+            gate_at(&snap_utc_start, before, false).key_verdict(&k),
+            Verdict::Allow
+        ));
+    }
+
+    #[test]
+    fn timezone_applies_to_team_member_provider_key_and_limit_zero_sentinel() {
+        let tm_doc = serde_json::json!({
+            "scope": "team_member",
+            "scope_ref": "team-1",
+            "period": "day",
+            "exhausted_members": {
+                "user-1": {
+                    "period_start": "2026-11-23T16:00:00Z",
+                    "reason": {"message": "member out"}
+                }
+            }
+        });
+        let pk_doc = serde_json::json!({
+            "scope": "provider_key",
+            "scope_ref": "pk-1",
+            "period": "day",
+            "exhausted": {
+                "period_start": "2026-11-23T16:00:00Z",
+                "reason": {"message": "pk out"}
+            }
+        });
+        let sentinel_doc = serde_json::json!({
+            "scope": "api_key",
+            "scope_ref": "k-sentinel",
+            "period": "day",
+            "exhausted": {
+                "reason": {"message": "zero limit"}
+            }
+        });
+        let snap = snapshot_with(&[
+            ("b-tm", tm_doc),
+            ("b-pk", pk_doc),
+            ("b-sentinel", sentinel_doc),
+        ]);
+        insert_policy(&snap, "env-1", Some("Asia/Shanghai"));
+
+        let before = Utc.with_ymd_and_hms(2026, 11, 24, 15, 0, 0).unwrap();
+        let after = Utc.with_ymd_and_hms(2026, 11, 24, 16, 0, 0).unwrap();
+
+        let tm_key = key(
+            &snap,
+            "k-tm",
+            serde_json::json!({"team_id": "team-1", "user_id": "user-1"}),
+        );
+        let Verdict::Exceeded(tm_r) = gate_at(&snap, before, false).key_verdict(&tm_key) else {
+            panic!("team_member should block before Beijing midnight");
+        };
+        assert_eq!(
+            tm_r.period_resets_at.as_deref(),
+            Some("2026-11-25T00:00:00+08:00")
+        );
+        assert!(matches!(
+            gate_at(&snap, after, false).key_verdict(&tm_key),
+            Verdict::Allow
+        ));
+
+        let Verdict::Exceeded(pk_r) = gate_at(&snap, before, false).provider_key_verdict("pk-1")
+        else {
+            panic!("provider_key should block before Beijing midnight");
+        };
+        assert_eq!(
+            pk_r.period_resets_at.as_deref(),
+            Some("2026-11-25T00:00:00+08:00")
+        );
+        assert!(matches!(
+            gate_at(&snap, after, false).provider_key_verdict("pk-1"),
+            Verdict::Allow
+        ));
+
+        // Limit=0 sentinel (period_start: None) stays in force after midnight too,
+        // and updates period_resets_at to the next Shanghai day.
+        let sentinel_key = key(&snap, "k-sentinel", serde_json::json!({}));
+        let Verdict::Exceeded(s_r) = gate_at(&snap, after, false).key_verdict(&sentinel_key) else {
+            panic!("limit=0 sentinel must stay in force in any period");
+        };
+        assert_eq!(
+            s_r.period_resets_at.as_deref(),
+            Some("2026-11-26T00:00:00+08:00")
+        );
+    }
+
+    #[test]
+    fn policy_timezone_is_deterministic_across_multiple_rows_and_falls_back_to_utc() {
+        let sentinel = serde_json::json!({
+            "scope": "api_key",
+            "scope_ref": "k-1",
+            "period": "day",
+            "exhausted": {"reason": {"message": "cap"}}
+        });
+        let now = Utc.with_ymd_and_hms(2026, 11, 24, 10, 0, 0).unwrap();
+
+        // Multiple rows: ignores rows with timezone=None and picks lowest entry id with Some.
+        let snap_multi = snapshot_with(&[("b-1", sentinel.clone())]);
+        insert_policy(&snap_multi, "a-none", None);
+        insert_policy(&snap_multi, "c-ny", Some("America/New_York"));
+        insert_policy(&snap_multi, "b-shanghai", Some("Asia/Shanghai"));
+        assert_eq!(policy_timezone(&snap_multi), Tz::Asia__Shanghai);
+
+        // In-memory invalid timezone (bypassing loader) falls back to UTC.
+        let snap_bad = snapshot_with(&[("b-1", sentinel.clone())]);
+        insert_policy(&snap_bad, "env-1", Some("Local"));
+        assert_eq!(policy_timezone(&snap_bad), Tz::UTC);
+        let k = key(&snap_bad, "k-1", serde_json::json!({}));
+        let Verdict::Exceeded(r) = gate_at(&snap_bad, now, false).key_verdict(&k) else {
+            panic!("expected block");
+        };
+        assert_eq!(r.period_resets_at.as_deref(), Some("2026-11-25T00:00:00Z"));
+
+        // Explicit UTC keeps Z suffix; non-whole-hour and DST zones emit RFC 3339 offsets.
+        for (tz_name, instant, expected) in [
+            ("UTC", now, "2026-11-25T00:00:00Z"),
+            ("Etc/UTC", now, "2026-11-25T00:00:00Z"),
+            ("Asia/Kathmandu", now, "2026-11-25T00:00:00+05:45"),
+            ("Europe/London", now, "2026-11-25T00:00:00Z"),
+            (
+                "Europe/London",
+                Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap(),
+                "2026-07-11T00:00:00+01:00",
+            ),
+        ] {
+            let snap = snapshot_with(&[("b-1", sentinel.clone())]);
+            insert_policy(&snap, "env-1", Some(tz_name));
+            let Verdict::Exceeded(r) = gate_at(&snap, instant, false).key_verdict(&k) else {
+                panic!("expected block for {tz_name}");
+            };
+            assert_eq!(
+                r.period_resets_at.as_deref(),
+                Some(expected),
+                "timezone {tz_name}"
+            );
+        }
     }
 }

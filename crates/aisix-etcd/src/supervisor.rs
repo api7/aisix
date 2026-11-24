@@ -5952,6 +5952,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn budget_policy_watch_put_rejects_invalid_timezone_and_keeps_last_good() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+
+        let good =
+            br#"{"fail_mode":"sticky","closed_grace_seconds":300,"timezone":"Asia/Shanghai"}"#;
+        let bad = br#"{"fail_mode":"sticky","closed_grace_seconds":300,"timezone":"Local"}"#;
+
+        assert!(sup.apply_put(&entry("/aisix/budget_policy/env-1", good, 1)));
+        assert_eq!(
+            sup.handle()
+                .load()
+                .budget_policy
+                .get_by_id("env-1")
+                .unwrap()
+                .value
+                .timezone
+                .as_deref(),
+            Some("Asia/Shanghai")
+        );
+
+        assert!(!sup.apply_put(&entry("/aisix/budget_policy/env-1", bad, 2)));
+        assert_eq!(
+            sup.handle()
+                .load()
+                .budget_policy
+                .get_by_id("env-1")
+                .unwrap()
+                .value
+                .timezone
+                .as_deref(),
+            Some("Asia/Shanghai"),
+            "rejected watch put must preserve last-known-good budget_policy"
+        );
+        let view = serde_json::to_value(sup.config_status().view()).unwrap();
+        let rejected = view["rejected"].as_array().unwrap();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0]["resource_kind"], "budget_policy");
+        assert_eq!(rejected[0]["resource_id"], "env-1");
+        assert_eq!(rejected[0]["last_error_kind"], "schema_failed");
+        assert!(rejected[0]["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("IANA timezone"));
+    }
+
+    #[tokio::test]
     async fn rejected_update_keeps_last_good_serving_across_restart() {
         let dir = tempfile::tempdir().unwrap();
         let cache_path = dir.path().join("snap.json");

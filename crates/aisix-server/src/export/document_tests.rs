@@ -397,6 +397,58 @@ fn every_exported_kind_loads_back_from_the_file() {
 }
 
 #[test]
+fn budget_policy_export_preserves_timezone_when_set_and_omits_when_absent() {
+    let env_with_tz = "718293a4-b5c6-4d7e-8f90-1a2b3c4d5e6f";
+    let entries = vec![
+        RawEntry {
+            key: format!("/aisix/budget_policy/{ENV}"),
+            value: serde_json::to_vec(&json!({"fail_mode": "sticky", "closed_grace_seconds": 300}))
+                .unwrap(),
+            revision: 1,
+        },
+        RawEntry {
+            key: format!("/aisix/budget_policy/{env_with_tz}"),
+            value: serde_json::to_vec(&json!({
+                "fail_mode": "closed",
+                "closed_grace_seconds": 600,
+                "timezone": "Asia/Shanghai"
+            }))
+            .unwrap(),
+            revision: 2,
+        },
+    ];
+    let doc = export_entries(&entries);
+    let policies = find(&doc, "budget_policy");
+    let without = policies.iter().find(|v| v["id"] == json!(ENV)).unwrap();
+    let with_tz = policies
+        .iter()
+        .find(|v| v["id"] == json!(env_with_tz))
+        .unwrap();
+    assert!(without.get("timezone").is_none());
+    assert_eq!(with_tz["timezone"], json!("Asia/Shanghai"));
+
+    let yaml = super::super::yaml_emit::emit_yaml(&doc).unwrap();
+    let reloaded = aisix_etcd::file_source::read_str(&yaml, "exported.yaml", 1, &|_| None)
+        .unwrap_or_else(|e| panic!("{e}\n{yaml}"));
+    let (loaded, stats) = build_snapshot(&aisix_etcd::file_source::prefixes(), &reloaded);
+    assert!(stats.rejections.is_empty(), "{:?}", stats.rejections);
+    assert_eq!(
+        loaded.budget_policy.get_by_id(ENV).unwrap().value.timezone,
+        None
+    );
+    assert_eq!(
+        loaded
+            .budget_policy
+            .get_by_id(env_with_tz)
+            .unwrap()
+            .value
+            .timezone
+            .as_deref(),
+        Some("Asia/Shanghai")
+    );
+}
+
+#[test]
 fn documents_are_written_as_stored_not_re_serialized() {
     // The typed model would add every default (`endpoint: null` among them,
     // which the read schema refuses); the file carries what etcd carries.
