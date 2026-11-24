@@ -81,6 +81,13 @@ async fn send(
             .with_surface_blocked(aisix_core::CREDENTIAL_SLOT_HEADERS),
     );
 
+    if let Some(inbound) = &ctx.client_headers {
+        for name in ["user-agent", "x-goog-api-client"] {
+            if let Some(value) = inbound.get(name) {
+                headers.entry(name).or_insert_with(|| value.clone());
+            }
+        }
+    }
     let client = crate::http_client::client_for(pk.upstream_connection().as_ref());
     let bytes = aisix_gateway::json_body(body).map_err(|e| BridgeError::Config(e.to_string()))?;
     let bytes = crate::decisions::apply_body_overrides(pk, bytes)
@@ -354,7 +361,7 @@ fn chunks(
         return Err(err);
     }
     let (usage, tier) = usage(&frame)?;
-    let empty = || ChatChunk {
+    let base = ChatChunk {
         id: frame["responseId"].as_str().unwrap_or_default().to_owned(),
         model: frame["modelVersion"]
             .as_str()
@@ -368,7 +375,6 @@ fn chunks(
         accounting_usage: None,
         service_tier: tier.clone(),
     };
-    let base = empty();
     let mut out = Vec::new();
     if let Some(candidates) = frame.get_mut("candidates").and_then(Value::as_array_mut) {
         for (position, mut candidate) in std::mem::take(candidates).into_iter().enumerate() {
