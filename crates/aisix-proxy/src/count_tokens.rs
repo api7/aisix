@@ -1151,7 +1151,7 @@ fn emit_usage_event(
         inbound_protocol: "anthropic".to_string(),
         applied_guardrails: screening.applied.clone(),
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        client_user_agent: client.user_agent.value.clone(),
         request_headers: client.request_headers.clone(),
         redacted_entity_counts: screening.redactions.clone(),
         guardrail_monitor_hits: screening.monitor_hits.clone(),

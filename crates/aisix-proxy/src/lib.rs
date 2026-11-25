@@ -678,7 +678,12 @@ async fn record_request_telemetry(
     // (AISIX-Cloud#1317). Installed here because a cancelled handler
     // future never gets to hand anything back.
     let snapshot = state.snapshot.load();
-    let attribution = std::sync::Arc::new(attribution::RequestAttribution::with_response_headers(
+    let user_agent = std::sync::Arc::new(client_ip::InboundUserAgent::from_headers(
+        request.headers(),
+        &state.client_classifier,
+    ));
+    let attribution = std::sync::Arc::new(attribution::RequestAttribution::new(
+        user_agent,
         client_ip::exported_header_names(&snapshot, true),
         usage_attr::content_cap(&snapshot).is_some(),
         request

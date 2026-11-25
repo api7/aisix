@@ -250,8 +250,6 @@ pub(crate) async fn serve(
         Ok(mut success) => {
             let status = 200;
             let elapsed = started.elapsed();
-            // #890 req-4: normalise the inbound client type once.
-            let client_type = state.client_classifier.classify(&client.user_agent);
             // One ProviderKey lookup for both terminal metric emits and the
             // winner's usage event below (#941).
             let pk = crate::usage_attr::ResolvedPk::resolve(&snapshot, &success.provider_key_id);
@@ -268,7 +266,7 @@ pub(crate) async fn serve(
                 &auth,
                 &success.provider,
                 &model_name,
-                client_type,
+                client.client_type(),
                 req.is_streaming(),
                 success.routing.fallback_count() > 0,
                 status,
@@ -2299,16 +2297,9 @@ async fn dispatch(
             );
             (m.into_owned(), u.into_owned())
         };
-        // #890 req-4: normalised inbound client type, captured for the
-        // streaming on_complete metric emission (mirrors the non-streaming
-        // `record_success` path).
         let user_name_for_metrics = auth.user_name().map(str::to_owned);
         let api_key_name_for_metrics = auth.api_key_name().map(str::to_owned);
         let team_name_for_metrics = auth.team_name().map(str::to_owned);
-        let client_type_for_metrics = state
-            .client_classifier
-            .classify(&client.user_agent)
-            .to_string();
         // Captured for the stream-end telemetry closure so
         // emit_usage_event can look up `telemetry_tags` for per-PK
         // attribution (#302 M17 / AISIX-Cloud#436). The metrics
@@ -2543,7 +2534,7 @@ async fn dispatch(
                         cached: comp.cached_prompt_tokens,
                         cache_read: comp.cache_read_tokens,
                         cache_creation: comp.cache_creation_tokens,
-                        client_type: &client_type_for_metrics,
+                        client_type: client_for_telem.client_type(),
                     },
                 );
                 metrics_for_stream.record_ttft(
@@ -4971,7 +4962,7 @@ fn emit_usage_event(
         // Downstream client attribution (#492). Already sanitised in the
         // extractor (control-char strip + cap); IP is a formatted addr.
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        client_user_agent: client.user_agent.value.clone(),
         request_headers: client.request_headers.clone(),
         // MCP attribution does not apply to the chat path.
         ..Default::default()
@@ -5809,7 +5800,7 @@ impl EnsembleCharge {
                 cached: aggregate_cached,
                 cache_read: aggregate_cache_read,
                 cache_creation: aggregate_cache_creation,
-                client_type: state.client_classifier.classify(&self.client.user_agent),
+                client_type: self.client.client_type(),
             },
         );
         let caller = self.metric_caller.as_caller();
@@ -5878,10 +5869,7 @@ impl EnsembleCharge {
                 cached: self.usage.cached_prompt_tokens,
                 cache_read: self.usage.cache_read_tokens,
                 cache_creation: self.usage.cache_creation_tokens,
-                client_type: self
-                    .state
-                    .client_classifier
-                    .classify(&self.client.user_agent),
+                client_type: self.client.client_type(),
             },
         );
     }

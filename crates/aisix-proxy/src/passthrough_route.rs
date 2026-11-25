@@ -1059,7 +1059,7 @@ async fn dispatch(
         anonymous: auth.anonymous,
         client_identity,
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        user_agent: client.user_agent.clone(),
         request_headers: client.request_headers.clone(),
         started,
         attempt_started,
@@ -7031,7 +7031,7 @@ struct RouteTelemetry {
     anonymous: bool,
     client_identity: String,
     client_source_ip: String,
-    client_user_agent: String,
+    user_agent: Arc<crate::client_ip::InboundUserAgent>,
     request_headers: std::collections::BTreeMap<String, String>,
     started: Instant,
     /// When the upstream call itself began — the scope the two `upstream_*`
@@ -7342,7 +7342,7 @@ impl RouteTelemetry {
             passthrough_route_name: self.route_name.clone(),
             client_identity: self.client_identity.clone(),
             client_source_ip: self.client_source_ip.clone(),
-            client_user_agent: self.client_user_agent.clone(),
+            client_user_agent: self.user_agent.value.clone(),
             request_headers: self.request_headers.clone(),
             guardrail_blocked: self.guardrail_blocked,
             guardrail_monitor_hits: std::mem::take(&mut self.monitor_hits),
@@ -7386,10 +7386,7 @@ impl RouteTelemetry {
                     cached: usage.cached_prompt_tokens,
                     cache_read: usage.cache_read_tokens,
                     cache_creation: usage.cache_creation_tokens,
-                    client_type: self
-                        .state
-                        .client_classifier
-                        .classify(&self.client_user_agent),
+                    client_type: &self.user_agent.client_type,
                 },
             );
         }

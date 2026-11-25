@@ -5,8 +5,11 @@ import {
   SeedClient,
   ProxyClient,
   spawnApp,
+  startMockSls,
   startOpenAiUpstream,
   waitConfigPropagation,
+  waitForSlsLog,
+  type MockSls,
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -29,6 +32,7 @@ const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
 
 const MODEL = "ct1045-chat";
 const USAGE = { prompt_tokens: 9, completion_tokens: 4, total_tokens: 13 };
+const LOGSTORE = "client-types";
 
 /** Real captured/source-verified UAs of newly supported built-in clients. */
 const BUILTIN_CASES: Array<{ ua: string; clientType: string }> = [
@@ -89,7 +93,7 @@ async function pollSeries(
   return text;
 }
 
-async function chatWithUa(app: SpawnedApp, ua: string): Promise<void> {
+async function chatWithUa(app: SpawnedApp, ua: string): Promise<string> {
   const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
     method: "POST",
     headers: {
@@ -102,13 +106,28 @@ async function chatWithUa(app: SpawnedApp, ua: string): Promise<void> {
       messages: [{ role: "user", content: "hi" }],
     }),
   });
-  expect(res.status).toBe(200);
+  expect(res.status, await res.text()).toBe(200);
+  const requestId = res.headers.get("x-aisix-request-id");
+  expect(requestId).toBeTruthy();
+  return requestId!;
 }
 
 describe("client_type built-ins + operator rules (AISIX-Cloud#1045)", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
+  let sls: MockSls | undefined;
   let etcdReachable = false;
+
+  async function expectClientUsage(requestId: string, ua: string, clientType: string) {
+    const event = await waitForSlsLog(
+      sls!,
+      LOGSTORE,
+      (log) => log.get("request_id") === requestId,
+      `usage event for ${requestId}`,
+    );
+    expect(event.get("client_type")).toBe(clientType);
+    expect(event.get("client_user_agent")).toBe(ua || undefined);
+  }
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -132,9 +151,25 @@ describe("client_type built-ins + operator rules (AISIX-Cloud#1045)", () => {
       },
     });
 
-    app = await spawnApp({ clientTypeRules: CUSTOM_RULES });
+    sls = await startMockSls();
+    app = await spawnApp({
+      clientTypeRules: CUSTOM_RULES,
+      extraEnv: {
+        SLS_CRED_MOCK_AK_ID: "mock-akid",
+        SLS_CRED_MOCK_AK_SECRET: "mock-secret",
+      },
+    });
     const seed = new SeedClient(new EtcdClient(), app.etcdPrefix);
 
+    await seed.createObservabilityExporter({
+      name: "sls-client-types",
+      enabled: true,
+      kind: "aliyun_sls",
+      endpoint: sls.url,
+      project: "aisix-e2e-obs",
+      logstore: LOGSTORE,
+      credential_ref: "mock",
+    });
     const pk = await seed.createProviderKey({
       display_name: "ct1045-pk",
       api_key: "sk-mock",
@@ -162,6 +197,7 @@ describe("client_type built-ins + operator rules (AISIX-Cloud#1045)", () => {
 
   afterAll(async () => {
     await app?.exit();
+    await sls?.close();
     await upstream?.close();
   });
 
@@ -188,16 +224,18 @@ describe("client_type built-ins + operator rules (AISIX-Cloud#1045)", () => {
     }
   });
 
-  test("operator rules classify in-house UAs and outrank generic built-ins", async (ctx) => {
+  test("operator rules classify the same request in usage events and metrics", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;
     }
 
     // Would be "other" without the rule.
-    await chatWithUa(app, "internal-agent/2.1");
+    const internal = "internal-agent/2.1";
+    const internalId = await chatWithUa(app, internal);
     // Embeds axios — the built-in table alone would bucket it as "node".
-    await chatWithUa(app, "billing-batcher/3.0 axios/1.6.0");
+    const batcher = "billing-batcher/3.0 axios/1.6.0";
+    const batcherId = await chatWithUa(app, batcher);
 
     const text = await pollSeries(
       app,
@@ -212,26 +250,34 @@ describe("client_type built-ins + operator rules (AISIX-Cloud#1045)", () => {
       USAGE.total_tokens,
     );
     // The raw UA never becomes a label value.
-    expect(text).not.toContain('client_type="internal-agent/2.1"');
+    expect(text).not.toContain(`client_type="${internal}"`);
+    await expectClientUsage(internalId, internal, "internal-agent");
+    await expectClientUsage(batcherId, batcher, "billing-batcher");
   });
 
-  test("unmatched UAs keep built-in behaviour (other/unknown intact)", async (ctx) => {
+  test("usage events use the same built-in and fallback client types as metrics", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;
     }
 
-    await chatWithUa(app, "SomeRandomBespokeClient/9.9");
-    // Empty UA must stay `unknown` even though a match-anything custom
-    // rule set could otherwise claim it.
-    await chatWithUa(app, "");
+    const other = "SomeRandomBespokeClient/9.9";
+    const otherId = await chatWithUa(app, other);
+    const unknownId = await chatWithUa(app, "");
+    const codex = "codex-cli/1.2";
+    const codexId = await chatWithUa(app, codex);
     const text = await pollSeries(
       app,
       (t) =>
         seriesValue(t, "other", "total") !== undefined &&
-        seriesValue(t, "unknown", "total") !== undefined,
+        seriesValue(t, "unknown", "total") !== undefined &&
+        seriesValue(t, "codex", "total") !== undefined,
     );
     expect(seriesValue(text, "other", "total")).toBe(USAGE.total_tokens);
     expect(seriesValue(text, "unknown", "total")).toBe(USAGE.total_tokens);
+    expect(seriesValue(text, "codex", "total")).toBe(USAGE.total_tokens);
+    await expectClientUsage(otherId, other, "other");
+    await expectClientUsage(unknownId, "", "unknown");
+    await expectClientUsage(codexId, codex, "codex");
   });
 });

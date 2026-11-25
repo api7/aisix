@@ -764,6 +764,7 @@ pub(crate) struct RequestAttribution {
     cell: Mutex<Cell>,
     bodies: BodyCounters,
     internal_calls: Arc<InternalCallLedger>,
+    user_agent: Option<Arc<crate::client_ip::InboundUserAgent>>,
     /// The upstream response headers this request's exporters asked for.
     /// See [`aisix_gateway::response_tap`].
     response_tap: Arc<aisix_gateway::ResponseHeaderTap>,
@@ -777,17 +778,19 @@ impl RequestAttribution {
             cell: Mutex::new(Cell::default()),
             bodies: BodyCounters::default(),
             internal_calls: Arc::clone(&self.internal_calls),
+            user_agent: self.user_agent.clone(),
             response_tap: Arc::default(),
         }
     }
 
-    /// A cell whose upstream responses record `names` for the exporters.
-    pub(crate) fn with_response_headers(
+    pub(crate) fn new(
+        user_agent: Arc<crate::client_ip::InboundUserAgent>,
         names: Vec<String>,
         keeps_error_bodies: bool,
         request_id: String,
     ) -> Self {
         Self {
+            user_agent: Some(user_agent),
             response_tap: Arc::new(aisix_gateway::ResponseHeaderTap::new(
                 names,
                 keeps_error_bodies,
@@ -1009,6 +1012,18 @@ fn write_line(line: ReadyLine, sizes: (Option<u64>, Option<u64>), span: Option<t
 
 tokio::task_local! {
     static CURRENT: Arc<RequestAttribution>;
+}
+
+pub(crate) fn user_agent() -> Option<Arc<crate::client_ip::InboundUserAgent>> {
+    CURRENT.try_with(|a| a.user_agent.clone()).ok().flatten()
+}
+
+pub(crate) fn client_type() -> String {
+    CURRENT
+        .try_with(|a| a.user_agent.as_ref().map(|ua| ua.client_type.clone()))
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// Install `attribution` as the cell for everything `fut` does.

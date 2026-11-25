@@ -865,7 +865,7 @@ pub(crate) fn emit_failed_attempts_as(
             inbound_protocol: inbound_protocol.to_string(),
             applied_guardrails: applied_guardrails.to_vec(),
             client_source_ip: client.source_ip.clone(),
-            client_user_agent: client.user_agent.clone(),
+            client_user_agent: client.user_agent.value.clone(),
             request_headers: client.request_headers.clone(),
             guardrail_blocked: terminal && guardrail_blocked,
             guardrail_monitor_hits: if terminal {
@@ -989,7 +989,7 @@ pub(crate) fn build_error_usage_event(
         error_class: error.class.to_string(),
         error_message: error.message,
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        client_user_agent: client.user_agent.value.clone(),
         request_headers: client.request_headers.clone(),
         guardrail_blocked,
         applied_guardrails: applied,
@@ -1135,6 +1135,11 @@ pub(crate) fn emit_usage(
     // present on a family's success path and missing from its error or
     // streaming one (AISIX-Cloud#1461).
     event.operation = surface.operation.to_string();
+    // Detached emitters carry their classification in the event. The
+    // request scope supplies it for every other attempt and terminal row.
+    if event.client_type.is_empty() {
+        event.client_type = crate::attribution::client_type();
+    }
     event.is_final_attempt = terminal;
     event.drop_total_beside_estimate();
     stamp_requested_model_id(&mut event);
@@ -1495,6 +1500,7 @@ fn internal_call_event(
         client_identity: parent.client_identity.clone(),
         client_source_ip: parent.client_source_ip.clone(),
         client_user_agent: parent.client_user_agent.clone(),
+        client_type: parent.client_type.clone(),
         request_headers: parent.request_headers.clone(),
         inbound_protocol: parent.inbound_protocol.clone(),
         ..Default::default()
@@ -1619,6 +1625,7 @@ mod tests {
                 event.model_id = "m-target".into();
                 event.api_key_id = "ak-1".into();
                 event.team_id = "team-1".into();
+                event.client_type = "codex".into();
                 event.status_code = 200;
                 event.attempt_index = attempt_index;
                 event
@@ -1657,6 +1664,7 @@ mod tests {
             assert_eq!(child.request_id, "req-1");
             assert_eq!(child.api_key_id, "ak-1");
             assert_eq!(child.team_id, "team-1");
+            assert_eq!(child.client_type, "codex");
             assert_eq!(child.model_id, "m-embed");
             assert_eq!(child.requested_model, "embed");
             assert_eq!(child.requested_model_id, "m-embed");

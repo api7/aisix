@@ -350,16 +350,7 @@ async fn dispatch(
         guardrail_audit: None,
         request_headers,
         request_started,
-        client_type: state
-            .client_classifier
-            .classify(
-                parts
-                    .headers
-                    .get(axum::http::header::USER_AGENT)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or_default(),
-            )
-            .to_string(),
+        client_type: crate::attribution::client_type(),
     };
     // Read before the upstream is contacted, so a call that never lands still
     // records which task the caller was asking about.

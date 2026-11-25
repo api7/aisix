@@ -935,8 +935,7 @@ pub(crate) struct Tokens<'a> {
     pub cached: u32,
     pub cache_read: u32,
     pub cache_creation: u32,
-    /// Normalised inbound client for the by-client series
-    /// (`state.client_classifier.classify(&client.user_agent)`).
+    /// Inbound client classification captured at request entry.
     pub client_type: &'a str,
 }
 

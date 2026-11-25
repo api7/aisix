@@ -56,7 +56,7 @@ pub static METRIC_VARIABLES: &[MetricVariable] = &[
     variable!("status_code", "The HTTP status class on usage-event metrics: 2xx, 3xx, 4xx, 5xx, or other. The status variable retains the exact code."),
     variable!("outcome", "The outcome defined by the metric, such as the request result, cache decision, or request-body-limit result."),
     variable!("error_source", "Who ended a failed request: upstream for an upstream's error answer or a call to it that failed, aisix for anything the gateway decided or failed at itself, including rate limits, budgets and guardrail blocks. Empty for a success or a caller that went away."),
-    variable!("client_type", "The classified client name from built-in or configured client_type_rules; never the raw User-Agent."),
+    variable!("client_type", "The client classification shared with usage events, from built-in clients or configured client_type_rules."),
     variable!("token_type", "The token count category: input, output, or total. Total already includes the input and output categories."),
     variable!("fallback_model", "The configured fallback model attributed to a routing fallback."),
     variable!("scope", "The scope of the rate-limit decision."),

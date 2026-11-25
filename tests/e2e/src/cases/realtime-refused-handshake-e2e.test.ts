@@ -23,6 +23,7 @@ import {
 // which is how OpenAI answers a wrong key.
 
 const CALLER = "sk-realtime-refused-caller";
+const CLIENT_TYPE = "realtime-client";
 const FULL = "refused-rows-full";
 const META = "refused-rows-meta";
 const CONNECT_TIMEOUT_MS = 800;
@@ -241,6 +242,7 @@ describe("a realtime session the upstream never let start", () => {
     sls = await startMockSls();
     app = await spawnApp({
       logLevel: "info",
+      clientTypeRules: [{ pattern: `^${CLIENT_TYPE}/`, client: CLIENT_TYPE }],
       extra: { upstream: { connect_timeout_ms: CONNECT_TIMEOUT_MS } },
       extraEnv: { SLS_CRED_MOCK_AK_ID: "LTAI_mock_ak", SLS_CRED_MOCK_AK_SECRET: "mock_ak_secret" },
     });
@@ -329,7 +331,7 @@ describe("a realtime session the upstream never let start", () => {
     new Promise((resolve, reject) => {
       const started = Date.now();
       const ws = new WebSocket(`${app!.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=${model}`, {
-        headers: { authorization: `Bearer ${CALLER}` },
+        headers: { authorization: `Bearer ${CALLER}`, "user-agent": `${CLIENT_TYPE}/1.0` },
       });
       let requestId = "";
       const frames: unknown[] = [];
@@ -392,7 +394,9 @@ describe("a realtime session the upstream never let start", () => {
         ]);
         expect(got.code).toBe(1011);
         expect(got.reason).toBe("upstream connect failed");
-        expect((await row(got.requestId)).get("error_message")).toBe("upstream returned HTTP 401: sentinel split text");
+        const event = await row(got.requestId);
+        expect(event.get("error_message")).toBe("upstream returned HTTP 401: sentinel split text");
+        expect(event.get("client_type")).toBe(CLIENT_TYPE);
       },
     );
 

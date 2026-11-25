@@ -849,11 +849,14 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_source_ip: String,
 
-    /// Client `User-Agent` header verbatim (control chars stripped,
-    /// length-capped). Surfaces the client type (e.g. `codex-cli/1.2`).
-    /// Empty when the client sent none. cp-api stores empty as NULL.
+    /// Inbound `User-Agent` with control characters removed and length capped.
+    /// Empty when the client sent none or the operation does not record it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_user_agent: String,
+
+    /// Inbound client classification shared with the by-client token metric.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_type: String,
 
     /// Values of the request headers any enabled exporter lists in its
     /// `request_headers`, keyed by the (lowercase) name. A header the
@@ -2299,6 +2302,7 @@ mod tests {
         // resolve a peer / the client sent no User-Agent.
         assert!(!json.contains("client_source_ip"));
         assert!(!json.contains("client_user_agent"));
+        assert!(!json.contains("client_type"));
         assert!(!json.contains("request_headers"));
         // Requested alias (AISIX-Cloud#790): absent when the request
         // never carried a resolvable model name.
@@ -2485,11 +2489,13 @@ mod tests {
             request_id: "req-client".into(),
             client_source_ip: "203.0.113.7".into(),
             client_user_agent: "codex-cli/1.2".into(),
+            client_type: "codex".into(),
             ..Default::default()
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains(r#""client_source_ip":"203.0.113.7""#));
         assert!(json.contains(r#""client_user_agent":"codex-cli/1.2""#));
+        assert!(json.contains(r#""client_type":"codex""#));
     }
 
     /// Captured header values are exporter-only: the control plane's wire
