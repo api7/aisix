@@ -54,9 +54,9 @@ fn endpoint(ctx: &BridgeContext, streaming: bool) -> Result<Url, BridgeError> {
 pub(crate) fn decisions_endpoint(pk: &ProviderKey) -> Result<Url, BridgeError> {
     let mut url = base_url(pk)?;
     let path = url.path().trim_end_matches('/');
-    let root = path
-        .strip_suffix("/v1beta/decisions")
-        .or_else(|| path.strip_suffix("/v1beta"))
+    let root = ["/v1beta/decisions", "/v1beta/openai", "/v1beta", "/v1"]
+        .into_iter()
+        .find_map(|suffix| path.strip_suffix(suffix))
         .unwrap_or(path);
     let path = format!("{root}/v1beta/decisions");
     url.set_path(&path);

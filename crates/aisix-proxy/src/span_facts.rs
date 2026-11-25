@@ -11,7 +11,7 @@
 //! attempts resolved theirs, and must not move the cell's "last target".
 
 use aisix_core::{AisixSnapshot, ApiSurface, Model, ProviderKey};
-use aisix_obs::{genai_provider_name, UpstreamFacts, UsageEvent};
+use aisix_obs::{genai_provider_name, InternalCallPurpose, UpstreamFacts, UsageEvent};
 
 /// The event's upstream, or `None` when it names none the snapshot holds:
 /// a pre-dispatch failure on a Model Group, a deleted row, a route with no
@@ -68,6 +68,15 @@ pub(crate) fn upstream_facts(
         };
         return Some(
             match pk.and_then(|p| {
+                if p.provider == "google"
+                    && event.operation == crate::operation::DECISIONS.operation
+                    && event.internal_call_purpose
+                        == Some(InternalCallPurpose::SemanticRouteDecision)
+                {
+                    return crate::gemini::native::decisions_endpoint(p)
+                        .ok()
+                        .map(String::from);
+                }
                 upstream_base(
                     model,
                     p,

@@ -20,6 +20,7 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 import { pickFreePort } from "../harness/ports.js";
 
 // A semantic router whose classifier names its direct model by
@@ -54,6 +55,7 @@ const NOT_TYPESAFE_MODEL = "ecm-not-typesafe";
 const ROUTER = "ecm-router";
 const BAD_ROUTER = "ecm-router-not-typesafe";
 const GEMINI_ROUTER = "ecm-gemini-router";
+const LEGACY_GEMINI_ROUTER = "ecm-gemini-router-legacy-base";
 const BAD_GEMINI_ROUTER = "ecm-router-not-gemini-decision";
 const ROUTE_TARGET = "ecm-route-target";
 const ROUTE_DEFAULT = "ecm-route-default";
@@ -133,6 +135,7 @@ describe("aisix export: a classifier that names its direct model by id", () => {
   let etcdApp: SpawnedApp | undefined;
   let fileApp: SpawnedApp | undefined;
   let sls: MockSls | undefined;
+  let otlp: MockOtlp | undefined;
   let decisions: Awaited<ReturnType<typeof startDecisionMock>> | undefined;
   let upstream: OpenAiUpstream | undefined;
   let exported = "";
@@ -172,6 +175,7 @@ describe("aisix export: a classifier that names its direct model by id", () => {
     expect(await etcd.ping(), "this e2e requires etcd").toBe(true);
 
     sls = await startMockSls();
+    otlp = await startMockOtlp();
     decisions = await startDecisionMock();
     upstream = await startOpenAiUpstream();
     etcdApp = await spawnApp({ exposeDebugHeaders: true, extraEnv: slsEnv });
@@ -186,6 +190,12 @@ describe("aisix export: a classifier that names its direct model by id", () => {
       logstore: LOGSTORE,
       credential_ref: CREDENTIAL_REF,
       content_mode: "metadata_only",
+    });
+    await seed.createObservabilityExporter({
+      name: "ecm-otlp",
+      enabled: true,
+      kind: "otlp_http",
+      endpoint: otlp.url,
     });
     const chatKey = await seed.createProviderKey({
       display_name: "ecm-chat-pk",
@@ -246,9 +256,13 @@ describe("aisix export: a classifier that names its direct model by id", () => {
       api_key: GEMINI_SECRET,
       provider: "google",
       api_base: `${upstream.baseUrl}/v1beta/openai`,
-      apis: { gemini: { base: `${decisions.baseUrl}/gemini-shim/v1beta/` } },
+      apis: { gemini: { base: `${decisions.baseUrl}/gemini-shim/v1/` } },
+      telemetry_tags: { kind: "catalog", featured: true, branded_provider: "google" },
       request: {
-        default_headers: { "x-classifier-id": "${model.id}" },
+        default_headers: {
+          "x-classifier-id": "${model.id}",
+          "x-classifier-provider-key-id": "${provider_key.id}",
+        },
         forward_client_headers: ["x-caller-context"],
         default_body_fields: { proxy_hint: "gemini-shim" },
       },
@@ -261,13 +275,30 @@ describe("aisix export: a classifier that names its direct model by id", () => {
       provider_key_id: geminiKey.id,
     });
     geminiId = gemini.id;
+    const legacyKey = await seed.createProviderKey({
+      display_name: "ecm-gemini-legacy-key",
+      api_key: GEMINI_SECRET,
+      provider: "google",
+      api_base: `${decisions.baseUrl}/gemini-shim/v1beta/openai/`,
+      apis: {},
+    });
+    const geminiLegacy = await seed.createModel({
+      display_name: "ecm-gemini-decision-legacy-base",
+      provider: "google",
+      model_name: GEMINI_UPSTREAM_MODEL,
+      provider_key_id: legacyKey.id,
+    });
     const geminiChat = await seed.createModel({
       display_name: "ecm-gemini-chat",
       provider: "google",
       model_name: "gemini-flash-latest",
       provider_key_id: geminiKey.id,
     });
-    for (const [name, id] of [[GEMINI_ROUTER, gemini.id], [BAD_GEMINI_ROUTER, geminiChat.id]]) {
+    for (const [name, id] of [
+      [GEMINI_ROUTER, gemini.id],
+      [LEGACY_GEMINI_ROUTER, geminiLegacy.id],
+      [BAD_GEMINI_ROUTER, geminiChat.id],
+    ]) {
       await seed.createModel({
         display_name: name,
         semantic: {
@@ -304,6 +335,7 @@ describe("aisix export: a classifier that names its direct model by id", () => {
     await etcdApp?.exit();
     await upstream?.close();
     await decisions?.close();
+    await otlp?.close();
     await sls?.close();
   });
 
@@ -382,6 +414,7 @@ describe("aisix export: a classifier that names its direct model by id", () => {
       "x-goog-api-key": GEMINI_SECRET,
       "x-aisix-request-id": response.requestId,
       "x-classifier-id": geminiId,
+      "x-classifier-provider-key-id": geminiKeyId,
       "x-caller-context": "client-header",
     });
     expect(call.headers.authorization).toBeUndefined();
@@ -411,20 +444,34 @@ describe("aisix export: a classifier that names its direct model by id", () => {
     expect(child.get("internal_call_purpose")).toBe("semantic_route_decision");
     expect(child.get("operation")).toBe("decisions");
     expect(child.get("model_id")).toBe(geminiId);
-    expect(child.get("provider_key_id")).toBe(geminiKeyId);
+    expect(child.get("branded_provider")).toBe("google");
     expect(child.get("prompt_tokens")).toBe("100");
     expect(child.get("total_tokens")).toBe("100");
+
+    const decisionUrl = new URL(decisions!.baseUrl);
+    await expect.poll(
+      () => otlp!.spans.find(
+        (span) =>
+          span.attributes["aisix.request_id"] === response.requestId &&
+          span.attributes["aisix.internal_call_purpose"] === "semantic_route_decision",
+      )?.attributes,
+      { timeout: 10_000 },
+    ).toMatchObject({
+      "server.address": decisionUrl.hostname,
+      "server.port": Number(decisionUrl.port),
+    });
   });
 
-  test("Gemini low confidence takes the default and an unoffered choice follows on_failure", async () => {
-    const low = await chat(etcdApp!, GEMINI_ROUTER, [LOW_CONFIDENCE_PROMPT]);
+  test("a Gemini router using a legacy base handles low confidence and an unoffered choice", async () => {
+    const low = await chat(etcdApp!, LEGACY_GEMINI_ROUTER, [LOW_CONFIDENCE_PROMPT]);
     expect(low.status, low.text).toBe(200);
     expect(low.route).toBeNull();
+    expect(decisions!.calls.at(-1)!.path).toBe(GEMINI_PATH);
     const served = JSON.parse(upstream!.receivedRequests.at(-1)!.body) as { model?: string };
     expect(served.model).toBe(DEFAULT_UPSTREAM_MODEL);
 
     const upstreamBefore = upstream!.receivedRequests.length;
-    const bad = await chat(etcdApp!, GEMINI_ROUTER, [UNKNOWN_CHOICE_PROMPT]);
+    const bad = await chat(etcdApp!, LEGACY_GEMINI_ROUTER, [UNKNOWN_CHOICE_PROMPT]);
     expect(bad.status).toBe(503);
     expect(bad.text).toContain("classifier_invalid_response");
     expect(upstream!.receivedRequests.length).toBe(upstreamBefore);
