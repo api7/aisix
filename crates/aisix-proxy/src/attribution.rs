@@ -647,7 +647,7 @@ struct BodyCounters {
 #[derive(Default)]
 pub(crate) struct InternalCall {
     pub(crate) purpose: Option<aisix_obs::InternalCallPurpose>,
-    /// `UsageEvent::operation` of the call: `embeddings` or `systemone`.
+    /// `UsageEvent::operation` of the call: `embeddings`, `systemone`, or `decisions`.
     pub(crate) operation: &'static str,
     /// The Model the call went to, empty for an inline classifier.
     pub(crate) model_id: String,

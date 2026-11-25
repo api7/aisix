@@ -814,6 +814,17 @@ pub(crate) fn systemone_usage(body: &Value) -> Option<DecisionUsage> {
     })
 }
 
+/// Usage from the Gemini Developer API Decisions response.
+pub(crate) fn gemini_decisions_usage(body: &Value) -> Option<DecisionUsage> {
+    body.get("usage")?;
+    Some(DecisionUsage {
+        input: count(body, "/usage/total_input_tokens").unwrap_or(0),
+        output: count(body, "/usage/total_output_tokens").unwrap_or(0),
+        upstream_total: count(body, "/usage/total_tokens").unwrap_or(0),
+        ..Default::default()
+    })
+}
+
 /// Usage from a Decisions response.
 pub(crate) fn decisions_usage(body: &Value) -> Option<DecisionUsage> {
     body.get("usage")?;

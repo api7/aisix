@@ -80,6 +80,17 @@
         ]
       },
       "then": {
+        "if": {
+          "properties": {
+            "classifier": {
+              "properties": {
+                "type": {
+                  "const": "gemini_decision"
+                }
+              }
+            }
+          }
+        },
         "not": {
           "anyOf": [
             {
@@ -136,6 +147,24 @@
               ]
             }
           }
+        },
+        "then": {
+          "properties": {
+            "classifier": {
+              "properties": {
+                "model_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model_id"
+              ]
+            },
+            "routes": {
+              "maxItems": 254,
+              "minItems": 2
+            }
+          }
         }
       }
     }
@@ -160,6 +189,13 @@
           "description": "TypeSafe's jev decision model.",
           "enum": [
             "jev"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Gemini Decision via the Gemini Developer API.",
+          "enum": [
+            "gemini_decision"
           ],
           "type": "string"
         }
@@ -267,12 +303,12 @@
         },
         "model": {
           "default": "jev-latest",
-          "description": "Decision model to call, read only when `model_id` is absent.",
+          "description": "Inline decision model name for `jev`, read only when `model_id` is absent.",
           "minLength": 1,
           "type": "string"
         },
         "model_id": {
-          "description": "Resource id of a direct Model whose Provider Key's `provider` is `typesafe`. When set, the decision calls go to that model exactly as a `POST /v1/systemone` request addressed to it does: its `model_name`, and its Provider Key's API key, `api_base`, request body overrides and request headers. `provider_key_id` and `model` are then not read. An id resolving to no such model is a classifier that cannot be called, and the router applies `on_failure`.",
+          "description": "Resource ID of the direct classifier model. `jev` uses a `typesafe` Provider Key. `gemini_decision` requires this ID and a `google` model with `model_name: gemini-decision-1`, a non-wildcard alias, and a `google` Provider Key. Decision calls use the referenced model and its Provider Key's API key, `api_base`, body overrides, and headers. When the reference cannot be resolved, the router applies `on_failure`.",
           "minLength": 1,
           "type": [
             "string",
@@ -288,7 +324,7 @@
           "description": "Behavior when the decision call fails, times out, or returns an answer that names no route. Same values as `on_embedding_failure`."
         },
         "provider_key_id": {
-          "description": "Resource id of the Provider Key that authenticates the decision calls, read only when `model_id` is absent. Required when there is no `model_id`. The key's `provider` must be `typesafe`; its API key is sent as the bearer token, and its `api_base`, when set, replaces the default endpoint `https://api.typesafe.ai`.",
+          "description": "Inline Provider Key for `jev`, required when `model_id` is absent. Its `provider` must be `typesafe`. The model uses its API key as a bearer token and its `api_base` when configured.",
           "minLength": 1,
           "type": "string"
         },
@@ -305,7 +341,7 @@
               "$ref": "#/definitions/ClassifierType"
             }
           ],
-          "description": "Decision model family. `jev` is the only supported value."
+          "description": "Decision model family, `jev` or `gemini_decision`."
         }
       },
       "required": [
@@ -515,7 +551,7 @@
       "description": "Behavior when the embedding call fails or times out. Defaults to routing to `default`."
     },
     "routes": {
-      "description": "Routes evaluated for each request. At least one is required.",
+      "description": "Routes evaluated for each request. At least one is required. `gemini_decision` requires 2 to 254 routes.",
       "items": {
         "$ref": "#/definitions/SemanticRoute"
       },

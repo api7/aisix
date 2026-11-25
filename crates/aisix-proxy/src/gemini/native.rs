@@ -3,12 +3,13 @@
 
 use std::{borrow::Cow, collections::HashMap, time::Instant};
 
-use aisix_core::ApiSurface;
+use aisix_core::{ApiSurface, ProviderKey};
 use aisix_gateway::{
     chat::{gemini_header_service_tier, ChatChoice},
     gemini::{finish_with_tool_calls, map_gemini_finish_reason, GeminiUsageMetadata},
     BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatDelta, ChatMessage, ChatResponse,
-    FinishReason, ServiceTier, SseDecoder, SseEvent, UpstreamErrorView, UpstreamWire, UsageStats,
+    FinishReason, ServiceTier, SseDecoder, SseEvent, UpstreamErrorView, UpstreamHeaderContext,
+    UpstreamWire, UsageStats,
 };
 use aisix_provider_openai::overrides::{
     apply_default_body_fields, apply_param_renames, apply_temperature_constraint,
@@ -21,9 +22,15 @@ use url::Url;
 const FRAME: &str = "_aisix_gemini_frame";
 const CANDIDATE: &str = "_aisix_gemini_candidate";
 
-fn endpoint(ctx: &BridgeContext, streaming: bool) -> Result<Url, BridgeError> {
-    let base = crate::dispatch::resolve_base_url_for(&ctx.provider_key, ApiSurface::Gemini)
+fn base_url(pk: &ProviderKey) -> Result<Url, BridgeError> {
+    let base = crate::dispatch::resolve_base_url_for(pk, ApiSurface::Gemini)
         .map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
+    Url::parse(&base)
+        .map_err(|e| BridgeError::InvalidUpstreamConfig(format!("invalid Gemini base URL: {e}")))
+}
+
+fn endpoint(ctx: &BridgeContext, streaming: bool) -> Result<Url, BridgeError> {
+    let mut url = base_url(&ctx.provider_key)?;
     let model = ctx.model.upstream_model().ok_or_else(|| {
         BridgeError::InvalidUpstreamConfig("Gemini requires an upstream model name".into())
     })?;
@@ -32,8 +39,6 @@ fn endpoint(ctx: &BridgeContext, streaming: bool) -> Result<Url, BridgeError> {
     } else {
         "generateContent"
     };
-    let mut url = Url::parse(&base)
-        .map_err(|e| BridgeError::InvalidUpstreamConfig(format!("invalid Gemini base URL: {e}")))?;
     url.path_segments_mut()
         .map_err(|_| BridgeError::InvalidUpstreamConfig("invalid Gemini base URL".into()))?
         .pop_if_empty()
@@ -42,6 +47,19 @@ fn endpoint(ctx: &BridgeContext, streaming: bool) -> Result<Url, BridgeError> {
     if streaming {
         url.query_pairs_mut().append_pair("alt", "sse");
     }
+    Ok(url)
+}
+
+/// <https://aistudio.google.com/docs/decisions-api#request>
+pub(crate) fn decisions_endpoint(pk: &ProviderKey) -> Result<Url, BridgeError> {
+    let mut url = base_url(pk)?;
+    let path = url.path().trim_end_matches('/');
+    let root = ["/v1beta/decisions", "/v1beta/openai", "/v1beta", "/v1"]
+        .into_iter()
+        .find_map(|suffix| path.strip_suffix(suffix))
+        .unwrap_or(path);
+    let path = format!("{root}/v1beta/decisions");
+    url.set_path(&path);
     Ok(url)
 }
 
@@ -56,16 +74,13 @@ fn error_view(body: &[u8]) -> Option<UpstreamErrorView> {
     })
 }
 
-async fn send(
-    ctx: &BridgeContext,
-    body: &Value,
-    streaming: bool,
-) -> Result<reqwest::Response, BridgeError> {
-    let pk = &ctx.provider_key;
+pub(crate) fn request_headers(
+    api_key: &str,
+    request_id: &str,
+    ctx: &UpstreamHeaderContext<'_>,
+) -> Result<HeaderMap, BridgeError> {
     let mut headers = HeaderMap::new();
-    let key = crate::dispatch::require_api_key(pk, &ctx.model)
-        .map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
-    let mut key = HeaderValue::from_str(key)
+    let mut key = HeaderValue::from_str(api_key)
         .map_err(|_| BridgeError::InvalidUpstreamConfig("invalid Gemini API key header".into()))?;
     key.set_sensitive(true);
     headers.insert("x-goog-api-key", key);
@@ -75,18 +90,30 @@ async fn send(
     );
     headers.insert(
         "x-aisix-request-id",
-        HeaderValue::from_str(&ctx.request_id)
+        HeaderValue::from_str(request_id)
             .map_err(|e| BridgeError::Config(format!("invalid request id: {e}")))?,
     );
-    aisix_gateway::apply_request_headers(&mut headers, &ctx.header_ctx());
+    aisix_gateway::apply_request_headers(&mut headers, ctx);
 
-    if let Some(inbound) = &ctx.client_headers {
+    if let Some(inbound) = ctx.client_headers {
         for name in ["user-agent", "x-goog-api-client"] {
             if let Some(value) = inbound.get(name) {
                 headers.entry(name).or_insert_with(|| value.clone());
             }
         }
     }
+    Ok(headers)
+}
+
+async fn send(
+    ctx: &BridgeContext,
+    body: &Value,
+    streaming: bool,
+) -> Result<reqwest::Response, BridgeError> {
+    let pk = &ctx.provider_key;
+    let key = crate::dispatch::require_api_key(pk, &ctx.model)
+        .map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
+    let headers = request_headers(key, &ctx.request_id, &ctx.header_ctx())?;
     let client = crate::http_client::client_for(pk.upstream_connection().as_ref());
     let mut body = Cow::Borrowed(body);
     if let Some(overrides) = pk.request.as_ref().filter(|r| r.rewrites_body()) {

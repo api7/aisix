@@ -1156,7 +1156,17 @@ fn split_semantic_modes(node: &mut serde_json::Map<String, Value>) {
                     {"required": ["examples"]},
                     {"required": ["threshold"]}
                 ]}
-            }}}
+            }}},
+            "if": {"properties": {"classifier": {"properties": {
+                "type": {"const": super::ClassifierType::GeminiDecision}
+            }}}},
+            "then": {"properties": {
+                "classifier": {
+                    "required": ["model_id"],
+                    "properties": {"model_id": {"type": "string"}}
+                },
+                "routes": {"minItems": 2, "maxItems": 254}
+            }}
         },
         "else": {
             "allOf": [embedder_clause],
@@ -3183,6 +3193,39 @@ mod tests {
         let c = m.semantic.unwrap().classifier.unwrap();
         assert_eq!(c.model_id.as_deref(), Some("m-jev"));
         assert_eq!(c.provider_key_id, "");
+    }
+
+    #[test]
+    fn model_semantic_gemini_decision_requires_a_model_id_and_two_to_254_routes() {
+        let mut router = jev_router(json!({}), jev_route());
+        let classifier = json!({"type": "gemini_decision", "model_id": "m-decision"});
+        router["semantic"]["classifier"] = classifier.clone();
+        assert_rejected_on_both(&router, "Gemini Decision with one route");
+
+        let routes: Vec<_> = (0..255)
+            .map(|n| json!({"name": format!("route-{n}"), "target_id": "m-1", "description": "code"}))
+            .collect();
+        for n in [2, 254] {
+            router["semantic"]["routes"] = json!(routes[..n]);
+            validate_model(&router).unwrap();
+            validate_model_lenient(&router).unwrap();
+        }
+        router["semantic"]["routes"] = json!(routes);
+        assert_rejected_on_both(&router, "Gemini Decision with 255 routes");
+
+        router["semantic"]["routes"] = json!(routes[..2]);
+        for inline in [
+            json!({"type": "gemini_decision", "provider_key_id": "pk"}),
+            json!({"type": "gemini_decision", "provider_key_id": "pk", "model_id": null}),
+        ] {
+            router["semantic"]["classifier"] = inline;
+            assert_rejected_on_both(&router, "Gemini Decision with only an inline key");
+        }
+        router["semantic"]["classifier"] = classifier;
+        let model: Model = serde_json::from_value(router).unwrap();
+        let config = model.semantic.unwrap().classifier.unwrap();
+        assert_eq!(config.r#type, crate::models::ClassifierType::GeminiDecision);
+        assert_eq!(config.model_id.as_deref(), Some("m-decision"));
     }
 
     #[test]

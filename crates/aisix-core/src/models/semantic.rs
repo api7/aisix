@@ -192,6 +192,8 @@ pub enum ClassifierType {
     /// TypeSafe's jev decision model.
     #[default]
     Jev,
+    /// Gemini Decision via the Gemini Developer API.
+    GeminiDecision,
 }
 
 fn default_classifier_model() -> String {
@@ -214,27 +216,24 @@ fn default_classifier_timeout_ms() -> u64 {
 /// requests that fit none of the routes, configure a route for them.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct SemanticClassifier {
-    /// Decision model family. `jev` is the only supported value.
+    /// Decision model family, `jev` or `gemini_decision`.
     pub r#type: ClassifierType,
-    /// Resource id of a direct Model whose Provider Key's `provider` is
-    /// `typesafe`. When set, the decision calls go to that model exactly as
-    /// a `POST /v1/systemone` request addressed to it does: its
-    /// `model_name`, and its Provider Key's API key, `api_base`, request
-    /// body overrides and request headers. `provider_key_id` and `model`
-    /// are then not read. An id resolving to no such model is a classifier
-    /// that cannot be called, and the router applies `on_failure`.
+    /// Resource ID of the direct classifier model. `jev` uses a `typesafe`
+    /// Provider Key. `gemini_decision` requires this ID and a `google` model
+    /// with `model_name: gemini-decision-1`, a non-wildcard alias, and a
+    /// `google` Provider Key. Decision calls use the referenced model and
+    /// its Provider Key's API key, `api_base`, body overrides, and headers.
+    /// When the reference cannot be resolved, the router applies `on_failure`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub model_id: Option<String>,
-    /// Resource id of the Provider Key that authenticates the decision
-    /// calls, read only when `model_id` is absent. Required when there is
-    /// no `model_id`. The key's `provider` must be `typesafe`; its API key
-    /// is sent as the bearer token, and its `api_base`, when set, replaces
-    /// the default endpoint `https://api.typesafe.ai`.
+    /// Inline Provider Key for `jev`, required when `model_id` is absent.
+    /// Its `provider` must be `typesafe`. The model uses its API key as a
+    /// bearer token and its `api_base` when configured.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     #[schemars(length(min = 1))]
     pub provider_key_id: String,
-    /// Decision model to call, read only when `model_id` is absent.
+    /// Inline decision model name for `jev`, read only when `model_id` is absent.
     #[serde(default = "default_classifier_model")]
     #[schemars(length(min = 1))]
     pub model: String,
@@ -331,6 +330,7 @@ pub struct Semantic {
     #[schemars(length(min = 1))]
     pub embedding_model_id: Option<String>,
     /// Routes evaluated for each request. At least one is required.
+    /// `gemini_decision` requires 2 to 254 routes.
     #[schemars(length(min = 1))]
     pub routes: Vec<SemanticRoute>,
     /// Alias of the direct model or model group used when no route clears
