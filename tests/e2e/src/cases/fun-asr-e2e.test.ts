@@ -10,6 +10,7 @@ import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 describe("DashScope Fun-ASR native tasks", () => {
   const caller = "sk-asr-caller";
   const revoked = "sk-asr-revoked";
+  const clientType = "asr-usage-client";
   let app: SpawnedApp;
   let seed: SeedClient;
   let otlp: MockOtlp;
@@ -24,9 +25,11 @@ describe("DashScope Fun-ASR native tasks", () => {
     vendor = await startFunAsrUpstream();
     otlp = await startMockOtlp();
     sls = await startMockSls();
-    app = await spawnApp({ logLevel: "info", extraEnv: {
-      SLS_CRED_MOCK_AK_ID: "test-key", SLS_CRED_MOCK_AK_SECRET: "test-secret",
-    } });
+    app = await spawnApp({
+      logLevel: "info",
+      clientTypeRules: [{ pattern: `^${clientType}/`, client: clientType }],
+      extraEnv: { SLS_CRED_MOCK_AK_ID: "test-key", SLS_CRED_MOCK_AK_SECRET: "test-secret" },
+    });
     seed = new SeedClient(etcd, app.etcdPrefix);
     await seed.createObservabilityExporter({ name: "asr-usage", kind: "otlp_http", endpoint: otlp.url });
     for (const mode of ["full", "metadata_only"]) {
@@ -276,8 +279,10 @@ describe("DashScope Fun-ASR native tasks", () => {
     if (!app) return ctx.skip();
     const remoteTrace = "4bf92f3577b34da6a3ce929d0e0e4736";
     const remoteParent = "00f067aa0ba902b7";
-    const client = await openFunAsr(app.proxyUrl, caller,
-      hasParent ? { traceparent: `00-${remoteTrace}-${remoteParent}-01` } : {});
+    const client = await openFunAsr(app.proxyUrl, caller, {
+      "user-agent": `${clientType}/1.0`,
+      ...(hasParent ? { traceparent: `00-${remoteTrace}-${remoteParent}-01` } : {}),
+    });
     try {
       const before = await scrapeMetrics(app.metricsUrl);
       const tasks = [];
@@ -302,10 +307,12 @@ describe("DashScope Fun-ASR native tasks", () => {
         expect(row.attributes).toMatchObject({
           "aisix.audio.duration_seconds": 6, "aisix.operation": "transcription", "aisix.requested_model": alias,
           "aisix.model_id": ids.get(alias), "http.response.status_code": 200, "aisix.is_final_attempt": true,
+          "aisix.client_type": clientType,
         });
         const req = row.attributes["aisix.request_id"];
         const servers = otlp.spans.filter(s => s.kind === 2 && s.attributes["aisix.request_id"] === req);
         expect(servers).toHaveLength(1);
+        expect(servers[0].attributes["aisix.client_type"]).toBe(clientType);
         expect(row.traceId).toMatch(/^[0-9a-f]{32}$/);
         expect(servers[0].traceId).toBe(row.traceId);
         expect(servers[0].parentSpanId).toBe(hasParent ? remoteParent : "");

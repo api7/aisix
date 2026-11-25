@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import OpenAI, { toFile } from "openai";
+import { WebSocket } from "undici";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { WebSocketServer, type WebSocket as WsSocket } from "ws";
 import {
@@ -32,6 +33,7 @@ const CALLER = "sk-usage-total-tokens-every-family";
 const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
 const CREDENTIAL_REF = "totaltokens";
 const LOGSTORE = "total-tokens";
+const REALTIME_CLIENT = "realtime-usage-client";
 
 const M = {
   chat: "tt-chat",
@@ -194,6 +196,7 @@ describe("UsageEvent total_tokens: the upstream's own total on every family", ()
     realtime = await startRealtimeUpstream();
     batch = await startBatchUpstream();
     app = await spawnApp({
+      clientTypeRules: [{ pattern: `^${REALTIME_CLIENT}/`, client: REALTIME_CLIENT }],
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-secret",
@@ -400,14 +403,17 @@ describe("UsageEvent total_tokens: the upstream's own total on every family", ()
   async function runRealtimeSession(): Promise<void> {
     const ws = new WebSocket(
       `${app!.proxyUrl.replace("http", "ws")}/v1/realtime?model=${M.realtime}`,
-      ["realtime", `openai-insecure-api-key.${CALLER}`],
+      {
+        protocols: ["realtime", `openai-insecure-api-key.${CALLER}`],
+        headers: { "user-agent": `${REALTIME_CLIENT}/1.0` },
+      },
     );
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("realtime session timed out")), 15_000);
       ws.addEventListener("open", () => ws.send(JSON.stringify({ type: "response.create" })));
       ws.addEventListener("message", () => {
         clearTimeout(timer);
-        ws.close();
+        ws.close(1000);
         resolve();
       });
       ws.addEventListener("error", (e) => {
@@ -486,6 +492,9 @@ describe("UsageEvent total_tokens: the upstream's own total on every family", ()
       });
 
       const total = (log: Map<string, string>) => log.get("total_tokens");
+      const realtimeUsage = await byModel(M.realtime);
+      expect(realtimeUsage.get("status_code")).toBe("200");
+      expect(realtimeUsage.get("client_type")).toBe(REALTIME_CLIENT);
       const observed: Record<string, string | undefined> = {
         chat: total(await byModel(M.chat)),
         responses: total(await byModel(M.responses)),
@@ -498,7 +507,7 @@ describe("UsageEvent total_tokens: the upstream's own total on every family", ()
         transcriptionStream: total(await byModel(M.transcriptionStream)),
         imageGeneration: total(await byRequest(generationId)),
         imageEdit: total(await byRequest(editId)),
-        realtime: total(await byModel(M.realtime)),
+        realtime: total(realtimeUsage),
         batch: total(
           await rowWhere(
             (log) => log.get("requested_model") === M.batch && log.get("inbound_protocol") === "batch",
