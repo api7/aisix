@@ -34,6 +34,8 @@ import { funAsrPath, openFunAsr, recognize, startFunAsrUpstream } from "../harne
 // by leaving it out, with the reason beside the row.
 
 const CALLER = "sk-metric-parity-caller";
+const CLIENT_TYPE = "parity-client";
+const USER_AGENT = `${CLIENT_TYPE}/1.0`;
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
 /** A per-request family and how its samples are matched for one row. */
@@ -348,7 +350,7 @@ describe("every proxy route emits every per-request metric family", () => {
   const jobs = { fileId: "", batchId: "", ftId: "" };
   let videoId = "";
 
-  const auth = (token = CALLER) => ({ authorization: `Bearer ${token}` });
+  const auth = (token = CALLER) => ({ authorization: `Bearer ${token}`, "user-agent": USER_AGENT });
 
   async function call(path: string, init: RequestInit = {}, token = CALLER): Promise<Response> {
     const res = await fetch(`${app!.proxyUrl}${path}`, {
@@ -642,10 +644,10 @@ describe("every proxy route emits every per-request metric family", () => {
       model: "par-realtime",
       families: ["proxy_requests", "llm_requests", "tokens", "deployment", "ratelimit_remaining"],
       drive: async () => {
-        const ws = new WebSocket(`${app!.proxyUrl.replace("http", "ws")}/v1/realtime?model=par-realtime`, [
-          "realtime",
-          `openai-insecure-api-key.${CALLER}`,
-        ]);
+        const ws = new WebSocket(`${app!.proxyUrl.replace("http", "ws")}/v1/realtime?model=par-realtime`, {
+          protocols: ["realtime", `openai-insecure-api-key.${CALLER}`],
+          headers: { "user-agent": USER_AGENT },
+        });
         await new Promise<void>((resolve, reject) => {
           const timer = setTimeout(() => reject(new Error("realtime session timed out")), 15_000);
           ws.addEventListener("open", () => ws.send(JSON.stringify({ type: "response.create" })));
@@ -932,7 +934,9 @@ describe("every proxy route emits every per-request metric family", () => {
     asr = await startFunAsrUpstream();
     mcp = await startMcpUpstream("alpha");
     a2a = await startA2aUpstream({ streamAnswer: true });
-    app = await spawnApp();
+    app = await spawnApp({
+      clientTypeRules: [{ pattern: `^${CLIENT_TYPE}/`, client: CLIENT_TYPE }],
+    });
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
     const openaiPk = await seed.createProviderKey({ display_name: "par-openai-pk", api_key: "sk-mock", api_base: `${upstream.baseUrl}/v1`, provider: "openai" });
@@ -1013,7 +1017,7 @@ describe("every proxy route emits every per-request metric family", () => {
         return Math.min(
           d("aisix_llm_input_tokens_total", protocolLabels),
           d("aisix_tokens_consumed_total", model),
-          d("aisix_llm_tokens_by_client_total", model),
+          d("aisix_llm_tokens_by_client_total", { ...model, client_type: CLIENT_TYPE }),
         );
       }
       case "deployment":

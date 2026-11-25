@@ -877,7 +877,7 @@ fn emit_usage_event(
         provider_model_version: success.reported_model.clone(),
         inbound_protocol: "openai".to_string(),
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        client_user_agent: client.user_agent.value.clone(),
         request_headers: client.request_headers.clone(),
         ..Default::default()
     };
@@ -916,7 +916,7 @@ fn emit_usage_event(
             cached: usage.cached,
             cache_read: 0,
             cache_creation: 0,
-            client_type: state.client_classifier.classify(&client.user_agent),
+            client_type: client.client_type(),
         },
     );
 }

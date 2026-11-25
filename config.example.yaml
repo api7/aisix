@@ -232,16 +232,15 @@ observability:
       # address; the endpoint is unauthenticated, so restrict access at
       # the network layer.
       addr: "0.0.0.0:9090"
-    # Optional User-Agent -> client_type mapping rules for the
-    # aisix_llm_tokens_by_client_total metric. Tried in order (first match
-    # wins) BEFORE the built-in client allowlist, so you can classify
-    # in-house tools or re-bucket a built-in match. `pattern` is a regex
-    # (max 512 bytes), matched case-insensitively and unanchored against
-    # the raw User-Agent; `client` is the fixed label value emitted on
-    # match ([a-z0-9][a-z0-9._-]*, max 64 chars; max 64 rules). Validated at
-    # boot; changes require a restart. The metric label set stays bounded:
-    # only these fixed values (plus built-ins / "other" / "unknown") are
-    # ever emitted — never the raw User-Agent.
+    # Optional User-Agent rules for client_type in usage events, observability
+    # exports, and the aisix_llm_tokens_by_client_total metric. The first matching
+    # rule takes precedence over built-in clients. `pattern` is a case-insensitive,
+    # unanchored regex (max 512 bytes) evaluated against the inbound User-Agent
+    # after control characters are removed and the value is capped at 256
+    # characters. A match uses the fixed `client` value ([a-z0-9][a-z0-9._-]*,
+    # max 64 characters). The gateway accepts up to 64 rules. A blank User-Agent
+    # is `unknown`. If neither a rule nor a built-in matches a non-empty
+    # User-Agent, the classification is `other`. Changes require a restart.
     # Env-only deployments set the whole list as one JSON array:
     # AISIX_OBSERVABILITY__METRICS__CLIENT_TYPE_RULES='[{"pattern":"^py-billing-batcher/","client":"billing-batcher"}]'
     # client_type_rules:

@@ -34,6 +34,7 @@ const PROVIDER_SECRET = "sk-mock-cancel-1571";
 const CREDENTIAL_REF = "mock";
 const SLS_PROJECT = "aisix-e2e-obs";
 const LOGSTORE = "cancel-events";
+const USER_AGENT = "cancel-client/1.0";
 
 const GROUP = "c1571-group";
 /** A passthrough route onto the same slow upstream: a surface with no model. */
@@ -117,6 +118,7 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
       // The access-log line is `tracing::info!`; the harness default of
       // `warn` would leave it unwritten and the assertion below vacuous.
       logLevel: "info",
+      clientTypeRules: [{ pattern: "^cancel-client/", client: "cancel-client" }],
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-secret",
@@ -212,6 +214,7 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
         headers: {
           authorization: `Bearer ${CALLER_PLAINTEXT}`,
           "content-type": "application/json",
+          "user-agent": USER_AGENT,
         },
         body: JSON.stringify({
           model: GROUP,
@@ -246,6 +249,7 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
       );
 
       expect(row.get("status_code")).toBe("499");
+      expect(row.get("client_type")).toBe("cancel-client");
       expect(row.get("error_class")).toBe("client_disconnected");
       expect(row.get("error_message")).toContain("before the response head");
       // The two identities the row has to keep apart: the caller addressed
@@ -390,6 +394,7 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
         headers: {
           authorization: `Bearer ${CALLER_PLAINTEXT}`,
           "content-type": "application/json",
+          "user-agent": USER_AGENT,
         },
         body: JSON.stringify({
           model: STREAM_MODEL,
@@ -422,6 +427,7 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
         20_000,
       );
       expect(row.get("status_code")).toBe("499");
+      expect(row.get("client_type")).toBe("cancel-client");
       expect(row.get("error_class")).toBe("client_disconnected");
       expect(row.get("error_message")).toContain("while the response was streaming");
 

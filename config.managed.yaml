@@ -220,10 +220,9 @@ observability:
       # deployment and point Prometheus at it. Override with
       # AISIX_OBSERVABILITY__METRICS__PROMETHEUS__ADDR.
       addr: "0.0.0.0:9090"
-    # Optional User-Agent -> client_type mapping rules for the
-    # aisix_llm_tokens_by_client_total metric (first match wins, tried
-    # before the built-in allowlist; regex, case-insensitive). See
-    # config.example.yaml for the full annotation.
+    # Optional User-Agent rules for client_type in usage events, observability
+    # exports, and the aisix_llm_tokens_by_client_total metric. The first matching
+    # regex takes precedence over built-in clients. See config.example.yaml.
     # client_type_rules:
     #   - pattern: "^py-billing-batcher/"
     #     client: billing-batcher

@@ -1119,6 +1119,9 @@ fn joining_attributes(event: &UsageEvent, exporter_name: &str) -> Vec<Value> {
     if !event.operation.is_empty() {
         attributes.push(attr_string("aisix.operation", &event.operation));
     }
+    if !event.client_type.is_empty() {
+        attributes.push(attr_string("aisix.client_type", &event.client_type));
+    }
     attributes
 }
 
@@ -1186,15 +1189,9 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
     let a2a = is_a2a(event);
     let operation = genai_operation_name(event);
 
-    let mut attributes = Vec::new();
+    let mut attributes = joining_attributes(event, exporter_name);
     if let Some(operation) = operation {
         attributes.push(attr_string("gen_ai.operation.name", operation));
-    }
-    // The gateway's own, finer reading of the same thing. The convention's
-    // value collapses chat, messages and responses onto `chat`, which
-    // cannot separate them (AISIX-Cloud#1461).
-    if !event.operation.is_empty() {
-        attributes.push(attr_string("aisix.operation", &event.operation));
     }
     if mcp {
         attributes.push(attr_string("mcp.method.name", MCP_TOOL_CALL_METHOD));
@@ -1301,8 +1298,6 @@ fn event_attributes(record: &SinkRecord, exporter_name: &str) -> Vec<Value> {
             event.audio_duration_seconds,
         ));
     }
-    attributes.push(attr_string("aisix.exporter_name", exporter_name));
-    attributes.push(attr_string("aisix.request_id", &event.request_id));
     if event.upstream_ttft_ms > 0 {
         attributes.push(attr_int(
             "aisix.upstream_ttft_ms",
@@ -3308,10 +3303,10 @@ mod tests {
         let mut ev = sample_event();
         ev.client_source_ip = "203.0.113.7".into();
         ev.client_user_agent = "codex-cli/1.2".into();
+        ev.client_type = "codex".into();
         let body = build_otlp_traces_payload(&ev, "test-exp");
-        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
-            .as_array()
-            .unwrap();
+        let span = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        let attrs = span["attributes"].as_array().unwrap();
         // Under the client / user-agent conventions' names, replacing the
         // former `aisix.client_*` keys.
         let ip = attrs.iter().find(|a| a["key"] == "client.address");
@@ -3323,6 +3318,10 @@ mod tests {
         assert_eq!(
             ua.expect("user_agent.original attr")["value"]["stringValue"],
             "codex-cli/1.2"
+        );
+        assert_eq!(
+            attr(span, "aisix.client_type").unwrap()["stringValue"],
+            "codex"
         );
         assert!(!body.to_string().contains("aisix.client_source_ip"));
         assert!(!body.to_string().contains("aisix.client_user_agent"));

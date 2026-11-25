@@ -1240,6 +1240,8 @@ async fn run_session(
                 crate::usage_attr::guardrail_scores(&audit),
                 crate::usage_attr::bypass_reason(&audit),
             );
+            // The detached session keeps the upgrade request's classification.
+            event.client_type = client.client_type().to_owned();
             // Same reason as the session-end event: no attribution cell here.
             // Realtime serves only direct models, so the entry is the target.
             event.model_id = model_entry.id.clone();
@@ -1594,7 +1596,8 @@ async fn run_session(
         upstream_response_headers,
         inbound_protocol: "realtime".to_string(),
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        client_user_agent: client.user_agent.value.clone(),
+        client_type: client.client_type().to_owned(),
         request_headers: client.request_headers.clone(),
         // A frame the chain refused ends the session, so the session's one
         // terminal event is where the refusal has to be recorded — this is
@@ -1664,7 +1667,7 @@ async fn run_session(
             cached: usage.cached_tokens.min(u32::MAX as u64) as u32,
             cache_read: 0,
             cache_creation: 0,
-            client_type: state.client_classifier.classify(&client.user_agent),
+            client_type: client.client_type(),
         },
     );
 }

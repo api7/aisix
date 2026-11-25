@@ -4278,7 +4278,7 @@ fn emit_usage_event(
         pk_label: sanitize_tag(tags.pk_label.unwrap_or_default()),
         byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        client_user_agent: client.user_agent.value.clone(),
         request_headers: client.request_headers.clone(),
         guardrail_blocked,
         redacted_entity_counts,
@@ -4340,7 +4340,7 @@ fn emit_usage_event(
             cached: usage.cached_prompt_tokens,
             cache_read: usage.cache_read_tokens,
             cache_creation: usage.cache_creation_tokens,
-            client_type: state.client_classifier.classify(&client.user_agent),
+            client_type: client.client_type(),
         },
     );
     if usage.upstream_ttft_ms > 0 {
@@ -4439,7 +4439,7 @@ fn emit_zero_token_event(
         pk_label: sanitize_tag(tags.pk_label.unwrap_or_default()),
         byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        client_user_agent: client.user_agent.value.clone(),
         request_headers: client.request_headers.clone(),
         // Guardrails run once per REQUEST, not once per attempt, so a
         // superseded attempt's event would repeat the same hit per retry.

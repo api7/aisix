@@ -2365,7 +2365,7 @@ fn emit_submit_usage_event(
         guardrail_scores: crate::usage_attr::guardrail_scores(audit),
         guardrail_bypassed_reason: crate::usage_attr::bypass_reason(audit),
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        client_user_agent: client.user_agent.value.clone(),
         request_headers: client.request_headers.clone(),
         ..Default::default()
     };

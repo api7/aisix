@@ -3805,7 +3805,7 @@ fn emit_anthropic_usage_event(
         pk_label: sanitize_tag(tags.pk_label.unwrap_or_default()),
         byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        client_user_agent: client.user_agent.value.clone(),
         request_headers: client.request_headers.clone(),
         applied_guardrails,
         redacted_entity_counts,
@@ -3870,7 +3870,7 @@ fn emit_anthropic_usage_event(
             cached: metrics.cached_prompt_tokens,
             cache_read: metrics.cache_read_tokens,
             cache_creation: metrics.cache_creation_tokens,
-            client_type: state.client_classifier.classify(&client.user_agent),
+            client_type: client.client_type(),
         },
     );
     if metrics.upstream_ttft_ms > 0 {

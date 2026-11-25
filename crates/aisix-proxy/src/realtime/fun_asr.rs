@@ -181,13 +181,12 @@ async fn serve(
         let snap = state.snapshot.load();
         client.request_headers = crate::client_ip::capture_request_headers(&client.headers, &snap);
         let cap = crate::usage_attr::content_cap(&snap).map(|n| n as usize);
-        let attribution = Arc::new(
-            crate::attribution::RequestAttribution::with_response_headers(
-                crate::client_ip::exported_header_names(&snap, true),
-                cap.is_some(),
-                client.request_id.clone(),
-            ),
-        );
+        let attribution = Arc::new(crate::attribution::RequestAttribution::new(
+            client.user_agent.clone(),
+            crate::client_ip::exported_header_names(&snap, true),
+            cap.is_some(),
+            client.request_id.clone(),
+        ));
         drop(snap);
         let mut task = Task {
             id,
@@ -675,7 +674,7 @@ impl Task {
                 .dial_started
                 .map_or(0, |t| crate::attempt::measured_ms(t.elapsed())),
             client_source_ip: client.source_ip.clone(),
-            client_user_agent: client.user_agent.clone(),
+            client_user_agent: client.user_agent.value.clone(),
             request_headers: client.request_headers.clone(),
             error_class: error
                 .map(crate::attempt::error_class)

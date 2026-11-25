@@ -1,8 +1,7 @@
 //! Downstream client attribution for usage logs (#492).
 //!
-//! Resolves the real client IP and the `User-Agent` once per request and
-//! exposes them via the [`ClientContext`] extractor — the same low-churn
-//! `FromRequestParts` pattern handlers already use for `AuthenticatedKey`.
+//! Resolves the real client IP and exposes it with the inbound `User-Agent`
+//! attribution via the [`ClientContext`] extractor.
 //!
 //! IP resolution mirrors nginx `set_real_ip_from` + `real_ip_recursive`:
 //! the immediate TCP peer is the client unless it's a configured trusted
@@ -124,13 +123,45 @@ fn parse_forwarded_token(tok: &str) -> Option<IpAddr> {
 /// tags never reach the upstream request body.
 pub const ROUTING_TAGS_HEADER: &str = "x-aisix-routing-tags";
 
+/// The sanitised inbound header and its classification, shared by the request
+/// scope and any handler that carries the values beyond that scope.
+#[derive(Debug)]
+pub(crate) struct InboundUserAgent {
+    pub(crate) value: String,
+    pub(crate) client_type: String,
+}
+
+impl InboundUserAgent {
+    pub(crate) fn from_headers(
+        headers: &HeaderMap,
+        classifier: &aisix_obs::ClientTypeClassifier,
+    ) -> Self {
+        let value = headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| crate::chat::sanitize_tag(s.to_string()))
+            .unwrap_or_default();
+        let client_type = classifier.classify(&value).to_owned();
+        Self { value, client_type }
+    }
+}
+
+impl Default for InboundUserAgent {
+    fn default() -> Self {
+        Self {
+            value: String::new(),
+            client_type: "unknown".into(),
+        }
+    }
+}
+
 /// Per-request client attribution. Resolved once via the extractor and
 /// threaded into the usage event by each handler's emit fn.
 #[derive(Debug, Clone, Default)]
 pub struct ClientContext {
     pub(crate) endpoint: &'static str,
     pub source_ip: String,
-    pub user_agent: String,
+    pub(crate) user_agent: Arc<InboundUserAgent>,
     /// Routing tags from [`ROUTING_TAGS_HEADER`], used to select among a
     /// routing model's tagged targets. Empty when the header is absent.
     pub routing_tags: Vec<String>,
@@ -171,6 +202,12 @@ pub struct ClientContext {
     /// The inbound body's byte count, read at dispatch time (the handler
     /// has the whole body by then). `None` outside the body-limit layer.
     pub(crate) inbound_body: Option<crate::request_body_account::InboundBody>,
+}
+
+impl ClientContext {
+    pub(crate) fn client_type(&self) -> &str {
+        &self.user_agent.client_type
+    }
 }
 
 /// The values of the request headers any enabled exporter of this snapshot
@@ -265,12 +302,12 @@ where
 
         let source_ip = source_ip_from_parts(parts, cfg);
 
-        let user_agent = parts
-            .headers
-            .get(axum::http::header::USER_AGENT)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| crate::chat::sanitize_tag(s.to_string()))
-            .unwrap_or_default();
+        let user_agent = crate::attribution::user_agent().unwrap_or_else(|| {
+            Arc::new(InboundUserAgent::from_headers(
+                &parts.headers,
+                &proxy_state.client_classifier,
+            ))
+        });
 
         let routing_tags = parts
             .headers

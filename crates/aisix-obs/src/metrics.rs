@@ -115,8 +115,8 @@ pub const M_LLM_TTFT: &str = "aisix_llm_time_to_first_token_seconds";
 /// Issue #890 req-4: token volume sliced by inbound client type — a
 /// DEDICATED low-cardinality series so the client dimension never multiplies
 /// the per-key `aisix_llm_*_tokens_total` families. `client_type` is
-/// normalised to a bounded allowlist by [`client_type_from_user_agent`]; the
-/// raw user-agent + client version stay in logs / `UsageEvent`, never here.
+/// the same bounded classification as [`crate::UsageEvent::client_type`],
+/// from [`ClientTypeClassifier`].
 /// AISIX-Cloud#1044 adds a `model` label (the requested logical model, same
 /// value as the `aisix_llm_*` families' `model`) so the series answers
 /// "which models is each client spending tokens on". The label set stays
@@ -2527,8 +2527,7 @@ impl Metrics {
 
     /// #890 req-4: record token volume for the inbound `client_type` on the
     /// dedicated [`M_LLM_TOKENS_BY_CLIENT_TOTAL`] series. `client_type` MUST
-    /// come from [`ClientTypeClassifier::classify`] (or the built-in
-    /// [`client_type_from_user_agent`]) — never raw client input — so the
+    /// come from [`ClientTypeClassifier::classify`] so the
     /// value set stays bounded by built-ins ∪ boot-validated operator rules
     /// (AISIX-Cloud#1045); zero dims are skipped to keep the series sparse.
     ///
@@ -3320,7 +3319,7 @@ impl ClientTypeClassifier {
         Ok(Self { rules: compiled })
     }
 
-    /// Classify a raw inbound `User-Agent`. Empty/whitespace UA is always
+    /// Classify an inbound `User-Agent`. Empty/whitespace UA is always
     /// `unknown` (custom rules never see it — `unknown` keeps meaning "the
     /// client sent nothing"); then custom rules in config order (first
     /// match wins); then the built-in table; then `other`.

@@ -26,6 +26,7 @@ import { STREAM_ANSWER } from "../harness/upstream-a2a.js";
 // does not exist however well the internals are populated.
 const KEY = "sk-a2a-telemetry-e2e";
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
+const LONG_USER_AGENT = "invoice-client/1 ".padEnd(256, "x") + " beyond-cap";
 
 /** How long to allow for the exporter's batch to reach the receiver. */
 const EXPORT_TIMEOUT_MS = 20_000;
@@ -42,12 +43,13 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
   let otlpFull: MockOtlp | undefined;
   let etcdReachable = false;
 
-  const call = async (agent: string, body: unknown) => {
+  const call = async (agent: string, body: unknown, userAgent?: string) => {
     const res = await fetch(`${app!.proxyUrl}/a2a/${agent}`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${KEY}`,
         "content-type": "application/json",
+        ...(userAgent ? { "user-agent": userAgent } : {}),
       },
       body: JSON.stringify(body),
     });
@@ -90,7 +92,12 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
       wireShape: "0.3",
       streamAnswer: true,
     });
-    app = await spawnApp();
+    app = await spawnApp({
+      clientTypeRules: [
+        { pattern: "beyond-cap$", client: "beyond-cap" },
+        { pattern: "^invoice-client/", client: "invoice-client" },
+      ],
+    });
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
     await seed.createObservabilityExporter({
@@ -341,20 +348,30 @@ describe("a2a protocol telemetry e2e (AISIX-Cloud#1215)", () => {
     const contextId = `ctx-${randomUUID()}`;
     const prompt = "summarise invoice forty two for the finance team";
     expect(
-      await call("invoices", {
-        jsonrpc: "2.0",
-        id: 10,
-        method: "message/send",
-        params: {
-          message: { role: "user", contextId, parts: [{ kind: "text", text: prompt }] },
+      await call(
+        "invoices",
+        {
+          jsonrpc: "2.0",
+          id: 10,
+          method: "message/send",
+          params: {
+            message: { role: "user", contextId, parts: [{ kind: "text", text: prompt }] },
+          },
         },
-      }),
+        LONG_USER_AGENT,
+      ),
     ).toBe(200);
 
     // An agent reports no usage of its own, so without the gateway counting
     // them every agent's spend would read as identical and zero.
     const metered = await awaitSpan((s) => s.attributes["gen_ai.conversation.id"] === contextId);
     expect(metered.attributes["gen_ai.usage.input_tokens"]).toBeGreaterThan(0);
+    expect(metered.attributes["aisix.client_type"]).toBe("invoice-client");
+    const requestSpan = otlp.spans.find((s) => s.traceId === metered.traceId && s.kind === 2);
+    expect(requestSpan?.attributes["aisix.client_type"]).toBe("invoice-client");
+    const metrics = await (await fetch(`${app.metricsUrl}/metrics`)).text();
+    expect(metrics).toMatch(/aisix_llm_tokens_by_client_total\{[^}]*client_type="invoice-client"/);
+    expect(metrics).not.toContain('client_type="beyond-cap"');
 
     // The words themselves reach only the exporter that asked for them.
     const deadline = Date.now() + EXPORT_TIMEOUT_MS;

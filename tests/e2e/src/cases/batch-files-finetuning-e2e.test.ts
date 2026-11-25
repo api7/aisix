@@ -9,6 +9,7 @@ import {
   waitConfigPropagation,
   type SpawnedApp,
 } from "../harness/index.js";
+import { startMockOtlp, type MockOtlp } from "../harness/otlp-mock.js";
 
 // E2E: first-class /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720,
 // AISIX-Cloud#873 §⑤). Pins the LiteLLM-baseline routing mechanism end to
@@ -174,6 +175,7 @@ describe("jobs e2e: /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720)", () =
   let app: SpawnedApp | undefined;
   let seed: SeedClient | undefined;
   let upstream: JobsUpstream | undefined;
+  let otlp: MockOtlp | undefined;
   let etcdReachable = false;
   let client: OpenAI;
 
@@ -182,9 +184,19 @@ describe("jobs e2e: /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720)", () =
     etcdReachable = await etcd.ping();
     if (!etcdReachable) return;
 
-    app = await spawnApp();
+    app = await spawnApp({
+      clientTypeRules: [{ pattern: "^batch-observer/", client: "batch-observer" }],
+    });
     seed = new SeedClient(etcd, app.etcdPrefix);
     upstream = await startJobsUpstream();
+    otlp = await startMockOtlp();
+
+    await seed.createObservabilityExporter({
+      name: "jobs-e2e-otlp",
+      enabled: true,
+      kind: "otlp_http",
+      endpoint: otlp.url,
+    });
 
     const pk = await seed.createProviderKey({
       display_name: "jobs-e2e-pk",
@@ -243,6 +255,7 @@ describe("jobs e2e: /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720)", () =
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
+    await otlp?.close();
   });
 
   test("full batch lifecycle through the OpenAI SDK: upload → create → retrieve → content → cancel", async (ctx) => {
@@ -290,7 +303,9 @@ describe("jobs e2e: /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720)", () =
     // 3. Retrieve → completed. The gateway must (a) re-encode the output
     // file id for the caller and (b) fire the detached usage-attribution
     // download of the output JSONL.
-    const got = await client.batches.retrieve(batch.id);
+    const got = await client.batches.retrieve(batch.id, {
+      headers: { "user-agent": "batch-observer/1.0" },
+    });
     expect(got.status).toBe("completed");
     expect(got.output_file_id?.startsWith("aisix-")).toBe(true);
 
@@ -303,6 +318,10 @@ describe("jobs e2e: /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720)", () =
         { timeout: 5000 },
       )
       .toBe(true);
+    const completion = () =>
+      otlp?.spans.find((span) => span.attributes["aisix.operation"] === "batch_completion");
+    await expect.poll(completion, { timeout: 15_000 }).toBeDefined();
+    expect(completion()?.attributes["aisix.client_type"]).toBe("batch-observer");
 
     // 4. Output file content downloads through the gateway via the
     // encoded id from the retrieve response.

@@ -32,7 +32,11 @@ const CALLER = "sk-usage-event-every-request";
 const CALLER_HASH = createHash("sha256").update(CALLER).digest("hex");
 const CREDENTIAL_REF = "mock";
 const LOGSTORE = "usage-event-every-request";
-const auth = { authorization: `Bearer ${CALLER}`, "content-type": "application/json" };
+const auth = {
+  authorization: `Bearer ${CALLER}`,
+  "content-type": "application/json",
+  "user-agent": "every-request-client/1.0",
+};
 
 // Cohere `rerank-v3.5`'s live response shape: no `input_tokens`.
 const COHERE_RERANK = {
@@ -65,6 +69,7 @@ describe("a usage event for every request", () => {
     });
     app = await spawnApp({
       requestBodyLimitBytes: BODY_LIMIT,
+      clientTypeRules: [{ pattern: "^every-request-client/", client: "every-request-client" }],
       extraEnv: {
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_ID`]: "mock-akid",
         [`SLS_CRED_${CREDENTIAL_REF.toUpperCase()}_AK_SECRET`]: "mock-secret",
@@ -193,6 +198,7 @@ describe("a usage event for every request", () => {
 
     const event = await eventFor("every-request-rerank", "rerank");
     expect(event.get("status_code")).toBe("200");
+    expect(event.get("client_type")).toBe("every-request-client");
     expect(event.get("prompt_tokens") ?? "0").toBe("0");
     expect(event.get("completion_tokens") ?? "0").toBe("0");
   });
@@ -208,6 +214,7 @@ describe("a usage event for every request", () => {
 
       const event = await eventFor("every-request-claude", operation);
       expect(event.get("status_code")).toBe("501");
+      expect(event.get("client_type")).toBe("every-request-client");
       expect(event.get("prompt_tokens") ?? "0").toBe("0");
     });
   }
@@ -239,6 +246,8 @@ describe("a usage event for every request", () => {
     );
     expect(event.get("status_code")).toBe("502");
     expect(event.get("mcp_server_name")).toBe("big");
+    expect(event.get("client_type")).toBe("every-request-client");
+    expect(event.get("client_user_agent")).toBeUndefined();
 
     // The exported tool span follows the MCP client span conventions.
     const deadline = Date.now() + 15_000;
@@ -269,6 +278,7 @@ describe("a usage event for every request", () => {
 
     const event = await eventFor("every-request-video", "video_generation");
     expect(event.get("status_code")).toBe("501");
+    expect(event.get("client_type")).toBe("every-request-client");
 
     // The request's SERVER span arrives; no upstream CLIENT span beside it,
     // since nothing was dispatched.

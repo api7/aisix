@@ -752,7 +752,7 @@ fn emit_job_usage_event(
         downstream_latency_ms: crate::attempt::measured_ms(elapsed),
         inbound_protocol: "openai".to_string(),
         client_source_ip: client.source_ip.clone(),
-        client_user_agent: client.user_agent.clone(),
+        client_user_agent: client.user_agent.value.clone(),
         request_headers: client.request_headers.clone(),
         guardrail_monitor_hits,
         applied_guardrails,
@@ -2072,6 +2072,7 @@ fn maybe_attribute_batch(
     let caller = auth.caller();
     let jwt = auth.jwt.clone();
     let request_headers = client.request_headers.clone();
+    let client_type = client.client_type().to_owned();
     let model_id = target.model_entry.id.clone();
     let display_name = target.display_name().to_string();
     let pk_id = target.pk_entry.id.to_string();
@@ -2088,6 +2089,7 @@ fn maybe_attribute_batch(
             jwt.as_ref(),
             &caller,
             &request_headers,
+            &client_type,
             &model_id,
             &display_name,
             &pk_id,
@@ -2121,6 +2123,7 @@ async fn attribute_batch_usage(
     jwt: Option<&std::sync::Arc<crate::auth::JwtIdentity>>,
     caller: &aisix_gateway::CallerIdentity,
     request_headers: &std::collections::BTreeMap<String, String>,
+    client_type: &str,
     model_id: &str,
     display_name: &str,
     pk_id: &str,
@@ -2270,6 +2273,7 @@ async fn attribute_batch_usage(
             // Each slice has its own request id, so each is its own last row.
             is_final_attempt: true,
             request_headers: request_headers.clone(),
+            client_type: client_type.to_owned(),
             ..Default::default()
         };
         crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
