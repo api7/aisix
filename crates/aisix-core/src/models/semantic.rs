@@ -5,10 +5,11 @@
 //! rather than by health/weight ([`Routing`](super::Routing)) or by
 //! fanning out to a panel ([`EnsembleConfig`](super::EnsembleConfig)).
 //!
-//! Per request the proxy embeds the newest user text (see below) via the
-//! `embedding_model`, scores it against each route's example embeddings
-//! (cosine, aggregated per route), and dispatches to the highest route
-//! whose score clears its threshold — or to `default` when none does.
+//! When `classifier` is omitted, the proxy embeds the newest user text
+//! (see below) via the `embedding_model`, scores it against each route's
+//! example embeddings (cosine, aggregated per route), and selects the
+//! highest-scoring route that meets its threshold. The router uses `default`
+//! when no route meets its threshold.
 //! Route example vectors are populated lazily during request handling and
 //! cached. A cold route request passes its prompt and every distinct uncached
 //! route-example text as one logical embedding batch. Providers without batch
@@ -59,9 +60,9 @@ pub enum Aggregation {
     Max,
 }
 
-/// One semantic route: a labeled set of example utterances whose
-/// embeddings define the route. A request that scores high enough against
-/// them dispatches to `target`.
+/// A named route and its target model or model group. Embedding routers
+/// match requests against the route's `examples`. A configured `classifier`
+/// uses the route's `description` to choose among routes.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct SemanticRoute {
     /// Operator-facing route label. Surfaced in access logs (e.g.
@@ -117,7 +118,7 @@ impl SemanticRoute {
     }
 }
 
-/// Matching parameters shared across every route in a semantic router.
+/// Matching parameters shared across the routes of an embedding-based router.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct SemanticMatch {
     /// Similarity metric. v1: cosine.
@@ -333,15 +334,20 @@ pub struct Semantic {
     /// `gemini_decision` requires 2 to 254 routes.
     #[schemars(length(min = 1))]
     pub routes: Vec<SemanticRoute>,
-    /// Alias of the direct model or model group used when no route clears
-    /// its threshold. Read only when `default_id` is absent.
+    /// Alias of the direct model or model group used when no route meets its
+    /// embedding similarity threshold or classifier confidence falls below
+    /// `min_confidence`. The router can also use this target when the selected
+    /// route's target is unavailable.
+    /// Read only when `default_id` is absent.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     #[schemars(length(min = 1))]
     pub default: String,
-    /// Resource id of the direct model or model group used when no route
-    /// clears its threshold. Present, it is authoritative and `default` is ignored,
-    /// so renaming that model keeps this router pointing at it with no
-    /// edit to this document.
+    /// Resource id of the direct model or model group used when no route meets
+    /// its embedding similarity threshold or classifier confidence falls below
+    /// `min_confidence`. The router can also use this target when the selected
+    /// route's target is unavailable. Present, it is authoritative and `default`
+    /// is ignored, so renaming that model keeps this router pointing at it with
+    /// no edit to this document.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub default_id: Option<String>,

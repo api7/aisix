@@ -945,12 +945,12 @@
           "description": "Route selection by a hosted decision model instead of embeddings. When set, `embedding_model`, `embedding_model_id`, `embedding_timeout_ms`, `on_embedding_failure` and `match` are not accepted, every route needs a `description` and takes no `examples` or `threshold`. When omitted, routes are matched by embedding similarity."
         },
         "default": {
-          "description": "Alias of the direct model or model group used when no route clears its threshold. Read only when `default_id` is absent.",
+          "description": "Alias of the direct model or model group used when no route meets its embedding similarity threshold or classifier confidence falls below `min_confidence`. The router can also use this target when the selected route's target is unavailable. Read only when `default_id` is absent.",
           "minLength": 1,
           "type": "string"
         },
         "default_id": {
-          "description": "Resource id of the direct model or model group used when no route clears its threshold. Present, it is authoritative and `default` is ignored, so renaming that model keeps this router pointing at it with no edit to this document.",
+          "description": "Resource id of the direct model or model group used when no route meets its embedding similarity threshold or classifier confidence falls below `min_confidence`. The router can also use this target when the selected route's target is unavailable. Present, it is authoritative and `default` is ignored, so renaming that model keeps this router pointing at it with no edit to this document.",
           "minLength": 1,
           "type": [
             "string",
@@ -1102,7 +1102,7 @@
     },
     "SemanticMatch": {
       "additionalProperties": false,
-      "description": "Matching parameters shared across every route in a semantic router.",
+      "description": "Matching parameters shared across the routes of an embedding-based router.",
       "properties": {
         "aggregation": {
           "allOf": [
@@ -1163,7 +1163,7 @@
           ]
         }
       ],
-      "description": "One semantic route: a labeled set of example utterances whose embeddings define the route. A request that scores high enough against them dispatches to `target`.",
+      "description": "A named route and its target model or model group. Embedding routers match requests against the route's `examples`. A configured `classifier` uses the route's `description` to choose among routes.",
       "properties": {
         "description": {
           "description": "What requests this route handles. With a `classifier`, this is the text the decision model reads to pick the route, and it is required. Without one, it is documentation only: routes are matched on `examples`.",
@@ -1642,7 +1642,7 @@
           "$ref": "#/definitions/Semantic"
         }
       ],
-      "description": "Semantic-routing configuration. When set, the gateway embeds the request and dispatches to the route whose examples it matches best, using that route's target Model for upstream dispatch."
+      "description": "Semantic-routing configuration. With `classifier`, a hosted decision model uses each route's `description` to pick a route. When `classifier` is omitted, the gateway compares the request embedding with route `examples` and picks the best match that meets its similarity threshold. The router can fall back to its default target when the selected route's target is unavailable."
     },
     "stream_timeout": {
       "description": "Maximum gap in milliseconds between upstream streaming chunks. `0` or absent falls back to the group's `stream_timeout`, then to the model's (or group's) `timeout`, then to the deployment-wide `upstream.stream_timeout_ms` / `timeout_ms` defaults.",

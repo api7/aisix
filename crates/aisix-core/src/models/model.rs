@@ -281,9 +281,12 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensemble: Option<EnsembleConfig>,
 
-    /// Semantic-routing configuration. When set, the gateway embeds the
-    /// request and dispatches to the route whose examples it matches best,
-    /// using that route's target Model for upstream dispatch.
+    /// Semantic-routing configuration. With `classifier`, a hosted decision
+    /// model uses each route's `description` to pick a route. When `classifier`
+    /// is omitted, the gateway compares the request embedding with route
+    /// `examples` and picks the best match that meets its similarity threshold.
+    /// The router can fall back to its default target when the selected route's
+    /// target is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic: Option<Semantic>,
 
