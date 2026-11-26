@@ -354,7 +354,7 @@
     },
     "SemanticMatch": {
       "additionalProperties": false,
-      "description": "Matching parameters shared across every route in a semantic router.",
+      "description": "Matching parameters shared across the routes of an embedding-based router.",
       "properties": {
         "aggregation": {
           "allOf": [
@@ -415,7 +415,7 @@
           ]
         }
       ],
-      "description": "One semantic route: a labeled set of example utterances whose embeddings define the route. A request that scores high enough against them dispatches to `target`.",
+      "description": "A named route and its target model or model group. Embedding routers match requests against the route's `examples`. A configured `classifier` uses the route's `description` to choose among routes.",
       "properties": {
         "description": {
           "description": "What requests this route handles. With a `classifier`, this is the text the decision model reads to pick the route, and it is required. Without one, it is documentation only: routes are matched on `examples`.",
@@ -503,12 +503,12 @@
       "description": "Route selection by a hosted decision model instead of embeddings. When set, `embedding_model`, `embedding_model_id`, `embedding_timeout_ms`, `on_embedding_failure` and `match` are not accepted, every route needs a `description` and takes no `examples` or `threshold`. When omitted, routes are matched by embedding similarity."
     },
     "default": {
-      "description": "Alias of the direct model or model group used when no route clears its threshold. Read only when `default_id` is absent.",
+      "description": "Alias of the direct model or model group used when no route meets its embedding similarity threshold or classifier confidence falls below `min_confidence`. Read only when `default_id` is absent.",
       "minLength": 1,
       "type": "string"
     },
     "default_id": {
-      "description": "Resource id of the direct model or model group used when no route clears its threshold. Present, it is authoritative and `default` is ignored, so renaming that model keeps this router pointing at it with no edit to this document.",
+      "description": "Resource id of the direct model or model group used when no route meets its embedding similarity threshold or classifier confidence falls below `min_confidence`. Present, it is authoritative and `default` is ignored, so renaming that model keeps this router pointing at it with no edit to this document.",
       "minLength": 1,
       "type": [
         "string",
