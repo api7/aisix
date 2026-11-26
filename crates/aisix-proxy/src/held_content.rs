@@ -894,9 +894,9 @@ pub(crate) fn responses_event_parts(v: &Value) -> Parts {
     p
 }
 
-/// An OpenAI chat-completions stream chunk: every choice's `delta.content`
-/// refusals, and tool-call arguments are scanned; `reasoning_content` (or
-/// the `reasoning` spelling some relays use) is reasoning.
+/// In an OpenAI chat-completions stream chunk, every choice's `delta.content`,
+/// refusals, and tool-call arguments are scanned. Count `reasoning_text`
+/// as reasoning when neither `reasoning_content` nor `reasoning` carries text.
 pub(crate) fn chat_chunk_parts(v: &Value) -> Parts {
     let mut p = Parts::default();
     for delta in v
@@ -929,8 +929,12 @@ pub(crate) fn chat_chunk_parts(v: &Value) -> Parts {
             p.scan_str(tc.get("custom").and_then(|c| c.get("input")));
         }
         p.scan_str(delta.get("function_call").and_then(|f| f.get("arguments")));
+        let reasoning_before = p.reasoning;
         p.reasoning_str(delta.get("reasoning_content"));
         p.reasoning_str(delta.get("reasoning"));
+        if p.reasoning == reasoning_before {
+            p.reasoning_str(delta.get("reasoning_text"));
+        }
     }
     p
 }

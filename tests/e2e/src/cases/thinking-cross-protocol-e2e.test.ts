@@ -65,21 +65,22 @@ function chatChunk(delta: Record<string, unknown>, finish: string | null = null)
   });
 }
 
-// The first chunk carries nothing but reasoning — no role, no content.
-const OPENAI_STREAM = [
-  chatChunk({ reasoning_content: REASONING_A }),
-  chatChunk({ reasoning_content: REASONING_B }),
-  chatChunk({ content: ANSWER }),
-  chatChunk({}, "stop"),
-  JSON.stringify({
-    id: "chatcmpl-think-s",
-    object: "chat.completion.chunk",
-    model: "deepseek-v4-pro",
-    choices: [],
-    usage: { prompt_tokens: 12, completion_tokens: 20, total_tokens: 32 },
-  }),
-  "[DONE]",
-];
+function chatReasoningStream(field: "reasoning_content" | "reasoning_text") {
+  return [
+    chatChunk({ [field]: REASONING_A }),
+    chatChunk({ [field]: REASONING_B }),
+    chatChunk({ content: ANSWER }),
+    chatChunk({}, "stop"),
+    JSON.stringify({
+      id: "chatcmpl-think-s",
+      object: "chat.completion.chunk",
+      model: "deepseek-v4-pro",
+      choices: [],
+      usage: { prompt_tokens: 12, completion_tokens: 20, total_tokens: 32 },
+    }),
+    "[DONE]",
+  ];
+}
 
 const ANTHROPIC_NON_STREAM = {
   id: "msg_think",
@@ -167,7 +168,7 @@ interface SseEvent {
   data: Record<string, any>;
 }
 
-function parseAnthropicSse(raw: string): SseEvent[] {
+function parseNamedSse(raw: string): SseEvent[] {
   const events: SseEvent[] = [];
   for (const frame of raw.split("\n\n")) {
     const lines = frame.split("\n");
@@ -195,9 +196,15 @@ describe("thinking ↔ reasoning_content across protocols (AISIX-Cloud#1784)", (
     oaiText: "think-oai-text",
     oaiTool: "think-oai-tool",
     oaiStream: "think-oai-stream",
+    oaiReasoningText: "think-oai-reasoning-text",
+    oaiReasoningTextStream: "think-oai-reasoning-text-stream",
     anthNonStream: "think-anth-nonstream",
     anthStream: "think-anth-stream",
   } as const;
+  const chatReasoningRequest = {
+    model: MODELS.oaiReasoningText,
+    messages: [{ role: "user", content: "say hi" }],
+  };
 
   beforeAll(async () => {
     const etcd = new EtcdClient();
@@ -226,17 +233,29 @@ describe("thinking ↔ reasoning_content across protocols (AISIX-Cloud#1784)", (
         "tool_calls",
       ),
     });
-    upstreams.oaiStream = await startOpenAiUpstream({ streamEvents: OPENAI_STREAM });
+    upstreams.oaiStream = await startOpenAiUpstream({
+      streamEvents: chatReasoningStream("reasoning_content"),
+    });
+    upstreams.oaiReasoningText = await startOpenAiUpstream({
+      nonStreamBody: chatCompletion(
+        { content: ANSWER, reasoning_text: REASONING_A + REASONING_B },
+        "stop",
+      ),
+    });
+    upstreams.oaiReasoningTextStream = await startOpenAiUpstream({
+      streamEvents: chatReasoningStream("reasoning_text"),
+    });
     upstreams.anthNonStream = await startOpenAiUpstream({ nonStreamBody: ANTHROPIC_NON_STREAM });
     upstreams.anthStream = await startOpenAiUpstream({ streamEvents: ANTHROPIC_STREAM });
 
     app = await spawnApp();
     const seed = new SeedClient(etcd, app.etcdPrefix);
-    for (const key of ["oaiText", "oaiTool", "oaiStream"] as const) {
+    for (const key of ["oaiText", "oaiTool", "oaiStream", "oaiReasoningText", "oaiReasoningTextStream"] as const) {
       const pk = await seed.createProviderKey({
         display_name: `${MODELS[key]}-pk`,
         api_key: "sk-mock",
         api_base: `${upstreams[key]!.baseUrl}/v1`,
+        apis: {},
       });
       await seed.createModel({
         display_name: MODELS[key],
@@ -286,11 +305,11 @@ describe("thinking ↔ reasoning_content across protocols (AISIX-Cloud#1784)", (
     });
   }
 
-  test("/v1/messages non-streaming: reasoning becomes a leading thinking block before text", async (ctx) => {
+  test.for([MODELS.oaiText, MODELS.oaiReasoningText])("/v1/messages non-streaming with %s: reasoning becomes a leading thinking block", async (model, ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     await ready();
     const res = await post("/v1/messages", {
-      model: MODELS.oaiText,
+      model,
       max_tokens: 256,
       messages: [{ role: "user", content: "say hi" }],
     });
@@ -319,17 +338,17 @@ describe("thinking ↔ reasoning_content across protocols (AISIX-Cloud#1784)", (
     expect(body.content[1]).toMatchObject({ id: "call_1", name: "get_time", input: { tz: "UTC" } });
   });
 
-  test("/v1/messages streaming: a reasoning-first stream opens with message_start, then a thinking block, then text", async (ctx) => {
+  test.for([MODELS.oaiStream, MODELS.oaiReasoningTextStream])("/v1/messages streaming with %s: a thinking block precedes text", async (model, ctx) => {
     if (!etcdReachable || !app) return ctx.skip();
     await ready();
     const res = await post("/v1/messages", {
-      model: MODELS.oaiStream,
+      model,
       max_tokens: 256,
       stream: true,
       messages: [{ role: "user", content: "say hi" }],
     });
     expect(res.status).toBe(200);
-    const events = parseAnthropicSse(await res.text());
+    const events = parseNamedSse(await res.text());
     const summary = events.map((e) => {
       switch (e.event) {
         case "content_block_start":
@@ -363,6 +382,66 @@ describe("thinking ↔ reasoning_content across protocols (AISIX-Cloud#1784)", (
     expect(thinking).toBe(REASONING_A + REASONING_B);
     const text = events.find((e) => e.data.delta?.type === "text_delta")!;
     expect(text.data.delta.text).toBe(ANSWER);
+  });
+
+  test("/v1/responses streaming: reasoning_text becomes reasoning summary deltas before output text", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    await ready();
+    const res = await post("/v1/responses", {
+      model: MODELS.oaiReasoningTextStream,
+      input: "say hi",
+      stream: true,
+    });
+    expect(res.status).toBe(200);
+    const deltas = parseNamedSse(await res.text())
+      .filter(({ event }) => event === "response.reasoning_summary_text.delta" || event === "response.output_text.delta")
+      .map(({ event, data }) => [event, data.delta]);
+    expect(deltas).toEqual([
+      ["response.reasoning_summary_text.delta", REASONING_A],
+      ["response.reasoning_summary_text.delta", REASONING_B],
+      ["response.output_text.delta", ANSWER],
+    ]);
+    expect(upstreams.oaiReasoningTextStream.receivedRequests.at(-1)?.path).toBe("/v1/chat/completions");
+  });
+
+  test("/v1/responses non-streaming: reasoning_text becomes a leading reasoning item", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    await ready();
+    const res = await post("/v1/responses", { model: MODELS.oaiReasoningText, input: "say hi" });
+    expect(res.status).toBe(200);
+    expect((await res.json()).output).toMatchObject([
+      { type: "reasoning", summary: [{ type: "summary_text", text: REASONING_A + REASONING_B }] },
+      { type: "message", content: [{ type: "output_text", text: ANSWER }] },
+    ]);
+  });
+
+  test("/v1/chat/completions non-streaming: reasoning_text and reasoning_content are returned", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    await ready();
+    const res = await post("/v1/chat/completions", chatReasoningRequest);
+    expect(res.status).toBe(200);
+    expect((await res.json()).choices[0].message).toMatchObject({
+      content: ANSWER,
+      reasoning_text: REASONING_A + REASONING_B,
+      reasoning_content: REASONING_A + REASONING_B,
+    });
+  });
+
+  test("/v1/chat/completions streaming: reasoning_text and reasoning_content precede output text", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    await ready();
+    const res = await post("/v1/chat/completions", {
+      ...chatReasoningRequest,
+      model: MODELS.oaiReasoningTextStream,
+      stream: true,
+    });
+    expect(res.status).toBe(200);
+    const deltas = parseChatSse(await res.text()).map((chunk) => chunk.choices[0]?.delta);
+    expect(deltas.slice(0, 3)).toMatchObject([
+      { reasoning_text: REASONING_A, reasoning_content: REASONING_A },
+      { reasoning_text: REASONING_B, reasoning_content: REASONING_B },
+      { content: ANSWER },
+    ]);
   });
 
   test("/v1/messages history: assistant thinking replays upstream as reasoning_content", async (ctx) => {

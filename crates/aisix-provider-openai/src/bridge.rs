@@ -2218,11 +2218,9 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     #[tokio::test]
     async fn chat_stream_extracts_reasoning_field_onto_canonical_slot() {
         let server = MockServer::builder().start().await;
-        // Upstream chunk uses `delta.thinking` (hypothetical vendor
-        // shape); after extract_reasoning_field the parsed chunk's
-        // delta should have reasoning_content="step1".
+        // The configured path takes precedence over all built-in fields.
         let sse = "\
-data: {\"id\":\"cmpl-r\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"thinking\":\"step1\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-r\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"thinking\":\"step1\",\"reasoning_content\":\"canonical\",\"reasoning\":\"legacy\",\"reasoning_text\":\"fallback\"},\"finish_reason\":null}]}\n\n\
 data: [DONE]\n\n";
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
