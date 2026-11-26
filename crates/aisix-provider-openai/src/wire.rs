@@ -428,24 +428,9 @@ fn choice_into_parts(
             );
         }
     }
-    // #466: surface DeepSeek-reasoner's reasoning_content on the
-    // non-streaming path. Stashed in `extra` so render.rs's
-    // RenderedMessage (which flattens `extra`) emits it as
-    // `message.reasoning_content` on the wire — matching the
-    // streaming path's `delta.reasoning_content`. Skip empty
-    // strings so a model that returns `""` doesn't add a noise
-    // field.
-    //
-    // #648: normalise OpenRouter's `message.reasoning` into the same
-    // canonical `reasoning_content` slot. The DeepSeek-canonical
-    // `reasoning_content` takes precedence when present; otherwise we
-    // fall back to OpenRouter's `reasoning`.
-    let reasoning_text = c
-        .message
-        .reasoning_content
-        .filter(|s| !s.is_empty())
-        .or(c.message.reasoning.filter(|s| !s.is_empty()));
-    if let Some(reasoning) = reasoning_text {
+    if let Some(reasoning) =
+        chat_reasoning_text(c.message.reasoning_content, c.message.reasoning, &extra)
+    {
         extra.insert(
             "reasoning_content".to_string(),
             serde_json::Value::String(reasoning),
@@ -480,6 +465,24 @@ fn choice_into_parts(
         turn_finish_reason(c.finish_reason.as_deref(), has_tool_calls),
         c.logprobs.filter(|l| !l.is_null()),
     )
+}
+
+fn chat_reasoning_text(
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    reasoning_content
+        .filter(|s| !s.is_empty())
+        .or_else(|| reasoning.filter(|s| !s.is_empty()))
+        .or_else(|| {
+            // Keep the original extension available to Chat Completions clients.
+            extra
+                .get("reasoning_text")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        })
 }
 
 pub fn into_usage(u: OpenAiUsage) -> UsageStats {
@@ -745,7 +748,7 @@ impl ChoiceToolCallIndexer {
 /// them in order: each chunk holds an optional reasoning run followed by an
 /// optional text run, which every renderer writes in that order.
 ///
-/// A `reasoning_content` (or `reasoning`) field wins over reasoning parts,
+/// A non-empty reasoning field wins over reasoning parts,
 /// as it does on a non-streamed answer (`ChatMessage::reasoning_text`),
 /// and leads the text. Reasoning parts are read through
 /// [`aisix_gateway::chat::reasoning_part_text`]; a part-array delta with
@@ -810,15 +813,8 @@ pub fn stream_chunk_into_chat_chunks(
         .flat_map(|(position, c)| {
             let choice_index = c.index.unwrap_or(position as u32);
             let indexer = tool_call_indexer.choice(choice_index);
-            // #648 canonical precedence, mirrored on the streaming path
-            // (#502): DeepSeek-canonical `reasoning_content` wins; fall
-            // back to OpenRouter's `reasoning`. Skip empties so a model
-            // that streams `""` doesn't emit a noise field.
-            let reasoning_field = c
-                .delta
-                .reasoning_content
-                .filter(|s| !s.is_empty())
-                .or(c.delta.reasoning.filter(|s| !s.is_empty()));
+            let reasoning_field =
+                chat_reasoning_text(c.delta.reasoning_content, c.delta.reasoning, &c.delta.extra);
             let mut chunks: Vec<ChatChunk> = delta_runs(reasoning_field, c.delta.content)
                 .into_iter()
                 .map(|(reasoning_content, content)| ChatChunk {
@@ -1504,7 +1500,8 @@ mod tests {
                     "role": "assistant",
                     "content": "ok",
                     "reasoning_content": "canonical thoughts",
-                    "reasoning": "aggregator thoughts"
+                    "reasoning": "aggregator thoughts",
+                    "reasoning_text": "fallback thoughts"
                 },
                 "finish_reason": "stop"
             }],
@@ -1543,7 +1540,8 @@ mod tests {
                     "role": "assistant",
                     "content": "",
                     "reasoning_content": "",
-                    "reasoning": "real openrouter thoughts"
+                    "reasoning": "real openrouter thoughts",
+                    "reasoning_text": "fallback thoughts"
                 },
                 "finish_reason": "stop"
             }],
@@ -1783,7 +1781,7 @@ mod tests {
             "model": "x",
             "choices": [{
                 "index": 0,
-                "delta": {"reasoning_content": "canonical", "reasoning": "fallback"},
+                "delta": {"reasoning_content": "canonical", "reasoning": "legacy", "reasoning_text": "fallback"},
                 "finish_reason": null
             }]
         }"#;
@@ -1799,13 +1797,13 @@ mod tests {
             "model": "x",
             "choices": [{
                 "index": 0,
-                "delta": {"reasoning_content": "", "reasoning": "fallback"},
+                "delta": {"reasoning_content": "", "reasoning": "legacy", "reasoning_text": "fallback"},
                 "finish_reason": null
             }]
         }"#;
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
         let chunk = first_chunk(raw, &mut ToolCallIndexer::default()).unwrap();
-        assert_eq!(chunk.delta.reasoning_content.as_deref(), Some("fallback"));
+        assert_eq!(chunk.delta.reasoning_content.as_deref(), Some("legacy"));
     }
 
     #[test]
