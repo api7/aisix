@@ -7,9 +7,9 @@
 //!
 //! When `classifier` is omitted, the proxy embeds the newest user text
 //! (see below) via the `embedding_model`, scores it against each route's
-//! example embeddings (cosine, aggregated per route), and dispatches to
-//! the highest-scoring route that meets its threshold or to `default` when
-//! none does.
+//! example embeddings (cosine, aggregated per route), and selects the
+//! highest-scoring route that meets its threshold. The router uses `default`
+//! when no route meets its threshold.
 //! Route example vectors are populated lazily during request handling and
 //! cached. A cold route request passes its prompt and every distinct uncached
 //! route-example text as one logical embedding batch. Providers without batch
@@ -336,16 +336,18 @@ pub struct Semantic {
     pub routes: Vec<SemanticRoute>,
     /// Alias of the direct model or model group used when no route meets its
     /// embedding similarity threshold or classifier confidence falls below
-    /// `min_confidence`.
+    /// `min_confidence`. The router can also use this target when the selected
+    /// route's target is unavailable.
     /// Read only when `default_id` is absent.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     #[schemars(length(min = 1))]
     pub default: String,
     /// Resource id of the direct model or model group used when no route meets
     /// its embedding similarity threshold or classifier confidence falls below
-    /// `min_confidence`. Present, it is authoritative and `default` is ignored,
-    /// so renaming that model keeps this router pointing at it with no edit to
-    /// this document.
+    /// `min_confidence`. The router can also use this target when the selected
+    /// route's target is unavailable. Present, it is authoritative and `default`
+    /// is ignored, so renaming that model keeps this router pointing at it with
+    /// no edit to this document.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub default_id: Option<String>,

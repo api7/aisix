@@ -945,12 +945,12 @@
           "description": "Route selection by a hosted decision model instead of embeddings. When set, `embedding_model`, `embedding_model_id`, `embedding_timeout_ms`, `on_embedding_failure` and `match` are not accepted, every route needs a `description` and takes no `examples` or `threshold`. When omitted, routes are matched by embedding similarity."
         },
         "default": {
-          "description": "Alias of the direct model or model group used when no route meets its embedding similarity threshold or classifier confidence falls below `min_confidence`. Read only when `default_id` is absent.",
+          "description": "Alias of the direct model or model group used when no route meets its embedding similarity threshold or classifier confidence falls below `min_confidence`. The router can also use this target when the selected route's target is unavailable. Read only when `default_id` is absent.",
           "minLength": 1,
           "type": "string"
         },
         "default_id": {
-          "description": "Resource id of the direct model or model group used when no route meets its embedding similarity threshold or classifier confidence falls below `min_confidence`. Present, it is authoritative and `default` is ignored, so renaming that model keeps this router pointing at it with no edit to this document.",
+          "description": "Resource id of the direct model or model group used when no route meets its embedding similarity threshold or classifier confidence falls below `min_confidence`. The router can also use this target when the selected route's target is unavailable. Present, it is authoritative and `default` is ignored, so renaming that model keeps this router pointing at it with no edit to this document.",
           "minLength": 1,
           "type": [
             "string",
@@ -1642,7 +1642,7 @@
           "$ref": "#/definitions/Semantic"
         }
       ],
-      "description": "Semantic-routing configuration. With `classifier`, a hosted decision model uses each route's `description` to pick a route. When `classifier` is omitted, the gateway compares the request embedding with route `examples` and picks the best match that meets its similarity threshold. The selected route's target handles the request."
+      "description": "Semantic-routing configuration. With `classifier`, a hosted decision model uses each route's `description` to pick a route. When `classifier` is omitted, the gateway compares the request embedding with route `examples` and picks the best match that meets its similarity threshold. The router can fall back to its default target when the selected route's target is unavailable."
     },
     "stream_timeout": {
       "description": "Maximum gap in milliseconds between upstream streaming chunks. `0` or absent falls back to the group's `stream_timeout`, then to the model's (or group's) `timeout`, then to the deployment-wide `upstream.stream_timeout_ms` / `timeout_ms` defaults.",
