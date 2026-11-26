@@ -53,6 +53,8 @@ const OPEN_TAIL_ROUTE = "cap-open-tail-passthrough";
 const CUMULATIVE_TAIL_ROUTE = "cap-cumulative-tail-passthrough";
 const OPEN_CUMULATIVE_TAIL_ROUTE = "cap-open-cumulative-tail-passthrough";
 const COMPLETE_FRAME_ROUTE = "cap-complete-frame-passthrough";
+const REASONING_ROUTE = "cap-reasoning-text";
+const DUPLICATE_REASONING_ROUTE = "cap-duplicate-reasoning-text";
 
 // 30 pieces of 100 bytes: three times the tight cap, far under the loose one.
 const TIGHT_CAP = 1_000;
@@ -72,6 +74,22 @@ const chatStream = (pieces: string[]) => [
   chatChunk({ role: "assistant" }),
   ...pieces.map((p) => chatChunk({ content: p })),
   chatChunk({}, "stop"),
+  "[DONE]",
+];
+
+const LARGE_REASONING = "r".repeat(TIGHT_CAP + 1);
+const REASONING_STREAM = [
+  chatChunk({ reasoning_content: "", reasoning: "", reasoning_text: LARGE_REASONING }),
+  chatChunk({ content: "Answer" }, "stop"),
+  "[DONE]",
+];
+
+// Both fragments fit under the cap. Counting either alias a second time exceeds it.
+const SHORT_REASONING = "r".repeat(450);
+const DUPLICATE_REASONING_STREAM = [
+  chatChunk({ reasoning_content: SHORT_REASONING, reasoning_text: SHORT_REASONING }),
+  chatChunk({ reasoning: SHORT_REASONING, reasoning_text: SHORT_REASONING }),
+  chatChunk({ content: "Answer" }, "stop"),
   "[DONE]",
 ];
 
@@ -290,6 +308,21 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
     });
     await attachBoth("passthrough_route", route.id);
 
+    for (const [name, stream] of [
+      [REASONING_ROUTE, REASONING_STREAM],
+      [DUPLICATE_REASONING_ROUTE, DUPLICATE_REASONING_STREAM],
+    ] as const) {
+      const backing = await model(name, "openai", stream);
+      await attachBoth("model", backing.model.id);
+      const reasoningRoute = await seed.createPassthroughRoute({
+        name,
+        path_prefix: `/passthrough/${name}`,
+        target_url: `${backing.upstream.baseUrl}/v1`,
+        provider_key_id: backing.pk.id,
+      });
+      await attachBoth("passthrough_route", reasoningRoute.id);
+    }
+
     const tailUp = await startOpenAiUpstream({
       rawStreamFrames: UNTERMINATED_TAIL_STREAM,
       // Ensure the prefix is available to the relay before the closing
@@ -397,7 +430,7 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
         "content-type": "application/json",
         authorization: `Bearer ${KEY}`,
         "x-api-key": KEY,
-        "anthropic-version": "2023-06-01",
+        ...(path === "/v1/messages" ? { "anthropic-version": "2023-06-01" } : {}),
       },
       body: JSON.stringify({ ...body, stream: true }),
     });
@@ -472,6 +505,28 @@ describe("a stream refused by the hold-back cap names the row whose cap it outgr
     expect(body).toContain("output_buffer_exceeded");
     expect(body).not.toContain(PIECES[29]);
     await expectCapHit("passthrough", (l) => l.get("passthrough_route_name") === ROUTE, TIGHT);
+  });
+
+  test("reasoning_text reaches the same content cap on Chat and passthrough", async (ctx) => {
+    if (!etcdReachable || !app || !sls) return ctx.skip();
+    expect(await chat(REASONING_ROUTE)).toContain("output_buffer_exceeded");
+
+    const body = await post(`/passthrough/${REASONING_ROUTE}/chat/completions`, {
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: "go" }],
+    });
+    expect(body).toContain("output_buffer_exceeded");
+    expect(body).not.toContain(LARGE_REASONING);
+    await expectCapHit("passthrough reasoning", (l) => l.get("passthrough_route_name") === REASONING_ROUTE, TIGHT);
+  });
+
+  test("passthrough route: reasoning_text alongside existing reasoning fields is relayed without tripping the cap", async (ctx) => {
+    if (!etcdReachable || !app) return ctx.skip();
+    const body = await post(`/passthrough/${DUPLICATE_REASONING_ROUTE}/chat/completions`, {
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: "go" }],
+    });
+    expect(body).toBe(DUPLICATE_REASONING_STREAM.map((payload) => `data: ${payload}\n\n`).join(""));
   });
 
   test("passthrough route: an unterminated last frame past the raw bound fails closed", async (ctx) => {
