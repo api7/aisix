@@ -2519,6 +2519,48 @@ mod tests {
         assert_eq!(ev.error_class, "transport", "{ev:?}");
         assert_eq!(ev.model_id, "m-rt");
         assert_eq!(ev.requested_model_id, "m-rt");
+        assert!(ev.provider_key_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fun_asr_command_rejected_before_upgrade_omits_provider_key_id() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let snap = snapshot(
+            &format!("http://{}", upstream.local_addr().unwrap()),
+            "openai",
+            "alibaba",
+        );
+        let (addr, _state, mut rx) = serve(snap).await;
+        let mut req = format!("ws://{addr}/api-ws/v1/inference")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        ws.send(TgMessage::Text(
+            serde_json::json!({
+                "header": { "action": "run-task", "task_id": uuid::Uuid::new_v4() },
+                "payload": {
+                    "task_group": "audio", "task": "asr", "function": "recognition", "model": "rt-model",
+                },
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        ws.send(TgMessage::Binary(vec![0; 4])).await.unwrap();
+
+        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("usage event expected")
+            .expect("sink closed");
+        assert_eq!(ev.status_code, 400, "{ev:?}");
+        assert_eq!(
+            ev.error_message,
+            "request payload is invalid: expected task-started before audio or finish-task"
+        );
+        assert_eq!(ev.model_id, "m-rt");
+        assert!(ev.provider_key_id.is_empty());
     }
 
     #[tokio::test]
@@ -2637,6 +2679,7 @@ mod tests {
         assert_eq!(ev.requested_model, "rt-model");
         assert_eq!(ev.requested_model_id, "m-rt");
         assert_eq!(ev.api_key_id, "k-1");
+        assert_eq!(ev.provider_key_id, PK_ID);
     }
 
     /// `/v1/realtime` builds its upstream handshake by hand rather than

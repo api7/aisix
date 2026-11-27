@@ -1087,6 +1087,15 @@ pub(crate) struct UsageAttribution<'a> {
     provider_key_id: &'a str,
 }
 
+impl UsageAttribution<'_> {
+    pub(crate) fn with_provider_key_if(mut self, known: bool) -> Self {
+        if !known {
+            self.provider_key_id = "";
+        }
+        self
+    }
+}
+
 /// Keep the attempt's resource ID separate from the metric label, which
 /// can also name a key on a cache hit or refusal and has a sentinel value.
 pub(crate) fn usage_attribution<'a>(

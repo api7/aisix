@@ -686,12 +686,15 @@ impl Task {
         };
         usage::apply_pk_telemetry(&mut event, &pk);
         usage::apply_caller_identity(&mut event, auth.jwt.as_ref(), &auth.caller());
+        // A client frame can end the task while the handshake is still pending.
+        let attribution = usage::usage_attribution(&model_label, &pk)
+            .with_provider_key_if(crate::attribution::observed_upstream_response());
         usage::emit_usage(
             state,
             &snap,
             crate::operation::TRANSCRIPTION,
             event,
-            usage::usage_attribution(&model_label, &pk),
+            attribution,
             self.capture.as_ref().map(|(content, _)| content),
             client.trace.as_ref(),
             true,
