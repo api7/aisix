@@ -256,7 +256,7 @@
           "type": "string"
         },
         {
-          "description": "A rolling window. Usage is recorded in sub-buckets aligned to a fixed step: 10 seconds for `rpm` and `tpm`, 5 minutes for `rph`, and 1 hour for `rpd` and `tpd`. A request is checked against the sum of the current sub-bucket and the preceding sub-buckets that cover one full window, so no window-length interval ever admits more than the limit. Usage leaves the count between one window and one window plus one step after it was recorded.",
+          "description": "A rolling window. Usage is recorded in sub-buckets aligned to a fixed step of 10 seconds for `rpm` and `tpm`, 5 minutes for `rph`, and 1 hour for `rpd` and `tpd`. The limiter sums the current sub-bucket and the preceding sub-buckets that cover a full window. For request-count limits, it counts requests at admission and admits at most the limit in any interval of that length. For token limits, it rejects new requests when recorded usage reaches the limit. Tokens are added after completion, so admitted requests can push usage above the limit. Usage leaves the count between one window and one window plus one step after it was recorded.",
           "enum": [
             "sliding"
           ],

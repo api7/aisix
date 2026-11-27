@@ -59,11 +59,12 @@ pub enum RoutingStrategy {
     /// after failure.
     #[default]
     Failover,
-    /// Rank targets cheapest-first by the target model's resolved price
-    /// (combined input+output per-1K), then fall forward. A target is
-    /// priced by the `pricing` document its `pricing_key` names, or by
-    /// its inline `cost` when it names none; a target with no price at
-    /// all ranks last.
+    /// Rank targets by their resolved price (combined input and output cost
+    /// per 1,000 tokens), lowest first, and use that order for fallback.
+    /// The gateway looks up `pricing_key` in the environment's pricing
+    /// documents first, then in the shared catalog. If the key is absent or
+    /// matches no document, the gateway uses the model's inline `cost`.
+    /// Targets with no price rank last.
     LeastCost,
     /// Rank targets fastest-first by a moving average of recent observed
     /// upstream latency (time-to-first-token for streaming), then fall
