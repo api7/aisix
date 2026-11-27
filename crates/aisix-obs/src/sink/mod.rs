@@ -33,7 +33,10 @@ pub(crate) use record::is_mcp;
 pub use record::{CapturedContent, EventBatch, SinkContent, SinkRecord, SCHEMA_VERSION};
 pub use redact::ErrorRedactor;
 pub use sls::{resolve_sls_credential, AliyunSlsSink};
-pub use truncate::{omit_base64_media, omit_base64_media_in_json};
+pub use truncate::{
+    omit_base64_media, omit_base64_media_in_json, omit_base64_media_in_json_lines,
+    omit_base64_media_in_response_json, omit_base64_media_in_sse,
+};
 
 use std::time::Duration;
 

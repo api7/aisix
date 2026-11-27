@@ -9,7 +9,9 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use aisix_gateway::media_fetch::{fetch_urls, Encoding};
-use aisix_gateway::{BridgeContext, BridgeError, NativeMessages};
+use aisix_gateway::{
+    BridgeContext, BridgeError, NativeMessages, UpstreamBodyFormat, UpstreamBodyTap,
+};
 use aisix_provider_anthropic::platform::{self, Platform};
 use aws_sdk_bedrockruntime::error::SdkError;
 use aws_sdk_bedrockruntime::primitives::Blob;
@@ -85,6 +87,7 @@ impl BedrockBridge {
             .await
             .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
 
+        let capture = aisix_gateway::tap_upstream_body(true, UpstreamBodyFormat::JsonLines);
         // The first event is awaited here, before the response is committed,
         // so an exception Bedrock raises before any content (a throttle is
         // the common one) fails this attempt and the caller can fail over.
@@ -98,9 +101,16 @@ impl BedrockBridge {
             None => resp.body.recv().await,
         };
         let first = match first {
-            Ok(Some(event)) => event_bytes(event),
+            Ok(Some(event)) => event_bytes(event, capture.as_deref()),
             Ok(None) => return Err(BridgeError::StreamAborted),
-            Err(e) => return Err(stream_error(&e).into_bridge_error()),
+            Err(e) => {
+                if let (Some(capture), Some(payload)) =
+                    (&capture, crate::errors::stream_error_payload(&e))
+                {
+                    capture.push_json_frame(payload);
+                }
+                return Err(stream_error(&e).into_bridge_error());
+            }
         };
         let frames = async_stream::stream! {
             if let Some(frame) = first {
@@ -109,12 +119,15 @@ impl BedrockBridge {
             loop {
                 match resp.body.recv().await {
                     Ok(Some(event)) => {
-                        if let Some(frame) = event_bytes(event) {
+                        if let Some(frame) = event_bytes(event, capture.as_deref()) {
                             yield Ok(frame);
                         }
                     }
                     Ok(None) => break,
                     Err(e) => {
+                        if let (Some(capture), Some(payload)) = (&capture, crate::errors::stream_error_payload(&e)) {
+                            capture.push_json_frame(payload);
+                        }
                         let err = stream_error(&e);
                         yield Ok(platform::error_frame(err.kind, &err.message));
                         break;
@@ -164,6 +177,7 @@ impl BedrockBridge {
             Err(BridgeError::UpstreamStatus {
                 status: 400 | 404, ..
             }) if model_id.to_ascii_lowercase().contains("claude") => {
+                aisix_gateway::response_tap::clear_upstream_body();
                 mantle_count_tokens(&body, model_id, ctx).await
             }
             Err(e) => Err(e),
@@ -258,7 +272,7 @@ async fn mantle_count_tokens(
     }
     let started = Instant::now();
     let resp = req.send().await.map_err(aisix_gateway::send_error)?;
-    aisix_gateway::note_upstream_response(resp.headers());
+    let resp = aisix_gateway::tap_upstream_response(resp);
     let status = resp.status();
     if !status.is_success() {
         let retry_after = aisix_gateway::parse_retry_after(resp.headers());
@@ -280,10 +294,7 @@ async fn mantle_count_tokens(
         )
         .with_body_read_error(body.read_error));
     }
-    let json: Value = resp
-        .json()
-        .await
-        .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?;
+    let json: Value = aisix_gateway::upstream_json(resp).await?;
     let tokens = json
         .get("input_tokens")
         .and_then(Value::as_u64)
@@ -295,11 +306,15 @@ async fn mantle_count_tokens(
 
 /// One stream event as an Anthropic SSE frame. A `chunk` carries the
 /// Anthropic event JSON itself.
-fn event_bytes(event: ResponseStream) -> Option<bytes::Bytes> {
-    match event {
-        ResponseStream::Chunk(part) => part.bytes.map(|b| platform::event_frame(b.as_ref())),
-        _ => None,
+fn event_bytes(event: ResponseStream, capture: Option<&UpstreamBodyTap>) -> Option<bytes::Bytes> {
+    let ResponseStream::Chunk(part) = event else {
+        return None;
+    };
+    let payload = part.bytes?;
+    if let Some(capture) = capture {
+        capture.push_json_frame(payload.as_ref());
     }
+    Some(platform::event_frame(payload.as_ref()))
 }
 
 /// An exception Bedrock raised inside the event stream, in Anthropic's

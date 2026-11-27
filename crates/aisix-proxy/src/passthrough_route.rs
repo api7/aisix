@@ -648,7 +648,7 @@ async fn dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    let resolved_chain = state.resolve_output_guardrails(&guardrail_ctx);
     *audit_out = resolved_chain.audit_log();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let output_guardrail_active = aisix_guardrails::Guardrail::runs_on_output(&resolved_chain);
@@ -1029,7 +1029,7 @@ async fn dispatch(
 
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
-    aisix_gateway::note_upstream_response(&resp_headers);
+    let upstream_resp = aisix_gateway::tap_upstream_response(upstream_resp);
     // Explicit `text/event-stream` only. Deliberately STRICTER than
     // `dispatch::upstream_body_is_sse`, which the typed relays use: a
     // passthrough route carries arbitrary REST traffic where most responses
@@ -1162,7 +1162,7 @@ async fn dispatch(
     // A non-SSE answer: the reqwest request carries no built-in timeout,
     // so the body read gets the exchange bound explicitly (same blackhole
     // guard as the send).
-    let body_fut = upstream_resp.bytes();
+    let body_fut = aisix_gateway::upstream_body(upstream_resp);
     let read = match exchange_timeout {
         Some(d) => match tokio::time::timeout(d, body_fut).await {
             Ok(r) => r,
@@ -1289,14 +1289,8 @@ async fn dispatch(
     if !status.is_success() {
         telemetry.keep_error_detail(&resp_body);
     }
-    if telemetry.content_cap.is_some() && !bypass_uninspectable_output {
-        telemetry.response_text = if status.is_success() {
-            response_capture_text(protocol, &resp_body)
-        } else if telemetry.error_body_encoded {
-            String::new()
-        } else {
-            String::from_utf8_lossy(&resp_body).into_owned()
-        };
+    if telemetry.content_cap.is_some() && !bypass_uninspectable_output && status.is_success() {
+        telemetry.response_text = response_capture_text(protocol, &resp_body);
     }
 
     let mut response = Response::builder()
@@ -5968,10 +5962,12 @@ fn guardrail_error_frame(
             unavailable,
         ));
     }
-    Bytes::from(format!(
+    let frame = format!(
         "event: error\ndata: {}\n\n",
         crate::error::guardrail_block_frame_payload(guardrail_name, unavailable)
-    ))
+    );
+    crate::error::note_client_error_frame(&frame);
+    Bytes::from(frame)
 }
 
 /// Whether a relayed chat-envelope frame is an Anthropic Messages event
@@ -6035,7 +6031,7 @@ fn stream_opaque_response(
         let _stream_hold = stream_hold;
         let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
         let mut upstream = Box::pin(crate::stream_timeout::with_read_timeout_bytes_signalled(
-            upstream_resp.bytes_stream(),
+            aisix_gateway::upstream_body_stream(upstream_resp),
             stream_read_timeout,
             read_timeout.clone(),
         ));
@@ -6060,16 +6056,8 @@ fn stream_opaque_response(
                         crate::attribution::note_upstream_first_frame();
                     }
                     telemetry.mark_first_delivery();
-                    // An opaque relay of a refusal is still that attempt's
-                    // upstream answer. A fail-open success stays uncaptured.
                     if !status.is_success() {
                         telemetry.keep_error_detail(&chunk);
-                        if let Some(cap) = telemetry.content_cap.filter(|_| !telemetry.error_body_encoded) {
-                            let room = cap.saturating_sub(telemetry.response_text.len());
-                            telemetry
-                                .response_text
-                                .push_str(&String::from_utf8_lossy(&chunk[..chunk.len().min(room)]));
-                        }
                     }
                     yield Ok::<_, std::convert::Infallible>(chunk);
                 }
@@ -6158,7 +6146,7 @@ fn stream_response(
         let _stream_hold = stream_hold;
         let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
         let mut upstream = Box::pin(crate::stream_timeout::with_read_timeout_bytes_signalled(
-            upstream_resp.bytes_stream(),
+            aisix_gateway::upstream_body_stream(upstream_resp),
             stream_read_timeout,
             read_timeout.clone(),
         ));

@@ -1167,9 +1167,8 @@ async fn run_session(
                 model_entry.value.cooldown.as_ref(),
                 connect_err,
             ));
-            let _ = client_tx
-                .send(AxMessage::Text(connect_failure_frame(&connect_err)))
-                .await;
+            let client_error_frame =
+                send_client_error_frame(&mut client_tx, connect_failure_frame(&connect_err)).await;
             let _ = client_tx
                 .send(AxMessage::Close(Some(CloseFrame {
                     code: 1011,
@@ -1249,8 +1248,8 @@ async fn run_session(
             event.provider_request_id = provider_request_id;
             let model = crate::usage_attr::usage_event_model_label(&snap, &requested_model);
             let unresolved_pk = crate::usage_attr::ResolvedPk::unresolved();
-            let labels = crate::usage_attr::usage_attribution(&model, &unresolved_pk);
-            if let Some(refused) = &refused {
+            let attribution = crate::usage_attr::usage_attribution(&model, &unresolved_pk);
+            let upstream_content = refused.as_ref().and_then(|refused| {
                 event.provider_key_id.clone_from(&pk_id);
                 let names = crate::client_ip::exported_header_names(&snap, true);
                 if !names.is_empty() {
@@ -1258,27 +1257,23 @@ async fn run_session(
                         aisix_gateway::capture_header_values(&refused.headers, &names);
                 }
                 event.upstream_latency_ms = crate::attempt::measured_ms(dial_started.elapsed());
-                let content = upstream_failure_content(&snap, &refused.body);
-                crate::usage_attr::emit_usage(
-                    &state,
-                    &snap,
-                    crate::operation::REALTIME,
-                    event,
-                    labels,
-                    content.as_ref(),
-                    client.trace.as_ref(),
-                    /* terminal */ true,
-                    /* dispatched */ true,
-                );
-                return;
-            }
-            crate::usage_attr::emit_prepared_usage_event(
+                failure_response_content(&snap, &refused.body)
+            });
+            let content = upstream_content.or_else(|| {
+                client_error_frame
+                    .as_deref()
+                    .and_then(|frame| failure_response_content(&snap, frame.as_bytes()))
+            });
+            crate::usage_attr::emit_usage(
                 &state,
                 &snap,
                 crate::operation::REALTIME,
                 event,
-                labels,
+                attribution,
+                content.as_ref(),
                 client.trace.as_ref(),
+                /* terminal */ true,
+                /* dispatched */ refused.is_some(),
             );
             return;
         }
@@ -1301,7 +1296,19 @@ async fn run_session(
     // (`downstream_remote_disconnect` and friends) the issue asks for
     // separately, which needs its own status decision.
     let mut session_error: Option<ProxyError> = None;
+    let mut client_error_frame = None;
     let mut opening = SessionOpening::default();
+    let mut captured = crate::usage_attr::content_cap(&state.snapshot.load())
+        .filter(|_| {
+            use aisix_guardrails::Guardrail;
+            !chain.redacts_output() && !chain.stream_output_policy().holds_back()
+        })
+        .map(|cap| {
+            (
+                aisix_obs::CapturedContent::new("", "", cap as usize),
+                cap as usize,
+            )
+        });
 
     loop {
         let next = async {
@@ -1345,7 +1352,8 @@ async fn run_session(
                         .await
                         {
                             let (resp, refusal) = resp;
-                            let _ = client_tx.send(AxMessage::Text(resp)).await;
+                            client_error_frame =
+                                send_client_error_frame(&mut client_tx, resp).await;
                             let _ = client_tx
                                 .send(AxMessage::Close(Some(CloseFrame {
                                     code: 1011,
@@ -1410,6 +1418,13 @@ async fn run_session(
                 Some(Ok(TgMessage::Text(text))) => {
                     usage.absorb(&text);
                     opening.observe(&state, &model_entry.id, Some(&text));
+                    if let Some((content, cap)) = captured
+                        .as_mut()
+                        .filter(|(content, _)| !content.response_truncated)
+                    {
+                        let frame = aisix_obs::sink::omit_base64_media_in_response_json(&text);
+                        content.append_response_frame(&frame, *cap);
+                    }
                     if !chain.is_empty() {
                         if let Some(resp) = guardrail_block_event(
                             &chain,
@@ -1421,7 +1436,8 @@ async fn run_session(
                         .await
                         {
                             let (resp, refusal) = resp;
-                            let _ = client_tx.send(AxMessage::Text(resp)).await;
+                            client_error_frame =
+                                send_client_error_frame(&mut client_tx, resp).await;
                             let _ = client_tx
                                 .send(AxMessage::Close(Some(CloseFrame {
                                     code: 1011,
@@ -1631,7 +1647,17 @@ async fn run_session(
         crate::usage_attr::usage_event_model_label(&snap, &event.requested_model).into_owned();
     let content = refusal_frame
         .as_deref()
-        .and_then(|frame| upstream_failure_content(&snap, frame.as_bytes()));
+        .and_then(|frame| failure_response_content(&snap, frame.as_bytes()))
+        .or_else(|| {
+            captured
+                .map(|(content, _)| content)
+                .filter(|_| session_error.is_some() && !event.guardrail_blocked)
+        })
+        .or_else(|| {
+            client_error_frame
+                .as_deref()
+                .and_then(|frame| failure_response_content(&snap, frame.as_bytes()))
+        });
     crate::usage_attr::emit_usage(
         &state,
         &snap,
@@ -1674,7 +1700,7 @@ async fn run_session(
 }
 
 /// The response column of a failure row, under a full-content export only.
-fn upstream_failure_content(
+fn failure_response_content(
     snap: &aisix_core::AisixSnapshot,
     body: &[u8],
 ) -> Option<aisix_obs::CapturedContent> {
@@ -1687,6 +1713,17 @@ fn upstream_failure_content(
         &String::from_utf8_lossy(body),
         cap as usize,
     ))
+}
+
+async fn send_client_error_frame<S>(client_tx: &mut S, frame: String) -> Option<String>
+where
+    S: futures::Sink<AxMessage> + Unpin,
+{
+    client_tx
+        .send(AxMessage::Text(frame.clone()))
+        .await
+        .is_ok()
+        .then_some(frame)
 }
 
 /// An upstream that completes the upgrade and then reports an error instead of

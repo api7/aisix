@@ -777,7 +777,7 @@ pub(crate) struct RequestAttribution {
     bodies: BodyCounters,
     internal_calls: Arc<InternalCallLedger>,
     user_agent: Option<Arc<crate::client_ip::InboundUserAgent>>,
-    /// The upstream response headers this request's exporters asked for.
+    /// The upstream response data the exporters asked for.
     /// See [`aisix_gateway::response_tap`].
     response_tap: Arc<aisix_gateway::ResponseHeaderTap>,
 }
@@ -798,14 +798,14 @@ impl RequestAttribution {
     pub(crate) fn new(
         user_agent: Arc<crate::client_ip::InboundUserAgent>,
         names: Vec<String>,
-        keeps_error_bodies: bool,
+        content_cap: Option<u32>,
         request_id: String,
     ) -> Self {
         Self {
             user_agent: Some(user_agent),
             response_tap: Arc::new(aisix_gateway::ResponseHeaderTap::new(
                 names,
-                keeps_error_bodies,
+                content_cap,
                 request_id,
             )),
             ..Self::default()
@@ -1757,6 +1757,33 @@ pub(crate) fn note_upstream_wait_unmeasured() {
     let _ = CURRENT.try_with(|a| a.lock().upstream_unmeasured = true);
 }
 
+/// Capture behind a separate task-local tap for each concurrent ensemble
+/// member. A streaming judge keeps the handle until its terminal emission.
+pub(crate) async fn capture_subcall_response<T, E>(
+    attempt_index: u32,
+    streaming: bool,
+    call: impl Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let tap = CURRENT
+        .try_with(|a| a.response_tap.for_subcall())
+        .ok()
+        .flatten();
+    let Some(tap) = tap else {
+        return call.await;
+    };
+    let result = aisix_gateway::response_tap::scope(tap.clone(), call).await;
+    if streaming || result.is_err() {
+        let mut response = tap.take();
+        response.headers.clear();
+        response.request_id.clear();
+        if !response.is_empty() {
+            let _ =
+                CURRENT.try_with(|a| a.lock().attempt_responses.insert(attempt_index, response));
+        }
+    }
+    result
+}
+
 /// What the upstream response of the attempt `attempt_index` names left —
 /// the exporters' headers and the provider's request id — moved out so each
 /// attempt's are reported once. An attempt the routing telemetry never
@@ -1767,14 +1794,20 @@ pub(crate) fn take_attempt_upstream_response(
     CURRENT
         .try_with(|a| {
             let mut cell = a.lock();
-            if let Some(stored) = cell.attempt_responses.remove(&attempt_index) {
-                return stored;
+            let mut response = match cell.attempt_responses.remove(&attempt_index) {
+                Some(stored) => stored,
+                None if cell.attempts_settled || cell.upstream_unmeasured => {
+                    return Default::default()
+                }
+                None => {
+                    drop(cell);
+                    a.response_tap.take()
+                }
+            };
+            if a.response_tap.protects_output() {
+                response.discard_success_body();
             }
-            if cell.attempts_settled || cell.upstream_unmeasured {
-                return Default::default();
-            }
-            drop(cell);
-            a.response_tap.take()
+            response
         })
         .unwrap_or_default()
 }

@@ -468,11 +468,16 @@ async fn send_upstream(
 
     let status = resp.status();
     let headers = resp.headers().clone();
-    aisix_gateway::note_upstream_response(&headers);
-    let bytes = resp.bytes().await;
+    // Jobs' output chain examines error bodies too. Only a completed scan
+    // can release one, even if the read or the scan ends early.
+    let bytes = if aisix_gateway::response_tap::upstream_output_is_protected() {
+        aisix_gateway::note_upstream_response(&headers);
+        resp.bytes().await
+    } else {
+        aisix_gateway::upstream_body(aisix_gateway::tap_upstream_response(resp)).await
+    };
     crate::attribution::note_upstream_wait_end(bytes.is_ok());
     if let (false, Ok(body)) = (status.is_success(), &bytes) {
-        aisix_gateway::note_upstream_error_body(body);
         crate::attribution::note_relayed_error_body(body);
     }
     let bytes = bytes
@@ -521,14 +526,9 @@ async fn scan_input_blob(
     // non-empty chain's set is the request's.
     applied: &mut Vec<aisix_core::AppliedGuardrail>,
 ) -> Result<(), ProxyError> {
-    let ctx = aisix_guardrails::RequestContext {
-        passthrough_route_id: "",
-        model_id: &target.model_entry.id,
-        mcp_server_id: "",
-        api_key_id: &auth.entry.id,
-        team_id: auth.key().team_id.as_deref(),
-    };
-    let chain = state.guardrail_index.resolve(&ctx);
+    let chain = state
+        .guardrail_index
+        .resolve(&job_guardrail_context(auth, target));
     if chain.is_empty() {
         return Ok(());
     }
@@ -574,15 +574,27 @@ async fn scan_input_blob(
     Ok(())
 }
 
+fn job_guardrail_context<'a>(
+    auth: &'a AuthenticatedKey,
+    target: &'a JobTarget,
+) -> aisix_guardrails::RequestContext<'a> {
+    aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
+        model_id: &target.model_entry.id,
+        mcp_server_id: "",
+        api_key_id: &auth.entry.id,
+        team_id: auth.key().team_id.as_deref(),
+    }
+}
+
 /// Run the resolved output-guardrail chain over an upstream body, as one
 /// synthetic assistant turn. The body is decoded best-effort and relayed
 /// as the provider sent it.
 #[allow(clippy::too_many_arguments)]
 async fn scan_output_blob(
-    state: &ProxyState,
-    auth: &AuthenticatedKey,
+    chain: &aisix_guardrails::GuardrailChain,
     target: &JobTarget,
-    blob: &[u8],
+    response: &(StatusCode, HeaderMap, Bytes),
     monitor_hits: &mut Vec<aisix_core::GuardrailMonitorHit>,
     // Accumulated rather than handed back as one handle: the input and
     // output scans resolve their own chain, so a request can produce two
@@ -596,17 +608,10 @@ async fn scan_output_blob(
     // non-empty chain's set is the request's.
     applied: &mut Vec<aisix_core::AppliedGuardrail>,
 ) -> Result<(), ProxyError> {
-    let ctx = aisix_guardrails::RequestContext {
-        passthrough_route_id: "",
-        model_id: &target.model_entry.id,
-        mcp_server_id: "",
-        api_key_id: &auth.entry.id,
-        team_id: auth.key().team_id.as_deref(),
-    };
-    let chain = state.guardrail_index.resolve(&ctx);
     if chain.is_empty() {
         return Ok(());
     }
+    let (status, headers, blob) = response;
     if applied.is_empty() {
         *applied = chain.applied().to_vec();
     }
@@ -621,7 +626,7 @@ async fn scan_output_blob(
         service_tier: None,
     };
     let (verdict, hits) =
-        aisix_guardrails::Guardrail::check_output_unmaskable_observed(&chain, &synth).await;
+        aisix_guardrails::Guardrail::check_output_unmaskable_observed(chain, &synth).await;
     monitor_hits.extend(hits);
     // See `scan_input_blob`.
     enforced_hits.extend(chain.enforced_hits());
@@ -649,6 +654,9 @@ async fn scan_output_blob(
             guardrail_name.as_deref(),
             unavailable.as_deref(),
         ));
+    }
+    if !status.is_success() && aisix_gateway::response_tap::upstream_output_is_protected() {
+        aisix_gateway::response_tap::note_checked_http_error_body(headers, blob);
     }
     Ok(())
 }
@@ -1395,7 +1403,8 @@ pub(crate) async fn create_batch(
         crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_entry.id)?;
 
         let url = upstream_url(&target, "/batches", "")?;
-        let (status, resp_headers, bytes) = send_upstream(
+        let output_chain = state.resolve_output_guardrails(&job_guardrail_context(&auth, &target));
+        let response = send_upstream(
             &state,
             &target,
             Method::POST,
@@ -1405,10 +1414,9 @@ pub(crate) async fn create_batch(
         )
         .await?;
         scan_output_blob(
-            &state,
-            &auth,
+            &output_chain,
             &target,
-            &bytes,
+            &response,
             &mut monitor_hits,
             &mut enforced_hits,
             &mut scores,
@@ -1416,6 +1424,7 @@ pub(crate) async fn create_batch(
             &mut applied,
         )
         .await?;
+        let (status, resp_headers, bytes) = response;
         let model = target.display_name().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
@@ -1481,7 +1490,8 @@ pub(crate) async fn get_batch(
         crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_entry.id)?;
 
         let url = upstream_url(&target, &format!("/batches/{raw}"), "")?;
-        let (status, resp_headers, bytes) = send_upstream(
+        let output_chain = state.resolve_output_guardrails(&job_guardrail_context(&auth, &target));
+        let response = send_upstream(
             &state,
             &target,
             Method::GET,
@@ -1491,10 +1501,9 @@ pub(crate) async fn get_batch(
         )
         .await?;
         scan_output_blob(
-            &state,
-            &auth,
+            &output_chain,
             &target,
-            &bytes,
+            &response,
             &mut monitor_hits,
             &mut enforced_hits,
             &mut scores,
@@ -1502,6 +1511,7 @@ pub(crate) async fn get_batch(
             &mut applied,
         )
         .await?;
+        let (status, resp_headers, bytes) = response;
 
         // Batch cost attribution (#720): first observation of a completed
         // batch downloads the output JSONL and emits real token usage.
@@ -1702,7 +1712,8 @@ pub(crate) async fn create_ft_job(
         crate::budget::gate(&state, &snapshot).check_provider_key(&target.pk_entry.id)?;
 
         let url = upstream_url(&target, "/fine_tuning/jobs", "")?;
-        let (status, resp_headers, bytes) = send_upstream(
+        let output_chain = state.resolve_output_guardrails(&job_guardrail_context(&auth, &target));
+        let response = send_upstream(
             &state,
             &target,
             Method::POST,
@@ -1712,10 +1723,9 @@ pub(crate) async fn create_ft_job(
         )
         .await?;
         scan_output_blob(
-            &state,
-            &auth,
+            &output_chain,
             &target,
-            &bytes,
+            &response,
             &mut monitor_hits,
             &mut enforced_hits,
             &mut scores,
@@ -1723,6 +1733,7 @@ pub(crate) async fn create_ft_job(
             &mut applied,
         )
         .await?;
+        let (status, resp_headers, bytes) = response;
         let model = target.display_name().to_string();
         Ok((
             json_response(status, &resp_headers, bytes, Some(&model)),
@@ -1928,19 +1939,19 @@ async fn forward_simple(
             Some(b) => UpstreamBody::Json(b),
             None => UpstreamBody::Empty,
         };
-        let (status, resp_headers, bytes) =
-            send_upstream(&state, &target, spec.method, &url, body, &request_id).await?;
         // The files surface carries opaque payloads, not model output: an
         // uploaded batch file is thousands of independent requests and a
         // download is whatever the provider stored under an id. Screening
         // either as one synthetic message is #1120's job, per record,
         // through the ordinary request chain.
-        if surface != crate::operation::FILES {
+        let output_chain = (surface != crate::operation::FILES)
+            .then(|| state.resolve_output_guardrails(&job_guardrail_context(&auth, &target)));
+        let response = send_upstream(&state, &target, spec.method, &url, body, &request_id).await?;
+        if let Some(chain) = &output_chain {
             scan_output_blob(
-                &state,
-                &auth,
+                chain,
                 &target,
-                &bytes,
+                &response,
                 &mut monitor_hits,
                 &mut enforced_hits,
                 &mut scores,
@@ -1950,6 +1961,7 @@ async fn forward_simple(
             .await?;
         }
 
+        let (status, resp_headers, bytes) = response;
         let resp = if spec.relay_raw_body {
             let mut resp = Response::builder()
                 .status(status)

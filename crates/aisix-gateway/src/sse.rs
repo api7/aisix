@@ -113,6 +113,61 @@ pub fn split_frame_end(buf: &[u8]) -> Option<(usize, usize)> {
     Some((content_end, end))
 }
 
+/// Continue finding frame boundaries even when the caller no longer holds
+/// the frame's earlier bytes. The capture advances past an oversized event
+/// this way without buffering its payload or giving up on later events.
+#[derive(Debug)]
+pub(crate) struct FrameBoundary {
+    line_start: bool,
+    // A CR at the end of a chunk may be the first byte of CRLF. Keep it
+    // with its LF, if one follows, so the captured separator stays intact.
+    trailing_cr: Option<bool>,
+}
+
+impl Default for FrameBoundary {
+    fn default() -> Self {
+        Self {
+            line_start: true,
+            trailing_cr: None,
+        }
+    }
+}
+
+impl FrameBoundary {
+    pub(crate) fn next_end(&mut self, bytes: &[u8]) -> Option<usize> {
+        let mut from = 0;
+        if let Some(blank) = self.trailing_cr.take() {
+            from = usize::from(bytes.first() == Some(&b'\n'));
+            if blank {
+                return Some(from);
+            }
+        }
+        while let Some(at) = bytes[from..].iter().position(|&b| b == b'\r' || b == b'\n') {
+            let blank = self.line_start && at == 0;
+            self.line_start = true;
+            from += at + 1;
+            if bytes[from - 1] == b'\r' {
+                if from == bytes.len() {
+                    self.trailing_cr = Some(blank);
+                    return None;
+                }
+                from += usize::from(bytes[from] == b'\n');
+            }
+            if blank {
+                return Some(from);
+            }
+        }
+        if from < bytes.len() {
+            self.line_start = false;
+        }
+        None
+    }
+
+    pub(crate) fn ends_with_blank_cr(&self) -> bool {
+        self.trailing_cr == Some(true)
+    }
+}
+
 /// Incremental splitter: push network chunks in, take complete frames out.
 ///
 /// The scan resumes where the previous one stopped, so a frame that arrives

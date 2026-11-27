@@ -65,7 +65,7 @@ pub(crate) fn reject_before_dispatch(
     record_rejection(state, method, path, request_id, api_key_id, started, &err);
     match envelope {
         Envelope::OpenAi => err.into_response(),
-        Envelope::Gemini => err.into_gemini_response(),
+        Envelope::Gemini => err.gemini_response(),
         Envelope::Anthropic => err.into_anthropic_response(),
     }
 }

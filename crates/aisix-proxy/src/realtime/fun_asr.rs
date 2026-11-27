@@ -180,11 +180,11 @@ async fn serve(
         }
         let snap = state.snapshot.load();
         client.request_headers = crate::client_ip::capture_request_headers(&client.headers, &snap);
-        let cap = crate::usage_attr::content_cap(&snap).map(|n| n as usize);
+        let cap = crate::usage_attr::content_cap(&snap);
         let attribution = Arc::new(crate::attribution::RequestAttribution::new(
             client.user_agent.clone(),
             crate::client_ip::exported_header_names(&snap, true),
-            cap.is_some(),
+            cap,
             client.request_id.clone(),
         ));
         drop(snap);
@@ -195,7 +195,9 @@ async fn serve(
             dial_started: None,
             duration: 0.0,
             upstream_confirmed_id: false,
-            capture: cap.map(|cap| (aisix_obs::CapturedContent::new(&text, "", cap), cap)),
+            capture: cap
+                .map(|cap| cap as usize)
+                .map(|cap| (aisix_obs::CapturedContent::new(&text, "", cap), cap)),
             audit: Default::default(),
             hits: Vec::new(),
         };
@@ -559,16 +561,7 @@ impl Task {
                             .take()
                             .map(|(content, cap)| (content.with_response(&text, cap), cap));
                     } else if let Some((content, cap)) = &mut self.capture {
-                        if !content.response_truncated {
-                            if !content.response.is_empty() && content.response.len() < *cap {
-                                content.response.push('\n');
-                            }
-                            let end = text
-                                .floor_char_boundary(cap.saturating_sub(content.response.len()));
-                            content.response.push_str(&text[..end]);
-                            content.response_truncated = end < text.len();
-                            content.truncated |= content.response_truncated;
-                        }
+                        content.append_response_frame(&text, *cap);
                     }
                     let write = bounded(idle, None, ws.send(Message::Text(text))).await;
                     if let Some(end) = End::after_write(end, matches!(write, Ok(Ok(())))) {

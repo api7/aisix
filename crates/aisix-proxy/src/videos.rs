@@ -83,7 +83,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
-use crate::error::{ErrorEnvelope, ProxyError};
+use crate::error::{not_implemented_response, ProxyError};
 use crate::reject::AisixPath;
 use crate::state::ProxyState;
 
@@ -1049,9 +1049,8 @@ impl UnsupportedProvider {
         applied_guardrails: Vec<AppliedGuardrail>,
         monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     ) -> CreateSuccess {
-        let env = ErrorEnvelope::new(self.0.clone(), "not_implemented");
         CreateSuccess {
-            response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
+            response: not_implemented_response(self.0.clone()),
             provider: "unknown".into(),
             model_id,
             provider_key_id: String::new(),
@@ -1278,7 +1277,7 @@ fn provider_call_once<'a>(
             .send()
             .await
             .map_err(|e| note(crate::dispatch::reqwest_error_to_bridge(&e, started)))?;
-        aisix_gateway::note_upstream_response(resp.headers());
+        let resp = aisix_gateway::tap_upstream_response(resp);
         if !resp.status().is_success() {
             return Err(note(
                 aisix_gateway::upstream_status_parsed_from_response(
@@ -1289,8 +1288,7 @@ fn provider_call_once<'a>(
                 .await,
             ));
         }
-        let bytes = resp
-            .bytes()
+        let bytes = aisix_gateway::upstream_body(resp)
             .await
             .map_err(|e| note(aisix_gateway::upstream_body_read_error(&e)))?;
 
@@ -1429,7 +1427,10 @@ async fn proxy_content(
     let wrapped: std::pin::Pin<
         Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
     > = Box::pin(crate::request_id::in_request_span(
-        crate::stream_timeout::with_read_timeout_bytes(resp.bytes_stream(), stream_budget),
+        crate::stream_timeout::with_read_timeout_bytes(
+            aisix_gateway::upstream_body_stream(resp),
+            stream_budget,
+        ),
     ));
     let mut response = Response::new(axum::body::Body::from_stream(wrapped));
     let headers = response.headers_mut();

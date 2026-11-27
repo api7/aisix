@@ -71,7 +71,7 @@ pub(crate) async fn entry(
     };
     let auth = match AuthenticatedKey::from_request_parts(&mut parts, &state).await {
         Ok(auth) => auth,
-        Err(e) => return e.into_gemini_response(),
+        Err(e) => return e.gemini_response(),
     };
     let client = ClientContext::from_request_parts(&mut parts, &state)
         .await
@@ -291,6 +291,11 @@ pub(crate) fn stream_error(
     native: Option<&Value>,
 ) -> Event {
     if wire == Wire::OpenAi {
+        if aisix_gateway::wants_upstream_error_body() {
+            crate::attribution::note_client_error_body(format!(
+                "event: error\ndata: {payload}\n\n"
+            ));
+        }
         return Event::default().event("error").data(payload);
     }
     let body = native.cloned().unwrap_or_else(|| {
@@ -302,7 +307,11 @@ pub(crate) fn stream_error(
                 .unwrap_or("Stream failed"),
         )
     });
-    Event::default().data(body.to_string())
+    let body = body.to_string();
+    if aisix_gateway::wants_upstream_error_body() {
+        crate::attribution::note_client_error_body(format!("data: {body}\n\n"));
+    }
+    Event::default().data(body)
 }
 
 pub(crate) use request::{has_execution, policy_input, redact, translate, with_model_effort};

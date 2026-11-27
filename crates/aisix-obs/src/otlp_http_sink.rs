@@ -604,12 +604,7 @@ fn content_record(
     if mode != SlsContentMode::Full {
         return None;
     }
-    let captured = content?;
-    let mut sc = SinkContent::capture(&captured.prompt, &captured.response, max_bytes as usize);
-    sc.truncated = sc.truncated || captured.truncated;
-    sc.prompt_truncated = sc.prompt_truncated || captured.prompt_truncated;
-    sc.response_truncated = sc.response_truncated || captured.response_truncated;
-    sc.output = captured.output.clone();
+    let sc = content?.for_exporter(max_bytes as usize);
     Some(Arc::new(
         SinkRecord::metadata_only(event.clone())
             .with_content(sc)
@@ -2203,14 +2198,7 @@ mod tests {
             content_record(
                 &otlp_kind(SlsContentMode::Full, cap),
                 &event,
-                Some(&CapturedContent {
-                    prompt: prompt.clone(),
-                    response: "hello there".into(),
-                    truncated: false,
-                    prompt_truncated: false,
-                    response_truncated: false,
-                    output: None,
-                }),
+                Some(&CapturedContent::new(&prompt, "hello there", 4096)),
                 None,
                 None,
             )
@@ -2450,14 +2438,7 @@ mod tests {
     #[test]
     fn content_record_targets_only_full_capture_sls() {
         let event = sample_event();
-        let captured = CapturedContent {
-            prompt: "the prompt".into(),
-            response: "the response".into(),
-            truncated: false,
-            prompt_truncated: false,
-            response_truncated: false,
-            output: None,
-        };
+        let captured = CapturedContent::new("the prompt", "the response", 1024);
 
         // otlp on its default (metadata_only) never carries content, even
         // when content was captured.
@@ -2499,14 +2480,7 @@ mod tests {
         assert_eq!(rec.usage.request_id, "req-test-123");
 
         // Per-exporter cap truncates + flags.
-        let big = CapturedContent {
-            prompt: "a".repeat(500),
-            response: "ok".into(),
-            truncated: false,
-            prompt_truncated: false,
-            response_truncated: false,
-            output: None,
-        };
+        let big = CapturedContent::new(&"a".repeat(500), "ok", 1024);
         let rec = content_record(
             &sls_kind(SlsContentMode::Full, 16),
             &event,
@@ -2522,12 +2496,9 @@ mod tests {
         // Handler-side truncation propagates even when the per-exporter cap
         // did not cut.
         let pre = CapturedContent {
-            prompt: "short".into(),
-            response: "short".into(),
             truncated: true,
             prompt_truncated: true,
-            response_truncated: false,
-            output: None,
+            ..CapturedContent::new("short", "short", 1024)
         };
         let rec = content_record(&full, &event, Some(&pre), None, None).unwrap();
         assert!(
@@ -2601,14 +2572,7 @@ mod tests {
         // Content-bearing record (content_mode = full) of a payload that is
         // not a message list (the sample is an image generation): it rides
         // the bounded `aisix.content.*` keys, never a `gen_ai.*` message.
-        let captured = CapturedContent {
-            prompt: "what is 2+2?".into(),
-            response: "4".into(),
-            truncated: false,
-            prompt_truncated: false,
-            response_truncated: false,
-            output: None,
-        };
+        let captured = CapturedContent::new("what is 2+2?", "4", 1024);
         let rec = content_record(
             &otlp_kind(SlsContentMode::Full, 1024),
             &event,
@@ -2639,14 +2603,7 @@ mod tests {
         assert!(find("aisix.content_truncated").is_none());
 
         // Truncation (here: per-exporter cap cut the prompt) flags the span.
-        let big = CapturedContent {
-            prompt: "a".repeat(500),
-            response: "ok".into(),
-            truncated: false,
-            prompt_truncated: false,
-            response_truncated: false,
-            output: None,
-        };
+        let big = CapturedContent::new(&"a".repeat(500), "ok", 1024);
         let rec = content_record(
             &otlp_kind(SlsContentMode::Full, 16),
             &event,

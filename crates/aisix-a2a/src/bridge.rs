@@ -136,7 +136,7 @@ async fn read_capped(resp: reqwest::Response) -> Result<Vec<u8>, A2aError> {
             )));
         }
     }
-    let mut stream = resp.bytes_stream();
+    let mut stream = aisix_gateway::upstream_body_stream(resp);
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(read_error)?;
@@ -545,7 +545,7 @@ impl A2aBridge for HttpBridge {
             .send()
             .await
             .map_err(connect_error)?;
-        aisix_gateway::note_upstream_response(resp.headers());
+        let resp = aisix_gateway::tap_upstream_response(resp);
         if !resp.status().is_success() {
             // Surface the upstream STATUS only — never proxy the upstream error
             // body verbatim to the caller, which could leak upstream internals.
@@ -584,7 +584,7 @@ impl A2aBridge for HttpBridge {
         .await
         .map_err(|_| A2aError::Connect("timed out opening the upstream stream".to_string()))?
         .map_err(connect_error)?;
-        aisix_gateway::note_upstream_response(resp.headers());
+        let resp = aisix_gateway::tap_upstream_response(resp);
 
         if !resp.status().is_success() {
             // Status only — never proxy the upstream's error body, same as
@@ -633,7 +633,7 @@ impl A2aBridge for HttpBridge {
 /// event ends, rather than silently reporting a truncated task as complete.
 fn sse_events(resp: reqwest::Response) -> impl futures::Stream<Item = A2aEvent> + Send {
     async_stream::stream! {
-        let mut bytes = resp.bytes_stream();
+        let mut bytes = aisix_gateway::upstream_body_stream(resp);
         // Bound the whole event, including multiple data lines, rather than a
         // network chunk that may contain many small events.
         let mut frames = aisix_gateway::sse::SseFrameSplitter::new(MAX_SSE_EVENT_BYTES);

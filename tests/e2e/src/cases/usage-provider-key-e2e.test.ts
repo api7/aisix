@@ -128,11 +128,13 @@ describe("Provider Key IDs in managed usage telemetry", () => {
 
   test("each fallback attempt carries the ID of the credential it used", async (ctx) => {
     if (!app) return ctx.skip();
+    const before = upstreams.map((upstream) => upstream.receivedRequests.length);
     const res = await chat(GROUP, "hi");
     expect(res.status).toBe(200);
-    expect(upstreams.map((upstream) => upstream.receivedRequests.length)).toEqual([1, 1]);
-    expect(upstreams[0]!.receivedRequests[0]?.headers.authorization).toBe(`Bearer sk-${PRIMARY}`);
-    expect(upstreams[1]!.receivedRequests[0]?.headers.authorization).toBe(`Bearer sk-${FALLBACK}`);
+    const requests = upstreams.map((upstream, i) => upstream.receivedRequests.slice(before[i]!));
+    expect(requests.map((attempts) => attempts.length)).toEqual([1, 1]);
+    expect(requests[0]![0]?.headers.authorization).toBe(`Bearer sk-${PRIMARY}`);
+    expect(requests[1]![0]?.headers.authorization).toBe(`Bearer sk-${FALLBACK}`);
     const requestId = res.headers.get("x-aisix-request-id");
     expect(requestId).toBeTruthy();
     expect(await usageFor(requestId!)).toMatchObject([
