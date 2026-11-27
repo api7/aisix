@@ -3257,6 +3257,7 @@ fn failure_frames(
     if !terminal_sent {
         frames.push_str(&encoder.failed_event(failed_code, message).to_sse_string());
     }
+    crate::error::note_client_error_frame(&frames);
     bytes::Bytes::from(frames)
 }
 

@@ -630,7 +630,7 @@ async fn dispatch(
                                 crate::dispatch::reqwest_error_to_bridge(&e, send_started),
                             )
                         })?;
-                        aisix_gateway::note_upstream_response(upstream_resp.headers());
+                        let upstream_resp = aisix_gateway::tap_upstream_response(upstream_resp);
 
                         let status = upstream_resp.status();
                         if !status.is_success() {
@@ -643,14 +643,16 @@ async fn dispatch(
                         }
 
                         let upstream_headers = upstream_resp.headers().clone();
-                        let body_bytes = upstream_resp.bytes().await.map_err(|e| {
-                            crate::cooldown::note_failure(
-                                tracker,
-                                model_id,
-                                cooldown_cfg,
-                                aisix_gateway::upstream_body_read_error(&e),
-                            )
-                        })?;
+                        let body_bytes = aisix_gateway::upstream_body(upstream_resp)
+                            .await
+                            .map_err(|e| {
+                                crate::cooldown::note_failure(
+                                    tracker,
+                                    model_id,
+                                    cooldown_cfg,
+                                    aisix_gateway::upstream_body_read_error(&e),
+                                )
+                            })?;
                         Ok((upstream_headers, body_bytes))
                     }
                 }

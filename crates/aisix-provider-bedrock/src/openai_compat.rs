@@ -447,7 +447,7 @@ async fn send(
             .map_err(aisix_gateway::send_error)
     })
     .await?;
-    aisix_gateway::note_upstream_response(resp.headers());
+    let resp = aisix_gateway::tap_upstream_response(resp);
     if !resp.status().is_success() {
         return Err(
             aisix_gateway::upstream_error_within(deadline, resp, |resp| http_error(resp, started))
@@ -491,7 +491,7 @@ pub(crate) async fn chat_stream(
 ) -> Result<ChatChunkStream, BridgeError> {
     let (resp, _, _) = send(&endpoint, req, ctx, model_id, true).await?;
     let request_id = request_id_header(resp.headers());
-    let byte_stream = resp.bytes_stream();
+    let byte_stream = aisix_gateway::upstream_sse_stream(resp);
     let stream = async_stream::try_stream! {
         let mut decoder = SseDecoder::new();
         let mut indexer = ToolCallIndexer::default();

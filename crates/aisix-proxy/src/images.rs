@@ -14,7 +14,6 @@ use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeCapability, BridgeError};
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::Value;
@@ -23,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
-use crate::error::{ErrorEnvelope, ProxyError};
+use crate::error::{not_implemented_response, ProxyError};
 use crate::state::ProxyState;
 
 /// Per-request payload from a successful dispatch — carries the
@@ -575,9 +574,8 @@ async fn dispatch(
             reservation
                 .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
                 .await;
-            let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(ImageDispatchSuccess {
-                response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
+                response: not_implemented_response(e.to_string()),
                 provider: provider_label,
                 model_id: target.id.clone(),
                 provider_key_id: pk_id.clone(),
