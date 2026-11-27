@@ -327,15 +327,13 @@ async fn screen_input(
     body: &mut Value,
     screening: &mut InputScreening,
 ) -> Result<(), ProxyError> {
-    let chain = state
-        .guardrail_index
-        .resolve(&aisix_guardrails::RequestContext {
-            passthrough_route_id: "",
-            model_id: model_entry_id,
-            mcp_server_id: "",
-            api_key_id: &auth.entry.id,
-            team_id: auth.key().team_id.as_deref(),
-        });
+    let chain = state.resolve_guardrails(&aisix_guardrails::RequestContext {
+        passthrough_route_id: "",
+        model_id: model_entry_id,
+        mcp_server_id: "",
+        api_key_id: &auth.entry.id,
+        team_id: auth.key().team_id.as_deref(),
+    });
     screening.applied = chain.applied().to_vec();
     screening.audit = chain.audit_log();
     if chain.is_empty() {
@@ -959,7 +957,7 @@ async fn count_tokens_to_target(
             )
         })
         .map_err(ProxyError::Bridge)?;
-    aisix_gateway::note_upstream_response(upstream_resp.headers());
+    let upstream_resp = aisix_gateway::tap_upstream_response(upstream_resp);
 
     let status = upstream_resp.status();
 
@@ -975,8 +973,7 @@ async fn count_tokens_to_target(
     // Forward the `{"input_tokens": <int>}` response body verbatim — the
     // gateway adds nothing to the token-counting contract.
     let upstream_headers = upstream_resp.headers().clone();
-    let body_bytes = upstream_resp
-        .bytes()
+    let body_bytes = aisix_gateway::upstream_body(upstream_resp)
         .await
         .map_err(|e| {
             crate::cooldown::note_failure(

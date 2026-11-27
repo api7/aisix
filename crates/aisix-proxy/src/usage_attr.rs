@@ -609,15 +609,12 @@ fn is_failure_row(event: &UsageEvent) -> bool {
     event.status_code >= 400 || !event.error_class.is_empty()
 }
 
-/// What a failure row exports (AISIX-Cloud#1921): the request body and
-/// the attempt's upstream response body, or, for an attempt no upstream
-/// answered, the gateway's own error body, except on a `499`, which went to
-/// no one. `None` for any other row, whose
-/// `content` stands as given.
+/// A failure's own upstream body takes precedence over assembled output and
+/// over the gateway's actual reply. A 499 was never sent to the caller.
 fn failure_row_content(
     event: &UsageEvent,
     content: Option<&aisix_obs::CapturedContent>,
-    upstream_body: Option<&[u8]>,
+    upstream_body: Option<&aisix_gateway::CapturedUpstreamBody>,
     terminal: bool,
     cap: usize,
 ) -> Option<aisix_obs::CapturedContent> {
@@ -625,16 +622,22 @@ fn failure_row_content(
         return None;
     }
     let (noted_request, noted_error) = crate::attribution::failure_notes();
-    let row = match content {
-        Some(c) if !c.prompt.is_empty() => c.clone(),
-        given => {
-            // A bodyless request's note says nothing; `given` may hold a response.
-            let request = noted_request
-                .filter(|noted| !noted.prompt.is_empty())
-                .or_else(|| given.cloned());
-            request.unwrap_or_else(|| aisix_obs::CapturedContent::new("", "", cap))
+    let mut row = content
+        .cloned()
+        .unwrap_or_else(|| aisix_obs::CapturedContent::new("", "", cap));
+    if let (true, Some(request)) = (row.prompt.is_empty(), noted_request) {
+        row.prompt = request.prompt;
+        row.prompt_truncated = request.prompt_truncated;
+        row.truncated |= request.prompt_truncated;
+    }
+    if let Some(body) = upstream_body {
+        if let Some(text) = exportable_upstream_text(body) {
+            let mut row = row.with_response(&text, cap);
+            row.response_truncated |= body.truncated;
+            row.truncated |= body.truncated;
+            return Some(row);
         }
-    };
+    }
     if !row.response.is_empty() {
         return Some(row);
     }
@@ -645,19 +648,41 @@ fn failure_row_content(
         .as_ref()
         .and_then(aisix_obs::OutputCapture::parts_json)
         .map(|parts| serde_json::Value::Array(parts).to_string());
-    let response = match (delivered, upstream_body.filter(|b| !b.is_empty())) {
-        (Some(delivered), _) => delivered,
-        (None, Some(body)) => String::from_utf8_lossy(body).into_owned(),
-        // The caller left: nothing was sent to report.
-        (None, None) if event.status_code == crate::CLIENT_CLOSED_REQUEST => return Some(row),
-        (None, None) => noted_error.filter(|_| terminal).unwrap_or_else(|| {
-            serde_json::json!({
-                "error": { "message": event.error_message, "type": event.error_class }
-            })
-            .to_string()
-        }),
+    let response = delivered
+        .or(noted_error.filter(|_| terminal && event.status_code != crate::CLIENT_CLOSED_REQUEST));
+    Some(match response {
+        Some(response) => row.with_response(&response, cap),
+        None => row,
+    })
+}
+
+fn exportable_upstream_text(
+    body: &aisix_gateway::CapturedUpstreamBody,
+) -> Option<std::borrow::Cow<'_, str>> {
+    let text = match std::str::from_utf8(&body.bytes) {
+        Ok(text) => text,
+        // The cap or a failed read can stop in the middle of a character.
+        Err(err) if err.error_len().is_none() => {
+            std::str::from_utf8(&body.bytes[..err.valid_up_to()]).ok()?
+        }
+        Err(_) => return None,
     };
-    Some(row.with_response(&response, cap))
+    if text.is_empty()
+        || text
+            .bytes()
+            .any(|byte| byte.is_ascii_control() && !b"\t\r\n".contains(&byte))
+    {
+        return None;
+    }
+    use aisix_gateway::UpstreamBodyFormat;
+    Some(match body.format {
+        UpstreamBodyFormat::Sse => aisix_obs::sink::omit_base64_media_in_sse(text),
+        UpstreamBodyFormat::JsonLines => aisix_obs::sink::omit_base64_media_in_json_lines(text),
+        UpstreamBodyFormat::Text if text.lines().any(|line| line.starts_with("data:")) => {
+            aisix_obs::sink::omit_base64_media_in_sse(text)
+        }
+        UpstreamBodyFormat::Text => aisix_obs::sink::omit_base64_media_in_response_json(text),
+    })
 }
 
 /// Emit ONE zero-token `UsageEvent` for a FAILED request on a non-chat handler
@@ -1172,10 +1197,20 @@ pub(crate) fn emit_usage(
     if is_failure_row(&event) && event.error_message.trim().is_empty() {
         event.error_message = aisix_obs::request_failed_message(event.status_code);
     }
-    let mut upstream_error_body = None;
+    // Some error rows are deliberately emitted without an upstream span.
+    // Their attempt may still have consumed a body before the read failed.
+    let keeps_failure_body = is_failure_row(&event) && !event.guardrail_blocked;
+    let mut response = if dispatched || keeps_failure_body {
+        crate::attribution::take_attempt_upstream_response(event.attempt_index)
+    } else {
+        Default::default()
+    };
+    let upstream_body = if keeps_failure_body {
+        response.take_body()
+    } else {
+        None
+    };
     if dispatched {
-        let response = crate::attribution::take_attempt_upstream_response(event.attempt_index);
-        upstream_error_body = response.error_body;
         // A surface that runs detached from the request scope (`/v1/realtime`)
         // read its own off the upgrade response.
         if event.upstream_response_headers.is_empty() {
@@ -1283,7 +1318,7 @@ pub(crate) fn emit_usage(
             failure_row_content(
                 &event,
                 content,
-                upstream_error_body.as_deref(),
+                upstream_body.as_ref(),
                 terminal,
                 cap as usize,
             )

@@ -196,11 +196,15 @@ fn base64_omitted(original_bytes: usize) -> String {
 /// `data` on an `image` / `audio` block beside its `mimeType`, or `resource.blob`
 /// on an embedded `resource`.
 pub fn omit_base64_media(v: &mut Value) -> bool {
+    omit_media(v, false)
+}
+
+fn omit_media(v: &mut Value, response: bool) -> bool {
     match v {
         Value::String(s) => omit_data_uri(s),
         Value::Array(items) => items
             .iter_mut()
-            .fold(false, |changed, item| omit_base64_media(item) | changed),
+            .fold(false, |changed, item| omit_media(item, response) | changed),
         Value::Object(map) => {
             let mut changed = match map.get("type").and_then(Value::as_str) {
                 Some("image" | "audio")
@@ -232,6 +236,12 @@ pub fn omit_base64_media(v: &mut Value) -> bool {
                 Some("image_generation_call") => {
                     map.get_mut("result").is_some_and(omit_bare_base64)
                 }
+                Some("response.audio.delta" | "response.output_audio.delta") if response => {
+                    map.get_mut("delta").is_some_and(omit_bare_base64)
+                }
+                Some("redacted_thinking") if response => {
+                    map.get_mut("data").is_some_and(omit_bare_base64)
+                }
                 _ => false,
             };
             for (key, child) in map.iter_mut() {
@@ -240,6 +250,10 @@ pub fn omit_base64_media(v: &mut Value) -> bool {
                         omit_bare_base64(child)
                     }
                     "file" => child.get_mut("file_data").is_some_and(omit_bare_base64),
+                    "choices" if response => omit_response_audio(child),
+                    "reasoningContent" if response => child
+                        .get_mut("redactedContent")
+                        .is_some_and(omit_bare_base64),
                     "inlineData" | "inline_data"
                         if child.get("mimeType").is_some() || child.get("mime_type").is_some() =>
                     {
@@ -251,7 +265,7 @@ pub fn omit_base64_media(v: &mut Value) -> bool {
                         .is_some_and(omit_bare_base64),
                     _ => false,
                 };
-                changed |= omit_base64_media(child);
+                changed |= omit_media(child, response);
             }
             changed
         }
@@ -322,6 +336,14 @@ const CUT_MEDIA_MARKERS: [&str; 11] = [
     "\"image_generation_call\"",
 ];
 
+const RESPONSE_MEDIA_MARKERS: [&str; 5] = [
+    "\"audio\"",
+    "\"response.audio.delta\"",
+    "\"response.output_audio.delta\"",
+    "\"redacted_thinking\"",
+    "\"redactedContent\"",
+];
+
 /// Where ASCII `needle` first occurs in `s`, in any case. An ASCII match always
 /// starts on a character boundary.
 fn find_ignore_ascii_case(s: &str, needle: &str) -> Option<usize> {
@@ -334,15 +356,39 @@ fn find_ignore_ascii_case(s: &str, needle: &str) -> Option<usize> {
 /// media comes back untouched, byte for byte. Text that does not parse has no
 /// fields to walk, so it is cut at the first media marker it shows.
 pub fn omit_base64_media_in_json(s: &str) -> Cow<'_, str> {
-    if !MEDIA_NEEDLES
+    omit_base64_media_in_serialized(s, false)
+}
+
+/// The upstream's response may also carry OpenAI audio output.
+pub fn omit_base64_media_in_response_json(s: &str) -> Cow<'_, str> {
+    omit_base64_media_in_serialized(s, true)
+}
+
+fn contains_media_marker(s: &str, response: bool) -> bool {
+    let response_markers = if response {
+        RESPONSE_MEDIA_MARKERS.as_slice()
+    } else {
+        &[]
+    };
+    MEDIA_NEEDLES
         .iter()
+        .chain(response_markers)
         .any(|needle| find_ignore_ascii_case(s, needle).is_some())
-    {
+}
+
+fn omit_base64_media_in_serialized(s: &str, response: bool) -> Cow<'_, str> {
+    if !contains_media_marker(s, response) {
         return Cow::Borrowed(s);
     }
     let Ok(mut root) = serde_json::from_str::<Value>(s) else {
+        let response_markers = if response {
+            RESPONSE_MEDIA_MARKERS.as_slice()
+        } else {
+            &[]
+        };
         return match CUT_MEDIA_MARKERS
             .iter()
+            .chain(response_markers)
             .filter_map(|marker| find_ignore_ascii_case(s, marker))
             .min()
         {
@@ -350,10 +396,82 @@ pub fn omit_base64_media_in_json(s: &str) -> Cow<'_, str> {
             None => Cow::Borrowed(s),
         };
     };
-    if !omit_base64_media(&mut root) {
+    if !omit_media(&mut root, response) {
         return Cow::Borrowed(s);
     }
     Cow::Owned(root.to_string())
+}
+
+fn omit_response_audio(choices: &mut Value) -> bool {
+    let mut changed = false;
+    if let Some(choices) = choices.as_array_mut() {
+        for choice in choices {
+            for field in ["message", "delta"] {
+                changed |= choice
+                    .get_mut(field)
+                    .and_then(|message| message.pointer_mut("/audio/data"))
+                    .is_some_and(omit_bare_base64);
+            }
+        }
+    }
+    changed
+}
+
+pub fn omit_base64_media_in_json_lines(s: &str) -> Cow<'_, str> {
+    if !contains_media_marker(s, true) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::new();
+    for line in s.split_inclusive('\n') {
+        let payload = line.strip_suffix('\n').unwrap_or(line);
+        out.push_str(&omit_base64_media_in_response_json(payload));
+        if payload.len() < line.len() {
+            out.push('\n');
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Keep the original SSE frames unless a data payload carries media. Omit
+/// that media without dropping the rest of the response's events.
+pub fn omit_base64_media_in_sse(s: &str) -> Cow<'_, str> {
+    if !contains_media_marker(s, true) {
+        return Cow::Borrowed(s);
+    }
+    let mut rest = s;
+    let mut out = String::new();
+    let mut changed = false;
+    while !rest.is_empty() {
+        let end = aisix_gateway::sse::find_frame_end(rest.as_bytes()).unwrap_or(rest.len());
+        let (frame, tail) = rest.split_at(end);
+        rest = tail;
+        let fields = aisix_gateway::sse::parse_frame(frame.as_bytes());
+        if let Some(payload) = fields.data.as_deref() {
+            let payload = std::str::from_utf8(payload).expect("SSE payload from UTF-8 input");
+            if let Cow::Owned(replacement) = omit_base64_media_in_response_json(payload) {
+                let mut from = 0;
+                for (i, range) in aisix_gateway::sse::data_ranges(frame.as_bytes())
+                    .into_iter()
+                    .enumerate()
+                {
+                    out.push_str(&frame[from..range.start]);
+                    if i == 0 {
+                        out.push_str(&replacement);
+                    }
+                    from = range.end;
+                }
+                out.push_str(&frame[from..]);
+                changed = true;
+                continue;
+            }
+        }
+        out.push_str(frame);
+    }
+    if changed {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(s)
+    }
 }
 
 /// Cap one string value. Base64 data URIs carry no information a log

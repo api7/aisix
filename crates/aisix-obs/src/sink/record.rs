@@ -141,11 +141,16 @@ impl SinkContent {
                 enc.tool_call_result = enc.raw_response.take();
             }
         } else if let Some(wire) = crate::genai::PromptWire::for_operation(&event.operation) {
+            let include_output = event.status_code < 400 && event.error_class.is_empty();
             let structured = crate::genai::structured_content(
                 wire,
                 if prompt_whole { &self.prompt } else { "" },
-                if response_whole { &self.response } else { "" },
-                output,
+                if response_whole && include_output {
+                    &self.response
+                } else {
+                    ""
+                },
+                output.filter(|_| include_output),
                 &event.finish_reason,
             );
             let input_fits = structured.input_messages.as_deref().is_some_and(fits)
@@ -204,6 +209,20 @@ impl CapturedContent {
         self.response_truncated = cut;
         self.truncated = self.prompt_truncated || cut;
         self
+    }
+
+    /// Append a text frame to a bounded response transcript.
+    pub fn append_response_frame(&mut self, frame: &str, max_bytes: usize) {
+        if self.response_truncated {
+            return;
+        }
+        if !self.response.is_empty() && self.response.len() < max_bytes {
+            self.response.push('\n');
+        }
+        let end = frame.floor_char_boundary(max_bytes.saturating_sub(self.response.len()));
+        self.response.push_str(&frame[..end]);
+        self.response_truncated = end < frame.len();
+        self.truncated |= self.response_truncated;
     }
 
     /// Capture `prompt` and `response`, truncating each to `max_bytes`

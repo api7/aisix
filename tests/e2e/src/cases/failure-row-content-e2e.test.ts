@@ -7,7 +7,10 @@ import { WebSocket as WsClient } from "ws";
 import {
   EtcdClient,
   SeedClient,
+  eventStream,
+  eventStreamException,
   expectFailureRowsNamed,
+  invokeChunk,
   slsLogsFor,
   spawnApp,
   startMcpUpstream,
@@ -38,6 +41,33 @@ const FULL = "failure-row-full";
 const META = "failure-row-meta";
 const CAPPED = "failure-row-capped";
 const CAPPED_MAX_BYTES = 2048;
+const RESPONSES_DELTA = `event: response.output_text.delta\r\ndata: ${JSON.stringify({
+  type: "response.output_text.delta", item_id: "msg_1", output_index: 0,
+  content_index: 0, delta: "partial Responses answer", sequence_number: 2,
+})}\r\n\r\n`;
+const RESPONSES_FAILED = `event: response.failed\r\ndata: ${JSON.stringify({
+  type: "response.failed", sequence_number: 3,
+  response: { id: "resp_failed", object: "response", status: "failed", error: null, output: [], custom: { trace: "provider-raw" } },
+})}\r\n\r\n`;
+const CHAT_STREAM_ERROR = `data: ${JSON.stringify({
+  error: { message: "sentinel-in-band", code: 500, metadata: { provider_request: null } },
+})}\n\n`;
+const IN_BAND_JSON = { error: { message: "provider whole-body error", code: 502, metadata: { ticket: null } } };
+const INVALID_JSON = '{"provider_answer":"readable but cut before the closing quote';
+const TIMEOUT_PREFIX = '{"error":{"message":"provider began the error body';
+const OUTPUT_EMAIL = "private-output@example.com";
+const RESPONSE_MEDIA = "cHJpdmF0ZS1pbWFnZS1wYXlsb2Fk";
+const MEDIA_FRAME = `event: response.image_generation_call.partial_image\ndata: ${JSON.stringify({
+  type: "response.image_generation_call.partial_image", sequence_number: 1,
+  item_id: "img_1", output_index: 0, partial_image_index: 0, partial_image_b64: RESPONSE_MEDIA,
+})}\n\n`;
+const LONG_DELTA = RESPONSES_DELTA.replace("partial Responses answer", "内容".repeat(600));
+const BEDROCK_EXCEPTION = { message: "Bedrock stream throttled", provider_details: { hint: null } };
+const ANTHROPIC_START = {
+  type: "message_start",
+  message: { id: "msg_native", model: "claude", role: "assistant", content: [], usage: { input_tokens: 5, output_tokens: 0 } },
+};
+const ANTHROPIC_DELTA = { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "partial Bedrock response" } };
 
 const NO_DETAIL = (status: number) =>
   `upstream returned HTTP ${status} with no error detail in the response`;
@@ -64,27 +94,31 @@ describe("failure rows carry request and response bodies", () => {
   async function failingModel(
     name: string,
     opts: Parameters<typeof startOpenAiUpstream>[0],
-  ): Promise<void> {
+    { translateResponses = false, streamTimeout }: { translateResponses?: boolean; streamTimeout?: number } = {},
+  ): Promise<string> {
     const upstream = await startOpenAiUpstream(opts);
     upstreams.push(upstream);
     const pk = await seed.createProviderKey({
       display_name: `${name}-pk`,
       api_key: "sk-mock",
       api_base: `${upstream.baseUrl}/v1`,
+      ...(translateResponses ? { apis: {} } : {}),
     });
-    await seed.createModel({
+    const model = await seed.createModel({
       display_name: name,
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: pk.id,
       cooldown: { enabled: false },
+      stream_timeout: streamTimeout,
     });
+    return model.id;
   }
 
   /** An upstream answering every path and method the same way. */
   async function fixedUpstream(
     status: number,
-    body: string,
+    body: string | Buffer,
     responseHeaders: Record<string, string> = { "content-type": "application/json" },
   ): Promise<string> {
     const server = createServer((req, res) => {
@@ -245,6 +279,14 @@ describe("failure rows carry request and response bodies", () => {
         targets: [{ model: "row-first-fails" }, { model: "row-ok" }],
       },
     });
+    await seed.createModel({
+      display_name: "row-ensemble-fails",
+      ensemble: {
+        panel: [{ model: "row-first-fails" }, { model: "row-second-fails" }],
+        judge: { model: "row-ok" },
+        min_responses: 1,
+      },
+    });
     const delta = (content: string) =>
       JSON.stringify({
         id: "c",
@@ -259,8 +301,36 @@ describe("failure rows carry request and response bodies", () => {
       eventDelayMs: 100,
     });
     await failingModel("row-in-band", {
-      streamEvents: [JSON.stringify({ error: { message: "sentinel-in-band", code: 500 } })],
+      rawStreamFrames: [CHAT_STREAM_ERROR],
+    }, { translateResponses: true });
+    await failingModel("row-responses-late", {
+      rawStreamFrames: [RESPONSES_DELTA, RESPONSES_FAILED],
+      eventDelayMs: 75,
     });
+    await failingModel("row-json-error", { nonStreamBody: IN_BAND_JSON });
+    await failingModel("row-invalid-json", { rawContentType: "application/json", rawBody: INVALID_JSON });
+    await failingModel("row-timeout-after-error-head", {
+      status: 503, rawErrorBodyChunks: [TIMEOUT_PREFIX], eventDelayMs: 1_500,
+    }, { streamTimeout: 350 });
+    await failingModel("row-responses-media", {
+      rawStreamFrames: [MEDIA_FRAME, LONG_DELTA, RESPONSES_FAILED],
+    });
+    const maskedModel = await failingModel("row-responses-masked", {
+      rawStreamFrames: [RESPONSES_DELTA.replace("partial Responses answer", OUTPUT_EMAIL), RESPONSES_FAILED],
+    });
+    const blockedModel = await failingModel("row-responses-blocked", {
+      rawStreamFrames: [RESPONSES_DELTA, RESPONSES_FAILED],
+    });
+    const outputMask = await seed.createGuardrail({
+      name: "row-output-mask", kind: "pii", hook_point: "output",
+      detectors: [{ type: "email", action: "mask" }],
+    }, { attach: false });
+    const outputBlock = await seed.createGuardrail({
+      name: "row-output-block", kind: "keyword", hook_point: "output",
+      patterns: [{ kind: "literal", value: "partial Responses answer" }],
+    }, { attach: false });
+    await seed.attachGuardrailToModel(outputMask.id, maskedModel);
+    await seed.attachGuardrailToModel(outputBlock.id, blockedModel);
     // Configured, and not on the caller's list.
     await failingModel("row-unlisted", { status: 400 });
     await failingModel("row-empty-404", { status: 404, rawErrorBody: "" });
@@ -307,6 +377,15 @@ describe("failure rows carry request and response bodies", () => {
       model_name: "rerank-v3.5",
     });
     await modelAt("row-count-400", any400, { provider: "anthropic", model_name: "claude-sonnet-4-5" });
+    const bedrockProvider = {
+      provider: "bedrock",
+      adapter: "bedrock",
+      api_key: JSON.stringify({
+        access_key_id: "AKIA-failure-row",
+        secret_access_key: "sk-failure-row",
+        region: "us-east-1",
+      }),
+    };
     await modelAt("row-bedrock-400", await fixedUpstream(
       400,
       JSON.stringify({ message: "sentinel-bedrock-answer" }),
@@ -315,15 +394,18 @@ describe("failure rows carry request and response bodies", () => {
         "x-amzn-errortype": "ValidationException:http://internal.amazon.com/coral/com.amazon.bedrock/",
       },
     ), {
-      provider: "bedrock",
-      adapter: "bedrock",
+      ...bedrockProvider,
       model_name: "openai.gpt-6-sol",
-      api_key: JSON.stringify({
-        access_key_id: "AKIA-failure-row",
-        secret_access_key: "sk-failure-row",
-        region: "us-east-1",
-      }),
     });
+    const exception = eventStreamException("throttlingException", BEDROCK_EXCEPTION);
+    const eventStreamHeaders = { "content-type": "application/vnd.amazon.eventstream" };
+    await modelAt("row-bedrock-converse-stream", await fixedUpstream(200, Buffer.concat([
+      eventStream([["messageStart", { role: "assistant" }], ["contentBlockDelta", { contentBlockIndex: 0, delta: { text: "partial" } }]]),
+      exception,
+    ]), eventStreamHeaders), { ...bedrockProvider, model_name: "deepseek.r1-v1:0" });
+    await modelAt("row-bedrock-native-stream", await fixedUpstream(200, Buffer.concat([
+      invokeChunk(ANTHROPIC_START), invokeChunk(ANTHROPIC_DELTA), exception,
+    ]), eventStreamHeaders), { ...bedrockProvider, model_name: "anthropic.claude-haiku-4-5-20251001-v1:0" });
     const textHeaders = { "content-type": "text/plain" };
     await modelAt("row-video-text", `${await fixedUpstream(500, "sentinel video gateway page", textHeaders)}/v1`);
     await modelAt("row-video-empty", `${await fixedUpstream(500, "", textHeaders)}/v1`);
@@ -410,6 +492,8 @@ describe("failure rows carry request and response bodies", () => {
         "row-rerank-400",
         "row-count-400",
         "row-bedrock-400",
+        "row-bedrock-converse-stream",
+        "row-bedrock-native-stream",
         "row-video-text",
         "row-video-empty",
         "row-video-json",
@@ -426,6 +510,7 @@ describe("failure rows carry request and response bodies", () => {
         "row-ok",
         "row-all-fail",
         "row-recovers",
+        "row-ensemble-fails",
         "row-empty-404",
         "row-blank-message",
         "row-control-only",
@@ -433,6 +518,13 @@ describe("failure rows carry request and response bodies", () => {
         "row-truncated",
         "row-stream-cut",
         "row-in-band",
+        "row-responses-late",
+        "row-json-error",
+        "row-invalid-json",
+        "row-timeout-after-error-head",
+        "row-responses-media",
+        "row-responses-masked",
+        "row-responses-blocked",
       ],
     });
 
@@ -569,6 +661,18 @@ describe("failure rows carry request and response bodies", () => {
     expect(second!.get("response")).toContain("sentinel-second-target");
   });
 
+  test("concurrent failed panel members each export their own body", async () => {
+    if (!etcdReachable) return;
+    const { requestId } = await chat("row-ensemble-fails", "ensemble-prompt");
+    await rowOf(requestId, "the ensemble's terminal row");
+    const panel = fullRows(requestId).filter((row) => row.get("attempt_kind") === "panel");
+    expect(panel).toHaveLength(2);
+    expect(Object.fromEntries(panel.map((row) => [row.get("attempt_model"), JSON.parse(row.get("response")!)]))).toEqual({
+      "row-first-fails": { error: { message: "sentinel-first-target" } },
+      "row-second-fails": { error: { message: "sentinel-second-target" } },
+    });
+  });
+
   test("a failed attempt before a winner carries its own body; the winner keeps its answer", async () => {
     if (!etcdReachable) return;
     const { res, requestId } = await chat("row-recovers", "recover-prompt");
@@ -637,7 +741,7 @@ describe("failure rows carry request and response bodies", () => {
     expect(row.get("response")).toContain("sentinel-retried-400");
     const [lost] = await rowsOf(requestId, 2);
     expect(lost!.get("is_final_attempt")).toBe("false");
-    expect(lost!.get("response")).toContain("transport error");
+    expect(lost!.get("response")).toBe("");
   });
 
   test("a multipart failure reports text fields and a file checksum, never the file", async () => {
@@ -843,6 +947,7 @@ describe("failure rows carry request and response bodies", () => {
     const row = await rowOf(requestId, "the jobs row");
     expect(row.get("error_message")).toMatch(READ_FAILURE(502));
     expect(requestText(row)).toContain("cut-prompt");
+    expect(row.get("response")).toBe(FRAGMENT);
     await waitForLogLine(
       app!,
       (l) => l.includes(requestId) && l.includes("failed to read response body"),
@@ -1110,6 +1215,114 @@ describe("failure rows carry request and response bodies", () => {
     expect(Number(row.get("status_code"))).toBeGreaterThanOrEqual(400);
     expect(requestText(row)).toContain("in-band-prompt");
     expect(row.get("response")).toContain("sentinel-in-band");
+  });
+
+  test("native Responses exports the SSE from its first delta through the late failure", async (ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    const res = await post("/v1/responses", { model: "row-responses-late", input: "test", stream: true });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain(RESPONSES_DELTA);
+    expect(text).toContain("event: response.failed");
+    expect(text).toContain('"error":null');
+    expect(text).toContain('"trace":"provider-raw"');
+    const requestId = res.headers.get("x-aisix-request-id")!;
+    const row = await rowOf(requestId, "the native Responses failure");
+    expect(row.get("status_code")).toBe("502");
+    expect(row.get("error_class")).toBe("upstream_in_band");
+    expect(row.get("response")).toBe(RESPONSES_DELTA + RESPONSES_FAILED);
+    const metadata = await waitForSlsLog(sls!, META, (l) => l.get("request_id") === requestId, "the native Responses metadata");
+    expect(metadata.get("response")).toBeUndefined();
+  });
+
+  test("translated Responses exports the upstream Chat SSE error before translation", async (ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    const res = await post("/v1/responses", { model: "row-in-band", input: "test", stream: true });
+    const text = await res.text();
+    expect(text).toContain("sentinel-in-band");
+    expect(text).not.toContain("provider_request");
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the translated Responses failure");
+    expect(row.get("error_class")).toBe("upstream_in_band");
+    expect(row.get("response")).toBe(CHAT_STREAM_ERROR);
+  });
+
+  test.each([
+    ["/v1/chat/completions", "row-bedrock-converse-stream", [BEDROCK_EXCEPTION]],
+    ["/v1/messages", "row-bedrock-native-stream", [ANTHROPIC_START, ANTHROPIC_DELTA, BEDROCK_EXCEPTION]],
+  ] as const)("%s exports the Bedrock SDK's available JSON payloads", async (path, model, expected) => {
+    if (!etcdReachable) return;
+    const res = await post(path, {
+      model, stream: true, max_tokens: 32, messages: [{ role: "user", content: "test" }],
+    }, { "anthropic-version": "2023-06-01" });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(BEDROCK_EXCEPTION.message);
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the Bedrock stream exception");
+    expect(row.get("status_code")).toBe("429");
+    expect(row.get("error_class")).toBe("upstream_in_band");
+    expect(row.get("response")!.split("\n").map((line) => JSON.parse(line))).toEqual(expected);
+  });
+
+  test("a non-2xx read deadline keeps the consumed prefix", async (ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    const res = await post("/v1/responses", { model: "row-timeout-after-error-head", input: "test", stream: true });
+    expect(res.status).toBe(502);
+    expect(clientMessage(await res.text())).toBe("upstream returned 503 Service Unavailable");
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the response body deadline");
+    expect(row.get("error_message")).toMatch(READ_FAILURE(503));
+    expect(row.get("response")).toBe(TIMEOUT_PREFIX);
+  });
+
+  test("a failed SSE export omits image payloads and retains later events", async (ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    const res = await post("/v1/responses", { model: "row-responses-media", input: "test", stream: true });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(RESPONSE_MEDIA);
+    const requestId = res.headers.get("x-aisix-request-id")!;
+    const row = await rowOf(requestId, "the SSE media failure");
+    expect(row.get("response")).toContain('"partial_image_b64":"[aisix: base64 data uri omitted,');
+    expect(row.get("response")).not.toContain(RESPONSE_MEDIA);
+    expect(row.get("response")).toContain(LONG_DELTA + RESPONSES_FAILED);
+    const capped = await waitForSlsLog(sls!, CAPPED, (l) => l.get("request_id") === requestId, "the capped SSE response");
+    expect(capped.get("content_truncated")).toBe("true");
+    expect(Buffer.byteLength(capped.get("response")!)).toBeLessThanOrEqual(CAPPED_MAX_BYTES);
+    expect(capped.get("response")).toContain("内容");
+    expect(capped.get("response")).not.toContain("\uFFFD");
+  });
+
+  test("a failed masked stream exports the masked output", async (ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    const res = await post("/v1/responses", { model: "row-responses-masked", input: "test", stream: true });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain("[EMAIL_REDACTED]");
+    expect(text).not.toContain(OUTPUT_EMAIL);
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the masked SSE failure");
+    expect(row.get("error_class")).toBe("upstream_in_band");
+    expect(row.get("response")).toContain("[EMAIL_REDACTED]");
+    expect(row.get("response")).not.toContain(OUTPUT_EMAIL);
+  });
+
+  test("a blocked stream exports the gateway's actual rejection without the upstream body", async (ctx) => {
+    if (!etcdReachable) return ctx.skip();
+    const res = await post("/v1/responses", { model: "row-responses-blocked", input: "test", stream: true });
+    expect(res.status).toBe(422);
+    const body = await res.text();
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the blocked SSE response");
+    expect(row.get("guardrail_blocked")).toBe("true");
+    expect(row.get("response")).toBe(body);
+    expect(row.get("response")).not.toContain("partial Responses answer");
+  });
+
+  test.each([
+    ["row-json-error", "upstream_in_band", JSON.stringify(IN_BAND_JSON)],
+    ["row-invalid-json", "upstream_decode", INVALID_JSON],
+  ])("%s exports the body of the failed 2xx answer", async (model, errorClass, response) => {
+    if (!etcdReachable) return;
+    const { res, requestId } = await chat(model, "test");
+    expect(res.status).toBe(502);
+    const row = await rowOf(requestId, `the ${model} failure`);
+    expect(row.get("error_class")).toBe(errorClass);
+    expect(row.get("response")).toBe(response);
   });
 
   test("a metadata_only exporter receives none of it", async () => {

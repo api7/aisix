@@ -362,7 +362,7 @@ async fn dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    let resolved_chain = state.resolve_guardrails(&guardrail_ctx);
     // Record which guardrails govern this request (#379 parity) so the emitted
     // UsageEvent surfaces them in Logs, like chat / messages. Empty when no
     // guardrail is attached.
@@ -630,7 +630,7 @@ async fn dispatch(
                                 crate::dispatch::reqwest_error_to_bridge(&e, send_started),
                             )
                         })?;
-                        aisix_gateway::note_upstream_response(upstream_resp.headers());
+                        let upstream_resp = aisix_gateway::tap_upstream_response(upstream_resp);
 
                         let status = upstream_resp.status();
                         if !status.is_success() {
@@ -643,14 +643,16 @@ async fn dispatch(
                         }
 
                         let upstream_headers = upstream_resp.headers().clone();
-                        let body_bytes = upstream_resp.bytes().await.map_err(|e| {
-                            crate::cooldown::note_failure(
-                                tracker,
-                                model_id,
-                                cooldown_cfg,
-                                aisix_gateway::upstream_body_read_error(&e),
-                            )
-                        })?;
+                        let body_bytes = aisix_gateway::upstream_body(upstream_resp)
+                            .await
+                            .map_err(|e| {
+                                crate::cooldown::note_failure(
+                                    tracker,
+                                    model_id,
+                                    cooldown_cfg,
+                                    aisix_gateway::upstream_body_read_error(&e),
+                                )
+                            })?;
                         Ok((upstream_headers, body_bytes))
                     }
                 }

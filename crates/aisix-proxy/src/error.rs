@@ -939,6 +939,13 @@ impl IntoResponse for ProxyError {
         let rate_limit_detail = self.rate_limit_detail();
         let upgrade_reject = matches!(self, ProxyError::WebSocketUpgradeRequired { .. });
         let body = self.envelope();
+        if matches!(self, ProxyError::ContentFiltered { .. })
+            && aisix_gateway::wants_upstream_error_body()
+        {
+            crate::attribution::note_client_error_body(
+                serde_json::to_string(&body).unwrap_or_default(),
+            );
+        }
         let mut response = (status, Json(body)).into_response();
         apply_retry_headers(&mut response, retry_after, rate_limit_detail);
         if let Some(challenge) = challenge {

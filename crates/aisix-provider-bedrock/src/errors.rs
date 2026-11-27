@@ -18,6 +18,7 @@ use aisix_gateway::{
 use aws_sdk_bedrockruntime::error::SdkError;
 use aws_smithy_runtime_api::client::result::ServiceError;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
+use aws_smithy_types::event_stream::RawMessage;
 
 /// Substrings Bedrock's publishers use for a prompt that does not fit the
 /// model's context window.
@@ -111,6 +112,13 @@ pub(crate) fn in_band_error(
     }
 }
 
+pub(crate) fn stream_error_payload<E>(err: &SdkError<E, RawMessage>) -> Option<&[u8]> {
+    match err.raw_response()? {
+        RawMessage::Decoded(message) => Some(message.payload()),
+        _ => None,
+    }
+}
+
 /// An AWS SDK operation failure.
 pub(crate) fn sdk_error<E>(
     err: SdkError<E, aws_smithy_runtime_api::http::Response>,
@@ -158,12 +166,6 @@ where
 {
     let kind = svc.err().meta().code().map(str::to_string);
     let raw = svc.raw();
-    if aisix_gateway::wants_upstream_error_body() {
-        if let Some(body) = raw.body().bytes() {
-            let kept = body.len().min(aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES);
-            aisix_gateway::note_upstream_error_body(&bytes::Bytes::copy_from_slice(&body[..kept]));
-        }
-    }
     // The SDK reads the message out of an error it can model; for one it
     // cannot, the body still carries it.
     let message = match svc.err().meta().message() {

@@ -1642,7 +1642,7 @@ async fn dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved = state.guardrail_index.resolve(&guardrail_ctx);
+    let resolved = state.resolve_guardrails(&guardrail_ctx);
     // Capture the applied `{kind, hook}` set before the concrete chain is
     // erased to `Arc<dyn Guardrail>` (the trait has no `applied()`). Fill the
     // caller's out-param so the failure path can surface it too, and keep a
@@ -4161,9 +4161,12 @@ async fn dispatch_ensemble(
         // what `upstream_ttft_ms` should be measured against — `started`
         // additionally covers the whole panel that ran before it.
         let judge_started = Instant::now();
-        let judge_stream = match judge_bridge
-            .chat_stream_cow(std::borrow::Cow::Owned(build_judge_req()), &judge_ctx)
-            .await
+        let judge_stream = match crate::attribution::capture_subcall_response(
+            judge_index,
+            true,
+            judge_bridge.chat_stream_cow(std::borrow::Cow::Owned(build_judge_req()), &judge_ctx),
+        )
+        .await
         {
             Ok(s) => s,
             // Judge connect failed AFTER the panel round-tripped: bill the

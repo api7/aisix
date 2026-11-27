@@ -458,9 +458,9 @@ called, and a call site that skips them reports nothing wrong — the field is
 just absent or off, which reads like a quiet upstream:
 
 - **Response headers.** Every upstream HTTP response that answers an attempt —
-  success or failure — goes through `aisix_gateway::note_upstream_response`
+  success or failure — goes through `aisix_gateway::tap_upstream_response`
   as soon as its head is in hand (`stream_timeout::send_with_deadline` and the
-  provider bridges already do; Bedrock through an SDK interceptor). That is
+  provider bridges already do; SDKs register the head and body separately). That is
   the only source of an exporter's `upstream_response_headers` and of the
   `provider_request_id` a failed attempt or a token count records.
 - **Upstream wait.** `gateway_overhead_ms` subtracts the time the request
@@ -503,7 +503,8 @@ provider key's budget.
 **With any exporter at `content_mode: full`, every usage event with a status of 400 or above or an `error_class` exports the request body and that attempt's own response body, whichever endpoint and status it is.** `usage_attr::emit_usage` fills them in, so a family cannot opt out by what it passes; it can only starve the fill. A new or changed route owes two things:
 
 - **Note the request body before its first possible failure** with `usage_attr::note_failure_request`, and again after a guardrail masks it, in the representation the route's success path captures. A guardrail block returns before the mask runs: mask there too, so a blocked row never exports what the success path would have hidden. `usage_attr::note_client_error` holds the error body the terminal row reports when no upstream answered; a route that does not answer with the OpenAI envelope uses `note_client_error_body`.
-- **Read every non-2xx upstream body through `aisix_gateway::read_body_capped`** (or hand a body it must relay anyway to `note_upstream_error_body`). That is what reaches the row, and a read that swallows its failure leaves `error_message` naming nothing. All of it is gated on the exporters: under `metadata_only` nothing extra may be read or copied, and a route never reads a body it would otherwise leave unread, because that delays its caller.
+- **Read registered responses with `upstream_body`, `upstream_json`, `upstream_body_stream`, or `read_body_capped`.** They keep the bytes the route consumed, including a prefix before a failed read. A streaming body keeps the capture of its own attempt even after the response head is committed. Register model and agent responses only. Credential exchanges and other internal HTTP traffic use their own readers without registration. Under `metadata_only` there is no body copy or extra read.
+- **Resolve output guardrails through `ProxyState::resolve_guardrails`.** This keeps pre-policy output out of failure exports on block- or mask-capable chains. The route supplies the safe content it would normally export, or the actual gateway rejection when present.
 
 **Every failure row also names the failure in `error_message`, at any `content_mode`, whoever wrote the text.** A typed error goes through `attempt::gateway_error_message`. A non-2xx relayed as sent has no typed error: keep at most `MAX_RELAYED_ERROR_DETAIL_BYTES` of a body the route holds or relays anyway, without holding the relay for it, and build the row's fields with `attempt::relayed_failure`. A guardrail refusal stays `guardrail_block_message`: the message and the guardrail's name, never what it matched.
 

@@ -1278,7 +1278,7 @@ fn provider_call_once<'a>(
             .send()
             .await
             .map_err(|e| note(crate::dispatch::reqwest_error_to_bridge(&e, started)))?;
-        aisix_gateway::note_upstream_response(resp.headers());
+        let resp = aisix_gateway::tap_upstream_response(resp);
         if !resp.status().is_success() {
             return Err(note(
                 aisix_gateway::upstream_status_parsed_from_response(
@@ -1289,8 +1289,7 @@ fn provider_call_once<'a>(
                 .await,
             ));
         }
-        let bytes = resp
-            .bytes()
+        let bytes = aisix_gateway::upstream_body(resp)
             .await
             .map_err(|e| note(aisix_gateway::upstream_body_read_error(&e)))?;
 
@@ -1429,7 +1428,10 @@ async fn proxy_content(
     let wrapped: std::pin::Pin<
         Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
     > = Box::pin(crate::request_id::in_request_span(
-        crate::stream_timeout::with_read_timeout_bytes(resp.bytes_stream(), stream_budget),
+        crate::stream_timeout::with_read_timeout_bytes(
+            aisix_gateway::upstream_body_stream(resp),
+            stream_budget,
+        ),
     ));
     let mut response = Response::new(axum::body::Body::from_stream(wrapped));
     let headers = response.headers_mut();
@@ -1874,7 +1876,7 @@ async fn dispatch_create(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    let resolved_chain = state.resolve_guardrails(&guardrail_ctx);
     let applied_guardrails = resolved_chain.applied().to_vec();
     *audit_out = resolved_chain.audit_log();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();

@@ -1282,7 +1282,7 @@ async fn multipart_dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    let resolved_chain = state.resolve_guardrails(&guardrail_ctx);
     let applied_guardrails = resolved_chain.applied().to_vec();
     *audit_out = resolved_chain.audit_log();
 
@@ -1613,15 +1613,16 @@ async fn multipart_dispatch(
                             match stream_budget.filter(|_| live_relay) {
                                 // No request-level timeout was set on the live path,
                                 // so bound this read rather than leaving it open.
-                                Some(d) => tokio::time::timeout(d, resp.bytes())
-                                    .await
-                                    .map_err(|_| aisix_gateway::BridgeError::Timeout {
-                                        elapsed_ms: d.as_millis() as u64,
-                                        cause: String::new(),
-                                    })?
-                                    .map_err(|e| aisix_gateway::upstream_body_read_error(&e)),
-                                None => resp
-                                    .bytes()
+                                Some(d) => {
+                                    tokio::time::timeout(d, aisix_gateway::upstream_body(resp))
+                                        .await
+                                        .map_err(|_| aisix_gateway::BridgeError::Timeout {
+                                            elapsed_ms: d.as_millis() as u64,
+                                            cause: String::new(),
+                                        })?
+                                        .map_err(|e| aisix_gateway::upstream_body_read_error(&e))
+                                }
+                                None => aisix_gateway::upstream_body(resp)
                                     .await
                                     .map_err(|e| aisix_gateway::upstream_body_read_error(&e)),
                             }
@@ -1742,7 +1743,7 @@ async fn multipart_dispatch(
             let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
             let relayed = transcription_relay(
                 crate::stream_timeout::with_read_timeout_bytes_signalled(
-                    resp.bytes_stream(),
+                    aisix_gateway::upstream_body_stream(resp),
                     stream_budget,
                     read_timeout.clone(),
                 ),
@@ -2182,7 +2183,7 @@ async fn speech_dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    let resolved_chain = state.resolve_guardrails(&guardrail_ctx);
     // Record which guardrails govern this request (#379 parity) for the emitted
     // UsageEvent. Empty when none attached.
     let applied_guardrails = resolved_chain.applied().to_vec();
@@ -2487,7 +2488,7 @@ async fn speech_dispatch(
         // the concurrency slot.
         let _hold = (stream_hold, in_flight);
         let inner = crate::stream_timeout::with_read_timeout_bytes_signalled(
-            upstream_resp.bytes_stream(),
+            aisix_gateway::upstream_body_stream(upstream_resp),
             stream_budget,
             signal,
         );

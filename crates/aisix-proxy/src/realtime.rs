@@ -1301,6 +1301,17 @@ async fn run_session(
     // separately, which needs its own status decision.
     let mut session_error: Option<ProxyError> = None;
     let mut opening = SessionOpening::default();
+    let mut captured = crate::usage_attr::content_cap(&state.snapshot.load())
+        .filter(|_| {
+            use aisix_guardrails::Guardrail;
+            !chain.redacts_output() && !chain.stream_output_policy().holds_back()
+        })
+        .map(|cap| {
+            (
+                aisix_obs::CapturedContent::new("", "", cap as usize),
+                cap as usize,
+            )
+        });
 
     loop {
         let next = async {
@@ -1409,6 +1420,13 @@ async fn run_session(
                 Some(Ok(TgMessage::Text(text))) => {
                     usage.absorb(&text);
                     opening.observe(&state, &model_entry.id, Some(&text));
+                    if let Some((content, cap)) = captured
+                        .as_mut()
+                        .filter(|(content, _)| !content.response_truncated)
+                    {
+                        let frame = aisix_obs::sink::omit_base64_media_in_response_json(&text);
+                        content.append_response_frame(&frame, *cap);
+                    }
                     if !chain.is_empty() {
                         if let Some(resp) = guardrail_block_event(
                             &chain,
@@ -1630,7 +1648,12 @@ async fn run_session(
         crate::usage_attr::usage_event_model_label(&snap, &event.requested_model).into_owned();
     let content = refusal_frame
         .as_deref()
-        .and_then(|frame| upstream_failure_content(&snap, frame.as_bytes()));
+        .and_then(|frame| upstream_failure_content(&snap, frame.as_bytes()))
+        .or_else(|| {
+            captured
+                .map(|(content, _)| content)
+                .filter(|_| session_error.is_some() && !event.guardrail_blocked)
+        });
     crate::usage_attr::emit_usage(
         &state,
         &snap,

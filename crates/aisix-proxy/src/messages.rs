@@ -586,7 +586,7 @@ async fn dispatch(
     };
     // Arc so the chain can be cloned into the streaming-response body
     // (which outlives this handler) for end-of-stream output guardrails.
-    let resolved_chain = std::sync::Arc::new(state.guardrail_index.resolve(&guardrail_ctx));
+    let resolved_chain = std::sync::Arc::new(state.resolve_guardrails(&guardrail_ctx));
     // Surface the applied `{kind, hook}` set to the caller so the telemetry
     // event records which guardrails governed the request even when the input
     // check below blocks it (#379 / closes the anthropic gap in #519).
@@ -2054,7 +2054,7 @@ impl Upstream {
                     .get(axum::http::header::CONTENT_TYPE)
                     .and_then(|v| HeaderValue::from_bytes(v.as_bytes()).ok())
                     .unwrap_or(sse);
-                (ct, Box::pin(resp.bytes_stream()))
+                (ct, Box::pin(aisix_gateway::upstream_body_stream(resp)))
             }
             Self::Native(aisix_gateway::NativeMessages::Stream(frames)) => {
                 let frames = async_stream::stream! {

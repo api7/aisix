@@ -542,7 +542,7 @@ async fn dispatch(
                         crate::dispatch::reqwest_error_to_bridge(&e, send_started),
                     ))
                 })?;
-                aisix_gateway::note_upstream_response(upstream_resp.headers());
+                let upstream_resp = aisix_gateway::tap_upstream_response(upstream_resp);
                 let status = upstream_resp.status();
                 if !status.is_success() {
                     return Err(ProxyError::Bridge(crate::cooldown::note_failure(
@@ -557,14 +557,17 @@ async fn dispatch(
                         .await,
                     )));
                 }
-                let body_bytes = upstream_resp.bytes().await.map_err(|e| {
-                    ProxyError::Bridge(crate::cooldown::note_failure(
-                        tracker,
-                        model_id,
-                        cooldown_cfg,
-                        aisix_gateway::upstream_body_read_error(&e),
-                    ))
-                })?;
+                let body_bytes =
+                    aisix_gateway::upstream_body(upstream_resp)
+                        .await
+                        .map_err(|e| {
+                            ProxyError::Bridge(crate::cooldown::note_failure(
+                                tracker,
+                                model_id,
+                                cooldown_cfg,
+                                aisix_gateway::upstream_body_read_error(&e),
+                            ))
+                        })?;
                 // A converted answer is read here, inside the attempt, so a 200
                 // that is not JSON, or whose answers lack a field their type
                 // requires, counts against the target like any other upstream

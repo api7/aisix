@@ -418,7 +418,7 @@ async fn dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    let resolved_chain = state.resolve_guardrails(&guardrail_ctx);
     let applied_guardrails = resolved_chain.applied().to_vec();
     *audit_out = resolved_chain.audit_log();
     let mut redactions = crate::redact::RedactionCounts::new();
@@ -684,7 +684,7 @@ async fn dispatch(
                                 crate::dispatch::reqwest_error_to_bridge(&e, send_started),
                             )
                         })?;
-                        aisix_gateway::note_upstream_response(resp.headers());
+                        let resp = aisix_gateway::tap_upstream_response(resp);
                         let status = resp.status();
                         if !status.is_success() {
                             return Err(crate::cooldown::note_failure(
@@ -694,7 +694,7 @@ async fn dispatch(
                                 crate::dispatch::held_route_http_error(azure, resp).await,
                             ));
                         }
-                        let body_bytes = resp.bytes().await.map_err(|e| {
+                        let body_bytes = aisix_gateway::upstream_body(resp).await.map_err(|e| {
                             crate::cooldown::note_failure(
                                 tracker,
                                 model_id,

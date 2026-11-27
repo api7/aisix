@@ -435,7 +435,7 @@ async fn dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    let resolved_chain = state.resolve_guardrails(&guardrail_ctx);
     let applied_guardrails = resolved_chain.applied().to_vec();
     *audit_out = resolved_chain.audit_log();
     let mut input_seg_counts = crate::redact::RedactionCounts::new();

@@ -1,20 +1,23 @@
-//! Upstream response headers an observability export asked for.
+//! Upstream response headers and bodies for observability exports.
 //!
 //! An exporter may list `upstream_response_headers`; the values come off the
 //! upstream's HTTP response, which only the code that sent the request ever
 //! sees — a provider bridge, or a proxy route that talks to its upstream
-//! itself. Each of those calls [`note_upstream_response`] right after the
-//! response head arrives. The proxy installs one [`ResponseHeaderTap`] per
-//! request (carrying the names the request's exporters want) and drains it
-//! per attempt; outside such a scope the call is a no-op, which is what a
-//! background poll or a gateway-initiated sub-call relies on.
+//! itself. [`tap_upstream_response`] records the head and taps bytes as the
+//! route reads them. The proxy drains the tap per attempt, moving the body
+//! capture with the headers even if the stream has only just started.
 //!
 //! The provider's own request id is read off the same head whether or not
 //! an exporter asked for any header: it is what a provider's support asks
 //! for about a failed call, and an error response carries no body id.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+use bytes::{Bytes, BytesMut};
+use futures::{Stream, StreamExt};
+use http::header;
 
 /// The longest value recorded per header, in characters.
 const MAX_VALUE_CHARS: usize = 256;
@@ -83,21 +86,86 @@ pub fn provider_request_id(headers: &http::HeaderMap) -> String {
         .unwrap_or_default()
 }
 
-/// What one upstream response head left for the request's telemetry.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// What one upstream response left for the request's telemetry.
+#[derive(Debug, Default)]
 pub struct UpstreamResponseCapture {
     /// The headers the request's exporters asked for.
     pub headers: BTreeMap<String, String>,
     /// See [`provider_request_id`].
     pub request_id: String,
-    /// The body of a non-2xx response, as read, when the request has a
-    /// full-content export to hand it to.
-    pub error_body: Option<bytes::Bytes>,
+    body: Option<Arc<UpstreamBodyTap>>,
 }
 
 impl UpstreamResponseCapture {
     pub fn is_empty(&self) -> bool {
-        self.headers.is_empty() && self.request_id.is_empty() && self.error_body.is_none()
+        self.headers.is_empty() && self.request_id.is_empty() && self.body.is_none()
+    }
+
+    pub fn take_body(&mut self) -> Option<CapturedUpstreamBody> {
+        let body = self.body.take()?;
+        let prefix = std::mem::take(&mut *body.prefix.lock().unwrap());
+        (!prefix.bytes.is_empty()).then(|| CapturedUpstreamBody {
+            bytes: prefix.bytes.freeze(),
+            truncated: prefix.truncated,
+            format: body.format,
+        })
+    }
+
+    pub fn discard_success_body(&mut self) {
+        if self.body.as_ref().is_some_and(|body| body.success) {
+            self.body = None;
+        }
+    }
+}
+
+pub struct CapturedUpstreamBody {
+    pub bytes: Bytes,
+    pub truncated: bool,
+    pub format: UpstreamBodyFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamBodyFormat {
+    Text,
+    Sse,
+    JsonLines,
+}
+
+#[derive(Debug, Default)]
+struct BodyPrefix {
+    bytes: BytesMut,
+    truncated: bool,
+}
+
+impl BodyPrefix {
+    fn push(&mut self, cap: usize, bytes: &[u8]) {
+        let kept = bytes.len().min(cap - self.bytes.len());
+        self.bytes.extend_from_slice(&bytes[..kept]);
+        self.truncated |= kept < bytes.len();
+    }
+}
+
+/// A body poll owns this handle even after routing settles its attempt and the
+/// request tap starts tracking another one.
+#[derive(Debug)]
+pub struct UpstreamBodyTap {
+    cap: usize,
+    success: bool,
+    format: UpstreamBodyFormat,
+    prefix: Mutex<BodyPrefix>,
+}
+
+impl UpstreamBodyTap {
+    pub fn push(&self, bytes: &[u8]) {
+        self.prefix.lock().unwrap().push(self.cap, bytes);
+    }
+
+    pub fn push_json_frame(&self, bytes: &[u8]) {
+        let mut prefix = self.prefix.lock().unwrap();
+        if !prefix.bytes.is_empty() {
+            prefix.push(self.cap, b"\n");
+        }
+        prefix.push(self.cap, bytes);
     }
 }
 
@@ -107,27 +175,63 @@ impl UpstreamResponseCapture {
 pub struct ResponseHeaderTap {
     names: Vec<String>,
     /// Whether an exporter of this request runs at `content_mode: full`.
-    /// Without one no error body is kept, nor read where nothing else needs it.
-    keeps_error_bodies: bool,
+    body_cap: Option<u32>,
+    /// Generated output protected by a guardrail uses its post-policy capture.
+    protects_output: AtomicBool,
     request_id: String,
     latest: Mutex<UpstreamResponseCapture>,
 }
 
 impl ResponseHeaderTap {
-    pub fn new(names: Vec<String>, keeps_error_bodies: bool, request_id: String) -> Self {
+    pub fn new(names: Vec<String>, body_cap: Option<u32>, request_id: String) -> Self {
         Self {
             names,
-            keeps_error_bodies,
+            body_cap,
             request_id,
-            latest: Mutex::default(),
+            ..Self::default()
         }
     }
 
-    fn record(&self, headers: &http::HeaderMap) {
+    pub fn protects_output(&self) -> bool {
+        self.protects_output.load(Ordering::Relaxed)
+    }
+
+    /// Concurrent sub-calls own separate body captures, with the same
+    /// output policy and content limit as the parent request.
+    pub fn for_subcall(&self) -> Option<Arc<Self>> {
+        Some(Arc::new(Self {
+            body_cap: Some(self.body_cap?),
+            protects_output: AtomicBool::new(self.protects_output()),
+            request_id: self.request_id.clone(),
+            ..Self::default()
+        }))
+    }
+
+    fn new_body(&self, success: bool, format: UpstreamBodyFormat) -> Option<Arc<UpstreamBodyTap>> {
+        let cap = self.body_cap? as usize;
+        if success && self.protects_output() {
+            return None;
+        }
+        // Keep the complete ordinary error body up to the parser's existing
+        // bound so an exporter with a lower cap can still shrink valid JSON.
+        let cap = if !success && format == UpstreamBodyFormat::Text {
+            cap.max(crate::MAX_UPSTREAM_ERROR_BODY_BYTES)
+        } else {
+            cap
+        };
+        Some(Arc::new(UpstreamBodyTap {
+            cap,
+            success,
+            format,
+            prefix: Mutex::default(),
+        }))
+    }
+
+    fn record(&self, headers: &http::HeaderMap, body: Option<Arc<UpstreamBodyTap>>) {
         let captured = UpstreamResponseCapture {
             headers: capture_header_values(headers, &self.names),
             request_id: provider_request_id(headers),
-            error_body: None,
+            body,
         };
         *self.lock() = captured;
     }
@@ -165,17 +269,161 @@ pub fn sync_scope<T>(tap: &Arc<ResponseHeaderTap>, f: impl FnOnce() -> T) -> T {
 /// Call it once per upstream HTTP response that answers a dispatched
 /// attempt, as soon as the head is in hand — success or failure.
 pub fn note_upstream_response(headers: &http::HeaderMap) {
-    let _ = TAP.try_with(|tap| tap.record(headers));
+    let _ = TAP.try_with(|tap| tap.record(headers, None));
 }
 
-/// Keep the non-2xx body of the response last noted, for the same attempt's
-/// failure row. Sharing `body`, so nothing is copied.
-pub fn note_upstream_error_body(body: &bytes::Bytes) {
+/// Clear the body before an internal retry that shares the same usage row.
+pub fn clear_upstream_body() {
     let _ = TAP.try_with(|tap| {
-        if tap.keeps_error_bodies {
-            tap.lock().error_body = Some(body.clone());
+        if tap.body_cap.is_some() {
+            tap.lock().body = None;
         }
     });
+}
+
+/// Use the post-policy output of this request's resolved guardrail chain.
+pub fn protect_upstream_output() {
+    let _ = TAP.try_with(|tap| {
+        tap.protects_output.store(true, Ordering::Relaxed);
+    });
+}
+
+/// SDKs that consume a response themselves can attach its text payload to the
+/// last noted response. Hold the returned handle when reading it later.
+pub fn tap_upstream_body(
+    success: bool,
+    format: UpstreamBodyFormat,
+) -> Option<Arc<UpstreamBodyTap>> {
+    TAP.try_with(|tap| {
+        let body = tap.new_body(success, format)?;
+        tap.lock().body = Some(body.clone());
+        Some(body)
+    })
+    .ok()
+    .flatten()
+}
+
+pub fn note_upstream_error_body(bytes: &[u8]) {
+    if !bytes.is_empty() {
+        if let Some(body) = tap_upstream_body(false, UpstreamBodyFormat::Text) {
+            body.push(bytes);
+        }
+    }
+}
+
+/// Record the response at its head. For a full-content request, observe its
+/// text bytes exactly where reqwest delivers them. In particular, a body read
+/// that gets dropped on timeout leaves the prefix it already consumed.
+pub fn tap_upstream_response(mut response: reqwest::Response) -> reqwest::Response {
+    let capture = TAP
+        .try_with(|tap| {
+            let capture = if tap.body_cap.is_some() {
+                text_content_type(response.headers())
+                    .and_then(|format| tap.new_body(response.status().is_success(), format))
+            } else {
+                None
+            };
+            tap.record(response.headers(), capture.clone());
+            capture
+        })
+        .ok()
+        .flatten();
+    if let Some(capture) = capture {
+        response.extensions_mut().insert(capture);
+    }
+    response
+}
+
+fn text_content_type(headers: &http::HeaderMap) -> Option<UpstreamBodyFormat> {
+    if headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| {
+            value.to_str().map_or(true, |value| {
+                value
+                    .split(',')
+                    .any(|coding| !coding.trim().eq_ignore_ascii_case("identity"))
+            })
+        })
+    {
+        return None;
+    }
+    let Some(content_type) = headers.get(header::CONTENT_TYPE) else {
+        return Some(UpstreamBodyFormat::Text);
+    };
+    let mime = content_type
+        .to_str()
+        .ok()?
+        .split(';')
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    (mime.starts_with("text/")
+        || matches!(
+            mime.as_str(),
+            "application/json"
+                | "application/json-rpc"
+                | "application/x-ndjson"
+                | "application/xml"
+        )
+        || mime.starts_with("application/x-amz-json-")
+        || mime.ends_with("+json")
+        || mime.ends_with("+xml"))
+    .then_some(match mime.as_str() {
+        "text/event-stream" => UpstreamBodyFormat::Sse,
+        "application/x-ndjson" => UpstreamBodyFormat::JsonLines,
+        _ => UpstreamBodyFormat::Text,
+    })
+}
+
+/// Read the response stream and keep the prefix actually consumed by this
+/// attempt. Responses that were never registered have no capture to update.
+pub fn upstream_body_stream(
+    response: reqwest::Response,
+) -> impl Stream<Item = reqwest::Result<Bytes>> {
+    let capture = response.extensions().get::<Arc<UpstreamBodyTap>>().cloned();
+    response.bytes_stream().inspect(move |item| {
+        if let (Some(capture), Ok(bytes)) = (&capture, item) {
+            capture.push(bytes);
+        }
+    })
+}
+
+pub async fn upstream_body(response: reqwest::Response) -> reqwest::Result<Bytes> {
+    if response
+        .extensions()
+        .get::<Arc<UpstreamBodyTap>>()
+        .is_none()
+    {
+        return response.bytes().await;
+    }
+    let mut stream = std::pin::pin!(upstream_body_stream(response));
+    let Some(first) = stream.next().await.transpose()? else {
+        return Ok(Bytes::new());
+    };
+    let Some(second) = stream.next().await.transpose()? else {
+        return Ok(first);
+    };
+    let mut body = BytesMut::with_capacity(first.len() + second.len());
+    body.extend_from_slice(&first);
+    body.extend_from_slice(&second);
+    while let Some(chunk) = stream.next().await {
+        body.extend_from_slice(&chunk?);
+    }
+    Ok(body.freeze())
+}
+
+/// Decode just as reqwest's `Response::json` does, with the same error shown
+/// to the caller. A serde error may quote response content, so log only the
+/// causes of real read errors.
+pub async fn upstream_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, crate::BridgeError> {
+    let body = upstream_body(response)
+        .await
+        .map_err(|e| crate::upstream_body_read_error(&e))?;
+    serde_json::from_slice(&body)
+        .map_err(|_| crate::BridgeError::UpstreamDecode("error decoding response body".to_string()))
 }
 
 /// Log an error response whose body could not be read. Names the request
@@ -194,7 +442,7 @@ pub fn warn_error_body_unread(status: u16, reason: &str) {
 
 /// Whether a route that does not otherwise need a non-2xx body should read it.
 pub fn wants_upstream_error_body() -> bool {
-    TAP.try_with(|tap| tap.keeps_error_bodies).unwrap_or(false)
+    TAP.try_with(|tap| tap.body_cap.is_some()).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -241,7 +489,7 @@ mod tests {
 
         let tap = Arc::new(ResponseHeaderTap::new(
             vec!["x-upstream-id".into()],
-            false,
+            None,
             String::new(),
         ));
         scope(tap.clone(), async { note_upstream_response(&h) }).await;
@@ -254,7 +502,7 @@ mod tests {
         assert!(tap.take().is_empty(), "take leaves nothing behind");
 
         // No exporter asked for a header: the request id is still read.
-        let idle = Arc::new(ResponseHeaderTap::new(Vec::new(), false, String::new()));
+        let idle = Arc::new(ResponseHeaderTap::new(Vec::new(), None, String::new()));
         scope(idle.clone(), async { note_upstream_response(&h) }).await;
         let got = idle.take();
         assert!(got.headers.is_empty());

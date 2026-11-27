@@ -465,11 +465,10 @@ async fn send_upstream(
 
     let status = resp.status();
     let headers = resp.headers().clone();
-    aisix_gateway::note_upstream_response(&headers);
-    let bytes = resp.bytes().await;
+    let resp = aisix_gateway::tap_upstream_response(resp);
+    let bytes = aisix_gateway::upstream_body(resp).await;
     crate::attribution::note_upstream_wait_end(bytes.is_ok());
     if let (false, Ok(body)) = (status.is_success(), &bytes) {
-        aisix_gateway::note_upstream_error_body(body);
         crate::attribution::note_relayed_error_body(body);
     }
     let bytes = bytes
@@ -525,7 +524,7 @@ async fn scan_input_blob(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let chain = state.guardrail_index.resolve(&ctx);
+    let chain = state.resolve_guardrails(&ctx);
     if chain.is_empty() {
         return Ok(());
     }
@@ -600,7 +599,7 @@ async fn scan_output_blob(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let chain = state.guardrail_index.resolve(&ctx);
+    let chain = state.resolve_guardrails(&ctx);
     if chain.is_empty() {
         return Ok(());
     }

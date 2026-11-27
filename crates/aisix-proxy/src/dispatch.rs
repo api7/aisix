@@ -929,7 +929,7 @@ pub(crate) async fn json_body_within(
     resp: reqwest::Response,
     deadline: Option<std::time::Duration>,
 ) -> Result<serde_json::Value, BridgeError> {
-    let read = resp.json::<serde_json::Value>();
+    let read = aisix_gateway::upstream_json(resp);
     match deadline {
         Some(d) => tokio::time::timeout(d, read)
             .await
@@ -937,11 +937,8 @@ pub(crate) async fn json_body_within(
                 elapsed_ms: d.as_millis() as u64,
                 cause: "upstream answered a streaming request with a JSON body that stalled"
                     .to_string(),
-            })?
-            .map_err(|e| aisix_gateway::upstream_body_read_error(&e)),
-        None => read
-            .await
-            .map_err(|e| aisix_gateway::upstream_body_read_error(&e)),
+            })?,
+        None => read.await,
     }
 }
 

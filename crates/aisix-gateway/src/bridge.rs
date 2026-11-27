@@ -841,8 +841,7 @@ pub async fn decode_success_body<T: serde::de::DeserializeOwned>(
     resp: reqwest::Response,
     wire: UpstreamWire,
 ) -> Result<T, BridgeError> {
-    let body = resp
-        .bytes()
+    let body = crate::upstream_body(resp)
         .await
         .map_err(|e| crate::upstream_http::upstream_body_read_error(&e))?;
     if let Some(err) = in_band_error_in_body(&body, wire) {
@@ -923,9 +922,8 @@ impl UpstreamErrorBody {
 
 /// Read an upstream error response's body, keeping at most `limit` bytes.
 /// Used to bound upstream-error parsing cost regardless of `Content-Length`.
-/// THE read of every non-2xx upstream body: it hands the bytes to the request's
-/// full-content exports ([`crate::response_tap::note_upstream_error_body`])
-/// and logs a failed read.
+/// Logs a failed read. When the response was registered by
+/// [`crate::tap_upstream_response`], the attempt also keeps its own prefix.
 ///
 /// Public so non-OpenAI / non-Anthropic bridges (Vertex) can
 /// enforce the same cap when they need a custom parse path (e.g.
@@ -936,7 +934,7 @@ pub async fn read_body_capped(resp: reqwest::Response, limit: usize) -> Upstream
     let status = resp.status().as_u16();
     let mut read_error = None;
     let mut buf = bytes::BytesMut::with_capacity(limit.min(16 * 1024));
-    let mut stream = resp.bytes_stream();
+    let mut stream = std::pin::pin!(crate::upstream_body_stream(resp));
     // Continue draining the stream past `limit` so the underlying
     // hyper connection can be returned to reqwest's keep-alive pool.
     // Stopping the iteration mid-stream taints the connection and
@@ -962,7 +960,6 @@ pub async fn read_body_capped(resp: reqwest::Response, limit: usize) -> Upstream
         buf.extend_from_slice(&chunk[..take]);
     }
     let bytes = buf.freeze();
-    crate::response_tap::note_upstream_error_body(&bytes);
     UpstreamErrorBody { bytes, read_error }
 }
 

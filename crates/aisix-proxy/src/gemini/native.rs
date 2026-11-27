@@ -309,10 +309,7 @@ fn finish(candidate: &Value, has_calls: bool) -> FinishReason {
 pub(crate) async fn chat(ctx: &BridgeContext, body: &Value) -> Result<ChatResponse, BridgeError> {
     let resp = send(ctx, body, false).await?;
     let header_tier = gemini_header_service_tier(resp.headers());
-    let raw: Value = resp
-        .json()
-        .await
-        .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?;
+    let raw: Value = aisix_gateway::upstream_json(resp).await?;
     response(raw).map(|r| r.with_fallback_service_tier(header_tier))
 }
 
@@ -394,7 +391,7 @@ pub(crate) async fn chat_stream(
 ) -> Result<ChatChunkStream, BridgeError> {
     let resp = send(ctx, body, true).await?;
     let tier = gemini_header_service_tier(resp.headers());
-    let mut bytes = resp.bytes_stream();
+    let mut bytes = aisix_gateway::upstream_body_stream(resp);
     let stream = async_stream::try_stream! {
         let mut decoder = SseDecoder::new();
         let mut next_tool = HashMap::new();

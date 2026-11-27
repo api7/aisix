@@ -422,7 +422,7 @@ impl Bridge for AnthropicBridge {
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
-            aisix_gateway::note_upstream_response(resp.headers());
+            let resp = aisix_gateway::tap_upstream_response(resp);
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -519,7 +519,7 @@ impl Bridge for AnthropicBridge {
         })
         .await?;
 
-        aisix_gateway::note_upstream_response(resp.headers());
+        let resp = aisix_gateway::tap_upstream_response(resp);
         let status = resp.status();
         if !status.is_success() {
             return Err(
@@ -530,7 +530,7 @@ impl Bridge for AnthropicBridge {
             );
         }
 
-        let byte_stream = resp.bytes_stream();
+        let byte_stream = aisix_gateway::upstream_body_stream(resp);
         let stream = build_chunk_stream(byte_stream);
         Ok(legacy.reply_stream(Box::pin(stream)))
     }
