@@ -331,6 +331,7 @@ pub(crate) async fn serve(
                 /* terminal_last */
                 false,
                 &audit,
+                true,
             );
             // The streaming path wires the WINNER's telemetry into the SSE
             // stream's on_complete callback (it has to wait for the
@@ -612,6 +613,7 @@ pub(crate) async fn serve(
                 /* terminal_last */
                 charge.is_none(),
                 &audit,
+                true,
             );
             // Terminal event:
             //  - output-blocked (charge present): the WINNING attempt was
@@ -4190,6 +4192,9 @@ async fn dispatch_ensemble(
 
         let judge_model_id = judge_entry.id.clone();
         let judge_provider_key_id = judge_pk.id.clone();
+        if crate::attribution::attempt_used_provider_key(judge_index) {
+            crate::attribution::note_confirmed_provider_key(&judge_provider_key_id);
+        }
         let judge_attempt_model = ensemble_cfg.judge.model.clone();
         let judge_attempt_index = judge_index;
 
@@ -5195,11 +5200,13 @@ fn emit_failed_attempts(
     // The request's enforced-guardrail audit handle (AISIX-Cloud#1330);
     // stamped only on the event this call marks terminal.
     audit: &crate::usage_attr::GuardrailAudit,
+    usage_key_known: bool,
 ) {
     let last_failed = attempts.iter().rposition(|a| !a.success);
     for (i, rec) in attempts.iter().enumerate().filter(|(_, a)| !a.success) {
         // Each failed attempt hit its own target, hence its own key.
-        let pk = crate::usage_attr::ResolvedPk::resolve(snap, &rec.provider_key_id);
+        let pk = crate::usage_attr::ResolvedPk::resolve(snap, &rec.provider_key_id)
+            .with_usage_key_if(usage_key_known);
         emit_usage_event(
             state,
             snap,
@@ -5517,7 +5524,19 @@ fn emit_failed_subcall(
     failure: &crate::ensemble::SubcallFailure,
     index: u32,
 ) {
-    let target_model_id = subcall_model_id(snap, &failure.model);
+    let target = snap.models.get_by_name(&failure.model);
+    let target_model_id = target
+        .as_ref()
+        .map(|entry| entry.id.clone())
+        .unwrap_or_default();
+    let usage_key_known = !failure.provider_key_id.is_empty();
+    let provider_key_id = if usage_key_known {
+        failure.provider_key_id.clone()
+    } else {
+        target
+            .and_then(|entry| entry.value.provider_key_id.clone())
+            .unwrap_or_default()
+    };
     emit_failed_attempts(
         state,
         snap,
@@ -5531,7 +5550,7 @@ fn emit_failed_subcall(
             kind: failure.kind,
             target_model: failure.model.clone(),
             target_model_id,
-            provider_key_id: failure.provider_key_id.clone(),
+            provider_key_id,
             status: failure.status,
             success: false,
             error_class: failure.error_class.to_string(),
@@ -5541,6 +5560,7 @@ fn emit_failed_subcall(
         }],
         /* terminal_last */ false,
         &ctx.audit,
+        usage_key_known,
     );
 }
 

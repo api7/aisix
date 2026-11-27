@@ -393,7 +393,7 @@ async fn send_upstream(
     // is what keeps a colliding operator header from putting two values of
     // e.g. `x-aisix-request-id` on the wire.
     let mut headers = HeaderMap::new();
-    match target.adapter {
+    let auth_header = match target.adapter {
         // An Entra ID client-credentials secret is exchanged for a bearer
         // token, as on every other Azure route; a resource key goes out as
         // `api-key`.
@@ -403,14 +403,16 @@ async fn send_upstream(
                 .map_err(ProxyError::Bridge)?;
             let (name, value) = aisix_provider_azure_openai::auth_header(&credential)
                 .map_err(ProxyError::Bridge)?;
-            headers.insert(name, value);
+            headers.insert(name.clone(), value);
+            name
         }
         _ => {
             if let Ok(v) = axum::http::HeaderValue::from_str(&format!("Bearer {}", target.secret)) {
                 headers.insert(header::AUTHORIZATION, v);
             }
+            header::AUTHORIZATION
         }
-    }
+    };
     if let Ok(v) = axum::http::HeaderValue::from_str(request_id) {
         headers.insert(axum::http::HeaderName::from_static("x-aisix-request-id"), v);
     }
@@ -442,9 +444,11 @@ async fn send_upstream(
     }
 
     crate::attribution::note_upstream_wait_begin();
+    let caller_credential = target.forwarded_client.claims(auth_header.as_str());
+    aisix_gateway::response_tap::note_upstream_credential(caller_credential);
     let sent = builder.send().await;
-    if sent.as_ref().err().is_none_or(|err| !err.is_builder()) {
-        crate::attribution::note_direct_provider_key(&target.pk_entry.id);
+    if sent.is_ok() && !caller_credential {
+        crate::attribution::note_confirmed_provider_key(&target.pk_entry.id);
     }
     if sent.is_err() {
         crate::attribution::note_upstream_wait_end(false);

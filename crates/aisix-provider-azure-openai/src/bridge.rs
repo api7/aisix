@@ -718,7 +718,7 @@ fn build_request_headers(
     hdr: &UpstreamHeaderContext<'_>,
 ) -> Result<HeaderMap, BridgeError> {
     let mut headers = HeaderMap::new();
-    match (&auth.api_key, &auth.bearer_token) {
+    let auth_slot = match (&auth.api_key, &auth.bearer_token) {
         (Some(key), None) => {
             let value = HeaderValue::from_str(key).map_err(|e| {
                 BridgeError::InvalidUpstreamCredentials(format!(
@@ -726,6 +726,7 @@ fn build_request_headers(
                 ))
             })?;
             headers.insert(HeaderName::from_static("api-key"), value);
+            "api-key"
         }
         (None, Some(token)) => {
             // Bearer token from AAD. Same byte-validation pattern as
@@ -739,6 +740,7 @@ fn build_request_headers(
                 )
             })?;
             headers.insert(header::AUTHORIZATION, value);
+            "authorization"
         }
         // parse() / resolve_auth() ensure exactly one is Some — keep
         // explicit guard for defense in depth.
@@ -747,7 +749,7 @@ fn build_request_headers(
                 "internal: AzureAuth must set exactly one of api_key / bearer_token".into(),
             ))
         }
-    }
+    };
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
@@ -762,7 +764,7 @@ fn build_request_headers(
             HeaderValue::from_static("text/event-stream"),
         );
     }
-    apply_request_headers(&mut headers, hdr);
+    apply_request_headers(&mut headers, hdr).note_auth_source(auth_slot);
     Ok(headers)
 }
 

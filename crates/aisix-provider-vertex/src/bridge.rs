@@ -2251,7 +2251,7 @@ fn build_request_headers(
     let rid = HeaderValue::from_str(request_id)
         .map_err(|_| BridgeError::Config("request_id contains invalid header characters".into()))?;
     headers.insert(HeaderName::from_static("x-aisix-request-id"), rid);
-    apply_request_headers(&mut headers, hdr);
+    apply_request_headers(&mut headers, hdr).note_auth_source("authorization");
     Ok(headers)
 }
 

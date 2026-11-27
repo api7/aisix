@@ -683,6 +683,7 @@ struct Prepared {
     auth: AuthenticatedKey,
     model_entry: std::sync::Arc<aisix_core::ResourceEntry<aisix_core::Model>>,
     pk_id: String,
+    caller_credential: bool,
     upstream_request: tokio_tungstenite::tungstenite::handshake::client::Request,
     reservation: aisix_ratelimit::MultiReservation,
     requested_model: String,
@@ -754,7 +755,7 @@ async fn prepare(
         );
     }
 
-    let mut upstream_request = match pk_entry.value.adapter {
+    let (mut upstream_request, auth_name) = match pk_entry.value.adapter {
         Some(Adapter::Openai) => {
             let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
             let url = crate::dispatch::build_openai_url(&base, "/realtime");
@@ -782,7 +783,7 @@ async fn prepare(
                 req.headers_mut()
                     .insert("openai-beta", "realtime=v1".parse().unwrap());
             }
-            req
+            (req, axum::http::header::AUTHORIZATION)
         }
         Some(Adapter::AzureOpenai) => {
             let base = aisix_provider_azure_openai::AzureUpstreamRef::api_base_url(
@@ -816,8 +817,8 @@ async fn prepare(
                 .map_err(ProxyError::Bridge)?;
             let (name, value) = aisix_provider_azure_openai::auth_header(&credential)
                 .map_err(ProxyError::Bridge)?;
-            req.headers_mut().insert(name, value);
-            req
+            req.headers_mut().insert(name.clone(), value);
+            (req, name)
         }
         _ => {
             return Err(ProxyError::InvalidRequest(format!(
@@ -852,6 +853,7 @@ async fn prepare(
     Ok(Prepared {
         auth,
         pk_id: pk_entry.id.to_string(),
+        caller_credential: forwarded.claims(auth_name.as_str()),
         model_entry,
         upstream_request,
         reservation,
@@ -1084,6 +1086,7 @@ async fn run_session(
         auth,
         model_entry,
         pk_id,
+        caller_credential,
         upstream_request,
         reservation,
         requested_model,
@@ -1250,7 +1253,9 @@ async fn run_session(
             let unresolved_pk = crate::usage_attr::ResolvedPk::unresolved();
             let attribution = crate::usage_attr::usage_attribution(&model, &unresolved_pk);
             let upstream_content = refused.as_ref().and_then(|refused| {
-                event.provider_key_id.clone_from(&pk_id);
+                if !caller_credential {
+                    event.provider_key_id.clone_from(&pk_id);
+                }
                 let names = crate::client_ip::exported_header_names(&snap, true);
                 if !names.is_empty() {
                     event.upstream_response_headers =
@@ -1641,6 +1646,9 @@ async fn run_session(
         guardrail_bypassed_reason: crate::usage_attr::bypass_reason(&audit),
         ..Default::default()
     };
+    if !caller_credential {
+        event.provider_key_id.clone_from(&pk_id);
+    }
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
     crate::usage_attr::apply_caller_identity(&mut event, auth.jwt.as_ref(), &auth.caller());
     let usage_model =

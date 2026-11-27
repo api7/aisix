@@ -1098,7 +1098,7 @@ fn classifier_headers(
     if let Ok(id) = HeaderValue::from_str(request_id) {
         headers.insert(HeaderName::from_static("x-aisix-request-id"), id);
     }
-    aisix_gateway::apply_request_headers(&mut headers, &ctx);
+    aisix_gateway::apply_request_headers(&mut headers, &ctx).note_auth_source("authorization");
     Ok(headers)
 }
 
@@ -1169,7 +1169,7 @@ async fn classify_inner(
         .body(body)
         .send()
         .await;
-    let dispatched = sent.as_ref().err().is_none_or(|err| !err.is_builder());
+    let dispatched = sent.is_ok();
     if let Ok(resp) = &sent {
         aisix_gateway::note_upstream_response(resp.headers());
     }
@@ -1614,10 +1614,7 @@ async fn embed_texts_inner(
         &pk_entry.id,
     ));
     let response = bridge.embed(&req, &ctx).await;
-    child.mark_returned(match &response {
-        Ok(_) => true,
-        Err(err) => err.reached_upstream(),
-    });
+    child.mark_returned(crate::attribution::observed_upstream_response());
     // Counted the way `/v1/embeddings` counts the same answer: the
     // upstream's prompt count, else its total, else a local estimate.
     let counted = match &response {

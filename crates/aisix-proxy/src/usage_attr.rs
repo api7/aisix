@@ -201,6 +201,7 @@ pub(crate) const UNKNOWN_PK: &str = "unknown";
 /// a per-emit lookup without saying so.
 pub(crate) struct ResolvedPk<'a> {
     id: &'a str,
+    usage_key_known: bool,
     /// `display_name`, control-char stripped and length-capped via
     /// [`sanitize_tag`]; [`UNKNOWN_PK`] when the id is empty, unresolved
     /// or names a row with a blank display name. Borrowed in the
@@ -244,6 +245,7 @@ impl<'a> ResolvedPk<'a> {
             .unwrap_or(aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN);
         Self {
             id,
+            usage_key_known: true,
             name,
             protocol,
             entry,
@@ -257,10 +259,16 @@ impl<'a> ResolvedPk<'a> {
     pub(crate) fn unresolved() -> ResolvedPk<'static> {
         ResolvedPk {
             id: "",
+            usage_key_known: false,
             name: Cow::Borrowed(UNKNOWN_PK),
             protocol: aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN,
             entry: None,
         }
+    }
+
+    pub(crate) fn with_usage_key_if(mut self, known: bool) -> Self {
+        self.usage_key_known &= known;
+        self
     }
 
     /// The ProviderKey dimensions of the metric label set.
@@ -1087,15 +1095,6 @@ pub(crate) struct UsageAttribution<'a> {
     provider_key_id: &'a str,
 }
 
-impl UsageAttribution<'_> {
-    pub(crate) fn with_provider_key_if(mut self, known: bool) -> Self {
-        if !known {
-            self.provider_key_id = "";
-        }
-        self
-    }
-}
-
 /// Keep the attempt's resource ID separate from the metric label, which
 /// can also name a key on a cache hit or refusal and has a sentinel value.
 pub(crate) fn usage_attribution<'a>(
@@ -1104,7 +1103,11 @@ pub(crate) fn usage_attribution<'a>(
 ) -> UsageAttribution<'a> {
     UsageAttribution {
         labels: usage_event_labels(model, pk),
-        provider_key_id: if pk.id == UNKNOWN_PK { "" } else { pk.id },
+        provider_key_id: if pk.usage_key_known && pk.id != UNKNOWN_PK {
+            pk.id
+        } else {
+            ""
+        },
     }
 }
 
@@ -1116,7 +1119,7 @@ pub(crate) fn emit_prepared_usage_event(
     attribution: UsageAttribution<'_>,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
 ) {
-    event.provider_key_id = crate::attribution::direct_provider_key_id();
+    event.provider_key_id = crate::attribution::confirmed_provider_key_id();
     // Follow any failed attempt rows the handler already emitted.
     event.attempt_index = event
         .attempt_index
@@ -1245,8 +1248,11 @@ pub(crate) fn emit_usage(
     } else {
         None
     };
+    if response.caller_credential {
+        event.provider_key_id.clear();
+    }
     if dispatched {
-        if event.provider_key_id.is_empty() {
+        if event.provider_key_id.is_empty() && response.received && !response.caller_credential {
             event.provider_key_id = attribution.provider_key_id.to_owned();
         }
         // A surface that runs detached from the request scope (`/v1/realtime`)
@@ -1467,7 +1473,7 @@ fn emit_internal_calls(
     let exporters = live_exporters(state, snap);
     for mut call in calls {
         let provider_key_id = std::mem::take(&mut call.provider_key_id);
-        let dispatched = call.dispatched;
+        let attributable = call.dispatched && !call.caller_credential;
         // Each child is a span of the request's own trace, under its SERVER span.
         let emission = trace.map(|bundle| {
             bundle.internal_call_emission(
@@ -1477,7 +1483,7 @@ fn emit_internal_calls(
         });
         let pk = ResolvedPk::resolve(snap, &provider_key_id);
         let mut event = internal_call_event(call, parent);
-        if dispatched {
+        if attributable {
             event.provider_key_id = provider_key_id.clone();
         }
         apply_pk_telemetry(&mut event, &pk);

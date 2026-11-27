@@ -89,7 +89,8 @@ pub fn provider_request_id(headers: &http::HeaderMap) -> String {
 /// What one upstream response left for the request's telemetry.
 #[derive(Debug, Default)]
 pub struct UpstreamResponseCapture {
-    received: bool,
+    pub received: bool,
+    pub caller_credential: bool,
     /// The headers the request's exporters asked for.
     pub headers: BTreeMap<String, String>,
     /// See [`provider_request_id`].
@@ -99,7 +100,11 @@ pub struct UpstreamResponseCapture {
 
 impl UpstreamResponseCapture {
     pub fn is_empty(&self) -> bool {
-        self.headers.is_empty() && self.request_id.is_empty() && self.body.is_none()
+        !self.received
+            && !self.caller_credential
+            && self.headers.is_empty()
+            && self.request_id.is_empty()
+            && self.body.is_none()
     }
 
     pub fn take_body(&mut self) -> Option<CapturedUpstreamBody> {
@@ -265,13 +270,13 @@ impl ResponseHeaderTap {
 
     /// Concurrent sub-calls own separate body captures, with the same
     /// output policy and content limit as the parent request.
-    pub fn for_subcall(&self) -> Option<Arc<Self>> {
-        Some(Arc::new(Self {
-            body_cap: Some(self.body_cap?),
+    pub fn for_subcall(&self) -> Arc<Self> {
+        Arc::new(Self {
+            body_cap: self.body_cap,
             protects_output: AtomicBool::new(self.protects_output()),
             request_id: self.request_id.clone(),
             ..Self::default()
-        }))
+        })
     }
 
     fn new_body(&self, success: bool, format: UpstreamBodyFormat) -> Option<Arc<UpstreamBodyTap>> {
@@ -298,19 +303,24 @@ impl ResponseHeaderTap {
     }
 
     fn record(&self, headers: &http::HeaderMap, body: Option<Arc<UpstreamBodyTap>>) {
-        let captured = UpstreamResponseCapture {
+        let mut current = self.lock();
+        *current = UpstreamResponseCapture {
             received: true,
+            caller_credential: current.caller_credential,
             headers: capture_header_values(headers, &self.names),
             request_id: provider_request_id(headers),
             body,
         };
-        *self.lock() = captured;
     }
 
     /// Whether an upstream answered since the last reset, even if it sent
     /// no request ID and there were no headers configured for capture.
     pub fn has_response(&self) -> bool {
         self.lock().received
+    }
+
+    pub fn has_caller_credential(&self) -> bool {
+        self.lock().caller_credential
     }
 
     /// Move the latest capture out, leaving nothing behind.
@@ -349,12 +359,25 @@ pub fn note_upstream_response(headers: &http::HeaderMap) {
     let _ = TAP.try_with(|tap| tap.record(headers, None));
 }
 
-/// Clear the body before an internal retry that shares the same usage row.
+/// Record the source of the credential in the upstream's own auth slot.
+pub fn note_upstream_credential(caller_credential: bool) {
+    if caller_credential {
+        let _ = TAP.try_with(|tap| tap.lock().caller_credential = true);
+    }
+}
+
+pub fn upstream_used_caller_credential() -> bool {
+    TAP.try_with(|tap| tap.has_caller_credential())
+        .unwrap_or(false)
+}
+
+/// Reset response evidence before an internal retry that shares a usage row.
 pub fn clear_upstream_body() {
     let _ = TAP.try_with(|tap| {
-        if tap.body_cap.is_some() {
-            tap.lock().body = None;
-        }
+        let mut capture = tap.lock();
+        capture.body = None;
+        capture.received = false;
+        capture.caller_credential = false;
     });
 }
 

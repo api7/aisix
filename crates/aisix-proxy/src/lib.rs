@@ -11647,6 +11647,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     /// finds it exhausted and fails before opening the stream (429).
     #[tokio::test]
     async fn ensemble_streaming_judge_rate_limit_enforced() {
+        use aisix_obs::UsageSink;
         let upstream = MockServer::builder().start().await;
         let judge_sse = "\
 data: {\"id\":\"cmpl-judge\",\"model\":\"judge-upstream\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final\"},\"finish_reason\":null}]}\n\n\
@@ -11686,13 +11687,18 @@ data: [DONE]\n\n";
             .insert(direct_model_entry("m-panel-a", "panel-a", "panel-upstream"));
         snap.models
             .insert(direct_model_entry("m-panel-b", "panel-b", "panel-upstream"));
+        let mut judge_key = pk_entry_with_id("pk-judge-limited", &upstream.uri());
+        judge_key.value.telemetry_tags.pk_label = Some("judge-credential".into());
+        snap.provider_keys.insert(judge_key);
         // Judge capped at one request per minute.
-        snap.models.insert(direct_model_entry_rl(
+        let mut judge = direct_model_entry_rl(
             "m-judge",
             "judge-m",
             "judge-upstream",
             serde_json::json!({ "rpm": 1 }),
-        ));
+        );
+        judge.value.provider_key_id = Some("pk-judge-limited".into());
+        snap.models.insert(judge);
         snap.models.insert(ensemble_model_entry(
             "m-council",
             "council",
@@ -11700,7 +11706,11 @@ data: [DONE]\n\n";
             "judge-m",
         ));
         snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
-        let app = build_router(build_state(snap, hub));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let state = build_state(snap, hub);
+        let sink = UsageSink::new(tx).with_metrics((*state.metrics).clone());
+        let state = state.with_usage_sink(sink);
+        let app = build_router(state.clone());
 
         let make_req = || {
             let body = serde_json::json!({
@@ -11723,6 +11733,16 @@ data: [DONE]\n\n";
             run(app, make_req()).await.status(),
             StatusCode::TOO_MANY_REQUESTS
         );
+        let refused = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|e| e.attempt_kind == "judge" && e.status_code == 429)
+            .expect("a local judge refusal row");
+        assert_eq!(refused.pk_label, "judge-credential");
+        assert!(refused.provider_key_id.is_empty());
+        assert!(state.metrics.render().lines().any(|line| {
+            line.starts_with("aisix_usage_events_emitted_total{")
+                && line.contains("provider_key_id=\"pk-judge-limited\"")
+                && line.contains("status=\"429\"")
+        }));
     }
 
     /// #620 (audit M-1): the per-member `commit_tokens` must accrue to the
@@ -12440,6 +12460,11 @@ data: [DONE]\n\n";
         hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = new_snap(&upstream.uri());
         seed_council_with_a_tpm_cap(&snap);
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-stream-judge", &upstream.uri()));
+        let mut judge = direct_model_entry("m-judge", "judge-m", "judge-upstream");
+        judge.value.provider_key_id = Some("pk-stream-judge".into());
+        snap.models.insert(judge);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
         let app = build_router(state.clone());
@@ -12482,6 +12507,7 @@ data: [DONE]\n\n";
         assert_eq!(events[2].status_code, CLIENT_CLOSED_REQUEST, "{events:?}");
         assert_eq!(events[2].error_message, cancel::CANCELLED_BEFORE_BODY);
         assert_eq!(events[2].attempt_kind, "", "{events:?}");
+        assert_eq!(events[2].provider_key_id, "pk-stream-judge");
         assert_attempt_indices_increase(&events);
         assert_council_charged(&state, app, 32).await;
     }

@@ -333,7 +333,7 @@ fn build_request_headers(
             HeaderValue::from_static("text/event-stream"),
         );
     }
-    aisix_gateway::apply_request_headers(&mut headers, hdr);
+    aisix_gateway::apply_request_headers(&mut headers, hdr).note_auth_source("x-api-key");
     Ok(headers)
 }
 

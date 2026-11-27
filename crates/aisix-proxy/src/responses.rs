@@ -1386,7 +1386,8 @@ async fn responses_to_target(
             model_id,
             client_ctx,
         ),
-    );
+    )
+    .note_auth_source("authorization");
 
     let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
     let mut req = url

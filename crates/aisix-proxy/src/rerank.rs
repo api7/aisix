@@ -597,7 +597,8 @@ async fn dispatch(
                         &target.id,
                         client_ctx,
                     ),
-                );
+                )
+                .note_auth_source("authorization");
 
                 let client =
                     crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());

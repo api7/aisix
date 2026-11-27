@@ -309,13 +309,15 @@ pub(crate) fn emit(
     // The selected target alone is insufficient: a cancel can drop a
     // reservation or request preparation before it reaches the upstream.
     if ctx.in_flight.is_some() {
-        if dispatched || crate::attribution::observed_upstream_response() {
+        if (dispatched || crate::attribution::observed_upstream_response())
+            && !aisix_gateway::response_tap::upstream_used_caller_credential()
+        {
             event.provider_key_id.clone_from(&resolved.provider_key_id);
         }
     } else if let Some(winner) = &ctx.won {
         event.provider_key_id.clone_from(&winner.provider_key_id);
     } else {
-        event.provider_key_id = ctx.direct_provider_key_id;
+        event.provider_key_id = ctx.confirmed_provider_key_id;
     }
     emit_one(
         state,

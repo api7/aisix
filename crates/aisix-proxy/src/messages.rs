@@ -1344,7 +1344,8 @@ async fn anthropic_passthrough_dispatch(
             aisix_gateway::apply_request_headers(
                 &mut headers,
                 &crate::dispatch::upstream_header_ctx(pk_value, pk_id, model, model_id, client_ctx),
-            );
+            )
+            .note_auth_source("x-api-key");
             forward_client_anthropic_beta(&mut headers, client_ctx);
 
             let client = crate::http_client::client_for(pk_value.upstream_connection().as_ref());

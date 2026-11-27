@@ -180,8 +180,8 @@ pub(crate) struct CancelContext {
     pub auth: Option<crate::auth::AuthenticatedKey>,
     /// See [`RouteIdentity`].
     pub route: RouteIdentity,
-    /// Provider Key used by a direct HTTP relay without a routing record.
-    pub direct_provider_key_id: String,
+    /// Provider Key confirmed by an upstream call outside the attempt loop.
+    pub confirmed_provider_key_id: String,
     /// `UsageEvent::request_headers`, from [`note_client`] or, on `/mcp`
     /// and `/a2a`, from [`note_request_headers`].
     pub request_headers: std::collections::BTreeMap<String, String>,
@@ -658,6 +658,7 @@ pub(crate) struct InternalCall {
     /// The Provider Key the call went out on.
     pub(crate) provider_key_id: String,
     pub(crate) dispatched: bool,
+    pub(crate) caller_credential: bool,
     pub(crate) completed_at: String,
     pub(crate) status_code: u16,
     pub(crate) error_class: String,
@@ -735,6 +736,10 @@ impl InternalCallGuard {
     /// to fill in. Disarms the cancellation record.
     pub(crate) fn settle(&mut self) -> InternalCall {
         let mut call = self.pending.take().expect("an internal call settles once");
+        call.caller_credential = self
+            .response_tap
+            .as_ref()
+            .is_some_and(|tap| tap.has_caller_credential());
         let returned = self.returned.unwrap_or_else(Instant::now);
         call.completed_at = aisix_obs::UsageEvent::occurred_at_now();
         call.settled_at = Some(returned);
@@ -764,6 +769,10 @@ impl Drop for InternalCallGuard {
             .response_tap
             .as_ref()
             .is_some_and(|tap| tap.has_response());
+        call.caller_credential = self
+            .response_tap
+            .as_ref()
+            .is_some_and(|tap| tap.has_caller_credential());
         ledger.record(call);
     }
 }
@@ -1718,14 +1727,25 @@ pub(crate) fn observed_upstream_response() -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn note_direct_provider_key(id: &str) {
-    with_cancel(|c| c.direct_provider_key_id = id.to_owned());
+pub(crate) fn note_confirmed_provider_key(id: &str) {
+    with_cancel(|c| c.confirmed_provider_key_id = id.to_owned());
 }
 
-pub(crate) fn direct_provider_key_id() -> String {
+pub(crate) fn confirmed_provider_key_id() -> String {
     CURRENT
-        .try_with(|a| a.lock().cancel.direct_provider_key_id.clone())
+        .try_with(|a| a.lock().cancel.confirmed_provider_key_id.clone())
         .unwrap_or_default()
+}
+
+pub(crate) fn attempt_used_provider_key(index: u32) -> bool {
+    CURRENT
+        .try_with(|a| {
+            a.lock()
+                .attempt_responses
+                .get(&index)
+                .is_some_and(|response| response.received && !response.caller_credential)
+        })
+        .unwrap_or(false)
 }
 
 /// Close the upstream wait [`note_upstream_wait_begin`] opened: the
@@ -1764,22 +1784,19 @@ pub(crate) async fn capture_subcall_response<T, E>(
     streaming: bool,
     call: impl Future<Output = Result<T, E>>,
 ) -> Result<T, E> {
-    let tap = CURRENT
-        .try_with(|a| a.response_tap.for_subcall())
-        .ok()
-        .flatten();
+    let tap = CURRENT.try_with(|a| a.response_tap.for_subcall()).ok();
     let Some(tap) = tap else {
         return call.await;
     };
     let result = aisix_gateway::response_tap::scope(tap.clone(), call).await;
-    if streaming || result.is_err() {
-        let mut response = tap.take();
-        response.headers.clear();
-        response.request_id.clear();
-        if !response.is_empty() {
-            let _ =
-                CURRENT.try_with(|a| a.lock().attempt_responses.insert(attempt_index, response));
-        }
+    let mut response = tap.take();
+    response.headers.clear();
+    response.request_id.clear();
+    if !streaming && result.is_ok() {
+        response.discard_success_body();
+    }
+    if !response.is_empty() {
+        let _ = CURRENT.try_with(|a| a.lock().attempt_responses.insert(attempt_index, response));
     }
     result
 }

@@ -937,7 +937,8 @@ async fn count_tokens_to_target(
             model_id,
             client,
         ),
-    );
+    )
+    .note_auth_source("x-api-key");
     crate::messages::forward_client_anthropic_beta(&mut headers, client);
 
     let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());

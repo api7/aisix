@@ -267,6 +267,11 @@ impl ForwardedClientHeaders {
         self.entries.iter().any(|(n, _)| n.as_str() == name)
     }
 
+    /// Record whether the forward took the adapter's credential slot.
+    pub fn note_auth_source(&self, slot: &str) {
+        crate::response_tap::note_upstream_credential(self.claims(slot));
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -325,7 +330,10 @@ impl ForwardedClientHeaders {
 /// `x-aisix-request-id`) before calling this. That ordering is what makes
 /// a `default_headers` entry unable to displace them — and what lets a
 /// forwarded client header displace the credential deliberately.
-pub fn apply_request_headers(headers: &mut HeaderMap, ctx: &UpstreamHeaderContext<'_>) {
+pub fn apply_request_headers(
+    headers: &mut HeaderMap,
+    ctx: &UpstreamHeaderContext<'_>,
+) -> ForwardedClientHeaders {
     for (name, value) in resolve_default_headers(ctx) {
         if headers.contains_key(&name) {
             continue;
@@ -337,7 +345,9 @@ pub fn apply_request_headers(headers: &mut HeaderMap, ctx: &UpstreamHeaderContex
     // one is the more specific statement of intent. `apply` is what makes
     // that hold: it declines a name already present unless the slot is a
     // credential one.
-    ForwardedClientHeaders::resolve(ctx).apply(headers);
+    let forwarded = ForwardedClientHeaders::resolve(ctx);
+    forwarded.apply(headers);
+    forwarded
 }
 
 #[cfg(test)]

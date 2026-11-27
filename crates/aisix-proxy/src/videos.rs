@@ -1261,6 +1261,7 @@ fn provider_call_once<'a>(
     }
     // Last, and overwriting — see the field's doc comment.
     target.forwarded_client.apply(&mut headers);
+    target.forwarded_client.note_auth_source("authorization");
 
     let mut builder = client.request(method, url).headers(headers);
     if let Some(b) = body {

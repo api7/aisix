@@ -505,7 +505,7 @@ async fn dispatch(
                             .map_err(|e| invalid("api key", e))?,
                     ),
                 };
-                headers.insert(auth_name, auth_value);
+                headers.insert(auth_name.clone(), auth_value);
                 headers.insert(
                     axum::http::header::CONTENT_TYPE,
                     HeaderValue::from_static("application/json"),
@@ -523,7 +523,8 @@ async fn dispatch(
                         &target.id,
                         client_ctx,
                     ),
-                );
+                )
+                .note_auth_source(auth_name.as_str());
 
                 let http = crate::http_client::client_for(pk.upstream_connection().as_ref());
                 let tracker = &state.runtime_status;

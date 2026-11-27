@@ -940,13 +940,15 @@ async fn dispatch(
     // statement about the INJECTION, not about the wire: a caller who
     // repeated the slot still has every value relayed below, which is
     // what `forward_client_headers` promises on this surface.
+    let mut caller_credential = false;
     if let Some(pk) = pk_entry.as_ref() {
         let api_key = pk.value.api_key.as_str();
         let provider_lower = pk.value.provider.to_ascii_lowercase();
         if provider_lower == "anthropic" {
             // Anthropic's documented auth shape (#166): `x-api-key` +
             // `anthropic-version`, never a redundant Bearer alongside.
-            if !forwarded_slots.contains("x-api-key") {
+            caller_credential = forwarded_slots.contains("x-api-key");
+            if !caller_credential {
                 builder = builder.header("x-api-key", api_key);
             }
             // Only when the caller sent none. `RequestBuilder::header`
@@ -958,8 +960,11 @@ async fn dispatch(
             if !incoming_headers.contains_key("anthropic-version") {
                 builder = builder.header("anthropic-version", "2023-06-01");
             }
-        } else if !forwarded_slots.contains("authorization") {
-            builder = builder.header(header::AUTHORIZATION, format!("Bearer {api_key}"));
+        } else {
+            caller_credential = forwarded_slots.contains("authorization");
+            if !caller_credential {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {api_key}"));
+            }
         }
     }
 
@@ -998,6 +1003,7 @@ async fn dispatch(
     // — that belongs to `downstream_latency_ms`, which runs from `started`.
     let attempt_started = Instant::now();
     crate::attribution::note_upstream_wait_begin();
+    aisix_gateway::response_tap::note_upstream_credential(caller_credential);
     let pk_id = pk_entry
         .as_ref()
         .map(|pk| pk.id.as_str())
@@ -1007,15 +1013,14 @@ async fn dispatch(
         Some(d) => match tokio::time::timeout(d, send_fut).await {
             Ok(r) => r,
             Err(_) => {
-                crate::attribution::note_direct_provider_key(pk_id);
                 crate::attribution::note_upstream_wait_end(false);
                 return Err(RouteError::of(ProxyError::Bridge(bridge_timeout(d)), &auth));
             }
         },
         None => send_fut.await,
     };
-    if sent.as_ref().err().is_none_or(|err| !err.is_builder()) {
-        crate::attribution::note_direct_provider_key(pk_id);
+    if sent.is_ok() && !caller_credential {
+        crate::attribution::note_confirmed_provider_key(pk_id);
     }
     if sent.is_err() {
         crate::attribution::note_upstream_wait_end(false);
