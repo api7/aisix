@@ -40,6 +40,7 @@ const CREDENTIAL_REF = "mock";
 const FULL = "failure-row-full";
 const META = "failure-row-meta";
 const CAPPED = "failure-row-capped";
+const FULL_MAX_BYTES = 128 * 1024;
 const CAPPED_MAX_BYTES = 2048;
 const RESPONSES_DELTA = `event: response.output_text.delta\r\ndata: ${JSON.stringify({
   type: "response.output_text.delta", item_id: "msg_1", output_index: 0,
@@ -60,7 +61,9 @@ const OUTPUT_EMAIL = "private-output@example.com";
 const JOBS_OUTPUT_PREFIX = '{"output":"partial Responses answer';
 const JSON_LINES_ERROR = '{"type": "refused", "provider_detail": null}\r\n{"trace": 42}\r\n';
 const RESPONSE_MEDIA = "cHJpdmF0ZS1pbWFnZS1wYXlsb2Fk";
-const ESCAPED_AUDIO_BODY = String.raw`{"error":{"message":"readable before audio"},"\u0061udio":"${RESPONSE_MEDIA}`;
+const AUDIO_PAYLOAD = "cHJpdmF0ZS1hdWRpby1wYXlsb2Fk";
+const AUDIO_DIAGNOSTIC = '{"error":{"message":"readable before audio","code":502},"choices":[{"message":{';
+const ESCAPED_AUDIO_BODY = AUDIO_DIAGNOSTIC + String.raw`"\u0061udio":{"data":"${AUDIO_PAYLOAD}`;
 const MEDIA_FRAME = `event: response.image_generation_call.partial_image\ndata\ndata: ${JSON.stringify({
   type: "response.image_generation_call.partial_image", sequence_number: 1,
   item_id: "img_1", output_index: 0, partial_image_index: 0, partial_image_b64: RESPONSE_MEDIA,
@@ -236,6 +239,7 @@ describe("failure rows carry request and response bodies", () => {
         logstore,
         credential_ref: CREDENTIAL_REF,
         content_mode,
+        ...(content_mode === "full" ? { content_max_bytes: FULL_MAX_BYTES } : {}),
       });
     }
     await seed.createObservabilityExporter({
@@ -321,6 +325,11 @@ describe("failure rows carry request and response bodies", () => {
     await failingModel("row-json-error", { nonStreamBody: IN_BAND_JSON });
     await failingModel("row-invalid-json", { rawContentType: "application/json", rawBody: INVALID_JSON });
     await failingModel("row-invalid-escaped-media", { rawContentType: "application/json", rawBody: ESCAPED_AUDIO_BODY });
+    await modelAt("row-interrupted-escaped-media", `${await truncatingUpstream("502 Bad Gateway", ESCAPED_AUDIO_BODY)}/v1`);
+    await failingModel("row-capped-escaped-media", {
+      rawContentType: "application/json",
+      rawBody: ESCAPED_AUDIO_BODY + "YWFh".repeat(FULL_MAX_BYTES / 4) + '"}}}]}',
+    });
     await failingModel("row-timeout-after-error-head", {
       status: 503, rawErrorBodyChunks: [TIMEOUT_PREFIX], eventDelayMs: 1_500,
     }, { streamTimeout: 350 });
@@ -580,6 +589,8 @@ describe("failure rows carry request and response bodies", () => {
         "row-json-error",
         "row-invalid-json",
         "row-invalid-escaped-media",
+        "row-interrupted-escaped-media",
+        "row-capped-escaped-media",
         "row-timeout-after-error-head",
         "row-responses-media",
         "row-responses-large-media",
@@ -1494,8 +1505,23 @@ describe("failure rows carry request and response bodies", () => {
     const { res, requestId } = await chat("row-invalid-escaped-media", "test");
     expect(res.status).toBe(502);
     const row = await rowOf(requestId, "the malformed JSON failure");
-    expect(row.get("response")).toContain("readable before audio");
-    expect(row.get("response")).not.toContain(RESPONSE_MEDIA);
+    expect(row.get("response")).toContain(AUDIO_DIAGNOSTIC);
+    expect(row.get("response")).not.toContain(AUDIO_PAYLOAD);
+  });
+
+  test.each([
+    ["an interrupted read", "row-interrupted-escaped-media", "upstream_status", READ_FAILURE(502), undefined],
+    ["the capture cap", "row-capped-escaped-media", "upstream_in_band", /readable before audio/, "true"],
+  ] as const)("an escaped audio key stays safe after %s", async (_what, model, errorClass, message, truncated) => {
+    if (!etcdReachable) return;
+    const { res, requestId } = await chat(model, "test");
+    expect(res.status).toBe(502);
+    const row = await rowOf(requestId, "the escaped audio failure");
+    expect(row.get("error_class")).toBe(errorClass);
+    expect(row.get("error_message")).toMatch(message);
+    expect(row.get("content_truncated")).toBe(truncated);
+    expect(row.get("response")).toContain(AUDIO_DIAGNOSTIC);
+    expect(row.get("response")).not.toContain(AUDIO_PAYLOAD);
   });
 
   test("a bridged SSE output block records the refusal frames actually sent", async () => {
