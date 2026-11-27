@@ -638,7 +638,7 @@ async fn dispatch(
     // Arc so the chain can be cloned into the cross-provider streaming
     // response body (which outlives this handler) for end-of-stream output
     // guardrails (#825), mirroring /v1/messages.
-    let resolved_chain = Arc::new(state.resolve_guardrails(&guardrail_ctx));
+    let resolved_chain = Arc::new(state.resolve_output_guardrails(&guardrail_ctx));
     *audit_out = resolved_chain.audit_log();
     if !resolved_chain.is_empty() {
         let chat = responses_input_to_chat(&model_name, body);
@@ -1495,7 +1495,7 @@ async fn responses_to_target(
             aisix_guardrails::Guardrail::runs_on_output(chain) && output_policy.holds_back();
         let mut upstream_body: std::pin::Pin<
             Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
-        > = Box::pin(aisix_gateway::upstream_body_stream(upstream_resp));
+        > = Box::pin(aisix_gateway::upstream_sse_stream(upstream_resp));
         let mut buf: Vec<u8> = Vec::new();
         // Held until this dispatch returns: the scan below still reads `buf`.
         let mut buf_held = crate::held_content::HeldBytes::default();

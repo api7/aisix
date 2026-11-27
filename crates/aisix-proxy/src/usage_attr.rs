@@ -630,30 +630,26 @@ fn failure_row_content(
         row.prompt_truncated = request.prompt_truncated;
         row.truncated |= request.prompt_truncated;
     }
-    if let Some(body) = upstream_body {
-        if let Some(text) = exportable_upstream_text(body) {
-            let mut row = row.with_response(&text, cap);
-            row.response_truncated |= body.truncated;
-            row.truncated |= body.truncated;
-            return Some(row);
+    if let Some(text) = upstream_body.and_then(exportable_upstream_text) {
+        row = row.with_response(&text, cap);
+    } else if row.response.is_empty() {
+        // A failed stream may have delivered parts without a finish reason.
+        let delivered = row
+            .output
+            .as_ref()
+            .and_then(aisix_obs::OutputCapture::parts_json)
+            .map(|parts| serde_json::Value::Array(parts).to_string());
+        let response = delivered
+            .or(noted_error
+                .filter(|_| terminal && event.status_code != crate::CLIENT_CLOSED_REQUEST));
+        if let Some(response) = response {
+            row = row.with_response(&response, cap);
         }
     }
-    if !row.response.is_empty() {
-        return Some(row);
-    }
-    // A stream that failed mid-way ends with no finish reason, which is what
-    // the structured output field needs: what it delivered goes here instead.
-    let delivered = row
-        .output
-        .as_ref()
-        .and_then(aisix_obs::OutputCapture::parts_json)
-        .map(|parts| serde_json::Value::Array(parts).to_string());
-    let response = delivered
-        .or(noted_error.filter(|_| terminal && event.status_code != crate::CLIENT_CLOSED_REQUEST));
-    Some(match response {
-        Some(response) => row.with_response(&response, cap),
-        None => row,
-    })
+    let truncated = upstream_body.is_some_and(|body| body.truncated);
+    row.response_truncated |= truncated;
+    row.truncated |= truncated;
+    Some(row)
 }
 
 fn exportable_upstream_text(

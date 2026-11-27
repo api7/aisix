@@ -228,10 +228,17 @@ fn omit_media(v: &mut Value, response: bool) -> bool {
                             .and_then(|source| source.get_mut("data"))
                             .is_some_and(omit_bare_base64)
                 }
-                Some("input_audio") => map
-                    .get_mut("input_audio")
-                    .and_then(|audio| audio.get_mut("data"))
-                    .is_some_and(omit_bare_base64),
+                Some("input_audio") => {
+                    let nested = map
+                        .get_mut("input_audio")
+                        .and_then(|audio| audio.get_mut("data"))
+                        .is_some_and(omit_bare_base64);
+                    let realtime = response && map.get_mut("audio").is_some_and(omit_bare_base64);
+                    nested || realtime
+                }
+                Some("audio" | "output_audio") if response => {
+                    map.get_mut("audio").is_some_and(omit_bare_base64)
+                }
                 Some("input_file") => map.get_mut("file_data").is_some_and(omit_bare_base64),
                 Some("image_generation_call") => {
                     map.get_mut("result").is_some_and(omit_bare_base64)
@@ -344,6 +351,10 @@ const RESPONSE_MEDIA_MARKERS: [&str; 5] = [
     "\"redactedContent\"",
 ];
 
+// An unfinished object can hide its media kind after a payload or spell a
+// field name using escapes. Preserve the preceding diagnostic text.
+const UNPARSED_RESPONSE_MEDIA_MARKERS: [&str; 4] = ["\\u", "\"result\"", "\"delta\"", "\"data\""];
+
 /// Where ASCII `needle` first occurs in `s`, in any case. An ASCII match always
 /// starts on a character boundary.
 fn find_ignore_ascii_case(s: &str, needle: &str) -> Option<usize> {
@@ -377,7 +388,18 @@ fn contains_media_marker(s: &str, response: bool) -> bool {
 }
 
 fn omit_base64_media_in_serialized(s: &str, response: bool) -> Cow<'_, str> {
-    if !contains_media_marker(s, response) {
+    let ambiguous = if response && s.trim_start().starts_with(['{', '[']) {
+        UNPARSED_RESPONSE_MEDIA_MARKERS.as_slice()
+    } else {
+        &[]
+    };
+    let ambiguous_offset = || {
+        ambiguous
+            .iter()
+            .filter_map(|marker| find_ignore_ascii_case(s, marker))
+            .min()
+    };
+    if !contains_media_marker(s, response) && ambiguous_offset().is_none() {
         return Cow::Borrowed(s);
     }
     let Ok(mut root) = serde_json::from_str::<Value>(s) else {
@@ -390,6 +412,7 @@ fn omit_base64_media_in_serialized(s: &str, response: bool) -> Cow<'_, str> {
             .iter()
             .chain(response_markers)
             .filter_map(|marker| find_ignore_ascii_case(s, marker))
+            .chain(ambiguous_offset())
             .min()
         {
             Some(at) => Cow::Owned(format!("{}{}", &s[..at], base64_omitted(s.len() - at))),
@@ -450,13 +473,12 @@ pub fn omit_base64_media_in_sse(s: &str) -> Cow<'_, str> {
             let payload = std::str::from_utf8(payload).expect("SSE payload from UTF-8 input");
             if let Cow::Owned(replacement) = omit_base64_media_in_response_json(payload) {
                 let mut from = 0;
-                for (i, range) in aisix_gateway::sse::data_ranges(frame.as_bytes())
-                    .into_iter()
-                    .enumerate()
-                {
+                let mut written = false;
+                for range in aisix_gateway::sse::data_ranges(frame.as_bytes()) {
                     out.push_str(&frame[from..range.start]);
-                    if i == 0 {
+                    if !written && !range.is_empty() {
                         out.push_str(&replacement);
+                        written = true;
                     }
                     from = range.end;
                 }

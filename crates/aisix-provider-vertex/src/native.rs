@@ -128,7 +128,7 @@ impl VertexBridge {
                 with_deadline(ctx.deadline, started, aisix_gateway::upstream_json(resp)).await?;
             return Ok(NativeMessages::Json(json));
         }
-        let frames = aisix_gateway::upstream_body_stream(resp).map(|item| {
+        let frames = aisix_gateway::upstream_sse_stream(resp).map(|item| {
             item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
         });
         Ok(NativeMessages::Stream(Box::pin(frames)))

@@ -530,7 +530,7 @@ impl Bridge for AnthropicBridge {
             );
         }
 
-        let byte_stream = aisix_gateway::upstream_body_stream(resp);
+        let byte_stream = aisix_gateway::upstream_sse_stream(resp);
         let stream = build_chunk_stream(byte_stream);
         Ok(legacy.reply_stream(Box::pin(stream)))
     }

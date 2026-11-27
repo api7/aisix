@@ -68,9 +68,9 @@ pub use hub::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};
 pub use response_tap::{
     capture_header_values, note_upstream_error_body, note_upstream_response,
     protect_upstream_output, provider_request_id, tap_upstream_body, tap_upstream_response,
-    upstream_body, upstream_body_stream, upstream_json, wants_upstream_error_body,
-    warn_error_body_unread, CapturedUpstreamBody, ResponseHeaderTap, UpstreamBodyFormat,
-    UpstreamBodyTap, UpstreamResponseCapture, PROVIDER_REQUEST_ID_HEADERS,
+    upstream_body, upstream_body_stream, upstream_json, upstream_sse_stream,
+    wants_upstream_error_body, warn_error_body_unread, CapturedUpstreamBody, ResponseHeaderTap,
+    UpstreamBodyFormat, UpstreamBodyTap, UpstreamResponseCapture, PROVIDER_REQUEST_ID_HEADERS,
 };
 pub use sse::{SseDecoder, SseEvent, SseFrameTooLarge};
 pub use structured_output::{

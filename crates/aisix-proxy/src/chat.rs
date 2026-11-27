@@ -587,7 +587,12 @@ pub(crate) async fn serve(
             // request body and, without an upstream answer, this error body
             // (AISIX-Cloud#1013, #1921).
             crate::usage_attr::note_failure_request(&snapshot, || captured_request_json(&req));
-            crate::usage_attr::note_client_error(&snapshot, &err);
+            let gemini_response = if matches!(path, gemini::ENDPOINT | gemini::STREAM_ENDPOINT) {
+                Some(err.gemini_response())
+            } else {
+                crate::usage_attr::note_client_error(&snapshot, &err);
+                None
+            };
             // Per #655: emit one zero-token event for each FAILED attempt.
             // `applied_guardrails` (resolved by `dispatch`) is recorded on
             // every attempt so an input-blocked / failed request still
@@ -756,11 +761,7 @@ pub(crate) async fn serve(
                     // AISIX-Cloud#1279, the trace's terminal spans).
                 }
             }
-            if matches!(path, gemini::ENDPOINT | gemini::STREAM_ENDPOINT) {
-                err.into_gemini_response()
-            } else {
-                err.into_response()
-            }
+            gemini_response.unwrap_or_else(|| err.into_response())
         }
     }
 }
@@ -1642,7 +1643,7 @@ async fn dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved = state.resolve_guardrails(&guardrail_ctx);
+    let resolved = state.resolve_output_guardrails(&guardrail_ctx);
     // Capture the applied `{kind, hook}` set before the concrete chain is
     // erased to `Arc<dyn Guardrail>` (the trait has no `applied()`). Fill the
     // caller's out-param so the failure path can surface it too, and keep a

@@ -931,6 +931,28 @@ fn mcp_user_oauth_message(failure: &aisix_mcp::UserOAuthFailure, server: &str) -
     }
 }
 
+fn captured_json_error_response(status: StatusCode, body: impl Serialize) -> Response {
+    if aisix_gateway::wants_upstream_error_body() {
+        crate::attribution::note_client_error_body(
+            serde_json::to_string(&body).unwrap_or_default(),
+        );
+    }
+    (status, Json(body)).into_response()
+}
+
+pub(crate) fn note_client_error_frame(frame: &str) {
+    if aisix_gateway::wants_upstream_error_body() {
+        crate::attribution::note_client_error_body(frame.to_owned());
+    }
+}
+
+pub(crate) fn not_implemented_response(message: String) -> Response {
+    captured_json_error_response(
+        StatusCode::NOT_IMPLEMENTED,
+        ErrorEnvelope::new(message, "not_implemented"),
+    )
+}
+
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let challenge = self.auth_challenge();
@@ -1058,9 +1080,9 @@ pub(crate) fn anthropic_kind_from_status(status: StatusCode) -> &'static str {
 }
 
 impl ProxyError {
-    pub fn into_gemini_response(self) -> Response {
+    pub fn gemini_response(&self) -> Response {
         let status = self.status();
-        let raw = if let ProxyError::Bridge(bridge) = &self {
+        let raw = if let ProxyError::Bridge(bridge) = self {
             crate::gemini::native_error(bridge)
         } else {
             None
@@ -1068,7 +1090,7 @@ impl ProxyError {
         let body = raw.cloned().unwrap_or_else(|| {
             crate::gemini::error(status.as_u16(), &self.envelope().error.message)
         });
-        let mut response = (status, Json(body)).into_response();
+        let mut response = captured_json_error_response(status, body);
         apply_retry_headers(
             &mut response,
             self.retry_after_secs(),

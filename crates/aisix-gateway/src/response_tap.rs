@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use http::header;
 
@@ -103,8 +103,9 @@ impl UpstreamResponseCapture {
 
     pub fn take_body(&mut self) -> Option<CapturedUpstreamBody> {
         let body = self.body.take()?;
-        let prefix = std::mem::take(&mut *body.prefix.lock().unwrap());
-        (!prefix.bytes.is_empty()).then(|| CapturedUpstreamBody {
+        let mut prefix = std::mem::take(&mut *body.prefix.lock().unwrap());
+        prefix.finish(body.cap);
+        (!prefix.bytes.is_empty() || prefix.truncated).then(|| CapturedUpstreamBody {
             bytes: prefix.bytes.freeze(),
             truncated: prefix.truncated,
             format: body.format,
@@ -135,13 +136,78 @@ pub enum UpstreamBodyFormat {
 struct BodyPrefix {
     bytes: BytesMut,
     truncated: bool,
+    sse: Option<SsePrefix>,
 }
 
 impl BodyPrefix {
     fn push(&mut self, cap: usize, bytes: &[u8]) {
+        if let Some(sse) = &mut self.sse {
+            sse.push(cap, bytes, &mut self.bytes, &mut self.truncated);
+            return;
+        }
         let kept = bytes.len().min(cap - self.bytes.len());
         self.bytes.extend_from_slice(&bytes[..kept]);
         self.truncated |= kept < bytes.len();
+    }
+
+    fn finish(&mut self, cap: usize) {
+        if let Some(sse) = &mut self.sse {
+            if sse.boundary.ends_with_blank_cr() {
+                sse.finish_frame(cap, &mut self.bytes, &mut self.truncated);
+            }
+            self.truncated |= sse.oversized || !sse.frame.is_empty();
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SsePrefix {
+    frame: BytesMut,
+    oversized: bool,
+    boundary: crate::sse::FrameBoundary,
+}
+
+impl SsePrefix {
+    fn push(&mut self, cap: usize, mut bytes: &[u8], kept: &mut BytesMut, truncated: &mut bool) {
+        while !bytes.is_empty() {
+            let end = self.boundary.next_end(bytes);
+            let (part, rest) = bytes.split_at(end.unwrap_or(bytes.len()));
+            if !self.oversized {
+                if part.len() <= cap - self.frame.len() {
+                    self.frame.extend_from_slice(part);
+                } else {
+                    self.frame.clear();
+                    self.oversized = true;
+                }
+            }
+            if end.is_some() {
+                self.finish_frame(cap, kept, truncated);
+            }
+            bytes = rest;
+        }
+    }
+
+    fn finish_frame(&mut self, cap: usize, kept: &mut BytesMut, truncated: &mut bool) {
+        if self.oversized
+            || std::str::from_utf8(&self.frame).is_err()
+            || self
+                .frame
+                .iter()
+                .any(|b| b.is_ascii_control() && !b"\t\r\n".contains(b))
+        {
+            *truncated = true;
+        } else {
+            // Keep the most recent complete frames when the total reaches
+            // the cap, so a long stream can still retain its terminal error.
+            while self.frame.len() > cap - kept.len() {
+                let end = crate::sse::find_frame_end(kept).expect("captured complete SSE frame");
+                kept.advance(end);
+                *truncated = true;
+            }
+            kept.extend_from_slice(&self.frame);
+        }
+        self.frame.clear();
+        self.oversized = false;
     }
 }
 
@@ -223,7 +289,10 @@ impl ResponseHeaderTap {
             cap,
             success,
             format,
-            prefix: Mutex::default(),
+            prefix: Mutex::new(BodyPrefix {
+                sse: (format == UpstreamBodyFormat::Sse).then(SsePrefix::default),
+                ..BodyPrefix::default()
+            }),
         }))
     }
 
@@ -288,6 +357,10 @@ pub fn protect_upstream_output() {
     });
 }
 
+pub fn upstream_output_is_protected() -> bool {
+    TAP.try_with(|tap| tap.protects_output()).unwrap_or(false)
+}
+
 /// SDKs that consume a response themselves can attach its text payload to the
 /// last noted response. Hold the returned handle when reading it later.
 pub fn tap_upstream_body(
@@ -311,18 +384,32 @@ pub fn note_upstream_error_body(bytes: &[u8]) {
     }
 }
 
+/// Register an HTTP error body a route already buffered and approved.
+pub fn note_checked_http_error_body(headers: &http::HeaderMap, bytes: &[u8]) {
+    if let Some(body) =
+        text_content_type(headers).and_then(|format| tap_upstream_body(false, format))
+    {
+        body.push(bytes);
+    }
+}
+
 /// Record the response at its head. For a full-content request, observe its
 /// text bytes exactly where reqwest delivers them. In particular, a body read
 /// that gets dropped on timeout leaves the prefix it already consumed.
-pub fn tap_upstream_response(mut response: reqwest::Response) -> reqwest::Response {
+pub fn tap_upstream_response(response: reqwest::Response) -> reqwest::Response {
+    tap_http_response(response, text_content_type)
+}
+
+fn tap_http_response(
+    mut response: reqwest::Response,
+    format: impl FnOnce(&http::HeaderMap) -> Option<UpstreamBodyFormat>,
+) -> reqwest::Response {
     let capture = TAP
         .try_with(|tap| {
-            let capture = if tap.body_cap.is_some() {
-                text_content_type(response.headers())
-                    .and_then(|format| tap.new_body(response.status().is_success(), format))
-            } else {
-                None
-            };
+            let capture = tap
+                .body_cap
+                .and_then(|_| format(response.headers()))
+                .and_then(|format| tap.new_body(response.status().is_success(), format));
             tap.record(response.headers(), capture.clone());
             capture
         })
@@ -334,8 +421,8 @@ pub fn tap_upstream_response(mut response: reqwest::Response) -> reqwest::Respon
     response
 }
 
-fn text_content_type(headers: &http::HeaderMap) -> Option<UpstreamBodyFormat> {
-    if headers
+fn has_content_encoding(headers: &http::HeaderMap) -> bool {
+    headers
         .get_all(header::CONTENT_ENCODING)
         .iter()
         .any(|value| {
@@ -345,7 +432,10 @@ fn text_content_type(headers: &http::HeaderMap) -> Option<UpstreamBodyFormat> {
                     .any(|coding| !coding.trim().eq_ignore_ascii_case("identity"))
             })
         })
-    {
+}
+
+fn text_content_type(headers: &http::HeaderMap) -> Option<UpstreamBodyFormat> {
+    if has_content_encoding(headers) {
         return None;
     }
     let Some(content_type) = headers.get(header::CONTENT_TYPE) else {
@@ -358,26 +448,52 @@ fn text_content_type(headers: &http::HeaderMap) -> Option<UpstreamBodyFormat> {
         .next()?
         .trim()
         .to_ascii_lowercase();
-    (mime.starts_with("text/")
-        || matches!(
-            mime.as_str(),
-            "application/json"
-                | "application/json-rpc"
-                | "application/x-ndjson"
-                | "application/xml"
-        )
-        || mime.starts_with("application/x-amz-json-")
-        || mime.ends_with("+json")
-        || mime.ends_with("+xml"))
-    .then_some(match mime.as_str() {
-        "text/event-stream" => UpstreamBodyFormat::Sse,
-        "application/x-ndjson" => UpstreamBodyFormat::JsonLines,
-        _ => UpstreamBodyFormat::Text,
-    })
+    match mime.as_str() {
+        "text/event-stream" => Some(UpstreamBodyFormat::Sse),
+        "application/jsonl"
+        | "application/x-jsonl"
+        | "application/ndjson"
+        | "application/x-ndjson"
+        | "text/jsonl"
+        | "text/x-jsonl"
+        | "text/ndjson"
+        | "text/x-ndjson" => Some(UpstreamBodyFormat::JsonLines),
+        "application/json" | "application/json-rpc" | "application/xml" => {
+            Some(UpstreamBodyFormat::Text)
+        }
+        mime if mime.starts_with("text/")
+            || mime.starts_with("application/x-amz-json-")
+            || mime.ends_with("+json")
+            || mime.ends_with("+xml") =>
+        {
+            Some(UpstreamBodyFormat::Text)
+        }
+        _ => None,
+    }
+}
+
+/// Read a response that the caller has selected for its SSE parser. Some
+/// providers deliver valid frames without a matching text content type.
+/// Construct this while the response still belongs to the current attempt.
+pub fn upstream_sse_stream(
+    mut response: reqwest::Response,
+) -> impl Stream<Item = reqwest::Result<Bytes>> {
+    if wants_upstream_error_body()
+        && !has_content_encoding(response.headers())
+        && !crate::response_is_json(&response)
+        && !response
+            .extensions()
+            .get::<Arc<UpstreamBodyTap>>()
+            .is_some_and(|body| body.format != UpstreamBodyFormat::Text)
+    {
+        response = tap_http_response(response, |_| Some(UpstreamBodyFormat::Sse));
+    }
+    upstream_body_stream(response)
 }
 
 /// Read the response stream and keep the prefix actually consumed by this
-/// attempt. Responses that were never registered have no capture to update.
+/// attempt, or the latest complete SSE frames. Responses that were never
+/// registered have no capture to update.
 pub fn upstream_body_stream(
     response: reqwest::Response,
 ) -> impl Stream<Item = reqwest::Result<Bytes>> {

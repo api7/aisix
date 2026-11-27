@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { createServer, type Server as HttpServer } from "node:http";
 import { createServer as createTcpServer, type Server as TcpServer } from "node:net";
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
-import { WebSocket as WsClient } from "ws";
+import { WebSocket as WsClient, WebSocketServer } from "ws";
 import {
   EtcdClient,
   SeedClient,
@@ -53,14 +53,23 @@ const CHAT_STREAM_ERROR = `data: ${JSON.stringify({
   error: { message: "sentinel-in-band", code: 500, metadata: { provider_request: null } },
 })}\n\n`;
 const IN_BAND_JSON = { error: { message: "provider whole-body error", code: 502, metadata: { ticket: null } } };
+const COUNT_IN_BAND_ERROR = '{ "type":"error", "error":{"type":"api_error","message":"provider count failed","details":null} }';
 const INVALID_JSON = '{"provider_answer":"readable but cut before the closing quote';
 const TIMEOUT_PREFIX = '{"error":{"message":"provider began the error body';
 const OUTPUT_EMAIL = "private-output@example.com";
+const JOBS_OUTPUT_PREFIX = '{"output":"partial Responses answer';
+const JSON_LINES_ERROR = '{"type": "refused", "provider_detail": null}\r\n{"trace": 42}\r\n';
 const RESPONSE_MEDIA = "cHJpdmF0ZS1pbWFnZS1wYXlsb2Fk";
-const MEDIA_FRAME = `event: response.image_generation_call.partial_image\ndata: ${JSON.stringify({
+const ESCAPED_AUDIO_BODY = String.raw`{"error":{"message":"readable before audio"},"\u0061udio":"${RESPONSE_MEDIA}`;
+const MEDIA_FRAME = `event: response.image_generation_call.partial_image\ndata\ndata: ${JSON.stringify({
   type: "response.image_generation_call.partial_image", sequence_number: 1,
   item_id: "img_1", output_index: 0, partial_image_index: 0, partial_image_b64: RESPONSE_MEDIA,
 })}\n\n`;
+const MEDIA_PREFIX = "c2VudGluZWwtbGFyZ2UtaW1hZ2Uh";
+const OVERSIZED_MEDIA_FRAME = `event: response.output_item.done\r\ndata: ${JSON.stringify({
+  item: { result: MEDIA_PREFIX.repeat(6_000), type: "image_generation_call", id: "img_large" },
+  type: "response.output_item.done", output_index: 1,
+})}\r\n\r\n`;
 const LONG_DELTA = RESPONSES_DELTA.replace("partial Responses answer", "内容".repeat(600));
 const BEDROCK_EXCEPTION = { message: "Bedrock stream throttled", provider_details: { hint: null } };
 const ANTHROPIC_START = {
@@ -82,6 +91,7 @@ describe("failure rows carry request and response bodies", () => {
   const tcpServers: TcpServer[] = [];
   const httpServers: HttpServer[] = [];
   let mcpUpstream: McpUpstream | undefined;
+  let realtimeUpstream: WebSocketServer | undefined;
   const upstreams: OpenAiUpstream[] = [];
   let etcdReachable = false;
   let seed: SeedClient;
@@ -177,23 +187,24 @@ describe("failure rows carry request and response bodies", () => {
   async function modelAt(
     name: string,
     apiBase: string,
-    provider: { provider?: string; adapter?: string; model_name?: string; api_key?: string } = {},
-  ): Promise<void> {
-    const { provider: providerName = "openai", adapter, model_name = "gpt-4o-mini", api_key } = provider;
+    provider: { provider?: string; key_provider?: string; adapter?: string; model_name?: string; api_key?: string } = {},
+  ): Promise<string> {
+    const { provider: providerName = "openai", key_provider = providerName, adapter, model_name = "gpt-4o-mini", api_key } = provider;
     const pk = await seed.createProviderKey({
       display_name: `${name}-pk`,
       api_key: api_key ?? "sk-mock",
-      provider: providerName,
+      provider: key_provider,
       ...(adapter ? { adapter } : {}),
       api_base: apiBase,
     });
-    await seed.createModel({
+    const model = await seed.createModel({
       display_name: name,
       provider: providerName,
       model_name,
       provider_key_id: pk.id,
       cooldown: { enabled: false },
     });
+    return model.id;
   }
 
   beforeAll(async () => {
@@ -309,11 +320,23 @@ describe("failure rows carry request and response bodies", () => {
     });
     await failingModel("row-json-error", { nonStreamBody: IN_BAND_JSON });
     await failingModel("row-invalid-json", { rawContentType: "application/json", rawBody: INVALID_JSON });
+    await failingModel("row-invalid-escaped-media", { rawContentType: "application/json", rawBody: ESCAPED_AUDIO_BODY });
     await failingModel("row-timeout-after-error-head", {
       status: 503, rawErrorBodyChunks: [TIMEOUT_PREFIX], eventDelayMs: 1_500,
     }, { streamTimeout: 350 });
     await failingModel("row-responses-media", {
       rawStreamFrames: [MEDIA_FRAME, LONG_DELTA, RESPONSES_FAILED],
+    });
+    await failingModel("row-responses-large-media", {
+      rawStreamFrames: [RESPONSES_DELTA, OVERSIZED_MEDIA_FRAME, RESPONSES_FAILED],
+    });
+    await failingModel("row-responses-octet-sse", {
+      rawContentType: "application/octet-stream",
+      rawBodyChunks: [RESPONSES_DELTA.slice(0, -1), "\n" + RESPONSES_FAILED],
+      eventDelayMs: 25,
+    });
+    await failingModel("row-responses-rollover", {
+      rawStreamFrames: [RESPONSES_DELTA.repeat(900), RESPONSES_FAILED],
     });
     const maskedModel = await failingModel("row-responses-masked", {
       rawStreamFrames: [RESPONSES_DELTA.replace("partial Responses answer", OUTPUT_EMAIL), RESPONSES_FAILED],
@@ -321,6 +344,9 @@ describe("failure rows carry request and response bodies", () => {
     const blockedModel = await failingModel("row-responses-blocked", {
       rawStreamFrames: [RESPONSES_DELTA, RESPONSES_FAILED],
     });
+    const bridgedBlockedModel = await failingModel("row-responses-bridge-blocked", {
+      streamEvents: [delta("partial Responses answer")],
+    }, { translateResponses: true });
     const outputMask = await seed.createGuardrail({
       name: "row-output-mask", kind: "pii", hook_point: "output",
       detectors: [{ type: "email", action: "mask" }],
@@ -331,6 +357,7 @@ describe("failure rows carry request and response bodies", () => {
     }, { attach: false });
     await seed.attachGuardrailToModel(outputMask.id, maskedModel);
     await seed.attachGuardrailToModel(outputBlock.id, blockedModel);
+    await seed.attachGuardrailToModel(outputBlock.id, bridgedBlockedModel);
     // Configured, and not on the caller's list.
     await failingModel("row-unlisted", { status: 400 });
     await failingModel("row-empty-404", { status: 404, rawErrorBody: "" });
@@ -377,6 +404,17 @@ describe("failure rows carry request and response bodies", () => {
       model_name: "rerank-v3.5",
     });
     await modelAt("row-count-400", any400, { provider: "anthropic", model_name: "claude-sonnet-4-5" });
+    const invalidCount = await modelAt("row-count-invalid", await fixedUpstream(200, COUNT_IN_BAND_ERROR), {
+      provider: "anthropic", model_name: "claude-sonnet-4-5",
+    });
+    await seed.attachGuardrailToModel(outputBlock.id, invalidCount);
+    await modelAt("row-images-unsupported", any400, { key_provider: "anthropic", adapter: "anthropic" });
+    const cutJobs = await modelAt("row-jobs-cut", `${await truncatingUpstream("200 OK", JOBS_OUTPUT_PREFIX)}/v1`);
+    await seed.attachGuardrailToModel(outputBlock.id, cutJobs);
+    const cutJobsError = await modelAt("row-jobs-error-cut", `${await truncatingUpstream("502 Bad Gateway", JOBS_OUTPUT_PREFIX)}/v1`);
+    await seed.attachGuardrailToModel(outputBlock.id, cutJobsError);
+    const checkedJobs = await modelAt("row-jobs-checked", `${any400}/v1`);
+    await seed.attachGuardrailToModel(outputBlock.id, checkedJobs);
     const bedrockProvider = {
       provider: "bedrock",
       adapter: "bedrock",
@@ -412,6 +450,14 @@ describe("failure rows carry request and response bodies", () => {
     await modelAt("row-video-json", `${await fixedUpstream(400, JSON.stringify({ error: { code: "bad", message: "sentinel-video" } }))}/v1`);
     await modelAt("row-video-cut", `${truncatedBase}/v1`);
     await modelAt("row-realtime-400", `${any400}/v1`);
+    realtimeUpstream = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await new Promise<void>((resolve) => realtimeUpstream!.once("listening", resolve));
+    realtimeUpstream.on("connection", (socket) => {
+      socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "partial Responses answer" }));
+    });
+    const realtimeAddr = realtimeUpstream.address() as { port: number };
+    const realtimeBlocked = await modelAt("row-realtime-blocked", `http://127.0.0.1:${realtimeAddr.port}/v1`);
+    await seed.attachGuardrailToModel(outputBlock.id, realtimeBlocked);
     const slowBody = {
       id: "cmpl-slow",
       object: "chat.completion",
@@ -468,6 +514,12 @@ describe("failure rows carry request and response bodies", () => {
       target_url: passthroughUpstream.baseUrl,
       provider_key_id: truncatedPk.id,
     });
+    await seed.createPassthroughRoute({
+      name: "row-passthrough-jsonl",
+      path_prefix: "/row-passthrough-jsonl",
+      target_url: await fixedUpstream(400, JSON_LINES_ERROR, { "content-type": "application/jsonl; charset=utf-8" }),
+      provider_key_id: truncatedPk.id,
+    });
 
     await seed.createApiKey({
       key_hash: hash(MCP_LIMITED_CALLER),
@@ -491,6 +543,11 @@ describe("failure rows carry request and response bodies", () => {
         "row-any-400",
         "row-rerank-400",
         "row-count-400",
+        "row-count-invalid",
+        "row-images-unsupported",
+        "row-jobs-cut",
+        "row-jobs-error-cut",
+        "row-jobs-checked",
         "row-bedrock-400",
         "row-bedrock-converse-stream",
         "row-bedrock-native-stream",
@@ -499,6 +556,7 @@ describe("failure rows carry request and response bodies", () => {
         "row-video-json",
         "row-video-cut",
         "row-realtime-400",
+        "row-realtime-blocked",
         "row-slow",
         "row-stream-slow",
         "row-400",
@@ -521,10 +579,15 @@ describe("failure rows carry request and response bodies", () => {
         "row-responses-late",
         "row-json-error",
         "row-invalid-json",
+        "row-invalid-escaped-media",
         "row-timeout-after-error-head",
         "row-responses-media",
+        "row-responses-large-media",
+        "row-responses-octet-sse",
+        "row-responses-rollover",
         "row-responses-masked",
         "row-responses-blocked",
+        "row-responses-bridge-blocked",
       ],
     });
 
@@ -546,6 +609,10 @@ describe("failure rows carry request and response bodies", () => {
     await mcpUpstream?.close();
     for (const server of tcpServers) server.close();
     for (const server of httpServers) server.close();
+    if (realtimeUpstream) {
+      for (const socket of realtimeUpstream.clients) socket.terminate();
+      await new Promise<void>((resolve) => realtimeUpstream!.close(() => resolve()));
+    }
     await sls?.close();
   });
 
@@ -650,6 +717,33 @@ describe("failure rows carry request and response bodies", () => {
     const row = await rowOf(requestId, "the refusal row");
     expect(requestText(row)).toContain("forbidden-prompt");
     expect(JSON.parse(row.get("response")!)).toEqual(JSON.parse(body));
+  });
+
+  test.each([
+    ["completions", "/v1/completions", { model: "row-count-400", prompt: "completion-prompt" }],
+    ["embeddings", "/v1/embeddings", { model: "row-count-400", input: "embeddings-prompt" }],
+    ["images", "/v1/images/generations", { model: "row-images-unsupported", prompt: "image-prompt" }],
+    ["videos", "/v1/videos", { model: "row-count-400", prompt: "video-prompt" }],
+  ] as const)("%s: a 501 records the actual gateway response", async (_what, path, input) => {
+    if (!etcdReachable) return;
+    const res = await post(path, input);
+    const body = await res.text();
+    expect(res.status).toBe(501);
+    expect(JSON.parse(body).error.type).toBe("not_implemented");
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, `the ${path} 501 row`);
+    expect(row.get("response")).toBe(body);
+  });
+
+  test("Gemini: a refusal records the actual gateway response", async () => {
+    if (!etcdReachable) return;
+    const res = await post("/v1beta/models/row-unlisted:generateContent", {
+      contents: [{ role: "user", parts: [{ text: "forbidden-prompt" }] }],
+    });
+    const body = await res.text();
+    expect(res.status).toBe(403);
+    expect(JSON.parse(body).error.status).toBe("PERMISSION_DENIED");
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the Gemini refusal row");
+    expect(row.get("response")).toBe(body);
   });
 
   test("every attempt of an all-failed group carries its own body", async () => {
@@ -806,6 +900,49 @@ describe("failure rows carry request and response bodies", () => {
     const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the passthrough row");
     expect(row.get("prompt")).toContain("passthrough-prompt");
     expect(row.get("response")).toContain("sentinel-passthrough-answer");
+  });
+
+  test("a passthrough JSONL failure records the upstream lines verbatim", async () => {
+    if (!etcdReachable) return;
+    const res = await post("/row-passthrough-jsonl/anything", {});
+    expect(res.status).toBe(400);
+    expect(await res.text()).toBe(JSON_LINES_ERROR);
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the passthrough JSONL row");
+    expect(row.get("response")).toBe(JSON_LINES_ERROR);
+  });
+
+  test("count_tokens records an in-band failure with an input-only guardrail path", async () => {
+    if (!etcdReachable) return;
+    const res = await post("/v1/messages/count_tokens", {
+      model: "row-count-invalid", messages: [{ role: "user", content: "count-prompt" }],
+    }, { "anthropic-version": "2023-06-01" });
+    await res.text();
+    expect(res.status).toBe(502);
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the failed count_tokens row");
+    expect(row.get("response")).toBe(COUNT_IN_BAND_ERROR);
+  });
+
+  test.each([
+    ["/v1/batches/batch_1", "row-jobs-cut", false],
+    ["/v1/fine_tuning/jobs", "row-jobs-cut", false],
+    ["/v1/fine_tuning/jobs/job_1", "row-jobs-error-cut", false],
+    ["/v1/files/file_1/content", "row-jobs-cut", true],
+  ] as const)("%s records a partial response according to its output guardrail path", async (path, model, opaque) => {
+    if (!etcdReachable) return;
+    const res = await fetch(`${app!.proxyUrl}${path}?model=${model}`, { headers });
+    const body = await res.text();
+    expect(res.status).toBe(502);
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, `the failed ${path} row`);
+    expect(row.get("response")).toBe(opaque ? JOBS_OUTPUT_PREFIX : body);
+  });
+
+  test("jobs records the complete upstream error after its output guardrail allows it", async () => {
+    if (!etcdReachable) return;
+    const res = await fetch(`${app!.proxyUrl}/v1/batches/batch_1?model=row-jobs-checked`, { headers });
+    await res.text();
+    expect(res.status).toBe(400);
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the checked jobs error row");
+    expect(row.get("response")).toBe(ANY_400);
   });
 
   test("count_tokens and videos, which capture nothing on success, report a failure", async () => {
@@ -1106,24 +1243,41 @@ describe("failure rows carry request and response bodies", () => {
     expect(JSON.parse(row.get("response")!)).toEqual(JSON.parse(body));
   });
 
-  test("realtime: an upstream that refuses the socket has a row naming its status", async () => {
-    if (!etcdReachable) return;
-    const requestId = await new Promise<string>((resolve, reject) => {
+  const realtimeFailure = (model: string) =>
+    new Promise<{ requestId: string; body: string }>((resolve, reject) => {
       const ws = new WsClient(
-        `${app!.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=row-realtime-400`,
+        `${app!.proxyUrl.replace("http://", "ws://")}/v1/realtime?model=${model}`,
         { headers: { authorization: `Bearer ${CALLER}` } },
       );
       let id = "";
+      let body = "";
       ws.on("upgrade", (res) => {
         id = String(res.headers["x-aisix-request-id"] ?? "");
       });
-      ws.on("close", () => resolve(id));
+      ws.on("message", (frame) => { body = frame.toString(); });
+      ws.on("close", () => resolve({ requestId: id, body }));
       ws.on("error", reject);
     });
+
+  test("realtime: an upstream that refuses the socket has a row naming its status", async () => {
+    if (!etcdReachable) return;
+    const { requestId } = await realtimeFailure("row-realtime-400");
     const row = await rowOf(requestId, "the failed realtime row");
     expect(row.get("status_code")).toBe("400");
     expect(row.get("error_class")).toBe("upstream_status");
-    expect(row.get("response")).toBeTruthy();
+    expect(row.get("response")).toBe(ANY_400);
+  });
+
+  test.each([
+    ["empty upstream handshake reply", "row-video-empty", "502"],
+    ["output guardrail block", "row-realtime-blocked", "400"],
+  ] as const)("realtime: %s records the actual gateway response", async (_what, model, status) => {
+    if (!etcdReachable) return;
+    const { requestId, body } = await realtimeFailure(model);
+    expect(JSON.parse(body).type).toBe("error");
+    const row = await rowOf(requestId, "the realtime failure row");
+    expect(row.get("status_code")).toBe(status);
+    expect(row.get("response")).toBe(body);
   });
 
   test.each([
@@ -1279,6 +1433,7 @@ describe("failure rows carry request and response bodies", () => {
     expect(await res.text()).toContain(RESPONSE_MEDIA);
     const requestId = res.headers.get("x-aisix-request-id")!;
     const row = await rowOf(requestId, "the SSE media failure");
+    expect(row.get("response")).toMatch(/^event: response\.image_generation_call\.partial_image\ndata\ndata: \{/);
     expect(row.get("response")).toContain('"partial_image_b64":"[aisix: base64 data uri omitted,');
     expect(row.get("response")).not.toContain(RESPONSE_MEDIA);
     expect(row.get("response")).toContain(LONG_DELTA + RESPONSES_FAILED);
@@ -1287,6 +1442,31 @@ describe("failure rows carry request and response bodies", () => {
     expect(Buffer.byteLength(capped.get("response")!)).toBeLessThanOrEqual(CAPPED_MAX_BYTES);
     expect(capped.get("response")).toContain("内容");
     expect(capped.get("response")).not.toContain("\uFFFD");
+  });
+
+  test.each([
+    ["row-responses-large-media", "text/event-stream", true],
+    ["row-responses-octet-sse", "application/octet-stream", false],
+    ["row-responses-rollover", "text/event-stream", true],
+  ] as const)("failed SSE uses complete frames from %s", async (model, mime, truncated) => {
+    if (!etcdReachable) return;
+    const res = await post("/v1/responses", { model, input: "test", stream: true });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain(mime);
+    const wire = await res.text();
+    expect(wire).toContain("event: response.failed");
+    expect(wire).toContain('"trace":"provider-raw"');
+    if (model === "row-responses-large-media") expect(wire).toContain(MEDIA_PREFIX);
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the model's failed SSE");
+    expect(row.get("error_class")).toBe("upstream_in_band");
+    const response = row.get("response")!;
+    expect(response.includes(MEDIA_PREFIX)).toBe(false);
+    expect(response.startsWith(RESPONSES_DELTA)).toBe(true);
+    expect(response.endsWith(RESPONSES_FAILED)).toBe(true);
+    expect(row.get("content_truncated")).toBe(truncated ? "true" : undefined);
+    if (model !== "row-responses-rollover") {
+      expect(response).toBe(RESPONSES_DELTA + RESPONSES_FAILED);
+    }
   });
 
   test("a failed masked stream exports the masked output", async (ctx) => {
@@ -1300,6 +1480,27 @@ describe("failure rows carry request and response bodies", () => {
     expect(row.get("error_class")).toBe("upstream_in_band");
     expect(row.get("response")).toContain("[EMAIL_REDACTED]");
     expect(row.get("response")).not.toContain(OUTPUT_EMAIL);
+  });
+
+  test("a malformed upstream JSON response keeps diagnostics before escaped audio", async () => {
+    if (!etcdReachable) return;
+    const { res, requestId } = await chat("row-invalid-escaped-media", "test");
+    expect(res.status).toBe(502);
+    const row = await rowOf(requestId, "the malformed JSON failure");
+    expect(row.get("response")).toContain("readable before audio");
+    expect(row.get("response")).not.toContain(RESPONSE_MEDIA);
+  });
+
+  test("a bridged SSE output block records the refusal frames actually sent", async () => {
+    if (!etcdReachable) return;
+    const res = await post("/v1/responses", { model: "row-responses-bridge-blocked", input: "test", stream: true });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain("event: response.failed");
+    expect(body).not.toContain("partial Responses answer");
+    const row = await rowOf(res.headers.get("x-aisix-request-id")!, "the bridged guardrail failure");
+    expect(row.get("guardrail_blocked")).toBe("true");
+    expect(row.get("response")).toBe(body);
   });
 
   test("a blocked stream exports the gateway's actual rejection without the upstream body", async (ctx) => {

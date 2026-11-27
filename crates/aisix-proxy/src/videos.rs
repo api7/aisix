@@ -83,7 +83,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
-use crate::error::{ErrorEnvelope, ProxyError};
+use crate::error::{not_implemented_response, ProxyError};
 use crate::reject::AisixPath;
 use crate::state::ProxyState;
 
@@ -1049,9 +1049,8 @@ impl UnsupportedProvider {
         applied_guardrails: Vec<AppliedGuardrail>,
         monitor_hits: Vec<aisix_core::GuardrailMonitorHit>,
     ) -> CreateSuccess {
-        let env = ErrorEnvelope::new(self.0.clone(), "not_implemented");
         CreateSuccess {
-            response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
+            response: not_implemented_response(self.0.clone()),
             provider: "unknown".into(),
             model_id,
             provider_key_id: String::new(),
@@ -1876,7 +1875,7 @@ async fn dispatch_create(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved_chain = state.resolve_guardrails(&guardrail_ctx);
+    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
     let applied_guardrails = resolved_chain.applied().to_vec();
     *audit_out = resolved_chain.audit_log();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();

@@ -400,7 +400,8 @@ fn guardrail_embedder_slot(
 }
 
 impl ProxyState {
-    pub(crate) fn resolve_guardrails(
+    /// Resolve a chain this endpoint runs on responses before reading upstream output.
+    pub(crate) fn resolve_output_guardrails(
         &self,
         context: &aisix_guardrails::RequestContext<'_>,
     ) -> aisix_guardrails::GuardrailChain {

@@ -1342,7 +1342,7 @@ impl VertexBridge {
         // AnthropicStreamEvent, update rolling state (id/model carried
         // from `message_start`), emit any chunk, and stop on the
         // terminal `message_stop`. Anthropic emits no `[DONE]` sentinel.
-        let byte_stream = aisix_gateway::upstream_body_stream(resp);
+        let byte_stream = aisix_gateway::upstream_sse_stream(resp);
         let stream = async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
             let mut state = StreamState::default();
@@ -1551,7 +1551,7 @@ impl VertexBridge {
         }
 
         let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
-        let byte_stream = aisix_gateway::upstream_body_stream(resp);
+        let byte_stream = aisix_gateway::upstream_sse_stream(resp);
         let stream = async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
             let mut tool_call_indexer = ToolCallIndexer::default();
@@ -1798,7 +1798,7 @@ impl VertexBridge {
         }
 
         let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
-        let byte_stream = aisix_gateway::upstream_body_stream(resp);
+        let byte_stream = aisix_gateway::upstream_sse_stream(resp);
         let stream = async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
             let mut tool_call_indexer = ToolCallIndexer::default();
@@ -1938,7 +1938,7 @@ impl VertexBridge {
 
         let upstream_id_owned = upstream_id.to_string();
         let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
-        let byte_stream = aisix_gateway::upstream_body_stream(resp);
+        let byte_stream = aisix_gateway::upstream_sse_stream(resp);
 
         // try_stream! adapts the byte stream into a Stream of
         // Result<ChatChunk, BridgeError>. Pattern mirrors the

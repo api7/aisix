@@ -327,13 +327,15 @@ async fn screen_input(
     body: &mut Value,
     screening: &mut InputScreening,
 ) -> Result<(), ProxyError> {
-    let chain = state.resolve_guardrails(&aisix_guardrails::RequestContext {
-        passthrough_route_id: "",
-        model_id: model_entry_id,
-        mcp_server_id: "",
-        api_key_id: &auth.entry.id,
-        team_id: auth.key().team_id.as_deref(),
-    });
+    let chain = state
+        .guardrail_index
+        .resolve(&aisix_guardrails::RequestContext {
+            passthrough_route_id: "",
+            model_id: model_entry_id,
+            mcp_server_id: "",
+            api_key_id: &auth.entry.id,
+            team_id: auth.key().team_id.as_deref(),
+        });
     screening.applied = chain.applied().to_vec();
     screening.audit = chain.audit_log();
     if chain.is_empty() {

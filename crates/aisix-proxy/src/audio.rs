@@ -1282,7 +1282,7 @@ async fn multipart_dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved_chain = state.resolve_guardrails(&guardrail_ctx);
+    let resolved_chain = state.resolve_output_guardrails(&guardrail_ctx);
     let applied_guardrails = resolved_chain.applied().to_vec();
     *audit_out = resolved_chain.audit_log();
 
@@ -2183,7 +2183,7 @@ async fn speech_dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved_chain = state.resolve_guardrails(&guardrail_ctx);
+    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
     // Record which guardrails govern this request (#379 parity) for the emitted
     // UsageEvent. Empty when none attached.
     let applied_guardrails = resolved_chain.applied().to_vec();

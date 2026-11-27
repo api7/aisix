@@ -648,7 +648,7 @@ async fn dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved_chain = state.resolve_guardrails(&guardrail_ctx);
+    let resolved_chain = state.resolve_output_guardrails(&guardrail_ctx);
     *audit_out = resolved_chain.audit_log();
     let mut monitor_hits: Vec<aisix_core::GuardrailMonitorHit> = Vec::new();
     let output_guardrail_active = aisix_guardrails::Guardrail::runs_on_output(&resolved_chain);
@@ -5957,10 +5957,12 @@ fn guardrail_error_frame(
             unavailable,
         ));
     }
-    Bytes::from(format!(
+    let frame = format!(
         "event: error\ndata: {}\n\n",
         crate::error::guardrail_block_frame_payload(guardrail_name, unavailable)
-    ))
+    );
+    crate::error::note_client_error_frame(&frame);
+    Bytes::from(frame)
 }
 
 /// Whether a relayed chat-envelope frame is an Anthropic Messages event

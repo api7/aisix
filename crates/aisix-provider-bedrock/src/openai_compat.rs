@@ -491,7 +491,7 @@ pub(crate) async fn chat_stream(
 ) -> Result<ChatChunkStream, BridgeError> {
     let (resp, _, _) = send(&endpoint, req, ctx, model_id, true).await?;
     let request_id = request_id_header(resp.headers());
-    let byte_stream = aisix_gateway::upstream_body_stream(resp);
+    let byte_stream = aisix_gateway::upstream_sse_stream(resp);
     let stream = async_stream::try_stream! {
         let mut decoder = SseDecoder::new();
         let mut indexer = ToolCallIndexer::default();

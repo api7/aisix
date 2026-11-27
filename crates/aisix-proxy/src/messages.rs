@@ -586,7 +586,7 @@ async fn dispatch(
     };
     // Arc so the chain can be cloned into the streaming-response body
     // (which outlives this handler) for end-of-stream output guardrails.
-    let resolved_chain = std::sync::Arc::new(state.resolve_guardrails(&guardrail_ctx));
+    let resolved_chain = std::sync::Arc::new(state.resolve_output_guardrails(&guardrail_ctx));
     // Surface the applied `{kind, hook}` set to the caller so the telemetry
     // event records which guardrails governed the request even when the input
     // check below blocks it (#379 / closes the anthropic gap in #519).
@@ -2054,7 +2054,7 @@ impl Upstream {
                     .get(axum::http::header::CONTENT_TYPE)
                     .and_then(|v| HeaderValue::from_bytes(v.as_bytes()).ok())
                     .unwrap_or(sse);
-                (ct, Box::pin(aisix_gateway::upstream_body_stream(resp)))
+                (ct, Box::pin(aisix_gateway::upstream_sse_stream(resp)))
             }
             Self::Native(aisix_gateway::NativeMessages::Stream(frames)) => {
                 let frames = async_stream::stream! {
@@ -3319,7 +3319,7 @@ pub(crate) fn guardrail_block_frame(
     guardrail_name: Option<&str>,
     unavailable: Option<&str>,
 ) -> String {
-    format!(
+    let frame = format!(
         "event: error\ndata: {}\n\n",
         serde_json::json!({
             "type": "error",
@@ -3329,7 +3329,9 @@ pub(crate) fn guardrail_block_frame(
                 "message": crate::error::guardrail_block_message("response", guardrail_name, unavailable),
             }
         })
-    )
+    );
+    crate::error::note_client_error_frame(&frame);
+    frame
 }
 
 fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {

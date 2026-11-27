@@ -362,7 +362,7 @@ async fn dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved_chain = state.resolve_guardrails(&guardrail_ctx);
+    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
     // Record which guardrails govern this request (#379 parity) so the emitted
     // UsageEvent surfaces them in Logs, like chat / messages. Empty when no
     // guardrail is attached.

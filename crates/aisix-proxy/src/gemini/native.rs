@@ -391,7 +391,7 @@ pub(crate) async fn chat_stream(
 ) -> Result<ChatChunkStream, BridgeError> {
     let resp = send(ctx, body, true).await?;
     let tier = gemini_header_service_tier(resp.headers());
-    let mut bytes = aisix_gateway::upstream_body_stream(resp);
+    let mut bytes = aisix_gateway::upstream_sse_stream(resp);
     let stream = async_stream::try_stream! {
         let mut decoder = SseDecoder::new();
         let mut next_tool = HashMap::new();

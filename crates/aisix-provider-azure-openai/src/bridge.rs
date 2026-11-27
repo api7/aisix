@@ -1035,7 +1035,7 @@ impl Bridge for AzureOpenAiBridge {
         // off just because its total duration exceeds one gap's budget.
         let per_chunk_timeout = ctx.deadline;
 
-        let byte_stream = aisix_gateway::upstream_body_stream(resp);
+        let byte_stream = aisix_gateway::upstream_sse_stream(resp);
         let stream = build_chunk_stream(
             byte_stream,
             reasoning_path,

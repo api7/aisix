@@ -18,7 +18,6 @@ use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeCapability, BridgeError, ChatFormat, ChatMessage, EmbeddingRequest};
 use aisix_obs::{content_capture_cap, AccessLog, CapturedContent, UsageEvent};
 use axum::extract::State;
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
@@ -27,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
-use crate::error::{ErrorEnvelope, ProxyError};
+use crate::error::{not_implemented_response, ProxyError};
 use crate::state::ProxyState;
 
 /// The request body accepted by `POST /v1/embeddings`.
@@ -506,7 +505,7 @@ async fn dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved_chain = state.resolve_guardrails(&guardrail_ctx);
+    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
     // Record which guardrails govern this request (#379 parity) so the emitted
     // UsageEvent surfaces them in Logs, like chat / messages. Empty when no
     // guardrail is attached.
@@ -813,9 +812,8 @@ async fn dispatch(
             reservation
                 .commit_tokens(aisix_ratelimit::TokenCharge::NONE)
                 .await;
-            let env = ErrorEnvelope::new(e.to_string(), "not_implemented");
             Ok(EmbedDispatchSuccess {
-                response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
+                response: not_implemented_response(e.to_string()),
                 provider,
                 model_id: target.id.clone(),
                 provider_key_id: pk_id.clone(),

@@ -852,7 +852,7 @@ impl Bridge for OpenAiBridge {
         let request_id_for_log = ctx.request_id.clone();
 
         let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
-        let byte_stream = aisix_gateway::upstream_body_stream(resp);
+        let byte_stream = aisix_gateway::upstream_sse_stream(resp);
         let stream = build_chunk_stream(
             byte_stream,
             reasoning_path,
