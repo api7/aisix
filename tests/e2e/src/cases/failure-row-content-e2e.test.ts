@@ -68,6 +68,18 @@ const MEDIA_FRAME = `event: response.image_generation_call.partial_image\ndata\n
   type: "response.image_generation_call.partial_image", sequence_number: 1,
   item_id: "img_1", output_index: 0, partial_image_index: 0, partial_image_b64: RESPONSE_MEDIA,
 })}\n\n`;
+const RESPONSES_OPAQUE_ITEMS = [
+  {
+    type: "reasoning", id: "rs_1", encrypted_content: "sentinel-reasoning-ciphertext",
+    summary: [{ type: "summary_text", text: "visible reasoning summary" }],
+  },
+  { type: "compaction", id: "cmp_1", encrypted_content: "sentinel-compaction-ciphertext" },
+].map((item, index) => ({
+  type: "response.output_item.done", output_index: index + 1, item, provider_extra: null,
+}));
+const OPAQUE_ITEM_FRAMES = RESPONSES_OPAQUE_ITEMS.map((frame) => (
+  `event: response.output_item.done\r\ndata: ${JSON.stringify(frame)}\r\n\r\n`
+));
 const MEDIA_PREFIX = "c2VudGluZWwtbGFyZ2UtaW1hZ2Uh";
 const OVERSIZED_MEDIA_FRAME = `event: response.output_item.done\r\ndata: ${JSON.stringify({
   item: { result: MEDIA_PREFIX.repeat(6_000), type: "image_generation_call", id: "img_large" },
@@ -334,7 +346,7 @@ describe("failure rows carry request and response bodies", () => {
       status: 503, rawErrorBodyChunks: [TIMEOUT_PREFIX], eventDelayMs: 1_500,
     }, { streamTimeout: 350 });
     await failingModel("row-responses-media", {
-      rawStreamFrames: [MEDIA_FRAME, LONG_DELTA, RESPONSES_FAILED],
+      rawStreamFrames: [MEDIA_FRAME, ...OPAQUE_ITEM_FRAMES, LONG_DELTA, RESPONSES_FAILED],
     });
     await failingModel("row-responses-large-media", {
       rawStreamFrames: [RESPONSES_DELTA, OVERSIZED_MEDIA_FRAME, RESPONSES_FAILED],
@@ -1437,24 +1449,35 @@ describe("failure rows carry request and response bodies", () => {
     expect(row.get("response")).toBe(TIMEOUT_PREFIX);
   });
 
-  test("a failed SSE export omits image payloads and retains later events", async (ctx) => {
+  test("a failed SSE export omits image payloads and ciphertext while retaining events", async (ctx) => {
     if (!etcdReachable) return ctx.skip();
     const res = await post("/v1/responses", { model: "row-responses-media", input: "test", stream: true });
     expect(res.status).toBe(200);
-    expect(await res.text()).toContain(RESPONSE_MEDIA);
+    const wire = await res.text();
+    expect(wire).toContain(RESPONSE_MEDIA);
     const requestId = res.headers.get("x-aisix-request-id")!;
     const row = await rowOf(requestId, "the SSE media failure");
-    expect(row.get("response")).toMatch(/^event: response\.image_generation_call\.partial_image\ndata\ndata: \{/);
-    expect(row.get("response")).toContain('"partial_image_b64":"[aisix: base64 data uri omitted,');
-    expect(row.get("response")).not.toContain(RESPONSE_MEDIA);
-    expect(row.get("response")).toContain(LONG_DELTA + RESPONSES_FAILED);
+    expect(row.get("error_class")).toBe("upstream_in_band");
+    const fullResponse = row.get("response")!;
+    expect(fullResponse).toMatch(/^event: response\.image_generation_call\.partial_image\ndata\ndata: \{/);
+    expect(fullResponse).toContain('"partial_image_b64":"[aisix: base64 data uri omitted,');
+    expect(fullResponse).not.toContain(RESPONSE_MEDIA);
+    expect(fullResponse).toContain(LONG_DELTA + RESPONSES_FAILED);
+    const events = fullResponse.split(/\r?\n/).flatMap((line) => (
+      line.startsWith("data: ") ? [JSON.parse(line.slice("data: ".length))] : []
+    ));
+    for (const frame of RESPONSES_OPAQUE_ITEMS) {
+      const { encrypted_content, ...readable } = frame.item;
+      expect(wire).toContain(encrypted_content);
+      expect(fullResponse).not.toContain(encrypted_content);
+      expect(events).toContainEqual({ ...frame, item: readable });
+    }
     const capped = await waitForSlsLog(sls!, CAPPED, (l) => l.get("request_id") === requestId, "the capped SSE response");
     expect(capped.get("content_truncated")).toBe("true");
     const cappedResponse = capped.get("response")!;
     expect(Buffer.byteLength(cappedResponse)).toBeLessThanOrEqual(CAPPED_MAX_BYTES);
-    const fullResponse = row.get("response")!;
-    const mediaFrame = fullResponse.slice(0, fullResponse.indexOf(LONG_DELTA));
-    expect(cappedResponse).toBe(mediaFrame + RESPONSES_FAILED);
+    const earlierFrames = fullResponse.slice(0, fullResponse.indexOf(LONG_DELTA));
+    expect(cappedResponse).toBe(earlierFrames + RESPONSES_FAILED);
   });
 
   test.each([

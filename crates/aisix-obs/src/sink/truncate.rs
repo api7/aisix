@@ -289,6 +289,9 @@ fn omit_media(v: &mut Value, response: bool) -> bool {
                 Some("redacted_thinking") if response => {
                     map.get_mut("data").is_some_and(omit_bare_base64)
                 }
+                Some("reasoning" | "compaction") if response => {
+                    map.remove("encrypted_content").is_some()
+                }
                 _ => false,
             };
             for (key, child) in map.iter_mut() {
@@ -383,12 +386,13 @@ const CUT_MEDIA_MARKERS: [&str; 11] = [
     "\"image_generation_call\"",
 ];
 
-const RESPONSE_MEDIA_MARKERS: [&str; 5] = [
+const RESPONSE_MEDIA_MARKERS: [&str; 6] = [
     "\"audio\"",
     "\"response.audio.delta\"",
     "\"response.output_audio.delta\"",
     "\"redacted_thinking\"",
     "\"redactedContent\"",
+    "\"encrypted_content\"",
 ];
 
 // An unfinished object can hide its media kind after a payload or spell a
@@ -410,7 +414,7 @@ pub fn omit_base64_media_in_json(s: &str) -> Cow<'_, str> {
     omit_base64_media_in_serialized(s, false)
 }
 
-/// The upstream's response may also carry OpenAI audio output.
+/// Omit media and opaque fields from upstream responses before export.
 pub fn omit_base64_media_in_response_json(s: &str) -> Cow<'_, str> {
     omit_base64_media_in_serialized(s, true)
 }
@@ -792,6 +796,14 @@ mod tests {
             assert!(out.contains(BASE64_OMITTED_PREFIX), "{out}");
             assert!(!out.contains("QUJD"), "{out}");
         }
+    }
+
+    #[test]
+    fn response_cut_before_the_item_type_omits_ciphertext() {
+        let cut = r#"{"summary":[{"text":"readable"}],"encrypted_content":"ciphertext-prefix"#;
+        let out = omit_base64_media_in_response_json(cut);
+        assert!(out.starts_with(r#"{"summary":[{"text":"readable"}],"#));
+        assert!(!out.contains("ciphertext-prefix"));
     }
 
     #[test]
