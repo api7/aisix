@@ -1353,7 +1353,7 @@ fn emit_a2a_usage_counted(
         snap,
         crate::operation::A2A,
         event,
-        aisix_obs::UsageEventLabels::default(),
+        Default::default(),
         captured.as_ref(),
         trace,
         /* terminal */ true,

@@ -133,6 +133,7 @@ pub(crate) struct SettledWinner {
     pub kind: &'static str,
     pub target_model: String,
     pub model_id: String,
+    pub provider_key_id: String,
     /// The attempt's own measured duration, as recorded. Taken from the
     /// record rather than measured here, so it does not absorb the
     /// post-dispatch work (the output scan, the cache write) the cancel
@@ -179,6 +180,8 @@ pub(crate) struct CancelContext {
     pub auth: Option<crate::auth::AuthenticatedKey>,
     /// See [`RouteIdentity`].
     pub route: RouteIdentity,
+    /// Provider Key confirmed by an upstream call outside the attempt loop.
+    pub confirmed_provider_key_id: String,
     /// `UsageEvent::request_headers`, from [`note_client`] or, on `/mcp`
     /// and `/a2a`, from [`note_request_headers`].
     pub request_headers: std::collections::BTreeMap<String, String>,
@@ -654,6 +657,8 @@ pub(crate) struct InternalCall {
     pub(crate) model_name: String,
     /// The Provider Key the call went out on.
     pub(crate) provider_key_id: String,
+    pub(crate) dispatched: bool,
+    pub(crate) caller_credential: bool,
     pub(crate) completed_at: String,
     pub(crate) status_code: u16,
     pub(crate) error_class: String,
@@ -707,6 +712,7 @@ impl InternalCallLedger {
 #[must_use = "an in-flight internal call must stay guarded until it settles"]
 pub(crate) struct InternalCallGuard {
     ledger: Option<Arc<InternalCallLedger>>,
+    response_tap: Option<Arc<aisix_gateway::ResponseHeaderTap>>,
     /// The child as far as it is known before the call returns.
     pending: Option<InternalCall>,
     started: Instant,
@@ -719,14 +725,21 @@ impl InternalCallGuard {
     /// The upstream has answered: the call's latency and span end here,
     /// even if counting its tokens still takes a while. The guard stays
     /// armed until [`Self::settle`].
-    pub(crate) fn mark_returned(&mut self) {
+    pub(crate) fn mark_returned(&mut self, dispatched: bool) {
         self.returned = Some(Instant::now());
+        if let Some(call) = &mut self.pending {
+            call.dispatched = dispatched;
+        }
     }
 
     /// The child as built before the call, timed, for the settled outcome
     /// to fill in. Disarms the cancellation record.
     pub(crate) fn settle(&mut self) -> InternalCall {
         let mut call = self.pending.take().expect("an internal call settles once");
+        call.caller_credential = self
+            .response_tap
+            .as_ref()
+            .is_some_and(|tap| tap.has_caller_credential());
         let returned = self.returned.unwrap_or_else(Instant::now);
         call.completed_at = aisix_obs::UsageEvent::occurred_at_now();
         call.settled_at = Some(returned);
@@ -752,6 +765,14 @@ impl Drop for InternalCallGuard {
         call.settled_at = Some(Instant::now());
         call.latency_ms = crate::attempt::measured_ms(self.started.elapsed());
         call.abandoned = true;
+        call.dispatched |= self
+            .response_tap
+            .as_ref()
+            .is_some_and(|tap| tap.has_response());
+        call.caller_credential = self
+            .response_tap
+            .as_ref()
+            .is_some_and(|tap| tap.has_caller_credential());
         ledger.record(call);
     }
 }
@@ -1169,6 +1190,7 @@ pub(crate) fn begin_internal_call(call: InternalCall) -> InternalCallGuard {
         ledger: CURRENT
             .try_with(|attribution| Arc::clone(&attribution.internal_calls))
             .ok(),
+        response_tap: CURRENT.try_with(|a| Arc::clone(&a.response_tap)).ok(),
         pending: Some(call),
         started: Instant::now(),
         returned: None,
@@ -1437,6 +1459,7 @@ pub(crate) fn note_attempt_settled(rec: &AttemptRecord) {
                 kind: rec.kind,
                 target_model: rec.target_model.clone(),
                 model_id: rec.target_model_id.clone(),
+                provider_key_id: rec.provider_key_id.clone(),
                 latency_ms: rec.latency_ms,
             });
         } else {
@@ -1696,6 +1719,35 @@ pub(crate) fn note_upstream_wait_begin() {
     });
 }
 
+/// The response tap is cleared at each attempt start, so an in-flight
+/// attempt can only observe its own upstream response.
+pub(crate) fn observed_upstream_response() -> bool {
+    CURRENT
+        .try_with(|a| a.response_tap.has_response())
+        .unwrap_or(false)
+}
+
+pub(crate) fn note_confirmed_provider_key(id: &str) {
+    with_cancel(|c| c.confirmed_provider_key_id = id.to_owned());
+}
+
+pub(crate) fn confirmed_provider_key_id() -> String {
+    CURRENT
+        .try_with(|a| a.lock().cancel.confirmed_provider_key_id.clone())
+        .unwrap_or_default()
+}
+
+pub(crate) fn attempt_used_provider_key(index: u32) -> bool {
+    CURRENT
+        .try_with(|a| {
+            a.lock()
+                .attempt_responses
+                .get(&index)
+                .is_some_and(|response| response.received && !response.caller_credential)
+        })
+        .unwrap_or(false)
+}
+
 /// Close the upstream wait [`note_upstream_wait_begin`] opened: the
 /// upstream answered (`success`) or failed.
 pub(crate) fn note_upstream_wait_end(success: bool) {
@@ -1732,22 +1784,19 @@ pub(crate) async fn capture_subcall_response<T, E>(
     streaming: bool,
     call: impl Future<Output = Result<T, E>>,
 ) -> Result<T, E> {
-    let tap = CURRENT
-        .try_with(|a| a.response_tap.for_subcall())
-        .ok()
-        .flatten();
+    let tap = CURRENT.try_with(|a| a.response_tap.for_subcall()).ok();
     let Some(tap) = tap else {
         return call.await;
     };
     let result = aisix_gateway::response_tap::scope(tap.clone(), call).await;
-    if streaming || result.is_err() {
-        let mut response = tap.take();
-        response.headers.clear();
-        response.request_id.clear();
-        if !response.is_empty() {
-            let _ =
-                CURRENT.try_with(|a| a.lock().attempt_responses.insert(attempt_index, response));
-        }
+    let mut response = tap.take();
+    response.headers.clear();
+    response.request_id.clear();
+    if !streaming && result.is_ok() {
+        response.discard_success_body();
+    }
+    if !response.is_empty() {
+        let _ = CURRENT.try_with(|a| a.lock().attempt_responses.insert(attempt_index, response));
     }
     result
 }

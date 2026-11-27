@@ -683,6 +683,7 @@ struct Prepared {
     auth: AuthenticatedKey,
     model_entry: std::sync::Arc<aisix_core::ResourceEntry<aisix_core::Model>>,
     pk_id: String,
+    caller_credential: bool,
     upstream_request: tokio_tungstenite::tungstenite::handshake::client::Request,
     reservation: aisix_ratelimit::MultiReservation,
     requested_model: String,
@@ -754,7 +755,7 @@ async fn prepare(
         );
     }
 
-    let mut upstream_request = match pk_entry.value.adapter {
+    let (mut upstream_request, auth_name) = match pk_entry.value.adapter {
         Some(Adapter::Openai) => {
             let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
             let url = crate::dispatch::build_openai_url(&base, "/realtime");
@@ -782,7 +783,7 @@ async fn prepare(
                 req.headers_mut()
                     .insert("openai-beta", "realtime=v1".parse().unwrap());
             }
-            req
+            (req, axum::http::header::AUTHORIZATION)
         }
         Some(Adapter::AzureOpenai) => {
             let base = aisix_provider_azure_openai::AzureUpstreamRef::api_base_url(
@@ -816,8 +817,8 @@ async fn prepare(
                 .map_err(ProxyError::Bridge)?;
             let (name, value) = aisix_provider_azure_openai::auth_header(&credential)
                 .map_err(ProxyError::Bridge)?;
-            req.headers_mut().insert(name, value);
-            req
+            req.headers_mut().insert(name.clone(), value);
+            (req, name)
         }
         _ => {
             return Err(ProxyError::InvalidRequest(format!(
@@ -852,6 +853,7 @@ async fn prepare(
     Ok(Prepared {
         auth,
         pk_id: pk_entry.id.to_string(),
+        caller_credential: forwarded.claims(auth_name.as_str()),
         model_entry,
         upstream_request,
         reservation,
@@ -1084,6 +1086,7 @@ async fn run_session(
         auth,
         model_entry,
         pk_id,
+        caller_credential,
         upstream_request,
         reservation,
         requested_model,
@@ -1248,8 +1251,11 @@ async fn run_session(
             event.provider_request_id = provider_request_id;
             let model = crate::usage_attr::usage_event_model_label(&snap, &requested_model);
             let unresolved_pk = crate::usage_attr::ResolvedPk::unresolved();
-            let labels = crate::usage_attr::usage_event_labels(&model, &unresolved_pk);
+            let attribution = crate::usage_attr::usage_attribution(&model, &unresolved_pk);
             let upstream_content = refused.as_ref().and_then(|refused| {
+                if !caller_credential {
+                    event.provider_key_id.clone_from(&pk_id);
+                }
                 let names = crate::client_ip::exported_header_names(&snap, true);
                 if !names.is_empty() {
                     event.upstream_response_headers =
@@ -1268,7 +1274,7 @@ async fn run_session(
                 &snap,
                 crate::operation::REALTIME,
                 event,
-                labels,
+                attribution,
                 content.as_ref(),
                 client.trace.as_ref(),
                 /* terminal */ true,
@@ -1640,6 +1646,9 @@ async fn run_session(
         guardrail_bypassed_reason: crate::usage_attr::bypass_reason(&audit),
         ..Default::default()
     };
+    if !caller_credential {
+        event.provider_key_id.clone_from(&pk_id);
+    }
     crate::usage_attr::apply_pk_telemetry(&mut event, &pk);
     crate::usage_attr::apply_caller_identity(&mut event, auth.jwt.as_ref(), &auth.caller());
     let usage_model =
@@ -1662,7 +1671,7 @@ async fn run_session(
         &snap,
         crate::operation::REALTIME,
         event.clone(),
-        crate::usage_attr::usage_event_labels(&usage_model, &pk),
+        crate::usage_attr::usage_attribution(&usage_model, &pk),
         content.as_ref(),
         client.trace.as_ref(),
         /* terminal */ true,
@@ -2518,6 +2527,48 @@ mod tests {
         assert_eq!(ev.error_class, "transport", "{ev:?}");
         assert_eq!(ev.model_id, "m-rt");
         assert_eq!(ev.requested_model_id, "m-rt");
+        assert!(ev.provider_key_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fun_asr_command_rejected_before_upgrade_omits_provider_key_id() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let snap = snapshot(
+            &format!("http://{}", upstream.local_addr().unwrap()),
+            "openai",
+            "alibaba",
+        );
+        let (addr, _state, mut rx) = serve(snap).await;
+        let mut req = format!("ws://{addr}/api-ws/v1/inference")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        ws.send(TgMessage::Text(
+            serde_json::json!({
+                "header": { "action": "run-task", "task_id": uuid::Uuid::new_v4() },
+                "payload": {
+                    "task_group": "audio", "task": "asr", "function": "recognition", "model": "rt-model",
+                },
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        ws.send(TgMessage::Binary(vec![0; 4])).await.unwrap();
+
+        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("usage event expected")
+            .expect("sink closed");
+        assert_eq!(ev.status_code, 400, "{ev:?}");
+        assert_eq!(
+            ev.error_message,
+            "request payload is invalid: expected task-started before audio or finish-task"
+        );
+        assert_eq!(ev.model_id, "m-rt");
+        assert!(ev.provider_key_id.is_empty());
     }
 
     #[tokio::test]
@@ -2636,6 +2687,7 @@ mod tests {
         assert_eq!(ev.requested_model, "rt-model");
         assert_eq!(ev.requested_model_id, "m-rt");
         assert_eq!(ev.api_key_id, "k-1");
+        assert_eq!(ev.provider_key_id, PK_ID);
     }
 
     /// `/v1/realtime` builds its upstream handshake by hand rather than

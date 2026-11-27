@@ -511,7 +511,7 @@ fn build_request_headers(
             HeaderValue::from_static("text/event-stream"),
         );
     }
-    apply_request_headers(&mut headers, hdr);
+    apply_request_headers(&mut headers, hdr).note_auth_source("authorization");
     Ok(headers)
 }
 

@@ -9454,6 +9454,7 @@ data: [DONE]\n\n";
         assert_eq!(event.attempt_model, "", "no attempt had begun");
         assert_eq!(event.attempt_kind, "");
         assert_eq!(event.operation, "chat");
+        assert!(event.provider_key_id.is_empty());
         assert!(
             rx.try_recv().is_err(),
             "a cancel with no attempts must emit exactly one event",
@@ -9555,6 +9556,7 @@ data: [DONE]\n\n";
         assert_eq!(failed.attempt_model, "primary");
         assert_eq!(failed.model_id, "m-primary");
         assert_eq!(failed.error_class, "upstream_status");
+        assert_eq!(failed.provider_key_id, "pk-m-primary");
 
         let terminal = next_event(&mut rx).await;
         assert_head_phase_cancel(&terminal);
@@ -9622,6 +9624,7 @@ data: [DONE]\n\n";
             "the terminal event follows the attempt rows already emitted",
         );
         assert_eq!(terminal.model_id, "m-primary");
+        assert!(terminal.provider_key_id.is_empty());
         assert!(
             rx.try_recv().is_err(),
             "one attempt plus the terminal event"
@@ -9699,6 +9702,7 @@ data: [DONE]\n\n";
         assert_eq!(event.attempt_model, "primary");
         assert_eq!(event.attempt_index, 0);
         assert_eq!(event.attempt_kind, "initial");
+        assert_eq!(event.provider_key_id, "pk-m-primary");
         assert!(
             rx.try_recv().is_err(),
             "the winner succeeded, so it is the only row"
@@ -11643,6 +11647,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     /// finds it exhausted and fails before opening the stream (429).
     #[tokio::test]
     async fn ensemble_streaming_judge_rate_limit_enforced() {
+        use aisix_obs::UsageSink;
         let upstream = MockServer::builder().start().await;
         let judge_sse = "\
 data: {\"id\":\"cmpl-judge\",\"model\":\"judge-upstream\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final\"},\"finish_reason\":null}]}\n\n\
@@ -11682,13 +11687,18 @@ data: [DONE]\n\n";
             .insert(direct_model_entry("m-panel-a", "panel-a", "panel-upstream"));
         snap.models
             .insert(direct_model_entry("m-panel-b", "panel-b", "panel-upstream"));
+        let mut judge_key = pk_entry_with_id("pk-judge-limited", &upstream.uri());
+        judge_key.value.telemetry_tags.pk_label = Some("judge-credential".into());
+        snap.provider_keys.insert(judge_key);
         // Judge capped at one request per minute.
-        snap.models.insert(direct_model_entry_rl(
+        let mut judge = direct_model_entry_rl(
             "m-judge",
             "judge-m",
             "judge-upstream",
             serde_json::json!({ "rpm": 1 }),
-        ));
+        );
+        judge.value.provider_key_id = Some("pk-judge-limited".into());
+        snap.models.insert(judge);
         snap.models.insert(ensemble_model_entry(
             "m-council",
             "council",
@@ -11696,7 +11706,11 @@ data: [DONE]\n\n";
             "judge-m",
         ));
         snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
-        let app = build_router(build_state(snap, hub));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let state = build_state(snap, hub);
+        let sink = UsageSink::new(tx).with_metrics((*state.metrics).clone());
+        let state = state.with_usage_sink(sink);
+        let app = build_router(state.clone());
 
         let make_req = || {
             let body = serde_json::json!({
@@ -11719,6 +11733,16 @@ data: [DONE]\n\n";
             run(app, make_req()).await.status(),
             StatusCode::TOO_MANY_REQUESTS
         );
+        let refused = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|e| e.attempt_kind == "judge" && e.status_code == 429)
+            .expect("a local judge refusal row");
+        assert_eq!(refused.pk_label, "judge-credential");
+        assert!(refused.provider_key_id.is_empty());
+        assert!(state.metrics.render().lines().any(|line| {
+            line.starts_with("aisix_usage_events_emitted_total{")
+                && line.contains("provider_key_id=\"pk-judge-limited\"")
+                && line.contains("status=\"429\"")
+        }));
     }
 
     /// #620 (audit M-1): the per-member `commit_tokens` must accrue to the
@@ -12436,6 +12460,11 @@ data: [DONE]\n\n";
         hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = new_snap(&upstream.uri());
         seed_council_with_a_tpm_cap(&snap);
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-stream-judge", &upstream.uri()));
+        let mut judge = direct_model_entry("m-judge", "judge-m", "judge-upstream");
+        judge.value.provider_key_id = Some("pk-stream-judge".into());
+        snap.models.insert(judge);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
         let app = build_router(state.clone());
@@ -12478,6 +12507,7 @@ data: [DONE]\n\n";
         assert_eq!(events[2].status_code, CLIENT_CLOSED_REQUEST, "{events:?}");
         assert_eq!(events[2].error_message, cancel::CANCELLED_BEFORE_BODY);
         assert_eq!(events[2].attempt_kind, "", "{events:?}");
+        assert_eq!(events[2].provider_key_id, "pk-stream-judge");
         assert_attempt_indices_increase(&events);
         assert_council_charged(&state, app, 32).await;
     }
@@ -12657,6 +12687,129 @@ data: [DONE]\n\n";
             events.push(ev);
         }
         events
+    }
+
+    #[tokio::test]
+    async fn ensemble_buffered_timeouts_keep_each_responding_provider_key() {
+        use axum::response::IntoResponse;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+        let (judge_auth_tx, mut judge_auth_rx) = tokio::sync::mpsc::unbounded_channel();
+        let upstream = Router::new().route(
+            "/chat/completions",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+                    let judge_auth_tx = judge_auth_tx.clone();
+                    async move {
+                        match body["model"].as_str().unwrap() {
+                            "pending-panel" => std::future::pending().await,
+                            "stalled-panel" | "judge" => {
+                                if body["model"] == "judge" {
+                                    judge_auth_tx.send(headers["authorization"].clone()).unwrap();
+                                }
+                                let first_chunk = Ok::<_, std::convert::Infallible>(
+                                    bytes::Bytes::from_static(b"{"),
+                                );
+                                let partial_body = futures::stream::iter([first_chunk])
+                                    .chain(futures::stream::pending());
+                                (
+                                    [("content-type", "application/json")],
+                                    Body::from_stream(partial_body),
+                                ).into_response()
+                            }
+                            "answered-panel" => axum::Json(serde_json::json!({
+                                "id": "cmpl-panel",
+                                "model": "answered-panel",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {"role": "assistant", "content": "candidate answer"},
+                                    "finish_reason": "stop"
+                                }],
+                                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+                            })).into_response(),
+                            model => panic!("unexpected upstream model: {model}"),
+                        }
+                    }
+                },
+            ),
+        );
+        let upstream = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = AisixSnapshot::new();
+        for model in ["answered-panel", "stalled-panel", "pending-panel", "judge"] {
+            let key_id = format!("pk-{model}");
+            let mut key = pk_entry_with_id(&key_id, &upstream_url);
+            key.value.telemetry_tags.pk_label = Some(model.into());
+            if model == "judge" {
+                key.value.request = Some(
+                    serde_json::from_value(serde_json::json!({
+                        "forward_client_headers": ["authorization"]
+                    }))
+                    .unwrap(),
+                );
+            }
+            snap.provider_keys.insert(key);
+            let mut entry = direct_model_entry(model, model, model);
+            entry.value.provider_key_id = Some(key_id);
+            snap.models.insert(entry);
+        }
+        let mut council = ensemble_model_entry_min(
+            "m-council",
+            "council",
+            &["answered-panel", "stalled-panel", "pending-panel"],
+            "judge",
+            1,
+        );
+        council.value.ensemble.as_mut().unwrap().timeout_ms = Some(500);
+        snap.models.insert(council);
+        snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app =
+            build_router(build_state(snap, hub).with_usage_sink(aisix_obs::UsageSink::new(tx)));
+
+        for (caller_auth, expected_auth, judge_key_id) in [
+            (None, "Bearer sk-upstream", "pk-judge"),
+            (Some("Bearer caller-upstream"), "Bearer caller-upstream", ""),
+        ] {
+            let mut req = cancellable_chat_request("council");
+            let headers = req.headers_mut();
+            headers.insert("x-aisix-api-key", "sk-caller".parse().unwrap());
+            headers.remove("authorization");
+            if let Some(caller_auth) = caller_auth {
+                headers.insert("authorization", caller_auth.parse().unwrap());
+            }
+            let response = run(app.clone(), req).await;
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(judge_auth_rx.try_recv().unwrap(), expected_auth);
+            let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let timeouts: Vec<_> = events
+                .iter()
+                .filter(|e| {
+                    matches!(e.attempt_kind.as_str(), "panel" | "judge")
+                        && e.error_class == "timeout"
+                })
+                .map(|e| {
+                    (
+                        e.attempt_model.as_str(),
+                        e.status_code,
+                        e.pk_label.as_str(),
+                        e.provider_key_id.as_str(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                timeouts,
+                [
+                    ("stalled-panel", 504, "stalled-panel", "pk-stalled-panel"),
+                    ("pending-panel", 504, "pending-panel", ""),
+                    ("judge", 504, "judge", judge_key_id),
+                ]
+            );
+        }
+        upstream.abort();
     }
 
     /// A non-streaming ensemble cancelled while its judge runs: both panel
@@ -13017,6 +13170,9 @@ data: [DONE]\n\n";
             .collect();
         assert_eq!(panel_events.len(), 2, "both panel members must emit");
         assert_eq!(judge_events.len(), 1, "the judge must emit");
+        assert!(panel_events.iter().all(|e| e.provider_key_id == PK_ID));
+        assert_eq!(judge_events[0].provider_key_id, PK_ID);
+        assert!(events.last().unwrap().provider_key_id.is_empty());
         assert!(
             events.iter().all(|e| e.guardrail_blocked),
             "every sub-call event on the block path must be guardrail_blocked"

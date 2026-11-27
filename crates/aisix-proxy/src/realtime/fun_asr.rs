@@ -359,6 +359,7 @@ impl Task {
         let dial_started = Instant::now();
         self.dial_started = Some(dial_started);
         crate::attribution::note_upstream_wait_begin();
+        forwarded.note_auth_source("authorization");
         let dial = connect_upstream(request);
         tokio::pin!(dial);
         let connected = loop {
@@ -691,7 +692,7 @@ impl Task {
             &snap,
             crate::operation::TRANSCRIPTION,
             event,
-            usage::usage_event_labels(&model_label, &pk),
+            usage::usage_attribution(&model_label, &pk),
             self.capture.as_ref().map(|(content, _)| content),
             client.trace.as_ref(),
             true,

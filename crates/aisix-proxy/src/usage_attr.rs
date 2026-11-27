@@ -201,6 +201,7 @@ pub(crate) const UNKNOWN_PK: &str = "unknown";
 /// a per-emit lookup without saying so.
 pub(crate) struct ResolvedPk<'a> {
     id: &'a str,
+    usage_key_known: bool,
     /// `display_name`, control-char stripped and length-capped via
     /// [`sanitize_tag`]; [`UNKNOWN_PK`] when the id is empty, unresolved
     /// or names a row with a blank display name. Borrowed in the
@@ -244,6 +245,7 @@ impl<'a> ResolvedPk<'a> {
             .unwrap_or(aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN);
         Self {
             id,
+            usage_key_known: true,
             name,
             protocol,
             entry,
@@ -257,10 +259,16 @@ impl<'a> ResolvedPk<'a> {
     pub(crate) fn unresolved() -> ResolvedPk<'static> {
         ResolvedPk {
             id: "",
+            usage_key_known: false,
             name: Cow::Borrowed(UNKNOWN_PK),
             protocol: aisix_gateway::UPSTREAM_PROTOCOL_UNKNOWN,
             entry: None,
         }
+    }
+
+    pub(crate) fn with_usage_key_if(mut self, known: bool) -> Self {
+        self.usage_key_known &= known;
+        self
     }
 
     /// The ProviderKey dimensions of the metric label set.
@@ -774,7 +782,7 @@ pub(crate) fn emit_error_usage_event(
         snap,
         surface,
         event,
-        usage_event_labels(&model, &pk),
+        usage_attribution(&model, &pk),
         client.trace.as_ref(),
     );
 }
@@ -925,7 +933,7 @@ pub(crate) fn emit_failed_attempts_as(
             snap,
             surface,
             event,
-            usage_event_labels(&usage_model, &pk),
+            usage_attribution(&usage_model, &pk),
             None,
             client.trace.as_ref(),
             terminal,
@@ -1081,25 +1089,53 @@ pub(crate) fn usage_event_labels<'a>(
     }
 }
 
+#[derive(Default)]
+pub(crate) struct UsageAttribution<'a> {
+    labels: UsageEventLabels<'a>,
+    provider_key_id: &'a str,
+}
+
+/// Keep the attempt's resource ID separate from the metric label, which
+/// can also name a key on a cache hit or refusal and has a sentinel value.
+pub(crate) fn usage_attribution<'a>(
+    model: &'a str,
+    pk: &'a ResolvedPk<'_>,
+) -> UsageAttribution<'a> {
+    UsageAttribution {
+        labels: usage_event_labels(model, pk),
+        provider_key_id: if pk.usage_key_known && pk.id != UNKNOWN_PK {
+            pk.id
+        } else {
+            ""
+        },
+    }
+}
+
 pub(crate) fn emit_prepared_usage_event(
     state: &ProxyState,
     snap: &AisixSnapshot,
     surface: Surface,
     mut event: UsageEvent,
-    labels: UsageEventLabels<'_>,
+    attribution: UsageAttribution<'_>,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
 ) {
-    // It speaks for no attempt of its own: after the failed attempts of a
-    // single-shot failover whose winner then failed, it follows them.
+    event.provider_key_id = crate::attribution::confirmed_provider_key_id();
+    // Follow any failed attempt rows the handler already emitted.
     event.attempt_index = event
         .attempt_index
         .max(crate::attribution::next_attempt_index());
-    // An error event is the request's terminal emission. Its
-    // builder leaves `upstream_latency_ms` at 0, so no upstream span is
-    // derivable either way — `dispatched: false` states the common case
-    // (most error events never reached a provider).
+    // The error builder carries no attempt timing, even for a direct
+    // relay with a known Provider Key.
     emit_usage(
-        state, snap, surface, event, labels, None, trace, true, false,
+        state,
+        snap,
+        surface,
+        event,
+        attribution,
+        None,
+        trace,
+        true,
+        false,
     );
 }
 
@@ -1151,7 +1187,7 @@ pub(crate) fn emit_usage(
     snap: &AisixSnapshot,
     surface: Surface,
     mut event: UsageEvent,
-    labels: UsageEventLabels<'_>,
+    attribution: UsageAttribution<'_>,
     content: Option<&aisix_obs::CapturedContent>,
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     terminal: bool,
@@ -1212,7 +1248,13 @@ pub(crate) fn emit_usage(
     } else {
         None
     };
+    if response.caller_credential {
+        event.provider_key_id.clear();
+    }
     if dispatched {
+        if event.provider_key_id.is_empty() && response.received && !response.caller_credential {
+            event.provider_key_id = attribution.provider_key_id.to_owned();
+        }
         // A surface that runs detached from the request scope (`/v1/realtime`)
         // read its own off the upgrade response.
         if event.upstream_response_headers.is_empty() {
@@ -1290,6 +1332,7 @@ pub(crate) fn emit_usage(
     // no-op outside a request scope, which is where the detached stream
     // emitters and the cancel guard itself both run.
     crate::attribution::note_usage_emitted(terminal, event.attempt_index);
+    let labels = attribution.labels;
     let provider_key_id = labels.provider_key_id;
     state
         .usage_sink
@@ -1430,6 +1473,7 @@ fn emit_internal_calls(
     let exporters = live_exporters(state, snap);
     for mut call in calls {
         let provider_key_id = std::mem::take(&mut call.provider_key_id);
+        let attributable = call.dispatched && !call.caller_credential;
         // Each child is a span of the request's own trace, under its SERVER span.
         let emission = trace.map(|bundle| {
             bundle.internal_call_emission(
@@ -1439,6 +1483,9 @@ fn emit_internal_calls(
         });
         let pk = ResolvedPk::resolve(snap, &provider_key_id);
         let mut event = internal_call_event(call, parent);
+        if attributable {
+            event.provider_key_id = provider_key_id.clone();
+        }
         apply_pk_telemetry(&mut event, &pk);
         let model = usage_event_model_label(snap, &event.requested_model);
         state.usage_sink.try_emit(
@@ -1586,7 +1633,7 @@ mod tests {
                 &snap,
                 crate::operation::CHAT,
                 event,
-                usage_event_labels("m", &ResolvedPk::unresolved()),
+                usage_attribution("m", &ResolvedPk::unresolved()),
                 None,
                 None,
                 true,
@@ -1651,6 +1698,7 @@ mod tests {
                     ..Default::default()
                 });
             let mut call = guard.settle();
+            call.dispatched = true;
             call.status_code = 200;
             call.prompt_tokens = 7;
             guard.record(call);
@@ -1673,7 +1721,7 @@ mod tests {
                     &snap,
                     crate::operation::CHAT,
                     event,
-                    usage_event_labels("router", &ResolvedPk::unresolved()),
+                    usage_attribution("router", &ResolvedPk::unresolved()),
                     None,
                     None,
                     terminal,
@@ -1703,6 +1751,7 @@ mod tests {
             assert_eq!(child.team_id, "team-1");
             assert_eq!(child.client_type, "codex");
             assert_eq!(child.model_id, "m-embed");
+            assert_eq!(child.provider_key_id, "pk-embed");
             assert_eq!(child.requested_model, "embed");
             assert_eq!(child.requested_model_id, "m-embed");
             assert_eq!(child.operation, "embeddings");

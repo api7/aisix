@@ -1261,6 +1261,7 @@ fn provider_call_once<'a>(
     }
     // Last, and overwriting — see the field's doc comment.
     target.forwarded_client.apply(&mut headers);
+    target.forwarded_client.note_auth_source("authorization");
 
     let mut builder = client.request(method, url).headers(headers);
     if let Some(b) = body {
@@ -2388,7 +2389,7 @@ fn emit_submit_usage_event(
         snap,
         crate::operation::VIDEO_GENERATION,
         event,
-        crate::usage_attr::usage_event_labels(&usage_model, &pk),
+        crate::usage_attr::usage_attribution(&usage_model, &pk),
         None,
         client.trace.as_ref(),
         /* terminal */ true,

@@ -331,6 +331,7 @@ pub(crate) async fn serve(
                 /* terminal_last */
                 false,
                 &audit,
+                true,
             );
             // The streaming path wires the WINNER's telemetry into the SSE
             // stream's on_complete callback (it has to wait for the
@@ -612,6 +613,7 @@ pub(crate) async fn serve(
                 /* terminal_last */
                 charge.is_none(),
                 &audit,
+                true,
             );
             // Terminal event:
             //  - output-blocked (charge present): the WINNING attempt was
@@ -3842,8 +3844,6 @@ async fn dispatch_ensemble(
     let ensemble_cfg = ensemble_cfg.with_refs_resolved(snapshot);
     let ensemble_cfg = &ensemble_cfg;
 
-    let resolve_sub =
-        |display_name: &str| -> (String, String, String) { subcall_target(snapshot, display_name) };
     let effective_panel_member_usage =
         |member: &crate::ensemble::PanelOutcome| -> EffectiveSubcallUsage {
             EffectiveSubcallUsage {
@@ -4175,10 +4175,14 @@ async fn dispatch_ensemble(
             // then surface the bridge error (5xx → 502, 4xx preserved).
             Err(be) => {
                 crate::attribution::settle_ensemble();
+                let mut failed_judge = judge_failure(&be, false, judge_started);
+                if failed_judge.dispatched {
+                    failed_judge.provider_key_id.clone_from(&judge_pk.id);
+                }
                 let failure = emit_panel_then_fail(
                     &panel,
                     &failed,
-                    Some(&judge_failure(&be, false, judge_started)),
+                    Some(&failed_judge),
                     ProxyError::Bridge(be),
                 );
                 reservation.commit_tokens(panel_spent).await;
@@ -4186,9 +4190,11 @@ async fn dispatch_ensemble(
             }
         };
 
-        // The streamed judge estimator keys off `judge_model.upstream_model()`
-        // directly (below), so resolve_sub's upstream_model is unused here.
-        let (judge_model_id, judge_provider_key_id, _) = resolve_sub(&ensemble_cfg.judge.model);
+        let judge_model_id = judge_entry.id.clone();
+        let judge_provider_key_id = judge_pk.id.clone();
+        if crate::attribution::attempt_used_provider_key(judge_index) {
+            crate::attribution::note_confirmed_provider_key(&judge_provider_key_id);
+        }
         let judge_attempt_model = ensemble_cfg.judge.model.clone();
         let judge_attempt_index = judge_index;
 
@@ -4543,8 +4549,9 @@ async fn dispatch_ensemble(
                          hits: &[aisix_core::GuardrailMonitorHit],
                          terminal_judge: bool| {
         emit_panel_rows(&outcome.panel, &outcome.failed, None, blocked, bypass);
-        let (judge_model_id, judge_provider_key_id, _) = resolve_sub(&outcome.judge_model);
-        let judge_pk = crate::usage_attr::ResolvedPk::resolve(snapshot, &judge_provider_key_id);
+        let judge_model_id = subcall_model_id(snapshot, &outcome.judge_model);
+        let judge_pk =
+            crate::usage_attr::ResolvedPk::resolve(snapshot, &outcome.judge_provider_key_id);
         emit_usage_event(
             state,
             snapshot,
@@ -4986,7 +4993,7 @@ fn emit_usage_event(
         snap,
         crate::operation::CHAT,
         event,
-        crate::usage_attr::usage_event_labels(&usage_model, pk),
+        crate::usage_attr::usage_attribution(&usage_model, pk),
         content.as_ref(),
         client.trace.as_ref(),
         terminal,
@@ -5193,11 +5200,13 @@ fn emit_failed_attempts(
     // The request's enforced-guardrail audit handle (AISIX-Cloud#1330);
     // stamped only on the event this call marks terminal.
     audit: &crate::usage_attr::GuardrailAudit,
+    usage_key_known: bool,
 ) {
     let last_failed = attempts.iter().rposition(|a| !a.success);
     for (i, rec) in attempts.iter().enumerate().filter(|(_, a)| !a.success) {
         // Each failed attempt hit its own target, hence its own key.
-        let pk = crate::usage_attr::ResolvedPk::resolve(snap, &rec.provider_key_id);
+        let pk = crate::usage_attr::ResolvedPk::resolve(snap, &rec.provider_key_id)
+            .with_usage_key_if(usage_key_known);
         emit_usage_event(
             state,
             snap,
@@ -5484,28 +5493,11 @@ struct StreamGuardrailContext {
     model_name: String,
 }
 
-/// An ensemble sub-call's target by display_name → (model_id,
-/// provider_key_id, upstream_model). The first two are telemetry
-/// attribution; the third is the tokenizer key for the #1074 estimation
-/// fallback — the estimator keys off the real upstream model, not the
-/// operator alias, exactly as the direct and streaming-judge paths do (a
-/// `gpt-4o` alias must select o200k_base, not the cl100k default an
-/// unrecognised alias falls back to). Empty ids if the target was deleted
-/// between dispatch and emit (cp-api stores NULL); the tokenizer then
-/// degrades to the display name.
-fn subcall_target(snap: &AisixSnapshot, display_name: &str) -> (String, String, String) {
-    match snap.models.get_by_name(display_name) {
-        Some(entry) => (
-            entry.id.clone(),
-            entry.value.provider_key_id.clone().unwrap_or_default(),
-            entry
-                .value
-                .upstream_model()
-                .unwrap_or(display_name)
-                .to_string(),
-        ),
-        None => (String::new(), String::new(), display_name.to_string()),
-    }
+fn subcall_model_id(snap: &AisixSnapshot, display_name: &str) -> String {
+    snap.models
+        .get_by_name(display_name)
+        .map(|entry| entry.id.clone())
+        .unwrap_or_default()
 }
 
 /// The request-scoped inputs every ensemble sub-call row carries, owned so
@@ -5532,7 +5524,19 @@ fn emit_failed_subcall(
     failure: &crate::ensemble::SubcallFailure,
     index: u32,
 ) {
-    let (target_model_id, provider_key_id, _) = subcall_target(snap, &failure.model);
+    let target = snap.models.get_by_name(&failure.model);
+    let target_model_id = target
+        .as_ref()
+        .map(|entry| entry.id.clone())
+        .unwrap_or_default();
+    let usage_key_known = !failure.provider_key_id.is_empty();
+    let provider_key_id = if usage_key_known {
+        failure.provider_key_id.clone()
+    } else {
+        target
+            .and_then(|entry| entry.value.provider_key_id.clone())
+            .unwrap_or_default()
+    };
     emit_failed_attempts(
         state,
         snap,
@@ -5556,6 +5560,7 @@ fn emit_failed_subcall(
         }],
         /* terminal_last */ false,
         &ctx.audit,
+        usage_key_known,
     );
 }
 
@@ -5607,12 +5612,10 @@ struct EnsembleSubcall {
 }
 
 impl EnsembleSubcall {
-    /// Resolve `outcome`'s target against `snap` (see [`subcall_target`]).
     fn of(snap: &AisixSnapshot, outcome: &crate::ensemble::PanelOutcome) -> Self {
-        let (model_id, provider_key_id, _) = subcall_target(snap, &outcome.model);
         Self {
-            model_id,
-            provider_key_id,
+            model_id: subcall_model_id(snap, &outcome.model),
+            provider_key_id: outcome.provider_key_id.clone(),
             attempt_model: outcome.model.clone(),
             usage: outcome.effective_usage.clone(),
             usage_estimated: outcome.usage_estimated,

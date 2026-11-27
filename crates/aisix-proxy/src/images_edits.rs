@@ -633,7 +633,7 @@ async fn dispatch(
                 // boundary). Reserved auth headers are protected by
                 // `apply_request_headers`.
                 let mut headers = axum::http::HeaderMap::new();
-                headers.insert(auth.0, auth.1);
+                headers.insert(auth.0.clone(), auth.1);
                 let rid_hv = header::HeaderValue::from_str(request_id).map_err(|e| {
                     ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
                         "request_id contains invalid header chars: {e}"
@@ -652,7 +652,8 @@ async fn dispatch(
                         &target.id,
                         client_ctx,
                     ),
-                );
+                )
+                .note_auth_source(auth.0.as_str());
 
                 let client =
                     crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());

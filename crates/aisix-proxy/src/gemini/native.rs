@@ -93,7 +93,7 @@ pub(crate) fn request_headers(
         HeaderValue::from_str(request_id)
             .map_err(|e| BridgeError::Config(format!("invalid request id: {e}")))?,
     );
-    aisix_gateway::apply_request_headers(&mut headers, ctx);
+    aisix_gateway::apply_request_headers(&mut headers, ctx).note_auth_source("x-goog-api-key");
 
     if let Some(inbound) = ctx.client_headers {
         for name in ["user-agent", "x-goog-api-client"] {

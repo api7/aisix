@@ -1386,7 +1386,8 @@ async fn responses_to_target(
             model_id,
             client_ctx,
         ),
-    );
+    )
+    .note_auth_source("authorization");
 
     let client = crate::http_client::client_for(pk_entry.value.upstream_connection().as_ref());
     let mut req = url
@@ -4300,7 +4301,7 @@ fn emit_usage_event(
         snap,
         crate::operation::RESPONSES,
         event.clone(),
-        crate::usage_attr::usage_event_labels(&usage_model, pk),
+        crate::usage_attr::usage_attribution(&usage_model, pk),
         content,
         client.trace.as_ref(),
         terminal,
@@ -4459,7 +4460,7 @@ fn emit_zero_token_event(
         snap,
         crate::operation::RESPONSES,
         event.clone(),
-        crate::usage_attr::usage_event_labels(&usage_model, &pk),
+        crate::usage_attr::usage_attribution(&usage_model, &pk),
         content.as_ref(),
         client.trace.as_ref(),
         terminal,

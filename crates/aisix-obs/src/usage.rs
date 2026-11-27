@@ -117,6 +117,11 @@ pub struct UsageEvent {
     #[serde(default)]
     pub api_key_id: String,
 
+    /// Resource ID of the Provider Key selected for this event's upstream
+    /// attempt. Omitted when the event has no attributable upstream call.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider_key_id: String,
+
     /// Display name of the ApiKey `api_key_id` names, snapshotted at request
     /// time so a later rename does not rewrite who made the call.
     /// Control-character-stripped and capped at 256 characters. Omitted when

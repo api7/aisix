@@ -1344,7 +1344,8 @@ async fn anthropic_passthrough_dispatch(
             aisix_gateway::apply_request_headers(
                 &mut headers,
                 &crate::dispatch::upstream_header_ctx(pk_value, pk_id, model, model_id, client_ctx),
-            );
+            )
+            .note_auth_source("x-api-key");
             forward_client_anthropic_beta(&mut headers, client_ctx);
 
             let client = crate::http_client::client_for(pk_value.upstream_connection().as_ref());
@@ -3836,7 +3837,7 @@ fn emit_anthropic_usage_event(
         snap,
         crate::operation::MESSAGES,
         event.clone(),
-        crate::usage_attr::usage_event_labels(&usage_model, pk),
+        crate::usage_attr::usage_attribution(&usage_model, pk),
         content.as_ref(),
         client.trace.as_ref(),
         terminal,
