@@ -66,9 +66,11 @@ pub use chat::{
 pub use credential::credential_fingerprint;
 pub use hub::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};
 pub use response_tap::{
-    capture_header_values, note_upstream_error_body, note_upstream_response, provider_request_id,
-    wants_upstream_error_body, warn_error_body_unread, ResponseHeaderTap, UpstreamResponseCapture,
-    PROVIDER_REQUEST_ID_HEADERS,
+    capture_header_values, note_upstream_error_body, note_upstream_response,
+    protect_upstream_output, provider_request_id, tap_upstream_body, tap_upstream_response,
+    upstream_body, upstream_body_stream, upstream_json, upstream_sse_stream,
+    wants_upstream_error_body, warn_error_body_unread, CapturedUpstreamBody, ResponseHeaderTap,
+    UpstreamBodyFormat, UpstreamBodyTap, UpstreamResponseCapture, PROVIDER_REQUEST_ID_HEADERS,
 };
 pub use sse::{SseDecoder, SseEvent, SseFrameTooLarge};
 pub use structured_output::{

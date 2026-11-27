@@ -150,10 +150,7 @@ pub(crate) async fn send_with_deadline(
             .await
             .map_err(|e| crate::dispatch::reqwest_error_to_bridge(&e, started)),
     };
-    if let Ok(resp) = &sent {
-        aisix_gateway::note_upstream_response(resp.headers());
-    }
-    sent
+    sent.map(aisix_gateway::tap_upstream_response)
 }
 
 #[cfg(test)]

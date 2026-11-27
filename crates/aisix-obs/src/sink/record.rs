@@ -6,12 +6,13 @@
 //! single-sourced; content lives in a separate field so the default
 //! metadata-only path can never carry a prompt.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::Serialize;
 
-use super::truncate::{omit_base64_media_in_json, truncate_content};
+use super::truncate::{omit_base64_media_in_json, truncate_content, truncate_sse};
 use crate::usage::UsageEvent;
 
 /// Current canonical event schema version, emitted on every [`SinkRecord`]
@@ -56,8 +57,17 @@ impl SinkContent {
     /// [`super::truncate::truncate_content`]). `truncated` is set when
     /// either field was cut.
     pub fn capture(prompt: &str, response: &str, max_bytes: usize) -> Self {
+        Self::capture_with_format(prompt, response, max_bytes, ResponseFormat::Text)
+    }
+
+    fn capture_with_format(
+        prompt: &str,
+        response: &str,
+        max_bytes: usize,
+        format: ResponseFormat,
+    ) -> Self {
         let (prompt, p_cut) = truncate_content(prompt, max_bytes);
-        let (response, r_cut) = truncate_content(response, max_bytes);
+        let (response, r_cut) = format.truncate(response, max_bytes);
         Self {
             prompt: prompt.into_owned(),
             response: response.into_owned(),
@@ -141,11 +151,16 @@ impl SinkContent {
                 enc.tool_call_result = enc.raw_response.take();
             }
         } else if let Some(wire) = crate::genai::PromptWire::for_operation(&event.operation) {
+            let include_output = event.status_code < 400 && event.error_class.is_empty();
             let structured = crate::genai::structured_content(
                 wire,
                 if prompt_whole { &self.prompt } else { "" },
-                if response_whole { &self.response } else { "" },
-                output,
+                if response_whole && include_output {
+                    &self.response
+                } else {
+                    ""
+                },
+                output.filter(|_| include_output),
                 &event.finish_reason,
             );
             let input_fits = structured.input_messages.as_deref().is_some_and(fits)
@@ -184,9 +199,25 @@ pub struct CapturedContent {
     /// Which side the capture cap cut; `truncated` is their OR.
     pub prompt_truncated: bool,
     pub response_truncated: bool,
+    pub(crate) response_format: ResponseFormat,
     /// The response as structured parts ([`crate::output`]), when the
     /// surface captures it that way.
     pub output: Option<crate::output::OutputCapture>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ResponseFormat {
+    Text,
+    Sse,
+}
+
+impl ResponseFormat {
+    fn truncate(self, response: &str, max_bytes: usize) -> (Cow<'_, str>, bool) {
+        match self {
+            Self::Text => truncate_content(response, max_bytes),
+            Self::Sse => truncate_sse(response, max_bytes),
+        }
+    }
 }
 
 impl CapturedContent {
@@ -198,12 +229,55 @@ impl CapturedContent {
 
     /// Set the response of a failure row, under the same cap and cut rule as
     /// [`Self::new`].
-    pub fn with_response(mut self, response: &str, max_bytes: usize) -> Self {
-        let (response, cut) = truncate_content(response, max_bytes);
+    pub fn with_response(self, response: &str, max_bytes: usize) -> Self {
+        self.with_response_format(response, max_bytes, ResponseFormat::Text)
+    }
+
+    /// Set a failure transcript made of complete SSE frames.
+    pub fn with_sse_response(self, response: &str, max_bytes: usize) -> Self {
+        self.with_response_format(response, max_bytes, ResponseFormat::Sse)
+    }
+
+    fn with_response_format(
+        mut self,
+        response: &str,
+        max_bytes: usize,
+        format: ResponseFormat,
+    ) -> Self {
+        let (response, cut) = format.truncate(response, max_bytes);
         self.response = response.into_owned();
         self.response_truncated = cut;
         self.truncated = self.prompt_truncated || cut;
+        self.response_format = format;
         self
+    }
+
+    pub(crate) fn for_exporter(&self, max_bytes: usize) -> SinkContent {
+        let mut content = SinkContent::capture_with_format(
+            &self.prompt,
+            &self.response,
+            max_bytes,
+            self.response_format,
+        );
+        content.truncated |= self.truncated;
+        content.prompt_truncated |= self.prompt_truncated;
+        content.response_truncated |= self.response_truncated;
+        content.output = self.output.clone();
+        content
+    }
+
+    /// Append a text frame to a bounded response transcript.
+    pub fn append_response_frame(&mut self, frame: &str, max_bytes: usize) {
+        if self.response_truncated {
+            return;
+        }
+        if !self.response.is_empty() && self.response.len() < max_bytes {
+            self.response.push('\n');
+        }
+        let end = frame.floor_char_boundary(max_bytes.saturating_sub(self.response.len()));
+        self.response.push_str(&frame[..end]);
+        self.response_truncated = end < frame.len();
+        self.truncated |= self.response_truncated;
     }
 
     /// Capture `prompt` and `response`, truncating each to `max_bytes`
@@ -226,6 +300,7 @@ impl CapturedContent {
             truncated: p_cut || r_cut,
             prompt_truncated: p_cut,
             response_truncated: r_cut,
+            response_format: ResponseFormat::Text,
             output: None,
         }
     }

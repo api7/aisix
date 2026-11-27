@@ -128,6 +128,20 @@ const NO_QUOTA = eventOf("insufficient_quota", "insufficient_quota", "Out of quo
 const OTHER = eventOf("server_error", "sentinel_unknown", "Something broke, sentinel.");
 const RECOVERABLE = eventOf("invalid_request_error", "invalid_json", "Invalid event, sentinel.");
 const CREATED = { type: "session.created", session: { id: "sess_1", model: "m" } };
+const AUDIO = { type: "response.output_audio.delta", delta: "cHJpdmF0ZS1hdWRpby1ieXRlcw==" };
+const AUDIO_PART = {
+  type: "response.content_part.done",
+  item_id: "audio_1",
+  part: { type: "audio", audio: "cGFydC1hdWRpby1ieXRlcw==", transcript: "audio part transcript" },
+};
+const AUDIO_ITEM = {
+  type: "response.output_item.done",
+  item: {
+    type: "message",
+    role: "assistant",
+    content: [{ type: "output_audio", audio: "aXRlbS1hdWRpby1ieXRlcw==", transcript: "audio item transcript" }],
+  },
+};
 const SESSIONS: Record<string, Step[]> = {
   "wrong-key": [{ frame: WRONG_KEY }, { wait: 200 }, { close: [3000, "invalid_request_error.invalid_api_key"] }],
   "bad-model": [{ frame: BAD_MODEL }, { wait: 200 }, { close: [4000, "invalid_request_error.invalid_model"] }],
@@ -142,6 +156,10 @@ const SESSIONS: Record<string, Step[]> = {
   "no-frames-close": [{ close: [4000, "no frames"] }],
   "recoverable-then-client-close": [{ frame: CREATED }, { frame: RECOVERABLE }],
   "usable-then-error-close": [{ frame: CREATED }, { frame: RECOVERABLE }, { close: [4000, "sentinel_late"] }],
+  "usable-then-drop": [
+    { frame: CREATED }, { frame: AUDIO }, { frame: AUDIO_PART }, { frame: AUDIO_ITEM },
+    { frame: RECOVERABLE }, { wait: 75 }, "drop",
+  ],
   "error-before-created": [{ frame: RECOVERABLE }, { frame: CREATED }, { close: [1000, ""] }],
   "clean-session": [{ frame: CREATED }, { close: [1000, ""] }],
   "drop-no-frames": ["drop"],
@@ -509,6 +527,7 @@ describe("a realtime session the upstream never let start", () => {
       expect(failure.get("status_code")).toBe("504");
       expect(failure.get("error_class")).toBe("timeout");
       expect(failure.get("error_message")).toMatch(/^upstream request timed out after \d+ms: /);
+      expect(JSON.parse(failure.get("response")!)).toEqual(got.frames[0]);
       expect(await metric("aisix_requests_total", { model: "silent", status: "504" })).toBeGreaterThan(0);
     });
 
@@ -619,7 +638,34 @@ describe("a realtime session the upstream never let start", () => {
     });
   });
 
-  describe("what stays as it was", () => {
+  describe("errors after the session opens", () => {
+    test("a transport failure exports the frames already received, with media omitted", async () => {
+      if (!etcdReachable) return;
+      const got = await session("usable-then-drop");
+      expect(got.frames).toContainEqual(AUDIO);
+      expect(got.frames).toContainEqual(AUDIO_PART);
+      expect(got.frames).toContainEqual(AUDIO_ITEM);
+      expect(got.frames).toContainEqual(RECOVERABLE);
+      const failure = await row(got.requestId);
+      expect(failure.get("status_code")).toBe("502");
+      expect(failure.get("error_class")).toBe("transport");
+      const response = failure.get("response")!;
+      expect(response).not.toContain(AUDIO.delta);
+      const frames = response.split("\n").map((frame) => JSON.parse(frame));
+      expect(frames).toEqual([
+        CREATED,
+        { ...AUDIO, delta: expect.stringContaining("omitted") },
+        { ...AUDIO_PART, part: { ...AUDIO_PART.part, audio: expect.stringContaining("omitted") } },
+        {
+          ...AUDIO_ITEM, item: { ...AUDIO_ITEM.item, content: [{
+            ...AUDIO_ITEM.item.content[0], audio: expect.stringContaining("omitted"),
+          }] },
+        },
+        RECOVERABLE,
+      ]);
+      expect((await row(got.requestId, META)).get("response")).toBeUndefined();
+    });
+
     test("an error event in a usable session is no failure", async () => {
       if (!etcdReachable) return;
       const got = await session("recoverable-then-client-close", (ws) => {
@@ -629,6 +675,7 @@ describe("a realtime session the upstream never let start", () => {
       const ended = await row(got.requestId);
       expect(ended.get("status_code")).toBe("200");
       expect(ended.get("error_class")).toBeFalsy();
+      expect(ended.get("response")).toBeUndefined();
     });
 
     test("a usable session that ends on an error close keeps its 200 and the gateway frame", async () => {

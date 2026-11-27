@@ -78,7 +78,8 @@ use aisix_provider_openai::overrides::{
     apply_param_renames,
 };
 use aws_sdk_bedrockruntime::config::interceptors::{
-    BeforeDeserializationInterceptorContextRef, BeforeTransmitInterceptorContextMut,
+    AfterDeserializationInterceptorContextRef, BeforeDeserializationInterceptorContextRef,
+    BeforeTransmitInterceptorContextMut, BeforeTransmitInterceptorContextRef,
 };
 use aws_sdk_bedrockruntime::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_smithy_runtime_api::box_error::BoxError;
@@ -1008,14 +1009,24 @@ fn write_sorted(value: &RawValue, out: &mut Vec<u8>, slot: Slot<'_>) -> serde_js
     Ok(())
 }
 
-/// Hands each response head to [`aisix_gateway::note_upstream_response`],
-/// which the SDK's typed outputs would otherwise hide.
+/// Hands the response head and any buffered payload to telemetry before the
+/// bridge sees the SDK's typed output.
 #[derive(Debug)]
 struct ResponseHeadersInterceptor;
 
 impl Intercept for ResponseHeadersInterceptor {
     fn name(&self) -> &'static str {
         "AisixBedrockResponseHeaders"
+    }
+
+    fn read_before_transmit(
+        &self,
+        _context: &BeforeTransmitInterceptorContextRef<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        aisix_gateway::response_tap::clear_upstream_body();
+        Ok(())
     }
 
     fn read_before_deserialization(
@@ -1034,6 +1045,24 @@ impl Intercept for ResponseHeadersInterceptor {
             }
         }
         aisix_gateway::note_upstream_response(&headers);
+        Ok(())
+    }
+
+    fn read_after_deserialization(
+        &self,
+        context: &AfterDeserializationInterceptorContextRef<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let response = context.response();
+        if let Some(bytes) = response.body().bytes().filter(|bytes| !bytes.is_empty()) {
+            if let Some(capture) = aisix_gateway::tap_upstream_body(
+                response.status().is_success(),
+                aisix_gateway::UpstreamBodyFormat::Text,
+            ) {
+                capture.push(bytes);
+            }
+        }
         Ok(())
     }
 }
@@ -1829,6 +1858,8 @@ impl BedrockBridge {
             .to_string();
 
         let upstream_id_owned = upstream_id.to_string();
+        let error_capture =
+            aisix_gateway::tap_upstream_body(true, aisix_gateway::UpstreamBodyFormat::Text);
         let stream = async_stream::try_stream! {
             let mut state = ConverseStreamState::default();
             loop {
@@ -1841,6 +1872,11 @@ impl BedrockBridge {
                     }
                     Ok(None) => break,
                     Err(e) => {
+                        if let (Some(capture), Some(payload)) =
+                            (&error_capture, crate::errors::stream_error_payload(&e))
+                        {
+                            capture.push(payload);
+                        }
                         Err(map_converse_stream_event_error(e))?;
                     }
                 }

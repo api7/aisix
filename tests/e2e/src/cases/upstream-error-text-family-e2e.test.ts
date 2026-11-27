@@ -621,7 +621,7 @@ describe("an upstream's failure reads the same on every route that sends its own
       const realtimeRow = await finalRow(got.requestId, "the realtime row");
       const chatRow = await finalRow(chat.requestId, "the chat row");
       expect(realtimeRow.get("error_message")).toBe(chatRow.get("error_message"));
-      expect(JSON.parse(realtimeRow.get("response")!).error.message).toBe(chatRow.get("error_message"));
+      expect(JSON.parse(realtimeRow.get("response")!)).toEqual(got.frames[0]);
     });
 
     test("a body that is no error is quoted within the usual bound", async () => {

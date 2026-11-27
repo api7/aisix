@@ -684,7 +684,7 @@ async fn dispatch(
                                 crate::dispatch::reqwest_error_to_bridge(&e, send_started),
                             )
                         })?;
-                        aisix_gateway::note_upstream_response(resp.headers());
+                        let resp = aisix_gateway::tap_upstream_response(resp);
                         let status = resp.status();
                         if !status.is_success() {
                             return Err(crate::cooldown::note_failure(
@@ -694,7 +694,7 @@ async fn dispatch(
                                 crate::dispatch::held_route_http_error(azure, resp).await,
                             ));
                         }
-                        let body_bytes = resp.bytes().await.map_err(|e| {
+                        let body_bytes = aisix_gateway::upstream_body(resp).await.map_err(|e| {
                             crate::cooldown::note_failure(
                                 tracker,
                                 model_id,

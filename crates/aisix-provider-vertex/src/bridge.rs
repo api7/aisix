@@ -921,15 +921,13 @@ impl Bridge for VertexBridge {
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
-            aisix_gateway::note_upstream_response(resp.headers());
+            let resp = aisix_gateway::tap_upstream_response(resp);
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
-            let parsed: VertexPredictEmbeddingsResponse = resp
-                .json()
-                .await
-                .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?;
+            let parsed: VertexPredictEmbeddingsResponse =
+                aisix_gateway::upstream_json(resp).await?;
 
             let mut data = Vec::with_capacity(parsed.predictions.len());
             let mut prompt_tokens: u64 = 0;
@@ -1077,16 +1075,13 @@ impl VertexBridge {
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
-            aisix_gateway::note_upstream_response(resp.headers());
+            let resp = aisix_gateway::tap_upstream_response(resp);
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
             let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
-            let parsed: GeminiGenerateContentResponse = resp
-                .json()
-                .await
-                .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?;
+            let parsed: GeminiGenerateContentResponse = aisix_gateway::upstream_json(resp).await?;
             Ok(gemini_response_into_chat_response(parsed, upstream_id)
                 .with_fallback_service_tier(header_tier))
         })
@@ -1209,7 +1204,7 @@ impl VertexBridge {
                 .await
                 .map_err(aisix_gateway::send_error)?;
 
-            aisix_gateway::note_upstream_response(resp.headers());
+            let resp = aisix_gateway::tap_upstream_response(resp);
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -1330,7 +1325,7 @@ impl VertexBridge {
         })
         .await?;
 
-        aisix_gateway::note_upstream_response(resp.headers());
+        let resp = aisix_gateway::tap_upstream_response(resp);
         let status = resp.status();
         if !status.is_success() {
             return Err(
@@ -1347,7 +1342,7 @@ impl VertexBridge {
         // AnthropicStreamEvent, update rolling state (id/model carried
         // from `message_start`), emit any chunk, and stop on the
         // terminal `message_stop`. Anthropic emits no `[DONE]` sentinel.
-        let byte_stream = resp.bytes_stream();
+        let byte_stream = aisix_gateway::upstream_sse_stream(resp);
         let stream = async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
             let mut state = StreamState::default();
@@ -1473,7 +1468,7 @@ impl VertexBridge {
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
-            aisix_gateway::note_upstream_response(resp.headers());
+            let resp = aisix_gateway::tap_upstream_response(resp);
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -1544,7 +1539,7 @@ impl VertexBridge {
         })
         .await?;
 
-        aisix_gateway::note_upstream_response(resp.headers());
+        let resp = aisix_gateway::tap_upstream_response(resp);
         let status = resp.status();
         if !status.is_success() {
             return Err(
@@ -1556,7 +1551,7 @@ impl VertexBridge {
         }
 
         let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
-        let byte_stream = resp.bytes_stream();
+        let byte_stream = aisix_gateway::upstream_sse_stream(resp);
         let stream = async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
             let mut tool_call_indexer = ToolCallIndexer::default();
@@ -1704,7 +1699,7 @@ impl VertexBridge {
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
-            aisix_gateway::note_upstream_response(resp.headers());
+            let resp = aisix_gateway::tap_upstream_response(resp);
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
@@ -1791,7 +1786,7 @@ impl VertexBridge {
         })
         .await?;
 
-        aisix_gateway::note_upstream_response(resp.headers());
+        let resp = aisix_gateway::tap_upstream_response(resp);
         let status = resp.status();
         if !status.is_success() {
             return Err(
@@ -1803,7 +1798,7 @@ impl VertexBridge {
         }
 
         let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
-        let byte_stream = resp.bytes_stream();
+        let byte_stream = aisix_gateway::upstream_sse_stream(resp);
         let stream = async_stream::try_stream! {
             let mut decoder = SseDecoder::new();
             let mut tool_call_indexer = ToolCallIndexer::default();
@@ -1930,7 +1925,7 @@ impl VertexBridge {
         })
         .await?;
 
-        aisix_gateway::note_upstream_response(resp.headers());
+        let resp = aisix_gateway::tap_upstream_response(resp);
         let status = resp.status();
         if !status.is_success() {
             return Err(
@@ -1943,7 +1938,7 @@ impl VertexBridge {
 
         let upstream_id_owned = upstream_id.to_string();
         let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
-        let byte_stream = resp.bytes_stream();
+        let byte_stream = aisix_gateway::upstream_sse_stream(resp);
 
         // try_stream! adapts the byte stream into a Stream of
         // Result<ChatChunk, BridgeError>. Pattern mirrors the

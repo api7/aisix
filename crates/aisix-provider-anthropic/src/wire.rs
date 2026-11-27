@@ -2274,8 +2274,7 @@ pub fn body_in_band_error(body: &serde_json::Value) -> Option<BridgeError> {
 pub async fn decode_success_body<T: serde::de::DeserializeOwned>(
     resp: reqwest::Response,
 ) -> Result<T, BridgeError> {
-    let body = resp
-        .bytes()
+    let body = aisix_gateway::upstream_body(resp)
         .await
         .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?;
     if let Some(err) = aisix_gateway::in_band_error_body(&body)

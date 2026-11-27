@@ -113,7 +113,7 @@ impl VertexBridge {
                 .map_err(aisix_gateway::send_error)
         })
         .await?;
-        aisix_gateway::note_upstream_response(resp.headers());
+        let resp = aisix_gateway::tap_upstream_response(resp);
         let status = resp.status();
         if !status.is_success() {
             return Err(
@@ -124,15 +124,11 @@ impl VertexBridge {
             );
         }
         if !stream || aisix_gateway::response_is_json(&resp) {
-            let json = with_deadline(ctx.deadline, started, async {
-                resp.json::<Value>()
-                    .await
-                    .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
-            })
-            .await?;
+            let json =
+                with_deadline(ctx.deadline, started, aisix_gateway::upstream_json(resp)).await?;
             return Ok(NativeMessages::Json(json));
         }
-        let frames = resp.bytes_stream().map(|item| {
+        let frames = aisix_gateway::upstream_sse_stream(resp).map(|item| {
             item.map_err(|e| BridgeError::Transport(aisix_gateway::transport_error_message(&e)))
         });
         Ok(NativeMessages::Stream(Box::pin(frames)))
@@ -166,15 +162,12 @@ impl VertexBridge {
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
-            aisix_gateway::note_upstream_response(resp.headers());
+            let resp = aisix_gateway::tap_upstream_response(resp);
             let status = resp.status();
             if !status.is_success() {
                 return Err(map_http_error(status, resp).await);
             }
-            let json: Value = resp
-                .json()
-                .await
-                .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?;
+            let json: Value = aisix_gateway::upstream_json(resp).await?;
             let tokens = json
                 .get("input_tokens")
                 .and_then(Value::as_u64)

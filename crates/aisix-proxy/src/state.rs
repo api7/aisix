@@ -400,6 +400,21 @@ fn guardrail_embedder_slot(
 }
 
 impl ProxyState {
+    /// Resolve a chain this endpoint runs on responses before reading upstream output.
+    pub(crate) fn resolve_output_guardrails(
+        &self,
+        context: &aisix_guardrails::RequestContext<'_>,
+    ) -> aisix_guardrails::GuardrailChain {
+        use aisix_guardrails::Guardrail;
+        let chain = self.guardrail_index.resolve(context);
+        if aisix_gateway::wants_upstream_error_body()
+            && (chain.redacts_output() || chain.stream_output_policy().holds_back())
+        {
+            aisix_gateway::protect_upstream_output();
+        }
+        chain
+    }
+
     /// This state's embedding dispatcher, for callers that rebuild the
     /// guardrail index and must not drop the embedder while doing so.
     pub fn guardrail_embedder(&self) -> aisix_guardrails::GuardrailEmbedderSlot {

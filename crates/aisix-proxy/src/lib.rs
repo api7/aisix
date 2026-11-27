@@ -685,7 +685,7 @@ async fn record_request_telemetry(
     let attribution = std::sync::Arc::new(attribution::RequestAttribution::new(
         user_agent,
         client_ip::exported_header_names(&snapshot, true),
-        usage_attr::content_cap(&snapshot).is_some(),
+        usage_attr::content_cap(&snapshot),
         request
             .extensions()
             .get::<request_id::RequestId>()

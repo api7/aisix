@@ -247,6 +247,7 @@ impl ModelCaller for ProxyModelCaller<'_> {
         // `config.timeout()` — applied by the caller — remains the ceiling on
         // the whole attempt sequence.
         let response = crate::routing::retrying_dispatch(self.state, model, "ensemble", || {
+            aisix_gateway::response_tap::clear_upstream_body();
             let attempt_req = req();
             let upstream_req = match crate::effort_mapping::chat_request(&attempt_req, model) {
                 std::borrow::Cow::Owned(mapped) => mapped,
@@ -513,8 +514,11 @@ pub(crate) async fn run_ensemble_panel(
         async move {
             let member_req = || panel_request(req, member);
             let started = Instant::now();
-            let result =
-                call_with_optional_timeout(caller, &model, &member_req, per_call_timeout).await;
+            let result = crate::attribution::capture_subcall_response(
+                slot,
+                false,
+                call_with_optional_timeout(caller, &model, &member_req, per_call_timeout),
+            ).await;
             let result = result.map_err(|err| {
                 tracing::warn!(panel_model = %model, error = %err.source, "ensemble panel member failed");
                 SubcallFailure::new(
@@ -598,11 +602,15 @@ pub async fn run_ensemble(
     // have stacked on top of the caller-level budget.
     let judge_index = config.panel.len() as u32;
     let judge_started = Instant::now();
-    let judge = match call_with_optional_timeout(
-        caller,
-        &config.judge.model,
-        &|| judge_request(req, &config.judge, &candidates),
-        config.timeout(),
+    let judge = match crate::attribution::capture_subcall_response(
+        judge_index,
+        false,
+        call_with_optional_timeout(
+            caller,
+            &config.judge.model,
+            &|| judge_request(req, &config.judge, &candidates),
+            config.timeout(),
+        ),
     )
     .await
     {
