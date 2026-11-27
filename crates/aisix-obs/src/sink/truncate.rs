@@ -80,6 +80,46 @@ pub(crate) fn truncate_content(s: &str, max_bytes: usize) -> (Cow<'_, str>, bool
     (Cow::Borrowed(cut), true)
 }
 
+/// Keep the latest complete SSE frames within the cap, skipping a frame
+/// that cannot fit on its own. Preserve the bytes and order of frames kept.
+pub(super) fn truncate_sse(s: &str, max_bytes: usize) -> (Cow<'_, str>, bool) {
+    use aisix_gateway::sse::find_frame_end;
+
+    if s.len() <= max_bytes {
+        return (Cow::Borrowed(s), false);
+    }
+    let mut rest = s;
+    let mut oldest = s;
+    let mut kept_bytes = 0;
+    while let Some(end) = find_frame_end(rest.as_bytes()) {
+        if end <= max_bytes {
+            while kept_bytes > max_bytes - end {
+                let evicted = find_frame_end(oldest.as_bytes()).expect("retained complete frame");
+                oldest = &oldest[evicted..];
+                if evicted <= max_bytes {
+                    kept_bytes -= evicted;
+                }
+            }
+            kept_bytes += end;
+        }
+        rest = &rest[end..];
+    }
+
+    let mut kept = &oldest[..oldest.len() - rest.len()];
+    if kept.len() == kept_bytes {
+        return (Cow::Borrowed(kept), true);
+    }
+    // The retained window can span oversize frames that were skipped.
+    let mut out = String::with_capacity(kept_bytes);
+    while let Some(end) = find_frame_end(kept.as_bytes()) {
+        if end <= max_bytes {
+            out.push_str(&kept[..end]);
+        }
+        kept = &kept[end..];
+    }
+    (Cow::Owned(out), true)
+}
+
 /// One pass over the tree: the largest string (bytes) and largest array
 /// (element count) anywhere — used to skip ladder rungs that cannot
 /// change anything.

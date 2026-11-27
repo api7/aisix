@@ -1439,9 +1439,11 @@ describe("failure rows carry request and response bodies", () => {
     expect(row.get("response")).toContain(LONG_DELTA + RESPONSES_FAILED);
     const capped = await waitForSlsLog(sls!, CAPPED, (l) => l.get("request_id") === requestId, "the capped SSE response");
     expect(capped.get("content_truncated")).toBe("true");
-    expect(Buffer.byteLength(capped.get("response")!)).toBeLessThanOrEqual(CAPPED_MAX_BYTES);
-    expect(capped.get("response")).toContain("内容");
-    expect(capped.get("response")).not.toContain("\uFFFD");
+    const cappedResponse = capped.get("response")!;
+    expect(Buffer.byteLength(cappedResponse)).toBeLessThanOrEqual(CAPPED_MAX_BYTES);
+    const fullResponse = row.get("response")!;
+    const mediaFrame = fullResponse.slice(0, fullResponse.indexOf(LONG_DELTA));
+    expect(cappedResponse).toBe(mediaFrame + RESPONSES_FAILED);
   });
 
   test.each([
@@ -1466,6 +1468,11 @@ describe("failure rows carry request and response bodies", () => {
     expect(row.get("content_truncated")).toBe(truncated ? "true" : undefined);
     if (model !== "row-responses-rollover") {
       expect(response).toBe(RESPONSES_DELTA + RESPONSES_FAILED);
+    } else {
+      const capped = await waitForSlsLog(sls!, CAPPED, (l) => l.get("request_id") === row.get("request_id"), "the capped SSE rollover");
+      const deltaCount = Math.floor((CAPPED_MAX_BYTES - Buffer.byteLength(RESPONSES_FAILED)) / Buffer.byteLength(RESPONSES_DELTA));
+      expect(capped.get("response")).toBe(RESPONSES_DELTA.repeat(deltaCount) + RESPONSES_FAILED);
+      expect(capped.get("content_truncated")).toBe("true");
     }
   });
 

@@ -630,8 +630,14 @@ fn failure_row_content(
         row.prompt_truncated = request.prompt_truncated;
         row.truncated |= request.prompt_truncated;
     }
-    if let Some(text) = upstream_body.and_then(exportable_upstream_text) {
-        row = row.with_response(&text, cap);
+    if let Some((text, format)) = upstream_body
+        .and_then(|body| exportable_upstream_text(body).map(|text| (text, body.format)))
+    {
+        row = if format == aisix_gateway::UpstreamBodyFormat::Sse {
+            row.with_sse_response(&text, cap)
+        } else {
+            row.with_response(&text, cap)
+        };
     } else if row.response.is_empty() {
         // A failed stream may have delivered parts without a finish reason.
         let delivered = row
