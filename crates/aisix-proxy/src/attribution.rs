@@ -133,6 +133,7 @@ pub(crate) struct SettledWinner {
     pub kind: &'static str,
     pub target_model: String,
     pub model_id: String,
+    pub provider_key_id: String,
     /// The attempt's own measured duration, as recorded. Taken from the
     /// record rather than measured here, so it does not absorb the
     /// post-dispatch work (the output scan, the cache write) the cancel
@@ -179,6 +180,8 @@ pub(crate) struct CancelContext {
     pub auth: Option<crate::auth::AuthenticatedKey>,
     /// See [`RouteIdentity`].
     pub route: RouteIdentity,
+    /// Provider Key used by a direct HTTP relay without a routing record.
+    pub direct_provider_key_id: String,
     /// `UsageEvent::request_headers`, from [`note_client`] or, on `/mcp`
     /// and `/a2a`, from [`note_request_headers`].
     pub request_headers: std::collections::BTreeMap<String, String>,
@@ -654,6 +657,7 @@ pub(crate) struct InternalCall {
     pub(crate) model_name: String,
     /// The Provider Key the call went out on.
     pub(crate) provider_key_id: String,
+    pub(crate) dispatched: bool,
     pub(crate) completed_at: String,
     pub(crate) status_code: u16,
     pub(crate) error_class: String,
@@ -707,6 +711,7 @@ impl InternalCallLedger {
 #[must_use = "an in-flight internal call must stay guarded until it settles"]
 pub(crate) struct InternalCallGuard {
     ledger: Option<Arc<InternalCallLedger>>,
+    response_tap: Option<Arc<aisix_gateway::ResponseHeaderTap>>,
     /// The child as far as it is known before the call returns.
     pending: Option<InternalCall>,
     started: Instant,
@@ -719,8 +724,11 @@ impl InternalCallGuard {
     /// The upstream has answered: the call's latency and span end here,
     /// even if counting its tokens still takes a while. The guard stays
     /// armed until [`Self::settle`].
-    pub(crate) fn mark_returned(&mut self) {
+    pub(crate) fn mark_returned(&mut self, dispatched: bool) {
         self.returned = Some(Instant::now());
+        if let Some(call) = &mut self.pending {
+            call.dispatched = dispatched;
+        }
     }
 
     /// The child as built before the call, timed, for the settled outcome
@@ -752,6 +760,10 @@ impl Drop for InternalCallGuard {
         call.settled_at = Some(Instant::now());
         call.latency_ms = crate::attempt::measured_ms(self.started.elapsed());
         call.abandoned = true;
+        call.dispatched |= self
+            .response_tap
+            .as_ref()
+            .is_some_and(|tap| tap.has_response());
         ledger.record(call);
     }
 }
@@ -1169,6 +1181,7 @@ pub(crate) fn begin_internal_call(call: InternalCall) -> InternalCallGuard {
         ledger: CURRENT
             .try_with(|attribution| Arc::clone(&attribution.internal_calls))
             .ok(),
+        response_tap: CURRENT.try_with(|a| Arc::clone(&a.response_tap)).ok(),
         pending: Some(call),
         started: Instant::now(),
         returned: None,
@@ -1437,6 +1450,7 @@ pub(crate) fn note_attempt_settled(rec: &AttemptRecord) {
                 kind: rec.kind,
                 target_model: rec.target_model.clone(),
                 model_id: rec.target_model_id.clone(),
+                provider_key_id: rec.provider_key_id.clone(),
                 latency_ms: rec.latency_ms,
             });
         } else {
@@ -1694,6 +1708,24 @@ pub(crate) fn note_upstream_wait_begin() {
         a.response_tap.take();
         a.lock().upstream_clock.begin(Instant::now());
     });
+}
+
+/// The response tap is cleared at each attempt start, so an in-flight
+/// attempt can only observe its own upstream response.
+pub(crate) fn observed_upstream_response() -> bool {
+    CURRENT
+        .try_with(|a| a.response_tap.has_response())
+        .unwrap_or(false)
+}
+
+pub(crate) fn note_direct_provider_key(id: &str) {
+    with_cancel(|c| c.direct_provider_key_id = id.to_owned());
+}
+
+pub(crate) fn direct_provider_key_id() -> String {
+    CURRENT
+        .try_with(|a| a.lock().cancel.direct_provider_key_id.clone())
+        .unwrap_or_default()
 }
 
 /// Close the upstream wait [`note_upstream_wait_begin`] opened: the

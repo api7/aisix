@@ -409,7 +409,7 @@ pub async fn entry(
                 &snapshot,
                 crate::operation::PASSTHROUGH,
                 event.clone(),
-                crate::usage_attr::usage_event_labels(
+                crate::usage_attr::usage_attribution(
                     &usage_model,
                     &crate::usage_attr::ResolvedPk::unresolved(),
                 ),
@@ -998,17 +998,25 @@ async fn dispatch(
     // — that belongs to `downstream_latency_ms`, which runs from `started`.
     let attempt_started = Instant::now();
     crate::attribution::note_upstream_wait_begin();
+    let pk_id = pk_entry
+        .as_ref()
+        .map(|pk| pk.id.as_str())
+        .unwrap_or_default();
     let send_fut = builder.send();
     let sent = match exchange_timeout {
         Some(d) => match tokio::time::timeout(d, send_fut).await {
             Ok(r) => r,
             Err(_) => {
+                crate::attribution::note_direct_provider_key(pk_id);
                 crate::attribution::note_upstream_wait_end(false);
                 return Err(RouteError::of(ProxyError::Bridge(bridge_timeout(d)), &auth));
             }
         },
         None => send_fut.await,
     };
+    if sent.as_ref().err().is_none_or(|err| !err.is_builder()) {
+        crate::attribution::note_direct_provider_key(pk_id);
+    }
     if sent.is_err() {
         crate::attribution::note_upstream_wait_end(false);
     }
@@ -1046,10 +1054,7 @@ async fn dispatch(
             .map(|pk| pk.value.provider.to_ascii_lowercase())
             .filter(|p| !p.is_empty())
             .unwrap_or_else(|| BYO_PROVIDER_LABEL.to_string()),
-        pk_id: pk_entry
-            .as_ref()
-            .map(|pk| pk.id.to_string())
-            .unwrap_or_default(),
+        pk_id: pk_id.to_owned(),
         method: method.clone(),
         path: path.clone(),
         request_id: client.request_id.clone(),
@@ -7406,7 +7411,7 @@ impl RouteTelemetry {
             &snapshot,
             crate::operation::PASSTHROUGH,
             event,
-            crate::usage_attr::usage_event_labels(&usage_model, &pk),
+            crate::usage_attr::usage_attribution(&usage_model, &pk),
             content.as_ref(),
             self.trace.as_ref(),
             // The Drop emit is the request's end — body EOF or client drop.

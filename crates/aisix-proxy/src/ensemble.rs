@@ -74,6 +74,7 @@ Candidate answers:
 /// calls `Bridge::chat`; tests supply a scripted mock.
 #[derive(Debug)]
 pub struct ModelCallOutcome {
+    pub provider_key_id: String,
     pub response: ChatResponse,
     pub effective_usage: UsageStats,
     pub usage_estimated: bool,
@@ -86,6 +87,7 @@ pub struct ModelCallOutcome {
 pub struct CallError {
     pub source: BridgeError,
     pub rate_limited: bool,
+    pub provider_key_id: String,
 }
 
 impl From<BridgeError> for CallError {
@@ -93,6 +95,7 @@ impl From<BridgeError> for CallError {
         Self {
             source,
             rate_limited: false,
+            provider_key_id: String::new(),
         }
     }
 }
@@ -232,6 +235,7 @@ impl ModelCaller for ProxyModelCaller<'_> {
                     "rate limit exceeded for an ensemble sub-call",
                 ),
                 rate_limited: true,
+                provider_key_id: String::new(),
             }
         })?;
 
@@ -254,7 +258,14 @@ impl ModelCaller for ProxyModelCaller<'_> {
             };
             bridge.chat_cow(std::borrow::Cow::Owned(upstream_req), &ctx)
         })
-        .await?;
+        .await
+        .map_err(|source| {
+            let mut error = CallError::from(source);
+            if error.source.reached_upstream() {
+                error.provider_key_id.clone_from(&pk_entry.id);
+            }
+            error
+        })?;
         let effective = crate::chat::effective_subcall_usage(
             req,
             model.upstream_model().unwrap_or(target),
@@ -268,6 +279,7 @@ impl ModelCaller for ProxyModelCaller<'_> {
             ))
             .await;
         Ok(ModelCallOutcome {
+            provider_key_id: pk_entry.id.clone(),
             response,
             effective_usage: effective.usage,
             usage_estimated: effective.estimated,
@@ -282,6 +294,7 @@ pub struct PanelOutcome {
     /// The member's slot in the configured panel — its row's `attempt_index`.
     pub slot: u32,
     pub model: String,
+    pub provider_key_id: String,
     /// Provider-reported usage retained for the client-facing aggregate.
     pub usage: UsageStats,
     /// Final accounting shared by member quota, parent quota, telemetry, and
@@ -297,6 +310,7 @@ impl PanelOutcome {
         Self {
             slot,
             model: model.to_string(),
+            provider_key_id: outcome.provider_key_id.clone(),
             usage: outcome.response.usage.clone(),
             effective_usage: outcome.effective_usage.clone(),
             usage_estimated: outcome.usage_estimated,
@@ -314,6 +328,7 @@ pub struct SubcallFailure {
     /// `"panel"` or `"judge"`.
     pub kind: &'static str,
     pub model: String,
+    pub provider_key_id: String,
     pub status: u16,
     pub error_class: &'static str,
     pub error_message: String,
@@ -338,6 +353,7 @@ impl SubcallFailure {
             index,
             kind,
             model: model.to_string(),
+            provider_key_id: String::new(),
             status: err.http_status(),
             error_class: if rate_limited {
                 "rate_limit_exceeded"
@@ -366,6 +382,7 @@ pub struct EnsembleOutcome {
     /// The panel members that failed, in slot order.
     pub failed: Vec<SubcallFailure>,
     pub judge_model: String,
+    pub judge_provider_key_id: String,
     pub judge_effective_usage: UsageStats,
     pub judge_usage_estimated: bool,
 }
@@ -517,14 +534,16 @@ pub(crate) async fn run_ensemble_panel(
                 call_with_optional_timeout(caller, &model, &member_req, per_call_timeout).await;
             let result = result.map_err(|err| {
                 tracing::warn!(panel_model = %model, error = %err.source, "ensemble panel member failed");
-                SubcallFailure::new(
+                let mut failure = SubcallFailure::new(
                     slot,
                     "panel",
                     &model,
                     &err.source,
                     err.rate_limited,
                     started,
-                )
+                );
+                failure.provider_key_id = err.provider_key_id;
+                failure
             });
             progress.record_panel(match &result {
                 Ok(outcome) => Ok(PanelOutcome::of(slot, &model, outcome)),
@@ -546,6 +565,7 @@ pub(crate) async fn run_ensemble_panel(
                 panel.push(PanelOutcome {
                     slot,
                     model,
+                    provider_key_id: outcome.provider_key_id,
                     usage: resp.usage.clone(),
                     effective_usage: outcome.effective_usage,
                     usage_estimated: outcome.usage_estimated,
@@ -610,7 +630,7 @@ pub async fn run_ensemble(
         // Carry the (already-billed) panel survivors out on the judge
         // failure so the dispatch layer commits + emits them too.
         Err(err) => {
-            let judge = SubcallFailure::new(
+            let mut judge = SubcallFailure::new(
                 judge_index,
                 "judge",
                 &config.judge.model,
@@ -618,6 +638,7 @@ pub async fn run_ensemble(
                 err.rate_limited,
                 judge_started,
             );
+            judge.provider_key_id = err.provider_key_id;
             return Err(EnsembleError::Judge {
                 source: err.source,
                 panel,
@@ -633,6 +654,7 @@ pub async fn run_ensemble(
         panel,
         failed,
         judge_model: config.judge.model.clone(),
+        judge_provider_key_id: judge.provider_key_id,
         judge_effective_usage: judge.effective_usage,
         judge_usage_estimated: judge.usage_estimated,
     })
@@ -819,6 +841,7 @@ mod tests {
                 .pop_front()
                 .unwrap_or_else(|| panic!("scripted responses exhausted for target {target:?}"))?;
             Ok(ModelCallOutcome {
+                provider_key_id: String::new(),
                 effective_usage: response.usage.clone(),
                 response,
                 usage_estimated: false,

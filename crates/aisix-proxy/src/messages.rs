@@ -3834,7 +3834,7 @@ fn emit_anthropic_usage_event(
         snap,
         crate::operation::MESSAGES,
         event.clone(),
-        crate::usage_attr::usage_event_labels(&usage_model, pk),
+        crate::usage_attr::usage_attribution(&usage_model, pk),
         content.as_ref(),
         client.trace.as_ref(),
         terminal,

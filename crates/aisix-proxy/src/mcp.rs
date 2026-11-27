@@ -1866,7 +1866,7 @@ fn emit_tool_call_usage(
         snap,
         crate::operation::MCP,
         event,
-        aisix_obs::UsageEventLabels::default(),
+        Default::default(),
         content,
         trace,
         /* terminal */ true,

@@ -1169,6 +1169,10 @@ async fn classify_inner(
         .body(body)
         .send()
         .await;
+    let dispatched = sent.as_ref().err().is_none_or(|err| !err.is_builder());
+    if let Ok(resp) = &sent {
+        aisix_gateway::note_upstream_response(resp.headers());
+    }
     // A refusal's body is never read: the router falls back on the status.
     let read = match sent {
         Ok(resp) if resp.status().is_success() => {
@@ -1179,6 +1183,7 @@ async fn classify_inner(
         Err(e) => Err(e),
     };
     let mut call = child.settle();
+    call.dispatched = dispatched;
     let (status, bytes) = match read {
         Ok(read) => read,
         Err(e) => {
@@ -1609,7 +1614,10 @@ async fn embed_texts_inner(
         &pk_entry.id,
     ));
     let response = bridge.embed(&req, &ctx).await;
-    child.mark_returned();
+    child.mark_returned(match &response {
+        Ok(_) => true,
+        Err(err) => err.reached_upstream(),
+    });
     // Counted the way `/v1/embeddings` counts the same answer: the
     // upstream's prompt count, else its total, else a local estimate.
     let counted = match &response {

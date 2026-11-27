@@ -891,7 +891,7 @@ fn emit_usage_event(
         snap,
         endpoint.surface,
         event,
-        crate::usage_attr::usage_event_labels(&usage_model, pk),
+        crate::usage_attr::usage_attribution(&usage_model, pk),
         success.captured_content.as_ref(),
         client.trace.as_ref(),
         /* terminal */ true,

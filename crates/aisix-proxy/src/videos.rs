@@ -2387,7 +2387,7 @@ fn emit_submit_usage_event(
         snap,
         crate::operation::VIDEO_GENERATION,
         event,
-        crate::usage_attr::usage_event_labels(&usage_model, &pk),
+        crate::usage_attr::usage_attribution(&usage_model, &pk),
         None,
         client.trace.as_ref(),
         /* terminal */ true,

@@ -918,7 +918,7 @@ fn emit_usage_event(
         snap,
         crate::operation::RERANK,
         event,
-        crate::usage_attr::usage_event_labels(&usage_model, pk),
+        crate::usage_attr::usage_attribution(&usage_model, pk),
         content,
         client.trace.as_ref(),
         /* terminal */ true,

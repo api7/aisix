@@ -1249,8 +1249,9 @@ async fn run_session(
             event.provider_request_id = provider_request_id;
             let model = crate::usage_attr::usage_event_model_label(&snap, &requested_model);
             let unresolved_pk = crate::usage_attr::ResolvedPk::unresolved();
-            let labels = crate::usage_attr::usage_event_labels(&model, &unresolved_pk);
+            let labels = crate::usage_attr::usage_attribution(&model, &unresolved_pk);
             if let Some(refused) = &refused {
+                event.provider_key_id.clone_from(&pk_id);
                 let names = crate::client_ip::exported_header_names(&snap, true);
                 if !names.is_empty() {
                     event.upstream_response_headers =
@@ -1636,7 +1637,7 @@ async fn run_session(
         &snap,
         crate::operation::REALTIME,
         event.clone(),
-        crate::usage_attr::usage_event_labels(&usage_model, &pk),
+        crate::usage_attr::usage_attribution(&usage_model, &pk),
         content.as_ref(),
         client.trace.as_ref(),
         /* terminal */ true,

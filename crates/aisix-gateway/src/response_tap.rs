@@ -86,6 +86,7 @@ pub fn provider_request_id(headers: &http::HeaderMap) -> String {
 /// What one upstream response head left for the request's telemetry.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct UpstreamResponseCapture {
+    received: bool,
     /// The headers the request's exporters asked for.
     pub headers: BTreeMap<String, String>,
     /// See [`provider_request_id`].
@@ -125,11 +126,18 @@ impl ResponseHeaderTap {
 
     fn record(&self, headers: &http::HeaderMap) {
         let captured = UpstreamResponseCapture {
+            received: true,
             headers: capture_header_values(headers, &self.names),
             request_id: provider_request_id(headers),
             error_body: None,
         };
         *self.lock() = captured;
+    }
+
+    /// Whether an upstream answered since the last reset, even if it sent
+    /// no request ID and there were no headers configured for capture.
+    pub fn has_response(&self) -> bool {
+        self.lock().received
     }
 
     /// Move the latest capture out, leaving nothing behind.

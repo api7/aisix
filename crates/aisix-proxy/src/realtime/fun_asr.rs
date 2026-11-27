@@ -698,7 +698,7 @@ impl Task {
             &snap,
             crate::operation::TRANSCRIPTION,
             event,
-            usage::usage_event_labels(&model_label, &pk),
+            usage::usage_attribution(&model_label, &pk),
             self.capture.as_ref().map(|(content, _)| content),
             client.trace.as_ref(),
             true,

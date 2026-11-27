@@ -443,6 +443,9 @@ async fn send_upstream(
 
     crate::attribution::note_upstream_wait_begin();
     let sent = builder.send().await;
+    if sent.as_ref().err().is_none_or(|err| !err.is_builder()) {
+        crate::attribution::note_direct_provider_key(&target.pk_entry.id);
+    }
     if sent.is_err() {
         crate::attribution::note_upstream_wait_end(false);
     }
@@ -773,7 +776,7 @@ fn emit_job_usage_event(
         snap,
         surface,
         event,
-        crate::usage_attr::usage_event_labels(&usage_model, &pk),
+        crate::usage_attr::usage_attribution(&usage_model, &pk),
         None,
         client.trace.as_ref(),
         /* terminal */ true,
@@ -2241,6 +2244,8 @@ async fn attribute_batch_usage(
             // NO-GUARDRAIL-CHAIN: a retroactive billing row for work the
             // provider did inside a batch. There is no request here, so no
             // chain was ever resolved and nothing could have been bypassed.
+            // The download key can differ from the submission key. The
+            // routed batch ID records only the model.
             request_id,
             occurred_at: aisix_obs::UsageEvent::occurred_at_now(),
             model_id: model_id.to_string(),
@@ -2935,6 +2940,7 @@ mod tests {
             if ev.inbound_protocol == "batch" {
                 agg = Some(ev);
             } else {
+                assert_eq!(ev.provider_key_id, PK_A);
                 mgmt += 1;
             }
         }
@@ -2952,6 +2958,7 @@ mod tests {
             batch_attribution_request_id("batch_1", 0, false)
         );
         assert!(agg.is_final_attempt, "a batch row stands for itself");
+        assert!(agg.provider_key_id.is_empty());
         assert_eq!(agg.prompt_tokens, 17);
         assert_eq!(agg.completion_tokens, 8);
         assert_eq!(agg.cached_prompt_tokens, 2);

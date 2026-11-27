@@ -9454,6 +9454,7 @@ data: [DONE]\n\n";
         assert_eq!(event.attempt_model, "", "no attempt had begun");
         assert_eq!(event.attempt_kind, "");
         assert_eq!(event.operation, "chat");
+        assert!(event.provider_key_id.is_empty());
         assert!(
             rx.try_recv().is_err(),
             "a cancel with no attempts must emit exactly one event",
@@ -9555,6 +9556,7 @@ data: [DONE]\n\n";
         assert_eq!(failed.attempt_model, "primary");
         assert_eq!(failed.model_id, "m-primary");
         assert_eq!(failed.error_class, "upstream_status");
+        assert_eq!(failed.provider_key_id, "pk-m-primary");
 
         let terminal = next_event(&mut rx).await;
         assert_head_phase_cancel(&terminal);
@@ -9622,6 +9624,7 @@ data: [DONE]\n\n";
             "the terminal event follows the attempt rows already emitted",
         );
         assert_eq!(terminal.model_id, "m-primary");
+        assert!(terminal.provider_key_id.is_empty());
         assert!(
             rx.try_recv().is_err(),
             "one attempt plus the terminal event"
@@ -9699,6 +9702,7 @@ data: [DONE]\n\n";
         assert_eq!(event.attempt_model, "primary");
         assert_eq!(event.attempt_index, 0);
         assert_eq!(event.attempt_kind, "initial");
+        assert_eq!(event.provider_key_id, "pk-m-primary");
         assert!(
             rx.try_recv().is_err(),
             "the winner succeeded, so it is the only row"
@@ -13017,6 +13021,9 @@ data: [DONE]\n\n";
             .collect();
         assert_eq!(panel_events.len(), 2, "both panel members must emit");
         assert_eq!(judge_events.len(), 1, "the judge must emit");
+        assert!(panel_events.iter().all(|e| e.provider_key_id == PK_ID));
+        assert_eq!(judge_events[0].provider_key_id, PK_ID);
+        assert!(events.last().unwrap().provider_key_id.is_empty());
         assert!(
             events.iter().all(|e| e.guardrail_blocked),
             "every sub-call event on the block path must be guardrail_blocked"

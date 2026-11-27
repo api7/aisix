@@ -1174,7 +1174,7 @@ fn emit_usage_event(
         snap,
         crate::operation::COUNT_TOKENS,
         event,
-        crate::usage_attr::usage_event_labels(&usage_model, pk),
+        crate::usage_attr::usage_attribution(&usage_model, pk),
         // Content capture (#700) is not wired for a counted request; a failed
         // one reports its body through `failure_row_content`.
         None,
