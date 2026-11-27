@@ -1543,8 +1543,10 @@ describe("failure rows carry request and response bodies", () => {
     expect(row.get("error_class")).toBe(errorClass);
     expect(row.get("error_message")).toMatch(message);
     expect(row.get("content_truncated")).toBe(truncated);
-    expect(row.get("response")).toContain(AUDIO_DIAGNOSTIC);
-    expect(row.get("response")).not.toContain(AUDIO_PAYLOAD);
+    const safePrefix = `${AUDIO_DIAGNOSTIC}"`;
+    const capturedBytes = truncated ? FULL_MAX_BYTES : Buffer.byteLength(ESCAPED_AUDIO_BODY);
+    const omittedBytes = capturedBytes - Buffer.byteLength(safePrefix);
+    expect(row.get("response")).toBe(`${safePrefix}[aisix: base64 data uri omitted, ${omittedBytes} bytes]`);
   });
 
   test("a bridged SSE output block records the refusal frames actually sent", async () => {
