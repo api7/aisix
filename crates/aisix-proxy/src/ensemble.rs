@@ -111,6 +111,11 @@ pub trait ModelCaller: Send + Sync {
         target: &str,
         req: &RequestBuilder<'_>,
     ) -> Result<ModelCallOutcome, CallError>;
+
+    /// Recover dispatch attribution when the deadline drops `call`.
+    fn provider_key_id_after_timeout(&self, _target: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Builds one sub-call's request on demand; see [`ModelCaller::call`].
@@ -118,7 +123,7 @@ pub type RequestBuilder<'a> = dyn Fn() -> ChatFormat + Send + Sync + 'a;
 
 /// Production [`ModelCaller`] used by the chat dispatch layer. Resolves
 /// a panel/judge member's `display_name` to its Bridge + ProviderKey
-/// from the live snapshot and dispatches a single non-streaming
+/// from the request's pinned snapshot and dispatches a single non-streaming
 /// `Bridge::chat`. Borrows everything it needs for the duration of one
 /// ensemble run, so it holds no owned state of its own.
 pub(crate) struct ProxyModelCaller<'a> {
@@ -139,6 +144,20 @@ pub(crate) struct ProxyModelCaller<'a> {
 
 #[async_trait]
 impl ModelCaller for ProxyModelCaller<'_> {
+    fn provider_key_id_after_timeout(&self, target: &str) -> Option<String> {
+        // The sub-call's tap still holds its response evidence when the
+        // deadline drops `call` before it can return the resolved key.
+        if !aisix_gateway::response_tap::upstream_responded_without_caller_credential() {
+            return None;
+        }
+        let model = self.snapshot.models.get_by_name(target)?;
+        let key = self
+            .snapshot
+            .provider_keys
+            .get_by_id(model.value.provider_key_id.as_deref()?)?;
+        Some(key.id.clone())
+    }
+
     async fn call(
         &self,
         target: &str,
@@ -148,7 +167,7 @@ impl ModelCaller for ProxyModelCaller<'_> {
         // upstream clock and the response-header tap key on; say so rather
         // than report their time as the gateway's.
         crate::attribution::note_upstream_wait_unmeasured();
-        // Resolve the member's display_name against the live snapshot.
+        // Resolve the member's display_name against the request's snapshot.
         // A missing entry is a misconfigured ensemble (a panel/judge name
         // that no longer points at a real Model) → 400 InvalidUpstreamConfig.
         // The member's display_name is operator-internal config; keep it in
@@ -777,11 +796,16 @@ async fn call_with_optional_timeout(
     match timeout {
         Some(d) => match tokio::time::timeout(d, caller.call(target, req)).await {
             Ok(result) => result,
-            Err(_) => Err(BridgeError::Timeout {
-                elapsed_ms: d.as_millis() as u64,
-                cause: String::new(),
-            }
-            .into()),
+            Err(_) => Err(CallError {
+                source: BridgeError::Timeout {
+                    elapsed_ms: d.as_millis() as u64,
+                    cause: String::new(),
+                },
+                rate_limited: false,
+                provider_key_id: caller
+                    .provider_key_id_after_timeout(target)
+                    .unwrap_or_default(),
+            }),
         },
         None => caller.call(target, req).await,
     }

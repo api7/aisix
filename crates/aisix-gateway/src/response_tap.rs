@@ -371,6 +371,15 @@ pub fn upstream_used_caller_credential() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the current attempt received a response without a caller credential override.
+pub fn upstream_responded_without_caller_credential() -> bool {
+    TAP.try_with(|tap| {
+        let capture = tap.lock();
+        capture.received && !capture.caller_credential
+    })
+    .unwrap_or(false)
+}
+
 /// Reset response evidence before an internal retry that shares a usage row.
 pub fn clear_upstream_body() {
     let _ = TAP.try_with(|tap| {

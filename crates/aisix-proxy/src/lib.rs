@@ -12689,6 +12689,129 @@ data: [DONE]\n\n";
         events
     }
 
+    #[tokio::test]
+    async fn ensemble_buffered_timeouts_keep_each_responding_provider_key() {
+        use axum::response::IntoResponse;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+        let (judge_auth_tx, mut judge_auth_rx) = tokio::sync::mpsc::unbounded_channel();
+        let upstream = Router::new().route(
+            "/chat/completions",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+                    let judge_auth_tx = judge_auth_tx.clone();
+                    async move {
+                        match body["model"].as_str().unwrap() {
+                            "pending-panel" => std::future::pending().await,
+                            "stalled-panel" | "judge" => {
+                                if body["model"] == "judge" {
+                                    judge_auth_tx.send(headers["authorization"].clone()).unwrap();
+                                }
+                                let first_chunk = Ok::<_, std::convert::Infallible>(
+                                    bytes::Bytes::from_static(b"{"),
+                                );
+                                let partial_body = futures::stream::iter([first_chunk])
+                                    .chain(futures::stream::pending());
+                                (
+                                    [("content-type", "application/json")],
+                                    Body::from_stream(partial_body),
+                                ).into_response()
+                            }
+                            "answered-panel" => axum::Json(serde_json::json!({
+                                "id": "cmpl-panel",
+                                "model": "answered-panel",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {"role": "assistant", "content": "candidate answer"},
+                                    "finish_reason": "stop"
+                                }],
+                                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+                            })).into_response(),
+                            model => panic!("unexpected upstream model: {model}"),
+                        }
+                    }
+                },
+            ),
+        );
+        let upstream = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = AisixSnapshot::new();
+        for model in ["answered-panel", "stalled-panel", "pending-panel", "judge"] {
+            let key_id = format!("pk-{model}");
+            let mut key = pk_entry_with_id(&key_id, &upstream_url);
+            key.value.telemetry_tags.pk_label = Some(model.into());
+            if model == "judge" {
+                key.value.request = Some(
+                    serde_json::from_value(serde_json::json!({
+                        "forward_client_headers": ["authorization"]
+                    }))
+                    .unwrap(),
+                );
+            }
+            snap.provider_keys.insert(key);
+            let mut entry = direct_model_entry(model, model, model);
+            entry.value.provider_key_id = Some(key_id);
+            snap.models.insert(entry);
+        }
+        let mut council = ensemble_model_entry_min(
+            "m-council",
+            "council",
+            &["answered-panel", "stalled-panel", "pending-panel"],
+            "judge",
+            1,
+        );
+        council.value.ensemble.as_mut().unwrap().timeout_ms = Some(500);
+        snap.models.insert(council);
+        snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app =
+            build_router(build_state(snap, hub).with_usage_sink(aisix_obs::UsageSink::new(tx)));
+
+        for (caller_auth, expected_auth, judge_key_id) in [
+            (None, "Bearer sk-upstream", "pk-judge"),
+            (Some("Bearer caller-upstream"), "Bearer caller-upstream", ""),
+        ] {
+            let mut req = cancellable_chat_request("council");
+            let headers = req.headers_mut();
+            headers.insert("x-aisix-api-key", "sk-caller".parse().unwrap());
+            headers.remove("authorization");
+            if let Some(caller_auth) = caller_auth {
+                headers.insert("authorization", caller_auth.parse().unwrap());
+            }
+            let response = run(app.clone(), req).await;
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(judge_auth_rx.try_recv().unwrap(), expected_auth);
+            let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let timeouts: Vec<_> = events
+                .iter()
+                .filter(|e| {
+                    matches!(e.attempt_kind.as_str(), "panel" | "judge")
+                        && e.error_class == "timeout"
+                })
+                .map(|e| {
+                    (
+                        e.attempt_model.as_str(),
+                        e.status_code,
+                        e.pk_label.as_str(),
+                        e.provider_key_id.as_str(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                timeouts,
+                [
+                    ("stalled-panel", 504, "stalled-panel", "pk-stalled-panel"),
+                    ("pending-panel", 504, "pending-panel", ""),
+                    ("judge", 504, "judge", judge_key_id),
+                ]
+            );
+        }
+        upstream.abort();
+    }
+
     /// A non-streaming ensemble cancelled while its judge runs: both panel
     /// members had answered, so their rows are owed ahead of the 499 row and
     /// their tokens are charged as the completed run would have charged them.
