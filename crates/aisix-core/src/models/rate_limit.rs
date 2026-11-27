@@ -62,15 +62,20 @@ pub struct RateLimit {
 pub enum RateLimitWindowType {
     /// Each window starts at a fixed boundary (the top of the minute, hour,
     /// or day, UTC) and its count resets to zero when the next one starts.
-    /// A burst at the end of one window and another at the start of the next
-    /// can therefore admit up to twice the limit within one window's length.
+    /// For a given request counter, the gateway can admit up to twice the
+    /// request limit within one window's length if a burst spans a window
+    /// boundary.
     #[default]
     Fixed,
     /// A rolling window. Usage is recorded in sub-buckets aligned to a fixed
-    /// step: 10 seconds for `rpm` and `tpm`, 5 minutes for `rph`, and 1 hour
-    /// for `rpd` and `tpd`. A request is checked against the sum of the
-    /// current sub-bucket and the preceding sub-buckets that cover one full
-    /// window, so no window-length interval ever admits more than the limit.
+    /// step of 10 seconds for `rpm` and `tpm`, 5 minutes for `rph`, and 1 hour
+    /// for `rpd` and `tpd`. The limiter sums the current sub-bucket and the
+    /// preceding sub-buckets that cover a full window. For each request
+    /// counter, the gateway counts requests at admission and admits at
+    /// most the configured number in any interval of that length.
+    /// For token limits, it rejects new requests when recorded usage
+    /// reaches the limit. Tokens are added after completion, so admitted
+    /// requests can push usage above the limit.
     /// Usage leaves the count between one window and one window plus one step
     /// after it was recorded.
     Sliding,
